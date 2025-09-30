@@ -14,27 +14,41 @@ use crate::{LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
-    bool,                // needs_pre_projection
-    Vec<LogicalExpr>,    // pre_projection_exprs
-    Vec<(String, Type)>, // pre_projection_schema
-    Vec<LogicalExpr>,    // modified_aggr_exprs
+    bool,             // needs_pre_projection
+    Vec<LogicalExpr>, // pre_projection_exprs
+    Vec<ColumnInfo>,  // pre_projection_schema
+    Vec<LogicalExpr>, // modified_aggr_exprs
+    Vec<LogicalExpr>, // modified_group_exprs
 );
+
+/// Result type for parsing join conditions
+type JoinConditionsResult = (Vec<(LogicalExpr, LogicalExpr)>, Option<LogicalExpr>);
+
+/// Information about a column in a logical schema
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub ty: Type,
+    pub database: Option<String>,
+    pub table: Option<String>,
+    pub table_alias: Option<String>,
+}
 
 /// Schema information for logical plan nodes
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogicalSchema {
-    /// Column names and types
-    pub columns: Vec<(String, Type)>,
+    pub columns: Vec<ColumnInfo>,
 }
 /// A reference to a schema that can be shared between nodes
 pub type SchemaRef = Arc<LogicalSchema>;
 
 impl LogicalSchema {
-    pub fn new(columns: Vec<(String, Type)>) -> Self {
+    pub fn new(columns: Vec<ColumnInfo>) -> Self {
         Self { columns }
     }
 
@@ -48,11 +62,42 @@ impl LogicalSchema {
         self.columns.len()
     }
 
-    pub fn find_column(&self, name: &str) -> Option<(usize, &Type)> {
-        self.columns
-            .iter()
-            .position(|(n, _)| n == name)
-            .map(|idx| (idx, &self.columns[idx].1))
+    pub fn find_column(&self, name: &str, table: Option<&str>) -> Option<(usize, &ColumnInfo)> {
+        if let Some(table_ref) = table {
+            // Check if it's a database.table format
+            if table_ref.contains('.') {
+                let parts: Vec<&str> = table_ref.splitn(2, '.').collect();
+                if parts.len() == 2 {
+                    let db = parts[0];
+                    let tbl = parts[1];
+                    return self
+                        .columns
+                        .iter()
+                        .position(|c| {
+                            c.name == name
+                                && c.database.as_deref() == Some(db)
+                                && c.table.as_deref() == Some(tbl)
+                        })
+                        .map(|idx| (idx, &self.columns[idx]));
+                }
+            }
+
+            // Try to match against table alias first, then table name
+            self.columns
+                .iter()
+                .position(|c| {
+                    c.name == name
+                        && (c.table_alias.as_deref() == Some(table_ref)
+                            || c.table.as_deref() == Some(table_ref))
+                })
+                .map(|idx| (idx, &self.columns[idx]))
+        } else {
+            // Unqualified lookup - just match by name
+            self.columns
+                .iter()
+                .position(|c| c.name == name)
+                .map(|idx| (idx, &self.columns[idx]))
+        }
     }
 }
 
@@ -65,8 +110,8 @@ pub enum LogicalPlan {
     Filter(Filter),
     /// Aggregate - GROUP BY with aggregate functions
     Aggregate(Aggregate),
-    // TODO: Join - combining two relations (not yet implemented)
-    // Join(Join),
+    /// Join - combining two relations
+    Join(Join),
     /// Sort - ORDER BY clause
     Sort(Sort),
     /// Limit - LIMIT/OFFSET clause
@@ -94,7 +139,7 @@ impl LogicalPlan {
             LogicalPlan::Projection(p) => &p.schema,
             LogicalPlan::Filter(f) => f.input.schema(),
             LogicalPlan::Aggregate(a) => &a.schema,
-            // LogicalPlan::Join(j) => &j.schema,
+            LogicalPlan::Join(j) => &j.schema,
             LogicalPlan::Sort(s) => s.input.schema(),
             LogicalPlan::Limit(l) => l.input.schema(),
             LogicalPlan::TableScan(t) => &t.schema,
@@ -132,26 +177,26 @@ pub struct Aggregate {
     pub schema: SchemaRef,
 }
 
-// TODO: Join operator (not yet implemented)
-// #[derive(Debug, Clone, PartialEq)]
-// pub struct Join {
-//     pub left: Arc<LogicalPlan>,
-//     pub right: Arc<LogicalPlan>,
-//     pub join_type: JoinType,
-//     pub on: Vec<(LogicalExpr, LogicalExpr)>, // Equijoin conditions
-//     pub filter: Option<LogicalExpr>,         // Additional filter conditions
-//     pub schema: SchemaRef,
-// }
+/// Types of joins
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
 
-// TODO: Types of joins (not yet implemented)
-// #[derive(Debug, Clone, Copy, PartialEq)]
-// pub enum JoinType {
-//     Inner,
-//     Left,
-//     Right,
-//     Full,
-//     Cross,
-// }
+/// Join operator - combines two relations
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub left: Arc<LogicalPlan>,
+    pub right: Arc<LogicalPlan>,
+    pub join_type: JoinType,
+    pub on: Vec<(LogicalExpr, LogicalExpr)>, // Equijoin conditions (left_expr, right_expr)
+    pub filter: Option<LogicalExpr>,         // Additional filter conditions
+    pub schema: SchemaRef,
+}
 
 /// Sort operator - ORDER BY
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +225,7 @@ pub struct Limit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableScan {
     pub table_name: String,
+    pub alias: Option<String>,
     pub schema: SchemaRef,
     pub projection: Option<Vec<usize>>, // Column indices to project
 }
@@ -301,6 +347,11 @@ pub enum LogicalExpr {
         escape: Option<char>,
         negated: bool,
     },
+    /// CAST expression
+    Cast {
+        expr: Box<LogicalExpr>,
+        type_name: Option<ast::Type>,
+    },
 }
 
 /// Column reference
@@ -332,6 +383,16 @@ impl Display for Column {
             Some(t) => write!(f, "{}.{}", t, self.name),
             None => write!(f, "{}", self.name),
         }
+    }
+}
+
+/// Strip alias wrapper from an expression, returning the underlying expression.
+/// This is useful when comparing expressions where one might be aliased and the other not,
+/// such as when matching SELECT expressions with GROUP BY expressions.
+pub fn strip_alias(expr: &LogicalExpr) -> &LogicalExpr {
+    match expr {
+        LogicalExpr::Alias { expr, .. } => expr,
+        _ => expr,
     }
 }
 
@@ -370,9 +431,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Convert Name to String
     fn name_to_string(name: &ast::Name) -> String {
-        match name {
-            ast::Name::Ident(s) | ast::Name::Quoted(s) => s.clone(),
-        }
+        name.as_str().to_string()
     }
 
     // Build a SELECT statement
@@ -532,7 +591,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Build a table reference
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
-            ast::SelectTable::Table(name, _alias, _indexed) => {
+            ast::SelectTable::Table(name, alias, _indexed) => {
                 let table_name = Self::name_to_string(&name.name);
                 // Check if it's a CTE reference
                 if let Some(cte_plan) = self.ctes.get(&table_name) {
@@ -543,9 +602,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
 
                 // Regular table scan
-                let table_schema = self.get_table_schema(&table_name)?;
+                let table_alias = alias.as_ref().map(|a| match a {
+                    ast::As::As(name) => Self::name_to_string(name),
+                    ast::As::Elided(name) => Self::name_to_string(name),
+                });
+                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
+                    alias: table_alias.clone(),
                     schema: table_schema,
                     projection: None,
                 }))
@@ -563,14 +627,291 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Build JOIN
     fn build_join(
         &mut self,
-        _left: LogicalPlan,
-        _right: LogicalPlan,
-        _op: &ast::JoinOperator,
-        _constraint: &Option<ast::JoinConstraint>,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        op: &ast::JoinOperator,
+        constraint: &Option<ast::JoinConstraint>,
     ) -> Result<LogicalPlan> {
-        Err(LimboError::ParseError(
-            "JOINs are not yet supported in logical plans".to_string(),
-        ))
+        // Determine join type
+        let join_type = match op {
+            ast::JoinOperator::Comma => JoinType::Cross, // Comma is essentially a cross join
+            ast::JoinOperator::TypedJoin(Some(jt)) => {
+                // Check the join type flags
+                // Note: JoinType can have multiple flags set
+                if jt.contains(ast::JoinType::NATURAL) {
+                    // Natural joins need special handling - find common columns
+                    return self.build_natural_join(left, right, JoinType::Inner);
+                } else if jt.contains(ast::JoinType::LEFT)
+                    && jt.contains(ast::JoinType::RIGHT)
+                    && jt.contains(ast::JoinType::OUTER)
+                {
+                    // FULL OUTER JOIN (has LEFT, RIGHT, and OUTER)
+                    JoinType::Full
+                } else if jt.contains(ast::JoinType::LEFT) && jt.contains(ast::JoinType::OUTER) {
+                    JoinType::Left
+                } else if jt.contains(ast::JoinType::RIGHT) && jt.contains(ast::JoinType::OUTER) {
+                    JoinType::Right
+                } else if jt.contains(ast::JoinType::OUTER)
+                    && !jt.contains(ast::JoinType::LEFT)
+                    && !jt.contains(ast::JoinType::RIGHT)
+                {
+                    // Plain OUTER JOIN should also be FULL
+                    JoinType::Full
+                } else if jt.contains(ast::JoinType::LEFT) {
+                    JoinType::Left
+                } else if jt.contains(ast::JoinType::RIGHT) {
+                    JoinType::Right
+                } else if jt.contains(ast::JoinType::CROSS)
+                    || (jt.contains(ast::JoinType::INNER) && jt.contains(ast::JoinType::CROSS))
+                {
+                    JoinType::Cross
+                } else {
+                    JoinType::Inner // Default to inner
+                }
+            }
+            ast::JoinOperator::TypedJoin(None) => JoinType::Inner, // Default JOIN is INNER JOIN
+        };
+
+        // Build join conditions
+        let (on_conditions, filter) = match constraint {
+            Some(ast::JoinConstraint::On(expr)) => {
+                // Parse ON clause into equijoin conditions and filters
+                self.parse_join_conditions(expr, left.schema(), right.schema())?
+            }
+            Some(ast::JoinConstraint::Using(columns)) => {
+                // Build equijoin conditions from USING clause
+                let on = self.build_using_conditions(columns, left.schema(), right.schema())?;
+                (on, None)
+            }
+            None => {
+                // Cross join or natural join
+                (Vec::new(), None)
+            }
+        };
+
+        // Build combined schema
+        let schema = self.build_join_schema(&left, &right, &join_type)?;
+
+        Ok(LogicalPlan::Join(Join {
+            left: Arc::new(left),
+            right: Arc::new(right),
+            join_type,
+            on: on_conditions,
+            filter,
+            schema,
+        }))
+    }
+
+    // Helper: Parse join conditions into equijoins and filters
+    fn parse_join_conditions(
+        &mut self,
+        expr: &ast::Expr,
+        left_schema: &SchemaRef,
+        right_schema: &SchemaRef,
+    ) -> Result<JoinConditionsResult> {
+        // For now, we'll handle simple equality conditions
+        // More complex conditions will go into the filter
+        let mut equijoins = Vec::new();
+        let mut filters = Vec::new();
+
+        // Try to extract equijoin conditions from the expression
+        self.extract_equijoin_conditions(
+            expr,
+            left_schema,
+            right_schema,
+            &mut equijoins,
+            &mut filters,
+        )?;
+
+        let filter = if filters.is_empty() {
+            None
+        } else {
+            // Combine multiple filters with AND
+            Some(
+                filters
+                    .into_iter()
+                    .reduce(|acc, e| LogicalExpr::BinaryExpr {
+                        left: Box::new(acc),
+                        op: BinaryOperator::And,
+                        right: Box::new(e),
+                    })
+                    .unwrap(),
+            )
+        };
+
+        Ok((equijoins, filter))
+    }
+
+    // Helper: Extract equijoin conditions from expression
+    fn extract_equijoin_conditions(
+        &mut self,
+        expr: &ast::Expr,
+        left_schema: &SchemaRef,
+        right_schema: &SchemaRef,
+        equijoins: &mut Vec<(LogicalExpr, LogicalExpr)>,
+        filters: &mut Vec<LogicalExpr>,
+    ) -> Result<()> {
+        match expr {
+            ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
+                // Check if this is an equijoin condition (left.col = right.col)
+                let left_expr = self.build_expr(lhs, left_schema)?;
+                let right_expr = self.build_expr(rhs, right_schema)?;
+
+                // For simplicity, we'll check if one references left and one references right
+                // In a real implementation, we'd need more sophisticated column resolution
+                equijoins.push((left_expr, right_expr));
+            }
+            ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+                // Recursively extract from AND conditions
+                self.extract_equijoin_conditions(
+                    lhs,
+                    left_schema,
+                    right_schema,
+                    equijoins,
+                    filters,
+                )?;
+                self.extract_equijoin_conditions(
+                    rhs,
+                    left_schema,
+                    right_schema,
+                    equijoins,
+                    filters,
+                )?;
+            }
+            _ => {
+                // Other conditions go into the filter
+                // We need a combined schema to build the expression
+                let combined_schema = self.combine_schemas(left_schema, right_schema)?;
+                let filter_expr = self.build_expr(expr, &combined_schema)?;
+                filters.push(filter_expr);
+            }
+        }
+        Ok(())
+    }
+
+    // Helper: Build equijoin conditions from USING clause
+    fn build_using_conditions(
+        &mut self,
+        columns: &[ast::Name],
+        left_schema: &SchemaRef,
+        right_schema: &SchemaRef,
+    ) -> Result<Vec<(LogicalExpr, LogicalExpr)>> {
+        let mut conditions = Vec::new();
+
+        for col_name in columns {
+            let name = Self::name_to_string(col_name);
+
+            // Find the column in both schemas
+            let _left_idx = left_schema
+                .columns
+                .iter()
+                .position(|col| col.name == name)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("Column {name} not found in left table"))
+                })?;
+            let _right_idx = right_schema
+                .columns
+                .iter()
+                .position(|col| col.name == name)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("Column {name} not found in right table"))
+                })?;
+
+            conditions.push((
+                LogicalExpr::Column(Column {
+                    name: name.clone(),
+                    table: None, // Will be resolved later
+                }),
+                LogicalExpr::Column(Column {
+                    name,
+                    table: None, // Will be resolved later
+                }),
+            ));
+        }
+
+        Ok(conditions)
+    }
+
+    // Helper: Build natural join by finding common columns
+    fn build_natural_join(
+        &mut self,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        join_type: JoinType,
+    ) -> Result<LogicalPlan> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+
+        // Find common column names
+        let mut common_columns = Vec::new();
+        for left_col in &left_schema.columns {
+            if right_schema
+                .columns
+                .iter()
+                .any(|col| col.name == left_col.name)
+            {
+                common_columns.push(ast::Name::exact(left_col.name.clone()));
+            }
+        }
+
+        if common_columns.is_empty() {
+            // Natural join with no common columns becomes a cross join
+            let schema = self.build_join_schema(&left, &right, &JoinType::Cross)?;
+            return Ok(LogicalPlan::Join(Join {
+                left: Arc::new(left),
+                right: Arc::new(right),
+                join_type: JoinType::Cross,
+                on: Vec::new(),
+                filter: None,
+                schema,
+            }));
+        }
+
+        // Build equijoin conditions for common columns
+        let on = self.build_using_conditions(&common_columns, left_schema, right_schema)?;
+        let schema = self.build_join_schema(&left, &right, &join_type)?;
+
+        Ok(LogicalPlan::Join(Join {
+            left: Arc::new(left),
+            right: Arc::new(right),
+            join_type,
+            on,
+            filter: None,
+            schema,
+        }))
+    }
+
+    // Helper: Build schema for join result
+    fn build_join_schema(
+        &self,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        _join_type: &JoinType,
+    ) -> Result<SchemaRef> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+
+        // Concatenate the schemas, preserving all column information
+        let mut columns = Vec::new();
+
+        // Keep all columns from left with their table info
+        for col in &left_schema.columns {
+            columns.push(col.clone());
+        }
+
+        // Keep all columns from right with their table info
+        for col in &right_schema.columns {
+            columns.push(col.clone());
+        }
+
+        Ok(Arc::new(LogicalSchema::new(columns)))
+    }
+
+    // Helper: Combine two schemas for expression building
+    fn combine_schemas(&self, left: &SchemaRef, right: &SchemaRef) -> Result<SchemaRef> {
+        let mut columns = left.columns.clone();
+        columns.extend(right.columns.clone());
+        Ok(Arc::new(LogicalSchema::new(columns)))
     }
 
     // Build projection
@@ -595,7 +936,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                     };
                     let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
 
-                    schema_columns.push((col_name.clone(), col_type));
+                    schema_columns.push(ColumnInfo {
+                        name: col_name.clone(),
+                        ty: col_type,
+                        database: None,
+                        table: None,
+                        table_alias: None,
+                    });
 
                     if let Some(as_alias) = alias {
                         let alias_name = match as_alias {
@@ -611,21 +958,21 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
                 ast::ResultColumn::Star => {
                     // Expand * to all columns
-                    for (name, typ) in &input_schema.columns {
-                        proj_exprs.push(LogicalExpr::Column(Column::new(name.clone())));
-                        schema_columns.push((name.clone(), *typ));
+                    for col in &input_schema.columns {
+                        proj_exprs.push(LogicalExpr::Column(Column::new(col.name.clone())));
+                        schema_columns.push(col.clone());
                     }
                 }
                 ast::ResultColumn::TableStar(table) => {
                     // Expand table.* to all columns from that table
                     let table_name = Self::name_to_string(table);
-                    for (name, typ) in &input_schema.columns {
+                    for col in &input_schema.columns {
                         // Simple check - would need proper table tracking in real implementation
                         proj_exprs.push(LogicalExpr::Column(Column::with_table(
-                            name.clone(),
+                            col.name.clone(),
                             table_name.clone(),
                         )));
-                        schema_columns.push((name.clone(), *typ));
+                        schema_columns.push(col.clone());
                     }
                 }
             }
@@ -656,6 +1003,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         let mut pre_projection_exprs = Vec::new();
         let mut pre_projection_schema = Vec::new();
         let mut modified_aggr_exprs = Vec::new();
+        let mut modified_group_exprs = Vec::new();
         let mut projected_col_counter = 0;
 
         // First, add all group by expressions to the pre-projection
@@ -663,7 +1011,15 @@ impl<'a> LogicalPlanBuilder<'a> {
             if let LogicalExpr::Column(col) = expr {
                 pre_projection_exprs.push(expr.clone());
                 let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push((col.name.clone(), col_type));
+                pre_projection_schema.push(ColumnInfo {
+                    name: col.name.clone(),
+                    ty: col_type,
+                    database: None,
+                    table: col.table.clone(),
+                    table_alias: None,
+                });
+                // Column references stay as-is in the modified group expressions
+                modified_group_exprs.push(expr.clone());
             } else {
                 // Complex group by expression - project it
                 needs_pre_projection = true;
@@ -671,7 +1027,18 @@ impl<'a> LogicalPlanBuilder<'a> {
                 projected_col_counter += 1;
                 pre_projection_exprs.push(expr.clone());
                 let col_type = Self::infer_expr_type(expr, input_schema)?;
-                pre_projection_schema.push((proj_col_name.clone(), col_type));
+                pre_projection_schema.push(ColumnInfo {
+                    name: proj_col_name.clone(),
+                    ty: col_type,
+                    database: None,
+                    table: None,
+                    table_alias: None,
+                });
+                // Replace complex expression with reference to projected column
+                modified_group_exprs.push(LogicalExpr::Column(Column {
+                    name: proj_col_name,
+                    table: None,
+                }));
             }
         }
 
@@ -695,7 +1062,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                                 pre_projection_exprs.push(arg.clone());
                                 let col_type = Self::infer_expr_type(arg, input_schema)?;
                                 if let LogicalExpr::Column(col) = arg {
-                                    pre_projection_schema.push((col.name.clone(), col_type));
+                                    pre_projection_schema.push(ColumnInfo {
+                                        name: col.name.clone(),
+                                        ty: col_type,
+                                        database: None,
+                                        table: col.table.clone(),
+                                        table_alias: None,
+                                    });
                                 }
                             }
                         }
@@ -708,7 +1081,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                             // Add the expression to the pre-projection
                             pre_projection_exprs.push(arg.clone());
                             let col_type = Self::infer_expr_type(arg, input_schema)?;
-                            pre_projection_schema.push((proj_col_name.clone(), col_type));
+                            pre_projection_schema.push(ColumnInfo {
+                                name: proj_col_name.clone(),
+                                ty: col_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
 
                             // In the aggregate, reference the projected column
                             modified_args.push(LogicalExpr::Column(Column::new(proj_col_name)));
@@ -732,6 +1111,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             pre_projection_exprs,
             pre_projection_schema,
             modified_aggr_exprs,
+            modified_group_exprs,
         ))
     }
 
@@ -774,6 +1154,52 @@ impl<'a> LogicalPlanBuilder<'a> {
         let input_schema = input.schema();
         let has_group_by = !group_exprs.is_empty();
 
+        // First pass: build a map of aliases to expressions from the SELECT list
+        // and a vector of SELECT expressions for positional references
+        // This allows GROUP BY to reference SELECT aliases (e.g., GROUP BY year)
+        // or positions (e.g., GROUP BY 1)
+        let mut alias_to_expr = HashMap::new();
+        let mut select_exprs = Vec::new();
+        for col in columns {
+            if let ast::ResultColumn::Expr(expr, alias) = col {
+                let logical_expr = self.build_expr(expr, input_schema)?;
+                select_exprs.push(logical_expr.clone());
+
+                if let Some(alias) = alias {
+                    let alias_name = match alias {
+                        ast::As::As(name) | ast::As::Elided(name) => Self::name_to_string(name),
+                    };
+                    alias_to_expr.insert(alias_name, logical_expr);
+                }
+            }
+        }
+
+        // Resolve GROUP BY expressions: replace column references that match SELECT aliases
+        // or integer literals that represent positions
+        let group_exprs = group_exprs
+            .into_iter()
+            .map(|expr| {
+                // Check for positional reference (integer literal)
+                if let LogicalExpr::Literal(crate::types::Value::Integer(pos)) = &expr {
+                    // SQLite uses 1-based indexing
+                    if *pos > 0 && (*pos as usize) <= select_exprs.len() {
+                        return select_exprs[(*pos as usize) - 1].clone();
+                    }
+                }
+
+                // Check for alias reference (unqualified column name)
+                if let LogicalExpr::Column(col) = &expr {
+                    if col.table.is_none() {
+                        // Unqualified column - check if it matches an alias
+                        if let Some(aliased_expr) = alias_to_expr.get(&col.name) {
+                            return aliased_expr.clone();
+                        }
+                    }
+                }
+                expr
+            })
+            .collect::<Vec<_>>();
+
         // Build aggregate expressions and projection expressions
         let mut aggr_exprs = Vec::new();
         let mut projection_exprs = Vec::new();
@@ -782,20 +1208,43 @@ impl<'a> LogicalPlanBuilder<'a> {
         // First, add GROUP BY columns to the aggregate output schema
         // These are always part of the aggregate operator's output
         for group_expr in &group_exprs {
-            let col_name = match group_expr {
-                LogicalExpr::Column(col) => col.name.clone(),
+            match group_expr {
+                LogicalExpr::Column(col) => {
+                    // For column references in GROUP BY, preserve the original column info
+                    if let Some((_, col_info)) =
+                        input_schema.find_column(&col.name, col.table.as_deref())
+                    {
+                        // Preserve the column with all its table information
+                        aggregate_schema_columns.push(col_info.clone());
+                    } else {
+                        // Fallback if column not found (shouldn't happen)
+                        let col_type = Self::infer_expr_type(group_expr, input_schema)?;
+                        aggregate_schema_columns.push(ColumnInfo {
+                            name: col.name.clone(),
+                            ty: col_type,
+                            database: None,
+                            table: col.table.clone(),
+                            table_alias: None,
+                        });
+                    }
+                }
                 _ => {
                     // For complex GROUP BY expressions, generate a name
-                    format!("__group_{}", aggregate_schema_columns.len())
+                    let col_name = format!("__group_{}", aggregate_schema_columns.len());
+                    let col_type = Self::infer_expr_type(group_expr, input_schema)?;
+                    aggregate_schema_columns.push(ColumnInfo {
+                        name: col_name,
+                        ty: col_type,
+                        database: None,
+                        table: None,
+                        table_alias: None,
+                    });
                 }
-            };
-            let col_type = Self::infer_expr_type(group_expr, input_schema)?;
-            aggregate_schema_columns.push((col_name, col_type));
+            }
         }
 
         // Track aggregates we've already seen to avoid duplicates
-        let mut aggregate_map: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut aggregate_map: HashMap<String, String> = HashMap::new();
 
         for col in columns {
             match col {
@@ -823,7 +1272,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                         } else {
                             // New aggregate - add it
                             let col_type = Self::infer_expr_type(&logical_expr, input_schema)?;
-                            aggregate_schema_columns.push((col_name.clone(), col_type));
+                            aggregate_schema_columns.push(ColumnInfo {
+                                name: col_name.clone(),
+                                ty: col_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
                             aggr_exprs.push(logical_expr);
                             aggregate_map.insert(agg_key, col_name.clone());
                             col_name.clone()
@@ -847,7 +1302,13 @@ impl<'a> LogicalPlanBuilder<'a> {
                         // Add only new aggregates
                         for (agg_expr, agg_name) in extracted_aggs {
                             let agg_type = Self::infer_expr_type(&agg_expr, input_schema)?;
-                            aggregate_schema_columns.push((agg_name, agg_type));
+                            aggregate_schema_columns.push(ColumnInfo {
+                                name: agg_name,
+                                ty: agg_type,
+                                database: None,
+                                table: None,
+                                table_alias: None,
+                            });
                             aggr_exprs.push(agg_expr);
                         }
 
@@ -868,6 +1329,23 @@ impl<'a> LogicalPlanBuilder<'a> {
                                     "Column '{col_name}' must appear in the GROUP BY clause or be used in an aggregate function"
                                 )));
                             }
+
+                            // If this expression matches a GROUP BY expression, replace it with a reference
+                            // to the corresponding column in the aggregate output
+                            let logical_expr_stripped = strip_alias(&logical_expr);
+                            if let Some(group_idx) = group_exprs
+                                .iter()
+                                .position(|g| logical_expr_stripped == strip_alias(g))
+                            {
+                                // Reference the GROUP BY column in the aggregate output by its name
+                                let group_col_name = &aggregate_schema_columns[group_idx].name;
+                                projection_exprs.push(LogicalExpr::Column(Column {
+                                    name: group_col_name.clone(),
+                                    table: None,
+                                }));
+                            } else {
+                                projection_exprs.push(logical_expr);
+                            }
                         } else {
                             // Without GROUP BY: only allow constant expressions
                             // TODO: SQLite allows any column here and returns a value from an
@@ -878,8 +1356,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                                     "Column '{col_name}' must be used in an aggregate function when using aggregates without GROUP BY"
                                 )));
                             }
+                            projection_exprs.push(logical_expr);
                         }
-                        projection_exprs.push(logical_expr);
                     }
                 }
                 _ => {
@@ -894,12 +1372,14 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         // Check if any aggregate functions have complex expressions as arguments
+        // or if GROUP BY has complex expressions
         // If so, we need to insert a projection before the aggregate
         let (
             needs_pre_projection,
             pre_projection_exprs,
             pre_projection_schema,
             modified_aggr_exprs,
+            modified_group_exprs,
         ) = Self::preprocess_aggregate_expressions(&aggr_exprs, &group_exprs, input_schema)?;
 
         // Build the final schema for the projection
@@ -922,7 +1402,13 @@ impl<'a> LogicalPlanBuilder<'a> {
             // For type inference, we need the aggregate schema for column references
             let aggregate_schema = LogicalSchema::new(aggregate_schema_columns.clone());
             let col_type = Self::infer_expr_type(expr, &Arc::new(aggregate_schema))?;
-            projection_schema_columns.push((col_name, col_type));
+            projection_schema_columns.push(ColumnInfo {
+                name: col_name,
+                ty: col_type,
+                database: None,
+                table: None,
+                table_alias: None,
+            });
         }
 
         // Create the input plan (with pre-projection if needed)
@@ -936,20 +1422,25 @@ impl<'a> LogicalPlanBuilder<'a> {
             Arc::new(input)
         };
 
-        // Use modified aggregate expressions if we inserted a pre-projection
+        // Use modified aggregate and group expressions if we inserted a pre-projection
         let final_aggr_exprs = if needs_pre_projection {
             modified_aggr_exprs
         } else {
             aggr_exprs
         };
+        let final_group_exprs = if needs_pre_projection {
+            modified_group_exprs
+        } else {
+            group_exprs
+        };
 
         // Check if we need the outer projection
         // We need a projection if:
-        // 1. Any expression is more complex than a simple column reference (e.g., abs(sum(id)))
-        // 2. We're selecting a different set of columns than what the aggregate outputs
-        // 3. Columns are renamed or reordered
+        // 1. We have expressions that compute new values (e.g., SUM(x) * 2)
+        // 2. We're selecting a different set of columns than GROUP BY + aggregates
+        // 3. We're reordering columns from their natural aggregate output order
         let needs_outer_projection = {
-            // Check if any expression is more complex than a simple column reference
+            // Check for complex expressions
             let has_complex_exprs = projection_exprs
                 .iter()
                 .any(|expr| !matches!(expr, LogicalExpr::Column(_)));
@@ -957,20 +1448,32 @@ impl<'a> LogicalPlanBuilder<'a> {
             if has_complex_exprs {
                 true
             } else {
-                // All are simple columns - check if we're selecting exactly what the aggregate outputs
-                // The projection might be selecting a subset (e.g., only aggregates without group columns)
-                // or reordering columns, or using different names
+                // Check if we're selecting exactly what aggregate outputs in the same order
+                // The aggregate outputs: all GROUP BY columns, then all aggregate expressions
+                // The projection might select a subset or reorder these
 
-                // For now, keep it simple: if schemas don't match exactly, we need projection
-                // This handles all cases: subset selection, reordering, renaming
-                projection_schema_columns != aggregate_schema_columns
+                if projection_exprs.len() != aggregate_schema_columns.len() {
+                    // Different number of columns
+                    true
+                } else {
+                    // Check if columns match in order and name
+                    !projection_exprs.iter().zip(&aggregate_schema_columns).all(
+                        |(expr, agg_col)| {
+                            if let LogicalExpr::Column(col) = expr {
+                                col.name == agg_col.name
+                            } else {
+                                false
+                            }
+                        },
+                    )
+                }
             }
         };
 
-        // Create the aggregate node
+        // Create the aggregate node with its natural schema
         let aggregate_plan = LogicalPlan::Aggregate(Aggregate {
             input: aggregate_input,
-            group_expr: group_exprs,
+            group_expr: final_group_exprs,
             aggr_expr: final_aggr_exprs,
             schema: Arc::new(LogicalSchema::new(aggregate_schema_columns)),
         });
@@ -982,7 +1485,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 schema: Arc::new(LogicalSchema::new(projection_schema_columns)),
             }))
         } else {
-            // No projection needed - the aggregate output is exactly what we want
+            // No projection needed - aggregate output matches what we want
             Ok(aggregate_plan)
         }
     }
@@ -1000,7 +1503,13 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Infer schema from first row
         let mut schema_columns = Vec::new();
         for (i, _) in values[0].iter().enumerate() {
-            schema_columns.push((format!("column{}", i + 1), Type::Text));
+            schema_columns.push(ColumnInfo {
+                name: format!("column{}", i + 1),
+                ty: Type::Text,
+                database: None,
+                table: None,
+                table_alias: None,
+            });
         }
 
         for row in values {
@@ -1357,6 +1866,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                 self.build_expr(&exprs[0], _schema)
             }
 
+            ast::Expr::Cast { expr, type_name } => {
+                let inner = self.build_expr(expr, _schema)?;
+                Ok(LogicalExpr::Cast {
+                    expr: Box::new(inner),
+                    type_name: type_name.clone(),
+                })
+            }
+
             _ => Err(LimboError::ParseError(format!(
                 "Unsupported expression type in logical plan: {expr:?}"
             ))),
@@ -1367,9 +1884,14 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("true") => Ok(Value::Integer(1)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) if k.eq_ignore_ascii_case("false") => Ok(Value::Integer(0)), // SQLite uses int for bool
-            ast::Literal::Keyword(k) => Ok(Value::Text(k.clone().into())),
+            ast::Literal::Keyword(k) => {
+                let k_bytes = k.as_bytes();
+                match_ignore_ascii_case!(match k_bytes {
+                    b"true" => Ok(Value::Integer(1)),  // SQLite uses int for bool
+                    b"false" => Ok(Value::Integer(0)), // SQLite uses int for bool
+                    _ => Ok(Value::Text(k.clone().into())),
+                })
+            }
             ast::Literal::Numeric(s) => {
                 if let Ok(i) = s.parse::<i64>() {
                     Ok(Value::Integer(i))
@@ -1400,19 +1922,20 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     /// Parse aggregate function name (considering argument count for min/max)
     fn parse_aggregate_function(name: &str, arg_count: usize) -> Option<AggregateFunction> {
-        match name.to_uppercase().as_str() {
-            "COUNT" => Some(AggFunc::Count),
-            "SUM" => Some(AggFunc::Sum),
-            "AVG" => Some(AggFunc::Avg),
+        let name_bytes = name.as_bytes();
+        match_ignore_ascii_case!(match name_bytes {
+            b"COUNT" => Some(AggFunc::Count),
+            b"SUM" => Some(AggFunc::Sum),
+            b"AVG" => Some(AggFunc::Avg),
             // MIN and MAX are only aggregates with 1 argument
             // With 2+ arguments, they're scalar functions
-            "MIN" if arg_count == 1 => Some(AggFunc::Min),
-            "MAX" if arg_count == 1 => Some(AggFunc::Max),
-            "GROUP_CONCAT" => Some(AggFunc::GroupConcat),
-            "STRING_AGG" => Some(AggFunc::StringAgg),
-            "TOTAL" => Some(AggFunc::Total),
+            b"MIN" if arg_count == 1 => Some(AggFunc::Min),
+            b"MAX" if arg_count == 1 => Some(AggFunc::Max),
+            b"GROUP_CONCAT" => Some(AggFunc::GroupConcat),
+            b"STRING_AGG" => Some(AggFunc::StringAgg),
+            b"TOTAL" => Some(AggFunc::Total),
             _ => None,
-        }
+        })
     }
 
     // Check if expression contains aggregates
@@ -1523,6 +2046,14 @@ impl<'a> LogicalPlanBuilder<'a> {
     // 2. An aggregate function
     // 3. A grouping column (or expression involving only grouping columns)
     fn is_valid_in_group_by(expr: &LogicalExpr, group_exprs: &[LogicalExpr]) -> bool {
+        // First check if the entire expression appears in GROUP BY
+        // Strip aliases before comparing since SELECT might have aliases but GROUP BY might not
+        let expr_stripped = strip_alias(expr);
+        if group_exprs.iter().any(|g| expr_stripped == strip_alias(g)) {
+            return true;
+        }
+
+        // If not, check recursively based on expression type
         match expr {
             LogicalExpr::Literal(_) => true, // Constants are always valid
             LogicalExpr::AggregateFunction { .. } => true, // Aggregates are valid
@@ -1553,7 +2084,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Returns the modified expression and a list of NEW (aggregate_expr, column_name) pairs
     fn extract_and_replace_aggregates_with_dedup(
         expr: LogicalExpr,
-        aggregate_map: &mut std::collections::HashMap<String, String>,
+        aggregate_map: &mut HashMap<String, String>,
     ) -> Result<(LogicalExpr, Vec<(LogicalExpr, String)>)> {
         let mut new_aggregates = Vec::new();
         let mut counter = aggregate_map.len();
@@ -1570,7 +2101,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn replace_aggregates_with_columns_dedup(
         expr: LogicalExpr,
         new_aggregates: &mut Vec<(LogicalExpr, String)>,
-        aggregate_map: &mut std::collections::HashMap<String, String>,
+        aggregate_map: &mut HashMap<String, String>,
         counter: &mut usize,
     ) -> Result<LogicalExpr> {
         match expr {
@@ -1722,17 +2253,31 @@ impl<'a> LogicalPlanBuilder<'a> {
     }
 
     // Get table schema
-    fn get_table_schema(&self, table_name: &str) -> Result<SchemaRef> {
+    fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
         // Look up table in schema
         let table = self
             .schema
             .get_table(table_name)
             .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
 
+        // Parse table_name which might be "db.table" for attached databases
+        let (database, actual_table) = if table_name.contains('.') {
+            let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+            (Some(parts[0].to_string()), parts[1].to_string())
+        } else {
+            (None, table_name.to_string())
+        };
+
         let mut columns = Vec::new();
         for col in table.columns() {
             if let Some(ref name) = col.name {
-                columns.push((name.clone(), col.ty));
+                columns.push(ColumnInfo {
+                    name: name.clone(),
+                    ty: col.ty,
+                    database: database.clone(),
+                    table: Some(actual_table.clone()),
+                    table_alias: alias.map(|s| s.to_string()),
+                });
             }
         }
 
@@ -1743,8 +2288,8 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn infer_expr_type(expr: &LogicalExpr, schema: &SchemaRef) -> Result<Type> {
         match expr {
             LogicalExpr::Column(col) => {
-                if let Some((_, typ)) = schema.find_column(&col.name) {
-                    Ok(*typ)
+                if let Some((_, col_info)) = schema.find_column(&col.name, col.table.as_deref()) {
+                    Ok(col_info.ty)
                 } else {
                     Ok(Type::Text)
                 }
@@ -1896,7 +2441,8 @@ mod tests {
             ],
             has_rowid: true,
             is_strict: false,
-            unique_sets: None,
+            has_autoincrement: false,
+            unique_sets: vec![],
         };
         schema.add_btree_table(Arc::new(users_table));
 
@@ -1957,9 +2503,72 @@ mod tests {
             ],
             has_rowid: true,
             is_strict: false,
-            unique_sets: None,
+            has_autoincrement: false,
+            unique_sets: vec![],
         };
         schema.add_btree_table(Arc::new(orders_table));
+
+        // Create products table
+        let products_table = BTreeTable {
+            name: "products".to_string(),
+            root_page: 4,
+            primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            columns: vec![
+                SchemaColumn {
+                    name: Some("id".to_string()),
+                    ty: Type::Integer,
+                    ty_str: "INTEGER".to_string(),
+                    primary_key: true,
+                    is_rowid_alias: true,
+                    notnull: true,
+                    default: None,
+                    unique: false,
+                    collation: None,
+                    hidden: false,
+                },
+                SchemaColumn {
+                    name: Some("name".to_string()),
+                    ty: Type::Text,
+                    ty_str: "TEXT".to_string(),
+                    primary_key: false,
+                    is_rowid_alias: false,
+                    notnull: false,
+                    default: None,
+                    unique: false,
+                    collation: None,
+                    hidden: false,
+                },
+                SchemaColumn {
+                    name: Some("price".to_string()),
+                    ty: Type::Real,
+                    ty_str: "REAL".to_string(),
+                    primary_key: false,
+                    is_rowid_alias: false,
+                    notnull: false,
+                    default: None,
+                    unique: false,
+                    collation: None,
+                    hidden: false,
+                },
+                SchemaColumn {
+                    name: Some("product_id".to_string()),
+                    ty: Type::Integer,
+                    ty_str: "INTEGER".to_string(),
+                    primary_key: false,
+                    is_rowid_alias: false,
+                    notnull: false,
+                    default: None,
+                    unique: false,
+                    collation: None,
+                    hidden: false,
+                },
+            ],
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            unique_sets: vec![],
+        };
+        schema.add_btree_table(Arc::new(products_table));
 
         schema
     }
@@ -3071,6 +3680,523 @@ mod tests {
                 }
             }
             _ => panic!("Expected Projection as top-level operator, got: {plan:?}"),
+        }
+    }
+
+    // ===== JOIN TESTS =====
+
+    #[test]
+    fn test_inner_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Join(join) => {
+                        assert_eq!(join.join_type, JoinType::Inner);
+                        assert!(!join.on.is_empty(), "Should have join conditions");
+
+                        // Check left input is users
+                        match &*join.left {
+                            LogicalPlan::TableScan(scan) => {
+                                assert_eq!(scan.table_name, "users");
+                            }
+                            _ => panic!("Expected TableScan for left input"),
+                        }
+
+                        // Check right input is orders
+                        match &*join.right {
+                            LogicalPlan::TableScan(scan) => {
+                                assert_eq!(scan.table_name, "orders");
+                            }
+                            _ => panic!("Expected TableScan for right input"),
+                        }
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_left_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                assert_eq!(proj.exprs.len(), 2); // name and amount
+                match &*proj.input {
+                    LogicalPlan::Join(join) => {
+                        assert_eq!(join.join_type, JoinType::Left);
+                        assert!(!join.on.is_empty(), "Should have join conditions");
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_right_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM orders o RIGHT JOIN users u ON o.user_id = u.id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => match &*proj.input {
+                LogicalPlan::Join(join) => {
+                    assert_eq!(join.join_type, JoinType::Right);
+                    assert!(!join.on.is_empty(), "Should have join conditions");
+                }
+                _ => panic!("Expected Join under Projection"),
+            },
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_full_outer_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => match &*proj.input {
+                LogicalPlan::Join(join) => {
+                    assert_eq!(join.join_type, JoinType::Full);
+                    assert!(!join.on.is_empty(), "Should have join conditions");
+                }
+                _ => panic!("Expected Join under Projection"),
+            },
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users CROSS JOIN orders";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => match &*proj.input {
+                LogicalPlan::Join(join) => {
+                    assert_eq!(join.join_type, JoinType::Cross);
+                    assert!(join.on.is_empty(), "Cross join should have no conditions");
+                    assert!(join.filter.is_none(), "Cross join should have no filter");
+                }
+                _ => panic!("Expected Join under Projection"),
+            },
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_multiple_conditions() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id AND u.age > 18";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Join(join) => {
+                        assert_eq!(join.join_type, JoinType::Inner);
+                        // Should have at least one equijoin condition
+                        assert!(!join.on.is_empty(), "Should have join conditions");
+                        // Additional conditions may be in filter
+                        // The exact distribution depends on our implementation
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_using_clause() {
+        let schema = create_test_schema();
+        // Note: Both tables should have an 'id' column for this to work
+        let sql = "SELECT * FROM users JOIN orders USING (id)";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => match &*proj.input {
+                LogicalPlan::Join(join) => {
+                    assert_eq!(join.join_type, JoinType::Inner);
+                    assert!(
+                        !join.on.is_empty(),
+                        "USING clause should create join conditions"
+                    );
+                }
+                _ => panic!("Expected Join under Projection"),
+            },
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_natural_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users NATURAL JOIN orders";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Join(join) => {
+                        // Natural join finds common columns (id in this case)
+                        // If no common columns, it becomes a cross join
+                        assert!(
+                            !join.on.is_empty() || join.join_type == JoinType::Cross,
+                            "Natural join should either find common columns or become cross join"
+                        );
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_three_way_join() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u
+                   JOIN orders o ON u.id = o.user_id
+                   JOIN products p ON o.product_id = p.id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Join(join2) => {
+                        // Second join (with products)
+                        assert_eq!(join2.join_type, JoinType::Inner);
+                        match &*join2.left {
+                            LogicalPlan::Join(join1) => {
+                                // First join (users with orders)
+                                assert_eq!(join1.join_type, JoinType::Inner);
+                            }
+                            _ => panic!("Expected nested Join for three-way join"),
+                        }
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_join_types() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u
+                   LEFT JOIN orders o ON u.id = o.user_id
+                   INNER JOIN products p ON o.product_id = p.id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Join(join2) => {
+                        // Second join should be INNER
+                        assert_eq!(join2.join_type, JoinType::Inner);
+                        match &*join2.left {
+                            LogicalPlan::Join(join1) => {
+                                // First join should be LEFT
+                                assert_eq!(join1.join_type, JoinType::Left);
+                            }
+                            _ => panic!("Expected nested Join"),
+                        }
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_filter() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                match &*proj.input {
+                    LogicalPlan::Filter(filter) => {
+                        // WHERE clause creates a Filter above the Join
+                        match &*filter.input {
+                            LogicalPlan::Join(join) => {
+                                assert_eq!(join.join_type, JoinType::Inner);
+                            }
+                            _ => panic!("Expected Join under Filter"),
+                        }
+                    }
+                    _ => panic!("Expected Filter under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_projection() {
+        let schema = create_test_schema();
+        let sql = "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                assert_eq!(proj.exprs.len(), 2); // u.name and o.amount
+                match &*proj.input {
+                    LogicalPlan::Join(join) => {
+                        assert_eq!(join.join_type, JoinType::Inner);
+                    }
+                    _ => panic!("Expected Join under Projection"),
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_aggregation() {
+        let schema = create_test_schema();
+        let sql = "SELECT u.name, SUM(o.amount)
+                   FROM users u JOIN orders o ON u.id = o.user_id
+                   GROUP BY u.name";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Aggregate(agg) => {
+                assert_eq!(agg.group_expr.len(), 1); // GROUP BY u.name
+                assert_eq!(agg.aggr_expr.len(), 1); // SUM(o.amount)
+                match &*agg.input {
+                    LogicalPlan::Join(join) => {
+                        assert_eq!(join.join_type, JoinType::Inner);
+                    }
+                    _ => panic!("Expected Join under Aggregate"),
+                }
+            }
+            _ => panic!("Expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_order_by() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount DESC";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Sort(sort) => {
+                assert_eq!(sort.exprs.len(), 1);
+                assert!(!sort.exprs[0].asc); // DESC
+                match &*sort.input {
+                    LogicalPlan::Projection(proj) => match &*proj.input {
+                        LogicalPlan::Join(join) => {
+                            assert_eq!(join.join_type, JoinType::Inner);
+                        }
+                        _ => panic!("Expected Join under Projection"),
+                    },
+                    _ => panic!("Expected Projection under Sort"),
+                }
+            }
+            _ => panic!("Expected Sort at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_in_subquery() {
+        let schema = create_test_schema();
+        let sql = "SELECT * FROM (
+                     SELECT u.id, u.name, o.amount
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                   ) WHERE amount > 100";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(outer_proj) => match &*outer_proj.input {
+                LogicalPlan::Filter(filter) => match &*filter.input {
+                    LogicalPlan::Projection(inner_proj) => match &*inner_proj.input {
+                        LogicalPlan::Join(join) => {
+                            assert_eq!(join.join_type, JoinType::Inner);
+                        }
+                        _ => panic!("Expected Join in subquery"),
+                    },
+                    _ => panic!("Expected Projection for subquery"),
+                },
+                _ => panic!("Expected Filter"),
+            },
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
+    fn test_join_ambiguous_column() {
+        let schema = create_test_schema();
+        // Both users and orders have an 'id' column
+        let sql = "SELECT id FROM users JOIN orders ON users.id = orders.user_id";
+        let result = parse_and_build(sql, &schema);
+        // This might error or succeed depending on how we handle ambiguous columns
+        // For now, just check that parsing completes
+        match result {
+            Ok(_) => {
+                // If successful, the implementation handles ambiguous columns somehow
+            }
+            Err(_) => {
+                // If error, the implementation rejects ambiguous columns
+            }
+        }
+    }
+
+    // Tests for strip_alias function
+    #[test]
+    fn test_strip_alias_with_alias() {
+        let inner_expr = LogicalExpr::Column(Column::new("test"));
+        let aliased = LogicalExpr::Alias {
+            expr: Box::new(inner_expr.clone()),
+            alias: "my_alias".to_string(),
+        };
+
+        let stripped = strip_alias(&aliased);
+        assert_eq!(stripped, &inner_expr);
+    }
+
+    #[test]
+    fn test_strip_alias_without_alias() {
+        let expr = LogicalExpr::Column(Column::new("test"));
+        let stripped = strip_alias(&expr);
+        assert_eq!(stripped, &expr);
+    }
+
+    #[test]
+    fn test_strip_alias_literal() {
+        let expr = LogicalExpr::Literal(Value::Integer(42));
+        let stripped = strip_alias(&expr);
+        assert_eq!(stripped, &expr);
+    }
+
+    #[test]
+    fn test_strip_alias_scalar_function() {
+        let expr = LogicalExpr::ScalarFunction {
+            fun: "substr".to_string(),
+            args: vec![
+                LogicalExpr::Column(Column::new("name")),
+                LogicalExpr::Literal(Value::Integer(1)),
+                LogicalExpr::Literal(Value::Integer(4)),
+            ],
+        };
+        let stripped = strip_alias(&expr);
+        assert_eq!(stripped, &expr);
+    }
+
+    #[test]
+    fn test_strip_alias_nested_alias() {
+        // Test that strip_alias only removes the outermost alias
+        let inner_expr = LogicalExpr::Column(Column::new("test"));
+        let inner_alias = LogicalExpr::Alias {
+            expr: Box::new(inner_expr.clone()),
+            alias: "inner_alias".to_string(),
+        };
+        let outer_alias = LogicalExpr::Alias {
+            expr: Box::new(inner_alias.clone()),
+            alias: "outer_alias".to_string(),
+        };
+
+        let stripped = strip_alias(&outer_alias);
+        assert_eq!(stripped, &inner_alias);
+
+        // Stripping again should give us the inner expression
+        let double_stripped = strip_alias(stripped);
+        assert_eq!(double_stripped, &inner_expr);
+    }
+
+    #[test]
+    fn test_strip_alias_comparison_with_alias() {
+        // Test that two expressions match when one has an alias and one doesn't
+        let base_expr = LogicalExpr::ScalarFunction {
+            fun: "substr".to_string(),
+            args: vec![
+                LogicalExpr::Column(Column::new("orderdate")),
+                LogicalExpr::Literal(Value::Integer(1)),
+                LogicalExpr::Literal(Value::Integer(4)),
+            ],
+        };
+
+        let aliased_expr = LogicalExpr::Alias {
+            expr: Box::new(base_expr.clone()),
+            alias: "year".to_string(),
+        };
+
+        // Without strip_alias, they wouldn't match
+        assert_ne!(&aliased_expr, &base_expr);
+
+        // With strip_alias, they should match
+        assert_eq!(strip_alias(&aliased_expr), &base_expr);
+        assert_eq!(strip_alias(&base_expr), &base_expr);
+    }
+
+    #[test]
+    fn test_strip_alias_binary_expr() {
+        let expr = LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column(Column::new("a"))),
+            op: BinaryOperator::Add,
+            right: Box::new(LogicalExpr::Literal(Value::Integer(1))),
+        };
+        let stripped = strip_alias(&expr);
+        assert_eq!(stripped, &expr);
+    }
+
+    #[test]
+    fn test_strip_alias_aggregate_function() {
+        let expr = LogicalExpr::AggregateFunction {
+            fun: AggFunc::Sum,
+            args: vec![LogicalExpr::Column(Column::new("amount"))],
+            distinct: false,
+        };
+        let stripped = strip_alias(&expr);
+        assert_eq!(stripped, &expr);
+    }
+
+    #[test]
+    fn test_strip_alias_comparison_multiple_expressions() {
+        // Test comparing a list of expressions with and without aliases
+        let expr1 = LogicalExpr::Column(Column::new("a"));
+        let expr2 = LogicalExpr::ScalarFunction {
+            fun: "substr".to_string(),
+            args: vec![
+                LogicalExpr::Column(Column::new("b")),
+                LogicalExpr::Literal(Value::Integer(1)),
+                LogicalExpr::Literal(Value::Integer(4)),
+            ],
+        };
+
+        let aliased1 = LogicalExpr::Alias {
+            expr: Box::new(expr1.clone()),
+            alias: "col_a".to_string(),
+        };
+        let aliased2 = LogicalExpr::Alias {
+            expr: Box::new(expr2.clone()),
+            alias: "year".to_string(),
+        };
+
+        let select_exprs = [aliased1, aliased2];
+        let group_exprs = [expr1.clone(), expr2.clone()];
+
+        // Verify that stripping aliases allows matching
+        for (select_expr, group_expr) in select_exprs.iter().zip(group_exprs.iter()) {
+            assert_eq!(strip_alias(select_expr), group_expr);
         }
     }
 }

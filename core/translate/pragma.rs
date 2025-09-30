@@ -2,9 +2,9 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use chrono::Datelike;
-use std::rc::Rc;
 use std::sync::Arc;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
+use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
@@ -15,12 +15,12 @@ use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
-use crate::translate::emitter::TransactionMode;
+use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -32,13 +32,11 @@ fn list_pragmas(program: &mut ProgramBuilder) {
     program.add_pragma_result_column("pragma_list".into());
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_pragma(
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
@@ -60,12 +58,17 @@ pub fn translate_pragma(
     };
 
     let (mut program, mode) = match body {
-        None => query_pragma(pragma, schema, None, pager, connection, program)?,
+        None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => {
-                query_pragma(pragma, schema, Some(*value), pager, connection, program)?
-            }
-            _ => update_pragma(pragma, schema, syms, *value, pager, connection, program)?,
+            PragmaName::TableInfo => query_pragma(
+                pragma,
+                resolver.schema,
+                Some(*value),
+                pager,
+                connection,
+                program,
+            )?,
+            _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
         },
     };
     match mode {
@@ -76,6 +79,9 @@ pub fn translate_pragma(
         TransactionMode::Write => {
             program.begin_write_operation();
         }
+        TransactionMode::Concurrent => {
+            program.begin_concurrent_operation();
+        }
     }
 
     Ok(program)
@@ -83,10 +89,9 @@ pub fn translate_pragma(
 
 fn update_pragma(
     pragma: PragmaName,
-    schema: &Schema,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     value: ast::Expr,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -96,7 +101,7 @@ fn update_pragma(
             let app_id_value = match data {
                 Value::Integer(i) => i as i32,
                 Value::Float(f) => f as i32,
-                _ => unreachable!(),
+                _ => bail_parse_error!("expected integer, got {:?}", data),
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -105,6 +110,17 @@ fn update_pragma(
                 value: app_id_value,
                 p5: 1,
             });
+            Ok((program, TransactionMode::Write))
+        }
+        PragmaName::BusyTimeout => {
+            let data = parse_signed_number(&value)?;
+            let busy_timeout_ms = match data {
+                Value::Integer(i) => i as i32,
+                Value::Float(f) => f as i32,
+                _ => bail_parse_error!("expected integer, got {:?}", data),
+            };
+            let busy_timeout_ms = busy_timeout_ms.max(0);
+            connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
             Ok((program, TransactionMode::Write))
         }
         PragmaName::CacheSize => {
@@ -140,7 +156,7 @@ fn update_pragma(
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,
@@ -149,7 +165,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            schema,
+            resolver.schema,
             None,
             pager,
             connection,
@@ -213,17 +229,17 @@ fn update_pragma(
         PragmaName::AutoVacuum => {
             let auto_vacuum_mode = match value {
                 Expr::Name(name) => {
-                    let name = name.as_str().to_lowercase();
-                    match name.as_str() {
-                        "none" => 0,
-                        "full" => 1,
-                        "incremental" => 2,
+                    let name = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name {
+                        b"none" => 0,
+                        b"full" => 1,
+                        b"incremental" => 2,
                         _ => {
                             return Err(LimboError::InvalidArgument(
                                 "invalid auto vacuum mode".to_string(),
                             ));
                         }
-                    }
+                    })
                 }
                 _ => {
                     return Err(LimboError::InvalidArgument(
@@ -273,24 +289,25 @@ fn update_pragma(
             // but for now, let's keep it as is...
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
-                // make sure that we have table created
-                program = translate_create_table(
-                    QualifiedName {
-                        db_name: None,
-                        name: ast::Name::new(table),
-                        alias: None,
-                    },
-                    false,
-                    ast::CreateTableBody::ColumnsAndConstraints {
-                        columns: turso_cdc_table_columns(),
-                        constraints: vec![],
-                        options: ast::TableOptions::NONE,
-                    },
-                    true,
-                    schema,
-                    syms,
-                    program,
-                )?;
+                if resolver.schema.get_table(table).is_none() {
+                    program = translate_create_table(
+                        QualifiedName {
+                            db_name: None,
+                            name: ast::Name::exact(table.to_string()),
+                            alias: None,
+                        },
+                        resolver,
+                        false,
+                        true, // if_not_exists
+                        ast::CreateTableBody::ColumnsAndConstraints {
+                            columns: turso_cdc_table_columns(),
+                            constraints: vec![],
+                            options: ast::TableOptions::NONE,
+                        },
+                        program,
+                        &connection,
+                    )?;
+                }
             }
             connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))
@@ -298,7 +315,7 @@ fn update_pragma(
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,
@@ -306,7 +323,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            schema,
+            resolver.schema,
             Some(value),
             pager,
             connection,
@@ -315,13 +332,13 @@ fn update_pragma(
         PragmaName::EncryptionKey => {
             let value = parse_string(&value)?;
             let key = EncryptionKey::from_hex_string(&value)?;
-            connection.set_encryption_key(key);
+            connection.set_encryption_key(key)?;
             Ok((program, TransactionMode::None))
         }
         PragmaName::EncryptionCipher => {
             let value = parse_string(&value)?;
             let cipher = CipherMode::try_from(value.as_str())?;
-            connection.set_encryption_cipher(cipher);
+            connection.set_encryption_cipher(cipher)?;
             Ok((program, TransactionMode::None))
         }
         PragmaName::Synchronous => {
@@ -329,11 +346,11 @@ fn update_pragma(
 
             let mode = match value {
                 Expr::Name(name) => {
-                    let name_upper = name.as_str().to_uppercase();
-                    match name_upper.as_str() {
-                        "OFF" | "FALSE" | "NO" | "0" => SyncMode::Off,
+                    let name_bytes = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name_bytes {
+                        b"OFF" | b"FALSE" | b"NO" | b"0" => SyncMode::Off,
                         _ => SyncMode::Full,
-                    }
+                    })
                 }
                 Expr::Literal(Literal::Numeric(n)) => match n.as_str() {
                     "0" => SyncMode::Off,
@@ -345,6 +362,22 @@ fn update_pragma(
             connection.set_sync_mode(mode);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::DataSyncRetry => {
+            let retry_enabled = match value {
+                Expr::Name(name) => {
+                    let name_bytes = name.as_str().as_bytes();
+                    match_ignore_ascii_case!(match name_bytes {
+                        b"ON" | b"TRUE" | b"YES" | b"1" => true,
+                        _ => false,
+                    })
+                }
+                Expr::Literal(Literal::Numeric(n)) => !matches!(n.as_str(), "0"),
+                _ => false,
+            };
+
+            connection.set_data_sync_retry(retry_enabled);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -352,7 +385,7 @@ fn query_pragma(
     pragma: PragmaName,
     schema: &Schema,
     value: Option<ast::Expr>,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
@@ -367,6 +400,12 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             program.emit_result_row(register, 1);
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::BusyTimeout => {
+            program.emit_int(connection.get_busy_timeout().as_millis() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
@@ -488,7 +527,8 @@ fn query_pragma(
                     emit_columns_for_table_info(&mut program, table.columns(), base_reg);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock().unwrap();
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                    let flat_columns = view.column_schema.flat_columns();
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg);
                 } else if let Some(view) = schema.get_view(&name) {
                     emit_columns_for_table_info(&mut program, &view.columns, base_reg);
                 }
@@ -571,10 +611,16 @@ fn query_pragma(
             if let Some(value_expr) = value {
                 let is_query_only = match value_expr {
                     ast::Expr::Literal(Literal::Numeric(i)) => i.parse::<i64>().unwrap() != 0,
-                    ast::Expr::Literal(Literal::String(ref s))
-                    | ast::Expr::Name(Name::Ident(ref s)) => {
-                        let s = s.to_lowercase();
-                        s == "1" || s == "on" || s == "true"
+                    ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
+                        let s = match &value_expr {
+                            ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                            ast::Expr::Name(n) => n.as_str().as_bytes(),
+                            _ => unreachable!(),
+                        };
+                        match_ignore_ascii_case!(match s {
+                            b"1" | b"on" | b"true" => true,
+                            _ => false,
+                        })
                     }
                     _ => {
                         return Err(LimboError::ParseError(format!(
@@ -604,7 +650,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.borrow().is_some() {
+                if connection.encryption_key.read().is_some() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"
@@ -629,6 +675,14 @@ fn query_pragma(
             let mode = connection.get_sync_mode();
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::DataSyncRetry => {
+            let retry_enabled = connection.get_data_sync_retry();
+            let register = program.alloc_register();
+            program.emit_int(retry_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
@@ -678,7 +732,7 @@ fn emit_columns_for_table_info(
 fn update_auto_vacuum_mode(
     auto_vacuum_mode: AutoVacuumMode,
     largest_root_page_number: u32,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
 ) -> crate::Result<()> {
     pager.io.block(|| {
         pager.with_header_mut(|header| {
@@ -691,7 +745,7 @@ fn update_auto_vacuum_mode(
 
 fn update_cache_size(
     value: i64,
-    pager: Rc<Pager>,
+    pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
@@ -743,7 +797,7 @@ pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
     vec![
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_id"),
+            col_name: ast::Name::exact("change_id".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -758,7 +812,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             }],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_time"),
+            col_name: ast::Name::exact("change_time".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -766,7 +820,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("change_type"),
+            col_name: ast::Name::exact("change_type".to_string()),
             col_type: Some(ast::Type {
                 name: "INTEGER".to_string(),
                 size: None,
@@ -774,7 +828,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("table_name"),
+            col_name: ast::Name::exact("table_name".to_string()),
             col_type: Some(ast::Type {
                 name: "TEXT".to_string(),
                 size: None,
@@ -782,12 +836,12 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("id"),
+            col_name: ast::Name::exact("id".to_string()),
             col_type: None,
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("before"),
+            col_name: ast::Name::exact("before".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,
@@ -795,7 +849,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("after"),
+            col_name: ast::Name::exact("after".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,
@@ -803,7 +857,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
-            col_name: ast::Name::new("updates"),
+            col_name: ast::Name::exact("updates".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
                 size: None,

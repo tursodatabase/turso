@@ -3,6 +3,7 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use parking_lot::Once;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
@@ -12,10 +13,10 @@ use std::{fmt::Debug, pin::Pin};
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion>;
-    fn pwrite(&self, pos: usize, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
-    fn pwritev(&self, pos: usize, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
             c.complete(0);
@@ -41,7 +42,7 @@ pub trait File: Send + Sync {
                         // reference buffer in callback to ensure alive for async io
                         let _buf = _cloned.clone();
                         // accumulate bytes actually reported by the backend
-                        total_written.fetch_add(n as usize, Ordering::Relaxed);
+                        total_written.fetch_add(n as usize, Ordering::SeqCst);
                         if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
                             // last one finished
                             c_main.complete(total_written.load(Ordering::Acquire) as i32);
@@ -50,18 +51,15 @@ pub trait File: Send + Sync {
                 })
             };
             if let Err(e) = self.pwrite(pos, buf.clone(), child_c) {
-                // best-effort: mark as abort so caller won't wait forever
-                // TODO: when we have `pwrite` and other I/O methods return CompletionError
-                // instead of LimboError, store the error inside
                 c.abort();
                 return Err(e);
             }
-            pos += len;
+            pos += len as u64;
         }
         Ok(c)
     }
     fn size(&self) -> Result<u64>;
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -87,11 +85,22 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
-    fn run_once(&self) -> Result<()>;
+    fn step(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn cancel(&self, c: &[Completion]) -> Result<()> {
+        c.iter().for_each(|c| c.abort());
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn wait_for_completion(&self, c: Completion) -> Result<()> {
         while !c.finished() {
-            self.run_once()?
+            self.step()?
         }
         if let Some(Some(err)) = c.inner.result.get().copied() {
             return Err(err.into());
@@ -133,6 +142,9 @@ struct CompletionInner {
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
+    needs_link: bool,
+    /// before calling callback we check if done is true
+    done: Once,
 }
 
 impl Debug for CompletionType {
@@ -159,8 +171,34 @@ impl Completion {
             inner: Arc::new(CompletionInner {
                 completion_type,
                 result: OnceLock::new(),
+                needs_link: false,
+                done: Once::new(),
             }),
         }
+    }
+
+    pub fn new_linked(completion_type: CompletionType) -> Self {
+        Self {
+            inner: Arc::new(CompletionInner {
+                completion_type,
+                result: OnceLock::new(),
+                needs_link: true,
+                done: Once::new(),
+            }),
+        }
+    }
+
+    pub fn needs_link(&self) -> bool {
+        self.inner.needs_link
+    }
+
+    pub fn new_write_linked<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + 'static,
+    {
+        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
     }
 
     pub fn new_write<F>(complete: F) -> Self
@@ -214,37 +252,42 @@ impl Completion {
         self.inner.result.get().is_some_and(|val| val.is_some())
     }
 
+    pub fn get_error(&self) -> Option<CompletionError> {
+        self.inner.result.get().and_then(|res| *res)
+    }
+
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
         self.inner.result.get().is_some()
     }
 
     pub fn complete(&self, result: i32) {
-        if self.inner.result.set(None).is_ok() {
-            let result = Ok(result);
-            match &self.inner.completion_type {
-                CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-            };
-        }
+        let result = Ok(result);
+        self.callback(result);
     }
 
     pub fn error(&self, err: CompletionError) {
-        if self.inner.result.set(Some(err)).is_ok() {
-            let result = Err(err);
-            match &self.inner.completion_type {
-                CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-            };
-        }
+        let result = Err(err);
+        self.callback(result);
     }
 
     pub fn abort(&self) {
         self.error(CompletionError::Aborted);
+    }
+
+    fn callback(&self, result: Result<i32, CompletionError>) {
+        self.inner.done.call_once(|| {
+            match &self.inner.completion_type {
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => w.callback(result),
+                CompletionType::Sync(s) => s.callback(result), // fix
+                CompletionType::Truncate(t) => t.callback(result),
+            };
+            self.inner
+                .result
+                .set(result.err())
+                .expect("result must be set only once");
+        });
     }
 
     /// only call this method if you are sure that the completion is

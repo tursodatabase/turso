@@ -1,24 +1,27 @@
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
-    Search, TableReferences, WhereTerm,
+    Search, TableReferences, WhereTerm, Window,
 };
-use crate::function::{AggFunc, ExtFunc, Func};
 use crate::schema::Table;
+use crate::translate::emitter::Resolver;
+use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
+use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{Aggregate, GroupBy, Plan, ResultSetColumn, SelectPlan};
+use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
-    bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
-    parse_where, resolve_aggregates,
+    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
+    resolve_window_and_aggregate_functions,
 };
+use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilderOpts, TableRefIdCounter};
+use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
-use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
-use crate::{Connection, SymbolTable};
+use crate::Connection;
+use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr, SortOrder};
+use turso_parser::ast::{self, CompoundSelect, Expr};
 
 pub struct TranslateSelectResult {
     pub program: ProgramBuilder,
@@ -26,23 +29,21 @@ pub struct TranslateSelectResult {
 }
 
 pub fn translate_select(
-    schema: &Schema,
     select: ast::Select,
-    syms: &SymbolTable,
+    resolver: &Resolver,
     mut program: ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<TranslateSelectResult> {
     let mut select_plan = prepare_select_plan(
-        schema,
         select,
-        syms,
+        resolver,
+        &mut program,
         &[],
-        &mut program.table_reference_counter,
         query_destination,
         connection,
     )?;
-    optimize_plan(&mut select_plan, schema)?;
+    optimize_plan(&mut select_plan, resolver.schema)?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {
@@ -81,7 +82,7 @@ pub fn translate_select(
     };
 
     program.extend(&opts);
-    emit_program(&mut program, select_plan, schema, syms, |_| {})?;
+    emit_program(connection, resolver, &mut program, select_plan, |_| {})?;
     Ok(TranslateSelectResult {
         program,
         num_result_cols,
@@ -89,38 +90,35 @@ pub fn translate_select(
 }
 
 pub fn prepare_select_plan(
-    schema: &Schema,
     select: ast::Select,
-    syms: &SymbolTable,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
-    table_ref_counter: &mut TableRefIdCounter,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
         true => Ok(Plan::Select(prepare_one_select_plan(
-            schema,
             select.body.select,
+            resolver,
+            program,
             select.limit,
             select.order_by,
             select.with,
-            syms,
             outer_query_refs,
-            table_ref_counter,
             query_destination,
             connection,
         )?)),
         false => {
             let mut last = prepare_one_select_plan(
-                schema,
                 select.body.select,
+                resolver,
+                program,
                 None,
                 vec![],
                 None,
-                syms,
                 outer_query_refs,
-                table_ref_counter,
                 query_destination.clone(),
                 connection,
             )?;
@@ -129,14 +127,13 @@ pub fn prepare_select_plan(
             for CompoundSelect { select, operator } in compounds {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
-                    schema,
                     select,
+                    resolver,
+                    program,
                     None,
                     vec![],
                     None,
-                    syms,
                     outer_query_refs,
-                    table_ref_counter,
                     query_destination.clone(),
                     connection,
                 )?;
@@ -149,10 +146,9 @@ pub fn prepare_select_plan(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select
-                .limit
-                .as_ref()
-                .map_or(Ok((None, None)), parse_limit)?;
+            let (limit, offset) = select.limit.map_or(Ok((None, None)), |mut l| {
+                parse_limit(&mut l, connection, &mut program.param_ctx)
+            })?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -175,14 +171,13 @@ pub fn prepare_select_plan(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_one_select_plan(
-    schema: &Schema,
     select: ast::OneSelect,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
     limit: Option<ast::Limit>,
     order_by: Vec<ast::SortedColumn>,
     with: Option<ast::With>,
-    syms: &SymbolTable,
     outer_query_refs: &[OuterQueryReference],
-    table_ref_counter: &mut TableRefIdCounter,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
@@ -196,14 +191,12 @@ fn prepare_one_select_plan(
             window_clause,
             ..
         } => {
-            if !schema.indexes_enabled() && distinctness.is_some() {
+            if !resolver.schema.indexes_enabled() && distinctness.is_some() {
                 crate::bail_parse_error!(
                     "SELECT with DISTINCT is not allowed without indexes enabled"
                 );
             }
-            if !window_clause.is_empty() {
-                crate::bail_parse_error!("WINDOW clause is not supported yet");
-            }
+
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -224,14 +217,13 @@ fn prepare_one_select_plan(
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
             parse_from(
-                schema,
                 from,
-                syms,
+                resolver,
+                program,
                 with,
                 &mut where_predicates,
                 &mut vtab_predicates,
                 &mut table_references,
-                table_ref_counter,
                 connection,
             )?;
 
@@ -258,7 +250,6 @@ fn prepare_one_select_plan(
                     })
                     .sum(),
             );
-
             let mut plan = SelectPlan {
                 join_order: table_references
                     .joined_tables()
@@ -282,7 +273,37 @@ fn prepare_one_select_plan(
                 query_destination,
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
+                window: None,
             };
+
+            let mut windows = Vec::with_capacity(window_clause.len());
+            for window_def in window_clause.iter() {
+                let name = normalize_ident(window_def.name.as_str());
+                let mut window = Window::new(Some(name), &window_def.window)?;
+
+                for expr in window.partition_by.iter_mut() {
+                    bind_and_rewrite_expr(
+                        expr,
+                        Some(&mut plan.table_references),
+                        None,
+                        connection,
+                        &mut program.param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
+                }
+                for (expr, _) in window.order_by.iter_mut() {
+                    bind_and_rewrite_expr(
+                        expr,
+                        Some(&mut plan.table_references),
+                        None,
+                        connection,
+                        &mut program.param_ctx,
+                        BindingBehavior::ResultColumnsNotAllowed,
+                    )?;
+                }
+
+                windows.push(window);
+            }
 
             let mut aggregate_expressions = Vec::new();
             for column in columns.iter_mut() {
@@ -334,212 +355,28 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(ref mut expr, maybe_alias) => {
-                        bind_column_references(
+                        bind_and_rewrite_expr(
                             expr,
-                            &mut plan.table_references,
-                            Some(&plan.result_columns),
+                            Some(&mut plan.table_references),
+                            None,
                             connection,
+                            &mut program.param_ctx,
+                            BindingBehavior::ResultColumnsNotAllowed,
                         )?;
-                        match expr.as_ref() {
-                            ast::Expr::FunctionCall {
-                                name,
-                                distinctness,
-                                args,
-                                filter_over,
-                                order_by,
-                            } => {
-                                if filter_over.filter_clause.is_some()
-                                    || filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "FILTER clause is not supported yet in aggregate functions"
-                                    );
-                                }
-                                if !order_by.is_empty() {
-                                    crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
-                                }
-                                let args_count = args.len();
-                                let distinctness = Distinctness::from_ast(distinctness.as_ref());
-
-                                if !schema.indexes_enabled() && distinctness.is_distinct() {
-                                    crate::bail_parse_error!(
-                                       "SELECT with DISTINCT is not allowed without indexes enabled"
-                                   );
-                                }
-                                if distinctness.is_distinct() && args_count != 1 {
-                                    crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
-                                }
-                                match Func::resolve_function(name.as_str(), args_count) {
-                                    Ok(Func::Agg(f)) => {
-                                        let agg_args = match (args.is_empty(), &f) {
-                                            (true, crate::function::AggFunc::Count0) => {
-                                                // COUNT() case
-                                                vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                    "1".to_string(),
-                                                ))
-                                                .into()]
-                                            }
-                                            (true, _) => crate::bail_parse_error!(
-                                                "Aggregate function {} requires arguments",
-                                                name.as_str()
-                                            ),
-                                            (false, _) => args.clone(),
-                                        };
-
-                                        let agg = Aggregate {
-                                            func: f,
-                                            args: agg_args.iter().map(|arg| *arg.clone()).collect(),
-                                            original_expr: *expr.clone(),
-                                            distinctness,
-                                        };
-                                        aggregate_expressions.push(agg);
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates: true,
-                                        });
-                                    }
-                                    Ok(_) => {
-                                        let contains_aggregates = resolve_aggregates(
-                                            schema,
-                                            expr,
-                                            &mut aggregate_expressions,
-                                        )?;
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        if let Some(f) =
-                                            syms.resolve_function(name.as_str(), args_count)
-                                        {
-                                            if let ExtFunc::Scalar(_) = f.as_ref().func {
-                                                let contains_aggregates = resolve_aggregates(
-                                                    schema,
-                                                    expr,
-                                                    &mut aggregate_expressions,
-                                                )?;
-                                                plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                            ast::As::As(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                        }
-                                                    }),
-                                                    expr: *expr.clone(),
-                                                    contains_aggregates,
-                                                });
-                                            } else {
-                                                let agg = Aggregate {
-                                                    func: AggFunc::External(f.func.clone().into()),
-                                                    args: args
-                                                        .iter()
-                                                        .map(|arg| *arg.clone())
-                                                        .collect(),
-                                                    original_expr: *expr.clone(),
-                                                    distinctness,
-                                                };
-                                                aggregate_expressions.push(agg);
-                                                plan.result_columns.push(ResultSetColumn {
-                                                    alias: maybe_alias.as_ref().map(|alias| {
-                                                        match alias {
-                                                            ast::As::Elided(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                            ast::As::As(alias) => {
-                                                                alias.as_str().to_string()
-                                                            }
-                                                        }
-                                                    }),
-                                                    expr: *expr.clone(),
-                                                    contains_aggregates: true,
-                                                });
-                                            }
-                                            continue; // Continue with the normal flow instead of returning
-                                        } else {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                            ast::Expr::FunctionCallStar { name, filter_over } => {
-                                if filter_over.filter_clause.is_some()
-                                    || filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "FILTER clause is not supported yet in aggregate functions"
-                                    );
-                                }
-                                match Func::resolve_function(name.as_str(), 0) {
-                                    Ok(Func::Agg(f)) => {
-                                        let agg = Aggregate {
-                                            func: f,
-                                            args: vec![ast::Expr::Literal(ast::Literal::Numeric(
-                                                "1".to_string(),
-                                            ))],
-                                            original_expr: *expr.clone(),
-                                            distinctness: Distinctness::NonDistinct,
-                                        };
-                                        aggregate_expressions.push(agg);
-                                        plan.result_columns.push(ResultSetColumn {
-                                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                                ast::As::Elided(alias) => {
-                                                    alias.as_str().to_string()
-                                                }
-                                                ast::As::As(alias) => alias.as_str().to_string(),
-                                            }),
-                                            expr: *expr.clone(),
-                                            contains_aggregates: true,
-                                        });
-                                    }
-                                    Ok(_) => {
-                                        crate::bail_parse_error!(
-                                            "Invalid aggregate function: {}",
-                                            name.as_str()
-                                        );
-                                    }
-                                    Err(e) => match e {
-                                        crate::LimboError::ParseError(e) => {
-                                            crate::bail_parse_error!("{}", e);
-                                        }
-                                        _ => {
-                                            crate::bail_parse_error!(
-                                                "Invalid aggregate function: {}",
-                                                name.as_str()
-                                            );
-                                        }
-                                    },
-                                }
-                            }
-                            expr => {
-                                let contains_aggregates =
-                                    resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
-                                plan.result_columns.push(ResultSetColumn {
-                                    alias: maybe_alias.as_ref().map(|alias| match alias {
-                                        ast::As::Elided(alias) => alias.as_str().to_string(),
-                                        ast::As::As(alias) => alias.as_str().to_string(),
-                                    }),
-                                    expr: expr.clone(),
-                                    contains_aggregates,
-                                });
-                            }
-                        }
+                        let contains_aggregates = resolve_window_and_aggregate_functions(
+                            expr,
+                            resolver,
+                            &mut aggregate_expressions,
+                            Some(&mut windows),
+                        )?;
+                        plan.result_columns.push(ResultSetColumn {
+                            alias: maybe_alias.as_ref().map(|alias| match alias {
+                                ast::As::Elided(alias) => alias.as_str().to_string(),
+                                ast::As::As(alias) => alias.as_str().to_string(),
+                            }),
+                            expr: expr.as_ref().clone(),
+                            contains_aggregates,
+                        });
                     }
                 }
             }
@@ -547,7 +384,12 @@ fn prepare_one_select_plan(
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
-            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, connection)?;
+            add_vtab_predicates_to_where_clause(
+                &mut vtab_predicates,
+                &mut plan,
+                connection,
+                &mut program.param_ctx,
+            )?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
@@ -556,34 +398,43 @@ fn prepare_one_select_plan(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 connection,
+                &mut program.param_ctx,
             )?;
 
             if let Some(mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
                     replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                    bind_column_references(
+                    bind_and_rewrite_expr(
                         expr,
-                        &mut plan.table_references,
+                        Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         connection,
+                        &mut program.param_ctx,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
 
                 plan.group_by = Some(GroupBy {
-                    sort_order: Some((0..group_by.exprs.len()).map(|_| SortOrder::Asc).collect()),
+                    sort_order: None,
                     exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                     having: if let Some(having) = group_by.having {
                         let mut predicates = vec![];
                         break_predicate_at_and_boundaries(&having, &mut predicates);
                         for expr in predicates.iter_mut() {
-                            bind_column_references(
+                            bind_and_rewrite_expr(
                                 expr,
-                                &mut plan.table_references,
+                                Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
                                 connection,
+                                &mut program.param_ctx,
+                                BindingBehavior::TryResultColumnsFirst,
                             )?;
-                            let contains_aggregates =
-                                resolve_aggregates(schema, expr, &mut aggregate_expressions)?;
+                            let contains_aggregates = resolve_window_and_aggregate_functions(
+                                expr,
+                                resolver,
+                                &mut aggregate_expressions,
+                                None,
+                            )?;
                             if !contains_aggregates {
                                 // TODO: sqlite allows HAVING clauses with non aggregate expressions like
                                 // HAVING id = 5. We should support this too eventually (I guess).
@@ -609,25 +460,59 @@ fn prepare_one_select_plan(
             for mut o in order_by {
                 replace_column_number_with_copy_of_column_expr(&mut o.expr, &plan.result_columns)?;
 
-                bind_column_references(
+                bind_and_rewrite_expr(
                     &mut o.expr,
-                    &mut plan.table_references,
+                    Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     connection,
+                    &mut program.param_ctx,
+                    BindingBehavior::TryResultColumnsFirst,
                 )?;
-                resolve_aggregates(schema, &o.expr, &mut plan.aggregates)?;
+                resolve_window_and_aggregate_functions(
+                    &o.expr,
+                    resolver,
+                    &mut plan.aggregates,
+                    Some(&mut windows),
+                )?;
 
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
             plan.order_by = key;
+            if let Some(group_by) = &mut plan.group_by {
+                // now that we have resolved the ORDER BY expressions and aggregates, we can
+                // compute the necessary sort order for the GROUP BY clause
+                group_by.sort_order = Some(compute_group_by_sort_order(
+                    &group_by.exprs,
+                    &plan.order_by,
+                    &plan.aggregates,
+                    resolver,
+                ));
+            }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.as_ref().map_or(Ok((None, None)), parse_limit)?;
+            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
+                parse_limit(&mut l, connection, &mut program.param_ctx)
+            })?;
+
+            if !windows.is_empty() {
+                plan_windows(
+                    &mut plan,
+                    resolver,
+                    &mut program.table_reference_counter,
+                    &mut windows,
+                )?;
+            }
 
             // Return the unoptimized query plan
             Ok(plan)
         }
         ast::OneSelect::Values(values) => {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+            }
+            if limit.is_some() {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+            }
             let len = values[0].len();
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
@@ -655,6 +540,7 @@ fn prepare_one_select_plan(
                     .iter()
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
+                window: None,
             };
 
             Ok(plan)
@@ -666,13 +552,16 @@ fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
     connection: &Arc<Connection>,
+    param_ctx: &mut ParamState,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
-        bind_column_references(
+        bind_and_rewrite_expr(
             expr,
-            &mut plan.table_references,
+            Some(&mut plan.table_references),
             Some(&plan.result_columns),
             connection,
+            param_ctx,
+            BindingBehavior::TryCanonicalColumnsFirst,
         )?;
     }
     for expr in vtab_predicates.drain(..) {

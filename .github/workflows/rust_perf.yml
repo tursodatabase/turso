@@ -11,7 +11,8 @@ env:
 
 jobs:
   bench:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -37,7 +38,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: false
+          comment-always: true
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -54,7 +55,8 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   clickbench:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -77,7 +79,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: false
+          comment-always: true
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -101,7 +103,8 @@ jobs:
           nyrkio-public: true
 
   tpc-h-criterion:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
@@ -138,7 +141,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: false
+          comment-always: true
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -155,14 +158,16 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   tpc-h:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - name: TPC-H
         run: ./perf/tpc-h/benchmark.sh
 
   vfs-bench-compile:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/rust-cache@v3

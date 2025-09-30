@@ -7,7 +7,7 @@ use crate::{
         backtrack, one_of, pick,
         predicate::{CompoundPredicate, SimplePredicate},
         table::{GTValue, LTValue, LikeValue},
-        ArbitraryFrom, ArbitraryFromMaybe as _,
+        ArbitraryFrom, ArbitraryFromMaybe as _, GenerationContext,
     },
     model::{
         query::predicate::Predicate,
@@ -17,8 +17,9 @@ use crate::{
 
 impl Predicate {
     /// Generate an [ast::Expr::Binary] [Predicate] from a column and [SimValue]
-    pub fn from_column_binary<R: rand::Rng>(
+    pub fn from_column_binary<R: rand::Rng, C: GenerationContext>(
         rng: &mut R,
+        context: &C,
         column_name: &str,
         value: &SimValue,
     ) -> Predicate {
@@ -26,23 +27,23 @@ impl Predicate {
             vec![
                 Box::new(|_| {
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, value).0;
+                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, value).0;
+                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::Ident(column_name.to_string()))),
+                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
                     )
@@ -54,7 +55,12 @@ impl Predicate {
     }
 
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
-    pub fn true_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
+    pub fn true_binary<R: rand::Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: &Table,
+        row: &[SimValue],
+    ) -> Predicate {
         // Pick a column
         let column_index = rng.random_range(0..t.columns.len());
         let mut column = t.columns[column_index].clone();
@@ -82,8 +88,8 @@ impl Predicate {
                     Box::new(|_| {
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name::new(&table_name),
-                                ast::Name::new(&column.name),
+                                ast::Name::from_string(&table_name),
+                                ast::Name::from_string(&column.name),
                             )),
                             ast::Operator::Equals,
                             Box::new(Expr::Literal(value.into())),
@@ -93,14 +99,14 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let v = SimValue::arbitrary_from(rng, &column.column_type);
+                        let v = SimValue::arbitrary_from(rng, context, &column.column_type);
                         if &v == value {
                             None
                         } else {
                             Some(Expr::Binary(
                                 Box::new(ast::Expr::Qualified(
-                                    ast::Name::new(&table_name),
-                                    ast::Name::new(&column.name),
+                                    ast::Name::from_string(&table_name),
+                                    ast::Name::from_string(&column.name),
                                 )),
                                 ast::Operator::NotEquals,
                                 Box::new(Expr::Literal(v.into())),
@@ -111,11 +117,11 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let lt_value = LTValue::arbitrary_from(rng, value).0;
+                        let lt_value = LTValue::arbitrary_from(rng, context, value).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name::new(&table_name),
-                                ast::Name::new(&column.name),
+                                ast::Name::from_string(&table_name),
+                                ast::Name::from_string(&column.name),
                             )),
                             ast::Operator::Greater,
                             Box::new(Expr::Literal(lt_value.into())),
@@ -125,11 +131,11 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let gt_value = GTValue::arbitrary_from(rng, value).0;
+                        let gt_value = GTValue::arbitrary_from(rng, context, value).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
-                                ast::Name::new(&table_name),
-                                ast::Name::new(&column.name),
+                                ast::Name::from_string(&table_name),
+                                ast::Name::from_string(&column.name),
                             )),
                             ast::Operator::Less,
                             Box::new(Expr::Literal(gt_value.into())),
@@ -140,11 +146,11 @@ impl Predicate {
                     1,
                     Box::new(|rng| {
                         // TODO: generation for Like and Glob expressions should be extracted to different module
-                        LikeValue::arbitrary_from_maybe(rng, value).map(|like| {
+                        LikeValue::arbitrary_from_maybe(rng, context, value).map(|like| {
                             Expr::Like {
                                 lhs: Box::new(ast::Expr::Qualified(
-                                    ast::Name::new(&table_name),
-                                    ast::Name::new(&column.name),
+                                    ast::Name::from_string(&table_name),
+                                    ast::Name::from_string(&column.name),
                                 )),
                                 not: false, // TODO: also generate this value eventually
                                 op: ast::LikeOperator::Like,
@@ -162,7 +168,12 @@ impl Predicate {
     }
 
     /// Produces an [ast::Expr::Binary] [Predicate] that is false for the provided row in the given table
-    pub fn false_binary<R: rand::Rng>(rng: &mut R, t: &Table, row: &[SimValue]) -> Predicate {
+    pub fn false_binary<R: rand::Rng, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: &Table,
+        row: &[SimValue],
+    ) -> Predicate {
         // Pick a column
         let column_index = rng.random_range(0..t.columns.len());
         let mut column = t.columns[column_index].clone();
@@ -188,8 +199,8 @@ impl Predicate {
                 Box::new(|_| {
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(&table_name),
-                            ast::Name::new(&column.name),
+                            ast::Name::from_string(&table_name),
+                            ast::Name::from_string(&column.name),
                         )),
                         ast::Operator::NotEquals,
                         Box::new(Expr::Literal(value.into())),
@@ -197,37 +208,37 @@ impl Predicate {
                 }),
                 Box::new(|rng| {
                     let v = loop {
-                        let v = SimValue::arbitrary_from(rng, &column.column_type);
+                        let v = SimValue::arbitrary_from(rng, context, &column.column_type);
                         if &v != value {
                             break v;
                         }
                     };
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(&table_name),
-                            ast::Name::new(&column.name),
+                            ast::Name::from_string(&table_name),
+                            ast::Name::from_string(&column.name),
                         )),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(v.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, value).0;
+                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(&table_name),
-                            ast::Name::new(&column.name),
+                            ast::Name::from_string(&table_name),
+                            ast::Name::from_string(&column.name),
                         )),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, value).0;
+                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(&table_name),
-                            ast::Name::new(&column.name),
+                            ast::Name::from_string(&table_name),
+                            ast::Name::from_string(&column.name),
                         )),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
@@ -242,51 +253,52 @@ impl Predicate {
 
 impl SimplePredicate {
     /// Generates a true [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn true_binary<R: rand::Rng, T: TableContext>(
+    pub fn true_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
         rng: &mut R,
+        context: &C,
         table: &T,
         row: &[SimValue],
     ) -> Self {
-        // Pick a random column
-        let columns = table.columns().collect::<Vec<_>>();
-        let column_index = rng.random_range(0..columns.len());
-        let column = columns[column_index];
-        let column_value = &row[column_index];
-        let table_name = column.table_name;
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::TRUE.into())));
         }
+        // Pick a random column
+        let columns = table.columns().collect::<Vec<_>>();
+        let column_index = rng.random_range(0..row.len());
+        let column = columns[column_index];
+        let column_value = &row[column_index];
+        let table_name = column.table_name;
 
         let expr = one_of(
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::Equals,
                         Box::new(Expr::Literal(column_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(lt_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(gt_value.into())),
@@ -299,51 +311,52 @@ impl SimplePredicate {
     }
 
     /// Generates a false [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn false_binary<R: rand::Rng, T: TableContext>(
+    pub fn false_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
         rng: &mut R,
+        context: &C,
         table: &T,
         row: &[SimValue],
     ) -> Self {
-        let columns = table.columns().collect::<Vec<_>>();
-        // Pick a random column
-        let column_index = rng.random_range(0..columns.len());
-        let column = columns[column_index];
-        let column_value = &row[column_index];
-        let table_name = column.table_name;
         // Avoid creation of NULLs
         if row.is_empty() {
             return SimplePredicate(Predicate(Expr::Literal(SimValue::FALSE.into())));
         }
+        let columns = table.columns().collect::<Vec<_>>();
+        // Pick a random column
+        let column_index = rng.random_range(0..row.len());
+        let column = columns[column_index];
+        let column_value = &row[column_index];
+        let table_name = column.table_name;
 
         let expr = one_of(
             vec![
                 Box::new(|_rng| {
                     Expr::Binary(
                         Box::new(Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::NotEquals,
                         Box::new(Expr::Literal(column_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::Greater,
                         Box::new(Expr::Literal(gt_value.into())),
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
-                            ast::Name::new(table_name),
-                            ast::Name::new(&column.column.name),
+                            ast::Name::from_string(table_name),
+                            ast::Name::from_string(&column.column.name),
                         )),
                         ast::Operator::Less,
                         Box::new(Expr::Literal(lt_value.into())),
@@ -360,8 +373,9 @@ impl CompoundPredicate {
     /// Decide if you want to create an AND or an OR
     ///
     /// Creates a Compound Predicate that is TRUE or FALSE for at least a single row
-    pub fn from_table_binary<R: rand::Rng, T: TableContext>(
+    pub fn from_table_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
         rng: &mut R,
+        context: &C,
         table: &T,
         predicate_value: bool,
     ) -> Self {
@@ -381,7 +395,7 @@ impl CompoundPredicate {
             // An AND for false requires at least one of its children to be false
             if predicate_value {
                 (0..rng.random_range(1..=3))
-                    .map(|_| SimplePredicate::arbitrary_from(rng, (table, row, true)).0)
+                    .map(|_| SimplePredicate::arbitrary_from(rng, context, (table, row, true)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -405,7 +419,7 @@ impl CompoundPredicate {
 
                 booleans
                     .iter()
-                    .map(|b| SimplePredicate::arbitrary_from(rng, (table, row, *b)).0)
+                    .map(|b| SimplePredicate::arbitrary_from(rng, context, (table, row, *b)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -431,7 +445,7 @@ impl CompoundPredicate {
 
                 booleans
                     .iter()
-                    .map(|b| SimplePredicate::arbitrary_from(rng, (table, row, *b)).0)
+                    .map(|b| SimplePredicate::arbitrary_from(rng, context, (table, row, *b)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -442,7 +456,7 @@ impl CompoundPredicate {
                     .unwrap_or(Predicate::true_())
             } else {
                 (0..rng.random_range(1..=3))
-                    .map(|_| SimplePredicate::arbitrary_from(rng, (table, row, false)).0)
+                    .map(|_| SimplePredicate::arbitrary_from(rng, context, (table, row, false)).0)
                     .reduce(|accum, curr| {
                         Predicate(Expr::Binary(
                             Box::new(accum.0),
@@ -463,7 +477,9 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     use crate::{
-        generation::{pick, predicate::SimplePredicate, Arbitrary, ArbitraryFrom as _},
+        generation::{
+            pick, predicate::SimplePredicate, tests::TestContext, Arbitrary, ArbitraryFrom as _,
+        },
         model::{
             query::predicate::{expr_to_value, Predicate},
             table::{SimValue, Table},
@@ -481,20 +497,22 @@ mod tests {
     fn fuzz_true_binary_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let context = &TestContext::default();
+
         for _ in 0..10000 {
-            let table = Table::arbitrary(&mut rng);
+            let table = Table::arbitrary(&mut rng, context);
             let num_rows = rng.random_range(1..10);
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
                     table
                         .columns
                         .iter()
-                        .map(|c| SimValue::arbitrary_from(&mut rng, &c.column_type))
+                        .map(|c| SimValue::arbitrary_from(&mut rng, context, &c.column_type))
                         .collect()
                 })
                 .collect();
             let row = pick(&values, &mut rng);
-            let predicate = Predicate::true_binary(&mut rng, &table, row);
+            let predicate = Predicate::true_binary(&mut rng, context, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 value.as_ref().is_some_and(|value| value.as_bool()),
@@ -507,20 +525,22 @@ mod tests {
     fn fuzz_false_binary_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let context = &TestContext::default();
+
         for _ in 0..10000 {
-            let table = Table::arbitrary(&mut rng);
+            let table = Table::arbitrary(&mut rng, context);
             let num_rows = rng.random_range(1..10);
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
                     table
                         .columns
                         .iter()
-                        .map(|c| SimValue::arbitrary_from(&mut rng, &c.column_type))
+                        .map(|c| SimValue::arbitrary_from(&mut rng, context, &c.column_type))
                         .collect()
                 })
                 .collect();
             let row = pick(&values, &mut rng);
-            let predicate = Predicate::false_binary(&mut rng, &table, row);
+            let predicate = Predicate::false_binary(&mut rng, context, &table, row);
             let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 !value.as_ref().is_some_and(|value| value.as_bool()),
@@ -533,21 +553,23 @@ mod tests {
     fn fuzz_true_binary_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let context = &TestContext::default();
+
         for _ in 0..10000 {
-            let mut table = Table::arbitrary(&mut rng);
+            let mut table = Table::arbitrary(&mut rng, context);
             let num_rows = rng.random_range(1..10);
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
                     table
                         .columns
                         .iter()
-                        .map(|c| SimValue::arbitrary_from(&mut rng, &c.column_type))
+                        .map(|c| SimValue::arbitrary_from(&mut rng, context, &c.column_type))
                         .collect()
                 })
                 .collect();
             table.rows.extend(values.clone());
             let row = pick(&table.rows, &mut rng);
-            let predicate = SimplePredicate::true_binary(&mut rng, &table, row);
+            let predicate = SimplePredicate::true_binary(&mut rng, context, &table, row);
             let result = values
                 .iter()
                 .map(|row| predicate.0.test(row, &table))
@@ -561,21 +583,23 @@ mod tests {
     fn fuzz_false_binary_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let context = &TestContext::default();
+
         for _ in 0..10000 {
-            let mut table = Table::arbitrary(&mut rng);
+            let mut table = Table::arbitrary(&mut rng, context);
             let num_rows = rng.random_range(1..10);
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
                     table
                         .columns
                         .iter()
-                        .map(|c| SimValue::arbitrary_from(&mut rng, &c.column_type))
+                        .map(|c| SimValue::arbitrary_from(&mut rng, context, &c.column_type))
                         .collect()
                 })
                 .collect();
             table.rows.extend(values.clone());
             let row = pick(&table.rows, &mut rng);
-            let predicate = SimplePredicate::false_binary(&mut rng, &table, row);
+            let predicate = SimplePredicate::false_binary(&mut rng, context, &table, row);
             let result = values
                 .iter()
                 .map(|row| predicate.0.test(row, &table))

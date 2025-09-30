@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "module": "nodenext",
+    "target": "esnext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist/",
+    "lib": [
+      "es2020",
+      "DOM",
+      "WebWorker"
+    ],
+  },
+  "include": [
+    "*"
+  ]
+}

@@ -1,3 +1,5 @@
+use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
+
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -30,7 +32,7 @@ pub fn emit_select_result(
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
     if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-        emit_offset(program, plan, jump_to, reg_offset);
+        emit_offset(program, jump_to, reg_offset);
     }
 
     let start_reg = reg_result_cols_start;
@@ -101,6 +103,7 @@ pub fn emit_result_row_and_limit(
                     count: plan.result_columns.len(),
                     dest_reg: record_reg,
                     index_name: Some(dedupe_index.name.clone()),
+                    affinity_str: None,
                 });
                 program.emit_insn(Insn::IdxInsert {
                     cursor_id: *index_cursor_id,
@@ -122,6 +125,7 @@ pub fn emit_result_row_and_limit(
                     count: plan.result_columns.len() - 1,
                     dest_reg: record_reg,
                     index_name: Some(table.name.clone()),
+                    affinity_str: None,
                 });
             }
             program.emit_insn(Insn::Insert {
@@ -158,21 +162,46 @@ pub fn emit_result_row_and_limit(
     Ok(())
 }
 
-pub fn emit_offset(
-    program: &mut ProgramBuilder,
-    plan: &SelectPlan,
-    jump_to: BranchOffset,
-    reg_offset: Option<usize>,
-) {
-    match plan.offset {
-        Some(offset) if offset > 0 => {
-            program.add_comment(program.offset(), "OFFSET");
-            program.emit_insn(Insn::IfPos {
-                reg: reg_offset.expect("reg_offset must be Some"),
-                target_pc: jump_to,
-                decrement_by: 1,
-            });
+pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offset: Option<usize>) {
+    let Some(reg_offset) = &reg_offset else {
+        return;
+    };
+    program.emit_insn(Insn::IfPos {
+        reg: *reg_offset,
+        target_pc: jump_to,
+        decrement_by: 1,
+    });
+}
+
+#[allow(clippy::borrowed_box)]
+pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
+    match expr.as_ref() {
+        Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+        Expr::Literal(Literal::Null) => Some(0),
+        Expr::Id(name) if !name.quoted() => {
+            let lowered = name.as_str();
+            if lowered == "true" {
+                Some(1)
+            } else if lowered == "false" {
+                Some(0)
+            } else {
+                None
+            }
         }
-        _ => {}
+        Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
+        Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
+        Expr::Binary(left, op, right) => {
+            let l = try_fold_expr_to_i64(left)?;
+            let r = try_fold_expr_to_i64(right)?;
+            match op {
+                Operator::Add => Some(l.saturating_add(r)),
+                Operator::Subtract => Some(l.saturating_sub(r)),
+                Operator::Multiply => Some(l.saturating_mul(r)),
+                Operator::Divide if r != 0 => Some(l.saturating_div(r)),
+                _ => None,
+            }
+        }
+
+        _ => None,
     }
 }

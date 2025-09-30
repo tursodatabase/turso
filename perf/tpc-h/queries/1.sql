@@ -12,7 +12,7 @@ select
 from
 	lineitem
 where
-	l_shipdate <= cast('1998-12-01' as datetime) -- modified not to include cast({'day': 71} as interval)
+	l_shipdate <= '1998-12-01' -- modified not to include cast({'day': 71} as interval)
 group by
 	l_returnflag,
 	l_linestatus

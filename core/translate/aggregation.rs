@@ -26,6 +26,7 @@ pub fn emit_ungrouped_aggregation<'a>(
     plan: &'a SelectPlan,
 ) -> Result<()> {
     let agg_start_reg = t_ctx.reg_agg_start.unwrap();
+
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
         program.emit_insn(Insn::AggFinal {
@@ -44,19 +45,46 @@ pub fn emit_ungrouped_aggregation<'a>(
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
-    // This always emits a ResultRow because currently it can only be used for a single row result
-    // Limit is None because we early exit on limit 0 and the max rows here is 1
-    emit_select_result(
-        program,
-        &t_ctx.resolver,
-        plan,
-        None,
-        None,
-        t_ctx.reg_nonagg_emit_once_flag,
-        t_ctx.reg_offset,
-        t_ctx.reg_result_cols_start.unwrap(),
-        t_ctx.limit_ctx,
-    )?;
+    // Handle OFFSET for ungrouped aggregates
+    // Since we only have one result row, either skip it (offset > 0) or emit it
+    if let Some(offset_reg) = t_ctx.reg_offset {
+        let done_label = program.allocate_label();
+
+        // If offset > 0, jump to end (skip the single row)
+        program.emit_insn(Insn::IfPos {
+            reg: offset_reg,
+            target_pc: done_label,
+            decrement_by: 0,
+        });
+
+        // Offset is 0, fall through to emit the row
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            None,
+            None,
+            t_ctx.reg_nonagg_emit_once_flag,
+            None, // we've already handled offset
+            t_ctx.reg_result_cols_start.unwrap(),
+            t_ctx.limit_ctx,
+        )?;
+
+        program.resolve_label(done_label, program.offset());
+    } else {
+        // No offset specified, just emit the row
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            None,
+            None,
+            t_ctx.reg_nonagg_emit_once_flag,
+            t_ctx.reg_offset,
+            t_ctx.reg_result_cols_start.unwrap(),
+            t_ctx.limit_ctx,
+        )?;
+    }
 
     Ok(())
 }
@@ -95,8 +123,12 @@ fn emit_collseq_if_needed(
 /// Emits the bytecode for handling duplicates in a distinct aggregate.
 /// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
 /// the AggStep that would otherwise accumulate the same value multiple times.
-pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_reg: usize) {
-    let Distinctness::Distinct { ctx } = &agg.distinctness else {
+pub fn handle_distinct(
+    program: &mut ProgramBuilder,
+    distinctness: &Distinctness,
+    agg_arg_reg: usize,
+) {
+    let Distinctness::Distinct { ctx } = distinctness else {
         return;
     };
     let distinct_ctx = ctx
@@ -115,6 +147,7 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
         count: num_regs,
         dest_reg: record_reg,
         index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::IdxInsert {
         cursor_id: distinct_ctx.cursor_id,
@@ -125,27 +158,173 @@ pub fn handle_distinct(program: &mut ProgramBuilder, agg: &Aggregate, agg_arg_re
     });
 }
 
-/// Emits the bytecode for processing an aggregate step.
-/// E.g. in `SELECT SUM(price) FROM t`, 'price' is evaluated for every row, and the result is added to the accumulator.
+/// Enum representing the source of the aggregate function arguments
 ///
-/// This is distinct from the final step, which is called after the main loop has finished processing
+/// Aggregate arguments can come from different sources, depending on how the aggregation
+/// is evaluated:
+/// * In the common grouped case, the aggregate function arguments are  first inserted
+///   into a sorter in the main loop, and in the group by aggregation phase we read
+///   the data from the sorter.
+/// * In grouped cases where no sorting is required, arguments are retrieved  directly
+///   from registers allocated in the main loop.
+/// * In ungrouped cases, arguments are computed directly from the `args` expressions.
+pub enum AggArgumentSource<'a> {
+    /// The aggregate function arguments are retrieved from a pseudo cursor
+    /// which reads from the GROUP BY sorter.
+    PseudoCursor {
+        cursor_id: usize,
+        col_start: usize,
+        dest_reg_start: usize,
+        aggregate: &'a Aggregate,
+    },
+    /// The aggregate function arguments are retrieved from a contiguous block of registers
+    /// allocated in the main loop for that given aggregate function.
+    Register {
+        src_reg_start: usize,
+        aggregate: &'a Aggregate,
+    },
+    /// The aggregate function arguments are retrieved by evaluating expressions.
+    Expression {
+        func: &'a AggFunc,
+        args: &'a Vec<ast::Expr>,
+        distinctness: &'a Distinctness,
+    },
+}
+
+impl<'a> AggArgumentSource<'a> {
+    /// Create a new [AggArgumentSource] that retrieves the values from a GROUP BY sorter.
+    pub fn new_from_cursor(
+        program: &mut ProgramBuilder,
+        cursor_id: usize,
+        col_start: usize,
+        aggregate: &'a Aggregate,
+    ) -> Self {
+        let dest_reg_start = program.alloc_registers(aggregate.args.len());
+        Self::PseudoCursor {
+            cursor_id,
+            col_start,
+            dest_reg_start,
+            aggregate,
+        }
+    }
+    /// Create a new [AggArgumentSource] that retrieves the values directly from an already
+    /// populated register or registers.
+    pub fn new_from_registers(src_reg_start: usize, aggregate: &'a Aggregate) -> Self {
+        Self::Register {
+            src_reg_start,
+            aggregate,
+        }
+    }
+
+    /// Create a new [AggArgumentSource] that retrieves the values by evaluating `args` expressions.
+    pub fn new_from_expression(
+        func: &'a AggFunc,
+        args: &'a Vec<ast::Expr>,
+        distinctness: &'a Distinctness,
+    ) -> Self {
+        Self::Expression {
+            func,
+            args,
+            distinctness,
+        }
+    }
+
+    pub fn distinctness(&self) -> &Distinctness {
+        match self {
+            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.distinctness,
+            AggArgumentSource::Register { aggregate, .. } => &aggregate.distinctness,
+            AggArgumentSource::Expression { distinctness, .. } => distinctness,
+        }
+    }
+
+    pub fn agg_func(&self) -> &AggFunc {
+        match self {
+            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.func,
+            AggArgumentSource::Register { aggregate, .. } => &aggregate.func,
+            AggArgumentSource::Expression { func, .. } => func,
+        }
+    }
+    pub fn arg_at(&self, idx: usize) -> &ast::Expr {
+        match self {
+            AggArgumentSource::PseudoCursor { aggregate, .. } => &aggregate.args[idx],
+            AggArgumentSource::Register { aggregate, .. } => &aggregate.args[idx],
+            AggArgumentSource::Expression { args, .. } => &args[idx],
+        }
+    }
+    pub fn num_args(&self) -> usize {
+        match self {
+            AggArgumentSource::PseudoCursor { aggregate, .. } => aggregate.args.len(),
+            AggArgumentSource::Register { aggregate, .. } => aggregate.args.len(),
+            AggArgumentSource::Expression { args, .. } => args.len(),
+        }
+    }
+    /// Read the value of an aggregate function argument
+    pub fn translate(
+        &self,
+        program: &mut ProgramBuilder,
+        referenced_tables: &TableReferences,
+        resolver: &Resolver,
+        arg_idx: usize,
+    ) -> Result<usize> {
+        match self {
+            AggArgumentSource::PseudoCursor {
+                cursor_id,
+                col_start,
+                dest_reg_start,
+                ..
+            } => {
+                program.emit_column_or_rowid(
+                    *cursor_id,
+                    *col_start + arg_idx,
+                    dest_reg_start + arg_idx,
+                );
+                Ok(dest_reg_start + arg_idx)
+            }
+            AggArgumentSource::Register {
+                src_reg_start: start_reg,
+                ..
+            } => Ok(*start_reg + arg_idx),
+            AggArgumentSource::Expression { args, .. } => {
+                let dest_reg = program.alloc_register();
+                translate_expr(
+                    program,
+                    Some(referenced_tables),
+                    &args[arg_idx],
+                    dest_reg,
+                    resolver,
+                )
+            }
+        }
+    }
+}
+
+/// Emits the bytecode for processing an aggregate step.
+///
+/// This is distinct from the final step, which is called after a single group has been entirely accumulated,
 /// and the actual result value of the aggregation is materialized.
+///
+/// Ungrouped aggregation is a special case of grouped aggregation that involves a single group.
+///
+/// Examples:
+/// * In `SELECT SUM(price) FROM t`, `price` is evaluated for each row and added to the accumulator.
+/// * In `SELECT product_category, SUM(price) FROM t GROUP BY product_category`, `price` is evaluated for
+///   each row in the group and added to that group’s accumulator.
 pub fn translate_aggregation_step(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
-    agg: &Aggregate,
+    agg_arg_source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let dest = match agg.func {
+    let num_args = agg_arg_source.num_args();
+    let func = agg_arg_source.agg_func();
+    let dest = match func {
         AggFunc::Avg => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("avg bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -154,62 +333,47 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::Count | AggFunc::Count0 => {
-            let expr_reg = if agg.args.is_empty() {
-                program.alloc_register()
-            } else {
-                let expr = &agg.args[0];
-                let expr_reg = program.alloc_register();
-                let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-                expr_reg
-            };
-            handle_distinct(program, agg, expr_reg);
+        AggFunc::Count0 => {
+            let expr = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+            let expr_reg = translate_const_arg(program, referenced_tables, resolver, &expr)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
                 delimiter: 0,
-                func: if matches!(agg.func, AggFunc::Count0) {
-                    AggFunc::Count0
-                } else {
-                    AggFunc::Count
-                },
+                func: AggFunc::Count0,
+            });
+            target_register
+        }
+        AggFunc::Count => {
+            if num_args != 1 {
+                crate::bail_parse_error!("count bad number of arguments");
+            }
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            program.emit_insn(Insn::AggStep {
+                acc_reg: target_register,
+                col: expr_reg,
+                delimiter: 0,
+                func: AggFunc::Count,
             });
             target_register
         }
         AggFunc::GroupConcat => {
-            if agg.args.len() != 1 && agg.args.len() != 2 {
+            if num_args != 1 && num_args != 2 {
                 crate::bail_parse_error!("group_concat bad number of arguments");
             }
 
-            let expr_reg = program.alloc_register();
-            let delimiter_reg = program.alloc_register();
-
-            let expr = &agg.args[0];
-            let delimiter_expr: ast::Expr;
-
-            if agg.args.len() == 2 {
-                match &agg.args[1] {
-                    arg @ ast::Expr::Column { .. } => {
-                        delimiter_expr = arg.clone();
-                    }
-                    ast::Expr::Literal(ast::Literal::String(s)) => {
-                        delimiter_expr = ast::Expr::Literal(ast::Literal::String(s.to_string()));
-                    }
-                    _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-                };
+            let delimiter_reg = if num_args == 2 {
+                agg_arg_source.translate(program, referenced_tables, resolver, 1)?
             } else {
-                delimiter_expr = ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
-            }
+                let delimiter_expr =
+                    ast::Expr::Literal(ast::Literal::String(String::from("\",\"")));
+                translate_const_arg(program, referenced_tables, resolver, &delimiter_expr)?
+            };
 
-            translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
-            translate_expr(
-                program,
-                Some(referenced_tables),
-                &delimiter_expr,
-                delimiter_reg,
-                resolver,
-            )?;
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
 
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
@@ -221,13 +385,12 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Max => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
@@ -238,13 +401,12 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Min => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("min bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let expr = &agg_arg_source.arg_at(0);
             emit_collseq_if_needed(program, referenced_tables, expr);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
@@ -256,23 +418,12 @@ pub fn translate_aggregation_step(
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            if agg.args.len() != 2 {
+            if num_args != 2 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let value_expr = &agg.args[1];
-            let value_reg = program.alloc_register();
-
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
-            let _ = translate_expr(
-                program,
-                Some(referenced_tables),
-                value_expr,
-                value_reg,
-                resolver,
-            )?;
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
@@ -284,13 +435,11 @@ pub fn translate_aggregation_step(
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("max bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -300,30 +449,13 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::StringAgg => {
-            if agg.args.len() != 2 {
+            if num_args != 2 {
                 crate::bail_parse_error!("string_agg bad number of arguments");
             }
 
-            let expr_reg = program.alloc_register();
-            let delimiter_reg = program.alloc_register();
-
-            let expr = &agg.args[0];
-            let delimiter_expr = match &agg.args[1] {
-                arg @ ast::Expr::Column { .. } => arg.clone(),
-                ast::Expr::Literal(ast::Literal::String(s)) => {
-                    ast::Expr::Literal(ast::Literal::String(s.to_string()))
-                }
-                _ => crate::bail_parse_error!("Incorrect delimiter parameter"),
-            };
-
-            translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            translate_expr(
-                program,
-                Some(referenced_tables),
-                &delimiter_expr,
-                delimiter_reg,
-                resolver,
-            )?;
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let delimiter_reg =
+                agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
@@ -335,13 +467,11 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Sum => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("sum bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -351,13 +481,11 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::Total => {
-            if agg.args.len() != 1 {
+            if num_args != 1 {
                 crate::bail_parse_error!("total bad number of arguments");
             }
-            let expr = &agg.args[0];
-            let expr_reg = program.alloc_register();
-            let _ = translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
-            handle_distinct(program, agg, expr_reg);
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 acc_reg: target_register,
                 col: expr_reg,
@@ -367,31 +495,24 @@ pub fn translate_aggregation_step(
             target_register
         }
         AggFunc::External(ref func) => {
-            let expr_reg = program.alloc_register();
             let argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(
                     "External aggregate function called with wrong number of arguments".to_string(),
                 )
             })?;
-            if argc != agg.args.len() {
+            if argc != num_args {
                 crate::bail_parse_error!(
                     "External aggregate function called with wrong number of arguments"
                 );
             }
+            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             for i in 0..argc {
                 if i != 0 {
-                    let _ = program.alloc_register();
+                    let _ = agg_arg_source.translate(program, referenced_tables, resolver, i)?;
                 }
-                let _ = translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    &agg.args[i],
-                    expr_reg + i,
-                    resolver,
-                )?;
                 // invariant: distinct aggregates are only supported for single-argument functions
                 if argc == 1 {
-                    handle_distinct(program, agg, expr_reg + i);
+                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
                 }
             }
             program.emit_insn(Insn::AggStep {
@@ -404,4 +525,20 @@ pub fn translate_aggregation_step(
         }
     };
     Ok(dest)
+}
+
+fn translate_const_arg(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+    expr: &ast::Expr,
+) -> Result<usize> {
+    let target_register = program.alloc_register();
+    translate_expr(
+        program,
+        Some(referenced_tables),
+        expr,
+        target_register,
+        resolver,
+    )
 }

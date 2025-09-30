@@ -509,7 +509,7 @@ fn test_wal_upper_bound_passive() {
                 Ok(StepResult::Row) => {
                     rows.push(stmt.row().unwrap().get_values().cloned().collect())
                 }
-                Ok(StepResult::IO) => db_copy.io.run_once().unwrap(),
+                Ok(StepResult::IO) => db_copy.io.step().unwrap(),
                 Ok(StepResult::Done) => break,
                 result => panic!("unexpected step result: {result:?}"),
             }
@@ -702,7 +702,7 @@ fn test_wal_api_exec_commit() {
         let result = stmt.step();
         match result {
             Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::IO) => db.io.step().unwrap(),
             Ok(StepResult::Done) => break,
             result => panic!("unexpected step result: {result:?}"),
         }
@@ -749,7 +749,7 @@ fn test_wal_api_exec_rollback() {
         let result = stmt.step();
         match result {
             Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::IO) => db.io.step().unwrap(),
             Ok(StepResult::Done) => break,
             result => panic!("unexpected step result: {result:?}"),
         }
@@ -813,7 +813,7 @@ fn test_wal_api_insert_exec_mix() {
         let result = stmt.step();
         match result {
             Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::IO) => db.io.step().unwrap(),
             Ok(StepResult::Done) => break,
             result => panic!("unexpected step result: {result:?}"),
         }
@@ -839,7 +839,7 @@ fn test_wal_api_insert_exec_mix() {
         let result = stmt.step();
         match result {
             Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.run_once().unwrap(),
+            Ok(StepResult::IO) => db.io.step().unwrap(),
             Ok(StepResult::Done) => break,
             result => panic!("unexpected step result: {result:?}"),
         }
@@ -870,9 +870,8 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         db_file.clone(),
         turso_core::OpenFlags::Create,
-        false,
-        true,
-        false,
+        turso_core::DatabaseOpts::new().with_indexes(true),
+        None,
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
@@ -898,9 +897,8 @@ fn test_db_share_same_file() {
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
         turso_core::OpenFlags::empty(),
-        false,
-        true,
-        false,
+        turso_core::DatabaseOpts::new().with_indexes(true),
+        None,
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();
@@ -912,7 +910,7 @@ fn test_db_share_same_file() {
         let result = stmt.step();
         match result {
             Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db2.io.run_once().unwrap(),
+            Ok(StepResult::IO) => db2.io.step().unwrap(),
             Ok(StepResult::Done) => break,
             result => panic!("unexpected step result: {result:?}"),
         }

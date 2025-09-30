@@ -1,6 +1,159 @@
 use crate::{error::Error, token::TokenType, Result};
+use turso_macros::match_ignore_ascii_case;
 
-include!(concat!(env!("OUT_DIR"), "/keywords.rs"));
+fn keyword_or_id_token(input: &[u8]) -> TokenType {
+    match_ignore_ascii_case!(match input {
+        b"ABORT" => TokenType::TK_ABORT,
+        b"ACTION" => TokenType::TK_ACTION,
+        b"ADD" => TokenType::TK_ADD,
+        b"AFTER" => TokenType::TK_AFTER,
+        b"ALL" => TokenType::TK_ALL,
+        b"ALTER" => TokenType::TK_ALTER,
+        b"ALWAYS" => TokenType::TK_ALWAYS,
+        b"ANALYZE" => TokenType::TK_ANALYZE,
+        b"AND" => TokenType::TK_AND,
+        b"AS" => TokenType::TK_AS,
+        b"ASC" => TokenType::TK_ASC,
+        b"ATTACH" => TokenType::TK_ATTACH,
+        b"AUTOINCREMENT" => TokenType::TK_AUTOINCR,
+        b"BEFORE" => TokenType::TK_BEFORE,
+        b"BEGIN" => TokenType::TK_BEGIN,
+        b"BETWEEN" => TokenType::TK_BETWEEN,
+        b"BY" => TokenType::TK_BY,
+        b"CASCADE" => TokenType::TK_CASCADE,
+        b"CASE" => TokenType::TK_CASE,
+        b"CAST" => TokenType::TK_CAST,
+        b"CHECK" => TokenType::TK_CHECK,
+        b"COLLATE" => TokenType::TK_COLLATE,
+        b"COLUMN" => TokenType::TK_COLUMNKW,
+        b"COMMIT" => TokenType::TK_COMMIT,
+        b"CONCURRENT" => TokenType::TK_CONCURRENT,
+        b"CONFLICT" => TokenType::TK_CONFLICT,
+        b"CONSTRAINT" => TokenType::TK_CONSTRAINT,
+        b"CREATE" => TokenType::TK_CREATE,
+        b"CROSS" => TokenType::TK_JOIN_KW,
+        b"CURRENT" => TokenType::TK_CURRENT,
+        b"CURRENT_DATE" => TokenType::TK_CTIME_KW,
+        b"CURRENT_TIME" => TokenType::TK_CTIME_KW,
+        b"CURRENT_TIMESTAMP" => TokenType::TK_CTIME_KW,
+        b"DATABASE" => TokenType::TK_DATABASE,
+        b"DEFAULT" => TokenType::TK_DEFAULT,
+        b"DEFERRABLE" => TokenType::TK_DEFERRABLE,
+        b"DEFERRED" => TokenType::TK_DEFERRED,
+        b"DELETE" => TokenType::TK_DELETE,
+        b"DESC" => TokenType::TK_DESC,
+        b"DETACH" => TokenType::TK_DETACH,
+        b"DISTINCT" => TokenType::TK_DISTINCT,
+        b"DO" => TokenType::TK_DO,
+        b"DROP" => TokenType::TK_DROP,
+        b"EACH" => TokenType::TK_EACH,
+        b"ELSE" => TokenType::TK_ELSE,
+        b"END" => TokenType::TK_END,
+        b"ESCAPE" => TokenType::TK_ESCAPE,
+        b"EXCEPT" => TokenType::TK_EXCEPT,
+        b"EXCLUDE" => TokenType::TK_EXCLUDE,
+        b"EXCLUSIVE" => TokenType::TK_EXCLUSIVE,
+        b"EXISTS" => TokenType::TK_EXISTS,
+        b"EXPLAIN" => TokenType::TK_EXPLAIN,
+        b"FAIL" => TokenType::TK_FAIL,
+        b"FILTER" => TokenType::TK_FILTER,
+        b"FIRST" => TokenType::TK_FIRST,
+        b"FOLLOWING" => TokenType::TK_FOLLOWING,
+        b"FOR" => TokenType::TK_FOR,
+        b"FOREIGN" => TokenType::TK_FOREIGN,
+        b"FROM" => TokenType::TK_FROM,
+        b"FULL" => TokenType::TK_JOIN_KW,
+        b"GENERATED" => TokenType::TK_GENERATED,
+        b"GLOB" => TokenType::TK_LIKE_KW,
+        b"GROUP" => TokenType::TK_GROUP,
+        b"GROUPS" => TokenType::TK_GROUPS,
+        b"HAVING" => TokenType::TK_HAVING,
+        b"IF" => TokenType::TK_IF,
+        b"IGNORE" => TokenType::TK_IGNORE,
+        b"IMMEDIATE" => TokenType::TK_IMMEDIATE,
+        b"IN" => TokenType::TK_IN,
+        b"INDEX" => TokenType::TK_INDEX,
+        b"INDEXED" => TokenType::TK_INDEXED,
+        b"INITIALLY" => TokenType::TK_INITIALLY,
+        b"INNER" => TokenType::TK_JOIN_KW,
+        b"INSERT" => TokenType::TK_INSERT,
+        b"INSTEAD" => TokenType::TK_INSTEAD,
+        b"INTERSECT" => TokenType::TK_INTERSECT,
+        b"INTO" => TokenType::TK_INTO,
+        b"IS" => TokenType::TK_IS,
+        b"ISNULL" => TokenType::TK_ISNULL,
+        b"JOIN" => TokenType::TK_JOIN,
+        b"KEY" => TokenType::TK_KEY,
+        b"LAST" => TokenType::TK_LAST,
+        b"LEFT" => TokenType::TK_JOIN_KW,
+        b"LIKE" => TokenType::TK_LIKE_KW,
+        b"LIMIT" => TokenType::TK_LIMIT,
+        b"MATCH" => TokenType::TK_MATCH,
+        b"MATERIALIZED" => TokenType::TK_MATERIALIZED,
+        b"NATURAL" => TokenType::TK_JOIN_KW,
+        b"NO" => TokenType::TK_NO,
+        b"NOT" => TokenType::TK_NOT,
+        b"NOTHING" => TokenType::TK_NOTHING,
+        b"NOTNULL" => TokenType::TK_NOTNULL,
+        b"NULL" => TokenType::TK_NULL,
+        b"NULLS" => TokenType::TK_NULLS,
+        b"OF" => TokenType::TK_OF,
+        b"OFFSET" => TokenType::TK_OFFSET,
+        b"ON" => TokenType::TK_ON,
+        b"OR" => TokenType::TK_OR,
+        b"ORDER" => TokenType::TK_ORDER,
+        b"OTHERS" => TokenType::TK_OTHERS,
+        b"OUTER" => TokenType::TK_JOIN_KW,
+        b"OVER" => TokenType::TK_OVER,
+        b"PARTITION" => TokenType::TK_PARTITION,
+        b"PLAN" => TokenType::TK_PLAN,
+        b"PRAGMA" => TokenType::TK_PRAGMA,
+        b"PRECEDING" => TokenType::TK_PRECEDING,
+        b"PRIMARY" => TokenType::TK_PRIMARY,
+        b"QUERY" => TokenType::TK_QUERY,
+        b"RAISE" => TokenType::TK_RAISE,
+        b"RANGE" => TokenType::TK_RANGE,
+        b"RECURSIVE" => TokenType::TK_RECURSIVE,
+        b"REFERENCES" => TokenType::TK_REFERENCES,
+        b"REGEXP" => TokenType::TK_LIKE_KW,
+        b"REINDEX" => TokenType::TK_REINDEX,
+        b"RELEASE" => TokenType::TK_RELEASE,
+        b"RENAME" => TokenType::TK_RENAME,
+        b"REPLACE" => TokenType::TK_REPLACE,
+        b"RETURNING" => TokenType::TK_RETURNING,
+        b"RESTRICT" => TokenType::TK_RESTRICT,
+        b"RIGHT" => TokenType::TK_JOIN_KW,
+        b"ROLLBACK" => TokenType::TK_ROLLBACK,
+        b"ROW" => TokenType::TK_ROW,
+        b"ROWS" => TokenType::TK_ROWS,
+        b"SAVEPOINT" => TokenType::TK_SAVEPOINT,
+        b"SELECT" => TokenType::TK_SELECT,
+        b"SET" => TokenType::TK_SET,
+        b"TABLE" => TokenType::TK_TABLE,
+        b"TEMP" => TokenType::TK_TEMP,
+        b"TEMPORARY" => TokenType::TK_TEMP,
+        b"THEN" => TokenType::TK_THEN,
+        b"TIES" => TokenType::TK_TIES,
+        b"TO" => TokenType::TK_TO,
+        b"TRANSACTION" => TokenType::TK_TRANSACTION,
+        b"TRIGGER" => TokenType::TK_TRIGGER,
+        b"UNBOUNDED" => TokenType::TK_UNBOUNDED,
+        b"UNION" => TokenType::TK_UNION,
+        b"UNIQUE" => TokenType::TK_UNIQUE,
+        b"UPDATE" => TokenType::TK_UPDATE,
+        b"USING" => TokenType::TK_USING,
+        b"VACUUM" => TokenType::TK_VACUUM,
+        b"VALUES" => TokenType::TK_VALUES,
+        b"VIEW" => TokenType::TK_VIEW,
+        b"VIRTUAL" => TokenType::TK_VIRTUAL,
+        b"WHEN" => TokenType::TK_WHEN,
+        b"WHERE" => TokenType::TK_WHERE,
+        b"WINDOW" => TokenType::TK_WINDOW,
+        b"WITH" => TokenType::TK_WITH,
+        b"WITHOUT" => TokenType::TK_WITHOUT,
+        _ => TokenType::TK_ID,
+    })
+}
 
 #[inline(always)]
 pub fn is_identifier_start(b: u8) -> bool {
@@ -17,7 +170,7 @@ pub fn is_identifier_continue(b: u8) -> bool {
         || b > b'\x7F'
 }
 
-#[derive(Clone, PartialEq, Eq)] // do not derive Copy for Token, just use .clone() when needed
+#[derive(Clone, PartialEq, Eq, Debug)] // do not derive Copy for Token, just use .clone() when needed
 pub struct Token<'a> {
     pub value: &'a [u8],
     pub token_type: Option<TokenType>, // None means Token is whitespaces or comments
@@ -55,7 +208,7 @@ impl<'a> Iterator for Lexer<'a> {
                 b'&' => Some(Ok(self.eat_one_token(TokenType::TK_BITAND))),
                 b'~' => Some(Ok(self.eat_one_token(TokenType::TK_BITNOT))),
                 b'\'' | b'"' | b'`' => Some(self.mark(|l| l.eat_lit_or_id())),
-                b'.' => Some(self.mark(|l| l.eat_dot_or_frac())),
+                b'.' => Some(self.mark(|l| l.eat_dot_or_frac(false))),
                 b'0'..=b'9' => Some(self.mark(|l| l.eat_number())),
                 b'[' => Some(self.mark(|l| l.eat_bracket())),
                 b'?' | b'$' | b'@' | b'#' | b':' => Some(self.mark(|l| l.eat_var())),
@@ -247,6 +400,9 @@ impl<'a> Lexer<'a> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'/');
         match self.peek() {
+            // C-style comments begin with "/*" and extend up to and
+            // including the next "*/" character pair or until
+            // the end of input, whichever comes first.
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
                 loop {
@@ -259,19 +415,11 @@ impl<'a> Lexer<'a> {
                                     self.eat_and_assert(|b| b == b'/');
                                     break; // End of block comment
                                 }
-                                None => {
-                                    return Err(Error::UnterminatedBlockComment(
-                                        (start, self.offset - start).into(),
-                                    ))
-                                }
+                                None => break,
                                 _ => {}
                             }
                         }
-                        None => {
-                            return Err(Error::UnterminatedBlockComment(
-                                (start, self.offset - start).into(),
-                            ))
-                        }
+                        None => break,
                         _ => unreachable!(), // We should not reach here
                     }
                 }
@@ -433,12 +581,14 @@ impl<'a> Lexer<'a> {
         })
     }
 
-    fn eat_dot_or_frac(&mut self) -> Result<Token<'a>> {
+    fn eat_dot_or_frac(&mut self, has_digit_prefix: bool) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'.');
 
         match self.peek() {
-            Some(b) if b.is_ascii_digit() => {
+            Some(b)
+                if b.is_ascii_digit() || (has_digit_prefix && b.eq_ignore_ascii_case(&b'e')) =>
+            {
                 self.eat_while_number_digit()?;
                 match self.peek() {
                     Some(b'e') | Some(b'E') => {
@@ -525,7 +675,7 @@ impl<'a> Lexer<'a> {
         self.eat_while_number_digit()?;
         match self.peek() {
             Some(b'.') => {
-                self.eat_dot_or_frac()?;
+                self.eat_dot_or_frac(true)?;
                 Ok(Token {
                     value: &self.input[start..self.offset],
                     token_type: Some(TokenType::TK_FLOAT),
@@ -637,7 +787,7 @@ impl<'a> Lexer<'a> {
                 let result = &self.input[start..self.offset];
                 Ok(Token {
                     value: result,
-                    token_type: Some(keyword_token(result).unwrap_or(TokenType::TK_ID)),
+                    token_type: Some(keyword_or_id_token(result)),
                 })
             }
         }
@@ -1087,6 +1237,29 @@ mod tests {
                     token_type: Some(TokenType::TK_ID),
                 },
             ),
+            // issue 2933
+            (
+                b"1.e5".as_slice(),
+                Token {
+                    value: b"1.e5".as_slice(),
+                    token_type: Some(TokenType::TK_FLOAT),
+                },
+            ),
+            // issue 3425
+            (
+                b"/*".as_slice(),
+                Token {
+                    value: b"/*".as_slice(),
+                    token_type: None,
+                },
+            ),
+            (
+                b"/**".as_slice(),
+                Token {
+                    value: b"/**".as_slice(),
+                    token_type: None,
+                },
+            ),
         ];
 
         for (input, expected) in test_cases {
@@ -1127,6 +1300,7 @@ mod tests {
             ("COLLATE", TokenType::TK_COLLATE),
             ("COLUMN", TokenType::TK_COLUMNKW),
             ("COMMIT", TokenType::TK_COMMIT),
+            ("CONCURRENT", TokenType::TK_CONCURRENT),
             ("CONFLICT", TokenType::TK_CONFLICT),
             ("CONSTRAINT", TokenType::TK_CONSTRAINT),
             ("CREATE", TokenType::TK_CREATE),
@@ -1253,19 +1427,23 @@ mod tests {
         ]);
 
         for (key, value) in &values {
-            assert!(keyword_token(key.as_bytes()).unwrap() == *value);
-            assert!(
-                keyword_token(key.as_bytes().to_ascii_lowercase().as_slice()).unwrap() == *value
-            );
+            assert!(keyword_or_id_token(key.as_bytes()) == *value);
+            assert!(keyword_or_id_token(key.as_bytes().to_ascii_lowercase().as_slice()) == *value);
         }
 
-        assert!(keyword_token(b"").is_none());
-        assert!(keyword_token(b"wrong").is_none());
-        assert!(keyword_token(b"super wrong").is_none());
-        assert!(keyword_token(b"super_wrong").is_none());
-        assert!(keyword_token(b"aae26e78-3ba7-4627-8f8f-02623302495a").is_none());
-        assert!(keyword_token("Crème Brulée".as_bytes()).is_none());
-        assert!(keyword_token("fróm".as_bytes()).is_none());
+        assert_eq!(keyword_or_id_token(b""), TokenType::TK_ID);
+        assert_eq!(keyword_or_id_token(b"wrong"), TokenType::TK_ID);
+        assert_eq!(keyword_or_id_token(b"super wrong"), TokenType::TK_ID);
+        assert_eq!(keyword_or_id_token(b"super_wrong"), TokenType::TK_ID);
+        assert_eq!(
+            keyword_or_id_token(b"aae26e78-3ba7-4627-8f8f-02623302495a"),
+            TokenType::TK_ID
+        );
+        assert_eq!(
+            keyword_or_id_token("Crème Brulée".as_bytes()),
+            TokenType::TK_ID
+        );
+        assert_eq!(keyword_or_id_token("fróm".as_bytes()), TokenType::TK_ID);
     }
 
     #[test]
@@ -1354,6 +1532,24 @@ mod tests {
                     Token {
                         value: b")".as_slice(),
                         token_type: Some(TokenType::TK_RP),
+                    },
+                ],
+            ),
+            // issue 2933
+            (
+                b"u.email".as_slice(),
+                vec![
+                    Token {
+                        value: b"u".as_slice(),
+                        token_type: Some(TokenType::TK_ID),
+                    },
+                    Token {
+                        value: b".".as_slice(),
+                        token_type: Some(TokenType::TK_DOT),
+                    },
+                    Token {
+                        value: b"email".as_slice(),
+                        token_type: Some(TokenType::TK_ID),
                     },
                 ],
             ),

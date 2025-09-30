@@ -4,7 +4,7 @@ import json
 
 import turso
 from antithesis.random import get_random
-from utils import generate_random_value
+from helper_utils import generate_random_value
 
 # Get initial state
 try:
@@ -32,7 +32,7 @@ pk = tbl_schema["pk"]
 cols = [f"col_{col}" for col in range(tbl_schema["colCount"]) if col != pk]
 # print(cols)
 try:
-    con = turso.connect("stress_composer.db", experimental_indexes=True)
+    con = turso.connect("stress_composer.db")
 except Exception as e:
     print(f"Failed to open stress_composer.db. Exiting... {e}")
     exit(0)

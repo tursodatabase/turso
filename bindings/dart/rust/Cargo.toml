@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+release = ["turso_core/tracing_release"]
+
 [lib]
 crate-type = ["cdylib", "staticlib"]
 

@@ -46,6 +46,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
                 | PragmaFlags::NoColumns1,
             &["cache_size"],
         ),
+        DataSyncRetry => Pragma::new(
+            PragmaFlags::Result0 | PragmaFlags::NoColumns1,
+            &["data_sync_retry"],
+        ),
         DatabaseList => Pragma::new(PragmaFlags::Result0, &["seq", "name", "file"]),
         Encoding => Pragma::new(
             PragmaFlags::Result0 | PragmaFlags::NoColumns1,
@@ -97,6 +101,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         AutoVacuum => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["auto_vacuum"],
+        ),
+        BusyTimeout => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["busy_timeout"],
         ),
         IntegrityCheck => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::ReadOnly | PragmaFlags::Result0,

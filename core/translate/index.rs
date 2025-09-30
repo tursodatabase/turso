@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
+use crate::bail_parse_error;
+use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
+use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
+use crate::translate::plan::{
+    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
+};
+use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
-use crate::SymbolTable;
+use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType, Schema},
+    schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
     util::normalize_ident,
     vdbe::{
@@ -14,26 +21,52 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{Expr, Name, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
     unique_if_not_exists: (bool, bool),
-    idx_name: &str,
-    tbl_name: &str,
+    resolver: &Resolver,
+    idx_name: &Name,
+    tbl_name: &Name,
     columns: &[SortedColumn],
-    schema: &Schema,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+    where_clause: Option<Box<Expr>>,
 ) -> crate::Result<ProgramBuilder> {
-    if !schema.indexes_enabled() {
+    let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
+    let idx_name = normalize_ident(idx_name.as_str());
+    let tbl_name = normalize_ident(tbl_name.as_str());
+
+    if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
+        crate::bail_parse_error!("table sqlite_sequence may not be indexed");
+    }
+    if connection.mvcc_enabled() {
+        crate::bail_parse_error!("CREATE INDEX is currently not supported when MVCC is enabled.");
+    }
+    if !resolver.schema.indexes_enabled() {
         crate::bail_parse_error!(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
     }
-    let idx_name = normalize_ident(idx_name);
-    let tbl_name = normalize_ident(tbl_name);
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| idx_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            original_idx_name
+        );
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| tbl_name.starts_with(prefix))
+    {
+        bail_parse_error!("Object name reserved for internal use: {}", tbl_name);
+    }
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
@@ -43,19 +76,20 @@ pub fn translate_create_index(
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    if !schema.is_unique_idx_name(&idx_name) {
+    if !resolver.schema.is_unique_idx_name(&idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
         if unique_if_not_exists.1 {
             return Ok(program);
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(&tbl_name) else {
+    let Some(table) = resolver.schema.tables.get(&tbl_name) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
-    let Some(tbl) = tbl.btree() else {
+    let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
+    let original_columns = columns;
     let columns = resolve_sorted_columns(&tbl, columns)?;
 
     let idx = Arc::new(Index {
@@ -75,7 +109,19 @@ pub fn translate_create_index(
         unique: unique_if_not_exists.0,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
+        // store the *original* where clause, because we need to rewrite it
+        // before translating, and it cannot reference a table alias
+        where_clause: where_clause.clone(),
     });
+
+    if !idx.validate_where_expr(table) {
+        crate::bail_parse_error!(
+            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
+            where_clause
+                .expect("where expr has to exist in order to fail")
+                .to_string()
+        );
+    }
 
     // Allocate the necessary cursors:
     //
@@ -84,15 +130,36 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
+    let table_ref = program.table_reference_counter.next();
     let btree_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
-    let table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
+    let table_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref),
+        CursorType::BTreeTable(tbl.clone()),
+    );
     let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
     let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
         column_count: tbl.columns.len(),
     }));
+
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            table: Table::BTree(tbl.clone()),
+            identifier: tbl_name.clone(),
+            internal_id: table_ref,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection);
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
@@ -108,12 +175,17 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
-    let resolver = Resolver::new(schema, syms);
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let sql = create_idx_stmt_to_sql(
+        &original_tbl_name.as_ident(),
+        &original_idx_name.as_ident(),
+        unique_if_not_exists,
+        original_columns,
+        &idx.where_clause.clone(),
+    );
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
         &mut program,
-        &resolver,
+        resolver,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
@@ -159,6 +231,23 @@ pub fn translate_create_index(
     // emit MakeRecord (index key + rowid) into record_reg.
     //
     // Then insert the record into the sorter
+    let mut skip_row_label = None;
+    if let Some(where_clause) = where_clause {
+        let label = program.allocate_label();
+        translate_condition_expr(
+            &mut program,
+            &table_references,
+            &where_clause,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_false: label,
+                jump_target_when_true: BranchOffset::Placeholder,
+            },
+            resolver,
+        )?;
+        skip_row_label = Some(label);
+    }
+
     let start_reg = program.alloc_registers(columns.len() + 1);
     for (i, (col, _)) in columns.iter().enumerate() {
         program.emit_column_or_rowid(table_cursor_id, col.0, start_reg + i);
@@ -174,12 +263,16 @@ pub fn translate_create_index(
         count: columns.len() + 1,
         dest_reg: record_reg,
         index_name: Some(idx_name.clone()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::SorterInsert {
         cursor_id: sorter_cursor_id,
         record_reg,
     });
 
+    if let Some(skip_row_label) = skip_row_label {
+        program.resolve_label(skip_row_label, program.offset());
+    }
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: loop_start_label,
@@ -236,7 +329,7 @@ pub fn translate_create_index(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: schema.schema_version as i32 + 1,
+        value: resolver.schema.schema_version as i32 + 1,
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
@@ -259,16 +352,13 @@ fn resolve_sorted_columns<'a>(
 ) -> crate::Result<Vec<((usize, &'a Column), SortOrder)>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
-        let ident = normalize_ident(match sc.expr.as_ref() {
+        let ident = match sc.expr.as_ref() {
             // SQLite supports indexes on arbitrary expressions, but we don't (yet).
             // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
-            Expr::Id(ast::Name::Ident(col_name))
-            | Expr::Id(ast::Name::Quoted(col_name))
-            | Expr::Name(ast::Name::Ident(col_name))
-            | Expr::Name(ast::Name::Quoted(col_name)) => col_name,
+            Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
             _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
-        });
-        let Some(col) = table.get_column(&ident) else {
+        };
+        let Some(col) = table.get_column(ident) else {
             crate::bail_parse_error!(
                 "Error: column '{ident}' does not exist in table '{}'",
                 table.name
@@ -283,7 +373,8 @@ fn create_idx_stmt_to_sql(
     tbl_name: &str,
     idx_name: &str,
     unique_if_not_exists: (bool, bool),
-    cols: &[((usize, &Column), SortOrder)],
+    cols: &[SortedColumn],
+    where_clause: &Option<Box<Expr>>,
 ) -> String {
     let mut sql = String::with_capacity(128);
     sql.push_str("CREATE ");
@@ -298,27 +389,34 @@ fn create_idx_stmt_to_sql(
     sql.push_str(" ON ");
     sql.push_str(tbl_name);
     sql.push_str(" (");
-    for (i, (col, order)) in cols.iter().enumerate() {
+    for (i, col) in cols.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        sql.push_str(col.1.name.as_ref().unwrap());
-        if *order == SortOrder::Desc {
+        let col_ident = match col.expr.as_ref() {
+            Expr::Id(name) | Expr::Name(name) => name.as_ident(),
+            _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
+        };
+        sql.push_str(&col_ident);
+        if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
             sql.push_str(" DESC");
         }
     }
     sql.push(')');
+    if let Some(where_clause) = where_clause {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause.to_string());
+    }
     sql
 }
 
 pub fn translate_drop_index(
     idx_name: &str,
+    resolver: &Resolver,
     if_exists: bool,
-    schema: &Schema,
-    syms: &SymbolTable,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    if !schema.indexes_enabled() {
+    if !resolver.schema.indexes_enabled() {
         crate::bail_parse_error!(
             "DROP INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
         );
@@ -333,7 +431,7 @@ pub fn translate_drop_index(
 
     // Find the index in Schema
     let mut maybe_index = None;
-    for val in schema.indexes.values() {
+    for val in resolver.schema.indexes.values() {
         if maybe_index.is_some() {
             break;
         }
@@ -367,7 +465,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(&mut program, schema, SQLITE_TABLEID)?;
+    let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -383,7 +481,7 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -451,10 +549,9 @@ pub fn translate_drop_index(
         } else {
             None
         };
-        let resolver = Resolver::new(schema, syms);
         emit_cdc_insns(
             &mut program,
-            &resolver,
+            resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,
@@ -481,7 +578,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::SetCookie {
         db: 0,
         cookie: Cookie::SchemaVersion,
-        value: schema.schema_version as i32 + 1,
+        value: resolver.schema.schema_version as i32 + 1,
         p5: 0,
     });
 

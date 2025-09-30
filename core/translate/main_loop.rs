@@ -1,7 +1,24 @@
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{fmt::ToTokens, SortOrder};
 
 use std::sync::Arc;
 
+use super::{
+    aggregation::{translate_aggregation_step, AggArgumentSource},
+    display::PlanContext,
+    emitter::{OperationMode, TranslateCtx},
+    expr::{
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        ConditionMetadata, NoConstantOptReason,
+    },
+    group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
+    optimizer::Optimizable,
+    order_by::{order_by_sorter_insert, sorter_insert},
+    plan::{
+        Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
+        Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
+    },
+};
+use crate::translate::window::emit_window_loop_source;
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
@@ -16,22 +33,6 @@ use crate::{
         BranchOffset, CursorID,
     },
     Result,
-};
-
-use super::{
-    aggregation::translate_aggregation_step,
-    emitter::{OperationMode, TranslateCtx},
-    expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
-    },
-    group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
-    optimizer::Optimizable,
-    order_by::{order_by_sorter_insert, sorter_insert},
-    plan::{
-        Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
-        Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
-    },
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -77,16 +78,22 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Distinc
             .result_columns
             .iter()
             .enumerate()
-            .map(|(i, col)| IndexColumn {
-                name: col.expr.to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: i,
-                collation: None, // FIXME: this should be determined based on the result column expression!
-                default: None, // FIXME: this should be determined based on the result column expression!
+            .map(|(i, col)| {
+                IndexColumn {
+                    name: col
+                        .expr
+                        .displayer(&PlanContext(&[&plan.table_references]))
+                        .to_string(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: None, // FIXME: this should be determined based on the result column expression!
+                    default: None, // FIXME: this should be determined based on the result column expression!
+                }
             })
             .collect(),
         unique: false,
         has_rowid: false,
+        where_clause: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     let ctx = DistinctCtx {
@@ -141,14 +148,18 @@ pub fn init_loop(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let index_name = format!("distinct_agg_{}_{}", i, agg.args[0]);
+        let index_name = format!(
+            "distinct_agg_{}_{}",
+            i,
+            agg.args[0].displayer(&PlanContext(&[tables]))
+        );
         let index = Arc::new(Index {
             name: index_name.clone(),
             table_name: String::new(),
             ephemeral: true,
             root_page: 0,
             columns: vec![IndexColumn {
-                name: agg.args[0].to_string(),
+                name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
                 collation: None, // FIXME: this should be inferred from the expression
@@ -156,6 +167,7 @@ pub fn init_loop(
             }],
             has_rowid: false,
             unique: false,
+            where_clause: None,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
@@ -186,7 +198,8 @@ pub fn init_loop(
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
             }
         }
-        let (table_cursor_id, index_cursor_id) = table.open_cursors(program, mode)?;
+        let (table_cursor_id, index_cursor_id) =
+            table.open_cursors(program, mode, t_ctx.resolver.schema)?;
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index, .. }) => match (mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
@@ -716,13 +729,15 @@ fn emit_conditions(
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)
-/// - an ORDER BY sorter (when there is no GROUP BY, but there is an ORDER BY)
 /// - an AggStep (the columns are collected for aggregation, which is finished later)
+/// - a Window (rows are buffered and returned according to the rules of the window definition)
+/// - an ORDER BY sorter (when there is none of the above, but there is an ORDER BY)
 /// - a QueryResult (there is none of the above, so the loop either emits a ResultRow, or if it's a subquery, yields to the parent query)
 enum LoopEmitTarget {
     GroupBy,
     OrderBySorter,
     AggStep,
+    Window,
     QueryResult,
 }
 
@@ -743,7 +758,15 @@ pub fn emit_loop(
     if !plan.aggregates.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::AggStep);
     }
-    // if we DONT have a group by, but we have an order by, we emit a record into the order by sorter.
+
+    // Window processing is planned so that the query plan has neither GROUP BY nor aggregates.
+    // If the original query contained them, they are pushed down into a subquery.
+    // Rows are buffered and returned according to the rules of the window definition.
+    if plan.window.is_some() {
+        return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::Window);
+    }
+
+    // if NONE of the above applies, but we have an order by, we emit a record into the order by sorter.
     if !plan.order_by.is_empty() {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::OrderBySorter);
     }
@@ -840,15 +863,7 @@ fn emit_loop_source(
             Ok(())
         }
         LoopEmitTarget::OrderBySorter => {
-            order_by_sorter_insert(
-                program,
-                &t_ctx.resolver,
-                t_ctx
-                    .meta_sort
-                    .as_ref()
-                    .expect("sort metadata must exist for ORDER BY"),
-                plan,
-            )?;
+            order_by_sorter_insert(program, t_ctx, plan)?;
 
             if let Distinctness::Distinct { ctx } = &plan.distinctness {
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
@@ -871,7 +886,7 @@ fn emit_loop_source(
                 translate_aggregation_step(
                     program,
                     &plan.table_references,
-                    agg,
+                    AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
                 )?;
@@ -949,6 +964,11 @@ fn emit_loop_source(
                 let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
                 program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
             }
+
+            Ok(())
+        }
+        LoopEmitTarget::Window => {
+            emit_window_loop_source(program, t_ctx, plan)?;
 
             Ok(())
         }
@@ -1390,6 +1410,7 @@ fn emit_autoindex(
         count: num_regs_to_reserve,
         dest_reg: record_reg,
         index_name: Some(index.name.clone()),
+        affinity_str: None,
     });
     program.emit_insn(Insn::IdxInsert {
         cursor_id: index_cursor_id,

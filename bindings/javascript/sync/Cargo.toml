@@ -1,0 +1,26 @@
+[package]
+name = "turso_sync_js"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.1.3", default-features = false, features = ["napi6"] }
+napi-derive = { version = "3.1.1", default-features = true }
+turso_sync_engine = { workspace = true }
+turso_core = { workspace = true }
+turso_node = { workspace = true }
+genawaiter = { version = "0.99.1", default-features = false }
+tracing-subscriber = { workspace = true }
+tracing.workspace = true
+
+[build-dependencies]
+napi-build = "2.2.3"
+
+[features]
+browser = ["turso_node/browser"]

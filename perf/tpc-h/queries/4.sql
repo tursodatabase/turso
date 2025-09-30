@@ -7,8 +7,8 @@ select
 from
 	orders
 where
-	o_orderdate >= cast('1997-06-01' as datetime)
-	and o_orderdate < cast('1997-09-01' as datetime) -- modified not to include cast({'month': 3} as interval)
+	o_orderdate >= '1997-06-01'
+	and o_orderdate < '1997-09-01' -- modified not to include cast({'month': 3} as interval)
 	and exists (
 		select
 			*

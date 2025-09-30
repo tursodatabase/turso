@@ -1,9 +1,9 @@
 use std::{cmp::Ordering, sync::Arc};
-use turso_parser::ast::{self, SortOrder};
+use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
+    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
     translate::optimizer::constraints::SeekRangeConstraint,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -114,7 +114,18 @@ impl WhereTerm {
     }
 }
 
+impl From<Expr> for WhereTerm {
+    fn from(value: Expr) -> Self {
+        Self {
+            expr: value,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
 use crate::ast::Expr;
+use crate::util::exprs_are_equivalent;
 
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),
@@ -155,8 +166,8 @@ pub enum Plan {
     CompoundSelect {
         left: Vec<(SelectPlan, ast::CompoundOperator)>,
         right_most: SelectPlan,
-        limit: Option<isize>,
-        offset: Option<isize>,
+        limit: Option<Box<Expr>>,
+        offset: Option<Box<Expr>>,
         order_by: Option<Vec<(ast::Expr, SortOrder)>>,
     },
     Delete(DeletePlan),
@@ -197,6 +208,15 @@ pub enum QueryDestination {
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
     },
+}
+
+impl QueryDestination {
+    pub fn placeholder_for_subquery() -> Self {
+        QueryDestination::CoroutineYield {
+            yield_reg: usize::MAX, // will be set later in bytecode emission
+            coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +285,7 @@ impl DistinctCtx {
             count: num_regs,
             dest_reg: record_reg,
             index_name: Some(self.ephemeral_index_name.to_string()),
+            affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
@@ -293,9 +314,9 @@ pub struct SelectPlan {
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// the destination of the resulting rows from this plan.
@@ -304,6 +325,9 @@ pub struct SelectPlan {
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
     pub values: Vec<Vec<Expr>>,
+    /// The window definition and all window functions associated with it. There is at most one
+    /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
+    pub window: Option<Window>,
 }
 
 impl SelectPlan {
@@ -344,7 +368,7 @@ impl SelectPlan {
         }
 
         let count = ast::Expr::FunctionCall {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             distinctness: None,
             args: vec![],
             order_by: vec![],
@@ -354,7 +378,7 @@ impl SelectPlan {
             },
         };
         let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             filter_over: ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -379,9 +403,9 @@ pub struct DeletePlan {
     /// order by clause
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
     /// limit clause
-    pub limit: Option<isize>,
+    pub limit: Option<Box<Expr>>,
     /// offset clause
-    pub offset: Option<isize>,
+    pub offset: Option<Box<Expr>>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
@@ -395,8 +419,8 @@ pub struct UpdatePlan {
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
     pub order_by: Vec<(Box<ast::Expr>, SortOrder)>,
-    pub limit: Option<isize>,
-    pub offset: Option<isize>,
+    pub limit: Option<Box<Expr>>,
+    pub offset: Option<Box<Expr>>,
     // TODO: optional RETURNING clause
     pub returning: Option<Vec<ResultSetColumn>>,
     // whether the WHERE clause is always false
@@ -552,6 +576,12 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+        }
+    }
+    pub fn new_empty() -> Self {
+        Self {
+            joined_tables: Vec::new(),
+            outer_query_refs: Vec::new(),
         }
     }
 
@@ -854,6 +884,7 @@ impl JoinedTable {
         &self,
         program: &mut ProgramBuilder,
         mode: OperationMode,
+        schema: &Schema,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         match &self.table {
@@ -865,10 +896,17 @@ impl JoinedTable {
                 let table_cursor_id = if table_not_required {
                     None
                 } else {
-                    Some(program.alloc_cursor_id_keyed(
-                        CursorKey::table(self.internal_id),
-                        CursorType::BTreeTable(btree.clone()),
-                    ))
+                    // Check if this is a materialized view
+                    let cursor_type =
+                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                            CursorType::MaterializedView(btree.clone(), view_mutex)
+                        } else {
+                            CursorType::BTreeTable(btree.clone())
+                        };
+                    Some(
+                        program
+                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
+                    )
                 };
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
@@ -1087,7 +1125,125 @@ pub struct Aggregate {
 }
 
 impl Aggregate {
+    pub fn new(func: AggFunc, args: &[Box<Expr>], expr: &Expr, distinctness: Distinctness) -> Self {
+        Aggregate {
+            func,
+            args: args.iter().map(|arg| *arg.clone()).collect(),
+            original_expr: expr.clone(),
+            distinctness,
+        }
+    }
+
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
     }
+}
+
+/// Represents the window definition and all window functions associated with a single SELECT.
+#[derive(Debug, Clone)]
+pub struct Window {
+    /// The window name, either provided in the original statement or synthetically generated by
+    /// the planner. This is optional because it can be assigned at different stages of query
+    /// processing, but it should eventually always be set.
+    pub name: Option<String>,
+    /// Expressions from the PARTITION BY clause.
+    pub partition_by: Vec<Expr>,
+    /// The number of unique expressions in the PARTITION BY clause. This determines how many of
+    /// the leftmost columns in the subquery output make up the partition key.
+    pub deduplicated_partition_by_len: Option<usize>,
+    /// Expressions from the ORDER BY clause.
+    pub order_by: Vec<(Expr, SortOrder)>,
+    /// All window functions associated with this window.
+    pub functions: Vec<WindowFunction>,
+}
+
+impl Window {
+    const DEFAULT_SORT_ORDER: SortOrder = SortOrder::Asc;
+
+    pub fn new(name: Option<String>, ast: &ast::Window) -> Result<Self> {
+        if !Self::is_default_frame_spec(&ast.frame_clause) {
+            crate::bail_parse_error!("Custom frame specifications are not supported yet");
+        }
+
+        Ok(Window {
+            name,
+            partition_by: ast.partition_by.iter().map(|arg| *arg.clone()).collect(),
+            deduplicated_partition_by_len: None,
+            order_by: ast
+                .order_by
+                .iter()
+                .map(|col| {
+                    (
+                        *col.expr.clone(),
+                        col.order.unwrap_or(Self::DEFAULT_SORT_ORDER),
+                    )
+                })
+                .collect(),
+            functions: vec![],
+        })
+    }
+
+    pub fn is_equivalent(&self, ast: &ast::Window) -> bool {
+        if !Self::is_default_frame_spec(&ast.frame_clause) {
+            return false;
+        }
+
+        if self.partition_by.len() != ast.partition_by.len() {
+            return false;
+        }
+        if !self
+            .partition_by
+            .iter()
+            .zip(&ast.partition_by)
+            .all(|(a, b)| exprs_are_equivalent(a, b))
+        {
+            return false;
+        }
+
+        if self.order_by.len() != ast.order_by.len() {
+            return false;
+        }
+        self.order_by
+            .iter()
+            .zip(&ast.order_by)
+            .all(|((expr_a, order_a), col_b)| {
+                exprs_are_equivalent(expr_a, &col_b.expr)
+                    && *order_a == col_b.order.unwrap_or(Self::DEFAULT_SORT_ORDER)
+            })
+    }
+
+    fn is_default_frame_spec(frame: &Option<FrameClause>) -> bool {
+        if let Some(frame_clause) = frame {
+            let FrameClause {
+                mode,
+                start,
+                end,
+                exclude,
+            } = frame_clause;
+            if *mode != FrameMode::Range {
+                return false;
+            }
+            if *start != FrameBound::UnboundedPreceding {
+                return false;
+            }
+            if *end != Some(FrameBound::CurrentRow) {
+                return false;
+            }
+            if let Some(exclude) = exclude {
+                if *exclude != FrameExclude::NoOthers {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFunction {
+    /// The resolved function. Currently, only regular aggregate functions are supported.
+    /// In the future, more specialized window functions such as `RANK()`, `ROW_NUMBER()`, etc. will be added.
+    pub func: AggFunc,
+    /// The expression from which the function was resolved.
+    pub original_expr: Expr,
 }

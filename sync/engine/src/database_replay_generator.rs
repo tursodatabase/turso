@@ -10,9 +10,9 @@ use crate::{
     Result,
 };
 
-pub struct DatabaseReplayGenerator<Ctx = ()> {
+pub struct DatabaseReplayGenerator {
     pub conn: Arc<turso_core::Connection>,
-    pub opts: DatabaseReplaySessionOpts<Ctx>,
+    pub opts: DatabaseReplaySessionOpts,
 }
 
 pub struct ReplayInfo {
@@ -24,8 +24,8 @@ pub struct ReplayInfo {
 }
 
 const SQLITE_SCHEMA_TABLE: &str = "sqlite_schema";
-impl<Ctx> DatabaseReplayGenerator<Ctx> {
-    pub fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts<Ctx>) -> Self {
+impl DatabaseReplayGenerator {
+    pub fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts) -> Self {
         Self { conn, opts }
     }
     pub fn create_mutation(
@@ -118,7 +118,7 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
         }
         match change {
             DatabaseChangeType::Delete => {
-                if self.opts.use_implicit_rowid {
+                if self.opts.use_implicit_rowid || info.pk_column_indices.is_none() {
                     vec![turso_core::Value::Integer(id)]
                 } else {
                     let mut values = Vec::new();
@@ -168,7 +168,7 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
             }
         }
     }
-    pub async fn replay_info(
+    pub async fn replay_info<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         change: &DatabaseTapeRowChange,
@@ -264,19 +264,18 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
                         let update = self.update_query(coro, table_name, &columns).await?;
                         Ok(update)
                     } else {
-                        let columns = [true].repeat(after.len());
-                        let update = self.update_query(coro, table_name, &columns).await?;
-                        Ok(update)
+                        let upsert = self.upsert_query(coro, table_name, after.len()).await?;
+                        Ok(upsert)
                     }
                 }
                 DatabaseTapeRowChangeType::Insert { after } => {
-                    let insert = self.insert_query(coro, table_name, after.len()).await?;
+                    let insert = self.upsert_query(coro, table_name, after.len()).await?;
                     Ok(insert)
                 }
             }
         }
     }
-    pub(crate) async fn update_query(
+    pub(crate) async fn update_query<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
@@ -320,7 +319,7 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
             is_ddl_replay: false,
         })
     }
-    pub(crate) async fn insert_query(
+    pub(crate) async fn upsert_query<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
@@ -371,7 +370,7 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
             is_ddl_replay: false,
         })
     }
-    pub(crate) async fn delete_query(
+    pub(crate) async fn delete_query<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,
@@ -406,7 +405,7 @@ impl<Ctx> DatabaseReplayGenerator<Ctx> {
         })
     }
 
-    async fn table_columns_info(
+    async fn table_columns_info<Ctx>(
         &self,
         coro: &Coro<Ctx>,
         table_name: &str,

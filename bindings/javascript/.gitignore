@@ -196,3 +196,6 @@ Cargo.lock
 
 *.node
 *.wasm
+
+npm
+bundle

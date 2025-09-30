@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::storage::page_cache::CacheError;
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -8,8 +10,8 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
-    #[error("Page cache is full")]
-    CacheFull,
+    #[error(transparent)]
+    CacheError(#[from] CacheError),
     #[error("Database is full: {0}")]
     DatabaseFull(String),
     #[error("Parse error: {0}")]
@@ -122,6 +124,14 @@ pub enum CompletionError {
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
     DecryptionError { page_idx: usize },
+    #[error("I/O error: partial write")]
+    ShortWrite,
+    #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        page_id: usize,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[macro_export]
@@ -154,3 +164,5 @@ impl From<turso_ext::ResultCode> for LimboError {
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
+pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
+pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;

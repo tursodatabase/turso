@@ -1,11 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use fallible_iterator::FallibleIterator;
 use pprof::criterion::{Output, PProfProfiler};
 use turso_parser::{lexer::Lexer, parser::Parser};
-use turso_sqlite3_parser::lexer::{
-    sql::{Parser as OldParser, Tokenizer},
-    Scanner,
-};
 
 fn bench_parser(criterion: &mut Criterion) {
     let queries = [
@@ -20,12 +15,6 @@ fn bench_parser(criterion: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("limbo_parser_query", ""), |b| {
             b.iter(|| Parser::new(black_box(qb)).next().unwrap());
-        });
-
-        group.bench_function(BenchmarkId::new("limbo_old_parser_query", ""), |b| {
-            b.iter(|| {
-                OldParser::new(black_box(qb)).next().unwrap().unwrap();
-            });
         });
 
         group.finish();
@@ -49,12 +38,6 @@ fn bench_parser_insert_batch(criterion: &mut Criterion) {
             b.iter(|| Parser::new(black_box(qb)).next().unwrap());
         });
 
-        group.bench_function(BenchmarkId::new("limbo_old_parser_insert_batch", ""), |b| {
-            b.iter(|| {
-                OldParser::new(black_box(qb)).next().unwrap().unwrap();
-            });
-        });
-
         group.finish();
     }
 }
@@ -74,18 +57,6 @@ fn bench_lexer(criterion: &mut Criterion) {
             b.iter(|| {
                 for token in Lexer::new(black_box(qb)) {
                     token.unwrap();
-                }
-            });
-        });
-
-        group.bench_function(BenchmarkId::new("limbo_old_lexer_query", ""), |b| {
-            b.iter(|| {
-                let tokenizer = Tokenizer::new();
-                let mut scanner = Scanner::new(black_box(tokenizer));
-                loop {
-                    if let (_, None, _) = scanner.scan(black_box(qb)).unwrap() {
-                        break;
-                    }
                 }
             });
         });

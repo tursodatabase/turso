@@ -82,6 +82,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Builder {
     path: String,
     enable_mvcc: bool,
+    vfs: Option<String>,
 }
 
 impl Builder {
@@ -90,6 +91,7 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_mvcc: false,
+            vfs: None,
         }
     }
 
@@ -98,25 +100,68 @@ impl Builder {
         self
     }
 
+    pub fn with_io(mut self, vfs: String) -> Self {
+        self.vfs = Some(vfs);
+        self
+    }
+
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
-        match self.path.as_str() {
-            ":memory:" => {
-                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-                let db = turso_core::Database::open_file(
-                    io,
-                    self.path.as_str(),
-                    self.enable_mvcc,
-                    true,
-                )?;
-                Ok(Database { inner: db })
+        let io = self.get_io()?;
+        let db = turso_core::Database::open_file(io, self.path.as_str(), self.enable_mvcc, true)?;
+        Ok(Database { inner: db })
+    }
+
+    fn get_io(&self) -> Result<Arc<dyn turso_core::IO>> {
+        let vfs_choice = self.vfs.as_deref().unwrap_or("");
+
+        if self.path == ":memory:" && vfs_choice.is_empty() {
+            return Ok(Arc::new(turso_core::MemoryIO::new()));
+        }
+
+        match vfs_choice {
+            "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
+            "syscall" => {
+                #[cfg(target_family = "unix")]
+                {
+                    Ok(Arc::new(
+                        turso_core::UnixIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
+                #[cfg(not(target_family = "unix"))]
+                {
+                    Ok(Arc::new(
+                        turso_core::PlatformIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
             }
-            path => {
-                let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-                let db = turso_core::Database::open_file(io, path, self.enable_mvcc, true)?;
-                Ok(Database { inner: db })
+            #[cfg(target_os = "linux")]
+            "io_uring" => Ok(Arc::new(
+                turso_core::UringIO::new()
+                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+            )),
+            #[cfg(not(target_os = "linux"))]
+            "io_uring" => Err(Error::SqlExecutionFailure(
+                "io_uring is only available on Linux targets".to_string(),
+            )),
+            "" => {
+                // Default behavior: memory for ":memory:", platform IO for files
+                if self.path == ":memory:" {
+                    Ok(Arc::new(turso_core::MemoryIO::new()))
+                } else {
+                    Ok(Arc::new(
+                        turso_core::PlatformIO::new()
+                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+                    ))
+                }
             }
+            _ => Ok(Arc::new(
+                turso_core::PlatformIO::new()
+                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
+            )),
         }
     }
 }
@@ -347,6 +392,29 @@ impl Connection {
             .map_err(|e| Error::MutexError(e.to_string()))?;
 
         Ok(conn.get_auto_commit())
+    }
+
+    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
+    ///
+    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
+    ///
+    /// Instead of sleeping for linear amount of time specified by the user,
+    /// we will sleep in phases, until the the total amount of time is reached.
+    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
+    ///
+    /// Example:
+    /// 1. Set duration to 5ms
+    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
+    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
+    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
+    /// 5. Step through query -> returns Busy -> return Busy to user
+    pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        conn.set_busy_timeout(duration);
+        Ok(())
     }
 }
 

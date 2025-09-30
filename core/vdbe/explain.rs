@@ -5,13 +5,13 @@ use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use super::{Insn, InsnReference, Program, Value};
 use crate::function::{Func, ScalarFunc};
 
-pub fn insn_to_str(
+pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+
+pub fn insn_to_row(
     program: &Program,
-    addr: InsnReference,
     insn: &Insn,
-    indent: String,
-    manual_comment: Option<&'static str>,
-) -> String {
+) -> (&'static str, i32, i32, i32, Value, u16, String) {
     let get_table_or_index_name = |cursor_id: usize| {
         let cursor_type = &program.cursor_ref[cursor_id].1;
         match cursor_type {
@@ -19,11 +19,11 @@ pub fn insn_to_str(
             CursorType::BTreeIndex(index) => &index.name,
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => &virtual_table.name,
+            CursorType::MaterializedView(table, _) => &table.name,
             CursorType::Sorter => "sorter",
         }
     };
-    let (opcode, p1, p2, p3, p4, p5, comment): (&str, i32, i32, i32, Value, u16, String) =
-        match insn {
+    match insn {
             Insn::Init { target_pc } => (
                 "Init",
                 0,
@@ -541,6 +541,10 @@ pub fn insn_to_str(
                         let name = &index.columns.get(*column).unwrap().name;
                         Some(name)
                     }
+                    CursorType::MaterializedView(table, _) => {
+                        let name = table.columns.get(*column).and_then(|v| v.name.as_ref());
+                        name
+                    }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
@@ -579,6 +583,7 @@ pub fn insn_to_str(
                 count,
                 dest_reg,
                 index_name,
+                affinity_str: _,
             } => {
                 let for_index = index_name.as_ref().map(|name| format!("; for {name}"));
                 (
@@ -647,14 +652,14 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { db, write , schema_cookie} => (
+            Insn::Transaction { db, tx_mode, schema_cookie} => (
                 "Transaction",
                 *db as i32,
-                *write as i32,
+                *tx_mode as i32,
                 *schema_cookie as i32,
                 Value::build_text(""),
                 0,
-                format!("iDb={db} write={write}"),
+                format!("iDb={db} tx_mode={tx_mode:?}"),
             ),
             Insn::Goto { target_pc } => (
                 "Goto",
@@ -946,6 +951,15 @@ pub fn insn_to_str(
                 Value::build_text(func.to_string()),
                 0,
                 format!("accum=r[{}]", *register),
+            ),
+            Insn::AggValue { acc_reg, dest_reg, func } => (
+                "AggValue",
+                0,
+                *acc_reg as i32,
+                *dest_reg as i32,
+                Value::build_text(func.to_string()),
+                0,
+                format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
             Insn::SorterOpen {
                 cursor_id,
@@ -1266,6 +1280,15 @@ pub fn insn_to_str(
                     "root iDb={root} former_root={former_root_reg} is_temp={is_temp}"
                 ),
             ),
+            Insn::ResetSorter { cursor_id } => (
+                "ResetSorter",
+                *cursor_id as i32,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                format!("cursor={cursor_id}"),
+            ),
             Insn::DropTable {
                 db,
                 _p2,
@@ -1337,13 +1360,13 @@ pub fn insn_to_str(
                 0,
                 where_clause.clone().unwrap_or("NULL".to_string()),
             ),
-            Insn::PopulateMaterializedViews => (
+            Insn::PopulateMaterializedViews { cursors } => (
                 "PopulateMaterializedViews",
                 0,
                 0,
                 0,
                 Value::Null,
-                0,
+                cursors.len() as u16,
                 "".to_string(),
             ),
             Insn::Prev {
@@ -1511,6 +1534,15 @@ pub fn insn_to_str(
                 0,
                 format!("cursor={cursor_id}"),
             ),
+            Insn::OpenDup { new_cursor_id, original_cursor_id } => (
+                "OpenDup",
+                *new_cursor_id as i32,
+                *original_cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("new_cursor={new_cursor_id}, original_cursor={original_cursor_id}"),
+            ),
             Insn::Once {
                 target_pc_when_reentered,
             } => (
@@ -1672,14 +1704,14 @@ pub fn insn_to_str(
                 0,
                 format!("add_column({table}, {column:?})"),
             ),
-            Insn::RenameColumn { table, column_index, name } => (
-                "RenameColumn",
+            Insn::AlterColumn { table, column_index, definition: column, rename } => (
+                "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("rename_column({table}, {column_index}, {name})"),
+                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
@@ -1709,7 +1741,79 @@ pub fn insn_to_str(
                 0,
                 format!("collation={collation}"),
             ),
-        };
+            Insn::IfNeg { reg, target_pc } => (
+                "IfNeg",
+                *reg as i32,
+                target_pc.as_debug_int(),
+                0,
+                Value::build_text(""),
+                0,
+                format!("if (r[{}] < 0) goto {}", reg, target_pc.as_debug_int()),
+            ),
+            Insn::Explain { p1, p2, detail } => (
+                "Explain",
+                *p1 as i32,
+                p2.as_ref().map(|p| *p).unwrap_or(0) as i32,
+                0,
+                Value::build_text(detail.as_str()),
+                0,
+                String::new(),
+            ),
+            Insn::MemMax { dest_reg, src_reg } => (
+                "MemMax",
+                *dest_reg as i32,
+                *src_reg as i32,
+                0,
+                Value::build_text(""),
+                0,
+                format!("r[{dest_reg}]=Max(r[{dest_reg}],r[{src_reg}])"),
+            ),
+        Insn::Sequence{ cursor_id, target_reg} => (
+                "Sequence",
+                *cursor_id as i32,
+                *target_reg as i32,
+                0,
+                Value::build_text(""),
+                0,
+                String::new(),
+          ),
+        Insn::SequenceTest{ cursor_id, target_pc, value_reg } => (
+            "SequenceTest",
+              *cursor_id as i32,
+            target_pc.as_debug_int(),
+            *value_reg as i32,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        }
+}
+
+pub fn insn_to_row_with_comment(
+    program: &Program,
+    insn: &Insn,
+    manual_comment: Option<&str>,
+) -> (&'static str, i32, i32, i32, Value, u16, String) {
+    let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row(program, insn);
+    (
+        opcode,
+        p1,
+        p2,
+        p3,
+        p4,
+        p5,
+        manual_comment.map_or(comment.to_string(), |mc| format!("{comment}; {mc}")),
+    )
+}
+
+pub fn insn_to_str(
+    program: &Program,
+    addr: InsnReference,
+    insn: &Insn,
+    indent: String,
+    manual_comment: Option<&str>,
+) -> String {
+    let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row(program, insn);
     format!(
         "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
         addr,

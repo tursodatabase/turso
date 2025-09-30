@@ -10,13 +10,21 @@ do_execsql_test_on_specific_db {:memory:} alter-table-rename-table {
 } { "t2" }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-rename-column {
-    CREATE TABLE t (a);
+    CREATE TABLE t (a INTEGER);
     CREATE INDEX i ON t (a);
     ALTER TABLE t RENAME a TO b;
     SELECT sql FROM sqlite_schema;
 } {
-    "CREATE TABLE t (b)"
+    "CREATE TABLE t (b INTEGER)"
     "CREATE INDEX i ON t (b)"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-quoted-column {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t RENAME a TO "ab cd";
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE t (\"ab cd\" INTEGER)"
 }
 
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column {
@@ -74,6 +82,14 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column-default {
 "0.1|hello"
 }
 
+do_execsql_test_on_specific_db {:memory:} alter-table-add-quoted-column {
+    CREATE TABLE test (a);
+    ALTER TABLE test ADD COLUMN [b c];
+    SELECT sql FROM sqlite_schema;
+} {
+    "CREATE TABLE test (a, [b c])"
+}
+
 do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
@@ -117,6 +133,17 @@ do_execsql_test_in_memory_any_error fail-alter-table-drop-unique-column-constrai
     ALTER TABLE t DROP b;
 }
 
+
+# refer https://github.com/tursodatabase/turso/issues/3231
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN a;
+}
+do_execsql_test_in_memory_any_error fail-alter-table-add-duplicate-column-case-insensitive {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN A;
+}
+
 do_execsql_test_in_memory_any_error fail-alter-table-drop-primary-key-column {
     CREATE TABLE t (a PRIMARY KEY, b);
     ALTER TABLE t DROP a;
@@ -138,3 +165,49 @@ do_execsql_test_in_memory_any_error fail-alter-table-rename-to-existing-table {
     CREATE TABLE y (a);
     ALTER TABLE x RENAME TO y;
 }
+
+do_execsql_test_on_specific_db {:memory:} alter-table-rename-to-quoted-identifier {
+    CREATE TABLE t (a);
+    CREATE INDEX idx ON t (a);
+    INSERT INTO t VALUES (1);
+
+    ALTER TABLE t RENAME TO "t t";
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO "t t" VALUES (2);
+    SELECT a FROM "t t";
+
+    DELETE FROM "t t" WHERE a = 1;
+    SELECT a FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN a TO "a a";
+    SELECT sql FROM sqlite_schema;
+    SELECT "a a" FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
+    SELECT sql FROM sqlite_schema;
+    SELECT "b b" FROM "t t";
+} {
+    "CREATE TABLE \"t t\" (a)"
+    "CREATE INDEX idx ON \"t t\" (a)"
+
+    "1"
+    "2"
+
+    "2"
+
+    "CREATE TABLE \"t t\" (\"a a\")"
+    "CREATE INDEX idx ON \"t t\" (\"a a\")"
+    "2"
+
+    "CREATE TABLE \"t t\" (\"b b\")"
+    "CREATE INDEX idx ON \"t t\" (\"b b\")"
+    "2"
+}
+
+# https://github.com/tursodatabase/turso/issues/3391
+do_execsql_test_on_specific_db {:memory:} alter-table-add-notnull-col {
+    CREATE TABLE t (a);
+	ALTER TABLE t ADD b NOT NULL;
+	SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+} {{CREATE TABLE t (a, b NOT NULL)}}

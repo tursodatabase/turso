@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, IO};
+use turso_core::{Connection, Database, Row, StepResult, IO};
 
 #[allow(dead_code)]
 pub struct TempDatabase {
@@ -29,12 +29,30 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
         Self { path, io, db }
+    }
+
+    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
+        let mut path = TempDir::new().unwrap().keep();
+        path.push(db_name);
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+        )
+        .unwrap();
+        Self {
+            path: path.to_path_buf(),
+            io,
+            db,
+        }
     }
 
     pub fn new_with_existent(db_path: &Path, enable_indexes: bool) -> Self {
@@ -55,9 +73,8 @@ impl TempDatabase {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
         Self {
@@ -68,9 +85,6 @@ impl TempDatabase {
     }
 
     pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
@@ -85,9 +99,8 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            false,
-            enable_indexes,
-            false,
+            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            None,
         )
         .unwrap();
 
@@ -217,6 +230,45 @@ pub(crate) fn limbo_exec_rows(
     rows
 }
 
+pub(crate) fn limbo_exec_rows_fallible(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = Vec::new();
+    'outer: loop {
+        let row = loop {
+            let result = stmt.step()?;
+            match result {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    break row;
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once()?;
+                    continue;
+                }
+
+                turso_core::StepResult::Done => break 'outer,
+                r => panic!("unexpected result {r:?}: expecting single row"),
+            }
+        };
+        let row = row
+            .get_values()
+            .map(|x| match x {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
+                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 pub(crate) fn limbo_exec_rows_error(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
@@ -243,6 +295,45 @@ pub(crate) fn rng_from_time() -> (ChaCha8Rng, u64) {
         .as_secs();
     let rng = ChaCha8Rng::seed_from_u64(seed);
     (rng, seed)
+}
+
+pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
+    run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
+}
+
+pub fn run_query_on_row(
+    tmp_db: &TempDatabase,
+    conn: &Arc<Connection>,
+    query: &str,
+    on_row: impl FnMut(&Row),
+) -> anyhow::Result<()> {
+    run_query_core(tmp_db, conn, query, Some(on_row))
+}
+
+pub fn run_query_core(
+    _tmp_db: &TempDatabase,
+    conn: &Arc<Connection>,
+    query: &str,
+    mut on_row: Option<impl FnMut(&Row)>,
+) -> anyhow::Result<()> {
+    if let Some(ref mut rows) = conn.query(query)? {
+        loop {
+            match rows.step()? {
+                StepResult::IO => {
+                    rows.run_once()?;
+                }
+                StepResult::Done => break,
+                StepResult::Row => {
+                    if let Some(on_row) = on_row.as_mut() {
+                        let row = rows.row().unwrap();
+                        on_row(row)
+                    }
+                }
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+    };
+    Ok(())
 }
 
 #[cfg(test)]

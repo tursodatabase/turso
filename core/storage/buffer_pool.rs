@@ -218,7 +218,7 @@ impl BufferPool {
         if inner.page_arena.is_some() {
             return Ok(());
         }
-        inner.db_page_size.store(page_size, Ordering::Relaxed);
+        inner.db_page_size.store(page_size, Ordering::SeqCst);
         inner.init_arenas()?;
         Ok(())
     }
@@ -230,7 +230,7 @@ impl PoolInner {
     pub fn allocate(&self, len: usize) -> Buffer {
         turso_assert!(len > 0, "Cannot allocate zero-length buffer");
 
-        let db_page_size = self.db_page_size.load(Ordering::Relaxed);
+        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
         let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
 
         // Check if this is exactly a WAL frame size allocation
@@ -249,7 +249,7 @@ impl PoolInner {
     }
 
     fn get_db_page_buffer(&mut self) -> Buffer {
-        let db_page_size = self.db_page_size.load(Ordering::Relaxed);
+        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
@@ -257,7 +257,7 @@ impl PoolInner {
     }
 
     fn get_wal_frame_buffer(&mut self) -> Buffer {
-        let len = self.db_page_size.load(Ordering::Relaxed) + WAL_FRAME_HEADER_SIZE;
+        let len = self.db_page_size.load(Ordering::SeqCst) + WAL_FRAME_HEADER_SIZE;
         self.wal_frame_arena
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
@@ -271,8 +271,8 @@ impl PoolInner {
             tracing::debug!("Buffer pool is already growing, skipping initialization");
             return Ok(()); // Already in progress
         };
-        let arena_size = self.arena_size.load(Ordering::Relaxed);
-        let db_page_size = self.db_page_size.load(Ordering::Relaxed);
+        let arena_size = self.arena_size.load(Ordering::SeqCst);
+        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
         let io = self.io.as_ref().expect("Pool not initialized").clone();
 
         // Create regular page arena
@@ -371,7 +371,7 @@ impl Arena {
             .register_fixed_buffer(base, rounded_bytes)
             .unwrap_or_else(|_| {
                 // Register with io_uring if possible, otherwise use next available ID
-                let next_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let next_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
                 tracing::trace!("Allocating arena with id {}", next_id);
                 next_id
             });
@@ -402,7 +402,7 @@ impl Arena {
         };
         arena
             .allocated_slots
-            .fetch_add(slots as usize, Ordering::Relaxed);
+            .fetch_add(slots as usize, Ordering::SeqCst);
         let offset = first_idx as usize * arena.slot_size;
         let ptr = unsafe { NonNull::new_unchecked(arena.base.as_ptr().add(offset)) };
         Some(Buffer::new_pooled(ArenaBuffer::new(
@@ -423,7 +423,7 @@ impl Arena {
             "must not already be marked free"
         );
         bm.free_run(slot_idx, count as u32);
-        self.allocated_slots.fetch_sub(count, Ordering::Relaxed);
+        self.allocated_slots.fetch_sub(count, Ordering::SeqCst);
     }
 }
 

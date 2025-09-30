@@ -58,7 +58,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
 | CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
 | CREATE TABLE              | Partial |                                                                                   |
-| CREATE TABLE ... STRICT   | Yes     |                                                                                   |
+| CREATE TABLE ... STRICT   | Partial | Strict schema mode is experimental.                                               |
 | CREATE TRIGGER            | No      |                                                                                   |
 | CREATE VIEW               | Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | Yes     |                                                                                   |
@@ -343,7 +343,7 @@ Modifiers:
 | TimeOffset     | Yes	 |                                 |
 | DateOffset	 | Yes   |                                 |
 | DateTimeOffset | Yes   |                                 |
-| Ceiling	     | No    |                                 |
+| Ceiling	     | Yes   |                                 |
 | Floor          | No    |                                 |
 | StartOfMonth	 | Yes	 |                                 |
 | StartOfYear	 | Yes	 |                                 |
@@ -393,10 +393,10 @@ Modifiers:
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |
 | json_group_object(label,value)     | Yes     |                                                                                                                                              |
 | jsonb_group_object(name,value)     | Yes     |                                                                                                                                              |
-| json_each(json)                    |         |                                                                                                                                              |
-| json_each(json,path)               |         |                                                                                                                                              |
-| json_tree(json)                    |         |                                                                                                                                              |
-| json_tree(json,path)               |         |                                                                                                                                              |
+| json_each(json)                    | Yes     |                                                                                                                                              |
+| json_each(json,path)               | Yes     |                                                                                                                                              |
+| json_tree(json)                    | Partial | see commented-out tests in json.test                                                                                                         |
+| json_tree(json,path)               | Partial | see commented-out tests in json.test                                                                                                         |
 
 ## SQLite C API
 
@@ -418,7 +418,7 @@ Modifiers:
 | Affinity       | Yes    |         |
 | AggFinal       | Yes    |         |
 | AggStep        | Yes    |         |
-| AggStep        | Yes    |         |
+| AggValue       | Yes    |         |
 | And            | Yes    |         |
 | AutoCommit     | Yes    |         |
 | BitAnd         | Yes    |         |
@@ -486,7 +486,7 @@ Modifiers:
 | Lt             | Yes    |         |
 | MakeRecord     | Yes    |         |
 | MaxPgcnt       | Yes    |         |
-| MemMax         | No     |         |
+| MemMax         | Yes     |         |
 | Move           | Yes    |         |
 | Multiply       | Yes    |         |
 | MustBeInt      | Yes    |         |
@@ -502,6 +502,7 @@ Modifiers:
 | NullRow        | Yes    |         |
 | Once           | Yes     |         |
 | OpenAutoindex  | Yes     |         |
+| OpenDup        | Yes     |         |
 | OpenEphemeral  | Yes     |         |
 | OpenPseudo     | Yes    |         |
 | OpenRead       | Yes    |         |
@@ -518,6 +519,7 @@ Modifiers:
 | RealAffinity   | Yes    |         |
 | Remainder      | Yes    |         |
 | ResetCount     | No     |         |
+| ResetSorter    | Partial| sorter cursors are not supported yet; only ephemeral tables are |
 | ResultRow      | Yes    |         |
 | Return         | Yes    |         |
 | Rewind         | Yes    |         |
@@ -537,7 +539,8 @@ Modifiers:
 | SeekLt         | Yes    |         |
 | SeekRowid      | Yes    |         |
 | SeekEnd        | Yes    |         |
-| Sequence       | No     |         |
+| Sequence       | Yes    |         |
+| SequenceTest   | Yes    |         |
 | SetCookie      | Yes    |         |
 | ShiftLeft      | Yes    |         |
 | ShiftRight     | Yes    |         |

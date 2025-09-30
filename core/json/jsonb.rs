@@ -1,4 +1,5 @@
 use crate::json::error::{Error as PError, Result as PResult};
+use crate::json::Conv;
 use crate::{bail_parse_error, LimboError, Result};
 use std::{
     borrow::Cow,
@@ -197,6 +198,12 @@ pub enum ElementType {
     RESERVED1 = 13,
     RESERVED2 = 14,
     RESERVED3 = 15,
+}
+
+pub enum IteratorState {
+    Array(ArrayIteratorState),
+    Object(ObjectIteratorState),
+    Primitive(Jsonb),
 }
 
 pub enum JsonIndentation<'a> {
@@ -742,7 +749,15 @@ impl JsonbHeader {
         Self(ElementType::OBJECT, 0)
     }
 
-    fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+    pub(super) fn element_type(&self) -> ElementType {
+        self.0
+    }
+
+    pub(super) fn payload_size(&self) -> PayloadSize {
+        self.1
+    }
+
+    pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         match slice.get(cursor) {
             Some(header_byte) => {
                 // Extract first 4 bits (values 0-15)
@@ -841,6 +856,18 @@ impl JsonbHeader {
     }
 }
 
+pub struct ArrayIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
+pub struct ObjectIteratorState {
+    cursor: usize,
+    end: usize,
+    index: usize,
+}
+
 impl Jsonb {
     pub fn new(capacity: usize, data: Option<&[u8]>) -> Self {
         if let Some(data) = data {
@@ -906,6 +933,96 @@ impl Jsonb {
                 }
             }
             Err(_) => bail_parse_error!("malformed JSON"),
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate_element(0, self.data.len(), 0).is_ok()
+    }
+
+    fn validate_element(&self, start: usize, end: usize, depth: usize) -> Result<()> {
+        if depth > MAX_JSON_DEPTH {
+            bail_parse_error!("Too deep");
+        }
+
+        if start >= end {
+            bail_parse_error!("Empty element");
+        }
+
+        let (header, header_offset) = self.read_header(start)?;
+        let payload_start = start + header_offset;
+        let payload_size = header.payload_size();
+        let payload_end = payload_start + payload_size;
+
+        if payload_end != end {
+            bail_parse_error!("Size mismatch");
+        }
+
+        match header.element_type() {
+            ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
+                if payload_size == 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Invalid payload for primitive")
+                }
+            }
+            ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+                if payload_size > 0 {
+                    Ok(())
+                } else {
+                    bail_parse_error!("Empty number payload")
+                }
+            }
+            ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
+                let payload = &self.data[payload_start..payload_end];
+                std::str::from_utf8(payload).map_err(|_| {
+                    LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
+                })?;
+                Ok(())
+            }
+            ElementType::ARRAY => {
+                let mut pos = payload_start;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Array element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Array element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                }
+                Ok(())
+            }
+            ElementType::OBJECT => {
+                let mut pos = payload_start;
+                let mut count = 0;
+                while pos < payload_end {
+                    if pos >= self.data.len() {
+                        bail_parse_error!("Object element out of bounds");
+                    }
+                    let (elem_header, elem_header_size) = self.read_header(pos)?;
+                    if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
+                        bail_parse_error!("Object key must be text");
+                    }
+
+                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    if elem_end > payload_end {
+                        bail_parse_error!("Object element exceeds bounds");
+                    }
+                    self.validate_element(pos, elem_end, depth + 1)?;
+                    pos = elem_end;
+                    count += 1;
+                }
+
+                if count % 2 != 0 {
+                    bail_parse_error!("Object must have even number of elements");
+                }
+                Ok(())
+            }
+            _ => bail_parse_error!("Invalid element type"),
         }
     }
 
@@ -2158,6 +2275,18 @@ impl Jsonb {
         Ok(result)
     }
 
+    pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
+        // Parse directly as JSON if it's already JSON subtype or strict mode is on
+        if matches!(mode, Conv::ToString) {
+            let mut str = input.replace('"', "\\\"");
+            str.insert(0, '"');
+            str.push('"');
+            Jsonb::from_str(&str)
+        } else {
+            Jsonb::from_str(input)
+        }
+    }
+
     pub fn from_raw_data(data: &[u8]) -> Self {
         Self::new(data.len(), Some(data))
     }
@@ -2871,6 +3000,166 @@ impl Jsonb {
         }
 
         Ok(())
+    }
+
+    pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::ARRAY, len) => Ok(ArrayIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.array_iterator(): not an array"),
+        }
+    }
+
+    pub fn array_iterator_next(
+        &self,
+        st: &ArrayIteratorState,
+    ) -> Option<((usize, Jsonb), ArrayIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        let (JsonbHeader(_, payload_len), header_len) = self.read_header(st.cursor).ok()?;
+        let start = st.cursor;
+        let stop = start.checked_add(header_len + payload_len)?;
+
+        if stop > st.end || stop > self.data.len() {
+            return None;
+        }
+
+        let elem = Jsonb::new(stop - start, Some(&self.data[start..stop]));
+        let next = ArrayIteratorState {
+            cursor: stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, elem), next))
+    }
+
+    pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
+        let (hdr, off) = self.read_header(0)?;
+        match hdr {
+            JsonbHeader(ElementType::OBJECT, len) => Ok(ObjectIteratorState {
+                cursor: off,
+                end: off + len,
+                index: 0,
+            }),
+            _ => bail_parse_error!("jsonb.object_iterator(): not an object"),
+        }
+    }
+
+    pub fn object_iterator_next(
+        &self,
+        st: &ObjectIteratorState,
+    ) -> Option<((usize, Jsonb, Jsonb), ObjectIteratorState)> {
+        if st.cursor >= st.end {
+            return None;
+        }
+
+        // key
+        let (JsonbHeader(key_ty, key_len), key_hdr_len) = self.read_header(st.cursor).ok()?;
+        if !key_ty.is_valid_key() {
+            return None;
+        }
+        let key_start = st.cursor;
+        let key_stop = key_start.checked_add(key_hdr_len + key_len)?;
+        if key_stop > st.end || key_stop > self.data.len() {
+            return None;
+        }
+
+        // value
+        let (JsonbHeader(_, val_len), val_hdr_len) = self.read_header(key_stop).ok()?;
+        let val_start = key_stop;
+        let val_stop = val_start.checked_add(val_hdr_len + val_len)?;
+        if val_stop > st.end || val_stop > self.data.len() {
+            return None;
+        }
+
+        let key = Jsonb::new(key_stop - key_start, Some(&self.data[key_start..key_stop]));
+        let value = Jsonb::new(val_stop - val_start, Some(&self.data[val_start..val_stop]));
+        let next = ObjectIteratorState {
+            cursor: val_stop,
+            end: st.end,
+            index: st.index + 1,
+        };
+
+        Some(((st.index, key, value), next))
+    }
+
+    /// If the iterator points at a container value, return an iterator for that container.
+    /// For arrays, we inspect the next element; for objects, we inspect the next property's *value*.
+    pub fn container_property_iterator(&self, it: &IteratorState) -> Option<IteratorState> {
+        match it {
+            IteratorState::Array(st) => {
+                if st.cursor >= st.end {
+                    return None;
+                }
+                let (JsonbHeader(ty, len), hdr_len) = self.read_header(st.cursor).ok()?;
+                let payload_cursor = st.cursor.checked_add(hdr_len)?;
+                let payload_end = payload_cursor.checked_add(len)?;
+                if payload_end > st.end || payload_end > self.data.len() {
+                    return None;
+                }
+
+                match ty {
+                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    _ => None,
+                }
+            }
+
+            IteratorState::Object(st) => {
+                if st.cursor >= st.end {
+                    return None;
+                }
+
+                // key -> value
+                let (JsonbHeader(key_ty, key_len), key_hdr_len) =
+                    self.read_header(st.cursor).ok()?;
+                if !key_ty.is_valid_key() {
+                    return None;
+                }
+                let key_stop = st.cursor.checked_add(key_hdr_len + key_len)?;
+                if key_stop > st.end || key_stop > self.data.len() {
+                    return None;
+                }
+
+                let (JsonbHeader(val_ty, val_len), val_hdr_len) =
+                    self.read_header(key_stop).ok()?;
+                let payload_cursor = key_stop.checked_add(val_hdr_len)?;
+                let payload_end = payload_cursor.checked_add(val_len)?;
+                if payload_end > st.end || payload_end > self.data.len() {
+                    return None;
+                }
+
+                match val_ty {
+                    ElementType::ARRAY => Some(IteratorState::Array(ArrayIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    ElementType::OBJECT => Some(IteratorState::Object(ObjectIteratorState {
+                        cursor: payload_cursor,
+                        end: payload_end,
+                        index: 0,
+                    })),
+                    _ => None,
+                }
+            }
+            IteratorState::Primitive(_) => None,
+        }
     }
 }
 

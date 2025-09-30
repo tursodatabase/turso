@@ -12,6 +12,7 @@ env:
 jobs:
   cargo-fmt-check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
@@ -21,6 +22,7 @@ jobs:
         run: cd fuzz && cargo fmt --check
 
   build-native:
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
@@ -42,14 +44,19 @@ jobs:
         run: |
           cargo test --features encryption --color=always --test integration_tests query_processing::encryption
           cargo test --features encryption --color=always --lib storage::encryption
+      - name: Test Checksums
+        run: |
+          cargo test --features checksum --color=always --lib storage::checksum
+          cargo test --features checksum --color=always --test integration_tests storage::checksum
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-        run: cargo test --verbose
+        run: cargo test --verbose --features checksum
         timeout-minutes: 20
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - name: Clippy
@@ -64,8 +71,14 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
-      - name: Install the project
+      - name: Simulator default
         run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 loop -n 10 -s
+      - name: Simulator InsertHeavy
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy loop -n 10 -s
+      - name: Simulator Faultless
+        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless loop -n 10 -s
+      - name: Simulator Differential
+        run: ./scripts/run-sim --maximum-tests 1000 --differential loop -n 10 -s
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -87,6 +100,7 @@ jobs:
         timeout-minutes: 20
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
       - uses: "./.github/shared/install_sqlite"

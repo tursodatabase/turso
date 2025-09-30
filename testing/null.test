@@ -18,3 +18,11 @@ do_execsql_test notnull {
 do_execsql_test not-null {
     select null not null, 'hi' not null;
 } {0|1}
+
+do_execsql_test sel-true {
+	select true;
+} {1}
+
+do_execsql_test sel-false {
+	select false;
+} {0}

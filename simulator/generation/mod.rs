@@ -1,6 +1,4 @@
-use sql_generation::generation::GenerationContext;
-
-use crate::runner::env::{SimulatorEnv, SimulatorTables};
+use crate::runner::env::ShadowTablesMut;
 
 pub mod plan;
 pub mod property;
@@ -17,17 +15,5 @@ pub mod query;
 /// might return a vector of rows that were inserted into the table.
 pub(crate) trait Shadow {
     type Result;
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result;
-}
-
-impl GenerationContext for SimulatorEnv {
-    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        &self.tables.tables
-    }
-
-    fn opts(&self) -> sql_generation::generation::Opts {
-        sql_generation::generation::Opts {
-            indexes: self.opts.experimental_indexes,
-        }
-    }
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result;
 }

@@ -703,3 +703,127 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
+
+#[test]
+fn test_cte_alias() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
+        false,
+    );
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO test (id, name) VALUES (1, 'Limbo');")?;
+    conn.execute("INSERT INTO test (id, name) VALUES (2, 'Turso');")?;
+
+    let mut stmt1 = conn.prepare(
+        "WITH a1 AS (SELECT id FROM test WHERE name = 'Limbo') SELECT a2.id FROM a1 AS a2",
+    )?;
+    loop {
+        match stmt1.step()? {
+            StepResult::Row => {
+                let row = stmt1.row().unwrap();
+                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
+                break;
+            }
+            StepResult::Done => {
+                panic!("Expected a row but got Done");
+            }
+            StepResult::IO => stmt1.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    let mut stmt2 = conn
+        .prepare("WITH a1 AS (SELECT id FROM test WHERE name = 'Turso') SELECT a2.id FROM a1 a2")?;
+    loop {
+        match stmt2.step()? {
+            StepResult::Row => {
+                let row = stmt2.row().unwrap();
+                assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(2));
+                break;
+            }
+            StepResult::Done => {
+                panic!("Expected a row but got Done");
+            }
+            StepResult::IO => stmt2.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_avg_agg() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x, y);", false);
+    let conn = tmp_db.connect_limbo();
+    conn.execute("insert into t values (1, null), (2, null), (3, null), (null, null), (4, null)")?;
+    let mut rows = Vec::new();
+    let mut stmt = conn.prepare("select avg(x), avg(y) from t")?;
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+
+    assert_eq!(stmt.num_columns(), 2);
+    assert_eq!(stmt.get_column_name(0), "avg (t.x)");
+    assert_eq!(stmt.get_column_name(1), "avg (t.y)");
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            turso_core::Value::Float((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
+            turso_core::Value::Null
+        ]]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_offset_limit_bind() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (i INTEGER);", false);
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
+
+    for (limit, offset, expected) in [
+        (
+            2,
+            1,
+            vec![
+                vec![turso_core::Value::Integer(4)],
+                vec![turso_core::Value::Integer(3)],
+            ],
+        ),
+        (0, 0, vec![]),
+        (1, 0, vec![vec![turso_core::Value::Integer(5)]]),
+        (0, 1, vec![]),
+        (1, 1, vec![vec![turso_core::Value::Integer(4)]]),
+    ] {
+        let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
+        stmt.bind_at(1.try_into()?, Value::Integer(limit));
+        stmt.bind_at(2.try_into()?, Value::Integer(offset));
+
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                StepResult::IO => stmt.run_once()?,
+                _ => break,
+            }
+        }
+
+        assert_eq!(rows, expected);
+    }
+
+    Ok(())
+}

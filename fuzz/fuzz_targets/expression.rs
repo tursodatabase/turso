@@ -4,7 +4,6 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
-use turso_core::IO as _;
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -31,15 +30,14 @@ macro_rules! str_enum {
 
 str_enum! {
     enum Binary {
-        // TODO: Not compatible yet
-        // Equal => "=",
-        // Is => "IS",
-        // Concat => "||",
-        // NotEqual => "<>",
-        // GreaterThan => ">",
-        // GreaterThanOrEqual => ">=",
-        // LessThan => "<",
-        // LessThanOrEqual => "<=",
+        Equal => "=",
+        Is => "IS",
+        Concat => "||",
+        NotEqual => "<>",
+        GreaterThan => ">",
+        GreaterThanOrEqual => ">=",
+        LessThan => "<",
+        LessThanOrEqual => "<=",
         RightShift => ">>",
         LeftShift => "<<",
         BitwiseAnd => "&",
@@ -118,11 +116,72 @@ impl rusqlite::types::FromSql for Value {
     }
 }
 
+str_enum! {
+    enum UnaryFunc {
+        Round => "round",
+        Hex => "hex",
+        Unhex => "unhex",
+        Abs => "abs",
+        Lower => "lower",
+        Upper => "upper",
+        Sign => "sign",
+
+        Ceil => "ceil",
+        Floor => "floor",
+        Trunc => "trunc",
+        Radians => "radians",
+        Degrees => "degrees",
+
+        Sqrt => "sqrt",
+        Exp => "exp",
+        Ln => "ln",
+        Log10 => "log10",
+        Log2 => "log2",
+
+        Sin => "sin",
+        Sinh => "sinh",
+        Asin => "asin",
+        Asinh => "asinh",
+
+        Cos => "cos",
+        Cosh => "cosh",
+        Acos => "acos",
+        Acosh => "acosh",
+
+        Tan => "tan",
+        Tanh => "tanh",
+        Atan => "atan",
+        Atanh => "atanh",
+    }
+}
+
+str_enum! {
+    enum BinaryFunc {
+        Round => "round",
+        Power => "pow",
+        Mod => "mod",
+        Atan2 => "atan2",
+        Log => "log",
+    }
+}
+
+str_enum! {
+    enum CastType {
+        Text => "text",
+        Real => "real",
+        Integer => "integer",
+        Numeric => "numeric",
+    }
+}
+
 #[derive(Debug, Arbitrary)]
 enum Expr {
     Value(Value),
     Binary(Binary, Box<Expr>, Box<Expr>),
     Unary(Unary, Box<Expr>),
+    Cast(Box<Expr>, CastType),
+    UnaryFunc(UnaryFunc, Box<Expr>),
+    BinaryFunc(BinaryFunc, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -160,6 +219,34 @@ impl Expr {
                     depth: lhs.depth.max(rhs.depth) + 1,
                 }
             }
+            Expr::BinaryFunc(func, lhs, rhs) => {
+                let mut lhs = lhs.lower();
+                let mut rhs = rhs.lower();
+                Output {
+                    query: format!("{func}({}, {})", lhs.query, rhs.query),
+                    parameters: {
+                        lhs.parameters.append(&mut rhs.parameters);
+                        lhs.parameters
+                    },
+                    depth: lhs.depth.max(rhs.depth) + 1,
+                }
+            }
+            Expr::UnaryFunc(func, expr) => {
+                let expr = expr.lower();
+                Output {
+                    query: format!("{func}({})", expr.query),
+                    parameters: expr.parameters,
+                    depth: expr.depth + 1,
+                }
+            }
+            Expr::Cast(expr, cast_type) => {
+                let expr = expr.lower();
+                Output {
+                    query: format!("cast({} as {cast_type})", expr.query),
+                    parameters: expr.parameters,
+                    depth: expr.depth + 1,
+                }
+            }
         }
     }
 }
@@ -169,7 +256,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
     let sql = format!("SELECT {}", expr.query);
 
     // FIX: `turso_core::translate::expr::translate_expr` causes a overflow if this is any higher.
-    if expr.depth > 140 {
+    if expr.depth > 100 {
         return Ok(Corpus::Reject);
     }
 

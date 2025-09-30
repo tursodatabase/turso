@@ -6,6 +6,7 @@ members = [
     "bindings/dart/rust",
     "bindings/java",
     "bindings/javascript",
+    "bindings/javascript/sync",
     "bindings/python",
     "bindings/rust",
     "cli",
@@ -18,44 +19,49 @@ members = [
     "extensions/percentile",
     "extensions/regexp",
     "extensions/tests",
+    "extensions/fuzzy",
     "macros",
     "simulator",
     "sqlite3",
     "stress",
     "testing/sqlite_test_ext",
     "tests",
-    "vendored/sqlite3-parser/sqlparser_bench",
     "parser",
     "sync/engine",
-    "sync/javascript",
     "sql_generation",
+    "whopper",
+    "perf/throughput/turso",
+    "perf/throughput/rusqlite",
+    "perf/encryption"
 ]
-exclude = ["perf/latency/limbo"]
+exclude = [
+    "perf/latency/limbo",
+]
 
 [workspace.package]
-version = "0.1.5-pre.1"
+version = "0.2.0-pre.11"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.1.5-pre.1" }
-turso_node = { path = "bindings/javascript", version = "0.1.5-pre.1" }
-limbo_completion = { path = "extensions/completion", version = "0.1.5-pre.1" }
-turso_core = { path = "core", version = "0.1.5-pre.1" }
-turso_sync_engine = { path = "sync/engine", version = "0.1.5-pre.1" }
-limbo_crypto = { path = "extensions/crypto", version = "0.1.5-pre.1" }
-limbo_csv = { path = "extensions/csv", version = "0.1.5-pre.1" }
-turso_ext = { path = "extensions/core", version = "0.1.5-pre.1" }
-turso_ext_tests = { path = "extensions/tests", version = "0.1.5-pre.1" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.1.5-pre.1" }
-turso_macros = { path = "macros", version = "0.1.5-pre.1" }
-limbo_percentile = { path = "extensions/percentile", version = "0.1.5-pre.1" }
-limbo_regexp = { path = "extensions/regexp", version = "0.1.5-pre.1" }
-turso_sqlite3_parser = { path = "vendored/sqlite3-parser", version = "0.1.5-pre.1" }
-limbo_uuid = { path = "extensions/uuid", version = "0.1.5-pre.1" }
-turso_parser = { path = "parser" }
+turso = { path = "bindings/rust", version = "0.2.0-pre.11" }
+turso_node = { path = "bindings/javascript", version = "0.2.0-pre.11" }
+limbo_completion = { path = "extensions/completion", version = "0.2.0-pre.11" }
+turso_core = { path = "core", version = "0.2.0-pre.11" }
+turso_sync_engine = { path = "sync/engine", version = "0.2.0-pre.11" }
+limbo_crypto = { path = "extensions/crypto", version = "0.2.0-pre.11" }
+limbo_csv = { path = "extensions/csv", version = "0.2.0-pre.11" }
+turso_ext = { path = "extensions/core", version = "0.2.0-pre.11" }
+turso_ext_tests = { path = "extensions/tests", version = "0.2.0-pre.11" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.2.0-pre.11" }
+turso_macros = { path = "macros", version = "0.2.0-pre.11" }
+limbo_percentile = { path = "extensions/percentile", version = "0.2.0-pre.11" }
+limbo_regexp = { path = "extensions/regexp", version = "0.2.0-pre.11" }
+limbo_uuid = { path = "extensions/uuid", version = "0.2.0-pre.11" }
+turso_parser = { path = "parser", version = "0.2.0-pre.11" }
+limbo_fuzzy = { path = "extensions/fuzzy", version = "0.2.0-pre.11" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
@@ -66,7 +72,35 @@ mimalloc = { version = "0.1.47", default-features = false }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 itertools = "0.14.0"
 rand = "0.9.2"
+rand_chacha = "0.9.0"
 tracing = "0.1.41"
+schemars = "1.0.4"
+garde = "0.22"
+parking_lot = "0.12.4"
+tokio = { version = "1.0", default-features = false }
+tracing-subscriber = "0.3.20"
+futures = "0.3"
+clap = "4.5.47"
+thiserror = "2.0.16"
+tempfile = "3.20.0"
+indexmap = "2.11.1"
+miette = "7.6.0"
+bitflags = "2.9.4"
+fallible-iterator = "0.3.0"
+criterion = "0.5"
+chrono = { version = "0.4.42", default-features = false }
+hex = "0.4"
+antithesis_sdk = "0.2"
+cfg-if = "1.0.0"
+tracing-appender = "0.2.3"
+env_logger = { version = "0.11.6", default-features = false }
+regex = "1.11.1"
+regex-syntax = { version = "0.8.5", default-features = false }
+similar = { version = "2.7.0" }
+similar-asserts = { version = "1.7.0" }
+
+[profile.dev.package.similar]
+opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"

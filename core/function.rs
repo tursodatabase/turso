@@ -1,6 +1,5 @@
 use std::fmt;
 use std::fmt::{Debug, Display};
-use std::rc::Rc;
 use std::sync::Arc;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
@@ -204,7 +203,7 @@ pub enum AggFunc {
     JsonbGroupObject,
     #[cfg(feature = "json")]
     JsonGroupObject,
-    External(Rc<ExtFunc>),
+    External(Arc<ExtFunc>),
 }
 
 impl PartialEq for AggFunc {
@@ -218,7 +217,7 @@ impl PartialEq for AggFunc {
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
             | (Self::Total, Self::Total) => true,
-            (Self::External(a), Self::External(b)) => Rc::ptr_eq(a, b),
+            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -583,6 +582,7 @@ impl Display for MathFunc {
 #[derive(Debug)]
 pub enum AlterTableFunc {
     RenameTable,
+    AlterColumn,
     RenameColumn,
 }
 
@@ -591,6 +591,7 @@ impl Display for AlterTableFunc {
         match self {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
+            AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
         }
     }
 }

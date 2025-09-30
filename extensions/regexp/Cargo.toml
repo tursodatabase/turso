@@ -17,7 +17,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 turso_ext = { workspace = true, features = ["static"] }
-regex = "1.11.1"
+regex = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }

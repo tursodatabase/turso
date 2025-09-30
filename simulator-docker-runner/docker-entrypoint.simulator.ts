@@ -171,9 +171,15 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   args.push('--seed', seed);
   // Bugbase wants to have .git available, so we disable it
   args.push("--disable-bugbase");
+
+  if (Math.random() < 0.5) {
+    args.push("--profile", "faultless");
+  }
+
   args.push(...["--minimum-tests", "100", "--maximum-tests", "1000"]);
   const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
   args.push(...loop);
+
 
   console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
   const issuePosted = await run(seed, "limbo_sim", args);

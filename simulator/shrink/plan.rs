@@ -1,12 +1,12 @@
 use crate::{
+    SandboxedResult, SimulatorEnv,
     generation::{
-        plan::{Interaction, InteractionPlan, Interactions},
+        plan::{InteractionPlan, InteractionType, Interactions, InteractionsType},
         property::Property,
     },
     model::Query,
     run_simulation,
     runner::execution::Execution,
-    SandboxedResult, SimulatorEnv,
 };
 use std::sync::{Arc, Mutex};
 
@@ -17,21 +17,28 @@ impl InteractionPlan {
         // - Shrink to multiple values by removing random interactions
         // - Shrink properties by removing their extensions, or shrinking their values
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
+
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
+
+        // Index of the parent property where the interaction originated from
+        let failing_property = &self.plan[secondary_interactions_index];
         let mut depending_tables = failing_property.dependencies();
 
-        let interactions = failing_property.interactions();
-
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx] {
-                    Interaction::Query(query) => {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
+                    InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
                         depending_tables = query.dependencies();
                         break;
                     }
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index
@@ -47,65 +54,126 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
         // Remove all properties after the failing one
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
-        let mut idx = 0;
-        // Remove all properties that do not use the failing tables
-        plan.plan.retain_mut(|interactions| {
-            let retain = if idx == failing_execution.interaction_index {
-                true
-            } else {
-                let mut has_table = interactions
-                    .uses()
-                    .iter()
-                    .any(|t| depending_tables.contains(t));
-
-                if has_table {
-                    // Remove the extensional parts of the properties
-                    if let Interactions::Property(p) = interactions {
-                        match p {
-                            Property::InsertValuesSelect { queries, .. }
-                            | Property::DoubleCreateFailure { queries, .. }
-                            | Property::DeleteSelect { queries, .. }
-                            | Property::DropSelect { queries, .. } => {
-                                queries.clear();
-                            }
-                            Property::FsyncNoWait { tables, .. }
-                            | Property::FaultyQuery { tables, .. } => {
-                                tables.retain(|table| depending_tables.contains(table));
-                            }
-                            Property::SelectLimit { .. }
-                            | Property::SelectSelectOptimizer { .. }
-                            | Property::WhereTrueFalseNull { .. }
-                            | Property::UNIONAllPreservesCardinality { .. }
-                            | Property::ReadYourUpdatesBack { .. }
-                            | Property::TableHasExpectedContent { .. } => {}
-                        }
+        // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
+        if !depending_tables.is_empty() {
+            let mut idx = 0;
+            // Remove all properties that do not use the failing tables
+            plan.plan.retain_mut(|interactions| {
+                let retain = if idx == secondary_interactions_index {
+                    if let InteractionsType::Property(
+                        Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
+                    ) = &mut interactions.interactions
+                    {
+                        tables.retain(|table| depending_tables.contains(table));
                     }
-                    // Check again after query clear if the interactions still uses the failing table
-                    has_table = interactions
+                    true
+                } else if matches!(
+                    interactions.interactions,
+                    InteractionsType::Query(Query::Begin(..))
+                        | InteractionsType::Query(Query::Commit(..))
+                        | InteractionsType::Query(Query::Rollback(..))
+                ) {
+                    true
+                } else {
+                    let mut has_table = interactions
                         .uses()
                         .iter()
                         .any(|t| depending_tables.contains(t));
-                }
-                let is_fault = matches!(interactions, Interactions::Fault(..));
-                is_fault
-                    || (has_table
-                        && !matches!(
-                            interactions,
-                            Interactions::Query(Query::Select(_))
-                                | Interactions::Property(Property::SelectLimit { .. })
-                                | Interactions::Property(Property::SelectSelectOptimizer { .. })
-                        ))
-            };
-            idx += 1;
-            retain
-        });
 
-        let after = plan.plan.len();
+                    if has_table {
+                        // Remove the extensional parts of the properties
+                        if let InteractionsType::Property(p) = &mut interactions.interactions {
+                            match p {
+                                Property::InsertValuesSelect { queries, .. }
+                                | Property::DoubleCreateFailure { queries, .. }
+                                | Property::DeleteSelect { queries, .. }
+                                | Property::DropSelect { queries, .. } => {
+                                    queries.clear();
+                                }
+                                Property::FsyncNoWait { tables, query }
+                                | Property::FaultyQuery { tables, query } => {
+                                    if !query.uses().iter().any(|t| depending_tables.contains(t)) {
+                                        tables.clear();
+                                    } else {
+                                        tables.retain(|table| depending_tables.contains(table));
+                                    }
+                                }
+                                Property::SelectLimit { .. }
+                                | Property::SelectSelectOptimizer { .. }
+                                | Property::WhereTrueFalseNull { .. }
+                                | Property::UNIONAllPreservesCardinality { .. }
+                                | Property::ReadYourUpdatesBack { .. }
+                                | Property::TableHasExpectedContent { .. } => {}
+                            }
+                        }
+                        // Check again after query clear if the interactions still uses the failing table
+                        has_table = interactions
+                            .uses()
+                            .iter()
+                            .any(|t| depending_tables.contains(t));
+                    }
+                    let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
+                    is_fault
+                        || (has_table
+                            && !matches!(
+                                interactions.interactions,
+                                InteractionsType::Query(Query::Select(_))
+                                    | InteractionsType::Property(Property::SelectLimit { .. })
+                                    | InteractionsType::Property(
+                                        Property::SelectSelectOptimizer { .. }
+                                    )
+                            ))
+                };
+                idx += 1;
+                retain
+            });
+
+            // Comprise of idxs of Begin interactions
+            let mut begin_idx = Vec::new();
+            // Comprise of idxs of the intereactions Commit and Rollback
+            let mut end_tx_idx = Vec::new();
+
+            for (idx, interactions) in plan.plan.iter().enumerate() {
+                match &interactions.interactions {
+                    InteractionsType::Query(Query::Begin(..)) => {
+                        begin_idx.push(idx);
+                    }
+                    InteractionsType::Query(Query::Commit(..))
+                    | InteractionsType::Query(Query::Rollback(..)) => {
+                        let last_begin = begin_idx.last().unwrap() + 1;
+                        if last_begin == idx {
+                            end_tx_idx.push(idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // remove interactions if its just a Begin Commit/Rollback with no queries in the middle
+            let mut range_transactions = end_tx_idx.into_iter().peekable();
+            let mut idx = 0;
+            plan.plan.retain_mut(|_| {
+                let mut retain = true;
+
+                if let Some(txn_interaction_idx) = range_transactions.peek().copied() {
+                    if txn_interaction_idx == idx {
+                        range_transactions.next();
+                    }
+                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
+                        retain = false;
+                    }
+                }
+                idx += 1;
+                retain
+            });
+        }
+
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -137,16 +205,19 @@ impl InteractionPlan {
         };
 
         let mut plan = self.clone();
-        let failing_property = &self.plan[failing_execution.interaction_index];
-
-        let interactions = failing_property.interactions();
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
 
         {
-            let mut idx = failing_execution.secondary_index;
+            let mut idx = failing_execution.interaction_index;
             loop {
-                match &interactions[idx] {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
                     // Fault does not depend on
-                    Interaction::Fault(..) => break,
+                    InteractionType::Fault(..) => break,
                     _ => {
                         // In principle we should never fail this checked_sub.
                         // But if there is a bug in how we count the secondary index
@@ -162,38 +233,44 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.plan.len();
+        let before = self.len();
 
-        plan.plan.truncate(failing_execution.interaction_index + 1);
+        plan.plan.truncate(secondary_interactions_index + 1);
 
         // phase 1: shrink extensions
         for interaction in &mut plan.plan {
-            if let Interactions::Property(property) = interaction {
+            if let InteractionsType::Property(property) = &mut interaction.interactions {
                 match property {
                     Property::InsertValuesSelect { queries, .. }
                     | Property::DoubleCreateFailure { queries, .. }
                     | Property::DeleteSelect { queries, .. }
                     | Property::DropSelect { queries, .. } => {
-                        let mut temp_plan = InteractionPlan {
-                            plan: queries
+                        let mut temp_plan = InteractionPlan::new_with(
+                            queries
                                 .iter()
-                                .map(|q| Interactions::Query(q.clone()))
+                                .map(|q| {
+                                    Interactions::new(
+                                        interaction.connection_index,
+                                        InteractionsType::Query(q.clone()),
+                                    )
+                                })
                                 .collect(),
-                        };
+                            self.mvcc,
+                        );
 
                         temp_plan = InteractionPlan::iterative_shrink(
                             temp_plan,
                             failing_execution,
                             result,
                             env.clone(),
+                            secondary_interactions_index,
                         );
                         //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
 
                         *queries = temp_plan
-                            .plan
                             .into_iter()
-                            .filter_map(|i| match i {
-                                Interactions::Query(q) => Some(q),
+                            .filter_map(|i| match i.interactions {
+                                InteractionsType::Query(q) => Some(q),
                                 _ => None,
                             })
                             .collect();
@@ -211,9 +288,15 @@ impl InteractionPlan {
         }
 
         // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(plan, failing_execution, result, env);
+        plan = Self::iterative_shrink(
+            plan,
+            failing_execution,
+            result,
+            env,
+            secondary_interactions_index,
+        );
 
-        let after = plan.plan.len();
+        let after = plan.len();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -230,9 +313,10 @@ impl InteractionPlan {
         failing_execution: &Execution,
         old_result: &SandboxedResult,
         env: Arc<Mutex<SimulatorEnv>>,
+        secondary_interaction_index: usize,
     ) -> InteractionPlan {
-        for i in (0..plan.plan.len()).rev() {
-            if i == failing_execution.interaction_index {
+        for i in (0..plan.len()).rev() {
+            if i == secondary_interaction_index {
                 continue;
             }
             let mut test_plan = plan.clone();
@@ -255,11 +339,9 @@ impl InteractionPlan {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
         let result = SandboxedResult::from(
             std::panic::catch_unwind(|| {
-                run_simulation(
-                    env.clone(),
-                    &mut [test_plan.clone()],
-                    last_execution.clone(),
-                )
+                let plan = test_plan.static_iterator();
+
+                run_simulation(env.clone(), plan, last_execution.clone())
             }),
             last_execution,
         );

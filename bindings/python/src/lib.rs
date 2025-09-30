@@ -317,7 +317,7 @@ impl Drop for Connection {
 #[allow(clippy::arc_with_non_send_sync)]
 #[pyfunction(signature = (path))]
 pub fn connect(path: &str) -> Result<Connection> {
-    match turso_core::Connection::from_uri(path, true, false, false) {
+    match turso_core::Connection::from_uri(path, true, false, false, false) {
         Ok((io, conn)) => Ok(Connection { conn, _io: io }),
         Err(e) => Err(PyErr::new::<ProgrammingError, _>(format!(
             "Failed to create connection: {e:?}"
@@ -348,13 +348,13 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
-        return Ok(Value::Integer(integer));
+        Ok(Value::Integer(integer))
     } else if let Ok(float) = obj.extract::<f64>() {
-        return Ok(Value::Float(float));
+        Ok(Value::Float(float))
     } else if let Ok(string) = obj.extract::<String>() {
-        return Ok(Value::Text(string.into()));
+        Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        return Ok(Value::Blob(bytes.as_bytes().to_vec()));
+        Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

@@ -82,6 +82,8 @@ pub enum StreamRequest {
     None,
     /// See [`ExecuteStreamReq`]
     Execute(ExecuteStreamReq),
+    /// See [`BatchStreamReq`]
+    Batch(BatchStreamReq),
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
@@ -101,6 +103,66 @@ pub enum StreamResult {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamResponse {
     Execute(ExecuteStreamResp),
+    Batch(BatchStreamResp),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+/// A request to execute a batch of SQL statements that may each have a [`BatchCond`] that must be satisfied for the statement to be executed.
+pub struct BatchStreamReq {
+    pub batch: Batch,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+/// A response to a [`BatchStreamReq`].
+pub struct BatchStreamResp {
+    pub result: BatchResult,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq)]
+pub struct BatchResult {
+    pub step_results: Vec<Option<StmtResult>>,
+    pub step_errors: Vec<Option<Error>>,
+    #[serde(default, with = "option_u64_as_str")]
+    pub replication_index: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct Batch {
+    pub steps: VecDeque<BatchStep>,
+    #[serde(default, with = "option_u64_as_str")]
+    pub replication_index: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct BatchStep {
+    #[serde(default)]
+    pub condition: Option<BatchCond>,
+    pub stmt: Stmt,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BatchCond {
+    #[serde(skip_deserializing)]
+    #[default]
+    None,
+    Ok {
+        step: u32,
+    },
+    Error {
+        step: u32,
+    },
+    Not {
+        cond: Box<BatchCond>,
+    },
+    And(BatchCondList),
+    Or(BatchCondList),
+    IsAutocommit {},
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct BatchCondList {
+    pub conds: Vec<BatchCond>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]

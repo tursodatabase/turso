@@ -1,20 +1,21 @@
-use std::{collections::HashSet, fmt::Display};
+use std::fmt::Display;
 
 use anyhow::Context;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
+        Create, CreateIndex, Delete, Drop, Insert, Select,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
-        Create, CreateIndex, Delete, Drop, EmptyContext, Insert, Select,
     },
     table::{JoinTable, JoinType, SimValue, Table, TableContext},
 };
-use turso_parser::ast::{fmt::ToTokens, Distinctness};
+use turso_parser::ast::Distinctness;
 
-use crate::{generation::Shadow, runner::env::SimulatorTables};
+use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,19 +33,19 @@ pub enum Query {
 }
 
 impl Query {
-    pub fn dependencies(&self) -> HashSet<String> {
+    pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
-            Query::Create(_) => HashSet::new(),
+            Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => HashSet::from_iter([table.clone()]),
+            | Query::Drop(Drop { table, .. }) => IndexSet::from_iter([table.clone()]),
             Query::CreateIndex(CreateIndex { table_name, .. }) => {
-                HashSet::from_iter([table_name.clone()])
+                IndexSet::from_iter([table_name.clone()])
             }
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => HashSet::new(),
+            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -82,7 +83,7 @@ impl Display for Query {
 impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -101,7 +102,7 @@ impl Shadow for Query {
 impl Shadow for Create {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         if !tables.iter().any(|t| t.name == self.table.name) {
             tables.push(self.table.clone());
             Ok(vec![])
@@ -116,9 +117,8 @@ impl Shadow for Create {
 
 impl Shadow for CreateIndex {
     type Result = Vec<Vec<SimValue>>;
-    fn shadow(&self, env: &mut SimulatorTables) -> Vec<Vec<SimValue>> {
-        env.tables
-            .iter_mut()
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Vec<Vec<SimValue>> {
+        env.iter_mut()
             .find(|t| t.name == self.table_name)
             .unwrap()
             .indexes
@@ -130,8 +130,8 @@ impl Shadow for CreateIndex {
 impl Shadow for Delete {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
-        let table = tables.tables.iter_mut().find(|t| t.name == self.table);
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        let table = tables.iter_mut().find(|t| t.name == self.table);
 
         if let Some(table) = table {
             // If the table exists, we can delete from it
@@ -152,7 +152,7 @@ impl Shadow for Delete {
 impl Shadow for Drop {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         if !tables.iter().any(|t| t.name == self.table) {
             // If the table does not exist, we return an error
             return Err(anyhow::anyhow!(
@@ -161,7 +161,7 @@ impl Shadow for Drop {
             ));
         }
 
-        tables.tables.retain(|t| t.name != self.table);
+        tables.retain(|t| t.name != self.table);
 
         Ok(vec![])
     }
@@ -170,10 +170,10 @@ impl Shadow for Drop {
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
-                if let Some(t) = tables.tables.iter_mut().find(|t| &t.name == table) {
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(values.clone());
                 } else {
                     return Err(anyhow::anyhow!(
@@ -184,7 +184,7 @@ impl Shadow for Insert {
             }
             Insert::Select { table, select } => {
                 let rows = select.shadow(tables)?;
-                if let Some(t) = tables.tables.iter_mut().find(|t| &t.name == table) {
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
                     t.rows.extend(rows);
                 } else {
                     return Err(anyhow::anyhow!(
@@ -201,9 +201,7 @@ impl Shadow for Insert {
 
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
-    fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
-        let tables = &mut env.tables;
-
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         let first_table = tables
             .iter()
             .find(|t| t.name == self.table)
@@ -258,7 +256,7 @@ impl Shadow for FromClause {
 impl Shadow for SelectInner {
     type Result = anyhow::Result<JoinTable>;
 
-    fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         if let Some(from) = &self.from {
             let mut join_table = from.shadow(env)?;
             let col_count = join_table.columns().count();
@@ -282,10 +280,11 @@ impl Shadow for SelectInner {
 
             Ok(join_table)
         } else {
-            assert!(self
-                .columns
-                .iter()
-                .all(|col| matches!(col, ResultColumn::Expr(_))));
+            assert!(
+                self.columns
+                    .iter()
+                    .all(|col| matches!(col, ResultColumn::Expr(_)))
+            );
 
             // If `WHERE` is false, just return an empty table
             if !self.where_clause.test(&[], &Table::anonymous(vec![])) {
@@ -306,7 +305,7 @@ impl Shadow for SelectInner {
                         } else {
                             return Err(anyhow::anyhow!(
                                 "Failed to evaluate expression in free select ({})",
-                                expr.0.format_with_context(&EmptyContext {}).unwrap()
+                                expr.0
                             ));
                         }
                     }
@@ -325,7 +324,7 @@ impl Shadow for SelectInner {
 impl Shadow for Select {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, env: &mut SimulatorTables) -> Self::Result {
+    fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         let first_result = self.body.select.shadow(env)?;
 
         let mut rows = first_result.rows;
@@ -355,26 +354,26 @@ impl Shadow for Select {
 
 impl Shadow for Begin {
     type Result = Vec<Vec<SimValue>>;
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
-        tables.snapshot = Some(tables.tables.clone());
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        // FIXME: currently the snapshot is taken eagerly
+        // this is wrong for Deffered transactions
+        tables.create_snapshot();
         vec![]
     }
 }
 
 impl Shadow for Commit {
     type Result = Vec<Vec<SimValue>>;
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
-        tables.snapshot = None;
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.apply_snapshot();
         vec![]
     }
 }
 
 impl Shadow for Rollback {
     type Result = Vec<Vec<SimValue>>;
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
-        if let Some(tables_) = tables.snapshot.take() {
-            tables.tables = tables_;
-        }
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tables.delete_snapshot();
         vec![]
     }
 }
@@ -382,8 +381,8 @@ impl Shadow for Rollback {
 impl Shadow for Update {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
-    fn shadow(&self, tables: &mut SimulatorTables) -> Self::Result {
-        let table = tables.tables.iter_mut().find(|t| t.name == self.table);
+    fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        let table = tables.iter_mut().find(|t| t.name == self.table);
 
         let table = if let Some(table) = table {
             table

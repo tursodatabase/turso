@@ -1,0 +1,12 @@
+[package]
+name = "write-throughput-sqlite"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "write-throughput-sqlite"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite = { workspace = true }
+clap = { workspace = true, features = ["derive"] }

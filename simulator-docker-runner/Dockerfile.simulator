@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1.87.0 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.88.0 AS chef
 RUN apt update \
     && apt install -y git libssl-dev pkg-config\
     && apt clean \
@@ -19,7 +19,9 @@ COPY extensions ./extensions/
 COPY macros ./macros/
 COPY sync ./sync
 COPY parser ./parser/
-COPY vendored ./vendored/
+COPY perf/encryption ./perf/encryption
+COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY perf/throughput/turso ./perf/throughput/turso
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
 COPY stress ./stress/
@@ -27,6 +29,7 @@ COPY tests ./tests/
 COPY packages ./packages/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY sql_generation ./sql_generation/
+COPY whopper ./whopper
 RUN cargo chef prepare --bin limbo_sim --recipe-path recipe.json
 
 #
@@ -38,10 +41,12 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin limbo_sim --release --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
-COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/perf/encryption ./perf/encryption
+COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
 COPY --from=planner /app/simulator ./simulator/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/

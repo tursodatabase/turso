@@ -100,7 +100,7 @@ def test_switch_back_to_in_memory():
     shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
     # Then switch back to :memory:
     shell.run_test("switch-back", ".open :memory:", "")
-    shell.run_test("schema-in-memory", ".schema users", "-- Error: Table 'users' not found.")
+    shell.run_test("schema-in-memory", ".schema users", "")
     shell.quit()
 
 
@@ -355,6 +355,20 @@ def test_copy_memory_db_to_file():
     sqlite.quit()
 
 
+def test_parse_error():
+    testpath = "testing/memory.db"
+    if Path(testpath).exists():
+        os.unlink(Path(testpath))
+        time.sleep(0.2)  # make sure closed
+
+    turso = TestTursoShell(init_commands="")
+    turso.run_test_fn(
+        "select * from sqlite_schema limit asdf;",
+        lambda res: "Parse error: " in res,
+        "Try to LIMIT using an identifier should trigger a Parse error",
+    )
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_basic_queries()
@@ -378,6 +392,7 @@ def main():
     test_uri_readonly()
     test_copy_db_file()
     test_copy_memory_db_to_file()
+    test_parse_error()
     console.info("All tests have passed")
 
 

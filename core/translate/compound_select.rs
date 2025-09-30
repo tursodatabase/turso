@@ -1,10 +1,12 @@
 use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::emitter::{emit_query, LimitCtx, TranslateCtx};
+use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
+use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
+use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::SymbolTable;
+use crate::{emit_explain, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, SortOrder};
@@ -14,9 +16,8 @@ use tracing::Level;
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     plan: Plan,
-    schema: &Schema,
-    syms: &SymbolTable,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
         left: _left,
@@ -30,37 +31,49 @@ pub fn emit_program_for_compound_select(
     };
 
     let right_plan = right_most.clone();
-    // Trivial exit on LIMIT 0
-    if let Some(limit) = limit {
-        if *limit == 0 {
-            program.result_columns = right_plan.result_columns;
-            program.table_references.extend(right_plan.table_references);
-            return Ok(());
-        }
-    }
+    let right_most_ctx = TranslateCtx::new(
+        program,
+        resolver.schema,
+        resolver.symbol_table,
+        right_most.table_references.joined_tables().len(),
+    );
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.map(|limit| {
+    let limit_ctx = limit.as_ref().map(|limit| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: limit as i64,
-            dest: reg,
-        });
+        if let Some(val) = try_fold_expr_to_i64(limit) {
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
         LimitCtx::new_shared(reg)
     });
-    let offset_reg = offset.map(|offset| {
+    let offset_reg = offset.as_ref().map(|offset_expr| {
         let reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            value: offset as i64,
-            dest: reg,
-        });
+
+        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
+            // Compile-time constant offset
+            program.emit_insn(Insn::Integer {
+                value: val,
+                dest: reg,
+            });
+        } else {
+            program.add_comment(program.offset(), "OFFSET expr");
+            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+            program.emit_insn(Insn::MustBeInt { reg });
+        }
 
         let combined_reg = program.alloc_register();
         program.emit_insn(Insn::OffsetLimit {
             offset_reg: reg,
             combined_reg,
-            limit_reg: limit_ctx.unwrap().reg_limit,
+            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
         });
 
         reg
@@ -77,16 +90,18 @@ pub fn emit_program_for_compound_select(
         _ => (None, None),
     };
 
+    emit_explain!(program, true, "COMPOUND QUERY".to_owned());
     emit_compound_select(
         program,
         plan,
-        schema,
-        syms,
+        right_most_ctx.resolver.schema,
+        right_most_ctx.resolver.symbol_table,
         limit_ctx,
         offset_reg,
         yield_reg,
         reg_result_cols_start,
     )?;
+    program.pop_current_parent_explain();
 
     program.result_columns = right_plan.result_columns;
     program.table_references.extend(right_plan.table_references);
@@ -118,6 +133,14 @@ fn emit_compound_select(
         unreachable!()
     };
 
+    let compound_select_end = program.allocate_label();
+    if let Some(limit_ctx) = &limit_ctx {
+        program.emit_insn(Insn::IfNot {
+            reg: limit_ctx.reg_limit,
+            target_pc: compound_select_end,
+            jump_if_null: false,
+        });
+    }
     let mut right_most_ctx = TranslateCtx::new(
         program,
         schema,
@@ -137,8 +160,8 @@ fn emit_compound_select(
                 let compound_select = Plan::CompoundSelect {
                     left,
                     right_most: plan,
-                    limit,
-                    offset,
+                    limit: limit.clone(),
+                    offset: offset.clone(),
                     order_by,
                 };
                 emit_compound_select(
@@ -166,7 +189,10 @@ fn emit_compound_select(
                     right_most.offset = offset;
                     right_most_ctx.reg_offset = offset_reg;
                 }
+
+                emit_explain!(program, true, "UNION ALL".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 program.preassign_label_to_next_insn(label_next_select);
             }
             CompoundOperator::Union => {
@@ -208,7 +234,10 @@ fn emit_compound_select(
                     index: dedupe_index.1.clone(),
                     is_delete: false,
                 };
+
+                emit_explain!(program, true, "UNION USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
@@ -261,7 +290,9 @@ fn emit_compound_select(
                     index: right_index,
                     is_delete: false,
                 };
+                emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 read_intersect_rows(
                     program,
                     left_cursor_id,
@@ -311,7 +342,9 @@ fn emit_compound_select(
                     index: index.clone(),
                     is_delete: true,
                 };
+                emit_explain!(program, true, "EXCEPT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
                         program, cursor_id, &index, limit_ctx, offset_reg, yield_reg,
@@ -328,9 +361,13 @@ fn emit_compound_select(
                 right_most.offset = offset;
                 right_most_ctx.reg_offset = offset_reg;
             }
+            emit_explain!(program, true, "LEFT-MOST SUBQUERY".to_owned());
             emit_query(program, &mut right_most, &mut right_most_ctx)?;
+            program.pop_current_parent_explain();
         }
     }
+
+    program.preassign_label_to_next_insn(compound_select_end);
 
     Ok(())
 }
@@ -366,6 +403,7 @@ fn create_dedupe_index(
         table_name: String::new(),
         unique: false,
         has_rowid: false,
+        where_clause: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -503,6 +541,7 @@ fn read_intersect_rows(
             count: column_count,
             dest_reg: row_content_reg,
             index_name: None,
+            affinity_str: None,
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: target_cursor_id,

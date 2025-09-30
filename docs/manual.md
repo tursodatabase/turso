@@ -9,6 +9,8 @@ Welcome to Turso database manual!
   - [Introduction](#introduction)
     - [Getting Started](#getting-started)
     - [Limitations](#limitations)
+  - [Transactions](#transactions)
+    - [Deferred transaction lifecycle](#deferred-transaction-lifecycle)
   - [The SQL shell](#the-sql-shell)
     - [Shell commands](#shell-commands)
     - [Command line options](#command-line-options)
@@ -38,6 +40,7 @@ Welcome to Turso database manual!
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
   - [Encryption](#encryption)
+  - [CDC](#cdc-early-preview)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -88,6 +91,7 @@ hello, world
 
 Turso aims towards full SQLite compatibility but has the following limitations:
 
+* Query result ordering is not guaranteed to be the same (see [#2964](https://github.com/tursodatabase/turso/issues/2964) for more discussion)
 * No multi-process access
 * No multi-threading
 * No savepoints
@@ -137,6 +141,23 @@ The SQL shell supports the following command line options:
 | `--experimental-mvcc` | Enable experimental MVCC feature. **Note:**  the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 
+## Transactions
+
+A transaction is a sequence of one or more SQL statements that execute as a single, atomic unit of work.
+A transaction ensures **atomicity** and **isolation**, meaning that either all SQL statements are executed or none of them are, and that concurrent transactions don't interfere with other transactions.
+Transactions maintain database integrity in the presence of errors, crashes, and concurrent access.
+
+Turso supports two types of transactions: **deferred** and **immediate** transactions:
+
+* **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.
+* **Immediate**: The transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists. The `EXCLUSIVE` mode is always an alias for `IMMEDIATE` in Turso, just like it is in SQLite in WAL mode.
+
+### Deferred transaction lifecycle
+
+When the `BEGIN DEFERRED TRANSACTION` statement executes, the database acquires no snapshot or locks. Instead, the transaction is in a suspended state until the first read or write SQL statement executes. When the first read statement executes, a read transaction begins. The database allows multiple read transactions to exist concurrently. When the first write statement executes, a read transaction is either upgraded to a write transaction or a write transaction begins. The database allows a single write transaction at a time. Concurrent write transactions fail with `SQLITE_BUSY` error.
+
+If a deferred transaction remains unused (no reads or writes), it is automatically restarted by the database if another write transaction commits before the transaction is used. However, if the deferred transaction has already performed reads and another concurrent write transaction commits, it cannot automatically restart due to potential snapshot inconsistency. In this case, the deferred transaction must be manually rolled back and restarted by the application.
+
 ## The SQL language
 
 ### `ALTER TABLE` — change table definition
@@ -175,12 +196,13 @@ BEGIN [ transaction_mode ] [ TRANSACTION ]
 
 where `transaction_mode` is one of the following:
 
-* `DEFERRED`
-* `IMMEDIATE`
-* `EXCLUSIVE`
+* A `DEFERRED` transaction in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes.
+* An `IMMEDIATE` transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists.
+* An `EXCLUSIVE` transaction is always an alias for `IMMEDIATE`.
 
 **See also:**
 
+* [Transactions](#transactions)
 * [END TRANSACTION](#end-transaction--commit-the-current-transaction)
 
 ### `COMMIT TRANSACTION` — commit the current transaction
@@ -509,7 +531,128 @@ $ cargo run --features encryption -- database.db
 PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
 PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
 ```
+Alternatively you can provide the encryption parameters directly in a **URI**. For example:
+```shell
+$ cargo run --features encryption \
+"file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
 
+
+> **Note:**  To reopen an already *encrypted database*,the file **must** opened in URI format with the `cipher` and `hexkey` passed as URI parameters. Now, to reopen `database.db` the command below must be run:
+
+```shell
+$ cargo run --features encryption \
+   "file:database.db?cipher=aegis256hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+```
+
+
+## CDC (Early Preview)
+
+Turso supports [Change Data Capture](https://en.wikipedia.org/wiki/Change_data_capture), a powerful pattern for tracking and recording changes to your database in real-time. Instead of periodically scanning tables to find what changed, CDC automatically logs every insert, update, and delete as it happens per connection.
+
+### Enabling CDC
+
+```sql
+PRAGMA unstable_capture_data_changes_conn('<mode>[,custom_cdc_table]');
+```
+
+### Parameters
+- `<mode>` can be:
+    - `off`: Turn off CDC for the connection
+    - `id`: Logs only the `rowid` (most compact)
+    - `before`: Captures row state before updates and deletes
+    - `after`: Captures row state after inserts and updates
+    - `full`: Captures both before and after states (recommended for complete audit trail)
+
+- `custom_cdc` is optional, It lets you specify a custom table to capture changes.
+If no table is provided, Turso uses a default `turso_cdc` table.
+
+
+When **Change Data Capture (CDC)** is enabled for a connection, Turso automatically logs all modifications from that connection into a dedicated table (default: `turso_cdc`). This table records each change with details about the operation, the affected row or schema object, and its state **before** and **after** the modification.
+
+> **Note:** Currently, the CDC table is a regular table stored explicitly on disk. If you use full CDC mode and update rows frequently, each update of size N bytes will be written three times to disk (once for the before state, once for the after state, and once for the actual value in the WAL). Frequent updates in full mode can therefore significantly increase disk I/O.
+
+
+
+- **`change_id` (INTEGER)**  
+  A monotonically increasing integer uniquely identifying each change record.(guaranteed by turso-db) 
+  - Always strictly increasing.  
+  - Serves as the primary key.  
+
+- **`change_time` (INTEGER)**  
+> turso-db guarantee nothing about properties of the change_time sequence 
+  Local timestamp (Unix epoch, seconds) when the change was recorded.  
+  - Not guaranteed to be strictly increasing (can drift or repeat).  
+
+- **`change_type` (INTEGER)**  
+  Indicates the type of operation:  
+  - `1` → INSERT  
+  - `0` → UPDATE (also used for ALTER TABLE)  
+  - `-1` → DELETE (also covers DROP TABLE, DROP INDEX)  
+
+- **`table_name` (TEXT)**  
+  Name of the affected table.  
+  - For schema changes (DDL), this is always `"sqlite_schema"`.  
+
+- **`id` (INTEGER)**  
+  Rowid of the affected row in the source table.  
+  - For DDL operations: rowid of the `sqlite_schema` entry.  
+  - **Note:** `WITHOUT ROWID` tables are not supported in the tursodb and CDC
+
+- **`before` (BLOB)**  
+  Full state of the row/schema **before** an UPDATE or DELETE
+  - NULL for INSERT.  
+  - For DDL changes, may contain the definition of the object before modification.  
+
+- **`after` (BLOB)**  
+  Full state of the row/schema **after** an INSERT or UPDATE
+  - NULL for DELETE.  
+  - For DDL changes, may contain the definition of the object after modification.  
+
+- **`updates` (BLOB)**  
+  Granular details about the change.  
+  - For UPDATE: shows specific column modifications.  
+
+
+> CDC records are visible even before a transaction commits. 
+> Operations that fail (e.g., constraint violations) are not recorded in CDC.
+
+> Changes to the CDC table itself are also logged to CDC table. if CDC is enabled for that connection.
+
+```zsh
+Example:
+turso> PRAGMA unstable_capture_data_changes_conn('full');
+turso> .tables
+turso_cdc
+turso> CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT
+);
+turso> INSERT INTO users VALUES (1, 'John'), (2, 'Jane');
+
+UPDATE users SET name='John Doe' WHERE id=1;
+
+DELETE FROM users WHERE id=2;
+
+SELECT * FROM turso_cdc;
+┌───────────┬─────────────┬─────────────┬───────────────┬────┬──────────┬──────────────────────────────────────────────────────────────────────────────┬───────────────┐
+│ change_id │ change_time │ change_type │ table_name    │ id │ before   │ after                                                                        │ updates       │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         1 │  1756713161 │           1 │ sqlite_schema │  2 │          │ ytableusersusersCREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         2 │  1756713176 │           1 │ users         │  1 │          │       John                                                                      │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         3 │  1756713176 │           1 │ users         │  2 │          │ Jane                                                                     │               │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         4 │  1756713176 │           0 │ users         │  1 │  John  │         John Doe                                                                  │     John Doe │
+├───────────┼─────────────┼─────────────┼───────────────┼────┼──────────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│         5 │  1756713176 │          -1 │ users         │  2 │ Jane │                                                                              │               │
+└───────────┴─────────────┴─────────────┴───────────────┴────┴──────────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┘
+turso>
+
+```
+
+If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
 ## Appendix A: Turso Internals
 
 Turso's architecture resembles SQLite's but differs primarily in its

@@ -3,8 +3,8 @@ pub mod import;
 
 use args::{
     CwdArgs, DbConfigArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs,
-    NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs, StatsArgs,
-    TablesArgs, TimerArgs,
+    ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs,
+    StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -94,6 +94,9 @@ pub enum Command {
     Headers(HeadersArgs),
     #[command(name = "clone", display_name = ".clone")]
     Clone(CloneArgs),
+    /// Display manual pages for features
+    #[command(name = "manual", display_name = ".manual", alias = "man")]
+    Manual(ManualArgs),
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

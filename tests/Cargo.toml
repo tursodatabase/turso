@@ -16,23 +16,25 @@ path = "integration/mod.rs"
 
 [dependencies]
 anyhow.workspace = true
-env_logger = "0.10.1"
-turso_core = { path = "../core", features = ["conn_raw_api"] }
-turso = { path = "../bindings/rust", features = ["conn_raw_api"] }
-tokio = { version = "1.47", features = ["full"] }
+env_logger = { workspace = true }
+turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso = { workspace = true, features = ["conn_raw_api"] }
+tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
-tempfile = "3.0.7"
+tempfile = { workspace = true }
 log = "0.4.22"
 assert_cmd = "^2"
-rand_chacha = "0.9.0"
-rand = "0.9.0"
+rand_chacha = { workspace = true }
+rand = { workspace = true }
 zerocopy = "0.8.26"
 ctor = "0.5.0"
+twox-hash = "2.1.1"
 
 [dev-dependencies]
 test-log = { version = "0.2.17", features = ["trace"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-tracing = "0.1.41"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing = { workspace = true }
 
 [features]
 encryption = ["turso_core/encryption"]
+checksum = ["turso_core/checksum"]

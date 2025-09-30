@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
+import java.nio.ByteBuffer;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.Clob;
@@ -48,9 +49,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     requireNonNull(this.statement);
     final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
-
-    // TODO: return updated count
-    return 0;
+    return Math.toIntExact(statement.changes());
   }
 
   @Override
@@ -121,17 +120,38 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setDate(int parameterIndex, Date x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+    } else {
+      long time = x.getTime();
+      this.statement.bindBlob(
+          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+    }
   }
 
   @Override
   public void setTime(int parameterIndex, Time x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+    } else {
+      long time = x.getTime();
+      this.statement.bindBlob(
+          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+    }
   }
 
   @Override
   public void setTimestamp(int parameterIndex, Timestamp x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+    } else {
+      long time = x.getTime();
+      this.statement.bindBlob(
+          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+    }
   }
 
   @Override
@@ -212,17 +232,18 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setDate(int parameterIndex, Date x, Calendar cal) throws SQLException {
-    // TODO
+    setDate(parameterIndex, x);
   }
 
   @Override
   public void setTime(int parameterIndex, Time x, Calendar cal) throws SQLException {
-    // TODO
+    setTime(parameterIndex, x);
   }
 
   @Override
   public void setTimestamp(int parameterIndex, Timestamp x, Calendar cal) throws SQLException {
-    // TODO
+    // TODO: Apply calendar timezone conversion
+    setTimestamp(parameterIndex, x);
   }
 
   @Override

@@ -15,12 +15,7 @@ use std::{io::ErrorKind, sync::Arc};
 use tracing::debug;
 use tracing::{instrument, trace, Level};
 
-/// UnixIO lives longer than any of the files it creates, so it is
-/// safe to store references to it's internals in the UnixFiles
 pub struct UnixIO {}
-
-unsafe impl Send for UnixIO {}
-unsafe impl Sync for UnixIO {}
 
 impl UnixIO {
     #[cfg(feature = "fs")]
@@ -122,34 +117,14 @@ impl IO for UnixIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn run_once(&self) -> Result<()> {
+    fn step(&self) -> Result<()> {
         Ok(())
     }
 }
 
-// enum CompletionCallback {
-//     Read(Arc<Mutex<std::fs::File>>, Completion, usize),
-//     Write(
-//         Arc<Mutex<std::fs::File>>,
-//         Completion,
-//         Arc<crate::Buffer>,
-//         usize,
-//     ),
-//     Writev(
-//         Arc<Mutex<std::fs::File>>,
-//         Completion,
-//         Vec<Arc<crate::Buffer>>,
-//         usize, // absolute file offset
-//         usize, // buf index
-//         usize, // intra-buf offset
-//     ),
-// }
-
 pub struct UnixFile {
     file: Arc<Mutex<std::fs::File>>,
 }
-unsafe impl Send for UnixFile {}
-unsafe impl Sync for UnixFile {}
 
 impl File for UnixFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
@@ -192,7 +167,7 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pread(&self, pos: usize, c: Completion) -> Result<Completion> {
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
         let result = unsafe {
             let r = c.as_read();
@@ -217,31 +192,55 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = unsafe {
-            libc::pwrite(
-                file.as_raw_fd(),
-                buffer.as_slice().as_ptr() as *const libc::c_void,
-                buffer.as_slice().len(),
-                pos as libc::off_t,
-            )
-        };
-        if result == -1 {
-            let e = std::io::Error::last_os_error();
-            Err(e.into())
-        } else {
-            trace!("pwrite n: {}", result);
-            // Write succeeded immediately
-            c.complete(result as i32);
-            Ok(c)
+        let buf_slice = buffer.as_slice();
+        let total_size = buf_slice.len();
+
+        let mut total_written = 0usize;
+        let mut current_pos = pos;
+
+        while total_written < total_size {
+            let remaining_slice = &buf_slice[total_written..];
+            let result = unsafe {
+                libc::pwrite(
+                    file.as_raw_fd(),
+                    remaining_slice.as_ptr() as *const libc::c_void,
+                    remaining_slice.len(),
+                    current_pos as libc::off_t,
+                )
+            };
+            if result == -1 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    // EINTR, retry without advancing
+                    continue;
+                }
+                return Err(e.into());
+            }
+            let written = result as usize;
+            if written == 0 {
+                // Unexpected EOF for regular files
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "pwrite returned 0 bytes written",
+                )
+                .into());
+            }
+
+            total_written += written;
+            current_pos += written as u64;
+            trace!("pwrite iteration: wrote {written}, total {total_written}/{total_size}");
         }
+        trace!("pwrite complete: wrote {total_written} bytes");
+        c.complete(total_written as i32);
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn pwritev(
         &self,
-        pos: usize,
+        pos: u64,
         buffers: Vec<Arc<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
@@ -249,18 +248,60 @@ impl File for UnixFile {
             // use `pwrite` for single buffer
             return self.pwrite(pos, buffers[0].clone(), c);
         }
-        let file = self.file.lock();
 
-        match try_pwritev_raw(file.as_raw_fd(), pos as u64, &buffers, 0, 0) {
-            Ok(written) => {
-                trace!("pwritev wrote {written}");
-                c.complete(written as i32);
-                Ok(c)
-            }
-            Err(e) => {
-                return Err(e.into());
+        let file = self.file.lock();
+        let mut total_written = 0usize;
+        let mut current_pos = pos;
+        let mut buf_idx = 0;
+        let mut buf_offset = 0;
+
+        let total_size: usize = buffers.iter().map(|b| b.len()).sum();
+        while total_written < total_size {
+            match try_pwritev_raw(file.as_raw_fd(), current_pos, &buffers, buf_idx, buf_offset) {
+                Ok(written) => {
+                    if written == 0 {
+                        // Unexpected EOF
+                        return Err(std::io::Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "pwritev returned 0 bytes written",
+                        )
+                        .into());
+                    }
+                    total_written += written;
+                    current_pos += written as u64;
+
+                    let mut remaining = written;
+                    while remaining > 0 && buf_idx < buffers.len() {
+                        let buf_remaining = buffers[buf_idx].len() - buf_offset;
+
+                        if remaining >= buf_remaining {
+                            // Consumed rest of current buffer
+                            remaining -= buf_remaining;
+                            buf_idx += 1;
+                            buf_offset = 0;
+                        } else {
+                            // Partial write within current buffer
+                            buf_offset += remaining;
+                            remaining = 0;
+                        }
+                    }
+
+                    trace!(
+                        "pwritev iteration: wrote {written}, total {total_written}/{total_size}"
+                    );
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    // EINTR - retry without advancing
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
             }
         }
+        trace!("pwritev complete: wrote {total_written} bytes");
+        c.complete(total_written as i32);
+        Ok(c)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -268,24 +309,21 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
                 libc::fsync(file.as_raw_fd())
             }
-            
+
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
                 libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
             }
-            
         };
-        
+
         if result == -1 {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
-
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             trace!("fsync");
 
@@ -304,9 +342,9 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::INFO)]
-    fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         let file = self.file.lock();
-        let result = file.set_len(len as u64);
+        let result = file.set_len(len);
         match result {
             Ok(()) => {
                 trace!("file truncated to len=({})", len);

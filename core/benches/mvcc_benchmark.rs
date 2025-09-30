@@ -5,8 +5,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID};
-use turso_core::state_machine::{StateTransition, TransitionResult};
-use turso_core::types::{ImmutableRecord, Text};
+use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
 
 struct BenchDb {
@@ -35,8 +34,10 @@ fn bench(c: &mut Criterion) {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
-            db.mvcc_store.rollback_tx(tx_id, conn.get_pager().clone())
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            db.mvcc_store
+                .rollback_tx(tx_id, conn.get_pager().clone(), &conn)
+                .unwrap();
         })
     });
 
@@ -44,18 +45,15 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx + commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
+            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })
@@ -65,7 +63,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-read-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
                 .read(
                     tx_id,
@@ -76,16 +74,13 @@ fn bench(c: &mut Criterion) {
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
+            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })
@@ -97,7 +92,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-update-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone());
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
                 .update(
                     tx_id,
@@ -109,27 +104,23 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
-            let mut sm = mv_store
-                .commit_tx(tx_id, conn.get_pager().clone(), conn)
-                .unwrap();
+            let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
                 let res = sm.step(mv_store).unwrap();
                 match res {
-                    TransitionResult::Io(io) => io.wait(db._db.io.as_ref()).unwrap(),
-                    TransitionResult::Continue => continue,
-                    TransitionResult::Done(_) => break,
+                    IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
+                    IOResult::Done(_) => break,
                 }
             }
         })
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -158,8 +149,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone());
-    let conn = &db.conn;
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -186,7 +176,6 @@ fn bench(c: &mut Criterion) {
                         data: record_data.clone(),
                         column_count: 1,
                     },
-                    conn.get_pager().clone(),
                 )
                 .unwrap();
         })

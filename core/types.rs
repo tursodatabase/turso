@@ -5,6 +5,7 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
@@ -14,10 +15,8 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Completion, Result, IO};
+use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
-
-const MAX_REAL_SIZE: u8 = 15;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -227,10 +226,7 @@ where
 {
     let s = String::deserialize(deserializer)?;
     match crate::numeric::str_to_f64(s) {
-        Some(result) => Ok(match result {
-            crate::numeric::StrToF64::Fractional(non_nan) => non_nan.into(),
-            crate::numeric::StrToF64::Decimal(non_nan) => non_nan.into(),
-        }),
+        Some(result) => Ok(result.into()),
         None => Err(serde::de::Error::custom("")),
     }
 }
@@ -350,6 +346,13 @@ impl Value {
         }
     }
 
+    pub fn as_uint(&self) -> u64 {
+        match self {
+            Value::Integer(i) => (*i).cast_unsigned(),
+            _ => 0,
+        }
+    }
+
     pub fn from_text(text: &str) -> Self {
         Value::Text(Text::new(text))
     }
@@ -383,6 +386,14 @@ impl Value {
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
+
+    /// Cast Value to String, if Value is NULL returns None
+    pub fn cast_text(&self) -> Option<String> {
+        Some(match self {
+            Value::Null => return None,
+            v => v.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,14 +402,6 @@ pub struct ExternalAggState {
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
-    pub finalized_value: Option<Value>,
-}
-
-impl ExternalAggState {
-    pub fn cache_final_value(&mut self, value: Value) -> &Value {
-        self.finalized_value = Some(value);
-        self.finalized_value.as_ref().unwrap()
-    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -418,108 +421,7 @@ impl Display for Value {
             Self::Integer(i) => {
                 write!(f, "{i}")
             }
-            Self::Float(fl) => {
-                let fl = *fl;
-                if fl == f64::INFINITY {
-                    return write!(f, "Inf");
-                }
-                if fl == f64::NEG_INFINITY {
-                    return write!(f, "-Inf");
-                }
-                if fl.is_nan() {
-                    return write!(f, "");
-                }
-                // handle negative 0
-                if fl == -0.0 {
-                    return write!(f, "{:.1}", fl.abs());
-                }
-
-                // handle scientific notation without trailing zeros
-                if (fl.abs() < 1e-4 || fl.abs() >= 1e15) && fl != 0.0 {
-                    let sci_notation = format!("{fl:.14e}");
-                    let parts: Vec<&str> = sci_notation.split('e').collect();
-
-                    if parts.len() == 2 {
-                        let mantissa = parts[0];
-                        let exponent = parts[1];
-
-                        let decimal_parts: Vec<&str> = mantissa.split('.').collect();
-                        if decimal_parts.len() == 2 {
-                            let whole = decimal_parts[0];
-                            // 1.{this part}
-                            let mut fraction = String::from(decimal_parts[1]);
-
-                            //removing trailing 0 from fraction
-                            while fraction.ends_with('0') {
-                                fraction.pop();
-                            }
-
-                            let trimmed_mantissa = if fraction.is_empty() {
-                                whole.to_string()
-                            } else {
-                                format!("{whole}.{fraction}")
-                            };
-                            let (prefix, exponent) =
-                                if let Some(stripped_exponent) = exponent.strip_prefix('-') {
-                                    ("-0", &stripped_exponent[1..])
-                                } else {
-                                    ("+", exponent)
-                                };
-                            return write!(f, "{trimmed_mantissa}e{prefix}{exponent}");
-                        }
-                    }
-
-                    // fallback
-                    return write!(f, "{sci_notation}");
-                }
-
-                // handle floating point max size is 15.
-                // If left > right && right + left > 15 go to sci notation
-                // If right > left && right + left > 15 truncate left so right + left == 15
-                let rounded = fl.round();
-                if (fl - rounded).abs() < 1e-14 {
-                    // if we very close to integer trim decimal part to 1 digit
-                    if rounded == rounded as i64 as f64 {
-                        return write!(f, "{fl:.1}");
-                    }
-                }
-
-                let fl_str = format!("{fl}");
-                let splitted = fl_str.split('.').collect::<Vec<&str>>();
-                // fallback
-                if splitted.len() != 2 {
-                    return write!(f, "{fl:.14e}");
-                }
-
-                let first_part = if fl < 0.0 {
-                    // remove -
-                    &splitted[0][1..]
-                } else {
-                    splitted[0]
-                };
-
-                let second = splitted[1];
-
-                // We want more precision for smaller numbers. in SQLite case we want 15 non zero digits in 0 < number < 1
-                // leading zeroes added to max real size. But if float < 1e-4 we go to scientific notation
-                let leading_zeros = second.chars().take_while(|c| c == &'0').count();
-                let reminder = if first_part != "0" {
-                    MAX_REAL_SIZE as isize - first_part.len() as isize
-                } else {
-                    MAX_REAL_SIZE as isize + leading_zeros as isize
-                };
-                // float that have integer part > 15 converted to sci notation
-                if reminder < 0 {
-                    return write!(f, "{fl:.14e}");
-                }
-                // trim decimal part to reminder or self len so total digits is 15;
-                let mut fl = format!("{:.*}", second.len().min(reminder as usize), fl);
-                // if decimal part ends with 0 we trim it
-                while fl.ends_with('0') {
-                    fl.pop();
-                }
-                write!(f, "{fl}")
-            }
+            Self::Float(fl) => f.write_str(&format_float(*fl)),
             Self::Text(s) => {
                 write!(f, "{}", s.as_str())
             }
@@ -724,28 +626,13 @@ pub enum AggContext {
     External(ExternalAggState),
 }
 
-const NULL: Value = Value::Null;
-
 impl AggContext {
-    pub fn compute_external(&mut self) -> Result<()> {
+    pub fn compute_external(&self) -> Result<Value> {
         if let Self::External(ext_state) = self {
-            if ext_state.finalized_value.is_none() {
-                let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
-                ext_state.cache_final_value(Value::from_ffi(final_value)?);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn final_value(&self) -> &Value {
-        match self {
-            Self::Avg(acc, _count) => acc,
-            Self::Sum(acc, _) => acc,
-            Self::Count(count) => count,
-            Self::Max(max) => max.as_ref().unwrap_or(&NULL),
-            Self::Min(min) => min.as_ref().unwrap_or(&NULL),
-            Self::GroupConcat(s) => s,
-            Self::External(ext_state) => ext_state.finalized_value.as_ref().unwrap_or(&NULL),
+            let final_value = unsafe { (ext_state.finalize_fn)(ext_state.state) };
+            Value::from_ffi(final_value)
+        } else {
+            panic!("AggContext::compute_external() expected External, found {self:?}");
         }
     }
 }
@@ -754,11 +641,8 @@ impl PartialEq<Value> for Value {
     fn eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64) == (*float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left == (&(*int_right as f64))
+            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
+                sqlite_int_float_compare(*int, *float).is_eq()
             }
             (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
             (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
@@ -778,11 +662,11 @@ impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64).partial_cmp(float_right)
+            (Self::Float(float), Self::Integer(int)) => {
+                Some(sqlite_int_float_compare(*int, *float).reverse())
             }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left.partial_cmp(&(*int_right as f64))
+            (Self::Integer(int), Self::Float(float)) => {
+                Some(sqlite_int_float_compare(*int, *float))
             }
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
@@ -835,83 +719,89 @@ impl Ord for Value {
 impl std::ops::Add<Value> for Value {
     type Output = Value;
 
-    fn add(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                Self::Integer(int_left + int_right)
-            }
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Self::Float(int_left as f64 + float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Self::Float(float_left + int_right as f64)
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                Self::Float(float_left + float_right)
-            }
-            (Self::Text(string_left), Self::Text(string_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + string_right.as_str()))
-            }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
-                Self::build_text(&(string_left.as_str().to_string() + &int_right.to_string()))
-            }
-            (Self::Integer(int_left), Self::Text(string_right)) => {
-                Self::build_text(&(int_left.to_string() + string_right.as_str()))
-            }
-            (Self::Text(string_left), Self::Float(float_right)) => {
-                let string_right = Self::Float(float_right).to_string();
-                Self::build_text(&(string_left.as_str().to_string() + &string_right))
-            }
-            (Self::Float(float_left), Self::Text(string_right)) => {
-                let string_left = Self::Float(float_left).to_string();
-                Self::build_text(&(string_left + string_right.as_str()))
-            }
-            (lhs, Self::Null) => lhs,
-            (Self::Null, rhs) => rhs,
-            _ => Self::Float(0.0),
-        }
+    fn add(mut self, rhs: Self) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::Add<f64> for Value {
     type Output = Value;
 
-    fn add(self, rhs: f64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Float(int_left as f64 + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs),
-            _ => unreachable!(),
-        }
+    fn add(mut self, rhs: f64) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::Add<i64> for Value {
     type Output = Value;
 
-    fn add(self, rhs: i64) -> Self::Output {
-        match self {
-            Self::Integer(int_left) => Self::Integer(int_left + rhs),
-            Self::Float(float_left) => Self::Float(float_left + rhs as f64),
-            _ => unreachable!(),
-        }
+    fn add(mut self, rhs: i64) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 
 impl std::ops::AddAssign for Value {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = self.clone() + rhs;
+    fn add_assign(mut self: &mut Self, rhs: Self) {
+        match (&mut self, rhs) {
+            (Self::Integer(int_left), Self::Integer(int_right)) => *int_left += int_right,
+            (Self::Integer(int_left), Self::Float(float_right)) => {
+                *self = Self::Float(*int_left as f64 + float_right)
+            }
+            (Self::Float(float_left), Self::Integer(int_right)) => {
+                *self = Self::Float(*float_left + int_right as f64)
+            }
+            (Self::Float(float_left), Self::Float(float_right)) => {
+                *float_left += float_right;
+            }
+            (Self::Text(string_left), Self::Text(string_right)) => {
+                string_left.value.extend_from_slice(&string_right.value);
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Text(string_left), Self::Integer(int_right)) => {
+                let string_right = int_right.to_string();
+                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Integer(int_left), Self::Text(string_right)) => {
+                let string_left = int_left.to_string();
+                *self = Self::build_text(&(string_left + string_right.as_str()));
+            }
+            (Self::Text(string_left), Self::Float(float_right)) => {
+                let string_right = Self::Float(float_right).to_string();
+                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.subtype = TextSubtype::Text;
+            }
+            (Self::Float(float_left), Self::Text(string_right)) => {
+                let string_left = Self::Float(*float_left).to_string();
+                *self = Self::build_text(&(string_left + string_right.as_str()));
+            }
+            (_, Self::Null) => {}
+            (Self::Null, rhs) => *self = rhs,
+            _ => *self = Self::Float(0.0),
+        }
     }
 }
 
 impl std::ops::AddAssign<i64> for Value {
     fn add_assign(&mut self, rhs: i64) {
-        *self = self.clone() + rhs;
+        match self {
+            Self::Integer(int_left) => *int_left += rhs,
+            Self::Float(float_left) => *float_left += rhs as f64,
+            _ => unreachable!(),
+        }
     }
 }
 
 impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
-        *self = self.clone() + rhs;
+        match self {
+            Self::Integer(int_left) => *self = Self::Float(*int_left as f64 + rhs),
+            Self::Float(float_left) => *float_left += rhs,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -1280,7 +1170,7 @@ impl ImmutableRecord {
     pub fn column_count(&self) -> usize {
         let mut cursor = RecordCursor::new();
         cursor.parse_full_header(self).unwrap();
-        cursor.offsets.len()
+        cursor.serial_types.len()
     }
 }
 
@@ -2423,6 +2313,19 @@ pub enum Cursor {
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
+    MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
+}
+
+impl Debug for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
+            Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
+            Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
+            Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
+        }
+    }
 }
 
 impl Cursor {
@@ -2436,6 +2339,12 @@ impl Cursor {
 
     pub fn new_sorter(cursor: Sorter) -> Self {
         Self::Sorter(cursor)
+    }
+
+    pub fn new_materialized_view(
+        cursor: crate::incremental::cursor::MaterializedViewCursor,
+    ) -> Self {
+        Self::MaterializedView(Box::new(cursor))
     }
 
     pub fn as_btree_mut(&mut self) -> &mut BTreeCursor {
@@ -2465,6 +2374,15 @@ impl Cursor {
             _ => panic!("Cursor is not a virtual cursor"),
         }
     }
+
+    pub fn as_materialized_view_mut(
+        &mut self,
+    ) -> &mut crate::incremental::cursor::MaterializedViewCursor {
+        match self {
+            Self::MaterializedView(cursor) => cursor,
+            _ => panic!("Cursor is not a materialized view cursor"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2480,8 +2398,15 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
             IOCompletions::Many(completions) => {
-                for c in completions {
-                    io.wait_for_completion(c)?;
+                let mut completions = completions.into_iter();
+                while let Some(c) = completions.next() {
+                    let res = io.wait_for_completion(c);
+                    if res.is_err() {
+                        for c in completions {
+                            c.abort();
+                        }
+                        return res;
+                    }
                 }
                 Ok(())
             }
@@ -2500,6 +2425,13 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => c.abort(),
             IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
+        }
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        match self {
+            IOCompletions::Single(c) => c.get_error(),
+            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
         }
     }
 }
@@ -2521,9 +2453,27 @@ impl<T> IOResult<T> {
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
-        match $expr? {
-            IOResult::Done(v) => v,
-            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        match $expr {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Err(err) => return Err(err),
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! return_and_restore_if_io {
+    ($field:expr, $saved_state:expr, $e:expr) => {
+        match $e {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => {
+                let _ = std::mem::replace($field, $saved_state);
+                return Ok(IOResult::IO(io));
+            }
+            Err(e) => {
+                let _ = std::mem::replace($field, $saved_state);
+                return Err(e);
+            }
         }
     };
 }
@@ -3561,5 +3511,20 @@ mod tests {
             buf.len(),
             header_length + size_of::<i8>() + size_of::<f64>() + text.len()
         );
+    }
+
+    #[test]
+    fn test_column_count_matches_values_written() {
+        // Test with different numbers of values
+        for num_values in 1..=10 {
+            let values: Vec<Value> = (0..num_values).map(|i| Value::Integer(i as i64)).collect();
+
+            let record = ImmutableRecord::from_values(&values, values.len());
+            let cnt = record.column_count();
+            assert_eq!(
+                cnt, num_values,
+                "column_count should be {num_values}, not {cnt}"
+            );
+        }
     }
 }

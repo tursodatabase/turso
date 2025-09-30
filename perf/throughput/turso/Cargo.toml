@@ -1,0 +1,15 @@
+[package]
+name = "write-throughput"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "write-throughput"
+path = "src/main.rs"
+
+[dependencies]
+turso = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+futures = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

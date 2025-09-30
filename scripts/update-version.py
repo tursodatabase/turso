@@ -17,11 +17,23 @@ from pathlib import Path
 # Define all npm package paths in one place
 NPM_PACKAGES = [
     "bindings/javascript",
-    "bindings/javascript/npm/darwin-universal",
-    "bindings/javascript/npm/linux-x64-gnu",
-    "bindings/javascript/npm/win32-x64-msvc",
-    "bindings/javascript/npm/wasm32-wasip1-threads",
-    "sync/javascript",
+    "bindings/javascript/packages/common",
+    "bindings/javascript/packages/native",
+    "bindings/javascript/packages/wasm",
+    "bindings/javascript/packages/wasm-common",
+    "bindings/javascript/sync/packages/common",
+    "bindings/javascript/sync/packages/native",
+    "bindings/javascript/sync/packages/wasm",
+]
+
+NPM_WORKSPACE_PACKAGES = [
+    "@tursodatabase/database-common",
+    "@tursodatabase/database-wasm-common",
+    "@tursodatabase/sync-common",
+]
+
+NPM_WORKSPACES = [
+    "bindings/javascript"
 ]
 
 
@@ -79,6 +91,11 @@ def update_package_json(dir_path, new_version):  # noqa: C901
 
         # Update version regardless of current value
         package_data["version"] = new_version
+        if "dependencies" in package_data:
+            for dependency in package_data["dependencies"].keys():
+                if dependency not in NPM_WORKSPACE_PACKAGES:
+                    continue
+                package_data["dependencies"][dependency] = f"^{new_version}"
 
         # Write updated package.json
         with open(package_path, "w") as f:
@@ -120,6 +137,25 @@ def update_package_json(dir_path, new_version):  # noqa: C901
     except Exception:
         return False
 
+def run_npm_install(path):
+    """Run npm install to update package-lock.json"""
+    try:
+        # Run cargo update showing its output with verbose flag
+        print(f"Info: run npm install at path {path}")
+        subprocess.run(["npm", "install"], check=True, cwd=path)
+        return True
+    except Exception:
+        return False
+
+def run_yarn_install(path):
+    """Run yarn install to update yarn-lock.json"""
+    try:
+        # Run cargo update showing its output with verbose flag
+        print(f"Info: run yarn install at path {path}")
+        subprocess.run(["yarn", "install"], check=True, cwd=path)
+        return True
+    except Exception:
+        return False
 
 def update_all_packages(new_version):
     """Update all npm packages with the new version."""
@@ -127,6 +163,9 @@ def update_all_packages(new_version):
     for package_path in NPM_PACKAGES:
         result = update_package_json(package_path, new_version)
         results.append((package_path, result))
+    for workspace_path in NPM_WORKSPACES:
+        run_npm_install(workspace_path)
+        run_yarn_install(workspace_path)
     return results
 
 
@@ -134,6 +173,7 @@ def run_cargo_update():
     """Run cargo update to update the Cargo.lock file."""
     try:
         # Run cargo update showing its output with verbose flag
+        print("Info: run cargo update")
         subprocess.run(["cargo", "update", "--workspace", "--verbose"], check=True)
         return True
     except Exception:
@@ -150,11 +190,14 @@ def create_git_commit_and_tag(version):
         for package_path in NPM_PACKAGES:
             package_json = f"{package_path}/package.json"
             package_lock = f"{package_path}/package-lock.json"
+            yarn_lock = f"{package_path}/yarn.lock"
 
             if os.path.exists(package_json):
                 files_to_add.append(package_json)
             if os.path.exists(package_lock):
                 files_to_add.append(package_lock)
+            if os.path.exists(yarn_lock):
+                files_to_add.append(yarn_lock)
 
         # Add each file individually
         for file in files_to_add:

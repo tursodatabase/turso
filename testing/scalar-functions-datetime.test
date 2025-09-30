@@ -251,6 +251,46 @@ do_execsql_test date-with-modifier-add-months {
   SELECT date('2023-05-18', '+2 months');
 } {2023-07-18}
 
+do_execsql_test datetime-default-ceiling {
+  SELECT date('2024-01-31', '+1 month'); -- default ceiling
+} {2024-03-02}
+
+do_execsql_test datetime-floor-keeps-time {
+  SELECT datetime('2024-01-31 10:20:30', '+1 month', 'floor');
+} {{2024-02-29 10:20:30}}
+
+do_execsql_test datetime-ceiling-keeps-time {
+  SELECT datetime('2024-01-31 10:20:30', '+1 month', 'ceiling');
+} {{2024-03-02 10:20:30}}
+
+do_execsql_test date-ceiling-floor-2 {
+  SELECT date('2024-01-31', '+1 month', 'floor');
+} {2024-02-29}
+
+do_execsql_test date-ceiling-floor-3 {
+  SELECT date('2023-01-31', '+1 month', 'floor');
+} {2023-02-28}
+
+do_execsql_test date-ceiling-floor-4 {
+  SELECT date('2024-03-31', '-1 month', 'floor');
+} {2024-02-29}
+
+do_execsql_test date-ceiling-floor-5 {
+  SELECT date('2024-01-31', '+1 month', '+1 month', 'floor');
+} {2024-04-02}
+
+do_execsql_test date-ceiling-floor-6 {
+  SELECT date('2024-01-31', '+1 month', 'ceiling');
+} {2024-03-02}
+
+do_execsql_test date-ceiling-floor-7 {
+  SELECT date('2024-01-31', '+1 month', 'floor', 'ceiling');
+} {2024-02-29}
+
+do_execsql_test date-ceiling-floor-8 {
+  SELECT date('2024-01-31', '+1 month', '+1 day', 'floor');
+} {2024-03-03}
+
 do_execsql_test date-with-modifier-subtract-months {
   SELECT date('2023-05-18', '-3 months');
 } {2023-02-18}
@@ -370,6 +410,26 @@ do_execsql_test time-with-multiple-modifiers {
 do_execsql_test datetime-with-multiple-modifiers {
 select datetime('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
 } {{2024-03-02 13:06:02}}
+
+do_execsql_test datetime-with-modifier-ceiling {
+  SELECT datetime('2023-05-18 15:30:45', 'ceiling');
+} {{2023-05-18 15:30:45}}
+
+do_execsql_test datetime-with-modifier-ceiling-already-ceiled {
+  SELECT datetime('2023-05-18 23:59:59', 'ceiling');
+} {{2023-05-18 23:59:59}}
+
+do_execsql_test datetime-with-ceiling-modifier-invalid-input {
+  SELECT datetime('not-a-date', 'ceiling');
+} {{}}
+
+do_execsql_test datetime-with-ceiling-modifier-stacked {
+  SELECT datetime('2023-05-18 15:30:45', '+1 day', 'ceiling');
+} {{2023-05-19 15:30:45}}
+
+do_execsql_test date-with-ceiling-modifier-basic {
+  SELECT date('2023-05-18 15:30:45', 'ceiling');
+} {2023-05-18}
 
 do_execsql_test datetime-with-weekday {
   SELECT datetime('2023-05-18', 'weekday 3');

@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::lexer::{Lexer, Token};
 use crate::token::TokenType::{self, *};
 use crate::Result;
+use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {
     ( $parser:expr, $( $x:ident ),* $(,)?) => {
@@ -22,12 +23,13 @@ macro_rules! peek_expect {
             match token.token_type.unwrap() {
                 $($x => token,)*
                 tt => {
+                    let token_len = token.value.len();
                     // handle fallback TK_ID
                     match (TK_ID, tt.fallback_id_if_ok()) {
                         $(($x, TK_ID) => token,)*
                         _ => {
                             return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: ($parser.offset(), 1).into(),
+                                parsed_offset: ($parser.offset(), token_len).into(),
                                 expected: &[
                                     $($x,)*
                                 ],
@@ -91,26 +93,19 @@ fn from_bytes(bytes: &[u8]) -> String {
 
 #[inline]
 fn join_type_from_bytes(s: &[u8]) -> Result<JoinType> {
-    if b"CROSS".eq_ignore_ascii_case(s) {
-        Ok(JoinType::INNER | JoinType::CROSS)
-    } else if b"FULL".eq_ignore_ascii_case(s) {
-        Ok(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER)
-    } else if b"INNER".eq_ignore_ascii_case(s) {
-        Ok(JoinType::INNER)
-    } else if b"LEFT".eq_ignore_ascii_case(s) {
-        Ok(JoinType::LEFT | JoinType::OUTER)
-    } else if b"NATURAL".eq_ignore_ascii_case(s) {
-        Ok(JoinType::NATURAL)
-    } else if b"RIGHT".eq_ignore_ascii_case(s) {
-        Ok(JoinType::RIGHT | JoinType::OUTER)
-    } else if b"OUTER".eq_ignore_ascii_case(s) {
-        Ok(JoinType::OUTER)
-    } else {
-        Err(Error::Custom(format!(
+    match_ignore_ascii_case!(match s {
+        b"CROSS" => Ok(JoinType::INNER | JoinType::CROSS),
+        b"FULL" => Ok(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER),
+        b"INNER" => Ok(JoinType::INNER),
+        b"LEFT" => Ok(JoinType::LEFT | JoinType::OUTER),
+        b"NATURAL" => Ok(JoinType::NATURAL),
+        b"RIGHT" => Ok(JoinType::RIGHT | JoinType::OUTER),
+        b"OUTER" => Ok(JoinType::OUTER),
+        _ => Err(Error::Custom(format!(
             "unsupported JOIN type: {:?}",
             str::from_utf8(s)
-        )))
-    }
+        ))),
+    })
 }
 
 #[inline]
@@ -425,7 +420,8 @@ impl<'a> Parser<'a> {
                 }
                 TK_COLUMNKW => {
                     let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
-                    let can_be_columnkw = matches!(prev_tt, TK_ADD | TK_RENAME | TK_DROP);
+                    let can_be_columnkw =
+                        matches!(prev_tt, TK_ADD | TK_RENAME | TK_DROP | TK_ALTER);
 
                     if !can_be_columnkw {
                         tok.token_type = Some(TK_ID);
@@ -610,12 +606,7 @@ impl<'a> Parser<'a> {
 
     fn parse_nm(&mut self) -> Result<Name> {
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
-
-        let first_char = tok.value[0]; // no need to check empty
-        match first_char {
-            b'[' | b'\'' | b'`' | b'"' => Ok(Name::Quoted(from_bytes(tok.value))),
-            _ => Ok(Name::Ident(from_bytes(tok.value))),
-        }
+        Ok(Name::from_bytes(tok.value))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -656,6 +647,10 @@ impl<'a> Parser<'a> {
                 TK_EXCLUSIVE => {
                     eat_assert!(self, TK_EXCLUSIVE);
                     Some(TransactionType::Exclusive)
+                }
+                TK_CONCURRENT => {
+                    eat_assert!(self, TK_CONCURRENT);
+                    Some(TransactionType::Concurrent)
                 }
                 _ => None,
             },
@@ -750,7 +745,7 @@ impl<'a> Parser<'a> {
 
     fn parse_create_materialized_view(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_MATERIALIZED);
-        eat_assert!(self, TK_VIEW);
+        eat_expect!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
         let columns = self.parse_eid_list(false)?;
@@ -912,7 +907,7 @@ impl<'a> Parser<'a> {
     fn parse_fullname(&mut self, allow_alias: bool) -> Result<QualifiedName> {
         let first_name = self.parse_nm()?;
 
-        let secone_name = if let Some(tok) = self.peek()? {
+        let second_name = if let Some(tok) = self.peek()? {
             if tok.token_type == Some(TK_DOT) {
                 eat_assert!(self, TK_DOT);
                 Some(self.parse_nm()?)
@@ -938,10 +933,10 @@ impl<'a> Parser<'a> {
             None
         };
 
-        if let Some(secone_name) = secone_name {
+        if let Some(second_name) = second_name {
             Ok(QualifiedName {
                 db_name: Some(first_name),
-                name: secone_name,
+                name: second_name,
                 alias: alias_name,
             })
         } else {
@@ -1365,15 +1360,12 @@ impl<'a> Parser<'a> {
             }
             TK_CTIME_KW => {
                 let tok = eat_assert!(self, TK_CTIME_KW);
-                if b"CURRENT_DATE".eq_ignore_ascii_case(tok.value) {
-                    Ok(Box::new(Expr::Literal(Literal::CurrentDate)))
-                } else if b"CURRENT_TIME".eq_ignore_ascii_case(tok.value) {
-                    Ok(Box::new(Expr::Literal(Literal::CurrentTime)))
-                } else if b"CURRENT_TIMESTAMP".eq_ignore_ascii_case(tok.value) {
-                    Ok(Box::new(Expr::Literal(Literal::CurrentTimestamp)))
-                } else {
-                    unreachable!()
-                }
+                match_ignore_ascii_case!(match tok.value {
+                    b"CURRENT_DATE" => Ok(Box::new(Expr::Literal(Literal::CurrentDate))),
+                    b"CURRENT_TIME" => Ok(Box::new(Expr::Literal(Literal::CurrentTime))),
+                    b"CURRENT_TIMESTAMP" => Ok(Box::new(Expr::Literal(Literal::CurrentTimestamp))),
+                    _ => unreachable!(),
+                })
             }
             TK_NOT => {
                 eat_assert!(self, TK_NOT);
@@ -1469,7 +1461,10 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let can_be_lit_str = tok.token_type == Some(TK_STRING);
-                let name = self.parse_nm()?;
+
+                // can be either Literal::String or Name - so we parse raw value early and decide later
+                let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
+                let name = tok.value;
 
                 let second_name = if let Some(tok) = self.peek()? {
                     if tok.token_type == Some(TK_DOT) {
@@ -1478,7 +1473,7 @@ impl<'a> Parser<'a> {
                     } else if tok.token_type == Some(TK_LP) {
                         if can_be_lit_str {
                             return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: (self.offset(), 1).into(),
+                                parsed_offset: (self.offset() - name.len(), name.len()).into(),
                                 got: TK_STRING,
                                 expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
                             });
@@ -1491,7 +1486,7 @@ impl<'a> Parser<'a> {
                                 eat_assert!(self, TK_STAR);
                                 eat_expect!(self, TK_RP);
                                 return Ok(Box::new(Expr::FunctionCallStar {
-                                    name,
+                                    name: Name::from_bytes(name),
                                     filter_over: self.parse_filter_over()?,
                                 }));
                             }
@@ -1502,7 +1497,7 @@ impl<'a> Parser<'a> {
                                 eat_expect!(self, TK_RP);
                                 let filter_over = self.parse_filter_over()?;
                                 return Ok(Box::new(Expr::FunctionCall {
-                                    name,
+                                    name: Name::from_bytes(name),
                                     distinctness: distinct,
                                     args: exprs,
                                     order_by,
@@ -1532,20 +1527,28 @@ impl<'a> Parser<'a> {
                 if let Some(second_name) = second_name {
                     if let Some(third_name) = third_name {
                         Ok(Box::new(Expr::DoublyQualified(
-                            name,
+                            Name::from_bytes(name),
                             second_name,
                             third_name,
                         )))
                     } else {
-                        Ok(Box::new(Expr::Qualified(name, second_name)))
+                        Ok(Box::new(Expr::Qualified(
+                            Name::from_bytes(name),
+                            second_name,
+                        )))
                     }
                 } else if can_be_lit_str {
-                    Ok(Box::new(Expr::Literal(match name {
-                        Name::Quoted(s) => Literal::String(s),
-                        Name::Ident(s) => Literal::String(s),
-                    })))
+                    Ok(Box::new(Expr::Literal(Literal::String(from_bytes(name)))))
                 } else {
-                    Ok(Box::new(Expr::Id(name)))
+                    match_ignore_ascii_case!(match name {
+                        b"true" => {
+                            Ok(Box::new(Expr::Literal(Literal::Numeric("1".into()))))
+                        }
+                        b"false" => {
+                            Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
+                        }
+                        _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
+                    })
                 }
             }
         }
@@ -1729,17 +1732,12 @@ impl<'a> Parser<'a> {
                     let tok = eat_assert!(self, TK_MATCH, TK_LIKE_KW);
                     let op = match tok.token_type.unwrap() {
                         TK_MATCH => LikeOperator::Match,
-                        TK_LIKE_KW => {
-                            if b"LIKE".eq_ignore_ascii_case(tok.value) {
-                                LikeOperator::Like
-                            } else if b"GLOB".eq_ignore_ascii_case(tok.value) {
-                                LikeOperator::Glob
-                            } else if b"REGEXP".eq_ignore_ascii_case(tok.value) {
-                                LikeOperator::Regexp
-                            } else {
-                                unreachable!()
-                            }
-                        }
+                        TK_LIKE_KW => match_ignore_ascii_case!(match tok.value {
+                            b"LIKE" => LikeOperator::Like,
+                            b"GLOB" => LikeOperator::Glob,
+                            b"REGEXP" => LikeOperator::Regexp,
+                            _ => unreachable!(),
+                        }),
                         _ => unreachable!(),
                     };
 
@@ -1914,11 +1912,7 @@ impl<'a> Parser<'a> {
         }
 
         let tok = eat_expect!(self, TK_ID, TK_STRING);
-        let first_char = tok.value[0]; // no need to check empty
-        match first_char {
-            b'[' | b'\'' | b'`' | b'"' => Ok(Some(Name::Quoted(from_bytes(tok.value)))),
-            _ => Ok(Some(Name::Ident(from_bytes(tok.value)))),
-        }
+        Ok(Some(Name::from_bytes(tok.value)))
     }
 
     fn parse_sort_order(&mut self) -> Result<Option<SortOrder>> {
@@ -2598,16 +2592,24 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
-        let limit = self.parse_expr(0)?;
-        let offset = match self.peek()? {
+        let expr = self.parse_expr(0)?;
+        let (limit, offset) = match self.peek()? {
             Some(tok) => match tok.token_type.unwrap() {
-                TK_OFFSET | TK_COMMA => {
-                    eat_assert!(self, TK_OFFSET, TK_COMMA);
-                    Some(self.parse_expr(0)?)
+                TK_COMMA => {
+                    eat_assert!(self, TK_COMMA);
+                    let offset = expr;
+                    let limit = self.parse_expr(0)?;
+                    (limit, Some(offset))
                 }
-                _ => None,
+                TK_OFFSET => {
+                    eat_assert!(self, TK_OFFSET);
+                    let limit = expr;
+                    let offset = self.parse_expr(0)?;
+                    (limit, Some(offset))
+                }
+                _ => (expr, None),
             },
-            _ => None,
+            _ => (expr, None),
         };
 
         Ok(Some(Limit {
@@ -2675,11 +2677,11 @@ impl<'a> Parser<'a> {
         let columns = self.parse_eid_list(false)?;
         peek_expect!(self, TK_REFERENCES);
         let clause = self.parse_foreign_key_clause()?;
-        let deref_clause = self.parse_defer_subclause()?;
+        let defer_clause = self.parse_defer_subclause()?;
         Ok(TableConstraint::ForeignKey {
             columns,
             clause,
-            deref_clause,
+            defer_clause,
         })
     }
 
@@ -2743,25 +2745,23 @@ impl<'a> Parser<'a> {
                 TK_WITHOUT => {
                     eat_assert!(self, TK_WITHOUT);
                     let tok = eat_expect!(self, TK_ID);
-                    if b"ROWID".eq_ignore_ascii_case(tok.value) {
-                        Ok(TableOptions::WITHOUT_ROWID)
-                    } else {
-                        Err(Error::Custom(format!(
+                    match_ignore_ascii_case!(match tok.value {
+                        b"ROWID" => Ok(TableOptions::WITHOUT_ROWID),
+                        _ => Err(Error::Custom(format!(
                             "unknown table option: {}",
                             from_bytes(tok.value)
-                        )))
-                    }
+                        ))),
+                    })
                 }
                 TK_ID => {
                     let tok = eat_assert!(self, TK_ID);
-                    if b"STRICT".eq_ignore_ascii_case(tok.value) {
-                        Ok(TableOptions::STRICT)
-                    } else {
-                        Err(Error::Custom(format!(
+                    match_ignore_ascii_case!(match tok.value {
+                        b"STRICT" => Ok(TableOptions::STRICT),
+                        _ => Err(Error::Custom(format!(
                             "unknown table option: {}",
                             from_bytes(tok.value)
-                        )))
-                    }
+                        ))),
+                    })
                 }
                 _ => Ok(TableOptions::NONE),
             },
@@ -2855,18 +2855,16 @@ impl<'a> Parser<'a> {
                         match &c.col_type {
                             Some(Type { name, .. }) => {
                                 // The datatype must be one of following: INT INTEGER REAL TEXT BLOB ANY
-                                if !(name.eq_ignore_ascii_case("INT")
-                                    || name.eq_ignore_ascii_case("INTEGER")
-                                    || name.eq_ignore_ascii_case("REAL")
-                                    || name.eq_ignore_ascii_case("TEXT")
-                                    || name.eq_ignore_ascii_case("BLOB")
-                                    || name.eq_ignore_ascii_case("ANY"))
-                                {
-                                    return Err(Error::Custom(format!(
-                                        "unknown datatype for {}.{}: \"{}\"",
-                                        tbl_name, c.col_name, name
-                                    )));
-                                }
+                                let bytes_name = name.as_bytes();
+                                match_ignore_ascii_case!(match bytes_name {
+                                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => {}
+                                    _ => {
+                                        return Err(Error::Custom(format!(
+                                            "unknown datatype for {}.{}: \"{}\"",
+                                            tbl_name, c.col_name, name
+                                        )));
+                                    }
+                                })
                             }
                             _ => {
                                 // Every column definition must specify a datatype for that column. The freedom to specify a column without a datatype is removed.
@@ -3046,7 +3044,22 @@ impl<'a> Parser<'a> {
 
     fn parse_default_column_constraint(&mut self) -> Result<ColumnConstraint> {
         eat_assert!(self, TK_DEFAULT);
-        match self.peek_no_eof()?.token_type.unwrap().fallback_id_if_ok() {
+        let tok = peek_expect!(
+            self,
+            TK_NULL,
+            TK_BLOB,
+            TK_STRING,
+            TK_FLOAT,
+            TK_INTEGER,
+            TK_CTIME_KW,
+            TK_LP,
+            TK_PLUS,
+            TK_MINUS,
+            TK_ID,
+            TK_INDEXED,
+        );
+
+        match tok.token_type.unwrap() {
             TK_LP => {
                 eat_assert!(self, TK_LP);
                 let expr = self.parse_expr(0)?;
@@ -3069,10 +3082,12 @@ impl<'a> Parser<'a> {
                     self.parse_term()?,
                 ))))
             }
-            TK_ID | TK_INDEXED => Ok(ColumnConstraint::Default(Box::new(Expr::Id(
+            TK_NULL | TK_BLOB | TK_STRING | TK_FLOAT | TK_INTEGER | TK_CTIME_KW => {
+                Ok(ColumnConstraint::Default(self.parse_term()?))
+            }
+            _ => Ok(ColumnConstraint::Default(Box::new(Expr::Id(
                 self.parse_nm()?,
             )))),
-            _ => Ok(ColumnConstraint::Default(self.parse_term()?)),
         }
     }
 
@@ -3274,10 +3289,10 @@ impl<'a> Parser<'a> {
 
     fn parse_reference_column_constraint(&mut self) -> Result<ColumnConstraint> {
         let clause = self.parse_foreign_key_clause()?;
-        let deref_clause = self.parse_defer_subclause()?;
+        let defer_clause = self.parse_defer_subclause()?;
         Ok(ColumnConstraint::ForeignKey {
             clause,
-            deref_clause,
+            defer_clause,
         })
     }
 
@@ -3300,7 +3315,7 @@ impl<'a> Parser<'a> {
             Some(tok) => match tok.token_type.unwrap().fallback_id_if_ok() {
                 TK_ID => {
                     let tok = eat_assert!(self, TK_ID);
-                    Some(Name::Ident(from_bytes(tok.value)))
+                    Some(Name::exact(from_bytes(tok.value)))
                 }
                 _ => None,
             },
@@ -3418,12 +3433,8 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    fn parse_column_definition(&mut self, in_alter: bool) -> Result<ColumnDefinition> {
+    pub fn parse_column_definition(&mut self, in_alter: bool) -> Result<ColumnDefinition> {
         let col_name = self.parse_nm()?;
-        if !in_alter && col_name.as_str().eq_ignore_ascii_case("rowid") {
-            return Err(Error::Custom("cannot use reserved word: ROWID".to_owned()));
-        }
-
         let col_type = self.parse_type()?;
         let constraints = self.parse_named_column_constraints(in_alter)?;
         Ok(ColumnDefinition {
@@ -3437,7 +3448,7 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_ALTER);
         eat_expect!(self, TK_TABLE);
         let tbl_name = self.parse_fullname(false)?;
-        let tok = eat_expect!(self, TK_ADD, TK_DROP, TK_RENAME);
+        let tok = eat_expect!(self, TK_ADD, TK_DROP, TK_RENAME, TK_ALTER);
 
         match tok.token_type.unwrap() {
             TK_ADD => {
@@ -3487,6 +3498,19 @@ impl<'a> Parser<'a> {
                         body: AlterTableBody::RenameTo(to_name),
                     }))
                 }
+            }
+            TK_ALTER => {
+                eat_expect!(self, TK_COLUMNKW);
+                let col_name = self.parse_nm()?;
+
+                eat_expect!(self, TK_TO);
+
+                let new = self.parse_column_definition(true)?;
+
+                Ok(Stmt::AlterTable(AlterTable {
+                    name: tbl_name,
+                    body: AlterTableBody::AlterColumn { old: col_name, new },
+                }))
             }
             _ => unreachable!(),
         }
@@ -4000,7 +4024,6 @@ mod tests {
             "ALTER TABLE my_table ADD COLUMN my_column PRIMARY KEY",
             "ALTER TABLE my_table ADD COLUMN my_column UNIQUE",
             "CREATE TEMP TABLE baz.foo(bar)",
-            "CREATE TABLE foo(rowid)",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(d INT AS (a*abs(b)))",
             "CREATE TABLE foo(bar UNKNOWN_INT) STRICT",
@@ -4078,28 +4101,49 @@ mod tests {
                 b"BEGIN DEFERRED TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
-                    name: Some(Name::Ident("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN IMMEDIATE TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
-                    name: Some(Name::Ident("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN EXCLUSIVE TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::Ident("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"BEGIN EXCLUSIVE TRANSACTION 'my_transaction'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
-                    name: Some(Name::Quoted("'my_transaction'".to_string())),
+                    name: Some(Name::from_string("'my_transaction'")),
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
+                    name: None,
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION my_transaction".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
+                    name: Some(Name::from_string("my_transaction")),
+                })],
+            ),
+            (
+                b"BEGIN CONCURRENT TRANSACTION 'my_transaction'".as_slice(),
+                vec![Cmd::Stmt(Stmt::Begin {
+                    typ: Some(TransactionType::Concurrent),
+                    name: Some(Name::from_string("'my_transaction'")),
                 })],
             ),
             (
@@ -4139,13 +4183,13 @@ mod tests {
             (
                 b"COMMIT TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Commit {
-                    name: Some(Name::Ident("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             (
                 b"END TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Commit {
-                    name: Some(Name::Ident("my_transaction".to_string())),
+                    name: Some(Name::from_string("my_transaction")),
                 })],
             ),
             // Rollback
@@ -4160,66 +4204,66 @@ mod tests {
                 b"ROLLBACK TO SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
                     tx_name: None,
-                    savepoint_name: Some(Name::Ident("my_savepoint".to_string())),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             (
                 b"ROLLBACK TO my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
                     tx_name: None,
-                    savepoint_name: Some(Name::Ident("my_savepoint".to_string())),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             (
                 b"ROLLBACK TRANSACTION my_transaction".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
-                    tx_name: Some(Name::Ident("my_transaction".to_string())),
+                    tx_name: Some(Name::from_string("my_transaction")),
                     savepoint_name: None,
                 })],
             ),
             (
                 b"ROLLBACK TRANSACTION my_transaction TO my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Rollback {
-                    tx_name: Some(Name::Ident("my_transaction".to_string())),
-                    savepoint_name: Some(Name::Ident("my_savepoint".to_string())),
+                    tx_name: Some(Name::from_string("my_transaction")),
+                    savepoint_name: Some(Name::from_string("my_savepoint")),
                 })],
             ),
             // savepoint
             (
                 b"SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::Ident("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Savepoint {
-                    name: Name::Quoted("'my_savepoint'".to_string()),
+                    name: Name::from_string("'my_savepoint'"),
                 })],
             ),
             // release
             (
                 b"RELEASE my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::Ident("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT my_savepoint".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::Ident("my_savepoint".to_string()),
+                    name: Name::from_string("my_savepoint"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT 'my_savepoint'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::Quoted("'my_savepoint'".to_string()),
+                    name: Name::from_string("'my_savepoint'"),
                 })],
             ),
             (
                 b"RELEASE SAVEPOINT ABORT".as_slice(),
                 vec![Cmd::Stmt(Stmt::Release {
-                    name: Name::Ident("ABORT".to_string()),
+                    name: Name::from_string("ABORT"),
                 })],
             ),
             // test expr operand
@@ -4996,7 +5040,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Id(Name::Ident("col_1".to_owned()))),
+                                Box::new(Expr::Id(Name::exact("col_1".to_owned()))),
                                 None,
                             )],
                             from: None,
@@ -5041,8 +5085,8 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::Qualified(
-                                    Name::Ident("tbl_name".to_owned()),
-                                    Name::Ident("col_1".to_owned()),
+                                    Name::exact("tbl_name".to_owned()),
+                                    Name::exact("col_1".to_owned()),
                                 )),
                                 None,
                             )],
@@ -5066,9 +5110,9 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::DoublyQualified(
-                                    Name::Ident("schema_name".to_owned()),
-                                    Name::Ident("tbl_name".to_owned()),
-                                    Name::Ident("col_1".to_owned()),
+                                    Name::exact("schema_name".to_owned()),
+                                    Name::exact("tbl_name".to_owned()),
+                                    Name::exact("col_1".to_owned()),
                                 )),
                                 None,
                             )],
@@ -5092,7 +5136,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: None,
                                     args: vec![],
                                     order_by: vec![],
@@ -5123,7 +5167,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5131,10 +5175,10 @@ mod tests {
                                     ],
                                     order_by: vec![],
                                     filter_over: FunctionTail {
-                                        filter_clause: Some(Box::new(Expr::Id(Name::Ident(
+                                        filter_clause: Some(Box::new(Expr::Id(Name::exact(
                                             "x".to_owned(),
                                         )))),
-                                        over_clause: Some(Over::Name(Name::Ident(
+                                        over_clause: Some(Over::Name(Name::exact(
                                             "window_name".to_owned(),
                                         ))),
                                     },
@@ -5161,7 +5205,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5172,7 +5216,7 @@ mod tests {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
                                             base: None,
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5202,7 +5246,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5212,8 +5256,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5243,7 +5287,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5253,13 +5297,13 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![
                                                 SortedColumn {
-                                                    expr: Box::new(Expr::Id(Name::Ident("test".to_owned()))),
+                                                    expr: Box::new(Expr::Id(Name::exact("test".to_owned()))),
                                                     order: Some(SortOrder::Asc),
                                                     nulls: Some(NullsOrder::Last),
                                                 }
@@ -5290,7 +5334,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5300,8 +5344,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5336,7 +5380,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5346,8 +5390,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5382,7 +5426,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5392,8 +5436,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5428,7 +5472,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5438,8 +5482,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5474,7 +5518,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5484,8 +5528,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5520,7 +5564,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5530,8 +5574,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5566,7 +5610,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5576,8 +5620,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5612,7 +5656,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5622,8 +5666,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5660,7 +5704,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5670,8 +5714,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5708,7 +5752,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5718,8 +5762,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5754,7 +5798,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5764,8 +5808,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5800,7 +5844,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5810,8 +5854,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -5846,7 +5890,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::FunctionCall {
-                                    name: Name::Ident("func_name".to_owned()),
+                                    name: Name::exact("func_name".to_owned()),
                                     distinctness: Some(Distinctness::Distinct),
                                     args: vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -5856,8 +5900,8 @@ mod tests {
                                     filter_over: FunctionTail {
                                         filter_clause: None,
                                         over_clause: Some(Over::Window(Window {
-                                            base: Some(Name::Ident("test".to_owned())),
-                                            partition_by: vec![Box::new(Expr::Id(Name::Ident(
+                                            base: Some(Name::exact("test".to_owned())),
+                                            partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
                                             )))],
                                             order_by: vec![],
@@ -6358,7 +6402,7 @@ mod tests {
                                         not: false,
                                         rhs: QualifiedName {
                                             db_name: None,
-                                            name: Name::Ident("test".to_owned()),
+                                            name: Name::exact("test".to_owned()),
                                             alias: None,
                                         },
                                         args: vec![
@@ -7032,7 +7076,7 @@ mod tests {
                                 Box::new(Expr::Binary (
                                     Box::new(Expr::Collate (
                                         Box::new(Expr::Literal(Literal::String("'foo'".to_owned()))),
-                                        Name::Ident("bar".to_owned()),
+                                        Name::exact("bar".to_owned()),
                                     )),
                                     Operator::And,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -7103,7 +7147,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::TableStar(
-                                Name::Ident("tbl_name".to_owned()),
+                                Name::exact("tbl_name".to_owned()),
                             )],
                             from: None,
                             where_clause: None,
@@ -7124,8 +7168,8 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Id(Name::Ident("col_1".to_owned()))),
-                                Some(As::Elided(Name::Ident("OVER".to_owned()))),
+                                Box::new(Expr::Id(Name::exact("col_1".to_owned()))),
+                                Some(As::Elided(Name::exact("OVER".to_owned()))),
                             )],
                             from: None,
                             where_clause: None,
@@ -7146,8 +7190,8 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Id(Name::Ident("col_1".to_owned()))),
-                                Some(As::As(Name::Ident("OVER".to_owned()))),
+                                Box::new(Expr::Id(Name::exact("col_1".to_owned()))),
+                                Some(As::As(Name::exact("OVER".to_owned()))),
                             )],
                             from: None,
                             where_clause: None,
@@ -7167,7 +7211,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -7217,10 +7261,10 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![
                                     IndexedColumn {
-                                        col_name: Name::Ident("col_1".to_owned()),
+                                        col_name: Name::exact("col_1".to_owned()),
                                         collation_name: None,
                                         order: None,
                                     },
@@ -7233,7 +7277,7 @@ mod tests {
                                             distinctness: None,
                                             columns: vec![ResultColumn::Expr(
                                                 Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                                Some(As::As(Name::Ident("col_1".to_owned()))),
+                                                Some(As::As(Name::exact("col_1".to_owned()))),
                                             )],
                                             from: None,
                                             where_clause: None,
@@ -7273,10 +7317,10 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![
                                     IndexedColumn {
-                                        col_name: Name::Ident("col_1".to_owned()),
+                                        col_name: Name::exact("col_1".to_owned()),
                                         collation_name: None,
                                         order: None,
                                     },
@@ -7289,7 +7333,7 @@ mod tests {
                                             distinctness: None,
                                             columns: vec![ResultColumn::Expr(
                                                 Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                                Some(As::As(Name::Ident("col_1".to_owned()))),
+                                                Some(As::As(Name::exact("col_1".to_owned()))),
                                             )],
                                             from: None,
                                             where_clause: None,
@@ -7329,7 +7373,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -7353,7 +7397,7 @@ mod tests {
                                 }
                             },
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test_2".to_owned()),
+                                tbl_name: Name::exact("test_2".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -7525,8 +7569,8 @@ mod tests {
                     },
                     order_by: vec![],
                     limit: Some(Limit {
-                        expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("2".to_owned())))),
+                        expr: Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
+                        offset: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     }),
                 }))],
             ),
@@ -7716,7 +7760,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -7745,7 +7789,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::TableCall(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     vec![
                                         Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
@@ -7825,7 +7869,7 @@ mod tests {
                                 select: Box::new(SelectTable::Sub(
                                     FromClause {
                                         select: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("tbl_name".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("tbl_name".to_owned()), alias: None },
                                             None,
                                             None
                                         )),
@@ -7858,9 +7902,9 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
-                                    Some(Indexed::IndexedBy(Name::Ident("bar".to_owned()))),
+                                    Some(Indexed::IndexedBy(Name::exact("bar".to_owned()))),
                                 )),
                                 joins: vec![]
                             }),
@@ -7887,7 +7931,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     Some(Indexed::NotIndexed),
                                 )),
@@ -7916,7 +7960,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -7924,7 +7968,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::Comma,
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -7955,7 +7999,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -7963,7 +8007,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::Comma,
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -7994,7 +8038,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8002,7 +8046,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8033,7 +8077,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8041,7 +8085,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::NATURAL)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8072,7 +8116,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8080,7 +8124,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::INNER|JoinType::CROSS)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8111,7 +8155,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8119,7 +8163,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::LEFT|JoinType::OUTER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8150,7 +8194,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8158,7 +8202,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::RIGHT|JoinType::OUTER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8189,7 +8233,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8197,7 +8241,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8228,7 +8272,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8236,7 +8280,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::INNER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8267,7 +8311,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8275,7 +8319,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::NATURAL | JoinType::INNER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8306,7 +8350,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8314,7 +8358,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(Some(JoinType::NATURAL | JoinType::LEFT | JoinType::OUTER)),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8345,7 +8389,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8353,7 +8397,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8388,7 +8432,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8396,12 +8440,12 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
                                         constraint: Some(JoinConstraint::Using(vec![
-                                            Name::Ident("col_1".to_owned()),
+                                            Name::exact("col_1".to_owned()),
                                         ])),
                                     }
                                 ]
@@ -8429,7 +8473,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8437,12 +8481,12 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
-                                            Some(As::Elided(Name::Ident("bar_alias".to_owned()))),
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
+                                            Some(As::Elided(Name::exact("bar_alias".to_owned()))),
                                             None,
                                         )),
                                         constraint: Some(JoinConstraint::Using(vec![
-                                            Name::Ident("col_1".to_owned()),
+                                            Name::exact("col_1".to_owned()),
                                         ])),
                                     }
                                 ]
@@ -8470,7 +8514,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8478,7 +8522,7 @@ mod tests {
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::TableCall(
-                                            QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                             vec![
                                                 Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                                 Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
@@ -8512,7 +8556,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8567,7 +8611,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8577,7 +8621,7 @@ mod tests {
                                         table: Box::new(SelectTable::Sub(
                                             FromClause {
                                                 select: Box::new(SelectTable::Table(
-                                                    QualifiedName { db_name: None, name: Name::Ident("bar".to_owned()), alias: None },
+                                                    QualifiedName { db_name: None, name: Name::exact("bar".to_owned()), alias: None },
                                                     None,
                                                     None,
                                                 )),
@@ -8612,7 +8656,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8645,7 +8689,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8683,7 +8727,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8725,7 +8769,7 @@ mod tests {
                             )],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8764,15 +8808,15 @@ mod tests {
                             columns: vec![ResultColumn::Star],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("t0".to_owned()), alias: None },
-                                    Some(As::Elided(Name::Ident("WINDOW".to_owned()))),
+                                    QualifiedName { db_name: None, name: Name::exact("t0".to_owned()), alias: None },
+                                    Some(As::Elided(Name::exact("WINDOW".to_owned()))),
                                     None,
                                 )),
                                 joins: vec![
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
                                         table: Box::new(SelectTable::Table(
-                                            QualifiedName { db_name: None, name: Name::Ident("t0".to_owned()), alias: None },
+                                            QualifiedName { db_name: None, name: Name::exact("t0".to_owned()), alias: None },
                                             None,
                                             None,
                                         )),
@@ -8800,7 +8844,7 @@ mod tests {
                             columns: vec![ResultColumn::Star],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("t0".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("t0".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8810,11 +8854,11 @@ mod tests {
                             group_by: None,
                             window_clause: vec![
                                 WindowDef {
-                                    name: Name::Ident("window_1".to_owned()),
+                                    name: Name::exact("window_1".to_owned()),
                                     window: Window {
                                         base: None,
                                         partition_by: vec![
-                                            Box::new(Expr::Id(Name::Ident("product".to_owned()))),
+                                            Box::new(Expr::Id(Name::exact("product".to_owned()))),
                                         ],
                                         order_by: vec![],
                                         frame_clause: None,
@@ -8838,7 +8882,7 @@ mod tests {
                             columns: vec![ResultColumn::Star],
                             from: Some(FromClause {
                                 select: Box::new(SelectTable::Table(
-                                    QualifiedName { db_name: None, name: Name::Ident("t0".to_owned()), alias: None },
+                                    QualifiedName { db_name: None, name: Name::exact("t0".to_owned()), alias: None },
                                     None,
                                     None,
                                 )),
@@ -8848,22 +8892,22 @@ mod tests {
                             group_by: None,
                             window_clause: vec![
                                 WindowDef {
-                                    name: Name::Ident("window_1".to_owned()),
+                                    name: Name::exact("window_1".to_owned()),
                                     window: Window {
                                         base: None,
                                         partition_by: vec![
-                                            Box::new(Expr::Id(Name::Ident("product".to_owned()))),
+                                            Box::new(Expr::Id(Name::exact("product".to_owned()))),
                                         ],
                                         order_by: vec![],
                                         frame_clause: None,
                                     },
                                 },
                                 WindowDef {
-                                    name: Name::Ident("window_2".to_owned()),
+                                    name: Name::exact("window_2".to_owned()),
                                     window: Window {
                                         base: None,
                                         partition_by: vec![
-                                            Box::new(Expr::Id(Name::Ident("product_2".to_owned()))),
+                                            Box::new(Expr::Id(Name::exact("product_2".to_owned()))),
                                         ],
                                         order_by: vec![],
                                         frame_clause: None,
@@ -8887,7 +8931,7 @@ mod tests {
             (
                 b"ANALYZE foo".as_slice(),
                 vec![Cmd::Stmt(Stmt::Analyze {
-                    name: Some(QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None }),
+                    name: Some(QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None }),
                 })],
             ),
             // parse attach
@@ -8895,7 +8939,7 @@ mod tests {
                 b"ATTACH DATABASE 'foo' AS bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Attach {
                     expr: Box::new(Expr::Literal(Literal::String("'foo'".to_owned()))),
-                    db_name: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                    db_name: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                     key: None,
                 })],
             ),
@@ -8903,7 +8947,7 @@ mod tests {
                 b"ATTACH 'foo' AS bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Attach {
                     expr: Box::new(Expr::Literal(Literal::String("'foo'".to_owned()))),
-                    db_name: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                    db_name: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                     key: None,
                 })],
             ),
@@ -8911,70 +8955,70 @@ mod tests {
                 b"ATTACH 'foo' AS bar key baz".as_slice(),
                 vec![Cmd::Stmt(Stmt::Attach {
                     expr: Box::new(Expr::Literal(Literal::String("'foo'".to_owned()))),
-                    db_name: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
-                    key: Some(Box::new(Expr::Id(Name::Ident("baz".to_owned())))),
+                    db_name: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
+                    key: Some(Box::new(Expr::Id(Name::exact("baz".to_owned())))),
                 })],
             ),
             // parse detach
             (
                 b"DETACH DATABASE bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Detach {
-                    name: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                    name: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                 })],
             ),
             (
                 b"DETACH bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Detach {
-                    name: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                    name: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                 })],
             ),
             // parse pragma
             (
                 b"PRAGMA foreign_keys = ON".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: Some(PragmaBody::Equals(Box::new(Expr::Literal(Literal::Keyword("ON".to_owned()))))),
                 })],
             ),
             (
                 b"PRAGMA foreign_keys = DELETE".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: Some(PragmaBody::Equals(Box::new(Expr::Literal(Literal::Keyword("DELETE".to_owned()))))),
                 })],
             ),
             (
                 b"PRAGMA foreign_keys = DEFAULT".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: Some(PragmaBody::Equals(Box::new(Expr::Literal(Literal::Keyword("DEFAULT".to_owned()))))),
                 })],
             ),
             (
                 b"PRAGMA foreign_keys".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: None,
                 })],
             ),
             (
                 b"PRAGMA foreign_keys = 1".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: Some(PragmaBody::Equals(Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))))),
                 })],
             ),
             (
                 b"PRAGMA foreign_keys = test".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
-                    body: Some(PragmaBody::Equals(Box::new(Expr::Name(Name::Ident("test".to_owned()))))),
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
+                    body: Some(PragmaBody::Equals(Box::new(Expr::Name(Name::exact("test".to_owned()))))),
                 })],
             ),
             (
                 b"PRAGMA foreign_keys".as_slice(),
                 vec![Cmd::Stmt(Stmt::Pragma {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foreign_keys".to_owned()),  alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foreign_keys".to_owned()),  alias: None },
                     body: None,
                 })],
             ),
@@ -8997,20 +9041,20 @@ mod tests {
                 b"VACUUM INTO foo".as_slice(),
                 vec![Cmd::Stmt(Stmt::Vacuum {
                     name: None,
-                    into: Some(Box::new(Expr::Id(Name::Ident("foo".to_owned())))),
+                    into: Some(Box::new(Expr::Id(Name::exact("foo".to_owned())))),
                 })],
             ),
             (
                 b"VACUUM foo".as_slice(),
                 vec![Cmd::Stmt(Stmt::Vacuum {
-                    name: Some(Name::Ident("foo".to_owned())),
+                    name: Some(Name::exact("foo".to_owned())),
                     into: None,
                 })],
             ),
             (
                 b"VACUUM foo INTO 'bar'".as_slice(),
                 vec![Cmd::Stmt(Stmt::Vacuum {
-                    name: Some(Name::Ident("foo".to_owned())),
+                    name: Some(Name::exact("foo".to_owned())),
                     into: Some(Box::new(Expr::Literal(Literal::String("'bar'".to_owned())))),
                 })],
             ),
@@ -9018,50 +9062,50 @@ mod tests {
             (
                 b"ALTER TABLE foo RENAME TO bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
-                    body: AlterTableBody::RenameTo(Name::Ident("bar".to_owned())),
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::RenameTo(Name::exact("bar".to_owned())),
                 }))],
             ),
             (
                 b"ALTER TABLE foo RENAME baz TO bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::RenameColumn {
-                        old: Name::Ident("baz".to_owned()),
-                        new: Name::Ident("bar".to_owned())
+                        old: Name::exact("baz".to_owned()),
+                        new: Name::exact("bar".to_owned())
                     },
                 }))],
             ),
             (
                 b"ALTER TABLE foo RENAME COLUMN baz TO bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::RenameColumn {
-                        old: Name::Ident("baz".to_owned()),
-                        new: Name::Ident("bar".to_owned())
+                        old: Name::exact("baz".to_owned()),
+                        new: Name::exact("bar".to_owned())
                     },
                 }))],
             ),
             (
                 b"ALTER TABLE foo DROP baz".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
-                    body: AlterTableBody::DropColumn(Name::Ident("baz".to_owned())),
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::DropColumn(Name::exact("baz".to_owned())),
                 }))],
             ),
             (
                 b"ALTER TABLE foo DROP COLUMN baz".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
-                    body: AlterTableBody::DropColumn(Name::Ident("baz".to_owned())),
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::DropColumn(Name::exact("baz".to_owned())),
                 }))],
             ),
             (
                 b"ALTER TABLE foo ADD baz".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: None,
                         constraints: vec![],
                     }),
@@ -9070,9 +9114,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9084,9 +9128,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER DEFAULT 1".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9105,9 +9149,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER DEFAULT (1)".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9128,9 +9172,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER DEFAULT +1".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9152,9 +9196,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER DEFAULT -1".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9176,9 +9220,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER DEFAULT hello".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9187,7 +9231,7 @@ mod tests {
                             NamedColumnConstraint {
                                 name: None,
                                 constraint: ColumnConstraint::Default(
-                                    Box::new(Expr::Id(Name::Ident("hello".to_owned())))
+                                    Box::new(Expr::Id(Name::exact("hello".to_owned())))
                                 ),
                             },
                         ],
@@ -9197,9 +9241,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER NULL".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9219,9 +9263,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER NOT NULL ON CONFLICT IGNORE".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9241,9 +9285,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER NOT NULL ON CONFLICT REPLACE".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9263,9 +9307,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER NOT NULL ON CONFLICT ROLLBACK".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9285,9 +9329,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER NOT NULL ON CONFLICT ROLLBACK".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9307,9 +9351,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER CHECK (1)".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable(AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9328,9 +9372,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER CHECK (1)".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9349,9 +9393,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9361,11 +9405,11 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9375,9 +9419,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON INSERT SET NULL".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9387,25 +9431,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnInsert(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9415,9 +9459,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON UPDATE SET NULL".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9427,25 +9471,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnUpdate(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9455,9 +9499,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON DELETE SET NULL".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9467,25 +9511,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnDelete(RefAct::SetNull),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9495,9 +9539,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON DELETE SET DEFAULT".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9507,25 +9551,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnDelete(RefAct::SetDefault),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9535,9 +9579,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON DELETE CASCADE".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9547,25 +9591,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnDelete(RefAct::Cascade),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9575,9 +9619,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON DELETE RESTRICT".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9587,25 +9631,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnDelete(RefAct::Restrict),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9615,9 +9659,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar(test, test_2) MATCH test_3 ON DELETE NO ACTION".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9627,25 +9671,25 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("test".to_owned()),
+                                                col_name: Name::exact("test".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                             IndexedColumn {
-                                                col_name: Name::Ident("test_2".to_owned()),
+                                                col_name: Name::exact("test_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![
-                                            RefArg::Match(Name::Ident("test_3".to_owned())),
+                                            RefArg::Match(Name::exact("test_3".to_owned())),
                                             RefArg::OnDelete(RefAct::NoAction),
                                         ]
                                     },
-                                    deref_clause: None
+                                    defer_clause: None
                                 },
                             },
                         ],
@@ -9655,9 +9699,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar DEFERRABLE".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9667,11 +9711,11 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: true,
                                         init_deferred: None,
                                     })
@@ -9684,9 +9728,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar NOT DEFERRABLE INITIALLY IMMEDIATE".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9696,11 +9740,11 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyImmediate),
                                     })
@@ -9713,9 +9757,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar NOT DEFERRABLE INITIALLY DEFERRED".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9725,11 +9769,11 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyDeferred),
                                     })
@@ -9742,9 +9786,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER REFERENCES bar NOT DEFERRABLE INITIALLY DEFERRED".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9754,11 +9798,11 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::ForeignKey {
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("bar".to_owned()),
+                                        tbl_name: Name::exact("bar".to_owned()),
                                         columns: vec![],
                                         args: vec![]
                                     },
-                                    deref_clause: Some(DeferSubclause {
+                                    defer_clause: Some(DeferSubclause {
                                         deferrable: false,
                                         init_deferred: Some(InitDeferredPred::InitiallyDeferred),
                                     })
@@ -9771,9 +9815,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER COLLATE bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9782,7 +9826,7 @@ mod tests {
                             NamedColumnConstraint {
                                 name: None,
                                 constraint: ColumnConstraint::Collate {
-                                    collation_name: Name::Ident("bar".to_owned()),
+                                    collation_name: Name::exact("bar".to_owned()),
                                 },
                             },
                         ],
@@ -9792,9 +9836,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER GENERATED ALWAYS AS (1)".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9814,9 +9858,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER AS (1)".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9836,9 +9880,9 @@ mod tests {
             (
                 b"ALTER TABLE foo ADD COLUMN baz INTEGER AS (1) STORED".as_slice(),
                 vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
-                    name: QualifiedName { db_name: None, name: Name::Ident("foo".to_owned()), alias: None },
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
                     body: AlterTableBody::AddColumn(ColumnDefinition {
-                        col_name: Name::Ident("baz".to_owned()),
+                        col_name: Name::exact("baz".to_owned()),
                         col_type: Some(Type {
                             name: "INTEGER".to_owned(),
                             size: None,
@@ -9848,11 +9892,29 @@ mod tests {
                                 name: None,
                                 constraint: ColumnConstraint::Generated {
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                    typ: Some(Name::Ident("STORED".to_owned())),
+                                    typ: Some(Name::exact("STORED".to_owned())),
                                 },
                             },
                         ],
                     }),
+                }))],
+            ),
+            (
+                b"ALTER TABLE foo ALTER COLUMN bar TO baz INTEGER".as_slice(),
+                vec![Cmd::Stmt(Stmt::AlterTable (AlterTable {
+                    name: QualifiedName { db_name: None, name: Name::exact("foo".to_owned()), alias: None },
+                    body: AlterTableBody::AlterColumn {
+                        old: Name::exact("bar".to_owned()),
+                        new: ColumnDefinition {
+                            col_name: Name::exact("baz".to_owned()),
+                            col_type: Some(Type {
+                                name: "INTEGER".to_owned(),
+                                size: None,
+                            }),
+                            constraints: vec![],
+                        },
+
+                    },
                 }))],
             ),
             // parse create index
@@ -9863,12 +9925,12 @@ mod tests {
                     if_not_exists: false,
                     idx_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("idx_foo".to_owned()),
+                        name: Name::exact("idx_foo".to_owned()),
                         alias: None,
                     },
-                    tbl_name: Name::Ident("foo".to_owned()),
+                    tbl_name: Name::exact("foo".to_owned()),
                     columns: vec![SortedColumn {
-                        expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                        expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                         order: None,
                         nulls: None,
                     }],
@@ -9882,12 +9944,12 @@ mod tests {
                     if_not_exists: true,
                     idx_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("idx_foo".to_owned()),
+                        name: Name::exact("idx_foo".to_owned()),
                         alias: None,
                     },
-                    tbl_name: Name::Ident("foo".to_owned()),
+                    tbl_name: Name::exact("foo".to_owned()),
                     columns: vec![SortedColumn {
-                        expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                        expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                         order: None,
                         nulls: None,
                     }],
@@ -9904,13 +9966,13 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints {
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Ident("column".to_owned()),
+                                col_name: Name::exact("column".to_owned()),
                                 col_type: None,
                                 constraints: vec![],
                             },
@@ -9927,7 +9989,7 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::AsSelect(Select {
@@ -9957,13 +10019,13 @@ mod tests {
                     if_not_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints {
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Ident("baz".to_owned()),
+                                col_name: Name::exact("baz".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
@@ -9973,11 +10035,11 @@ mod tests {
                         ],
                         constraints: vec![
                             NamedTableConstraint {
-                                name: Some(Name::Ident("tbl_cons".to_owned())),
+                                name: Some(Name::exact("tbl_cons".to_owned())),
                                 constraint: TableConstraint::PrimaryKey {
                                     columns: vec![
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                             order: None,
                                             nulls: None,
                                         },
@@ -9998,13 +10060,13 @@ mod tests {
                     if_not_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints {
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Ident("bar".to_owned()),
+                                col_name: Name::exact("bar".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
@@ -10021,7 +10083,7 @@ mod tests {
                                 ],
                             },
                             ColumnDefinition {
-                                col_name: Name::Ident("baz".to_owned()),
+                                col_name: Name::exact("baz".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
@@ -10035,7 +10097,7 @@ mod tests {
                                 constraint: TableConstraint::Unique {
                                     columns: vec![
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                             order: None,
                                             nulls: None,
                                         },
@@ -10055,18 +10117,18 @@ mod tests {
                     if_not_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints {
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Ident("bar".to_owned()),
+                                col_name: Name::exact("bar".to_owned()),
                                 col_type: None,
                                 constraints: vec![],
                             },
                             ColumnDefinition {
-                                col_name: Name::Ident("baz".to_owned()),
+                                col_name: Name::exact("baz".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
@@ -10093,18 +10155,18 @@ mod tests {
                     if_not_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     body: CreateTableBody::ColumnsAndConstraints {
                         columns: vec![
                             ColumnDefinition {
-                                col_name: Name::Ident("bar".to_owned()),
+                                col_name: Name::exact("bar".to_owned()),
                                 col_type: None,
                                 constraints: vec![],
                             },
                             ColumnDefinition {
-                                col_name: Name::Ident("baz".to_owned()),
+                                col_name: Name::exact("baz".to_owned()),
                                 col_type: Some(Type {
                                     name: "INTEGER".to_owned(),
                                     size: None,
@@ -10118,23 +10180,23 @@ mod tests {
                                 constraint: TableConstraint::ForeignKey {
                                     columns: vec![
                                         IndexedColumn {
-                                            col_name: Name::Ident("bar".to_owned()),
+                                            col_name: Name::exact("bar".to_owned()),
                                             collation_name: None,
                                             order: None,
                                         },
                                     ],
                                     clause: ForeignKeyClause {
-                                        tbl_name: Name::Ident("foo_2".to_owned()),
+                                        tbl_name: Name::exact("foo_2".to_owned()),
                                         columns: vec![
                                             IndexedColumn {
-                                                col_name: Name::Ident("bar_2".to_owned()),
+                                                col_name: Name::exact("bar_2".to_owned()),
                                                 collation_name: None,
                                                 order: None,
                                             },
                                         ],
                                         args: vec![],
                                     },
-                                    deref_clause: None,
+                                    defer_clause: None,
                                 },
                             },
                             NamedTableConstraint {
@@ -10156,14 +10218,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10198,14 +10260,14 @@ mod tests {
                     if_not_exists: true,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: Some(TriggerTime::After),
                     event: TriggerEvent::Update,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: true,
@@ -10240,14 +10302,14 @@ mod tests {
                     if_not_exists: true,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: Some(TriggerTime::Before),
                     event: TriggerEvent::Delete,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: true,
@@ -10282,17 +10344,17 @@ mod tests {
                     if_not_exists: true,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: Some(TriggerTime::InsteadOf),
                     event: TriggerEvent::UpdateOf(vec![
-                        Name::Ident("baz".to_owned()),
-                        Name::Ident("bar".to_owned()),
+                        Name::exact("baz".to_owned()),
+                        Name::exact("bar".to_owned()),
                     ]),
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: true,
@@ -10327,14 +10389,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10342,7 +10404,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -10371,14 +10433,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10386,10 +10448,10 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: Some(ResolveType::Rollback),
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![
-                                Name::Ident("bar".to_owned()),
-                                Name::Ident("baz".to_owned()),
+                                Name::exact("bar".to_owned()),
+                                Name::exact("baz".to_owned()),
                             ],
                             select: Select {
                                 with: None,
@@ -10418,14 +10480,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10433,7 +10495,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -10452,11 +10514,11 @@ mod tests {
                             upsert: None,
                             returning: vec![
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                     None,
                                 ),
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("baz".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
                                     None,
                                 ),
                             ],
@@ -10471,14 +10533,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10486,7 +10548,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -10506,12 +10568,12 @@ mod tests {
                                 index: Some(UpsertIndex {
                                     targets: vec![
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                             order: None,
                                             nulls: None
                                         },
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("baz".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("baz".to_owned()))),
                                             order: None,
                                             nulls: None
                                         },
@@ -10523,11 +10585,11 @@ mod tests {
                             })),
                             returning: vec![
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                     None,
                                 ),
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("baz".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
                                     None,
                                 ),
                             ],
@@ -10542,14 +10604,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10557,7 +10619,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -10579,8 +10641,8 @@ mod tests {
                                     sets: vec![
                                         Set {
                                             col_names: vec![
-                                                Name::Ident("bar".to_owned()),
-                                                Name::Ident("baz".to_owned()),
+                                                Name::exact("bar".to_owned()),
+                                                Name::exact("baz".to_owned()),
                                             ],
                                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         }
@@ -10591,11 +10653,11 @@ mod tests {
                             })),
                             returning: vec![
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                     None,
                                 ),
                                 ResultColumn::Expr(
-                                    Box::new(Expr::Id(Name::Ident("baz".to_owned()))),
+                                    Box::new(Expr::Id(Name::exact("baz".to_owned()))),
                                     None,
                                 ),
                             ],
@@ -10610,14 +10672,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10625,7 +10687,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Insert {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -10645,12 +10707,12 @@ mod tests {
                                 index: Some(UpsertIndex {
                                     targets: vec![
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                                             order: None,
                                             nulls: None
                                         },
                                         SortedColumn {
-                                            expr: Box::new(Expr::Id(Name::Ident("baz".to_owned()))),
+                                            expr: Box::new(Expr::Id(Name::exact("baz".to_owned()))),
                                             order: None,
                                             nulls: None
                                         },
@@ -10676,14 +10738,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10691,10 +10753,10 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Update {
                             or_conflict: None,
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             sets: vec![
                                 Set {
-                                    col_names: vec![Name::Ident("bar".to_owned())],
+                                    col_names: vec![Name::exact("bar".to_owned())],
                                     expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 },
                             ],
@@ -10711,21 +10773,21 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Delete {
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             where_clause: None,
                         },
                     ],
@@ -10738,21 +10800,21 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
                     when_clause: None,
                     commands: vec![
                         TriggerCmd::Delete {
-                            tbl_name: Name::Ident("foo".to_owned()),
+                            tbl_name: Name::exact("foo".to_owned()),
                             where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                         },
                     ],
@@ -10765,14 +10827,14 @@ mod tests {
                     if_not_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     time: None,
                     event: TriggerEvent::Insert,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("bar".to_owned()),
+                        name: Name::exact("bar".to_owned()),
                         alias: None,
                     },
                     for_each_row: false,
@@ -10827,12 +10889,12 @@ mod tests {
                     if_not_exists: false,
                     view_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![
                         IndexedColumn {
-                            col_name: Name::Ident("bar".to_owned()),
+                            col_name: Name::exact("bar".to_owned()),
                             collation_name: None,
                             order: None,
                         }
@@ -10865,12 +10927,12 @@ mod tests {
                     if_not_exists: true,
                     view_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![
                         IndexedColumn {
-                            col_name: Name::Ident("bar".to_owned()),
+                            col_name: Name::exact("bar".to_owned()),
                             collation_name: None,
                             order: None,
                         }
@@ -10903,10 +10965,10 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
-                    module_name: Name::Ident("bar".to_owned()),
+                    module_name: Name::exact("bar".to_owned()),
                     args: vec![],
                 }))],
             ),
@@ -10916,10 +10978,10 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
-                    module_name: Name::Ident("bar".to_owned()),
+                    module_name: Name::exact("bar".to_owned()),
                     args: vec![],
                 }))],
             ),
@@ -10929,10 +10991,10 @@ mod tests {
                     if_not_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
-                    module_name: Name::Ident("bar".to_owned()),
+                    module_name: Name::exact("bar".to_owned()),
                     args: vec![
                         "1".to_owned(),
                         "2".to_owned(),
@@ -10946,10 +11008,10 @@ mod tests {
                     if_not_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("ft".to_owned()),
+                        name: Name::exact("ft".to_owned()),
                         alias: None,
                     },
-                    module_name: Name::Ident("fts5".to_owned()),
+                    module_name: Name::exact("fts5".to_owned()),
                     args: vec![
                         "x".to_owned(),
                         "tokenize = '''porter'' ''ascii'''".to_owned(),
@@ -10963,7 +11025,7 @@ mod tests {
                     with: None,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None
                     },
                     indexed: None,
@@ -10980,7 +11042,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -11007,20 +11069,20 @@ mod tests {
                     }),
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None
                     },
                     indexed: Some(Indexed::NotIndexed),
                     where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     returning: vec![
                         ResultColumn::Expr(
-                            Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             None,
                         ),
                     ],
                     order_by: vec![
                         SortedColumn {
-                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             order: None,
                             nulls: None,
                         }
@@ -11038,7 +11100,7 @@ mod tests {
                     if_exists: false,
                     idx_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11049,7 +11111,7 @@ mod tests {
                     if_exists: true,
                     idx_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11061,7 +11123,7 @@ mod tests {
                     if_exists: false,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11072,7 +11134,7 @@ mod tests {
                     if_exists: true,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11084,7 +11146,7 @@ mod tests {
                     if_exists: false,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11095,7 +11157,7 @@ mod tests {
                     if_exists: true,
                     trigger_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11107,7 +11169,7 @@ mod tests {
                     if_exists: false,
                     view_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11118,7 +11180,7 @@ mod tests {
                     if_exists: true,
                     view_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                 })],
@@ -11131,7 +11193,7 @@ mod tests {
                     or_conflict: None,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![],
@@ -11159,7 +11221,7 @@ mod tests {
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![],
@@ -11187,7 +11249,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -11215,14 +11277,14 @@ mod tests {
                     or_conflict: None,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![],
                     body: InsertBody::DefaultValues,
                     returning: vec![
                         ResultColumn::Expr(
-                            Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             None,
                         ),
                     ],
@@ -11235,7 +11297,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -11263,14 +11325,14 @@ mod tests {
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     columns: vec![],
                     body: InsertBody::DefaultValues,
                     returning: vec![
                         ResultColumn::Expr(
-                            Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             None,
                         ),
                     ],
@@ -11284,14 +11346,14 @@ mod tests {
                     or_conflict: None,
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     indexed: None,
                     sets: vec![
                         Set {
                             col_names: vec![
-                                Name::Ident("bar".to_owned()),
+                                Name::exact("bar".to_owned()),
                             ],
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
@@ -11310,7 +11372,7 @@ mod tests {
                         recursive: false,
                         ctes: vec![
                             CommonTableExpr {
-                                tbl_name: Name::Ident("test".to_owned()),
+                                tbl_name: Name::exact("test".to_owned()),
                                 columns: vec![],
                                 materialized: Materialized::Any,
                                 select: Select {
@@ -11338,14 +11400,14 @@ mod tests {
                     or_conflict: Some(ResolveType::Replace),
                     tbl_name: QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None,
                     },
                     indexed: Some(Indexed::NotIndexed),
                     sets: vec![
                         Set {
                             col_names: vec![
-                                Name::Ident("bar".to_owned()),
+                                Name::exact("bar".to_owned()),
                             ],
                             expr: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                         }
@@ -11354,7 +11416,7 @@ mod tests {
                         select: Box::new(SelectTable::Table(
                             QualifiedName {
                                 db_name: None,
-                                name: Name::Ident("foo_2".to_owned()),
+                                name: Name::exact("foo_2".to_owned()),
                                 alias: None,
                             },
                             None,
@@ -11365,13 +11427,13 @@ mod tests {
                     where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                     returning: vec![
                         ResultColumn::Expr(
-                            Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             None,
                         ),
                     ],
                     order_by: vec![
                         SortedColumn {
-                            expr: Box::new(Expr::Id(Name::Ident("bar".to_owned()))),
+                            expr: Box::new(Expr::Id(Name::exact("bar".to_owned()))),
                             order: None,
                             nulls: None,
                         }
@@ -11394,22 +11456,67 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Reindex {
                     name: Some(QualifiedName {
                         db_name: None,
-                        name: Name::Ident("foo".to_owned()),
+                        name: Name::exact("foo".to_owned()),
                         alias: None
                     }),
                 })],
             ),
+            // issue 2875
+            (
+                b"CREATE TABLE \"settings\" (\"enabled\" INTEGER DEFAULT CURRENT_TIMESTAMP NOT NULL)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateTable {
+                    temporary: false,
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        db_name: None,
+                        name: Name::from_string("\"settings\""),
+                        alias: None,
+                    },
+                    body: CreateTableBody::ColumnsAndConstraints{
+                        columns: vec![
+                            ColumnDefinition {
+                                col_name: Name::from_string("\"enabled\""),
+                                col_type: Some(Type {
+                                    name: "INTEGER".to_owned(),
+                                    size: None,
+                                }),
+                                constraints: vec![
+                                    NamedColumnConstraint {
+                                        name: None,
+                                        constraint: ColumnConstraint::Default(Box::new(Expr::Literal(Literal::CurrentTimestamp))),
+                                    },
+                                    NamedColumnConstraint {
+                                        name: None,
+                                        constraint: ColumnConstraint::NotNull { nullable: false, conflict_clause: None }
+                                    },
+                                ],
+                            }
+                        ],
+                        constraints: vec![],
+                        options: TableOptions::NONE,
+                    },
+                })],
+            )
         ];
 
         for (input, expected) in test_cases {
-            println!("Testing input: {:?}", from_bytes(input));
+            let input_str = from_bytes(input);
             let parser = Parser::new(input);
             let mut results = Vec::new();
             for cmd in parser {
                 results.push(cmd.unwrap());
             }
 
-            assert_eq!(results, expected, "Input: {input:?}");
+            assert_eq!(results, expected, "Input: {input_str:?}");
+
+            // to_string tests
+            for (i, r) in results.iter().enumerate() {
+                let rstring = r.to_string();
+                // put new string into parser again
+                let result = Parser::new(rstring.as_bytes()).next().unwrap().unwrap();
+                let expected = &expected[i];
+                assert_eq!(result, expected.clone(), "Input: {rstring:?}");
+            }
         }
     }
 }

@@ -305,7 +305,30 @@ do_execsql_test_on_specific_db {:memory:} upsert-omitted-target-updates-unique {
     SELECT * FROM ou;
 } {3|y}
 
-# Target qualified with database.table.column should match too (assuming single db).
+do_execsql_test_on_specific_db {:memory:} upsert-current-qualified.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'new')
+    ON CONFLICT(dq.a) DO UPDATE SET b = dq.b || '-' || excluded.b;
+  SELECT * FROM dq;
+} {1|old-new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-multicol-set.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'new')
+    ON CONFLICT(a) DO UPDATE SET (`a`,`b`) = (`excluded`.`a`, `excluded`.`b`);
+  SELECT * FROM dq;
+} {1|new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-where-predicate.1 {
+  CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+  INSERT INTO dq VALUES (1,'old');
+  INSERT INTO dq VALUES (1,'old')
+    ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE dq.b != excluded.b;
+  SELECT * FROM dq;
+} {1|old}
+
 do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
     CREATE TABLE dq (a UNIQUE, b);
     INSERT INTO dq VALUES (1,'old');
@@ -313,6 +336,14 @@ do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
       ON CONFLICT(main.dq.a) DO UPDATE SET b = excluded.b;
     SELECT * FROM dq;
 } {1|new}
+
+# https://github.com/tursodatabase/turso/issues/3384
+do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
+	create table phonebook(name text primary key, phonenumber text, validDate date);
+	insert into phonebook values ('Alice','704-545-3333','2018-10-10');
+	insert into phonebook values ('Alice','704-111-1111','2018-10-20') on conflict (name) do update set phonenumber=excluded.phonenumber, validDate=excluded.validDate;
+    SELECT phonenumber, validDate FROM phonebook;
+} {704-111-1111|2018-10-20}
 
 
 # TODO: uncomment these when we support collations in indexes 

@@ -232,6 +232,22 @@ public final class TursoStatement {
   private native long totalChanges(long statementPointer) throws SQLException;
 
   /**
+   * Returns number of changes.
+   *
+   * @throws SQLException If a database access error occurs
+   */
+  public long changes() throws SQLException {
+    final long result = changes(statementPointer);
+    if (result == -1) {
+      throw new SQLException("Exception while retrieving number of changes");
+    }
+
+    return result;
+  }
+
+  private native long changes(long statementPointer) throws SQLException;
+
+  /**
    * Checks if the statement is closed.
    *
    * @return true if the statement is closed, false otherwise.

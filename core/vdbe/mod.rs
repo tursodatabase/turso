@@ -28,15 +28,19 @@ pub mod sorter;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
-    state_machine::StateTransition,
+    mvcc::{database::CommitStateMachine, LocalClock},
+    state_machine::StateMachine,
     storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult, RawSlice, TextRef},
-    vdbe::execute::{
-        OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState, OpInsertState,
-        OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState, OpSeekState,
+    vdbe::{
+        execute::{
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState,
+            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState,
+            OpSeekState, OpTransactionState,
+        },
+        metrics::StatementMetrics,
     },
-    vdbe::metrics::StatementMetrics,
     IOExt, RefValue,
 };
 
@@ -50,21 +54,34 @@ use crate::{
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::{Connection, MvStore, Result, TransactionState};
-use builder::CursorKey;
+use builder::{CursorKey, QueryMode};
 use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
 
+use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
-    cell::{Cell, RefCell},
     collections::HashMap,
     num::NonZero,
-    rc::Rc,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
 };
 use tracing::{instrument, Level};
+
+/// State machine for committing view deltas with I/O handling
+#[derive(Debug, Clone)]
+pub enum ViewDeltaCommitState {
+    NotStarted,
+    Processing {
+        views: Vec<String>, // view names (all materialized views have storage)
+        current_index: usize,
+    },
+    Done,
+}
 
 /// We use labels to indicate that we want to jump to whatever the instruction offset
 /// will be at runtime, because the offset cannot always be determined when the jump
@@ -147,7 +164,7 @@ impl BranchOffset {
 
 pub type CursorID = usize;
 
-pub type PageIdx = usize;
+pub type PageIdx = i64;
 
 // Index of insn in list of insns
 type InsnReference = u32;
@@ -210,7 +227,8 @@ impl<const N: usize> Bitfield<N> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 /// The commit state of the program.
 /// There are two states:
 /// - Ready: The program is ready to run the next instruction, or has shut down after
@@ -220,6 +238,9 @@ impl<const N: usize> Bitfield<N> {
 enum CommitState {
     Ready,
     Committing,
+    CommitingMvcc {
+        state_machine: StateMachine<CommitStateMachine<LocalClock>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +269,7 @@ pub struct Row {
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
-    cursors: RefCell<Vec<Option<Cursor>>>,
+    cursors: Vec<Option<Cursor>>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
@@ -277,12 +298,15 @@ pub struct ProgramState {
     current_collation: Option<CollationSeq>,
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
+    op_transaction_state: OpTransactionState,
+    op_checkpoint_state: OpCheckpointState,
+    /// State machine for committing view deltas with I/O handling
+    view_delta_state: ViewDeltaCommitState,
 }
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
-        let cursors: RefCell<Vec<Option<Cursor>>> =
-            RefCell::new((0..max_cursors).map(|_| None).collect());
+        let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
             io_completions: None,
@@ -319,6 +343,9 @@ impl ProgramState {
             current_collation: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
+            op_transaction_state: OpTransactionState::Start,
+            op_checkpoint_state: OpCheckpointState::StartCheckpoint,
+            view_delta_state: ViewDeltaCommitState::NotStarted,
         }
     }
 
@@ -358,9 +385,17 @@ impl ProgramState {
         self.parameters.get(&index).cloned().unwrap_or(Value::Null)
     }
 
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.pc = 0;
-        self.cursors.borrow_mut().iter_mut().for_each(|c| *c = None);
+
+        if let Some(max_cursors) = max_cursors {
+            self.cursors.resize_with(max_cursors, || None);
+        }
+        if let Some(max_resgisters) = max_registers {
+            self.registers
+                .resize_with(max_resgisters, || Register::Value(Value::Null));
+        }
+        self.cursors.iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
@@ -372,17 +407,37 @@ impl ProgramState {
         self.parameters.clear();
         self.current_collation = None;
         #[cfg(feature = "json")]
-        self.json_cache.clear()
+        self.json_cache.clear();
+
+        // Reset state machines
+        self.op_delete_state = OpDeleteState {
+            sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            deleted_record: None,
+        };
+        self.op_idx_delete_state = None;
+        self.op_integrity_check_state = OpIntegrityCheckState::Start;
+        self.metrics = StatementMetrics::new();
+        self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
+        self.op_new_rowid_state = OpNewRowidState::Start;
+        self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
+        self.op_insert_state = OpInsertState {
+            sub_state: OpInsertSubState::MaybeCaptureRecord,
+            old_record: None,
+        };
+        self.op_no_conflict_state = OpNoConflictState::Start;
+        self.seek_state = OpSeekState::Start;
+        self.current_collation = None;
+        self.op_column_state = OpColumnState::Start;
+        self.op_row_id_state = OpRowIdState::Start;
+        self.view_delta_state = ViewDeltaCommitState::NotStarted;
     }
 
-    pub fn get_cursor(&self, cursor_id: CursorID) -> std::cell::RefMut<Cursor> {
-        let cursors = self.cursors.borrow_mut();
-        std::cell::RefMut::map(cursors, |c| {
-            c.get_mut(cursor_id)
-                .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
-                .as_mut()
-                .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
-        })
+    pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
+        self.cursors
+            .get_mut(cursor_id)
+            .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
+            .as_mut()
+            .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
 }
 
@@ -403,25 +458,43 @@ impl Register {
 macro_rules! must_be_btree_cursor {
     ($cursor_id:expr, $cursor_ref:expr, $state:expr, $insn_name:expr) => {{
         let (_, cursor_type) = $cursor_ref.get($cursor_id).unwrap();
-        let cursor = match cursor_type {
-            CursorType::BTreeTable(_) => $state.get_cursor($cursor_id),
-            CursorType::BTreeIndex(_) => $state.get_cursor($cursor_id),
-            CursorType::Pseudo(_) => panic!("{} on pseudo cursor", $insn_name),
-            CursorType::Sorter => panic!("{} on sorter cursor", $insn_name),
-            CursorType::VirtualTable(_) => panic!("{} on virtual table cursor", $insn_name),
-        };
-        cursor
+        if matches!(
+            cursor_type,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::MaterializedView(_, _)
+        ) {
+            $crate::get_cursor!($state, $cursor_id)
+        } else {
+            panic!("{} on unexpected cursor", $insn_name)
+        }
     }};
+}
+
+/// Macro is necessary to help the borrow checker see we are only accessing state.cursor field
+/// and nothing else
+#[macro_export]
+macro_rules! get_cursor {
+    ($state:expr, $cursor_id:expr) => {
+        $state
+            .cursors
+            .get_mut($cursor_id)
+            .unwrap_or_else(|| panic!("cursor id {} out of bounds", $cursor_id))
+            .as_mut()
+            .unwrap_or_else(|| panic!("cursor id {} is None", $cursor_id))
+    };
 }
 
 pub struct Program {
     pub max_registers: usize,
-    pub insns: Vec<(Insn, InsnFunction)>,
+    // we store original indices because we don't want to create new vec from
+    // ProgramBuilder
+    pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub comments: Option<Vec<(InsnReference, &'static str)>>,
+    pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
-    pub n_change: Cell<i64>,
+    pub n_change: AtomicI64,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -433,21 +506,137 @@ pub struct Program {
 }
 
 impl Program {
-    fn get_pager_from_database_index(&self, idx: &usize) -> Rc<Pager> {
+    fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
     pub fn step(
         &self,
         state: &mut ProgramState,
         mv_store: Option<Arc<MvStore>>,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
+        query_mode: QueryMode,
     ) -> Result<StepResult> {
+        match query_mode {
+            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Explain => self.explain_step(state, mv_store, pager),
+            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
+        }
+    }
+
+    fn explain_step(
+        &self,
+        state: &mut ProgramState,
+        _mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
+    ) -> Result<StepResult> {
+        debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        if self.connection.is_closed() {
+            // Connection is closed for whatever reason, rollback the transaction.
+            let state = self.connection.get_tx_state();
+            if let TransactionState::Write { .. } = state {
+                pager.io.block(|| pager.end_tx(true, &self.connection))?;
+            }
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        if state.is_interrupted() {
+            return Ok(StepResult::Interrupt);
+        }
+
+        // FIXME: do we need this?
+        state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+        if state.pc as usize >= self.insns.len() {
+            return Ok(StepResult::Done);
+        }
+
+        let (current_insn, _) = &self.insns[state.pc as usize];
+        let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
+            self,
+            current_insn,
+            self.comments
+                .iter()
+                .find(|(offset, _)| *offset == state.pc)
+                .map(|(_, comment)| comment)
+                .copied(),
+        );
+
+        state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
+        state.registers[1] = Register::Value(Value::from_text(opcode));
+        state.registers[2] = Register::Value(Value::Integer(p1 as i64));
+        state.registers[3] = Register::Value(Value::Integer(p2 as i64));
+        state.registers[4] = Register::Value(Value::Integer(p3 as i64));
+        state.registers[5] = Register::Value(p4);
+        state.registers[6] = Register::Value(Value::Integer(p5 as i64));
+        state.registers[7] = Register::Value(Value::from_text(&comment));
+        state.result_row = Some(Row {
+            values: &state.registers[0] as *const Register,
+            count: EXPLAIN_COLUMNS.len(),
+        });
+        state.pc += 1;
+        Ok(StepResult::Row)
+    }
+
+    fn explain_query_plan_step(
+        &self,
+        state: &mut ProgramState,
+        _mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
+    ) -> Result<StepResult> {
+        debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
-            if self.connection.closed.get() {
+            if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.
-                let state = self.connection.transaction_state.get();
+                let state = self.connection.get_tx_state();
+                if let TransactionState::Write { .. } = state {
+                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                }
+                return Err(LimboError::InternalError("Connection closed".to_string()));
+            }
+
+            if state.is_interrupted() {
+                return Ok(StepResult::Interrupt);
+            }
+
+            // FIXME: do we need this?
+            state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
+
+            if state.pc as usize >= self.insns.len() {
+                return Ok(StepResult::Done);
+            }
+
+            let Insn::Explain { p1, p2, detail } = &self.insns[state.pc as usize].0 else {
+                state.pc += 1;
+                continue;
+            };
+
+            state.registers[0] = Register::Value(Value::Integer(*p1 as i64));
+            state.registers[1] =
+                Register::Value(Value::Integer(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
+            state.registers[2] = Register::Value(Value::Integer(0));
+            state.registers[3] = Register::Value(Value::from_text(detail.as_str()));
+            state.result_row = Some(Row {
+                values: &state.registers[0] as *const Register,
+                count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
+            });
+            state.pc += 1;
+            return Ok(StepResult::Row);
+        }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn normal_step(
+        &self,
+        state: &mut ProgramState,
+        mv_store: Option<Arc<MvStore>>,
+        pager: Arc<Pager>,
+    ) -> Result<StepResult> {
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        loop {
+            if self.connection.is_closed() {
+                // Connection is closed for whatever reason, rollback the transaction.
+                let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
                     pager.io.block(|| pager.end_tx(true, &self.connection))?;
                 }
@@ -460,12 +649,20 @@ impl Program {
                 if !io.finished() {
                     return Ok(StepResult::IO);
                 }
+                if let Some(err) = io.get_error() {
+                    let err = err.into();
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
+                    return Err(err);
+                }
                 state.io_completions = None;
             }
             // invalidate row
             let _ = state.result_row.take();
-            let (insn, insn_function) = &self.insns[state.pc as usize];
-            trace_insn(self, state.pc as InsnReference, insn);
+            let (insn, _) = &self.insns[state.pc as usize];
+            let insn_function = insn.to_function();
+            if enable_tracing {
+                trace_insn(self, state.pc as InsnReference, insn);
+            }
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
@@ -493,12 +690,12 @@ impl Program {
                     // Instruction interrupted - may resume at same PC
                     return Ok(StepResult::Interrupt);
                 }
-                Ok(InsnFunctionStepResult::Busy) => {
+                Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err)?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
                     return Err(err);
                 }
             }
@@ -506,20 +703,103 @@ impl Program {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn apply_view_deltas(&self, rollback: bool) {
-        if self.connection.view_transaction_states.borrow().is_empty() {
-            return;
-        }
+    fn apply_view_deltas(
+        &self,
+        state: &mut ProgramState,
+        rollback: bool,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        use crate::types::IOResult;
 
-        let tx_states = self.connection.view_transaction_states.take();
+        loop {
+            match &state.view_delta_state {
+                ViewDeltaCommitState::NotStarted => {
+                    if self.connection.view_transaction_states.is_empty() {
+                        return Ok(IOResult::Done(()));
+                    }
 
-        if !rollback {
-            let schema = self.connection.schema.borrow();
+                    if rollback {
+                        // On rollback, just clear and done
+                        self.connection.view_transaction_states.clear();
+                        return Ok(IOResult::Done(()));
+                    }
 
-            for (view_name, tx_state) in tx_states.iter() {
-                if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                    let mut view = view_mutex.lock().unwrap();
-                    view.merge_delta(&tx_state.delta);
+                    // Not a rollback - proceed with processing
+                    let schema = self.connection.schema.read();
+
+                    // Collect materialized views - they should all have storage
+                    let mut views = Vec::new();
+                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
+                            let view = view_mutex.lock().unwrap();
+                            let root_page = view.get_root_page();
+
+                            // Materialized views should always have storage (root_page != 0)
+                            assert!(
+                                root_page != 0,
+                                "Materialized view '{view_name}' should have a root page"
+                            );
+
+                            views.push(view_name);
+                        }
+                    }
+
+                    state.view_delta_state = ViewDeltaCommitState::Processing {
+                        views,
+                        current_index: 0,
+                    };
+                }
+
+                ViewDeltaCommitState::Processing {
+                    views,
+                    current_index,
+                } => {
+                    // At this point we know it's not a rollback
+                    if *current_index >= views.len() {
+                        // All done, clear the transaction states
+                        self.connection.view_transaction_states.clear();
+                        state.view_delta_state = ViewDeltaCommitState::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    let view_name = &views[*current_index];
+
+                    let table_deltas = self
+                        .connection
+                        .view_transaction_states
+                        .get(view_name)
+                        .unwrap()
+                        .get_table_deltas();
+
+                    let schema = self.connection.schema.read();
+                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                        let mut view = view_mutex.lock().unwrap();
+
+                        // Create a DeltaSet from the per-table deltas
+                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
+                        for (table_name, delta) in table_deltas {
+                            delta_set.insert(table_name, delta);
+                        }
+
+                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
+                        match view.merge_delta(delta_set, pager.clone())? {
+                            IOResult::Done(_) => {
+                                // Move to next view
+                                state.view_delta_state = ViewDeltaCommitState::Processing {
+                                    views: views.clone(),
+                                    current_index: current_index + 1,
+                                };
+                            }
+                            IOResult::IO(io) => {
+                                // Return I/O, will resume at same index
+                                return Ok(IOResult::IO(io));
+                            }
+                        }
+                    }
+                }
+
+                ViewDeltaCommitState::Done => {
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
@@ -527,55 +807,69 @@ impl Program {
 
     pub fn commit_txn(
         &self,
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
         program_state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        self.apply_view_deltas(rollback);
+        // Apply view deltas with I/O handling
+        match self.apply_view_deltas(program_state, rollback, &pager)? {
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            IOResult::Done(_) => {}
+        }
 
-        if self.connection.transaction_state.get() == TransactionState::None && mv_store.is_none() {
+        // Reset state for next use
+        program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+
+        if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
         }
         if let Some(mv_store) = mv_store {
+            if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+                // We don't want to commit on nested statements. Let parent handle it.
+                return Ok(IOResult::Done(()));
+            }
             let conn = self.connection.clone();
-            let auto_commit = conn.auto_commit.get();
+            let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
             if auto_commit {
                 // FIXME: we don't want to commit stuff from other programs.
-                let mut mv_transactions = conn.mv_transactions.borrow_mut();
-                for tx_id in mv_transactions.iter() {
-                    let mut state_machine =
-                        mv_store.commit_tx(*tx_id, pager.clone(), &conn).unwrap();
-                    // TODO: sync IO hack
-                    loop {
-                        let res = state_machine.step(mv_store)?;
-                        match res {
-                            crate::state_machine::TransitionResult::Io(io) => {
-                                io.wait(conn._db.io.as_ref())?;
-                            }
-                            crate::state_machine::TransitionResult::Continue => continue,
-                            crate::state_machine::TransitionResult::Done(_) => break,
-                        }
-                    }
-                    assert!(state_machine.is_finalized());
+                if matches!(program_state.commit_state, CommitState::Ready) {
+                    let Some(tx_id) = conn.get_mv_tx_id() else {
+                        return Ok(IOResult::Done(()));
+                    };
+                    let state_machine = mv_store.commit_tx(tx_id, &conn).unwrap();
+                    program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
-                conn.mv_tx_id.set(None);
-                conn.transaction_state.replace(TransactionState::None);
-                mv_transactions.clear();
+                let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
+                else {
+                    panic!("invalid state for mvcc commit step")
+                };
+                match self.step_end_mvcc_txn(state_machine, mv_store)? {
+                    IOResult::Done(_) => {
+                        assert!(state_machine.is_finalized());
+                        *conn.mv_tx.write() = None;
+                        conn.set_tx_state(TransactionState::None);
+                        program_state.commit_state = CommitState::Ready;
+                        return Ok(IOResult::Done(()));
+                    }
+                    IOResult::IO(io) => {
+                        return Ok(IOResult::IO(io));
+                    }
+                }
             }
             Ok(IOResult::Done(()))
         } else {
             let connection = self.connection.clone();
-            let auto_commit = connection.auto_commit.get();
+            let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
             tracing::trace!(
                 "Halt auto_commit {}, state={:?}",
                 auto_commit,
                 program_state.commit_state
             );
-            if program_state.commit_state == CommitState::Committing {
-                let TransactionState::Write { .. } = connection.transaction_state.get() else {
+            if matches!(program_state.commit_state, CommitState::Committing) {
+                let TransactionState::Write { .. } = connection.get_tx_state() else {
                     unreachable!("invalid state for write commit step")
                 };
                 self.step_end_write_txn(
@@ -585,7 +879,7 @@ impl Program {
                     rollback,
                 )
             } else if auto_commit {
-                let current_state = connection.transaction_state.get();
+                let current_state = connection.get_tx_state();
                 tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
                     TransactionState::Write { .. } => self.step_end_write_txn(
@@ -595,7 +889,7 @@ impl Program {
                         rollback,
                     ),
                     TransactionState::Read => {
-                        connection.transaction_state.replace(TransactionState::None);
+                        connection.set_tx_state(TransactionState::None);
                         pager.end_read_tx()?;
                         Ok(IOResult::Done(()))
                     }
@@ -606,7 +900,8 @@ impl Program {
                 }
             } else {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
                 Ok(IOResult::Done(()))
             }
@@ -616,7 +911,7 @@ impl Program {
     #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         commit_state: &mut CommitState,
         connection: &Connection,
         rollback: bool,
@@ -625,9 +920,10 @@ impl Program {
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
-                connection.transaction_state.replace(TransactionState::None);
+                connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
             IOResult::IO(io) => {
@@ -639,25 +935,13 @@ impl Program {
         Ok(IOResult::Done(()))
     }
 
-    #[rustfmt::skip]
-    pub fn explain(&self) -> String {
-        let mut buff = String::with_capacity(1024);
-        buff.push_str("addr  opcode             p1    p2    p3    p4             p5  comment\n");
-        buff.push_str("----  -----------------  ----  ----  ----  -------------  --  -------\n");
-        let indent = "  ";
-        let indent_counts = get_indent_counts(&self.insns);
-        for (addr, (insn, _)) in self.insns.iter().enumerate() {
-            let indent_count = indent_counts[addr];
-            print_insn(
-                self,
-                addr as InsnReference,
-                insn,
-                indent.repeat(indent_count),
-                &mut buff,
-            );
-            buff.push('\n');
-        }
-        buff
+    #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
+    fn step_end_mvcc_txn(
+        &self,
+        commit_state: &mut StateMachine<CommitStateMachine<LocalClock>>,
+        mv_store: &Arc<MvStore>,
+    ) -> Result<IOResult<()>> {
+        commit_state.step(mv_store)
     }
 }
 
@@ -687,9 +971,6 @@ pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
 
 #[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
-        return;
-    }
     tracing::trace!(
         "\n{}",
         explain::insn_to_str(
@@ -697,89 +978,14 @@ fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
             addr,
             insn,
             String::new(),
-            program.comments.as_ref().and_then(|comments| comments
-                .iter()
-                .find(|(offset, _)| *offset == addr)
-                .map(|(_, comment)| comment)
-                .copied())
-        )
-    );
-}
-
-fn print_insn(program: &Program, addr: InsnReference, insn: &Insn, indent: String, w: &mut String) {
-    let s = explain::insn_to_str(
-        program,
-        addr,
-        insn,
-        indent,
-        program.comments.as_ref().and_then(|comments| {
-            comments
+            program
+                .comments
                 .iter()
                 .find(|(offset, _)| *offset == addr)
                 .map(|(_, comment)| comment)
                 .copied()
-        }),
+        )
     );
-    w.push_str(&s);
-}
-
-// The indenting rules are(from SQLite):
-//
-//  * For each "Next", "Prev", "VNext" or "VPrev" instruction, increase the ident number for
-//    all opcodes that occur between the p2 jump destination and the opcode itself.
-//
-//   * Do the previous for "Return" instructions for when P2 is positive.
-//
-//   * For each "Goto", if the jump destination is earlier in the program and ends on one of:
-//        Yield  SeekGt  SeekLt  RowSetRead  Rewind
-//     or if the P1 parameter is one instead of zero, then increase the indent number for all
-//     opcodes between the earlier instruction and "Goto"
-fn get_indent_counts(insns: &[(Insn, InsnFunction)]) -> Vec<usize> {
-    let mut indents = vec![0; insns.len()];
-
-    for (i, (insn, _)) in insns.iter().enumerate() {
-        let mut start = 0;
-        let mut end = 0;
-        match insn {
-            Insn::Next { pc_if_next, .. } | Insn::VNext { pc_if_next, .. } => {
-                let dest = pc_if_next.as_debug_int() as usize;
-                if dest < i {
-                    start = dest;
-                    end = i;
-                }
-            }
-            Insn::Prev { pc_if_prev, .. } => {
-                let dest = pc_if_prev.as_debug_int() as usize;
-                if dest < i {
-                    start = dest;
-                    end = i;
-                }
-            }
-
-            Insn::Goto { target_pc } => {
-                let dest = target_pc.as_debug_int() as usize;
-                if dest < i
-                    && matches!(
-                        insns.get(dest).map(|(insn, _)| insn),
-                        Some(Insn::Yield { .. })
-                            | Some(Insn::SeekGT { .. })
-                            | Some(Insn::SeekLT { .. })
-                            | Some(Insn::Rewind { .. })
-                    )
-                {
-                    start = dest;
-                    end = i;
-                }
-            }
-
-            _ => {}
-        }
-        for indent in indents.iter_mut().take(end).skip(start) {
-            *indent += 1;
-        }
-    }
-
-    indents
 }
 
 pub trait FromValueRow<'a> {
@@ -862,11 +1068,12 @@ impl Row {
 
 /// Handle a program error by rolling back the transaction
 pub fn handle_program_error(
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     connection: &Connection,
     err: &LimboError,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
-    if connection.is_nested_stmt.get() {
+    if connection.is_nested_stmt.load(Ordering::SeqCst) {
         // Errors from nested statements are handled by the parent statement.
         return Ok(());
     }
@@ -875,14 +1082,24 @@ pub fn handle_program_error(
         LimboError::TxError(_) => {}
         // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
         LimboError::TableLocked => {}
+        // Busy errors do not cause a rollback.
+        LimboError::Busy => {}
         _ => {
-            pager
-                .io
-                .block(|| pager.end_tx(true, connection))
-                .inspect_err(|e| {
-                    tracing::error!("end_tx failed: {e}");
-                })?;
-            connection.transaction_state.replace(TransactionState::None);
+            if let Some(mv_store) = mv_store {
+                if let Some(tx_id) = connection.get_mv_tx_id() {
+                    connection.set_tx_state(TransactionState::None);
+                    connection.auto_commit.store(true, Ordering::SeqCst);
+                    mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
+                }
+            } else {
+                pager
+                    .io
+                    .block(|| pager.end_tx(true, connection))
+                    .inspect_err(|e| {
+                        tracing::error!("end_tx failed: {e}");
+                    })?;
+            }
+            connection.set_tx_state(TransactionState::None);
         }
     }
     Ok(())

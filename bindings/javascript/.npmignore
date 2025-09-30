@@ -11,3 +11,5 @@ yarn.lock
 .yarn
 __test__
 renovate.json
+examples
+perf

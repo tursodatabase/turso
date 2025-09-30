@@ -145,6 +145,18 @@ do_execsql_test group_by_count_star {
   select u.first_name, count(*) from users u group by u.first_name limit 1;
 } {Aaron|41}
 
+do_execsql_test group_by_count_star_in_expression {
+  select u.first_name, count(*) % 3 from users u group by u.first_name order by u.first_name limit 3;
+} {Aaron|2
+Abigail|1
+Adam|0}
+
+do_execsql_test group_by_count_no_args_in_expression {
+  select u.first_name, count() % 3 from users u group by u.first_name order by u.first_name limit 3;
+} {Aaron|2
+Abigail|1
+Adam|0}
+
 do_execsql_test having {
   select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 97 order by avg(u.age) desc limit 5;
 } {Nina|100.0
@@ -296,3 +308,49 @@ shirt
 shorts
 sweater
 sweatshirt}
+
+# There was a bug where, while resetting accumulator registers, subsequent  registers were also reset.
+# This happened when there were more arguments than aggregate functions — the number of registers to reset
+# was calculated as the sum of the arguments, not the number of aggregates.
+# The issue affected cases where rows were pre-sorted, hence the 'GROUP BY id' test.
+do_execsql_test more_args_than_aggregates {
+  SELECT group_concat(name, ','), group_concat(name, ';'), group_concat(name, '.') FROM products GROUP BY id;
+} {hat|hat|hat
+cap|cap|cap
+shirt|shirt|shirt
+sweater|sweater|sweater
+sweatshirt|sweatshirt|sweatshirt
+shorts|shorts|shorts
+jeans|jeans|jeans
+sneakers|sneakers|sneakers
+boots|boots|boots
+coat|coat|coat
+accessories|accessories|accessories}
+
+# make sure we return the group by key sorted DESC when the order by has only an aggregate term
+do_execsql_test proper-sort-order {
+	SELECT u.first_name, COUNT(*) AS c
+	FROM users u
+	JOIN products p ON p.id = u.id
+	GROUP BY u.first_name
+	ORDER BY c DESC;
+} {Travis|1
+Tommy|1
+Rachel|1
+Nicholas|1
+Matthew|1
+Jennifer|1
+Jamie|1
+Edward|1
+Daniel|1
+Cindy|1
+Aimee|1}
+
+# In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
+do_execsql_test_on_specific_db {:memory:} group_by_alias_precedence {
+    CREATE TABLE t(x,y);
+    INSERT INTO t VALUES (1,200),(2,100);
+    INSERT INTO t VALUES (1,200),(2,100);
+    SELECT x AS y, SUM(y) as x FROM t GROUP BY y ORDER BY x;
+} {2|200
+1|400}

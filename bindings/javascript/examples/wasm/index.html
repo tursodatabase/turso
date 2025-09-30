@@ -1,0 +1,34 @@
+<html>
+  <head>
+    <meta content="text/html;charset=utf-8" http-equiv="Content-Type"/>
+  </head>
+  <body>
+    <button id="run">Run</button>
+    <script type="module">
+        import { Database, opfsSetup } from "@tursodatabase/database";
+        var opfs = await opfsSetup("local.db");
+        console.info(opfs);
+        async function consume() {
+            console.info('take', opfs.take());
+            setTimeout(consume, 1000);
+        }
+        consume();
+        async function tick() {
+            console.info('tick');
+            setTimeout(tick, 1000);
+        }
+        tick();
+
+        async function run() {
+            const db = new Database(opfs);
+            console.info('inited');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+            console.info('created');
+            await db.exec("INSERT INTO t VALUES (1)");
+            console.info('inserted');
+        }
+        document.getElementById("run").onclick = run;
+    </script>
+  </body>
+</html>

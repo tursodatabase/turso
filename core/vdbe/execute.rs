@@ -1,24 +1,26 @@
 #![allow(unused_variables)]
+use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
+use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
-use crate::storage::page_cache::DumbLruPageCache;
+use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::read_varint;
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::{normalize_ident, IOExt as _};
+use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
-use crate::MvCursor;
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -31,16 +33,18 @@ use crate::{
         },
         printf::exec_printf,
     },
+    translate::emitter::TransactionMode,
 };
+use crate::{get_cursor, CheckpointMode, MvCursor};
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
-    rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
+use turso_macros::match_ignore_ascii_case;
 
-use crate::{pseudo::PseudoCursor, result::LimboResult};
+use crate::pseudo::PseudoCursor;
 
 use crate::{
     schema::{affinity, Affinity},
@@ -53,10 +57,7 @@ use crate::{
         AggContext, Cursor, ExternalAggState, IOResult, SeekKey, SeekOp, SumAggState, Value,
         ValueType,
     },
-    util::{
-        cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
-        checked_cast_text_to_numeric, parse_schema_rows, RoundToPrecision,
-    },
+    util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
     vdbe::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn},
@@ -72,8 +73,7 @@ use super::{
 };
 use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
-use turso_parser::ast;
-use turso_parser::ast::fmt::ToTokens;
+use turso_parser::ast::{self, Name};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -81,7 +81,7 @@ use super::{
     sorter::Sorter,
 };
 use regex::{Regex, RegexBuilder};
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
 
 #[cfg(feature = "json")]
 use crate::{
@@ -118,17 +118,19 @@ macro_rules! load_insn {
 
 macro_rules! return_if_io {
     ($expr:expr) => {
-        match $expr? {
-            IOResult::Done(v) => v,
-            IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        match $expr {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Err(err) => return Err(err),
         }
     };
 }
+
 pub type InsnFunction = fn(
     &Program,
     &mut ProgramState,
     &Insn,
-    &Rc<Pager>,
+    &Arc<Pager>,
     Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult>;
 
@@ -156,7 +158,6 @@ pub enum InsnFunctionStepResult {
     IO(IOCompletions),
     Row,
     Interrupt,
-    Busy,
     Step,
 }
 
@@ -173,7 +174,7 @@ pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
@@ -186,7 +187,7 @@ pub fn op_add(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
@@ -203,7 +204,7 @@ pub fn op_subtract(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
@@ -220,7 +221,7 @@ pub fn op_multiply(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
@@ -237,7 +238,7 @@ pub fn op_divide(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
@@ -254,7 +255,7 @@ pub fn op_drop_index(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
@@ -269,7 +270,7 @@ pub fn op_remainder(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
@@ -286,7 +287,7 @@ pub fn op_bit_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
@@ -303,7 +304,7 @@ pub fn op_bit_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
@@ -320,7 +321,7 @@ pub fn op_bit_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitNot { reg, dest }, insn);
@@ -329,11 +330,34 @@ pub fn op_bit_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Debug)]
+pub enum OpCheckpointState {
+    StartCheckpoint,
+    FinishCheckpoint { result: Option<CheckpointResult> },
+    CompleteResult { result: Result<CheckpointResult> },
+}
+
 pub fn op_checkpoint(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    match op_checkpoint_inner(program, state, insn, pager, mv_store) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            state.op_checkpoint_state = OpCheckpointState::StartCheckpoint;
+            Err(err)
+        }
+    }
+}
+
+pub fn op_checkpoint_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -344,40 +368,114 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.auto_commit.get() {
+    if !program.connection.auto_commit.load(Ordering::SeqCst) {
         // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
         // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
         // attempt to checkpoint in an interactive transaction. This does not end the transaction,
         // however.
         return Err(LimboError::TableLocked);
     }
-    let result = program.connection.checkpoint(*checkpoint_mode);
-    match result {
-        Ok(CheckpointResult {
-            num_attempted,
-            num_backfilled,
-            ..
-        }) => {
-            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest] = Register::Value(Value::Integer(0));
-            // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
-            // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+    if let Some(mv_store) = mv_store {
+        if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
+            return Err(LimboError::InvalidArgument(
+                "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
+            ));
         }
-        Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
+        let mut ckpt_sm = StateMachine::new(CheckpointStateMachine::new(
+            pager.clone(),
+            mv_store.clone(),
+            program.connection.clone(),
+        ));
+        loop {
+            let result = ckpt_sm.step(&())?;
+            match result {
+                IOResult::IO(io) => {
+                    pager.io.step()?;
+                }
+                IOResult::Done(result) => {
+                    state.op_checkpoint_state =
+                        OpCheckpointState::CompleteResult { result: Ok(result) };
+                    break;
+                }
+            }
+        }
     }
+    loop {
+        match &mut state.op_checkpoint_state {
+            OpCheckpointState::StartCheckpoint => {
+                let step_result = program
+                    .connection
+                    .pager
+                    .write()
+                    .wal_checkpoint_start(*checkpoint_mode);
+                match step_result {
+                    Ok(IOResult::Done(result)) => {
+                        state.op_checkpoint_state = OpCheckpointState::FinishCheckpoint {
+                            result: Some(result),
+                        };
+                        continue;
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Err(err) => {
+                        state.op_checkpoint_state =
+                            OpCheckpointState::CompleteResult { result: Err(err) };
+                        continue;
+                    }
+                }
+            }
+            OpCheckpointState::FinishCheckpoint { result } => {
+                let step_result = program
+                    .connection
+                    .pager
+                    .write()
+                    .wal_checkpoint_finish(result.as_mut().unwrap());
+                match step_result {
+                    Ok(IOResult::Done(())) => {
+                        state.op_checkpoint_state = OpCheckpointState::CompleteResult {
+                            result: Ok(result.take().unwrap()),
+                        };
+                        continue;
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Err(err) => {
+                        state.op_checkpoint_state =
+                            OpCheckpointState::CompleteResult { result: Err(err) };
+                        continue;
+                    }
+                }
+            }
+            OpCheckpointState::CompleteResult { result } => {
+                match result {
+                    Ok(CheckpointResult {
+                        num_attempted,
+                        num_backfilled,
+                        ..
+                    }) => {
+                        // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+                        // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+                        state.registers[*dest] = Register::Value(Value::Integer(0));
+                        // 2nd col: # modified pages written to wal file
+                        state.registers[*dest + 1] =
+                            Register::Value(Value::Integer(*num_attempted as i64));
+                        // 3rd col: # pages moved to db after checkpoint
+                        state.registers[*dest + 2] =
+                            Register::Value(Value::Integer(*num_backfilled as i64));
+                    }
+                    Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
+                }
 
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 pub fn op_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     match insn {
@@ -400,12 +498,12 @@ pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
     {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
         let cursor = cursor.as_btree_mut();
         cursor.set_null_flag(true);
     }
@@ -417,7 +515,7 @@ pub fn op_compare(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -463,7 +561,7 @@ pub fn op_jump(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -496,7 +594,7 @@ pub fn op_move(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -524,7 +622,7 @@ pub fn op_if_pos(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -559,7 +657,7 @@ pub fn op_not_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NotNull { reg, target_pc }, insn);
@@ -644,7 +742,7 @@ pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
@@ -869,7 +967,7 @@ pub fn op_if(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -896,7 +994,7 @@ pub fn op_if_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -923,7 +1021,7 @@ pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -938,26 +1036,58 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
-            let table_id = *root_page as u64;
-            let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
-                MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
-            ));
-            Some(mv_cursor)
-        }
-        None => None,
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = *root_page;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(
+            MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
+        ));
+        Some(mv_cursor)
+    } else {
+        assert!(*root_page >= 0, "");
+        None
     };
-    let mut cursors = state.cursors.borrow_mut();
+    let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
+        CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
         _ => unreachable!("This should not have happened"),
     };
 
     match cursor_type {
+        CursorType::MaterializedView(_, view_mutex) => {
+            // This is a materialized view with storage
+            // Create btree cursor for reading the persistent data
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                mv_cursor,
+                pager.clone(),
+                *root_page,
+                num_columns,
+            ));
+
+            // Get the view name and look up or create its transaction state
+            let view_name = view_mutex.lock().unwrap().name().to_string();
+            let tx_state = program
+                .connection
+                .view_transaction_states
+                .get_or_create(&view_name);
+
+            // Create materialized view cursor with this view's transaction state
+            let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
+                btree_cursor,
+                view_mutex.clone(),
+                pager.clone(),
+                tx_state,
+            )?;
+
+            cursors
+                .get_mut(*cursor_id)
+                .unwrap()
+                .replace(Cursor::new_materialized_view(mv_cursor));
+        }
         CursorType::BTreeTable(_) => {
+            // Regular table
             let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
             cursors
                 .get_mut(*cursor_id)
@@ -995,7 +1125,7 @@ pub fn op_vopen(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VOpen { cursor_id }, insn);
@@ -1006,7 +1136,6 @@ pub fn op_vopen(
     let cursor = virtual_table.open(program.connection.clone())?;
     state
         .cursors
-        .borrow_mut()
         .get_mut(*cursor_id)
         .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
         .replace(Cursor::Virtual(cursor));
@@ -1018,7 +1147,7 @@ pub fn op_vcreate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1044,12 +1173,9 @@ pub fn op_vcreate(
     };
     let conn = program.connection.clone();
     let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.borrow())?;
+        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms
-            .borrow_mut()
-            .vtabs
-            .insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table.clone());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1059,7 +1185,7 @@ pub fn op_vfilter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1074,7 +1200,7 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_virtual_mut();
         let mut args = Vec::with_capacity(*arg_count);
         for i in 0..*arg_count {
@@ -1103,7 +1229,7 @@ pub fn op_vcolumn(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1115,7 +1241,7 @@ pub fn op_vcolumn(
         insn
     );
     let value = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
         cursor.column(*column)?
     };
@@ -1128,7 +1254,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1192,7 +1318,7 @@ pub fn op_vnext(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1203,7 +1329,7 @@ pub fn op_vnext(
         insn
     );
     let has_more = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
         cursor.next()?
     };
@@ -1221,13 +1347,13 @@ pub fn op_vdestroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VDestroy { db, table_name }, insn);
     let conn = program.connection.clone();
     {
-        let Some(vtab) = conn.syms.borrow_mut().vtabs.remove(table_name) else {
+        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),
             ));
@@ -1243,7 +1369,7 @@ pub fn op_open_pseudo(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1255,7 +1381,7 @@ pub fn op_open_pseudo(
         insn
     );
     {
-        let mut cursors = state.cursors.borrow_mut();
+        let cursors = &mut state.cursors;
         let cursor = PseudoCursor::default();
         cursors
             .get_mut(*cursor_id)
@@ -1270,7 +1396,7 @@ pub fn op_rewind(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1282,10 +1408,18 @@ pub fn op_rewind(
     );
     assert!(pc_if_empty.is_offset());
     let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Rewind");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.rewind());
-        cursor.is_empty()
+        let cursor = state.get_cursor(*cursor_id);
+        match cursor {
+            Cursor::BTree(btree_cursor) => {
+                return_if_io!(btree_cursor.rewind());
+                btree_cursor.is_empty()
+            }
+            Cursor::MaterializedView(mv_cursor) => {
+                return_if_io!(mv_cursor.rewind());
+                !mv_cursor.is_valid()?
+            }
+            _ => panic!("Rewind on non-btree/materialized-view cursor"),
+        }
     };
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
@@ -1301,7 +1435,7 @@ pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1313,7 +1447,7 @@ pub fn op_last(
     );
     assert!(pc_if_empty.is_offset());
     let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
         return_if_io!(cursor.last());
         cursor.is_empty()
@@ -1384,7 +1518,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1414,13 +1548,16 @@ pub fn op_column(
                 index_cursor_id,
                 table_cursor_id,
             } => {
-                let rowid = {
-                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                let Some(rowid) = ({
+                    let index_cursor = state.get_cursor(index_cursor_id);
                     let index_cursor = index_cursor.as_btree_mut();
                     return_if_io!(index_cursor.rowid())
+                }) else {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                    break 'outer;
                 };
                 state.op_column_state = OpColumnState::Seek {
-                    rowid: rowid.unwrap(),
+                    rowid,
                     table_cursor_id,
                 };
             }
@@ -1429,20 +1566,45 @@ pub fn op_column(
                 table_cursor_id,
             } => {
                 {
-                    let mut table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
+                    let table_cursor = state.get_cursor(table_cursor_id);
+                    // MaterializedView cursors shouldn't go through deferred seek logic
+                    // but if we somehow get here, handle it appropriately
+                    match table_cursor {
+                        Cursor::MaterializedView(mv_cursor) => {
+                            // Seek to the rowid in the materialized view
+                            return_if_io!(mv_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        }
+                        _ => {
+                            // Regular btree cursor
+                            let table_cursor = table_cursor.as_btree_mut();
+                            return_if_io!(table_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        }
+                    }
                 }
                 state.op_column_state = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
+                // First check if this is a MaterializedViewCursor
+                {
+                    let cursor = state.get_cursor(*cursor_id);
+                    if let Cursor::MaterializedView(mv_cursor) = cursor {
+                        // Handle materialized view column access
+                        let value = return_if_io!(mv_cursor.column(*column));
+                        state.registers[*dest] = Register::Value(value);
+                        break 'outer;
+                    }
+                    // Fall back to normal handling
+                }
+
                 let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
                 match cursor_type {
-                    CursorType::BTreeTable(_) | CursorType::BTreeIndex(_) => {
+                    CursorType::BTreeTable(_)
+                    | CursorType::BTreeIndex(_)
+                    | CursorType::MaterializedView(_, _) => {
                         'ifnull: {
-                            let mut cursor_ref = must_be_btree_cursor!(
+                            let cursor_ref = must_be_btree_cursor!(
                                 *cursor_id,
                                 program.cursor_ref,
                                 state,
@@ -1451,7 +1613,6 @@ pub fn op_column(
                             let cursor = cursor_ref.as_btree_mut();
 
                             if cursor.get_null_flag() {
-                                drop(cursor_ref);
                                 state.registers[*dest] = Register::Value(Value::Null);
                                 break 'outer;
                             }
@@ -1549,11 +1710,12 @@ pub fn op_column(
                             let serial_type = record_cursor.serial_types[target_column];
                             drop(record_result);
                             drop(record_cursor);
-                            drop(cursor_ref);
 
                             match serial_type {
                                 // NULL
-                                0 => break 'ifnull,
+                                0 => {
+                                    state.registers[*dest] = Register::Value(Value::Null);
+                                }
                                 // I8
                                 1 => {
                                     state.registers[*dest] =
@@ -1688,7 +1850,7 @@ pub fn op_column(
                     }
                     CursorType::Sorter => {
                         let record = {
-                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_sorter_mut();
                             cursor.record().cloned()
                         };
@@ -1704,7 +1866,7 @@ pub fn op_column(
                     }
                     CursorType::Pseudo(_) => {
                         let value = {
-                            let mut cursor = state.get_cursor(*cursor_id);
+                            let cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_pseudo_mut();
                             if let Some(record) = cursor.record() {
                                 record.get_value(*column)?.to_owned()
@@ -1732,7 +1894,7 @@ pub fn op_type_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1763,25 +1925,24 @@ pub fn op_type_check(
             }
             let col_affinity = col.affinity();
             let ty_str = &col.ty_str;
+            let ty_bytes = ty_str.as_bytes();
             let applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
-            match value_type {
-                ValueType::Integer
-                    if ty_str.eq_ignore_ascii_case("INTEGER")
-                        || ty_str.eq_ignore_ascii_case("INT") => {}
-                ValueType::Float if ty_str.eq_ignore_ascii_case("REAL") => {}
-                ValueType::Blob if ty_str.eq_ignore_ascii_case("BLOB") => {}
-                ValueType::Text if ty_str.eq_ignore_ascii_case("TEXT") => {}
-                _ if ty_str.eq_ignore_ascii_case("ANY") => {}
-                v => bail_constraint_error!(
+            match_ignore_ascii_case!(match ty_bytes {
+                b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
+                b"REAL" if value_type == ValueType::Float => {}
+                b"BLOB" if value_type == ValueType::Blob => {}
+                b"TEXT" if value_type == ValueType::Text => {}
+                b"ANY" => {}
+                _ => bail_constraint_error!(
                     "cannot store {} value in {} column {}.{} ({})",
-                    v,
+                    value_type,
                     ty_str,
                     &table_reference.name,
                     col.name.as_deref().unwrap_or(""),
                     SQLITE_CONSTRAINT
                 ),
-            };
+            });
             Ok(())
         })?;
 
@@ -1793,7 +1954,7 @@ pub fn op_make_record(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1801,12 +1962,52 @@ pub fn op_make_record(
             start_reg,
             count,
             dest_reg,
+            affinity_str,
             ..
         },
         insn
     );
+
+    if let Some(affinity_str) = affinity_str {
+        if affinity_str.len() != *count {
+            return Err(LimboError::InternalError(format!(
+                "MakeRecord: the length of affinity string ({}) does not match the count ({})",
+                affinity_str.len(),
+                *count
+            )));
+        }
+        for (i, affinity_ch) in affinity_str.chars().enumerate().take(*count) {
+            let reg_index = *start_reg + i;
+            let affinity = Affinity::from_char(affinity_ch);
+            apply_affinity_char(&mut state.registers[reg_index], affinity);
+        }
+    }
+
     let record = make_record(&state.registers, start_reg, count);
     state.registers[*dest_reg] = Register::Record(record);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_mem_max(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(MemMax { dest_reg, src_reg }, insn);
+
+    let dest_val = state.registers[*dest_reg].get_value();
+    let src_val = state.registers[*src_reg].get_value();
+
+    let dest_int = extract_int_value(dest_val);
+    let src_int = extract_int_value(src_val);
+
+    if dest_int < src_int {
+        state.registers[*dest_reg] = Register::Value(Value::Integer(src_int));
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1815,7 +2016,7 @@ pub fn op_result_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ResultRow { start_reg, count }, insn);
@@ -1832,7 +2033,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1844,12 +2045,19 @@ pub fn op_next(
     );
     assert!(pc_if_next.is_offset());
     let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Next");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(false);
-        return_if_io!(cursor.next());
-
-        cursor.is_empty()
+        let cursor = state.get_cursor(*cursor_id);
+        match cursor {
+            Cursor::BTree(btree_cursor) => {
+                btree_cursor.set_null_flag(false);
+                return_if_io!(btree_cursor.next());
+                btree_cursor.is_empty()
+            }
+            Cursor::MaterializedView(mv_cursor) => {
+                let has_more = return_if_io!(mv_cursor.next());
+                !has_more
+            }
+            _ => panic!("Next on non-btree/materialized-view cursor"),
+        }
     };
     if !is_empty {
         // Increment metrics for row read
@@ -1874,7 +2082,7 @@ pub fn op_prev(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1886,7 +2094,7 @@ pub fn op_prev(
     );
     assert!(pc_if_prev.is_offset());
     let is_empty = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
         let cursor = cursor.as_btree_mut();
         cursor.set_null_flag(false);
         return_if_io!(cursor.prev());
@@ -1915,7 +2123,7 @@ pub fn op_prev(
 pub fn halt(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     err_code: usize,
     description: &str,
@@ -1936,6 +2144,11 @@ pub fn halt(
                 "NOT NULL constraint failed: {description} (19)"
             )));
         }
+        SQLITE_CONSTRAINT_UNIQUE => {
+            return Err(LimboError::Constraint(format!(
+                "UNIQUE constraint failed: {description} (19)"
+            )));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -1943,7 +2156,7 @@ pub fn halt(
         }
     }
 
-    let auto_commit = program.connection.auto_commit.get();
+    let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
         program
@@ -1958,7 +2171,7 @@ pub fn op_halt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1975,7 +2188,7 @@ pub fn op_halt_if_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -1994,167 +2207,226 @@ pub fn op_halt_if_null(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum OpTransactionState {
+    Start,
+    CheckSchemaCookie,
+}
+
 pub fn op_transaction(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    match op_transaction_inner(program, state, insn, pager, mv_store) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            state.op_transaction_state = OpTransactionState::Start;
+            Err(err)
+        }
+    }
+}
+
+pub fn op_transaction_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Transaction {
             db,
-            write,
+            tx_mode,
             schema_cookie,
         },
         insn
     );
-    let conn = program.connection.clone();
-    if *write && conn._db.open_flags.contains(OpenFlags::ReadOnly) {
-        return Err(LimboError::ReadOnly);
-    }
-
+    tracing::info!("op_transaction: mv_store.is_some()={}", mv_store.is_some());
     let pager = program.get_pager_from_database_index(db);
+    loop {
+        match state.op_transaction_state {
+            OpTransactionState::Start => {
+                let conn = program.connection.clone();
+                let write = matches!(tx_mode, TransactionMode::Write);
+                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
+                    return Err(LimboError::ReadOnly);
+                }
 
-    // 1. We try to upgrade current version
-    let current_state = conn.transaction_state.get();
-    let (new_transaction_state, updated) = if conn.is_nested_stmt.get() {
-        (current_state, false)
-    } else {
-        match (current_state, write) {
-            // pending state means that we tried beginning a tx and the method returned IO.
-            // instead of ending the read tx, just update the state to pending.
-            (TransactionState::PendingUpgrade, write) => {
-                turso_assert!(
-                    *write,
-                    "pending upgrade should only be set for write transactions"
-                );
-                (
-                    TransactionState::Write {
-                        schema_did_change: false,
-                    },
-                    true,
-                )
-            }
-            (TransactionState::Write { schema_did_change }, true) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Write { schema_did_change }, false) => {
-                (TransactionState::Write { schema_did_change }, false)
-            }
-            (TransactionState::Read, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                },
-                true,
-            ),
-            (TransactionState::Read, false) => (TransactionState::Read, false),
-            (TransactionState::None, true) => (
-                TransactionState::Write {
-                    schema_did_change: false,
-                },
-                true,
-            ),
-            (TransactionState::None, false) => (TransactionState::Read, true),
-        }
-    };
+                // 1. We try to upgrade current version
+                let current_state = conn.get_tx_state();
+                let (new_transaction_state, updated) = if conn.is_nested_stmt.load(Ordering::SeqCst)
+                {
+                    (current_state, false)
+                } else {
+                    match (current_state, write) {
+                        // pending state means that we tried beginning a tx and the method returned IO.
+                        // instead of ending the read tx, just update the state to pending.
+                        (TransactionState::PendingUpgrade, write) => {
+                            turso_assert!(
+                                write,
+                                "pending upgrade should only be set for write transactions"
+                            );
+                            (
+                                TransactionState::Write {
+                                    schema_did_change: false,
+                                },
+                                true,
+                            )
+                        }
+                        (TransactionState::Write { schema_did_change }, true) => {
+                            (TransactionState::Write { schema_did_change }, false)
+                        }
+                        (TransactionState::Write { schema_did_change }, false) => {
+                            (TransactionState::Write { schema_did_change }, false)
+                        }
+                        (TransactionState::Read, true) => (
+                            TransactionState::Write {
+                                schema_did_change: false,
+                            },
+                            true,
+                        ),
+                        (TransactionState::Read, false) => (TransactionState::Read, false),
+                        (TransactionState::None, true) => (
+                            TransactionState::Write {
+                                schema_did_change: false,
+                            },
+                            true,
+                        ),
+                        (TransactionState::None, false) => (TransactionState::Read, true),
+                    }
+                };
 
-    // 2. Start transaction if needed
-    if let Some(mv_store) = &mv_store {
-        // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
-        // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
-        // for both.
-        if program.connection.mv_tx_id.get().is_none() {
-            // We allocate the first page lazily in the first transaction.
-            return_if_io!(pager.maybe_allocate_page1());
-            // TODO: when we fix MVCC enable schema cookie detection for reprepare statements
-            // let header_schema_cookie = pager
-            //     .io
-            //     .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-            // if header_schema_cookie != *schema_cookie {
-            //     return Err(LimboError::SchemaUpdated);
-            // }
-            let tx_id = mv_store.begin_tx(pager.clone());
-            conn.mv_transactions.borrow_mut().push(tx_id);
-            program.connection.mv_tx_id.set(Some(tx_id));
-        }
-    } else {
-        if updated && matches!(current_state, TransactionState::None) {
-            turso_assert!(
-                !conn.is_nested_stmt.get(),
-                "nested stmt should not begin a new read transaction"
-            );
-            if let LimboResult::Busy = pager.begin_read_tx()? {
-                return Ok(InsnFunctionStepResult::Busy);
-            }
-        }
+                // 2. Start transaction if needed
+                if let Some(mv_store) = &mv_store {
+                    // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
+                    // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
+                    // for both.
+                    let current_mv_tx = program.connection.get_mv_tx();
+                    let has_existing_mv_tx = current_mv_tx.is_some();
 
-        if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
-            turso_assert!(
-                !conn.is_nested_stmt.get(),
-                "nested stmt should not begin a new write transaction"
-            );
-            match pager.begin_write_tx()? {
-                IOResult::Done(r) => {
-                    if let LimboResult::Busy = r {
-                        pager.end_read_tx()?;
-                        conn.transaction_state.replace(TransactionState::None);
-                        conn.auto_commit.replace(true);
-                        return Ok(InsnFunctionStepResult::Busy);
+                    let conn_has_executed_begin_deferred = !has_existing_mv_tx
+                        && !program.connection.auto_commit.load(Ordering::SeqCst);
+                    if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
+                        return Err(LimboError::TxError(
+                            "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
+                        ));
+                    }
+
+                    if !has_existing_mv_tx {
+                        let tx_id = match tx_mode {
+                            TransactionMode::None
+                            | TransactionMode::Read
+                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
+                            TransactionMode::Write => {
+                                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
+                            }
+                        };
+                        *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
+                    } else if updated {
+                        // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
+                        let (tx_id, mv_tx_mode) = current_mv_tx.unwrap();
+                        let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
+                            TransactionMode::Concurrent
+                        } else {
+                            *tx_mode
+                        };
+                        if matches!(new_transaction_state, TransactionState::Write { .. })
+                            && matches!(actual_tx_mode, TransactionMode::Write)
+                        {
+                            return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                        }
+                    }
+                } else {
+                    if matches!(tx_mode, TransactionMode::Concurrent) {
+                        return Err(LimboError::TxError(
+                            "Concurrent transaction mode is only supported when MVCC is enabled"
+                                .to_string(),
+                        ));
+                    }
+                    if updated && matches!(current_state, TransactionState::None) {
+                        turso_assert!(
+                            !conn.is_nested_stmt.load(Ordering::SeqCst),
+                            "nested stmt should not begin a new read transaction"
+                        );
+                        pager.begin_read_tx()?;
+                    }
+
+                    if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
+                        turso_assert!(
+                            !conn.is_nested_stmt.load(Ordering::SeqCst),
+                            "nested stmt should not begin a new write transaction"
+                        );
+                        let begin_w_tx_res = pager.begin_write_tx();
+                        if let Err(LimboError::Busy) = begin_w_tx_res {
+                            // We failed to upgrade to write transaction so put the transaction into its original state.
+                            // That is, if the transaction had not started, end the read transaction so that next time we
+                            // start a new one.
+                            if matches!(current_state, TransactionState::None) {
+                                pager.end_read_tx()?;
+                                conn.set_tx_state(TransactionState::None);
+                            }
+                            assert_eq!(conn.get_tx_state(), current_state);
+                            return Err(LimboError::Busy);
+                        }
+                        if let IOResult::IO(io) = begin_w_tx_res? {
+                            // set the transaction state to pending so we don't have to
+                            // end the read transaction.
+                            program
+                                .connection
+                                .set_tx_state(TransactionState::PendingUpgrade);
+                            return Ok(InsnFunctionStepResult::IO(io));
+                        }
                     }
                 }
-                IOResult::IO(io) => {
-                    // set the transaction state to pending so we don't have to
-                    // end the read transaction.
-                    program
-                        .connection
-                        .transaction_state
-                        .replace(TransactionState::PendingUpgrade);
-                    return Ok(InsnFunctionStepResult::IO(io));
+
+                // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
+                if updated {
+                    conn.set_tx_state(new_transaction_state);
                 }
+                state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
+                continue;
+            }
+            // 4. Check whether schema has changed if we are actually going to access the database.
+            // Can only read header if page 1 has been allocated already
+            // begin_write_tx that happens, but not begin_read_tx
+            OpTransactionState::CheckSchemaCookie => {
+                let res = with_header(&pager, mv_store, program, |header| {
+                    header.schema_cookie.get()
+                });
+                match res {
+                    Ok(IOResult::Done(header_schema_cookie)) => {
+                        if header_schema_cookie != *schema_cookie {
+                            tracing::debug!(
+                                "schema changed, force reprepare: {} != {}",
+                                header_schema_cookie,
+                                *schema_cookie
+                            );
+                            return Err(LimboError::SchemaUpdated);
+                        }
+                    }
+                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
+                    Err(LimboError::Page1NotAlloc) => {}
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
             }
         }
     }
-
-    // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
-    if updated {
-        conn.transaction_state.replace(new_transaction_state);
-    }
-
-    // 4. Check whether schema has changed if we are actually going to access the database.
-    // Can only read header if page 1 has been allocated already
-    // begin_write_tx that happens, but not begin_read_tx
-    // TODO: this is a hack to make the pager run the IO loop
-    let res = pager
-        .io
-        .block(|| pager.with_header(|header| header.schema_cookie.get()));
-    match res {
-        Ok(header_schema_cookie) => {
-            if header_schema_cookie != *schema_cookie {
-                tracing::info!(
-                    "schema changed, force reprepare: {} != {}",
-                    header_schema_cookie,
-                    *schema_cookie
-                );
-                return Err(LimboError::SchemaUpdated);
-            }
-        }
-        // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
-        Err(LimboError::Page1NotAlloc) => {}
-        Err(err) => {
-            return Err(err);
-        }
-    }
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2165,34 +2437,53 @@ pub fn op_auto_commit(
         insn
     );
     let conn = program.connection.clone();
-    if state.commit_state == CommitState::Committing {
+    if matches!(state.commit_state, CommitState::Committing) {
         return program
             .commit_txn(pager.clone(), state, mv_store, *rollback)
             .map(Into::into);
     }
 
-    if *auto_commit != conn.auto_commit.get() {
+    if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
             // TODO(pere): add rollback I/O logic once we implement rollback journal
-            return_if_io!(pager.end_tx(true, &conn));
-            conn.transaction_state.replace(TransactionState::None);
-            conn.auto_commit.replace(true);
+            if let Some(mv_store) = mv_store {
+                if let Some(tx_id) = conn.get_mv_tx_id() {
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
+                }
+            } else {
+                return_if_io!(pager.end_tx(true, &conn));
+            }
+            conn.set_tx_state(TransactionState::None);
+            conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
-            conn.auto_commit.replace(*auto_commit);
+            conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
         }
-    } else if !*auto_commit {
-        return Err(LimboError::TxError(
-            "cannot start a transaction within a transaction".to_string(),
-        ));
-    } else if *rollback {
-        return Err(LimboError::TxError(
-            "cannot rollback - no transaction is active".to_string(),
-        ));
     } else {
-        return Err(LimboError::TxError(
-            "cannot commit - no transaction is active".to_string(),
-        ));
+        let mvcc_tx_active = program.connection.get_mv_tx().is_some();
+        if !mvcc_tx_active {
+            if !*auto_commit {
+                return Err(LimboError::TxError(
+                    "cannot start a transaction within a transaction".to_string(),
+                ));
+            } else if *rollback {
+                return Err(LimboError::TxError(
+                    "cannot rollback - no transaction is active".to_string(),
+                ));
+            } else {
+                return Err(LimboError::TxError(
+                    "cannot commit - no transaction is active".to_string(),
+                ));
+            }
+        } else {
+            let is_begin = !*auto_commit && !*rollback;
+            if is_begin {
+                return Err(LimboError::TxError(
+                    "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+                ));
+            }
+        }
     }
+
     program
         .commit_txn(pager.clone(), state, mv_store, *rollback)
         .map(Into::into)
@@ -2202,7 +2493,7 @@ pub fn op_goto(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Goto { target_pc }, insn);
@@ -2215,7 +2506,7 @@ pub fn op_gosub(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2235,7 +2526,7 @@ pub fn op_return(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2265,7 +2556,7 @@ pub fn op_integer(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Integer { value, dest }, insn);
@@ -2278,7 +2569,7 @@ pub fn op_real(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Real { value, dest }, insn);
@@ -2291,7 +2582,7 @@ pub fn op_real_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RealAffinity { register }, insn);
@@ -2306,7 +2597,7 @@ pub fn op_string8(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
@@ -2319,7 +2610,7 @@ pub fn op_blob(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
@@ -2332,14 +2623,13 @@ pub fn op_row_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
 
     let record = {
-        let mut cursor_ref =
-            must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
+        let cursor_ref = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "RowData");
         let cursor = cursor_ref.as_btree_mut();
         let record_option = return_if_io!(cursor.record());
 
@@ -2375,7 +2665,7 @@ pub fn op_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowId { cursor_id, dest }, insn);
@@ -2398,7 +2688,7 @@ pub fn op_row_id(
                 table_cursor_id,
             } => {
                 let rowid = {
-                    let mut index_cursor = state.get_cursor(index_cursor_id);
+                    let index_cursor = state.get_cursor(index_cursor_id);
                     let index_cursor = index_cursor.as_btree_mut();
                     let record = return_if_io!(index_cursor.record());
                     let record = record.as_ref().unwrap();
@@ -2420,7 +2710,7 @@ pub fn op_row_id(
                 table_cursor_id,
             } => {
                 {
-                    let mut table_cursor = state.get_cursor(table_cursor_id);
+                    let table_cursor = state.get_cursor(table_cursor_id);
                     let table_cursor = table_cursor.as_btree_mut();
                     return_if_io!(
                         table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
@@ -2429,7 +2719,7 @@ pub fn op_row_id(
                 state.op_row_id_state = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
-                let mut cursors = state.cursors.borrow_mut();
+                let cursors = &mut state.cursors;
                 if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
                         state.registers[*dest] = Register::Value(Value::Integer(*rowid));
@@ -2445,9 +2735,18 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
+                } else if let Some(Cursor::MaterializedView(mv_cursor)) =
+                    cursors.get_mut(*cursor_id).unwrap()
+                {
+                    if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
+                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
                 } else {
                     return Err(LimboError::InternalError(
-                        "RowId: cursor is not a table or virtual cursor".to_string(),
+                        "RowId: cursor is not a table, virtual, or materialized view cursor"
+                            .to_string(),
                     ));
                 }
                 break;
@@ -2464,11 +2763,11 @@ pub fn op_idx_row_id(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IdxRowId { cursor_id, dest }, insn);
-    let mut cursors = state.cursors.borrow_mut();
+    let cursors = &mut state.cursors;
     let cursor = cursors.get_mut(*cursor_id).unwrap().as_mut().unwrap();
     let cursor = cursor.as_btree_mut();
     let rowid = return_if_io!(cursor.rowid());
@@ -2484,7 +2783,7 @@ pub fn op_seek_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2497,41 +2796,68 @@ pub fn op_seek_rowid(
     );
     assert!(target_pc.is_offset());
     let (pc, did_seek) = {
-        let mut cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let rowid = match state.registers[*src_reg].get_value() {
-            Value::Integer(rowid) => Some(*rowid),
-            Value::Null => None,
-            // For non-integer values try to apply affinity and convert them to integer.
-            other => {
-                let mut temp_reg = Register::Value(other.clone());
-                let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
-                if converted {
-                    match temp_reg.get_value() {
-                        Value::Integer(i) => Some(*i),
-                        Value::Float(f) => Some(*f as i64),
-                        _ => unreachable!("apply_affinity_char with Numeric should produce an integer if it returns true"),
+        let cursor = get_cursor!(state, *cursor_id);
+
+        // Handle MaterializedView cursor
+        let (pc, did_seek) = match cursor {
+            Cursor::MaterializedView(mv_cursor) => {
+                let rowid = match state.registers[*src_reg].get_value() {
+                    Value::Integer(rowid) => Some(*rowid),
+                    Value::Null => None,
+                    _ => None,
+                };
+
+                match rowid {
+                    Some(rowid) => {
+                        let seek_result = return_if_io!(mv_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        let pc = if !matches!(seek_result, SeekResult::Found) {
+                            target_pc.as_offset_int()
+                        } else {
+                            state.pc + 1
+                        };
+                        (pc, true)
                     }
-                } else {
-                    None
+                    None => (target_pc.as_offset_int(), false),
                 }
             }
-        };
-
-        match rowid {
-            Some(rowid) => {
-                let seek_result = return_if_io!(
-                    cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                );
-                let pc = if !matches!(seek_result, SeekResult::Found) {
-                    target_pc.as_offset_int()
-                } else {
-                    state.pc + 1
+            Cursor::BTree(btree_cursor) => {
+                let rowid = match state.registers[*src_reg].get_value() {
+                    Value::Integer(rowid) => Some(*rowid),
+                    Value::Null => None,
+                    // For non-integer values try to apply affinity and convert them to integer.
+                    other => {
+                        let mut temp_reg = Register::Value(other.clone());
+                        let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
+                        if converted {
+                            match temp_reg.get_value() {
+                                Value::Integer(i) => Some(*i),
+                                Value::Float(f) => Some(*f as i64),
+                                _ => unreachable!("apply_affinity_char with Numeric should produce an integer if it returns true"),
+                            }
+                        } else {
+                            None
+                        }
+                    }
                 };
-                (pc, true)
+
+                match rowid {
+                    Some(rowid) => {
+                        let seek_result = return_if_io!(btree_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        let pc = if !matches!(seek_result, SeekResult::Found) {
+                            target_pc.as_offset_int()
+                        } else {
+                            state.pc + 1
+                        };
+                        (pc, true)
+                    }
+                    None => (target_pc.as_offset_int(), false),
+                }
             }
-            None => (target_pc.as_offset_int(), false),
-        }
+            _ => panic!("SeekRowid on non-btree/materialized-view cursor"),
+        };
+        (pc, did_seek)
     };
     // Increment btree_seeks metric for SeekRowid operation after cursor is dropped
     if did_seek {
@@ -2545,7 +2871,7 @@ pub fn op_deferred_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2571,6 +2897,7 @@ pub enum OpSeekKey {
     IndexKeyFromRegister(usize),
 }
 
+#[derive(Debug)]
 pub enum OpSeekState {
     /// Initial state
     Start,
@@ -2587,7 +2914,7 @@ pub fn op_seek(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_index, record_source, target_pc) = match insn {
@@ -2677,7 +3004,7 @@ pub enum SeekInternalResult {
     NotFound,
     IO(IOCompletions),
 }
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum RecordSource {
     Unpacked { start_reg: usize, num_regs: usize },
     Packed { record_reg: usize },
@@ -2694,7 +3021,7 @@ pub enum RecordSource {
 pub fn seek_internal(
     program: &Program,
     state: &mut ProgramState,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     record_source: RecordSource,
     cursor_id: usize,
@@ -2705,7 +3032,7 @@ pub fn seek_internal(
     fn inner(
         program: &Program,
         state: &mut ProgramState,
-        pager: &Rc<Pager>,
+        pager: &Arc<Pager>,
         mv_store: Option<&Arc<MvStore>>,
         record_source: RecordSource,
         cursor_id: usize,
@@ -2827,7 +3154,7 @@ pub fn seek_internal(
                 }
                 OpSeekState::Seek { key, op } => {
                     let seek_result = {
-                        let mut cursor = state.get_cursor(cursor_id);
+                        let cursor = get_cursor!(state, cursor_id);
                         let cursor = cursor.as_btree_mut();
                         let seek_key = match key {
                         OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
@@ -2860,7 +3187,7 @@ pub fn seek_internal(
                 }
                 OpSeekState::Advance { op } => {
                     let found = {
-                        let mut cursor = state.get_cursor(cursor_id);
+                        let cursor = get_cursor!(state, cursor_id);
                         let cursor = cursor.as_btree_mut();
                         // Seek operation has anchor number which equals to the closed boundary of the range
                         // (e.g. for >= x - anchor is x, for > x - anchor is x + 1)
@@ -2881,12 +3208,21 @@ pub fn seek_internal(
 
                         // this same logic applies for indexes, but the next/prev record is expected to be found in the parent page's
                         // divider cell.
+                        turso_assert!(
+                            !cursor.skip_advance.get(),
+                            "skip_advance should not be true in the middle of a seek operation"
+                        );
                         let result = match op {
+                            // deliberately call get_next_record() instead of next() to avoid skip_advance triggering unwantedly
                             SeekOp::GT | SeekOp::GE { .. } => cursor.next()?,
                             SeekOp::LT | SeekOp::LE { .. } => cursor.prev()?,
                         };
                         match result {
-                            IOResult::Done(found) => found,
+                            IOResult::Done(found) => {
+                                cursor.has_record.set(found);
+                                cursor.invalidate_record();
+                                found
+                            }
                             IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
@@ -2897,7 +3233,7 @@ pub fn seek_internal(
                     });
                 }
                 OpSeekState::MoveLast => {
-                    let mut cursor = state.get_cursor(cursor_id);
+                    let cursor = state.get_cursor(cursor_id);
                     let cursor = cursor.as_btree_mut();
                     match cursor.last()? {
                         IOResult::Done(()) => {}
@@ -2973,7 +3309,7 @@ pub fn op_idx_ge(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -2988,7 +3324,7 @@ pub fn op_idx_ge(
     assert!(target_pc.is_offset());
 
     let pc = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
@@ -3024,12 +3360,12 @@ pub fn op_seek_end(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SeekEnd { cursor_id }, *insn);
     {
-        let mut cursor = state.get_cursor(cursor_id);
+        let cursor = state.get_cursor(cursor_id);
         let cursor = cursor.as_btree_mut();
         return_if_io!(cursor.seek_end());
     }
@@ -3042,7 +3378,7 @@ pub fn op_idx_le(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3057,7 +3393,7 @@ pub fn op_idx_le(
     assert!(target_pc.is_offset());
 
     let pc = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
@@ -3093,7 +3429,7 @@ pub fn op_idx_gt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3108,7 +3444,7 @@ pub fn op_idx_gt(
     assert!(target_pc.is_offset());
 
     let pc = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
@@ -3144,7 +3480,7 @@ pub fn op_idx_lt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3159,7 +3495,7 @@ pub fn op_idx_lt(
     assert!(target_pc.is_offset());
 
     let pc = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
@@ -3195,7 +3531,7 @@ pub fn op_decr_jump_zero(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
@@ -3246,7 +3582,7 @@ pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3299,7 +3635,6 @@ pub fn op_agg_step(
                     argc: *argc,
                     step_fn: *step,
                     finalize_fn: *finalize,
-                    finalized_value: None,
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
@@ -3308,17 +3643,21 @@ pub fn op_agg_step(
     match func {
         AggFunc::Avg => {
             let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            *acc = acc.exec_add(col.get_value());
-            *count += 1;
+            // > The avg() function returns the average value of all non-NULL X within a group
+            // https://sqlite.org/lang_aggfunc.html#avg
+            if !col.is_null() {
+                let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
+                    panic!(
+                        "Unexpected value {:?} in AggStep at register {}",
+                        state.registers[*acc_reg], *acc_reg
+                    );
+                };
+                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                    unreachable!();
+                };
+                *acc = acc.exec_add(col.get_value());
+                *count += 1;
+            }
         }
         AggFunc::Sum | AggFunc::Total => {
             let col = state.registers[*col].clone();
@@ -3346,13 +3685,17 @@ pub fn op_agg_step(
                                 match acc_i.checked_add(i) {
                                     Some(sum) => *acc = Value::Integer(sum),
                                     None => {
-                                        // Overflow -> switch to float with KBN summation
-                                        let acc_f = *acc_i as f64;
-                                        *acc = Value::Float(acc_f);
-                                        sum_state.approx = true;
-                                        sum_state.ovrfl = true;
+                                        if matches!(func, AggFunc::Total) {
+                                            // Total() never throw an integer overflow -> switch to float with KBN summation
+                                            let acc_f = *acc_i as f64;
+                                            *acc = Value::Float(acc_f);
+                                            sum_state.approx = true;
+                                            sum_state.ovrfl = true;
 
-                                        apply_kbn_step_int(acc, i, sum_state);
+                                            apply_kbn_step_int(acc, i, sum_state);
+                                        } else {
+                                            return Err(LimboError::IntegerOverflow);
+                                        }
                                     }
                                 }
                             }
@@ -3365,6 +3708,7 @@ pub fn op_agg_step(
                         Value::Float(f) => match acc {
                             Value::Null => {
                                 *acc = Value::Float(f);
+                                sum_state.approx = true;
                             }
                             Value::Integer(i) => {
                                 let i_f = *i as f64;
@@ -3378,11 +3722,18 @@ pub fn op_agg_step(
                             }
                             _ => unreachable!(),
                         },
-
-                        _ => {
-                            //  If any input to sum() is neither an integer nor a NULL, then sum() returns a float
-                            // https://sqlite.org/lang_aggfunc.html
-                            sum_state.approx = true;
+                        Value::Text(t) => {
+                            let s = t.as_str();
+                            let (_, parsed_number) = try_for_float(s);
+                            handle_text_sum(acc, sum_state, parsed_number);
+                        }
+                        Value::Blob(b) => {
+                            if let Ok(s) = std::str::from_utf8(&b) {
+                                let (_, parsed_number) = try_for_float(s);
+                                handle_text_sum(acc, sum_state, parsed_number);
+                            } else {
+                                handle_text_sum(acc, sum_state, ParsedNumber::None);
+                            }
                         }
                     }
                 }
@@ -3390,22 +3741,22 @@ pub fn op_agg_step(
             }
         }
         AggFunc::Count | AggFunc::Count0 => {
-            let col = state.registers[*col].get_value().clone();
+            let skip = (matches!(func, AggFunc::Count)
+                && matches!(state.registers[*col].get_value(), Value::Null));
             if matches!(&state.registers[*acc_reg], Register::Value(Value::Null)) {
                 state.registers[*acc_reg] =
                     Register::Aggregate(AggContext::Count(Value::Integer(0)));
             }
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
                 panic!(
                     "Unexpected value {:?} in AggStep at register {}",
                     state.registers[*acc_reg], *acc_reg
                 );
             };
-            let AggContext::Count(count) = agg.borrow_mut() else {
+            let AggContext::Count(count) = agg else {
                 unreachable!();
             };
-
-            if !(matches!(func, AggFunc::Count) && matches!(col, Value::Null)) {
+            if !skip {
                 *count += 1;
             };
         }
@@ -3468,13 +3819,18 @@ pub fn op_agg_step(
             if acc.to_string().is_empty() {
                 *acc = col;
             } else {
-                match delimiter {
-                    Register::Value(value) => {
-                        *acc += value;
+                match col {
+                    Value::Null => {}
+                    _ => {
+                        match delimiter {
+                            Register::Value(value) => {
+                                *acc += value;
+                            }
+                            _ => unreachable!(),
+                        }
+                        *acc += col;
                     }
-                    _ => unreachable!(),
                 }
-                *acc += col;
             }
         }
         #[cfg(feature = "json")]
@@ -3563,21 +3919,33 @@ pub fn op_agg_final(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AggFinal { register, func }, insn);
-    match state.registers[*register].borrow_mut() {
+    let (acc_reg, dest_reg, func) = match insn {
+        Insn::AggFinal { register, func } => (*register, *register, func),
+        Insn::AggValue {
+            acc_reg,
+            dest_reg,
+            func,
+        } => (*acc_reg, *dest_reg, func),
+        _ => unreachable!("unexpected Insn {:?}", insn),
+    };
+    match &state.registers[acc_reg] {
         Register::Aggregate(agg) => match func {
             AggFunc::Avg => {
-                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
+                let AggContext::Avg(acc, count) = agg else {
                     unreachable!();
                 };
-                *acc /= count.clone();
-                state.registers[*register] = Register::Value(acc.clone());
+                let acc = if count.as_int() == Some(0) {
+                    Value::Null
+                } else {
+                    acc.clone() / count.clone()
+                };
+                state.registers[dest_reg] = Register::Value(acc);
             }
             AggFunc::Sum => {
-                let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, sum_state) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3590,10 +3958,10 @@ pub fn op_agg_final(
                     }
                     _ => Value::Float(acc.as_float() + sum_state.r_err),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Total => {
-                let AggContext::Sum(acc, _) = agg.borrow_mut() else {
+                let AggContext::Sum(acc, _) = agg else {
                     unreachable!();
                 };
                 let value = match acc {
@@ -3602,89 +3970,86 @@ pub fn op_agg_final(
                     Value::Float(f) => Value::Float(*f),
                     _ => unreachable!(),
                 };
-                state.registers[*register] = Register::Value(value);
+                state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Count | AggFunc::Count0 => {
-                let AggContext::Count(count) = agg.borrow_mut() else {
+                let AggContext::Count(count) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(count.clone());
+                state.registers[dest_reg] = Register::Value(count.clone());
             }
             AggFunc::Max => {
-                let AggContext::Max(acc) = agg.borrow_mut() else {
+                let AggContext::Max(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::Min => {
-                let AggContext::Min(acc) = agg.borrow_mut() else {
+                let AggContext::Min(acc) = agg else {
                     unreachable!();
                 };
                 match acc {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
+                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
+                    None => state.registers[dest_reg] = Register::Value(Value::Null),
                 }
             }
             AggFunc::GroupConcat | AggFunc::StringAgg => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
-                state.registers[*register] = Register::Value(acc.clone());
+                state.registers[dest_reg] = Register::Value(acc.clone());
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupObject => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, false)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
             }
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupArray => {
-                let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
+                let AggContext::GroupConcat(acc) = agg else {
                     unreachable!();
                 };
                 let data = acc.to_blob().expect("Should be blob");
-                state.registers[*register] = Register::Value(json_from_raw_bytes_agg(data, true)?);
+                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
-                agg.compute_external()?;
                 let AggContext::External(agg_state) = agg else {
                     unreachable!();
                 };
-                match &agg_state.finalized_value {
-                    Some(value) => state.registers[*register] = Register::Value(value.clone()),
-                    None => state.registers[*register] = Register::Value(Value::Null),
-                }
+                let value = agg.compute_external()?;
+                state.registers[dest_reg] = Register::Value(value)
             }
         },
         Register::Value(Value::Null) => {
             // when the set is empty
             match func {
                 AggFunc::Total => {
-                    state.registers[*register] = Register::Value(Value::Float(0.0));
+                    state.registers[dest_reg] = Register::Value(Value::Float(0.0));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[*register] = Register::Value(Value::Integer(0));
+                    state.registers[dest_reg] = Register::Value(Value::Integer(0));
                 }
                 _ => {}
             }
@@ -3701,7 +4066,7 @@ pub fn op_sorter_open(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3713,14 +4078,17 @@ pub fn op_sorter_open(
         },
         insn
     );
-    let cache_size = program.connection.get_cache_size();
-    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
-    let page_size = pager
-        .io
-        .block(|| pager.with_header(|header| header.page_size))
-        .unwrap_or_default()
-        .get() as usize;
+    // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
+    let page_size = match pager.with_header(|header| header.page_size) {
+        Ok(IOResult::Done(page_size)) => page_size,
+        Err(_) => PageSize::default(),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+    };
+    let page_size = page_size.get() as usize;
 
+    let cache_size = program.connection.get_cache_size();
+
+    // Set the buffer size threshold to be roughly the same as the limit configured for the page-cache.
     let max_buffer_size_bytes = if cache_size < 0 {
         (cache_size.abs() * 1024) as usize
     } else {
@@ -3736,7 +4104,7 @@ pub fn op_sorter_open(
         page_size,
         pager.io.clone(),
     );
-    let mut cursors = state.cursors.borrow_mut();
+    let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
         .unwrap()
@@ -3749,7 +4117,7 @@ pub fn op_sorter_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3761,7 +4129,7 @@ pub fn op_sorter_data(
         insn
     );
     let record = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         cursor.record().cloned()
     };
@@ -3774,7 +4142,7 @@ pub fn op_sorter_data(
     };
     state.registers[*dest_reg] = Register::Record(record.clone());
     {
-        let mut pseudo_cursor = state.get_cursor(*pseudo_cursor);
+        let pseudo_cursor = state.get_cursor(*pseudo_cursor);
         pseudo_cursor.as_pseudo_mut().insert(record);
     }
     state.pc += 1;
@@ -3785,7 +4153,7 @@ pub fn op_sorter_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3796,7 +4164,7 @@ pub fn op_sorter_insert(
         insn
     );
     {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_sorter_mut();
         let record = match &state.registers[*record_reg] {
             Register::Record(record) => record,
@@ -3812,7 +4180,7 @@ pub fn op_sorter_sort(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3823,7 +4191,7 @@ pub fn op_sorter_sort(
         insn
     );
     let (is_empty, did_sort) = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
@@ -3847,7 +4215,7 @@ pub fn op_sorter_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -3859,7 +4227,7 @@ pub fn op_sorter_next(
     );
     assert!(pc_if_next.is_offset());
     let has_more = {
-        let mut cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         return_if_io!(cursor.next());
         cursor.has_more()
@@ -3876,7 +4244,7 @@ pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -4175,7 +4543,7 @@ pub fn op_function(
             }
             ScalarFunc::Changes => {
                 let res = &program.connection.last_change;
-                let changes = res.get();
+                let changes = res.load(Ordering::SeqCst);
                 state.registers[*dest] = Register::Value(Value::Integer(changes));
             }
             ScalarFunc::Char => {
@@ -4313,7 +4681,11 @@ pub fn op_function(
             }
             ScalarFunc::Unhex => {
                 let reg_value = &state.registers[*start_reg];
-                let ignored_chars = state.registers.get(*start_reg + 1);
+                let ignored_chars = if func.arg_count == 2 {
+                    state.registers.get(*start_reg + 1)
+                } else {
+                    None
+                };
                 let result = reg_value
                     .get_value()
                     .exec_unhex(ignored_chars.map(|x| x.get_value()));
@@ -4430,7 +4802,7 @@ pub fn op_function(
             }
             ScalarFunc::TotalChanges => {
                 let res = &program.connection.total_changes;
-                let total_changes = res.get();
+                let total_changes = res.load(Ordering::SeqCst);
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
             ScalarFunc::DateTime => {
@@ -4460,10 +4832,16 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer =
-                    return_if_io!(pager.with_header(|header| header.version_number)).get() as i64;
-                let version = execute_sqlite_version(version_integer);
-                state.registers[*dest] = Register::Value(Value::build_text(version));
+                if !program.connection.is_db_initialized() {
+                    state.registers[*dest] =
+                        Register::Value(Value::build_text(info::build::PKG_VERSION));
+                } else {
+                    let version_integer =
+                        return_if_io!(pager.with_header(|header| header.version_number)).get()
+                            as i64;
+                    let version = execute_sqlite_version(version_integer);
+                    state.registers[*dest] = Register::Value(Value::build_text(version));
+                }
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -4487,6 +4865,9 @@ pub fn op_function(
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             ScalarFunc::LoadExtension => {
+                if !program.connection.db.can_load_extensions() {
+                    crate::bail_parse_error!("runtime extension loading is disabled");
+                }
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
@@ -4520,7 +4901,7 @@ pub fn op_function(
                         ));
                     };
                     let table = {
-                        let schema = program.connection.schema.borrow();
+                        let schema = program.connection.schema.read();
                         match schema.get_table(table.as_str()) {
                             Some(table) => table,
                             None => {
@@ -4816,12 +5197,13 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_to = {
+                    let original_rename_to = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(rename_to) => rename_to,
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
+                    let rename_to = normalize_ident(original_rename_to.as_str());
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -4851,10 +5233,10 @@ pub fn op_function(
 
                         match stmt {
                             ast::Stmt::CreateIndex {
+                                tbl_name,
                                 unique,
                                 if_not_exists,
                                 idx_name,
-                                tbl_name,
                                 columns,
                                 where_clause,
                             } => {
@@ -4866,21 +5248,20 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
+                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
                                         unique,
                                         if_not_exists,
                                         idx_name,
-                                        tbl_name: ast::Name::new(&rename_to),
                                         columns,
                                         where_clause,
                                     }
-                                    .format()
-                                    .unwrap(),
+                                    .to_string(),
                                 )
                             }
                             ast::Stmt::CreateTable {
+                                tbl_name,
                                 temporary,
                                 if_not_exists,
-                                tbl_name,
                                 body,
                             } => {
                                 let table_name = normalize_ident(tbl_name.name.as_str());
@@ -4891,17 +5272,16 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateTable {
-                                        temporary,
-                                        if_not_exists,
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(&rename_to),
+                                            name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
+                                        temporary,
+                                        if_not_exists,
                                         body,
                                     }
-                                    .format()
-                                    .unwrap(),
+                                    .to_string(),
                                 )
                             }
                             _ => todo!(),
@@ -4910,7 +5290,7 @@ pub fn op_function(
 
                     (new_name, new_tbl_name, new_sql)
                 }
-                AlterTableFunc::RenameColumn => {
+                AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
                             Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
@@ -4918,19 +5298,24 @@ pub fn op_function(
                         }
                     };
 
-                    let rename_from = {
+                    let original_rename_from = {
                         match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                            Value::Text(rename_from) => rename_from,
                             _ => panic!("rename_from parameter should be TEXT"),
                         }
                     };
+                    let rename_from = normalize_ident(original_rename_from.as_str());
 
-                    let rename_to = {
+                    let column_def = {
                         match &state.registers[*start_reg + 7].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                            Value::Text(column_def) => column_def.as_str(),
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
+
+                    let column_def = Parser::new(column_def.as_bytes())
+                        .parse_column_definition(true)
+                        .unwrap();
 
                     let new_sql = 'sql: {
                         if table != tbl_name {
@@ -4948,11 +5333,11 @@ pub fn op_function(
 
                         match stmt {
                             ast::Stmt::CreateIndex {
+                                tbl_name,
+                                mut columns,
                                 unique,
                                 if_not_exists,
                                 idx_name,
-                                tbl_name,
-                                mut columns,
                                 where_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
@@ -4961,10 +5346,12 @@ pub fn op_function(
 
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
-                                        ast::Expr::Id(ast::Name::Ident(id))
-                                            if normalize_ident(id) == rename_from =>
+                                        ast::Expr::Id(id)
+                                            if normalize_ident(id.as_str()) == rename_from =>
                                         {
-                                            *id = rename_to.clone();
+                                            *id = Name::exact(
+                                                column_def.col_name.as_str().to_owned(),
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -4972,22 +5359,21 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
+                                        tbl_name,
+                                        columns,
                                         unique,
                                         if_not_exists,
                                         idx_name,
-                                        tbl_name,
-                                        columns,
                                         where_clause,
                                     }
-                                    .format()
-                                    .unwrap(),
+                                    .to_string(),
                                 )
                             }
                             ast::Stmt::CreateTable {
-                                temporary,
-                                if_not_exists,
                                 tbl_name,
                                 body,
+                                temporary,
+                                if_not_exists,
                             } => {
                                 if table != normalize_ident(tbl_name.name.as_str()) {
                                     break 'sql None;
@@ -5004,24 +5390,31 @@ pub fn op_function(
 
                                 let column = columns
                                     .iter_mut()
-                                    .find(|column| column.col_name == ast::Name::new(&rename_from))
+                                    .find(|column| {
+                                        column.col_name.as_str() == original_rename_from.as_str()
+                                    })
                                     .expect("column being renamed should be present");
 
-                                column.col_name = ast::Name::new(&rename_to);
+                                match alter_func {
+                                    AlterTableFunc::AlterColumn => *column = column_def,
+                                    AlterTableFunc::RenameColumn => {
+                                        column.col_name = column_def.col_name
+                                    }
+                                    _ => unreachable!(),
+                                }
 
                                 Some(
                                     ast::Stmt::CreateTable {
-                                        temporary,
-                                        if_not_exists,
                                         tbl_name,
                                         body: ast::CreateTableBody::ColumnsAndConstraints {
                                             columns,
                                             constraints,
                                             options,
                                         },
+                                        temporary,
+                                        if_not_exists,
                                     }
-                                    .format()
-                                    .unwrap(),
+                                    .to_string(),
                                 )
                             }
                             _ => todo!(),
@@ -5051,11 +5444,56 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_sequence(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Sequence {
+            cursor_id,
+            target_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    let seq_num = cursor.next_sequence();
+    state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_sequence_test(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SequenceTest {
+            cursor_id,
+            target_pc,
+            value_reg
+        },
+        insn
+    );
+    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
+    state.pc = if cursor.seq_beginning() {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_init_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5083,7 +5521,7 @@ pub fn op_end_coroutine(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(EndCoroutine { yield_reg }, insn);
@@ -5104,7 +5542,7 @@ pub fn op_yield(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5163,7 +5601,7 @@ pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5180,13 +5618,12 @@ pub fn op_insert(
     loop {
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
+                let schema = program.connection.schema.read();
+                let dependent_views = schema.get_dependent_materialized_views(table_name);
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
                 // we deleted it earlier and `op_delete` already captured the change.
-                if dependent_views.is_none() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
+                if dependent_views.is_empty() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
                     if flag.has(InsertFlags::REQUIRE_SEEK) {
                         state.op_insert_state.sub_state = OpInsertSubState::Seek;
                     } else {
@@ -5198,7 +5635,7 @@ pub fn op_insert(
                 turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
 
                 let old_record = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     // Get the current key - for INSERT operations, there may not be a current row
                     let maybe_key = return_if_io!(cursor.rowid());
@@ -5274,7 +5711,7 @@ pub fn op_insert(
                 };
 
                 {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = get_cursor!(state, *cursor_id);
                     let cursor = cursor.as_btree_mut();
 
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
@@ -5284,17 +5721,16 @@ pub fn op_insert(
 
                 // Only update last_insert_rowid for regular table inserts, not schema modifications
                 let root_page = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     cursor.root_page()
                 };
-                if root_page != 1 {
+                if root_page != 1 && table_name != "sqlite_sequence" {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
                 } else {
-                    let schema = program.connection.schema.borrow();
-                    let dependent_views =
-                        schema.get_dependent_materialized_views_unnormalized(table_name);
-                    if dependent_views.is_some() {
+                    let schema = program.connection.schema.read();
+                    let dependent_views = schema.get_dependent_materialized_views(table_name);
+                    if !dependent_views.is_empty() {
                         state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
                     } else {
                         break;
@@ -5303,34 +5739,32 @@ pub fn op_insert(
             }
             OpInsertSubState::UpdateLastRowid => {
                 let maybe_rowid = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
                 if let Some(rowid) = maybe_rowid {
                     program.connection.update_last_rowid(rowid);
 
-                    let prev_changes = program.n_change.get();
-                    program.n_change.set(prev_changes + 1);
+                    program
+                        .n_change
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
-                if dependent_views.is_some() {
+                let schema = program.connection.schema.read();
+                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                if !dependent_views.is_empty() {
                     state.op_insert_state.sub_state = OpInsertSubState::ApplyViewChange;
                     continue;
                 }
                 break;
             }
             OpInsertSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
-                let dependent_views =
-                    schema.get_dependent_materialized_views_unnormalized(table_name);
-                assert!(dependent_views.is_some());
-                let dependent_views = dependent_views.unwrap();
+                let schema = program.connection.schema.read();
+                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                assert!(!dependent_views.is_empty());
 
                 let (key, values) = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
 
                     let key = match &state.registers[*key_reg].get_value() {
@@ -5360,7 +5794,7 @@ pub fn op_insert(
                         .collect::<Vec<_>>();
 
                     // Fix rowid alias columns: replace Null with actual rowid value
-                    let schema = program.connection.schema.borrow();
+                    let schema = program.connection.schema.read();
                     if let Some(table) = schema.get_table(table_name) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias && i < new_values.len() {
@@ -5372,17 +5806,22 @@ pub fn op_insert(
                     (key, new_values)
                 };
 
-                let mut tx_states = program.connection.view_transaction_states.borrow_mut();
                 if let Some((key, values)) = state.op_insert_state.old_record.take() {
                     for view_name in dependent_views.iter() {
-                        let tx_state = tx_states.entry(view_name.clone()).or_default();
-                        tx_state.delta.delete(key, values.clone());
+                        let tx_state = program
+                            .connection
+                            .view_transaction_states
+                            .get_or_create(view_name);
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 for view_name in dependent_views.iter() {
-                    let tx_state = tx_states.entry(view_name.clone()).or_default();
+                    let tx_state = program
+                        .connection
+                        .view_transaction_states
+                        .get_or_create(view_name);
 
-                    tx_state.delta.insert(key, values.clone());
+                    tx_state.insert(table_name, key, values.clone());
                 }
 
                 break;
@@ -5399,7 +5838,7 @@ pub fn op_int_64(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5434,7 +5873,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5448,7 +5887,7 @@ pub fn op_delete(
     loop {
         match &state.op_delete_state.sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     state.op_delete_state.sub_state = OpDeleteSubState::Delete;
@@ -5456,7 +5895,7 @@ pub fn op_delete(
                 }
 
                 let deleted_record = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     // Get the current key
                     let maybe_key = return_if_io!(cursor.rowid());
@@ -5491,13 +5930,13 @@ pub fn op_delete(
             }
             OpDeleteSubState::Delete => {
                 {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 if dependent_views.is_empty() {
                     break;
@@ -5506,15 +5945,17 @@ pub fn op_delete(
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let schema = program.connection.schema.borrow();
+                let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
                 assert!(!dependent_views.is_empty());
                 let maybe_deleted_record = state.op_delete_state.deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
-                    let mut tx_states = program.connection.view_transaction_states.borrow_mut();
                     for view_name in dependent_views {
-                        let tx_state = tx_states.entry(view_name.clone()).or_default();
-                        tx_state.delta.delete(key, values.clone());
+                        let tx_state = program
+                            .connection
+                            .view_transaction_states
+                            .get_or_create(&view_name);
+                        tx_state.delete(table_name, key, values.clone());
                     }
                 }
                 break;
@@ -5523,8 +5964,9 @@ pub fn op_delete(
     }
 
     state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
-    let prev_changes = program.n_change.get();
-    program.n_change.set(prev_changes + 1);
+    program
+        .n_change
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -5539,7 +5981,7 @@ pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5553,6 +5995,7 @@ pub fn op_idx_delete(
     );
 
     loop {
+        #[cfg(debug_assertions)]
         tracing::debug!(
             "op_idx_delete(cursor_id={}, start_reg={}, num_regs={}, rootpage={}, state={:?})",
             cursor_id,
@@ -5586,9 +6029,11 @@ pub fn op_idx_delete(
                     // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
                     // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
                     if *raise_error_if_no_matching_entry {
-                        let record = make_record(&state.registers, start_reg, num_regs);
+                        let reg_values = (*start_reg..*start_reg + *num_regs)
+                            .map(|i| &state.registers[i])
+                            .collect::<Vec<_>>();
                         return Err(LimboError::Corrupt(format!(
-                            "IdxDelete: no matching index entry found for record {record:?}"
+                            "IdxDelete: no matching index entry found for key {reg_values:?}"
                         )));
                     }
                     state.pc += 1;
@@ -5599,29 +6044,29 @@ pub fn op_idx_delete(
             }
             Some(OpIdxDeleteState::Verifying) => {
                 let rowid = {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
 
                 if rowid.is_none() && *raise_error_if_no_matching_entry {
+                    let reg_values = (*start_reg..*start_reg + *num_regs)
+                        .map(|i| &state.registers[i])
+                        .collect::<Vec<_>>();
                     return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for record {:?}",
-                        make_record(&state.registers, start_reg, num_regs)
+                        "IdxDelete: no matching index entry found for key {reg_values:?}"
                     )));
                 }
                 state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
             }
             Some(OpIdxDeleteState::Deleting) => {
                 {
-                    let mut cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
                 }
                 // Increment metrics for index write (delete is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
-                let n_change = program.n_change.get();
-                program.n_change.set(n_change + 1);
                 state.pc += 1;
                 state.op_idx_delete_state = None;
                 return Ok(InsnFunctionStepResult::Step);
@@ -5647,7 +6092,7 @@ pub fn op_idx_insert(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5710,7 +6155,7 @@ pub fn op_idx_insert(
         }
         OpIdxInsertState::UniqueConstraintCheck => {
             let ignore_conflict = 'i: {
-                let mut cursor = state.get_cursor(cursor_id);
+                let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
                 let record_opt = return_if_io!(cursor.record());
                 let Some(record) = record_opt.as_ref() else {
@@ -5756,7 +6201,7 @@ pub fn op_idx_insert(
         }
         OpIdxInsertState::Insert => {
             {
-                let mut cursor = state.get_cursor(cursor_id);
+                let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
                 return_if_io!(cursor.insert(&BTreeKey::new_index_key(record_to_insert)));
             }
@@ -5771,7 +6216,7 @@ pub fn op_idx_insert(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum OpNewRowidState {
     Start,
     SeekingToLast,
@@ -5793,7 +6238,7 @@ pub fn op_new_rowid(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5807,10 +6252,10 @@ pub fn op_new_rowid(
 
     if let Some(mv_store) = mv_store {
         let rowid = {
-            let mut cursor = state.get_cursor(*cursor);
+            let cursor = state.get_cursor(*cursor);
             let cursor = cursor.as_btree_mut();
             let mvcc_cursor = cursor.get_mvcc_cursor();
-            let mut mvcc_cursor = RefCell::borrow_mut(&mvcc_cursor);
+            let mut mvcc_cursor = mvcc_cursor.write();
             mvcc_cursor.get_next_rowid()
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
@@ -5822,14 +6267,14 @@ pub fn op_new_rowid(
     const MAX_ATTEMPTS: u32 = 100;
 
     loop {
-        match &state.op_new_rowid_state {
+        match state.op_new_rowid_state {
             OpNewRowidState::Start => {
                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast;
             }
 
             OpNewRowidState::SeekingToLast => {
                 {
-                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.seek_to_last());
                 }
@@ -5838,7 +6283,7 @@ pub fn op_new_rowid(
 
             OpNewRowidState::ReadingMaxRowid => {
                 let current_max = {
-                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
@@ -5865,7 +6310,7 @@ pub fn op_new_rowid(
             }
 
             OpNewRowidState::GeneratingRandom { attempts } => {
-                if *attempts >= MAX_ATTEMPTS {
+                if attempts >= MAX_ATTEMPTS {
                     return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
                 }
 
@@ -5878,7 +6323,7 @@ pub fn op_new_rowid(
                 random_rowid += 1; // Ensure positive
 
                 state.op_new_rowid_state = OpNewRowidState::VerifyingCandidate {
-                    attempts: *attempts,
+                    attempts,
                     candidate: random_rowid,
                 };
             }
@@ -5888,18 +6333,17 @@ pub fn op_new_rowid(
                 candidate,
             } => {
                 let exists = {
-                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    let seek_result = return_if_io!(cursor.seek(
-                        SeekKey::TableRowId(*candidate),
-                        SeekOp::GE { eq_only: true }
-                    ));
+                    let seek_result =
+                        return_if_io!(cursor
+                            .seek(SeekKey::TableRowId(candidate), SeekOp::GE { eq_only: true }));
                     matches!(seek_result, SeekResult::Found)
                 };
 
                 if !exists {
                     // Found unused rowid!
-                    state.registers[*rowid_reg] = Register::Value(Value::Integer(*candidate));
+                    state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
                     return Ok(InsnFunctionStepResult::Step);
@@ -5912,7 +6356,7 @@ pub fn op_new_rowid(
             }
             OpNewRowidState::GoNext => {
                 {
-                    let mut cursor = state.get_cursor(*cursor);
+                    let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.next());
                 }
@@ -5928,7 +6372,7 @@ pub fn op_must_be_int(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg }, insn);
@@ -5961,7 +6405,7 @@ pub fn op_soft_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SoftNull { reg }, insn);
@@ -5970,6 +6414,7 @@ pub fn op_soft_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[derive(Clone, Copy)]
 pub enum OpNoConflictState {
     Start,
     Seeking(RecordSource),
@@ -5981,7 +6426,7 @@ pub fn op_no_conflict(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -5995,9 +6440,9 @@ pub fn op_no_conflict(
     );
 
     loop {
-        match &state.op_no_conflict_state {
+        match state.op_no_conflict_state {
             OpNoConflictState::Start => {
-                let mut cursor_ref = state.get_cursor(*cursor_id);
+                let cursor_ref = state.get_cursor(*cursor_id);
                 let cursor = cursor_ref.as_btree_mut();
 
                 let record_source = if *num_regs == 0 {
@@ -6035,8 +6480,6 @@ pub fn op_no_conflict(
                     }),
                 };
 
-                drop(cursor_ref);
-
                 if contains_nulls {
                     state.pc = target_pc.as_offset_int();
                     state.op_no_conflict_state = OpNoConflictState::Start;
@@ -6051,7 +6494,7 @@ pub fn op_no_conflict(
                     state,
                     pager,
                     mv_store,
-                    record_source.clone(),
+                    record_source,
                     *cursor_id,
                     true,
                     SeekOp::GE { eq_only: true },
@@ -6077,7 +6520,7 @@ pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6089,12 +6532,12 @@ pub fn op_not_exists(
         insn
     );
     let exists = if let Some(mv_store) = mv_store {
-        let mut cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
         let cursor = cursor.as_btree_mut();
         let mvcc_cursor = cursor.get_mvcc_cursor();
         false
     } else {
-        let mut cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
         let cursor = cursor.as_btree_mut();
         return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()))
     };
@@ -6110,7 +6553,7 @@ pub fn op_offset_limit(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6155,7 +6598,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6172,9 +6615,9 @@ pub fn op_open_write(
     let pager = program.get_pager_from_database_index(db);
 
     let root_page = match root_page {
-        RegisterOrLiteral::Literal(lit) => *lit as u64,
+        RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
-            Value::Integer(val) => *val as u64,
+            Value::Integer(val) => *val,
             _ => {
                 return Err(LimboError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
@@ -6182,26 +6625,42 @@ pub fn op_open_write(
             }
         },
     };
+
+    const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
+
+    if root_page == SQLITE_SCHEMA_ROOT_PAGE {
+        if let Some(mv_store) = mv_store {
+            let Some(tx_id) = program.connection.get_mv_tx_id() else {
+                return Err(LimboError::InternalError(
+                    "Schema changes in MVCC mode require an exclusive MVCC transaction".to_string(),
+                ));
+            };
+            if !mv_store.is_exclusive_tx(&tx_id) {
+                // Schema changes in MVCC mode require an exclusive transaction
+                return Err(LimboError::TableLocked);
+            }
+        }
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mut cursors = state.cursors.borrow_mut();
+    let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = match program.connection.mv_tx_id.get() {
-        Some(tx_id) => {
-            let table_id = root_page;
-            let mv_store = mv_store.unwrap().clone();
-            let mv_cursor = Rc::new(RefCell::new(
-                MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
-            ));
-            Some(mv_cursor)
-        }
-        None => None,
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = root_page;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(
+            MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+        ));
+        Some(mv_cursor)
+    } else {
+        None
     };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
-        let schema = conn.schema.borrow();
+        let schema = conn.schema.read();
         let table = schema
             .get_table(&index.table_name)
             .and_then(|table| table.btree());
@@ -6210,7 +6669,7 @@ pub fn op_open_write(
         let cursor = BTreeCursor::new_index(
             mv_cursor,
             pager.clone(),
-            root_page as usize,
+            root_page,
             index.as_ref(),
             num_columns,
         );
@@ -6221,11 +6680,13 @@ pub fn op_open_write(
     } else {
         let num_columns = match cursor_type {
             CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-            _ => unreachable!("Expected BTreeTable. This should not have happened."),
+            CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
+            _ => unreachable!(
+                "Expected BTreeTable or MaterializedView. This should not have happened."
+            ),
         };
 
-        let cursor =
-            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns);
+        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -6239,7 +6700,7 @@ pub fn op_copy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6261,7 +6722,7 @@ pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(CreateBtree { db, root, flags }, insn);
@@ -6275,6 +6736,13 @@ pub fn op_create_btree(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
+
+    if let Some(mv_store) = mv_store {
+        let root_page = mv_store.get_next_table_id();
+        state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
@@ -6286,7 +6754,7 @@ pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6311,11 +6779,38 @@ pub fn op_destroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_reset_sorter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(ResetSorter { cursor_id }, insn);
+
+    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let cursor = state.get_cursor(*cursor_id);
+
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(cursor.clear_btree());
+        }
+        CursorType::Sorter => {
+            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+        }
+        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
@@ -6337,7 +6832,7 @@ pub fn op_drop_view(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
@@ -6357,11 +6852,11 @@ pub fn op_close(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
-    let mut cursors = state.cursors.borrow_mut();
+    let cursors = &mut state.cursors;
     cursors.get_mut(*cursor_id).unwrap().take();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6371,7 +6866,7 @@ pub fn op_is_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IsNull { reg, target_pc }, insn);
@@ -6387,7 +6882,7 @@ pub fn op_coll_seq(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let Insn::CollSeq { reg, collation } = insn else {
@@ -6410,7 +6905,7 @@ pub fn op_page_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(PageCount { db, dest }, insn);
@@ -6418,7 +6913,9 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = match pager.with_header(|header| header.database_size.get()) {
+    let count = match with_header(pager, mv_store, program, |header| {
+        header.database_size.get()
+    }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
@@ -6432,7 +6929,7 @@ pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6442,25 +6939,27 @@ pub fn op_parse_schema(
         },
         insn
     );
+
     let conn = program.connection.clone();
     // set auto commit to false in order for parse schema to not commit changes as transaction state is stored in connection,
     // and we use the same connection for nested query.
-    let previous_auto_commit = conn.auto_commit.get();
-    conn.auto_commit.set(false);
+    let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+    conn.auto_commit.store(false, Ordering::SeqCst);
 
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
 
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
-            let existing_views = schema.materialized_views.clone();
-            conn.is_nested_stmt.set(true);
+            let existing_views = schema.incremental_views.clone();
+            conn.is_nested_stmt.store(true, Ordering::SeqCst);
             parse_schema_rows(
                 stmt,
                 schema,
-                &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                &conn.syms.read(),
+                program.connection.get_mv_tx(),
                 existing_views,
+                mv_store,
             )
         })
     } else {
@@ -6468,20 +6967,23 @@ pub fn op_parse_schema(
 
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
-            let existing_views = schema.materialized_views.clone();
-            conn.is_nested_stmt.set(true);
+            let existing_views = schema.incremental_views.clone();
+            conn.is_nested_stmt.store(true, Ordering::SeqCst);
             parse_schema_rows(
                 stmt,
                 schema,
-                &conn.syms.borrow(),
-                program.connection.mv_tx_id.get(),
+                &conn.syms.read(),
+                program.connection.get_mv_tx(),
                 existing_views,
+                mv_store,
             )
         })
     };
-    conn.is_nested_stmt.set(false);
-    conn.auto_commit.set(previous_auto_commit);
+    conn.is_nested_stmt.store(false, Ordering::SeqCst);
+    conn.auto_commit
+        .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6489,14 +6991,75 @@ pub fn op_parse_schema(
 pub fn op_populate_materialized_views(
     program: &Program,
     state: &mut ProgramState,
-    _insn: &Insn,
-    _pager: &Rc<Pager>,
+    insn: &Insn,
+    pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    let conn = program.connection.clone();
-    let schema = conn.schema.borrow();
+    load_insn!(PopulateMaterializedViews { cursors }, insn);
 
-    return_if_io!(schema.populate_materialized_views(&conn));
+    let conn = program.connection.clone();
+
+    // For each view, get its cursor and root page
+    let mut view_info = Vec::new();
+    {
+        let cursors_ref = &state.cursors;
+        for (view_name, cursor_id) in cursors {
+            // Get the cursor to find the root page
+            let cursor = cursors_ref
+                .get(*cursor_id)
+                .and_then(|c| c.as_ref())
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!("Cursor {cursor_id} not found"))
+                })?;
+
+            let root_page = match cursor {
+                crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "Expected BTree cursor for materialized view".into(),
+                    ))
+                }
+            };
+
+            view_info.push((view_name.clone(), root_page, *cursor_id));
+        }
+    }
+
+    // Now populate the views (after releasing the schema borrow)
+    for (view_name, _root_page, cursor_id) in view_info {
+        let schema = conn.schema.read();
+        if let Some(view) = schema.get_materialized_view(&view_name) {
+            let mut view = view.lock().unwrap();
+            // Drop the schema borrow before calling populate_from_table
+            drop(schema);
+
+            // Get the cursor for writing
+            // Get a mutable reference to the cursor
+            let cursors_ref = &mut state.cursors;
+            let cursor = cursors_ref
+                .get_mut(cursor_id)
+                .and_then(|c| c.as_mut())
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "Cursor {cursor_id} not found for population"
+                    ))
+                })?;
+
+            // Extract the BTreeCursor
+            let btree_cursor = match cursor {
+                crate::types::Cursor::BTree(btree_cursor) => btree_cursor,
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "Expected BTree cursor for materialized view population".into(),
+                    ))
+                }
+            };
+
+            // Now populate it with the cursor for writing
+            return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));
+        }
+    }
+
     // All views populated, advance to next instruction
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6506,7 +7069,7 @@ pub fn op_read_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ReadCookie { db, dest, cookie }, insn);
@@ -6515,7 +7078,7 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
 
-    let cookie_value = match pager.with_header(|header| match cookie {
+    let cookie_value = match with_header(pager, mv_store, program, |header| match cookie {
         Cookie::ApplicationId => header.application_id.get().into(),
         Cookie::UserVersion => header.user_version.get().into(),
         Cookie::SchemaVersion => header.schema_cookie.get().into(),
@@ -6536,7 +7099,7 @@ pub fn op_set_cookie(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6552,21 +7115,19 @@ pub fn op_set_cookie(
         todo!("temp databases not implemented yet");
     }
 
-    return_if_io!(pager.with_header_mut(|header| {
+    return_if_io!(with_header_mut(pager, mv_store, program, |header| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
             Cookie::UserVersion => header.user_version = (*value).into(),
             Cookie::LargestRootPageNumber => {
                 header.vacuum_mode_largest_root_page = (*value as u32).into();
             }
-            Cookie::IncrementalVacuum => {
-                header.incremental_vacuum_enabled = (*value as u32).into()
-            }
+            Cookie::IncrementalVacuum => header.incremental_vacuum_enabled = (*value as u32).into(),
             Cookie::SchemaVersion => {
                 // we update transaction state to indicate that the schema has changed
-                match program.connection.transaction_state.get() {
+                match program.connection.get_tx_state() {
                     TransactionState::Write { schema_did_change } => {
-                        program.connection.transaction_state.set(TransactionState::Write { schema_did_change: true });
+                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
@@ -6589,7 +7150,7 @@ pub fn op_shift_right(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
@@ -6606,7 +7167,7 @@ pub fn op_shift_left(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
@@ -6623,7 +7184,7 @@ pub fn op_add_imm(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddImm { register, value }, insn);
@@ -6652,7 +7213,7 @@ pub fn op_variable(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Variable { index, dest }, insn);
@@ -6665,7 +7226,7 @@ pub fn op_zero_or_null(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
@@ -6682,7 +7243,7 @@ pub fn op_not(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
@@ -6695,7 +7256,7 @@ pub fn op_concat(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
@@ -6712,7 +7273,7 @@ pub fn op_and(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(And { lhs, rhs, dest }, insn);
@@ -6729,7 +7290,7 @@ pub fn op_or(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Or { lhs, rhs, dest }, insn);
@@ -6746,7 +7307,7 @@ pub fn op_noop(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     // Do nothing
@@ -6760,10 +7321,10 @@ pub enum OpOpenEphemeralState {
     #[default]
     Start,
     StartingTxn {
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     },
     CreateBtree {
-        pager: Rc<Pager>,
+        pager: Arc<Pager>,
     },
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
@@ -6775,7 +7336,7 @@ pub fn op_open_ephemeral(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, is_table) = match insn {
@@ -6789,44 +7350,54 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
+            let page_size =
+                return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
-            let io = conn.pager.borrow().io.clone();
+            let io = conn.pager.read().io.clone();
             let rand_num = io.generate_random_number();
-            let temp_dir = temp_dir();
-            let rand_path =
-                std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
-            let Some(rand_path_str) = rand_path.to_str() else {
-                return Err(LimboError::InternalError(
-                    "Failed to convert path to string".to_string(),
-                ));
-            };
-            let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-            let db_file = Arc::new(DatabaseFile::new(file));
+            let db_file;
+            let db_file_io: Arc<dyn crate::IO>;
 
-            let page_size = pager
-                .io
-                .block(|| pager.with_header(|header| header.page_size))?
-                .get();
+            // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
+            // we can fix this if we will make open_file interface async
+            // but for now for simplicity we use MemoryIO for all intermediate calculations
+            #[cfg(target_family = "wasm")]
+            {
+                use crate::MemoryIO;
 
-            let buffer_pool = program.connection._db.buffer_pool.clone();
-            let page_cache = Arc::new(RwLock::new(DumbLruPageCache::default()));
+                db_file_io = Arc::new(MemoryIO::new());
+                let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
+                db_file = Arc::new(DatabaseFile::new(file));
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let temp_dir = temp_dir();
+                let rand_path =
+                    std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
+                let Some(rand_path_str) = rand_path.to_str() else {
+                    return Err(LimboError::InternalError(
+                        "Failed to convert path to string".to_string(),
+                    ));
+                };
+                let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
+                db_file = Arc::new(DatabaseFile::new(file));
+                db_file_io = io;
+            }
 
-            let pager = Rc::new(Pager::new(
+            let buffer_pool = program.connection.db.buffer_pool.clone();
+            let page_cache = Arc::new(RwLock::new(PageCache::default()));
+
+            let pager = Arc::new(Pager::new(
                 db_file,
                 None,
-                io,
+                db_file_io,
                 page_cache,
                 buffer_pool.clone(),
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
             )?);
 
-            let page_size = pager
-                .io
-                .block(|| pager.with_header(|header| header.page_size))
-                .unwrap_or_default();
-
-            pager.page_size.set(Some(page_size));
+            pager.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
         }
@@ -6848,19 +7419,18 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag));
+            let root_page = return_if_io!(pager.btree_create(flag)) as i64;
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = match program.connection.mv_tx_id.get() {
-                Some(tx_id) => {
-                    let table_id = root_page as u64;
-                    let mv_store = mv_store.unwrap().clone();
-                    let mv_cursor = Rc::new(RefCell::new(
-                        MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
-                    ));
-                    Some(mv_cursor)
-                }
-                None => None,
+            let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let table_id = root_page;
+                let mv_store = mv_store.unwrap().clone();
+                let mv_cursor = Arc::new(RwLock::new(
+                    MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+                ));
+                Some(mv_cursor)
+            } else {
+                None
             };
 
             let num_columns = match cursor_type {
@@ -6870,15 +7440,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(
-                    mv_cursor,
-                    pager.clone(),
-                    root_page as usize,
-                    index,
-                    num_columns,
-                )
+                BTreeCursor::new_index(mv_cursor, pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
@@ -6887,8 +7451,7 @@ pub fn op_open_ephemeral(
         OpOpenEphemeralState::Rewind { cursor } => {
             return_if_io!(cursor.rewind());
 
-            let mut cursors: std::cell::RefMut<'_, Vec<Option<Cursor>>> =
-                state.cursors.borrow_mut();
+            let cursors = &mut state.cursors;
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
 
@@ -6921,6 +7484,9 @@ pub fn op_open_ephemeral(
                 CursorType::VirtualTable(_) => {
                     panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
                 }
+                CursorType::MaterializedView(_, _) => {
+                    panic!("OpenEphemeral on materialized view cursor");
+                }
             }
 
             state.pc += 1;
@@ -6928,6 +7494,68 @@ pub fn op_open_ephemeral(
         }
     }
 
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_open_dup(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        OpenDup {
+            new_cursor_id,
+            original_cursor_id,
+        },
+        insn
+    );
+
+    let original_cursor = state.get_cursor(*original_cursor_id);
+    let original_cursor = original_cursor.as_btree_mut();
+
+    let root_page = original_cursor.root_page();
+    // We use the pager from the original cursor instead of the one attached to
+    // the connection because each ephemeral table creates its own pager (and
+    // a separate database file).
+    let pager = &original_cursor.pager;
+
+    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
+        let table_id = root_page;
+        let mv_store = mv_store.unwrap().clone();
+        let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
+            mv_store,
+            tx_id,
+            table_id,
+            pager.clone(),
+        )?));
+        Some(mv_cursor)
+    } else {
+        None
+    };
+
+    let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
+    match cursor_type {
+        CursorType::BTreeTable(table) => {
+            let cursor =
+                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursors = &mut state.cursors;
+            cursors
+                .get_mut(*new_cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
+        CursorType::BTreeIndex(table) => {
+            // In principle, we could implement OpenDup for BTreeIndex,
+            // but doing so now would create dead code since we have no use case,
+            // and it wouldn't be possible to test it.
+            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+        }
+        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+    }
+
+    state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -6939,7 +7567,7 @@ pub fn op_once(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -6963,7 +7591,7 @@ pub fn op_found(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
@@ -7025,7 +7653,7 @@ pub fn op_affinity(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7046,7 +7674,7 @@ pub fn op_affinity(
     for (i, affinity_char) in affinities.chars().enumerate().take(count.get()) {
         let reg_index = *start_reg + i;
 
-        let affinity = Affinity::from_char(affinity_char)?;
+        let affinity = Affinity::from_char(affinity_char);
 
         apply_affinity_char(&mut state.registers[reg_index], affinity);
     }
@@ -7059,7 +7687,7 @@ pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7072,7 +7700,7 @@ pub fn op_count(
     );
 
     let count = {
-        let mut cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
+        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
         let cursor = cursor.as_btree_mut();
         return_if_io!(cursor.count())
     };
@@ -7102,7 +7730,7 @@ pub fn op_integrity_check(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7116,14 +7744,21 @@ pub fn op_integrity_check(
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
             let freelist_trunk_page =
-                return_if_io!(pager.with_header(|header| header.freelist_trunk_page.get()));
+                return_if_io!(with_header(pager, mv_store, program, |header| header
+                    .freelist_trunk_page
+                    .get()));
             let mut errors = Vec::new();
             let mut integrity_check_state = IntegrityCheckState::new();
             let mut current_root_idx = 0;
             // check freelist pages first, if there are any for database
             if freelist_trunk_page > 0 {
+                let expected_freelist_count =
+                    return_if_io!(with_header(pager, mv_store, program, |header| header
+                        .freelist_pages
+                        .get()));
+                integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
-                    freelist_trunk_page as usize,
+                    freelist_trunk_page as i64,
                     PageCategory::FreeListTrunk,
                     &mut errors,
                 );
@@ -7148,6 +7783,14 @@ pub fn op_integrity_check(
                 *current_root_idx += 1;
                 return Ok(InsnFunctionStepResult::Step);
             } else {
+                if integrity_check_state.freelist_count.actual_count
+                    != integrity_check_state.freelist_count.expected_count
+                {
+                    errors.push(IntegrityCheckError::FreelistCountMismatch {
+                        actual_count: integrity_check_state.freelist_count.actual_count,
+                        expected_count: integrity_check_state.freelist_count.expected_count,
+                    });
+                }
                 let message = if errors.is_empty() {
                     "ok".to_string()
                 } else {
@@ -7171,7 +7814,7 @@ pub fn op_cast(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Rc<Pager>,
+    _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Cast { reg, affinity }, insn);
@@ -7194,26 +7837,29 @@ pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { from, to }, insn);
 
+    let normalized_from = normalize_ident(from.as_str());
+    let normalized_to = normalize_ident(to.as_str());
+
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        if let Some(mut indexes) = schema.indexes.remove(from) {
+        if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = to.to_owned();
+                index.table_name = normalized_to.to_owned();
             });
 
-            schema.indexes.insert(to.to_owned(), indexes);
+            schema.indexes.insert(normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
             .tables
-            .remove(from)
+            .remove(&normalized_from)
             .expect("table being renamed should be in schema");
 
         {
@@ -7224,10 +7870,10 @@ pub fn op_rename_table(
             };
 
             let btree = Arc::make_mut(btree);
-            btree.name = to.to_owned();
+            btree.name = normalized_to.to_owned();
         }
 
-        schema.tables.insert(to.to_owned(), table);
+        schema.tables.insert(normalized_to.to_owned(), table);
     });
 
     state.pc += 1;
@@ -7238,7 +7884,7 @@ pub fn op_drop_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
@@ -7251,10 +7897,27 @@ pub fn op_drop_column(
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table.as_str());
+
+    let column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
+
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7267,6 +7930,31 @@ pub fn op_drop_column(
         btree.columns.remove(*column_index)
     });
 
+    let schema = conn.schema.read();
+    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+        for index in indexes {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
+            }
+        }
+    }
+
+    for (view_name, view) in schema.views.iter() {
+        let view_select_sql = format!("SELECT * FROM {view_name}");
+        conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            LimboError::ParseError(format!(
+                "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                column_name, view.sql,
+            ))
+        })?;
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -7275,7 +7963,7 @@ pub fn op_add_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddColumn { table, column }, insn);
@@ -7302,28 +7990,46 @@ pub fn op_add_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_rename_column(
+pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
-        RenameColumn {
+        AlterColumn {
             table: table_name,
             column_index,
-            name
+            definition,
+            rename,
         },
         insn
     );
 
     let conn = program.connection.clone();
 
+    let normalized_table_name = normalize_ident(table_name.as_str());
+    let old_column_name = {
+        let schema = conn.schema.read();
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema")
+            .name
+            .as_ref()
+            .expect("column being ALTERed should be named")
+            .clone()
+    };
+    let new_column = crate::schema::Column::from(definition);
+
     conn.with_schema_mut(|schema| {
         let table = schema
             .tables
-            .get_mut(table_name)
+            .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::make_mut(table);
@@ -7339,39 +8045,164 @@ pub fn op_rename_column(
             .get_mut(*column_index)
             .expect("renamed column should be in schema");
 
-        if let Some(indexes) = schema.indexes.get_mut(table_name) {
+        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
                 let index = Arc::make_mut(index);
                 for index_column in &mut index.columns {
                     if index_column.name
                         == *column.name.as_ref().expect("btree column should be named")
                     {
-                        index_column.name = name.to_owned();
+                        index_column.name = definition.col_name.as_str().to_owned();
                     }
                 }
             }
         }
 
-        column.name = Some(name.to_owned());
+        if *rename {
+            column.name = new_column.name;
+        } else {
+            *column = new_column;
+        }
     });
+
+    let schema = conn.schema.read();
+    if *rename {
+        let table = schema
+            .tables
+            .get(&normalized_table_name)
+            .expect("table being ALTERed should be in schema");
+        let column = table
+            .get_column_at(*column_index)
+            .expect("column being ALTERed should be in schema");
+        for (view_name, view) in schema.views.iter() {
+            let view_select_sql = format!("SELECT * FROM {view_name}");
+            // FIXME: this should rewrite the view to reference the new column name
+            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                LimboError::ParseError(format!(
+                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
+                    old_column_name, view.sql,
+                ))
+            })?;
+        }
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_neg(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IfNeg { reg, target_pc }, insn);
+
+    match &state.registers[*reg] {
+        Register::Value(Value::Integer(i)) if *i < 0 => {
+            state.pc = target_pc.as_offset_int();
+        }
+        Register::Value(Value::Float(f)) if *f < 0.0 => {
+            state.pc = target_pc.as_offset_int();
+        }
+        Register::Value(Value::Null) => {
+            state.pc += 1;
+        }
+        _ => {
+            state.pc += 1;
+        }
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: ParsedNumber) {
+    match parsed_number {
+        ParsedNumber::Integer(i) => match acc {
+            Value::Null => {
+                *acc = Value::Integer(i);
+            }
+            Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                Some(sum) => *acc = Value::Integer(sum),
+                None => {
+                    let acc_f = *acc_i as f64;
+                    *acc = Value::Float(acc_f);
+                    sum_state.approx = true;
+                    sum_state.ovrfl = true;
+                    apply_kbn_step_int(acc, i, sum_state);
+                }
+            },
+            Value::Float(_) => {
+                apply_kbn_step_int(acc, i, sum_state);
+            }
+            _ => unreachable!(),
+        },
+        ParsedNumber::Float(f) => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+            apply_kbn_step(acc, f, sum_state);
+        }
+        ParsedNumber::None => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+        }
+    }
+}
+
+mod cmath {
+    extern "C" {
+        pub fn exp(x: f64) -> f64;
+        pub fn log(x: f64) -> f64;
+        pub fn log10(x: f64) -> f64;
+        pub fn log2(x: f64) -> f64;
+        pub fn pow(x: f64, y: f64) -> f64;
+
+        pub fn sin(x: f64) -> f64;
+        pub fn sinh(x: f64) -> f64;
+        pub fn asin(x: f64) -> f64;
+        pub fn asinh(x: f64) -> f64;
+
+        pub fn cos(x: f64) -> f64;
+        pub fn cosh(x: f64) -> f64;
+        pub fn acos(x: f64) -> f64;
+        pub fn acosh(x: f64) -> f64;
+
+        pub fn tan(x: f64) -> f64;
+        pub fn tanh(x: f64) -> f64;
+        pub fn atan(x: f64) -> f64;
+        pub fn atanh(x: f64) -> f64;
+        pub fn atan2(x: f64, y: f64) -> f64;
+    }
+}
+
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_lowercase())),
-            t => Some(t.to_owned()),
-        }
+        self.cast_text()
+            .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
     pub fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
-                // Count Unicode scalar values (characters)
-                Value::Integer(t.as_str().chars().count() as i64)
+                let s = t.as_str();
+                let len_before_null = s.find('\0').map_or_else(
+                    || s.chars().count(),
+                    |null_pos| s[..null_pos].chars().count(),
+                );
+                Value::Integer(len_before_null as i64)
             }
             Value::Integer(_) | Value::Float(_) => {
                 // For numbers, SQLite returns the length of the string representation
@@ -7393,49 +8224,20 @@ impl Value {
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        match self {
-            Value::Text(t) => Some(Value::build_text(t.as_str().to_uppercase())),
-            t => Some(t.to_owned()),
-        }
+        self.cast_text()
+            .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
-        let num = match self {
-            Value::Integer(i) => *i as f64,
-            Value::Float(f) => *f,
-            Value::Text(s) => {
-                if let Ok(i) = s.as_str().parse::<i64>() {
-                    i as f64
-                } else if let Ok(f) = s.as_str().parse::<f64>() {
-                    f
-                } else {
-                    return Some(Value::Null);
-                }
-            }
-            Value::Blob(b) => match std::str::from_utf8(b) {
-                Ok(s) => {
-                    if let Ok(i) = s.parse::<i64>() {
-                        i as f64
-                    } else if let Ok(f) = s.parse::<f64>() {
-                        f
-                    } else {
-                        return Some(Value::Null);
-                    }
-                }
-                Err(_) => return Some(Value::Null),
-            },
-            _ => return Some(Value::Null),
-        };
+        let v = Numeric::from_value_strict(self).try_into_f64()?;
 
-        let sign = if num > 0.0 {
+        Some(Value::Integer(if v > 0.0 {
             1
-        } else if num < 0.0 {
+        } else if v < 0.0 {
             -1
         } else {
             0
-        };
-
-        Some(Value::Integer(sign))
+        }))
     }
 
     /// Generates the Soundex code for a given word
@@ -7530,25 +8332,24 @@ impl Value {
     }
 
     pub fn exec_abs(&self) -> Result<Self> {
-        match self {
-            Value::Integer(x) => {
-                match i64::checked_abs(*x) {
-                    Some(y) => Ok(Value::Integer(y)),
-                    // Special case: if we do the abs of "-9223372036854775808", it causes overflow.
-                    // return IntegerOverflow error
-                    None => Err(LimboError::IntegerOverflow),
-                }
+        Ok(match self {
+            Value::Null => Value::Null,
+            Value::Integer(v) => {
+                Value::Integer(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
             }
-            Value::Float(x) => {
-                if x < &0.0 {
-                    Ok(Value::Float(-x))
-                } else {
-                    Ok(Value::Float(*x))
-                }
+            Value::Float(non_nan) => Value::Float(non_nan.abs()),
+            _ => {
+                let s = match self {
+                    Value::Text(text) => text.to_string(),
+                    Value::Blob(blob) => String::from_utf8_lossy(blob).to_string(),
+                    _ => unreachable!(),
+                };
+
+                crate::numeric::str_to_f64(s)
+                    .map(|v| Value::Float(f64::from(v).abs()))
+                    .unwrap_or(Value::Float(0.0))
             }
-            Value::Null => Ok(Value::Null),
-            _ => Ok(Value::Float(0.0)),
-        }
+        })
     }
 
     pub fn exec_random() -> Self {
@@ -7605,12 +8406,12 @@ impl Value {
     }
 
     pub fn exec_substring(
-        str_value: &Value,
+        value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
-        if let (Value::Text(str), Value::Integer(start)) = (str_value, start_value) {
-            let str_len = str.as_str().len() as i64;
+        if let (Some(str), Value::Integer(start)) = (value.cast_text(), start_value) {
+            let str_len = str.len() as i64;
 
             // The left-most character of X is number 1.
             // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
@@ -7691,7 +8492,7 @@ impl Value {
                 Value::build_text(hex::encode_upper(text))
             }
             Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
-            _ => Value::Null,
+            Value::Null => Value::build_text(""),
         }
     }
 
@@ -7699,9 +8500,12 @@ impl Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
-                None => match hex::decode(self.to_string()) {
-                    Ok(bytes) => Value::Blob(bytes),
-                    Err(_) => Value::Null,
+                None => match self
+                    .cast_text()
+                    .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
+                {
+                    Some(Ok(bytes)) => Value::Blob(bytes),
+                    _ => Value::Null,
                 },
                 Some(ignore) => match ignore {
                     Value::Text(_) => {
@@ -7713,7 +8517,7 @@ impl Value {
                             .to_string();
                         match hex::decode(trimmed) {
                             Ok(bytes) => Value::Blob(bytes),
-                            Err(_) => Value::Null,
+                            _ => Value::Null,
                         }
                     }
                     _ => Value::Null,
@@ -7736,36 +8540,33 @@ impl Value {
         }
     }
 
-    fn _to_float(&self) -> f64 {
-        match self {
-            Value::Text(x) => match cast_text_to_numeric(x.as_str()) {
-                Value::Integer(i) => i as f64,
-                Value::Float(f) => f,
-                _ => unreachable!(),
-            },
-            Value::Integer(x) => *x as f64,
-            Value::Float(x) => *x,
-            _ => 0.0,
-        }
-    }
-
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
-        let reg = self._to_float();
-        let round = |reg: f64, f: f64| {
-            let precision = if f < 1.0 { 0.0 } else { f };
-            Value::Float(reg.round_to_precision(precision as i32))
+        let Some(f) = Numeric::from(self).try_into_f64() else {
+            return Value::Null;
         };
-        match precision {
-            Some(Value::Text(x)) => match cast_text_to_numeric(x.as_str()) {
-                Value::Integer(i) => round(reg, i as f64),
-                Value::Float(f) => round(reg, f),
-                _ => unreachable!(),
-            },
-            Some(Value::Integer(i)) => round(reg, *i as f64),
-            Some(Value::Float(f)) => round(reg, *f),
-            None => round(reg, 0.0),
-            _ => Value::Null,
+
+        let precision = match precision.map(|v| Numeric::from(v).try_into_f64()) {
+            None => 0.0,
+            Some(Some(v)) => v,
+            Some(None) => return Value::Null,
+        };
+
+        if !(-4503599627370496.0..=4503599627370496.0).contains(&f) {
+            return Value::Float(f);
         }
+
+        let precision = if precision < 1.0 { 0.0 } else { precision };
+        let precision = precision.clamp(0.0, 30.0) as usize;
+
+        if precision == 0 {
+            return Value::Float(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
+        }
+
+        let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
+            .unwrap()
+            .into();
+
+        Value::Float(f)
     }
 
     // Implements TRIM pattern matching.
@@ -7852,11 +8653,16 @@ impl Value {
             }
             Affinity::Real => match self {
                 Value::Blob(b) => {
-                    // Convert BLOB to TEXT first
                     let text = String::from_utf8_lossy(b);
-                    cast_text_to_real(&text)
+                    Value::Float(
+                        crate::numeric::str_to_f64(&text)
+                            .map(f64::from)
+                            .unwrap_or(0.0),
+                    )
                 }
-                Value::Text(t) => cast_text_to_real(t.as_str()),
+                Value::Text(t) => {
+                    Value::Float(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
+                }
                 Value::Integer(i) => Value::Float(*i as f64),
                 Value::Float(f) => Value::Float(*f),
                 _ => Value::Float(0.0),
@@ -7865,9 +8671,9 @@ impl Value {
                 Value::Blob(b) => {
                     // Convert BLOB to TEXT first
                     let text = String::from_utf8_lossy(b);
-                    cast_text_to_integer(&text)
+                    Value::Integer(crate::numeric::str_to_i64(&text).unwrap_or(0))
                 }
-                Value::Text(t) => cast_text_to_integer(t.as_str()),
+                Value::Text(t) => Value::Integer(crate::numeric::str_to_i64(t).unwrap_or(0)),
                 Value::Integer(i) => Value::Integer(*i),
                 // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
                 // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
@@ -7886,14 +8692,31 @@ impl Value {
                 _ => Value::Integer(0),
             },
             Affinity::Numeric => match self {
-                Value::Blob(b) => {
-                    let text = String::from_utf8_lossy(b);
-                    cast_text_to_numeric(&text)
+                Value::Null => Value::Null,
+                Value::Integer(v) => Value::Integer(*v),
+                Value::Float(v) => Self::Float(*v),
+                _ => {
+                    let s = match self {
+                        Value::Text(text) => text.to_string(),
+                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()).to_string(),
+                        _ => unreachable!(),
+                    };
+
+                    match crate::numeric::str_to_f64(&s) {
+                        Some(parsed) => {
+                            let Some(int) = crate::numeric::str_to_i64(&s) else {
+                                return Value::Integer(0);
+                            };
+
+                            if f64::from(parsed) == int as f64 {
+                                return Value::Integer(int);
+                            }
+
+                            Value::Float(parsed.into())
+                        }
+                        None => Value::Integer(0),
+                    }
                 }
-                Value::Text(t) => cast_text_to_numeric(t.as_str()),
-                Value::Integer(i) => Value::Integer(*i),
-                Value::Float(f) => Value::Float(*f),
-                _ => self.clone(), // TODO probably wrong
             },
         }
     }
@@ -7931,51 +8754,47 @@ impl Value {
         }
     }
 
-    fn to_f64(&self) -> Option<f64> {
-        match self {
-            Value::Integer(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
-            Value::Text(t) => t.as_str().parse::<f64>().ok(),
-            _ => None,
-        }
-    }
-
     fn exec_math_unary(&self, function: &MathFunc) -> Value {
+        let v = Numeric::from_value_strict(self);
+
         // In case of some functions and integer input, return the input as is
-        if let Value::Integer(_) = self {
+        if let Numeric::Integer(i) = v {
             if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
             {
-                return self.clone();
+                return Value::Integer(i);
             }
         }
 
-        let f = match self.to_f64() {
-            Some(f) => f,
-            None => return Value::Null,
+        let Some(f) = v.try_into_f64() else {
+            return Value::Null;
         };
 
+        if matches! { function, MathFunc::Ln | MathFunc::Log10 | MathFunc::Log2 } && f <= 0.0 {
+            return Value::Null;
+        }
+
         let result = match function {
-            MathFunc::Acos => libm::acos(f),
-            MathFunc::Acosh => libm::acosh(f),
-            MathFunc::Asin => libm::asin(f),
-            MathFunc::Asinh => libm::asinh(f),
-            MathFunc::Atan => libm::atan(f),
-            MathFunc::Atanh => libm::atanh(f),
+            MathFunc::Acos => unsafe { cmath::acos(f) },
+            MathFunc::Acosh => unsafe { cmath::acosh(f) },
+            MathFunc::Asin => unsafe { cmath::asin(f) },
+            MathFunc::Asinh => unsafe { cmath::asinh(f) },
+            MathFunc::Atan => unsafe { cmath::atan(f) },
+            MathFunc::Atanh => unsafe { cmath::atanh(f) },
             MathFunc::Ceil | MathFunc::Ceiling => libm::ceil(f),
-            MathFunc::Cos => libm::cos(f),
-            MathFunc::Cosh => libm::cosh(f),
+            MathFunc::Cos => unsafe { cmath::cos(f) },
+            MathFunc::Cosh => unsafe { cmath::cosh(f) },
             MathFunc::Degrees => f.to_degrees(),
-            MathFunc::Exp => libm::exp(f),
+            MathFunc::Exp => unsafe { cmath::exp(f) },
             MathFunc::Floor => libm::floor(f),
-            MathFunc::Ln => libm::log(f),
-            MathFunc::Log10 => libm::log10(f),
-            MathFunc::Log2 => libm::log2(f),
+            MathFunc::Ln => unsafe { cmath::log(f) },
+            MathFunc::Log10 => unsafe { cmath::log10(f) },
+            MathFunc::Log2 => unsafe { cmath::log2(f) },
             MathFunc::Radians => f.to_radians(),
-            MathFunc::Sin => libm::sin(f),
-            MathFunc::Sinh => libm::sinh(f),
+            MathFunc::Sin => unsafe { cmath::sin(f) },
+            MathFunc::Sinh => unsafe { cmath::sinh(f) },
             MathFunc::Sqrt => libm::sqrt(f),
-            MathFunc::Tan => libm::tan(f),
-            MathFunc::Tanh => libm::tanh(f),
+            MathFunc::Tan => unsafe { cmath::tan(f) },
+            MathFunc::Tanh => unsafe { cmath::tanh(f) },
             MathFunc::Trunc => libm::trunc(f),
             _ => unreachable!("Unexpected mathematical unary function {:?}", function),
         };
@@ -7988,20 +8807,18 @@ impl Value {
     }
 
     fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
-        let lhs = match self.to_f64() {
-            Some(f) => f,
-            None => return Value::Null,
+        let Some(lhs) = Numeric::from_value_strict(self).try_into_f64() else {
+            return Value::Null;
         };
 
-        let rhs = match rhs.to_f64() {
-            Some(f) => f,
-            None => return Value::Null,
+        let Some(rhs) = Numeric::from_value_strict(rhs).try_into_f64() else {
+            return Value::Null;
         };
 
         let result = match function {
-            MathFunc::Atan2 => libm::atan2(lhs, rhs),
+            MathFunc::Atan2 => unsafe { cmath::atan2(lhs, rhs) },
             MathFunc::Mod => libm::fmod(lhs, rhs),
-            MathFunc::Pow | MathFunc::Power => libm::pow(lhs, rhs),
+            MathFunc::Pow | MathFunc::Power => unsafe { cmath::pow(lhs, rhs) },
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 
@@ -8013,18 +8830,19 @@ impl Value {
     }
 
     fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let f = match self.to_f64() {
-            Some(f) => f,
-            None => return Value::Null,
+        let Some(f) = Numeric::from_value_strict(self).try_into_f64() else {
+            return Value::Null;
         };
 
-        let base = match base {
-            Some(base) => match base.to_f64() {
-                Some(f) => f,
-                None => return Value::Null,
-            },
+        let base = match base.map(|value| Numeric::from_value_strict(value).try_into_f64()) {
+            Some(Some(f)) => f,
+            Some(None) => return Value::Null,
             None => 10.0,
         };
+
+        if f <= 0.0 || base <= 0.0 || base == 1.0 {
+            return Value::Null;
+        }
 
         if base == 2.0 {
             return Value::Float(libm::log2(f));
@@ -8032,11 +8850,13 @@ impl Value {
             return Value::Float(libm::log10(f));
         };
 
-        if f <= 0.0 || base <= 0.0 || base == 1.0 {
-            return Value::Null;
-        }
         let log_x = libm::log(f);
         let log_base = libm::log(base);
+
+        if log_base <= 0.0 {
+            return Value::Null;
+        }
+
         let result = log_x / log_base;
         Value::Float(result)
     }
@@ -8101,39 +8921,21 @@ impl Value {
     }
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
-        match (self, rhs) {
-            (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_text.as_str().to_string() + rhs_text.as_str())
-            }
-            (Value::Text(lhs_text), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_text.as_str().to_string() + &rhs_int.to_string())
-            }
-            (Value::Text(lhs_text), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_text.as_str().to_string() + &rhs_float.to_string())
-            }
-            (Value::Integer(lhs_int), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_int.to_string() + rhs_text.as_str())
-            }
-            (Value::Integer(lhs_int), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_int.to_string() + &rhs_int.to_string())
-            }
-            (Value::Integer(lhs_int), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_int.to_string() + &rhs_float.to_string())
-            }
-            (Value::Float(lhs_float), Value::Text(rhs_text)) => {
-                Value::build_text(lhs_float.to_string() + rhs_text.as_str())
-            }
-            (Value::Float(lhs_float), Value::Integer(rhs_int)) => {
-                Value::build_text(lhs_float.to_string() + &rhs_int.to_string())
-            }
-            (Value::Float(lhs_float), Value::Float(rhs_float)) => {
-                Value::build_text(lhs_float.to_string() + &rhs_float.to_string())
-            }
-            (Value::Null, _) | (_, Value::Null) => Value::Null,
-            (Value::Blob(_), _) | (_, Value::Blob(_)) => {
-                todo!("TODO: Handle Blob conversion to String")
-            }
+        if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
+            return Value::build_text(String::from_utf8_lossy(
+                &[lhs.as_slice(), rhs.as_slice()].concat(),
+            ));
         }
+
+        let Some(lhs) = self.cast_text() else {
+            return Value::Null;
+        };
+
+        let Some(rhs) = rhs.cast_text() else {
+            return Value::Null;
+        };
+
+        Value::build_text(lhs + &rhs)
     }
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
@@ -8299,15 +9101,19 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = t.as_str();
+                    let text = t.as_str().trim();
 
                     // Handle hex numbers - they shouldn't be converted
                     if text.starts_with("0x") {
                         return false;
                     }
 
-                    // Try to parse as number (similar to applyNumericAffinity)
-                    let Ok(num) = checked_cast_text_to_numeric(text) else {
+                    // For affinity conversion, only convert strings that are entirely numeric
+                    let num = if let Ok(i) = text.parse::<i64>() {
+                        Value::Integer(i)
+                    } else if let Ok(f) = text.parse::<f64>() {
+                        Value::Float(f)
+                    } else {
                         return false;
                     };
 
@@ -8767,7 +9573,7 @@ pub fn op_max_pgcnt(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
@@ -8795,7 +9601,7 @@ pub fn op_journal_mode(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Rc<Pager>,
+    pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(JournalMode { db, dest, new_mode }, insn);
@@ -8808,11 +9614,11 @@ pub fn op_journal_mode(
     // Currently, Turso only supports WAL mode
     // If a new mode is specified, we validate it but always return "wal"
     if let Some(mode) = new_mode {
-        let mode_lower = mode.to_lowercase();
+        let mode_bytes = mode.as_bytes();
         // Valid journal modes in SQLite are: delete, truncate, persist, memory, wal, off
         // We accept any valid mode but always use WAL
-        match mode_lower.as_str() {
-            "delete" | "truncate" | "persist" | "memory" | "wal" | "off" => {
+        match_ignore_ascii_case!(match mode_bytes {
+            b"delete" | b"truncate" | b"persist" | b"memory" | b"wal" | b"off" => {
                 // Mode is valid, but we stay in WAL mode
             }
             _ => {
@@ -8821,13 +9627,49 @@ pub fn op_journal_mode(
                     "Unknown journal mode: {mode}"
                 )));
             }
-        }
+        })
     }
 
     // Always return "wal" as the current journal mode
     state.registers[*dest] = Register::Value(Value::build_text("wal"));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn with_header<T, F>(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+    f: F,
+) -> Result<IOResult<T>>
+where
+    F: Fn(&DatabaseHeader) -> T,
+{
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.get_mv_tx_id();
+        mv_store.with_header(f, tx_id.as_ref()).map(IOResult::Done)
+    } else {
+        pager.with_header(&f)
+    }
+}
+
+fn with_header_mut<T, F>(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+    f: F,
+) -> Result<IOResult<T>>
+where
+    F: Fn(&mut DatabaseHeader) -> T,
+{
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.get_mv_tx_id();
+        mv_store
+            .with_header_mut(f, tx_id.as_ref())
+            .map(IOResult::Done)
+    } else {
+        pager.with_header_mut(&f)
+    }
 }
 
 #[cfg(test)]
@@ -9447,8 +10289,8 @@ mod tests {
         assert_eq!(input_str.exec_upper().unwrap(), expected_str);
 
         let input_int = Value::Integer(10);
-        assert_eq!(input_int.exec_upper().unwrap(), input_int);
-        assert_eq!(Value::Null.exec_upper().unwrap(), Value::Null)
+        assert_eq!(input_int.exec_upper().unwrap(), Value::build_text("10"));
+        assert_eq!(Value::Null.exec_upper(), None)
     }
 
     #[test]
@@ -9458,8 +10300,8 @@ mod tests {
         assert_eq!(input_str.exec_lower().unwrap(), expected_str);
 
         let input_int = Value::Integer(10);
-        assert_eq!(input_int.exec_lower().unwrap(), input_int);
-        assert_eq!(Value::Null.exec_lower().unwrap(), Value::Null)
+        assert_eq!(input_int.exec_lower().unwrap(), Value::build_text("10"));
+        assert_eq!(Value::Null.exec_lower(), None)
     }
 
     #[test]
@@ -9926,7 +10768,7 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("abc");
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("42");
@@ -9942,23 +10784,23 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"abc".to_vec());
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"42".to_vec());
-        let expected = Some(Value::Integer(1));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"-42".to_vec());
-        let expected = Some(Value::Integer(-1));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"0".to_vec());
-        let expected = Some(Value::Integer(0));
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Null;
-        let expected = Some(Value::Null);
+        let expected = None;
         assert_eq!(input.exec_sign(), expected);
     }
 

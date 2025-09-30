@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     schema::{Column, Index},
@@ -7,6 +11,7 @@ use crate::{
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
+    util::exprs_are_equivalent,
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -165,7 +170,7 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, Vec<Arc<Index>>>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -305,31 +310,26 @@ pub fn constraints_from_where_clause(
             }
             for index in available_indexes
                 .get(table_reference.table.get_name())
-                .unwrap_or(&Vec::new())
+                .unwrap_or(&VecDeque::new())
             {
                 if let Some(position_in_index) =
                     index.column_table_pos_to_index_pos(constraint.table_col_pos)
                 {
-                    let index_candidate = cs
-                        .candidates
-                        .iter_mut()
-                        .find_map(|candidate| {
-                            if candidate
-                                .index
-                                .as_ref()
-                                .is_some_and(|i| Arc::ptr_eq(index, i))
-                            {
-                                Some(candidate)
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap();
-                    index_candidate.refs.push(ConstraintRef {
-                        constraint_vec_pos: i,
-                        index_col_pos: position_in_index,
-                        sort_order: index.columns[position_in_index].order,
-                    });
+                    if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
+                        if candidate.index.as_ref().is_some_and(|i| {
+                            Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
+                        }) {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    }) {
+                        index_candidate.refs.push(ConstraintRef {
+                            constraint_vec_pos: i,
+                            index_col_pos: position_in_index,
+                            sort_order: index.columns[position_in_index].order,
+                        });
+                    }
                 }
             }
         }
@@ -338,6 +338,15 @@ pub fn constraints_from_where_clause(
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
         }
+        cs.candidates.retain(|c| {
+            if let Some(idx) = &c.index {
+                if idx.where_clause.is_some() && c.refs.is_empty() {
+                    // prevent a partial index from even being considered as a scan driver.
+                    return false;
+                }
+            }
+            true
+        });
         constraints.push(cs);
     }
 
@@ -515,6 +524,21 @@ pub fn usable_constraints_for_join_order<'a>(
         last_column_pos += 1;
     }
     usable
+}
+
+fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {
+    let Some(index_where) = &index.where_clause else {
+        // Full index, always usable
+        return true;
+    };
+    // Check if query WHERE contains the exact same predicate
+    for term in query_where_clause {
+        if exprs_are_equivalent(&term.expr, index_where.as_ref()) {
+            return true;
+        }
+    }
+    // TODO: do better to determine if we should use partial index
+    false
 }
 
 pub fn convert_to_vtab_constraint(

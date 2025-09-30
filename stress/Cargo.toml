@@ -21,12 +21,12 @@ experimental_indexes = []
 
 [dependencies]
 anarchist-readable-name-generator-lib = "0.1.0"
-antithesis_sdk = "0.2.5"
-clap = { version = "4.5", features = ["derive"] }
-hex = "0.4"
-tempfile = "3.20.0"
-tokio = { version = "1.29.1", features = ["full"] }
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-turso = { path = "../bindings/rust" }
+antithesis_sdk = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+turso = { workspace = true }

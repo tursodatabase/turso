@@ -55,4 +55,11 @@ pub struct Opts {
     /// Database file
     #[clap(short = 'd', long, help = "database file")]
     pub db_file: Option<String>,
+
+    /// Select VFS
+    #[clap(
+        long,
+        help = "Select VFS. options are io_uring (if feature enabled), memory, and syscall"
+    )]
+    pub vfs: Option<String>,
 }

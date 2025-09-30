@@ -1,18 +1,23 @@
 #![allow(unused)]
+use crate::incremental::view::IncrementalView;
+use crate::numeric::StrToF64;
+use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::WalkControl;
 use crate::types::IOResult;
 use crate::{
-    schema::{self, Column, MaterializedViewsMap, Schema, Type},
+    schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
-use crate::{Connection, IO};
+use crate::{Connection, MvStore, IO};
 use std::{
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 use tracing::{instrument, Level};
+use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{
     self, fmt::ToTokens, Cmd, CreateTableBody, Expr, FunctionTail, Literal, Stmt, UnaryOperator,
 };
@@ -31,6 +36,58 @@ macro_rules! io_yield_many {
     };
 }
 
+#[macro_export]
+macro_rules! eq_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        match_ignore_ascii_case!(match $var {
+            $value => true,
+            _ => false,
+        })
+    }};
+}
+
+#[macro_export]
+macro_rules! contains_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        let compare_to_idx = $var.len().saturating_sub($value.len());
+        if $var.len() < $value.len() {
+            false
+        } else {
+            let mut result = false;
+            for i in 0..=compare_to_idx {
+                if eq_ignore_ascii_case!(&$var[i..i + $value.len()], $value) {
+                    result = true;
+                    break;
+                }
+            }
+
+            result
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! starts_with_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        if $var.len() < $value.len() {
+            false
+        } else {
+            eq_ignore_ascii_case!(&$var[..$value.len()], $value)
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! ends_with_ignore_ascii_case {
+    ( $var:expr, $value:literal ) => {{
+        if $var.len() < $value.len() {
+            false
+        } else {
+            eq_ignore_ascii_case!(&$var[$var.len() - $value.len()..], $value)
+        }
+    }};
+}
+
 pub trait IOExt {
     fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
 }
@@ -46,31 +103,18 @@ impl<I: ?Sized + IO> IOExt for I {
     }
 }
 
-pub trait RoundToPrecision {
-    fn round_to_precision(self, precision: i32) -> f64;
-}
-
-impl RoundToPrecision for f64 {
-    fn round_to_precision(self, precision: i32) -> f64 {
-        let factor = 10f64.powi(precision);
-        (self * factor).round() / factor
-    }
-}
-
 // https://sqlite.org/lang_keywords.html
-const QUOTE_PAIRS: &[(char, char)] = &[('"', '"'), ('[', ']'), ('`', '`')];
+const QUOTE_PAIRS: &[(char, char)] = &[
+    ('"', '"'),
+    ('[', ']'),
+    ('`', '`'),
+    ('\'', '\''), // string sometimes used as identifier quoting
+];
 
 pub fn normalize_ident(identifier: &str) -> String {
-    let quote_pair = QUOTE_PAIRS
-        .iter()
-        .find(|&(start, end)| identifier.starts_with(*start) && identifier.ends_with(*end));
-
-    if let Some(&(_, _)) = quote_pair {
-        &identifier[1..identifier.len() - 1]
-    } else {
-        identifier
-    }
-    .to_lowercase()
+    // quotes normalization already happened in the parser layer (see Name ast node implementation)
+    // so, we only need to convert identifier string to lowercase
+    identifier.to_lowercase()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -80,7 +124,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// CREATE INDEX idx ON table_name(sql)
 pub struct UnparsedFromSqlIndex {
     pub table_name: String,
-    pub root_page: usize,
+    pub root_page: i64,
     pub sql: String,
 }
 
@@ -89,177 +133,48 @@ pub fn parse_schema_rows(
     mut rows: Statement,
     schema: &mut Schema,
     syms: &SymbolTable,
-    mv_tx_id: Option<u64>,
-    mut existing_views: MaterializedViewsMap,
+    mv_tx: Option<(u64, TransactionMode)>,
+    mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
-    rows.set_mv_tx_id(mv_tx_id);
+    rows.set_mv_tx(mv_tx);
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
     let mut automatic_indices = std::collections::HashMap::with_capacity(10);
 
-    // Collect views for second pass to populate table_to_views mapping
-    let mut views_to_process: Vec<(String, Vec<String>)> = Vec::new();
+    // Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    let mut dbsp_state_roots: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    let mut dbsp_state_index_roots: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    // Store materialized view info (SQL and root page) for later creation
+    let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
+        std::collections::HashMap::new();
     loop {
         match rows.step()? {
             StepResult::Row => {
                 let row = rows.row().unwrap();
                 let ty = row.get::<&str>(0)?;
-                if !["table", "index", "view"].contains(&ty) {
-                    continue;
-                }
-                match ty {
-                    "table" => {
-                        let root_page: i64 = row.get::<i64>(3)?;
-                        let sql: &str = row.get::<&str>(4)?;
-                        if root_page == 0 && sql.to_lowercase().contains("create virtual") {
-                            let name: &str = row.get::<&str>(1)?;
-                            // a virtual table is found in the sqlite_schema, but it's no
-                            // longer in the in-memory schema. We need to recreate it if
-                            // the module is loaded in the symbol table.
-                            let vtab = if let Some(vtab) = syms.vtabs.get(name) {
-                                vtab.clone()
-                            } else {
-                                let mod_name = module_name_from_sql(sql)?;
-                                crate::VirtualTable::table(
-                                    Some(name),
-                                    mod_name,
-                                    module_args_from_sql(sql)?,
-                                    syms,
-                                )?
-                            };
-                            schema.add_virtual_table(vtab);
-                        } else {
-                            let table = schema::BTreeTable::from_sql(sql, root_page as usize)?;
-                            schema.add_btree_table(Arc::new(table));
-                        }
-                    }
-                    "index" => {
-                        let root_page: i64 = row.get::<i64>(3)?;
-                        match row.get::<&str>(4) {
-                            Ok(sql) => {
-                                from_sql_indexes.push(UnparsedFromSqlIndex {
-                                    table_name: row.get::<&str>(2)?.to_string(),
-                                    root_page: root_page as usize,
-                                    sql: sql.to_string(),
-                                });
-                            }
-                            _ => {
-                                // Automatic index on primary key and/or unique constraint, e.g.
-                                // table|foo|foo|2|CREATE TABLE foo (a text PRIMARY KEY, b)
-                                // index|sqlite_autoindex_foo_1|foo|3|
-                                let index_name = row.get::<&str>(1)?.to_string();
-                                let table_name = row.get::<&str>(2)?.to_string();
-                                let root_page = row.get::<i64>(3)?;
-                                match automatic_indices.entry(table_name) {
-                                    std::collections::hash_map::Entry::Vacant(e) => {
-                                        e.insert(vec![(index_name, root_page as usize)]);
-                                    }
-                                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                                        e.get_mut().push((index_name, root_page as usize));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    "view" => {
-                        use crate::incremental::view::IncrementalView;
-                        use crate::schema::View;
-                        use fallible_iterator::FallibleIterator;
-                        use turso_parser::ast::{Cmd, Stmt};
-                        use turso_parser::parser::Parser;
-
-                        let name: &str = row.get::<&str>(1)?;
-                        let sql: &str = row.get::<&str>(4)?;
-                        let view_name = name.to_string();
-
-                        // Parse the SQL to determine if it's a regular or materialized view
-                        let mut parser = Parser::new(sql.as_bytes());
-                        if let Ok(Some(Cmd::Stmt(stmt))) = parser.next_cmd() {
-                            match stmt {
-                                Stmt::CreateMaterializedView { .. } => {
-                                    // Handle materialized view with potential reuse
-                                    let should_create_new = if let Some(existing_view) =
-                                        existing_views.remove(&view_name)
-                                    {
-                                        // Check if we can reuse this view (same SQL definition)
-                                        let can_reuse = if let Ok(view_guard) = existing_view.lock()
-                                        {
-                                            view_guard.has_same_sql(sql)
-                                        } else {
-                                            false
-                                        };
-
-                                        if can_reuse {
-                                            // Reuse the existing view - it's already populated!
-                                            let referenced_tables =
-                                                if let Ok(view_guard) = existing_view.lock() {
-                                                    view_guard.get_referenced_table_names()
-                                                } else {
-                                                    vec![]
-                                                };
-
-                                            // Add the existing view to the new schema
-                                            schema
-                                                .materialized_views
-                                                .insert(view_name.clone(), existing_view);
-
-                                            // Store for second pass processing
-                                            views_to_process
-                                                .push((view_name.clone(), referenced_tables));
-                                            false // Don't create new
-                                        } else {
-                                            true // SQL changed, need to create new
-                                        }
-                                    } else {
-                                        true // No existing view, need to create new
-                                    };
-
-                                    if should_create_new {
-                                        // Create a new IncrementalView
-                                        // If this fails, we should propagate the error so the transaction rolls back
-                                        let incremental_view =
-                                            IncrementalView::from_sql(sql, schema)?;
-                                        let referenced_tables =
-                                            incremental_view.get_referenced_table_names();
-                                        schema.add_materialized_view(incremental_view);
-                                        views_to_process.push((view_name, referenced_tables));
-                                    }
-                                }
-                                Stmt::CreateView {
-                                    view_name: _,
-                                    columns: column_names,
-                                    select,
-                                    ..
-                                } => {
-                                    // Extract actual columns from the SELECT statement
-                                    let view_columns =
-                                        crate::util::extract_view_columns(&select, schema);
-
-                                    // If column names were provided in CREATE VIEW (col1, col2, ...),
-                                    // use them to rename the columns
-                                    let mut final_columns = view_columns;
-                                    for (i, indexed_col) in column_names.iter().enumerate() {
-                                        if let Some(col) = final_columns.get_mut(i) {
-                                            col.name = Some(indexed_col.col_name.to_string());
-                                        }
-                                    }
-
-                                    // Create regular view
-                                    let view = View {
-                                        name: name.to_string(),
-                                        sql: sql.to_string(),
-                                        select_stmt: select,
-                                        columns: final_columns,
-                                    };
-                                    schema.add_view(view);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    _ => continue,
-                }
+                let name = row.get::<&str>(1)?;
+                let table_name = row.get::<&str>(2)?;
+                let root_page = row.get::<i64>(3)?;
+                let sql = row.get::<&str>(4).ok();
+                schema.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    root_page,
+                    sql,
+                    syms,
+                    &mut from_sql_indexes,
+                    &mut automatic_indices,
+                    &mut dbsp_state_roots,
+                    &mut dbsp_state_index_roots,
+                    &mut materialized_view_info,
+                    mv_store,
+                )?
             }
             StepResult::IO => {
                 // TODO: How do we ensure that the I/O we submitted to
@@ -271,43 +186,13 @@ pub fn parse_schema_rows(
             StepResult::Busy => break,
         }
     }
-    for unparsed_sql_from_index in from_sql_indexes {
-        if !schema.indexes_enabled() {
-            schema.table_set_has_index(&unparsed_sql_from_index.table_name);
-        } else {
-            let table = schema
-                .get_btree_table(&unparsed_sql_from_index.table_name)
-                .unwrap();
-            let index = schema::Index::from_sql(
-                &unparsed_sql_from_index.sql,
-                unparsed_sql_from_index.root_page,
-                table.as_ref(),
-            )?;
-            schema.add_index(Arc::new(index));
-        }
-    }
-    for automatic_index in automatic_indices {
-        if !schema.indexes_enabled() {
-            schema.table_set_has_index(&automatic_index.0);
-        } else {
-            let table = schema.get_btree_table(&automatic_index.0).unwrap();
-            let ret_index = schema::Index::automatic_from_primary_key_and_unique(
-                table.as_ref(),
-                automatic_index.1,
-            )?;
-            for index in ret_index {
-                schema.add_index(Arc::new(index));
-            }
-        }
-    }
 
-    // Second pass: populate table_to_views mapping
-    for (view_name, referenced_tables) in views_to_process {
-        // Register this view as dependent on each referenced table
-        for table_name in referenced_tables {
-            schema.add_materialized_view_dependency(&table_name, &view_name);
-        }
-    }
+    schema.populate_indices(from_sql_indexes, automatic_indices)?;
+    schema.populate_materialized_views(
+        materialized_view_info,
+        dbsp_state_roots,
+        dbsp_state_index_roots,
+    )?;
 
     Ok(())
 }
@@ -441,8 +326,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
-///
-/// *Note*: doesn't attempt to evaluate/compute "constexpr" results
 pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     match (expr1, expr2) {
         (
@@ -609,6 +492,36 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
     }
 }
 
+// this function returns the affinity type and whether the type name was exactly "INTEGER"
+// https://www.sqlite.org/datatype3.html
+pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
+    let type_name = type_name.as_bytes();
+    if type_name.is_empty() {
+        return (Type::Blob, false);
+    }
+
+    if eq_ignore_ascii_case!(type_name, b"INTEGER") {
+        return (Type::Integer, true);
+    }
+
+    if contains_ignore_ascii_case!(type_name, b"INT") {
+        return (Type::Integer, false);
+    }
+
+    if let Some(ty) = type_name.windows(4).find_map(|s| {
+        match_ignore_ascii_case!(match s {
+            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
+            b"BLOB" => Some(Type::Blob),
+            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
+            _ => None,
+        })
+    }) {
+        return (ty, false);
+    }
+
+    (Type::Numeric, false)
+}
+
 pub fn columns_from_create_table_body(
     body: &turso_parser::ast::CreateTableBody,
 ) -> crate::Result<Vec<Column>> {
@@ -620,78 +533,7 @@ pub fn columns_from_create_table_body(
 
     use turso_parser::ast;
 
-    Ok(columns
-        .iter()
-        .map(
-            |ast::ColumnDefinition {
-                 col_name: name,
-                 col_type,
-                 constraints,
-             }| {
-                Column {
-                    name: Some(normalize_ident(name.as_str())),
-                    ty: match col_type {
-                        Some(ref data_type) => {
-                            // https://www.sqlite.org/datatype3.html
-                            let type_name = data_type.name.as_str().to_uppercase();
-                            if type_name.contains("INT") {
-                                Type::Integer
-                            } else if type_name.contains("CHAR")
-                                || type_name.contains("CLOB")
-                                || type_name.contains("TEXT")
-                            {
-                                Type::Text
-                            } else if type_name.contains("BLOB") || type_name.is_empty() {
-                                Type::Blob
-                            } else if type_name.contains("REAL")
-                                || type_name.contains("FLOA")
-                                || type_name.contains("DOUB")
-                            {
-                                Type::Real
-                            } else {
-                                Type::Numeric
-                            }
-                        }
-                        None => Type::Null,
-                    },
-                    default: constraints.iter().find_map(|c| match &c.constraint {
-                        ast::ColumnConstraint::Default(val) => Some(val.clone()),
-                        _ => None,
-                    }),
-                    notnull: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::NotNull { .. })),
-                    ty_str: col_type
-                        .clone()
-                        .map(|t| t.name.to_string())
-                        .unwrap_or_default(),
-                    primary_key: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. })),
-                    is_rowid_alias: false,
-                    unique: constraints
-                        .iter()
-                        .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique(..))),
-                    collation: constraints.iter().find_map(|c| match &c.constraint {
-                        // TODO: see if this should be the correct behavior
-                        // currently there cannot be any user defined collation sequences.
-                        // But in the future, when a user defines a collation sequence, creates a table with it,
-                        // then closes the db and opens it again. This may panic here if the collation seq is not registered
-                        // before reading the columns
-                        ast::ColumnConstraint::Collate { collation_name } => Some(
-                            CollationSeq::new(collation_name.as_str())
-                                .expect("collation should have been set correctly in create table"),
-                        ),
-                        _ => None,
-                    }),
-                    hidden: col_type
-                        .as_ref()
-                        .map(|data_type| data_type.name.as_str().contains("HIDDEN"))
-                        .unwrap_or(false),
-                }
-            },
-        )
-        .collect::<Vec<_>>())
+    Ok(columns.iter().map(Into::into).collect())
 }
 
 /// This function checks if a given expression is a constant value that can be pushed down to the database engine.
@@ -740,6 +582,10 @@ pub struct OpenOptions<'a> {
     pub cache: CacheMode,
     /// immutable=1|0 specifies that the database is stored on read-only media
     pub immutable: bool,
+    // The encryption cipher
+    pub cipher: Option<String>,
+    // The encryption key in hex format
+    pub hexkey: Option<String>,
 }
 
 pub const MEMORY_PATH: &str = ":memory:";
@@ -772,15 +618,16 @@ impl From<&str> for CacheMode {
 
 impl OpenMode {
     pub fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "ro" => Ok(OpenMode::ReadOnly),
-            "rw" => Ok(OpenMode::ReadWrite),
-            "memory" => Ok(OpenMode::Memory),
-            "rwc" => Ok(OpenMode::ReadWriteCreate),
+        let s_bytes = s.trim().as_bytes();
+        match_ignore_ascii_case!(match s_bytes {
+            b"ro" => Ok(OpenMode::ReadOnly),
+            b"rw" => Ok(OpenMode::ReadWrite),
+            b"memory" => Ok(OpenMode::Memory),
+            b"rwc" => Ok(OpenMode::ReadWriteCreate),
             _ => Err(LimboError::InvalidArgument(format!(
                 "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
             ))),
-        }
+        })
     }
 }
 
@@ -890,6 +737,8 @@ fn parse_query_params(query: &str, opts: &mut OpenOptions) -> Result<()> {
                 "cache" => opts.cache = decoded_value.as_str().into(),
                 "immutable" => opts.immutable = decoded_value == "1",
                 "vfs" => opts.vfs = Some(decoded_value),
+                "cipher" => opts.cipher = Some(decoded_value),
+                "hexkey" => opts.hexkey = Some(decoded_value),
                 _ => {}
             }
         }
@@ -1132,8 +981,12 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         return Ok(Value::Integer(int_value));
     }
 
-    let float_value = text.parse::<f64>()?;
-    Ok(Value::Float(float_value))
+    let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
+        crate::numeric::str_to_f64(text)
+    else {
+        unreachable!();
+    };
+    Ok(Value::Float(float.into()))
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -1159,11 +1012,7 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
 
 pub fn parse_string(expr: &Expr) -> Result<String> {
     match expr {
-        Expr::Name(ast::Name::Ident(s)) | Expr::Name(ast::Name::Quoted(s))
-            if s.len() >= 2 && s.starts_with("'") && s.ends_with("'") =>
-        {
-            Ok(s[1..s.len() - 1].to_string())
-        }
+        Expr::Name(name) if name.quoted_with('\'') => Ok(name.as_str().to_string()),
         _ => Err(LimboError::InvalidArgument(format!(
             "string parameter expected, got {expr:?} instead"
         ))),
@@ -1197,14 +1046,66 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
 pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
-        ast::Expr::Qualified(_, name) => Some(name.as_str().to_string()),
+        ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
+            Some(normalize_ident(name.as_str()))
+        }
         _ => None,
     }
 }
 
+/// Information about a table referenced in a view
+#[derive(Debug, Clone)]
+pub struct ViewTable {
+    /// The full table name (potentially including database qualifier like "main.customers")
+    pub name: String,
+    /// Optional alias (e.g., "c" in "FROM customers c")
+    pub alias: Option<String>,
+}
+
+/// Information about a column in the view's output
+#[derive(Debug, Clone)]
+pub struct ViewColumn {
+    /// Index into ViewColumnSchema.tables indicating which table this column comes from
+    /// For computed columns or constants, this will be usize::MAX
+    pub table_index: usize,
+    /// The actual column definition
+    pub column: Column,
+}
+
+/// Schema information for a view, tracking which columns come from which tables
+#[derive(Debug, Clone)]
+pub struct ViewColumnSchema {
+    /// All tables referenced by the view (in order of appearance)
+    pub tables: Vec<ViewTable>,
+    /// The view's output columns with their table associations
+    pub columns: Vec<ViewColumn>,
+}
+
+impl ViewColumnSchema {
+    /// Get all columns as a flat vector (without table association info)
+    pub fn flat_columns(&self) -> Vec<Column> {
+        self.columns.iter().map(|vc| vc.column.clone()).collect()
+    }
+
+    /// Get columns that belong to a specific table
+    pub fn table_columns(&self, table_index: usize) -> Vec<Column> {
+        self.columns
+            .iter()
+            .filter(|vc| vc.table_index == table_index)
+            .map(|vc| vc.column.clone())
+            .collect()
+    }
+}
+
 /// Extract column information from a SELECT statement for view creation
-pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<Column> {
+pub fn extract_view_columns(
+    select_stmt: &ast::Select,
+    schema: &Schema,
+) -> Result<ViewColumnSchema> {
+    let mut tables = Vec::new();
     let mut columns = Vec::new();
+    let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
         ref from,
@@ -1212,23 +1113,85 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
         ..
     } = &select_stmt.body.select
     {
-        // First, we need to figure out which table(s) are being selected from
-        let table_name = if let Some(from) = from {
-            if let ast::SelectTable::Table(qualified_name, _, _) = from.select.as_ref() {
-                Some(normalize_ident(qualified_name.name.as_str()))
-            } else {
-                None
+        // First, extract all tables (from FROM clause and JOINs)
+        if let Some(from) = from {
+            // Add the main table from FROM clause
+            match from.select.as_ref() {
+                ast::SelectTable::Table(qualified_name, alias, _) => {
+                    let table_name = if qualified_name.db_name.is_some() {
+                        // Include database qualifier if present
+                        qualified_name.to_string()
+                    } else {
+                        normalize_ident(qualified_name.name.as_str())
+                    };
+                    tables.push(ViewTable {
+                        name: table_name.clone(),
+                        alias: alias.as_ref().map(|a| match a {
+                            ast::As::As(name) => normalize_ident(name.as_str()),
+                            ast::As::Elided(name) => normalize_ident(name.as_str()),
+                        }),
+                    });
+                }
+                _ => {
+                    // Handle other types like subqueries if needed
+                }
             }
-        } else {
-            None
+
+            // Add tables from JOINs
+            for join in &from.joins {
+                match join.table.as_ref() {
+                    ast::SelectTable::Table(qualified_name, alias, _) => {
+                        let table_name = if qualified_name.db_name.is_some() {
+                            // Include database qualifier if present
+                            qualified_name.to_string()
+                        } else {
+                            normalize_ident(qualified_name.name.as_str())
+                        };
+                        tables.push(ViewTable {
+                            name: table_name.clone(),
+                            alias: alias.as_ref().map(|a| match a {
+                                ast::As::As(name) => normalize_ident(name.as_str()),
+                                ast::As::Elided(name) => normalize_ident(name.as_str()),
+                            }),
+                        });
+                    }
+                    _ => {
+                        // Handle other types like subqueries if needed
+                    }
+                }
+            }
+        }
+
+        // Helper function to find table index by name or alias
+        let find_table_index = |name: &str| -> Option<usize> {
+            tables
+                .iter()
+                .position(|t| t.name == name || t.alias.as_ref().is_some_and(|a| a == name))
         };
-        // Get the table for column resolution
-        let _table = table_name.as_ref().and_then(|name| schema.get_table(name));
+
         // Process each column in the SELECT list
-        for (i, result_col) in select_columns.iter().enumerate() {
+        for result_col in select_columns.iter() {
             match result_col {
                 ast::ResultColumn::Expr(expr, alias) => {
-                    let name = alias
+                    // Figure out which table this expression comes from
+                    let table_index = match expr.as_ref() {
+                        ast::Expr::Qualified(table_ref, _col_name) => {
+                            // Column qualified with table name
+                            find_table_index(table_ref.as_str())
+                        }
+                        ast::Expr::Id(_col_name) => {
+                            // Unqualified column - would need to resolve based on schema
+                            // For now, assume it's from the first table if there is one
+                            if !tables.is_empty() {
+                                Some(0)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None, // Expression, literal, etc.
+                    };
+
+                    let col_name = alias
                         .as_ref()
                         .map(|a| match a {
                             ast::As::Elided(name) => name.as_str().to_string(),
@@ -1237,43 +1200,67 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                         .or_else(|| extract_column_name_from_expr(expr))
                         .unwrap_or_else(|| {
                             // If we can't extract a simple column name, use the expression itself
-                            expr.format().unwrap_or_else(|_| format!("column_{i}"))
+                            expr.to_string()
                         });
-                    columns.push(Column {
-                        name: Some(name),
-                        ty: Type::Text, // Default to TEXT, could be refined with type analysis
-                        ty_str: "TEXT".to_string(),
-                        primary_key: false, // Views don't have primary keys
-                        is_rowid_alias: false,
-                        notnull: false, // Views typically don't enforce NOT NULL
-                        default: None,  // Views don't have default values
-                        unique: false,
-                        collation: None,
-                        hidden: false,
+
+                    columns.push(ViewColumn {
+                        table_index: table_index.unwrap_or(usize::MAX),
+                        column: Column {
+                            name: Some(col_name),
+                            ty: Type::Text, // Default to TEXT, could be refined with type analysis
+                            ty_str: "TEXT".to_string(),
+                            primary_key: false,
+                            is_rowid_alias: false,
+                            notnull: false,
+                            default: None,
+                            unique: false,
+                            collation: None,
+                            hidden: false,
+                        },
                     });
                 }
                 ast::ResultColumn::Star => {
-                    // For SELECT *, expand to all columns from the table
-                    if let Some(ref table_name) = table_name {
-                        if let Some(table) = schema.get_table(table_name) {
-                            // Copy all columns from the table, but adjust for view constraints
-                            for table_column in table.columns() {
-                                columns.push(Column {
-                                    name: table_column.name.clone(),
-                                    ty: table_column.ty,
-                                    ty_str: table_column.ty_str.clone(),
-                                    primary_key: false, // Views don't have primary keys
-                                    is_rowid_alias: false,
-                                    notnull: false, // Views typically don't enforce NOT NULL
-                                    default: None,  // Views don't have default values
-                                    unique: false,
-                                    collation: table_column.collation,
-                                    hidden: false,
+                    // For SELECT *, expand to all columns from all tables
+                    for (table_idx, table) in tables.iter().enumerate() {
+                        if let Some(table_obj) = schema.get_table(&table.name) {
+                            for table_column in table_obj.columns() {
+                                let col_name =
+                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Handle duplicate column names by adding suffix
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column: Column {
+                                        name: Some(final_name),
+                                        ty: table_column.ty,
+                                        ty_str: table_column.ty_str.clone(),
+                                        primary_key: false,
+                                        is_rowid_alias: false,
+                                        notnull: false,
+                                        default: None,
+                                        unique: false,
+                                        collation: table_column.collation,
+                                        hidden: false,
+                                    },
                                 });
                             }
-                        } else {
-                            // Table not found, create placeholder
-                            columns.push(Column {
+                        }
+                    }
+
+                    // If no tables, create a placeholder
+                    if tables.is_empty() {
+                        columns.push(ViewColumn {
+                            table_index: usize::MAX,
+                            column: Column {
                                 name: Some("*".to_string()),
                                 ty: Type::Text,
                                 ty_str: "TEXT".to_string(),
@@ -1284,76 +1271,83 @@ pub fn extract_view_columns(select_stmt: &ast::Select, schema: &Schema) -> Vec<C
                                 unique: false,
                                 collation: None,
                                 hidden: false,
-                            });
-                        }
-                    } else {
-                        // No FROM clause or couldn't determine table, create placeholder
-                        columns.push(Column {
-                            name: Some("*".to_string()),
-                            ty: Type::Text,
-                            ty_str: "TEXT".to_string(),
-                            primary_key: false,
-                            is_rowid_alias: false,
-                            notnull: false,
-                            default: None,
-                            unique: false,
-                            collation: None,
-                            hidden: false,
+                            },
                         });
                     }
                 }
-                ast::ResultColumn::TableStar(table_name) => {
+                ast::ResultColumn::TableStar(table_ref) => {
                     // For table.*, expand to all columns from the specified table
-                    let table_name_str = normalize_ident(table_name.as_str());
-                    if let Some(table) = schema.get_table(&table_name_str) {
-                        // Copy all columns from the table, but adjust for view constraints
-                        for table_column in table.columns() {
-                            columns.push(Column {
-                                name: table_column.name.clone(),
-                                ty: table_column.ty,
-                                ty_str: table_column.ty_str.clone(),
-                                primary_key: false,
-                                is_rowid_alias: false,
-                                notnull: false,
-                                default: None,
-                                unique: false,
-                                collation: table_column.collation,
-                                hidden: false,
+                    let table_name_str = normalize_ident(table_ref.as_str());
+                    if let Some(table_idx) = find_table_index(&table_name_str) {
+                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
+                            for table_column in table.columns() {
+                                let col_name =
+                                    table_column.name.clone().unwrap_or_else(|| "?".to_string());
+
+                                // Handle duplicate column names by adding suffix
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(&col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column: Column {
+                                        name: Some(final_name),
+                                        ty: table_column.ty,
+                                        ty_str: table_column.ty_str.clone(),
+                                        primary_key: false,
+                                        is_rowid_alias: false,
+                                        notnull: false,
+                                        default: None,
+                                        unique: false,
+                                        collation: table_column.collation,
+                                        hidden: false,
+                                    },
+                                });
+                            }
+                        } else {
+                            // Table not found, create placeholder
+                            columns.push(ViewColumn {
+                                table_index: usize::MAX,
+                                column: Column {
+                                    name: Some(format!("{table_name_str}.*")),
+                                    ty: Type::Text,
+                                    ty_str: "TEXT".to_string(),
+                                    primary_key: false,
+                                    is_rowid_alias: false,
+                                    notnull: false,
+                                    default: None,
+                                    unique: false,
+                                    collation: None,
+                                    hidden: false,
+                                },
                             });
                         }
-                    } else {
-                        // Table not found, create placeholder
-                        columns.push(Column {
-                            name: Some(format!("{table_name_str}.*")),
-                            ty: Type::Text,
-                            ty_str: "TEXT".to_string(),
-                            primary_key: false,
-                            is_rowid_alias: false,
-                            notnull: false,
-                            default: None,
-                            unique: false,
-                            collation: None,
-                            hidden: false,
-                        });
                     }
                 }
             }
         }
     }
-    columns
+
+    Ok(ViewColumnSchema { tables, columns })
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::schema::Type as SchemaValueType;
     use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
 
     #[test]
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
-        assert_eq!(normalize_ident("`foo`"), "foo");
-        assert_eq!(normalize_ident("[foo]"), "foo");
-        assert_eq!(normalize_ident("\"foo\""), "foo");
+        assert_eq!(normalize_ident("FOO"), "foo");
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
     }
 
     #[test]
@@ -1437,9 +1431,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_case_insensitive_functioncalls() {
         let func1 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1447,9 +1441,9 @@ pub mod tests {
             },
         };
         let func2 = Expr::FunctionCall {
-            name: Name::Ident("sum".to_string()),
+            name: Name::exact("sum".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1459,9 +1453,9 @@ pub mod tests {
         assert!(exprs_are_equivalent(&func1, &func2));
 
         let func3 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1474,9 +1468,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_identical_fn_with_distinct() {
         let sum = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1484,9 +1478,9 @@ pub mod tests {
             },
         };
         let sum_distinct = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1545,14 +1539,14 @@ pub mod tests {
     #[test]
     fn test_like_expressions_equivalent() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1564,14 +1558,14 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_like_escaped() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1582,13 +1576,13 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_between() {
         let expr1 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
         };
         let expr2 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -1597,7 +1591,7 @@ pub mod tests {
 
         // differing BETWEEN bounds
         let expr3 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("20".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -2322,17 +2316,39 @@ pub mod tests {
     #[test]
     fn test_parse_pragma_bool() {
         assert!(parse_pragma_bool(&Expr::Literal(Literal::Numeric("1".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("true".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("on".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("yes".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("true".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("on".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("yes".into()))).unwrap(),);
 
         assert!(!parse_pragma_bool(&Expr::Literal(Literal::Numeric("0".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("false".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("off".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("no".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("false".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("off".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("no".into()))).unwrap(),);
 
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("nono".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("10".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("-1".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("nono".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("10".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("-1".into()))).is_err());
+    }
+
+    #[test]
+    fn test_type_from_name() {
+        let tc = vec![
+            ("", (SchemaValueType::Blob, false)),
+            ("INTEGER", (SchemaValueType::Integer, true)),
+            ("INT", (SchemaValueType::Integer, false)),
+            ("CHAR", (SchemaValueType::Text, false)),
+            ("CLOB", (SchemaValueType::Text, false)),
+            ("TEXT", (SchemaValueType::Text, false)),
+            ("BLOB", (SchemaValueType::Blob, false)),
+            ("REAL", (SchemaValueType::Real, false)),
+            ("FLOAT", (SchemaValueType::Real, false)),
+            ("DOUBLE", (SchemaValueType::Real, false)),
+            ("U128", (SchemaValueType::Numeric, false)),
+        ];
+
+        for (input, expected) in tc {
+            let result = type_from_name(input);
+            assert_eq!(result, expected, "Failed for input: {input}");
+        }
     }
 }

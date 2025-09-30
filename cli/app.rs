@@ -10,6 +10,7 @@ use crate::{
         get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
         Settings, StderrProgress,
     },
+    manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     HISTORY_FILE,
 };
@@ -19,6 +20,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
     io::{self, BufRead as _, IsTerminal, Write},
+    mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -29,7 +31,9 @@ use std::{
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, LimboError, OpenFlags, Statement, StepResult, Value};
+use turso_core::{
+    Connection, Database, LimboError, OpenFlags, QueryMode, Statement, StepResult, Value,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -66,10 +70,14 @@ pub struct Opts {
     pub experimental_views: bool,
     #[clap(long, help = "Enable experimental indexing feature")]
     pub experimental_indexes: Option<bool>,
+    #[clap(long, help = "Enable experimental strict schema mode")]
+    pub experimental_strict: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
+    #[clap(long, help = "Enable experimental logical log feature")]
+    pub experimental_logical_log: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -80,7 +88,7 @@ pub struct Limbo {
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
     pub interrupt_count: Arc<AtomicUsize>,
-    input_buff: String,
+    input_buff: ManuallyDrop<String>,
     opts: Settings,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -91,9 +99,63 @@ struct QueryStatistics {
     execute_time_elapsed_samples: Vec<Duration>,
 }
 
+macro_rules! row_step_result_query {
+    ($app:expr, $sql:expr, $rows:expr, $stats:expr, $row_handle:expr) => {
+        if $app.interrupt_count.load(Ordering::Acquire) > 0 {
+            println!("Query interrupted.");
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        match $rows.step() {
+            Ok(StepResult::Row) => {
+                if let Some(ref mut stats) = $stats {
+                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                }
+
+                $row_handle
+            }
+            Ok(StepResult::IO) => {
+                let start = Instant::now();
+                $rows.run_once()?;
+                if let Some(ref mut stats) = $stats {
+                    stats.io_time_elapsed_samples.push(start.elapsed());
+                }
+            }
+            Ok(StepResult::Interrupt) => {
+                if let Some(ref mut stats) = $stats {
+                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                }
+                break;
+            }
+            Ok(StepResult::Done) => {
+                if let Some(ref mut stats) = $stats {
+                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                }
+                break;
+            }
+            Ok(StepResult::Busy) => {
+                if let Some(ref mut stats) = $stats {
+                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                }
+                let _ = $app.writeln("database is busy");
+                break;
+            }
+            Err(err) => {
+                if let Some(ref mut stats) = $stats {
+                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                }
+                let report = miette::Error::from(err).with_source_code($sql.to_owned());
+                let _ = $app.writeln_fmt(format_args!("{report:?}"));
+                break;
+            }
+        }
+    };
+}
+
 impl Limbo {
     pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
-        let opts = Opts::parse();
+        let mut opts = Opts::parse();
         let guard = Self::init_tracing(&opts)?;
 
         let db_file = opts
@@ -107,6 +169,7 @@ impl Limbo {
                 indexes_enabled,
                 opts.experimental_mvcc,
                 opts.experimental_views,
+                opts.experimental_strict,
             )?
         } else {
             let flags = if opts.readonly {
@@ -118,9 +181,13 @@ impl Limbo {
                 &db_file,
                 opts.vfs.as_ref(),
                 flags,
-                indexes_enabled,
-                opts.experimental_mvcc,
-                opts.experimental_views,
+                turso_core::DatabaseOpts::new()
+                    .with_mvcc(opts.experimental_mvcc)
+                    .with_indexes(indexes_enabled)
+                    .with_views(opts.experimental_views)
+                    .with_strict(opts.experimental_strict)
+                    .turso_cli(),
+                None,
             )?;
             let conn = db.connect()?;
             (io, conn)
@@ -143,7 +210,8 @@ impl Limbo {
             })
             .expect("Error setting Ctrl-C handler");
         }
-        let sql = opts.sql.clone();
+        let sql = opts.sql.take();
+        let has_sql = sql.is_some();
         let quiet = opts.quiet;
         let config = Config::for_output_mode(opts.output_mode);
         let mut app = Self {
@@ -152,12 +220,12 @@ impl Limbo {
             writer: Some(get_writer(&opts.output)),
             conn,
             interrupt_count,
-            input_buff: String::new(),
+            input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             opts: Settings::from(opts),
             rl: None,
             config: Some(config),
         };
-        app.first_run(sql, quiet)?;
+        app.first_run(has_sql, quiet)?;
         Ok((app, guard))
     }
 
@@ -176,18 +244,24 @@ impl Limbo {
         self
     }
 
-    fn first_run(&mut self, sql: Option<String>, quiet: bool) -> Result<(), LimboError> {
+    fn first_run(&mut self, has_sql: bool, quiet: bool) -> Result<(), LimboError> {
         // Skip startup messages and SQL execution in MCP mode
         if self.is_mcp_mode() {
             return Ok(());
         }
 
-        if let Some(sql) = sql {
-            self.handle_first_input(&sql)?;
+        if has_sql {
+            self.handle_first_input()?;
         }
         if !quiet {
-            self.write_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
+            self.writeln_fmt(format_args!("Turso v{}", env!("CARGO_PKG_VERSION")))?;
             self.writeln("Enter \".help\" for usage hints.")?;
+
+            // Add random feature hint
+            if let Some(hint) = manual::get_random_feature_hint() {
+                self.writeln(&hint)?;
+            }
+
             self.writeln(
                 "This software is ALPHA, only use for development, testing, and experimentation.",
             )?;
@@ -196,12 +270,8 @@ impl Limbo {
         Ok(())
     }
 
-    fn handle_first_input(&mut self, cmd: &str) -> Result<(), LimboError> {
-        if cmd.trim().starts_with('.') {
-            self.handle_dot_command(&cmd[1..]);
-        } else {
-            self.run_query(cmd);
-        }
+    fn handle_first_input(&mut self) -> Result<(), LimboError> {
+        self.consume(true);
         self.close_conn()?;
         std::process::exit(0);
     }
@@ -260,14 +330,14 @@ impl Limbo {
 
         // Display all metrics
         let output = {
-            let metrics = self.conn.metrics.borrow();
+            let metrics = self.conn.metrics.read();
             format!("{metrics}")
         };
 
         self.writeln(output)?;
 
         if args.reset {
-            self.conn.metrics.borrow_mut().reset();
+            self.conn.metrics.write().reset();
             self.writeln("Statistics reset.")?;
         }
 
@@ -357,7 +427,11 @@ impl Limbo {
     }
 
     fn write_fmt(&mut self, fmt: std::fmt::Arguments) -> io::Result<()> {
-        let _ = self.writer.as_mut().unwrap().write_fmt(fmt);
+        self.writer.as_mut().unwrap().write_fmt(fmt)
+    }
+
+    fn writeln_fmt(&mut self, fmt: std::fmt::Arguments) -> io::Result<()> {
+        self.writer.as_mut().unwrap().write_fmt(fmt)?;
         self.writer.as_mut().unwrap().write_all(b"\n")
     }
 
@@ -370,11 +444,12 @@ impl Limbo {
         self.writer.as_mut().unwrap().write_all(b"\n")
     }
 
-    fn buffer_input(&mut self, line: &str) {
-        self.input_buff.push_str(line);
-        self.input_buff.push(' ');
+    fn write_null(&mut self) -> io::Result<()> {
+        self.writer
+            .as_mut()
+            .unwrap()
+            .write_all(self.opts.null_value.as_bytes())
     }
-
     fn run_query(&mut self, input: &str) {
         let echo = self.opts.echo;
         if echo {
@@ -382,46 +457,32 @@ impl Limbo {
         }
 
         let start = Instant::now();
-        let mut stats = QueryStatistics {
-            io_time_elapsed_samples: vec![],
-            execute_time_elapsed_samples: vec![],
-        };
-        // TODO this is a quickfix. Some ideas to do case insensitive comparisons is to use
-        // Uncased or Unicase.
-        let explain_str = "explain";
-        if input
-            .trim_start()
-            .get(..explain_str.len())
-            .map(|s| s.eq_ignore_ascii_case(explain_str))
-            .unwrap_or(false)
-        {
-            match self.conn.query(input) {
-                Ok(Some(stmt)) => {
-                    let _ = self.writeln(stmt.explain().as_bytes());
-                }
-                Err(e) => {
-                    let _ = self.writeln(e.to_string());
-                }
-                _ => {}
-            }
+        let mut stats = if self.opts.timer {
+            Some(QueryStatistics {
+                io_time_elapsed_samples: vec![],
+                execute_time_elapsed_samples: vec![],
+            })
         } else {
-            let conn = self.conn.clone();
-            let runner = conn.query_runner(input.as_bytes());
-            for output in runner {
-                if self
-                    .print_query_result(input, output, Some(&mut stats))
-                    .is_err()
-                {
-                    break;
-                }
+            None
+        };
+
+        let conn = self.conn.clone();
+        let runner = conn.query_runner(input.as_bytes());
+        for output in runner {
+            if self
+                .print_query_result(input, output, stats.as_mut())
+                .is_err()
+            {
+                break;
             }
         }
-        self.print_query_performance_stats(start, stats);
+
+        self.print_query_performance_stats(start, stats.as_ref());
 
         // Display stats if enabled
         if self.opts.stats {
             let stats_output = {
-                let metrics = self.conn.metrics.borrow();
+                let metrics = self.conn.metrics.read();
                 metrics
                     .last_statement
                     .as_ref()
@@ -431,11 +492,9 @@ impl Limbo {
                 let _ = self.writeln(output);
             }
         }
-
-        self.reset_input();
     }
 
-    fn print_query_performance_stats(&mut self, start: Instant, stats: QueryStatistics) {
+    fn print_query_performance_stats(&mut self, start: Instant, stats: Option<&QueryStatistics>) {
         let elapsed_as_str = |duration: Duration| {
             if duration.as_secs() >= 1 {
                 format!("{} s", duration.as_secs_f64())
@@ -447,7 +506,7 @@ impl Limbo {
                 format!("{} ns", duration.as_nanos())
             }
         };
-        let sample_stats_as_str = |name: &str, samples: Vec<Duration>| {
+        let sample_stats_as_str = |name: &str, samples: &Vec<Duration>| {
             if samples.is_empty() {
                 return format!("{name}: No samples available");
             }
@@ -461,76 +520,91 @@ impl Limbo {
             )
         };
         if self.opts.timer {
-            let _ = self.writeln("Command stats:\n----------------------------");
-            let _ = self.writeln(format!(
-                "total: {} (this includes parsing/coloring of cli app)\n",
-                elapsed_as_str(start.elapsed())
-            ));
+            if let Some(stats) = stats {
+                let _ = self.writeln("Command stats:\n----------------------------");
+                let _ = self.writeln(format!(
+                    "total: {} (this includes parsing/coloring of cli app)\n",
+                    elapsed_as_str(start.elapsed())
+                ));
 
-            let _ = self.writeln("query execution stats:\n----------------------------");
-            let _ = self.writeln(sample_stats_as_str(
-                "Execution",
-                stats.execute_time_elapsed_samples,
-            ));
-            let _ = self.writeln(sample_stats_as_str("I/O", stats.io_time_elapsed_samples));
+                let _ = self.writeln("query execution stats:\n----------------------------");
+                let _ = self.writeln(sample_stats_as_str(
+                    "Execution",
+                    &stats.execute_time_elapsed_samples,
+                ));
+                let _ = self.writeln(sample_stats_as_str("I/O", &stats.io_time_elapsed_samples));
+            }
         }
     }
 
-    fn reset_line(&mut self, _line: &str) -> rustyline::Result<()> {
+    fn reset_line(&mut self) {
         // Entry is auto added to history
         // self.rl.add_history_entry(line.to_owned())?;
         self.interrupt_count.store(0, Ordering::Release);
-        Ok(())
     }
 
-    pub fn handle_input_line(&mut self, line: &str) -> anyhow::Result<()> {
-        if self.input_buff.is_empty() {
-            if line.is_empty() {
-                return Ok(());
+    // consume will consume `input_buff`
+    pub fn consume(&mut self, flush: bool) {
+        if self.input_buff.trim().is_empty() {
+            return;
+        }
+
+        self.reset_line();
+
+        // we are taking ownership of input_buff here
+        // its always safe because we split the string in two parts
+        fn take_usable_part(app: &mut Limbo) -> (String, usize) {
+            let ptr = app.input_buff.as_mut_ptr();
+            let (len, cap) = (app.input_buff.len(), app.input_buff.capacity());
+            app.input_buff =
+                ManuallyDrop::new(unsafe { String::from_raw_parts(ptr.add(len), 0, cap - len) });
+            (unsafe { String::from_raw_parts(ptr, len, len) }, unsafe {
+                ptr.add(len).addr()
+            })
+        }
+
+        fn concat_usable_part(app: &mut Limbo, mut part: String, old_address: usize) {
+            let ptr = app.input_buff.as_mut_ptr();
+            let (len, cap) = (app.input_buff.len(), app.input_buff.capacity());
+
+            // if the address is not the same, meaning the string has been reallocated
+            // so we just drop the part we took earlier
+            if ptr.addr() != old_address || !app.input_buff.is_empty() {
+                return;
             }
-            if let Some(command) = line.strip_prefix('.') {
-                self.handle_dot_command(command);
-                let _ = self.reset_line(line);
-                return Ok(());
+
+            let head_ptr = part.as_mut_ptr();
+            let (head_len, head_cap) = (part.len(), part.capacity());
+            forget(part); // move this part into `input_buff`
+            app.input_buff = ManuallyDrop::new(unsafe {
+                String::from_raw_parts(head_ptr, head_len + len, head_cap + cap)
+            });
+        }
+
+        let value = self.input_buff.trim();
+        match (value.starts_with('.'), value.ends_with(';')) {
+            (true, _) => {
+                let (owned_value, old_address) = take_usable_part(self);
+                self.handle_dot_command(owned_value.trim().strip_prefix('.').unwrap());
+                concat_usable_part(self, owned_value, old_address);
+                self.reset_input();
+            }
+            (false, true) => {
+                let (owned_value, old_address) = take_usable_part(self);
+                self.run_query(owned_value.trim());
+                concat_usable_part(self, owned_value, old_address);
+                self.reset_input();
+            }
+            (false, false) if flush => {
+                let (owned_value, old_address) = take_usable_part(self);
+                self.run_query(owned_value.trim());
+                concat_usable_part(self, owned_value, old_address);
+                self.reset_input();
+            }
+            (false, false) => {
+                self.set_multiline_prompt();
             }
         }
-        if line.trim_start().starts_with("--") {
-            if let Some(remaining) = line.split_once('\n') {
-                let after_comment = remaining.1.trim();
-                if !after_comment.is_empty() {
-                    if after_comment.ends_with(';') {
-                        self.run_query(after_comment);
-                        if self.opts.echo {
-                            let _ = self.writeln(after_comment);
-                        }
-                        let conn = self.conn.clone();
-                        let runner = conn.query_runner(after_comment.as_bytes());
-                        for output in runner {
-                            if let Err(e) = self.print_query_result(after_comment, output, None) {
-                                let _ = self.writeln(e.to_string());
-                            }
-                        }
-                        self.reset_input();
-                        return self.handle_input_line(after_comment);
-                    } else {
-                        self.set_multiline_prompt();
-                        let _ = self.reset_line(line);
-                        return Ok(());
-                    }
-                }
-            }
-            return Ok(());
-        }
-        self.reset_line(line)?;
-        if line.ends_with(';') {
-            self.buffer_input(line);
-            let buff = self.input_buff.clone();
-            self.run_query(buff.as_str());
-        } else {
-            self.buffer_input(format!("{line}\n").as_str());
-            self.set_multiline_prompt();
-        }
-        Ok(())
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
@@ -578,12 +652,12 @@ impl Limbo {
                     if let Some(opcode) = args.opcode {
                         for op in &OPCODE_DESCRIPTIONS {
                             if op.name.eq_ignore_ascii_case(opcode.trim()) {
-                                let _ = self.write_fmt(format_args!("{op}"));
+                                let _ = self.writeln_fmt(format_args!("{op}"));
                             }
                         }
                     } else {
                         for op in &OPCODE_DESCRIPTIONS {
-                            let _ = self.write_fmt(format_args!("{op}\n"));
+                            let _ = self.writeln_fmt(format_args!("{op}\n"));
                         }
                     }
                 }
@@ -592,13 +666,13 @@ impl Limbo {
                 }
                 Command::OutputMode(args) => {
                     if let Err(e) = self.set_mode(args.mode) {
-                        let _ = self.write_fmt(format_args!("Error: {e}"));
+                        let _ = self.writeln_fmt(format_args!("Error: {e}"));
                     }
                 }
                 Command::SetOutput(args) => {
                     if let Some(path) = args.path {
                         if let Err(e) = self.set_output_file(&path) {
-                            let _ = self.write_fmt(format_args!("Error: {e}"));
+                            let _ = self.writeln_fmt(format_args!("Error: {e}"));
                         }
                     } else {
                         self.set_output_stdout();
@@ -631,7 +705,7 @@ impl Limbo {
                 }
                 Command::Dump => {
                     if let Err(e) = self.dump_database() {
-                        let _ = self.write_fmt(format_args!("/****** ERROR: {e} ******/"));
+                        let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
                 Command::DbConfig(_args) => {
@@ -665,6 +739,12 @@ impl Limbo {
                         let _ = self.writeln(e.to_string());
                     }
                 }
+                Command::Manual(args) => {
+                    let w = self.writer.as_mut().unwrap();
+                    if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
             },
         }
     }
@@ -676,92 +756,158 @@ impl Limbo {
         mut statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
-            Ok(Some(ref mut rows)) => match self.opts.output_mode {
-                OutputMode::List => {
-                    let mut headers_printed = false;
-                    loop {
-                        if self.interrupt_count.load(Ordering::Acquire) > 0 {
-                            println!("Query interrupted.");
-                            return Ok(());
+            Ok(Some(ref mut rows)) => match (self.opts.output_mode, rows.get_query_mode()) {
+                (_, QueryMode::ExplainQueryPlan) => {
+                    struct Entry {
+                        id: usize,
+                        detail: String,
+                        child_prefix: String,
+                        children: Vec<Entry>,
+                    }
+
+                    let mut root = Entry {
+                        id: 0,
+                        detail: "QUERY PLAN".to_owned(),
+                        child_prefix: "".to_owned(),
+                        children: vec![],
+                    };
+
+                    fn add_children(
+                        id: usize,
+                        parent_id: usize,
+                        detail: String,
+                        current: &mut Entry,
+                    ) -> bool {
+                        if current.id == parent_id {
+                            current.children.push(Entry {
+                                id,
+                                detail,
+                                child_prefix: current.child_prefix.clone() + "   ",
+                                children: vec![],
+                            });
+                            if current.children.len() > 1 {
+                                let idx = current.children.len() - 2;
+                                current.children[idx].child_prefix =
+                                    current.child_prefix.clone() + "|  ";
+                            }
+
+                            return false;
                         }
 
-                        let start = Instant::now();
+                        for child in &mut current.children {
+                            if !add_children(id, parent_id, detail.clone(), child) {
+                                return false;
+                            }
+                        }
 
-                        match rows.step() {
-                            Ok(StepResult::Row) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
+                        true
+                    }
 
-                                // Print headers if enabled and not already printed
-                                if self.opts.headers && !headers_printed {
-                                    for i in 0..rows.num_columns() {
-                                        if i > 0 {
-                                            let _ = self.write(b"|");
-                                        }
-                                        let _ = self.write(rows.get_column_name(i).as_bytes());
-                                    }
-                                    let _ = self.writeln("");
-                                    headers_printed = true;
-                                }
+                    fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
+                        writeln!(app, "{}{}", prefix, entry.detail).unwrap();
+                        for (i, child) in entry.children.iter().enumerate() {
+                            let is_last = i == entry.children.len() - 1;
+                            let child_prefix = format!(
+                                "{}{}",
+                                entry.child_prefix,
+                                if is_last { "`--" } else { "|--" }
+                            );
+                            print_entry(app, child, child_prefix.as_str());
+                        }
+                    }
 
-                                let row = rows.row().unwrap();
-                                for (i, value) in row.get_values().enumerate() {
+                    loop {
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            let row = rows.row().unwrap();
+                            let id: usize = row.get_value(0).as_uint() as usize;
+                            let parent_id: usize = row.get_value(1).as_uint() as usize;
+                            let detail = row.get_value(3).to_string();
+                            add_children(id, parent_id, detail, &mut root);
+                        });
+                    }
+
+                    print_entry(self, &root, "");
+                }
+                (_, QueryMode::Explain) => {
+                    fn get_explain_indent(
+                        indent_count: usize,
+                        curr_insn: &str,
+                        prev_insn: &str,
+                    ) -> usize {
+                        let indent_count = match prev_insn {
+                            "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
+                            | "SeekLT" => indent_count + 1,
+                            _ => indent_count,
+                        };
+
+                        match curr_insn {
+                            "Next" | "SorterNext" | "Prev" => indent_count - 1,
+                            _ => indent_count,
+                        }
+                    }
+
+                    let _ = self.writeln(
+                        "addr  opcode             p1    p2    p3    p4             p5  comment",
+                    );
+                    let _ = self.writeln(
+                        "----  -----------------  ----  ----  ----  -------------  --  -------",
+                    );
+
+                    let mut prev_insn: String = "".to_string();
+                    let mut indent_count = 0;
+                    let indent = "  ";
+                    loop {
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            let row = rows.row().unwrap();
+                            let insn = row.get_value(1).to_string();
+                            indent_count = get_explain_indent(indent_count, &insn, &prev_insn);
+                            let _ = self.writeln(format!(
+                                "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
+                                row.get_value(0).to_string(),
+                                &(indent.repeat(indent_count) + &insn),
+                                row.get_value(2).to_string(),
+                                row.get_value(3).to_string(),
+                                row.get_value(4).to_string(),
+                                row.get_value(5).to_string(),
+                                row.get_value(6).to_string(),
+                                row.get_value(7),
+                            ));
+                            prev_insn = insn;
+                        });
+                    }
+                }
+                (OutputMode::List, _) => {
+                    let mut headers_printed = false;
+                    loop {
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            // Print headers if enabled and not already printed
+                            if self.opts.headers && !headers_printed {
+                                for i in 0..rows.num_columns() {
                                     if i > 0 {
                                         let _ = self.write(b"|");
                                     }
-                                    if matches!(value, Value::Null) {
-                                        let bytes = self.opts.null_value.clone();
-                                        self.write(bytes.as_bytes())?;
-                                    } else {
-                                        self.write(format!("{value}").as_bytes())?;
-                                    }
+                                    let _ = self.write(rows.get_column_name(i).as_bytes());
                                 }
                                 let _ = self.writeln("");
+                                headers_printed = true;
                             }
-                            Ok(StepResult::IO) => {
-                                let start = Instant::now();
-                                rows.run_once()?;
-                                if let Some(ref mut stats) = statistics {
-                                    stats.io_time_elapsed_samples.push(start.elapsed());
+
+                            let row = rows.row().unwrap();
+                            for (i, value) in row.get_values().enumerate() {
+                                if i > 0 {
+                                    let _ = self.write(b"|");
+                                }
+                                if matches!(value, Value::Null) {
+                                    self.write_null()?;
+                                } else {
+                                    write!(self, "{value}")?;
                                 }
                             }
-                            Ok(StepResult::Interrupt) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Done) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Busy) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let _ = self.writeln("database is busy");
-                                break;
-                            }
-                            Err(err) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let report =
-                                    miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{report:?}"));
-                                break;
-                            }
-                        }
+                            let _ = self.writeln("");
+                        });
                     }
                 }
-                OutputMode::Pretty => {
-                    if self.interrupt_count.load(Ordering::Acquire) > 0 {
-                        println!("Query interrupted.");
-                        return Ok(());
-                    }
+                (OutputMode::Pretty, _) => {
                     let config = self.config.as_ref().unwrap();
                     let mut table = Table::new();
                     table
@@ -780,170 +926,76 @@ impl Limbo {
                         table.set_header(header);
                     }
                     loop {
-                        let start = Instant::now();
-                        match rows.step() {
-                            Ok(StepResult::Row) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let record = rows.row().unwrap();
-                                let mut row = Row::new();
-                                row.max_height(1);
-                                for (idx, value) in record.get_values().enumerate() {
-                                    let (content, alignment) = match value {
-                                        Value::Null => {
-                                            (self.opts.null_value.clone(), CellAlignment::Left)
-                                        }
-                                        Value::Integer(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Float(_) => {
-                                            (format!("{value}"), CellAlignment::Right)
-                                        }
-                                        Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                        Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
-                                    };
-                                    row.add_cell(
-                                        Cell::new(content)
-                                            .set_alignment(alignment)
-                                            .fg(config.table.column_colors
-                                                [idx % config.table.column_colors.len()]
-                                            .as_comfy_table_color()),
-                                    );
-                                }
-                                table.add_row(row);
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            let record = rows.row().unwrap();
+                            let mut row = Row::new();
+                            row.max_height(1);
+                            for (idx, value) in record.get_values().enumerate() {
+                                let (content, alignment) = match value {
+                                    Value::Null => {
+                                        (self.opts.null_value.clone(), CellAlignment::Left)
+                                    }
+                                    Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
+                                    Value::Float(_) => (format!("{value}"), CellAlignment::Right),
+                                    Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                                    Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                                };
+                                row.add_cell(
+                                    Cell::new(content)
+                                        .set_alignment(alignment)
+                                        .fg(config.table.column_colors
+                                            [idx % config.table.column_colors.len()]
+                                        .as_comfy_table_color()),
+                                );
                             }
-                            Ok(StepResult::IO) => {
-                                let start = Instant::now();
-                                rows.run_once()?;
-                                if let Some(ref mut stats) = statistics {
-                                    stats.io_time_elapsed_samples.push(start.elapsed());
-                                }
-                            }
-                            Ok(StepResult::Interrupt) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Done) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Busy) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let _ = self.writeln("database is busy");
-                                break;
-                            }
-                            Err(err) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let report =
-                                    miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{report:?}"));
-                                break;
-                            }
-                        }
+                            table.add_row(row);
+                        });
                     }
 
                     if !table.is_empty() {
-                        let _ = self.write_fmt(format_args!("{table}"));
+                        writeln!(self, "{table}")?;
                     }
                 }
-                OutputMode::Line => {
+                (OutputMode::Line, _) => {
                     let mut first_row_printed = false;
+
+                    let max_width = (0..rows.num_columns())
+                        .map(|i| rows.get_column_name(i).len())
+                        .max()
+                        .unwrap_or(0);
+
+                    let formatted_columns: Vec<String> = (0..rows.num_columns())
+                        .map(|i| format!("{:>width$}", rows.get_column_name(i), width = max_width))
+                        .collect();
+
                     loop {
-                        if self.interrupt_count.load(Ordering::Acquire) > 0 {
-                            println!("Query interrupted.");
-                            return Ok(());
-                        }
+                        row_step_result_query!(self, sql, rows, statistics, {
+                            let record = rows.row().unwrap();
 
-                        let start = Instant::now();
+                            if !first_row_printed {
+                                first_row_printed = true;
+                            } else {
+                                self.writeln("")?;
+                            }
 
-                        let max_width = (0..rows.num_columns())
-                            .map(|i| rows.get_column_name(i).len())
-                            .max()
-                            .unwrap_or(0);
-
-                        let formatted_columns: Vec<String> = (0..rows.num_columns())
-                            .map(|i| {
-                                format!("{:>width$}", rows.get_column_name(i), width = max_width)
-                            })
-                            .collect();
-
-                        match rows.step() {
-                            Ok(StepResult::Row) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let record = rows.row().unwrap();
-
-                                if !first_row_printed {
-                                    first_row_printed = true;
+                            for (i, value) in record.get_values().enumerate() {
+                                self.write(&formatted_columns[i])?;
+                                self.write(b" = ")?;
+                                if matches!(value, Value::Null) {
+                                    self.write_null()?;
                                 } else {
-                                    self.writeln("")?;
+                                    write!(self, "{value}")?;
                                 }
-
-                                for (i, value) in record.get_values().enumerate() {
-                                    self.write(&formatted_columns[i])?;
-                                    self.write(b" = ")?;
-                                    if matches!(value, Value::Null) {
-                                        let bytes = self.opts.null_value.clone();
-                                        self.write(bytes.as_bytes())?;
-                                    } else {
-                                        self.write(format!("{value}").as_bytes())?;
-                                    }
-                                    self.writeln("")?;
-                                }
+                                self.writeln("")?;
                             }
-                            Ok(StepResult::IO) => {
-                                let start = Instant::now();
-                                rows.run_once()?;
-                                if let Some(ref mut stats) = statistics {
-                                    stats.io_time_elapsed_samples.push(start.elapsed());
-                                }
-                            }
-                            Ok(StepResult::Interrupt) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Done) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                break;
-                            }
-                            Ok(StepResult::Busy) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let _ = self.writeln("database is busy");
-                                break;
-                            }
-                            Err(err) => {
-                                if let Some(ref mut stats) = statistics {
-                                    stats.execute_time_elapsed_samples.push(start.elapsed());
-                                }
-                                let report =
-                                    miette::Error::from(err).with_source_code(sql.to_owned());
-                                let _ = self.write_fmt(format_args!("{report:?}"));
-                                break;
-                            }
-                        }
+                        });
                     }
                 }
             },
             Ok(None) => {}
             Err(err) => {
                 let report = miette::Error::from(err).with_source_code(sql.to_owned());
-                let _ = self.write_fmt(format_args!("{report:?}"));
+                let _ = self.writeln_fmt(format_args!("{report:?}"));
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
@@ -1019,13 +1071,13 @@ impl Limbo {
                     schema_str.to_string()
                 }
             };
-            let _ = self.write_fmt(format_args!("{modified_schema};"));
+            let _ = self.writeln_fmt(format_args!("{modified_schema};"));
             // For views, add the column comment like SQLite does
             if obj_type.as_str() == "view" {
                 let columns = self
                     .get_view_columns(obj_name.as_str())
                     .unwrap_or_else(|_| "x".to_string());
-                let _ = self.write_fmt(format_args!("/* {}({}) */", obj_name.as_str(), columns));
+                let _ = self.writeln_fmt(format_args!("/* {}({}) */", obj_name.as_str(), columns));
             }
             true
         } else {
@@ -1065,8 +1117,19 @@ impl Limbo {
         db_display_name: &str,
         table_name: &str,
     ) -> anyhow::Result<bool> {
+        // Yeah, sqlite also has this hardcoded: https://github.com/sqlite/sqlite/blob/31efe5a0f2f80a263457a1fc6524783c0c45769b/src/shell.c.in#L10765
+        match table_name {
+            "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema" => {
+                let schema = format!(
+                                    "CREATE TABLE {table_name} (\n type text,\n name text,\n tbl_name text,\n rootpage integer,\n sql text\n);",
+                                );
+                let _ = self.writeln(&schema);
+                return Ok(true);
+            }
+            _ => {}
+        }
         let sql = format!(
-            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
+            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid"
         );
 
         let mut found = false;
@@ -1099,7 +1162,7 @@ impl Limbo {
         db_prefix: &str,
         db_display_name: &str,
     ) -> anyhow::Result<()> {
-        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
+        let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
 
         match self.conn.query(&sql) {
             Ok(Some(ref mut rows)) => loop {
@@ -1146,26 +1209,14 @@ impl Limbo {
                     };
 
                 // Query only the specific table in the specific database
-                let found = if target_db == "main" {
-                    self.query_one_table_schema("main", "main", table_name)?
+                if target_db == "main" {
+                    self.query_one_table_schema("main", "main", table_name)?;
                 } else {
                     // Check if the database is attached
                     let attached_databases = self.conn.list_attached_databases();
                     if attached_databases.contains(&target_db.to_string()) {
-                        self.query_one_table_schema(target_db, target_db, table_name)?
-                    } else {
-                        false
+                        self.query_one_table_schema(target_db, target_db, table_name)?;
                     }
-                };
-
-                if !found {
-                    let table_display = if target_db == "main" {
-                        table_name.to_string()
-                    } else {
-                        format!("{target_db}.{table_name}")
-                    };
-                    let _ = self
-                        .write_fmt(format_args!("-- Error: Table '{table_display}' not found."));
                 }
             }
             None => {
@@ -1242,7 +1293,7 @@ impl Limbo {
         if !tables.is_empty() {
             let _ = self.writeln(tables.trim_end().as_bytes());
         } else if let Some(pattern) = pattern {
-            let _ = self.write_fmt(format_args!(
+            let _ = self.writeln_fmt(format_args!(
                 "Error: Tables with pattern '{pattern}' not found."
             ));
         } else {
@@ -1352,35 +1403,23 @@ impl Limbo {
         Ok(())
     }
 
-    pub fn handle_remaining_input(&mut self) {
-        if self.input_buff.is_empty() {
-            return;
-        }
+    // readline will read inputs from rustyline or stdin
+    // and write it to input_buff.
+    pub fn readline(&mut self) -> Result<(), ReadlineError> {
+        use std::fmt::Write;
 
-        let buff = self.input_buff.clone();
-        self.run_query(buff.as_str());
-        self.reset_input();
-    }
-
-    pub fn readline(&mut self) -> Result<String, ReadlineError> {
         if let Some(rl) = &mut self.rl {
-            Ok(rl.readline(&self.prompt)?)
+            let result = rl.readline(&self.prompt)?;
+            let _ = self.input_buff.write_str(result.as_str());
         } else {
-            let mut input = String::new();
             let mut reader = std::io::stdin().lock();
-            if reader.read_line(&mut input)? == 0 {
+            if reader.read_line(&mut self.input_buff)? == 0 {
                 return Err(ReadlineError::Eof);
             }
-            // Remove trailing newline
-            if input.ends_with('\n') {
-                input.pop();
-                if input.ends_with('\r') {
-                    input.pop();
-                }
-            }
-
-            Ok(input)
         }
+
+        let _ = self.input_buff.write_char(' ');
+        Ok(())
     }
 
     pub fn dump_database_from_conn<W: Write, P: ProgressSink>(
@@ -1394,7 +1433,7 @@ impl Limbo {
         // FIXME: we don't yet support PRAGMA foreign_keys=OFF internally,
         // so for now this hacky boolean that decides not to emit it when cloning
         if fk {
-            writeln!(out, "PRAGMA foreign_keys=OFF")?;
+            writeln!(out, "PRAGMA foreign_keys=OFF;")?;
         }
         writeln!(out, "BEGIN TRANSACTION;")?;
         // FIXME: At this point, SQLite executes the following:
@@ -1675,6 +1714,9 @@ fn sql_quote_string(s: &str) -> String {
 }
 impl Drop for Limbo {
     fn drop(&mut self) {
-        self.save_history()
+        self.save_history();
+        unsafe {
+            ManuallyDrop::drop(&mut self.input_buff);
+        }
     }
 }

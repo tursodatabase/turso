@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "module": "nodenext",
+    "target": "esnext",
+    "outDir": "dist/",
+    "lib": [
+      "es2020"
+    ],
+    "paths": {
+      "#index": [
+        "./index.d.ts"
+      ]
+    }
+  },
+  "include": [
+    "*"
+  ]
+}

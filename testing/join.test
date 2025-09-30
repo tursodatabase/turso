@@ -311,3 +311,43 @@ do_execsql_test_on_specific_db {:memory:} min-null-regression-test {
     insert into u values (1,1),(3,3);
     select count(u.x) from t left join u using(y);
 } {1}
+
+# regression test for issue 2949: consuming WHERE terms not originating from the LEFT JOIN
+do_execsql_test_on_specific_db {:memory:} left-join-seek-key-regression-test {
+  CREATE TABLE t (x INTEGER PRIMARY KEY);
+  CREATE TABLE u (x INTEGER PRIMARY KEY);
+  INSERT INTO t VALUES (1);
+  SELECT * FROM t LEFT JOIN u ON false WHERE u.x = 1; 
+} {}
+
+# regression test for issue 2924: calling Next on a cursor that hasn't moved yet
+do_execsql_test_on_specific_db {:memory:} next-crash {
+  create table a(x int primary key,y);
+  create table b(x int primary key,y);
+  create table c(x int primary key,y);
+  insert into a values (1,1),(2,2);
+  select a.x, b.x, c.x from a left join b on a.y=b.x left join c on b.y=c.x;
+} {1||
+2||}
+
+# regression test for crash in op_column
+do_execsql_test_on_specific_db {:memory:} left-join-column-crash {
+    create table a(x int primary key,y);
+    create table b(x int primary key,y);
+    insert into a values (1,1),(2,2);
+    insert into b values (3,3),(4,4);
+    select * from a left join b on a.x < 2 where a.x < 3 and b.x < 12;
+} {1|1|3|3
+1|1|4|4}
+
+# Test that column names in USING clause are not ambiguous since they are deduplicated.
+# The column 'a' appears in both tables but can be referenced unqualified in the SELECT
+# since it's in the USING clause.
+do_execsql_test_on_specific_db {:memory:} using-deduplicates-columns {
+    create table t(a);
+    create table tt(a); 
+    insert into t values (1),(2),(3),(4),(5);
+    insert into tt values (4),(5),(6),(7),(8);
+    select a from t join tt using(a);
+} {4
+5}

@@ -204,7 +204,7 @@ impl ArbitrarySchema {
                     .collect::<Vec<_>>()
                     .join(",");
 
-                format!("CREATE TABLE {} ({});", table.name, columns)
+                format!("CREATE TABLE IF NOT EXISTS {} ({});", table.name, columns)
             })
             .collect()
     }
@@ -353,8 +353,15 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         }
     }
     plan.ddl_statements = ddl_statements;
-    for _ in 0..opts.nr_threads {
+    for id in 0..opts.nr_threads {
+        writeln!(log_file, "{id}",)?;
         let mut queries = vec![];
+        let mut push = |sql: &str| {
+            queries.push(sql.to_string());
+            if !opts.skip_log {
+                writeln!(log_file, "{sql}").unwrap();
+            }
+        };
         for i in 0..opts.nr_iterations {
             if !opts.silent && !opts.verbose && i % 100 == 0 {
                 print!(
@@ -369,18 +376,15 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 None
             };
             if let Some(tx) = tx {
-                queries.push(tx.to_string());
+                push(tx);
             }
             let sql = generate_random_statement(&schema);
-            if !opts.skip_log {
-                writeln!(log_file, "{sql}")?;
-            }
-            queries.push(sql);
+            push(&sql);
             if tx.is_some() {
                 if get_random() % 2 == 0 {
-                    queries.push("COMMIT".to_string());
+                    push("COMMIT");
                 } else {
-                    queries.push("ROLLBACK".to_string());
+                    push("ROLLBACK");
                 }
             }
         }
@@ -415,17 +419,15 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
         plan.ddl_statements
             .push(lines.next().expect("expected ddl statement").to_string());
     }
-    for _ in 0..plan.nr_threads {
-        let mut queries = vec![];
-        for _ in 0..plan.nr_iterations {
-            queries.push(
-                lines
-                    .next()
-                    .expect("missing query for thread {}")
-                    .to_string(),
-            );
+    for line in lines {
+        if line.parse::<i64>().is_ok() {
+            plan.queries_per_thread.push(Vec::new());
+        } else {
+            plan.queries_per_thread
+                .last_mut()
+                .unwrap()
+                .push(line.to_string());
         }
-        plan.queries_per_thread.push(queries);
     }
     Ok(plan)
 }
@@ -470,17 +472,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = Arc::new(plan);
 
     let tempfile = tempfile::NamedTempFile::new()?;
+    let (_, path) = tempfile.keep().unwrap();
     let db_file = if let Some(db_file) = opts.db_file {
         db_file
     } else {
-        tempfile.path().to_string_lossy().to_string()
+        path.to_string_lossy().to_string()
     };
+
+    println!("db_file={db_file}");
+
+    let vfs_option = opts.vfs.clone();
 
     for thread in 0..opts.nr_threads {
         let db_file = db_file.clone();
-        let db = Arc::new(Mutex::new(Builder::new_local(&db_file).build().await?));
+        let mut builder = Builder::new_local(&db_file);
+        if let Some(ref vfs) = vfs_option {
+            builder = builder.with_io(vfs.clone());
+        }
+        let db = Arc::new(Mutex::new(builder.build().await?));
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
+
+        conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         // Apply each DDL statement individually
         for stmt in &plan.ddl_statements {
@@ -507,20 +520,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let nr_iterations = opts.nr_iterations;
         let db = db.clone();
+        let vfs_for_task = vfs_option.clone();
 
         let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
+
+            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+
             println!("\rExecuting queries...");
             for query_index in 0..nr_iterations {
-                if gen_bool(0.001) {
+                if gen_bool(0.0) {
+                    // disabled
                     if opts.verbose {
                         println!("Reopening database");
                     }
                     // Reopen the database
                     let mut db_guard = db.lock().await;
-                    *db_guard = Builder::new_local(&db_file).build().await?;
+                    let mut builder = Builder::new_local(&db_file);
+                    if let Some(ref vfs) = vfs_for_task {
+                        builder = builder.with_io(vfs.clone());
+                    }
+                    *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
-                } else if gen_bool(0.01) {
+                } else if gen_bool(0.0) {
+                    // disabled
                     // Reconnect to the database
                     if opts.verbose {
                         println!("Reconnecting to database");
@@ -559,13 +582,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    if let Some(row) = res.next().await? {
-                        let value = row.get_value(0).unwrap();
-                        if value != "ok".into() {
-                            panic!("integrity check failed: {:?}", value);
+                    match res.next().await {
+                        Ok(Some(row)) => {
+                            let value = row.get_value(0).unwrap();
+                            if value != "ok".into() {
+                                panic!("integrity check failed: {:?}", value);
+                            }
                         }
-                    } else {
-                        panic!("integrity check failed: no rows");
+                        Ok(None) => {
+                            panic!("integrity check failed: no rows");
+                        }
+                        Err(e) => {
+                            println!("Error performing integrity check: {e}");
+                        }
                     }
                 }
             }

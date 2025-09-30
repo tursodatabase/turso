@@ -1,9 +1,11 @@
 /target
 /.idea
 /.vscode
+**/target
 
 *.so
 *.ipynb
+*.o
 
 # Python
 .mypy_cache/
@@ -41,3 +43,8 @@ simulator.log
 **/*.txt
 profile.json.gz
 simulator-output/
+
+&1
+bisected.sql
+*.log
+
