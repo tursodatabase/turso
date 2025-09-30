@@ -7911,7 +7911,7 @@ pub fn op_drop_column(
             .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table = Arc::get_mut(table).expect("this should be the only strong reference");
 
         let Table::BTree(btree) = table else {
             panic!("only btree tables can be renamed");
@@ -7943,7 +7943,7 @@ pub fn op_drop_column(
     conn.with_schema_mut(|schema| {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
-                let index = Arc::make_mut(index);
+                let index = Arc::get_mut(index).expect("this should be the only strong reference");
                 for index_column in index.columns.iter_mut() {
                     if index_column.pos_in_table > *column_index {
                         index_column.pos_in_table -= 1;
