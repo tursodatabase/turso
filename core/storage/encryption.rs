@@ -32,9 +32,9 @@ use turso_macros::match_ignore_ascii_case;
 ///             │ (4048 bytes)  │  ────────► │    Content    │
 ///             │               │            │ (4048 bytes)  │
 ///             ├───────────────┤            ├───────────────┤
-///             │   Reserved    │            │    Tag (32)   │
+///             │   Reserved    │            │    Tag (16)   │
 ///             │  (48 bytes)   │            ├───────────────┤
-///             │   [empty]     │            │   Nonce (12)  │
+///             │   [empty]     │            │   Nonce (32)  │
 ///             └───────────────┘            └───────────────┘
 ///                4096 bytes                   4096 bytes
 /// ```
