@@ -1936,7 +1936,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let record_values = record_cursor.get_values(&record).unwrap();
-                        println!("record_values: {:?}", record_values);
                         let RefValue::Integer(root_page) = record_values[3] else {
                             panic!(
                                 "Expected integer value for root page, got {:?}",
