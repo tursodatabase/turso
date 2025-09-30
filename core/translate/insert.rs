@@ -193,7 +193,6 @@ pub fn translate_insert(
                         &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
-                    tracing::info!("rewrite expr: {:?}", set.expr);
                 }
                 if let Some(ref mut where_expr) = where_clause {
                     bind_and_rewrite_expr(
