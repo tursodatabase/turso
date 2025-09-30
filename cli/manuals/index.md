@@ -32,6 +32,13 @@ Build similarity search and semantic search applications using vector embeddings
 .manual vector
 ```
 
+### materialized-views - Live Materialized Views
+Create automatically updating views that use Incremental View Maintenance to stay current with minimal overhead.
+
+```
+.manual materialized-views
+```
+
 ## Usage
 
 To view a manual page, use the `.manual` or `.man` command:
