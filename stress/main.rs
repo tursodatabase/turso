@@ -353,8 +353,15 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         }
     }
     plan.ddl_statements = ddl_statements;
-    for _ in 0..opts.nr_threads {
+    for id in 0..opts.nr_threads {
+        writeln!(log_file, "{id}",)?;
         let mut queries = vec![];
+        let mut push = |sql: &str| {
+            queries.push(sql.to_string());
+            if !opts.skip_log {
+                writeln!(log_file, "{sql}").unwrap();
+            }
+        };
         for i in 0..opts.nr_iterations {
             if !opts.silent && !opts.verbose && i % 100 == 0 {
                 print!(
@@ -369,18 +376,15 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 None
             };
             if let Some(tx) = tx {
-                queries.push(tx.to_string());
+                push(tx);
             }
             let sql = generate_random_statement(&schema);
-            if !opts.skip_log {
-                writeln!(log_file, "{sql}")?;
-            }
-            queries.push(sql);
+            push(&sql);
             if tx.is_some() {
                 if get_random() % 2 == 0 {
-                    queries.push("COMMIT".to_string());
+                    push("COMMIT");
                 } else {
-                    queries.push("ROLLBACK".to_string());
+                    push("ROLLBACK");
                 }
             }
         }
@@ -415,17 +419,15 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
         plan.ddl_statements
             .push(lines.next().expect("expected ddl statement").to_string());
     }
-    for _ in 0..plan.nr_threads {
-        let mut queries = vec![];
-        for _ in 0..plan.nr_iterations {
-            queries.push(
-                lines
-                    .next()
-                    .expect("missing query for thread {}")
-                    .to_string(),
-            );
+    for line in lines {
+        if line.parse::<i64>().is_ok() {
+            plan.queries_per_thread.push(Vec::new());
+        } else {
+            plan.queries_per_thread
+                .last_mut()
+                .unwrap()
+                .push(line.to_string());
         }
-        plan.queries_per_thread.push(queries);
     }
     Ok(plan)
 }
@@ -470,11 +472,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = Arc::new(plan);
 
     let tempfile = tempfile::NamedTempFile::new()?;
+    let (_, path) = tempfile.keep().unwrap();
     let db_file = if let Some(db_file) = opts.db_file {
         db_file
     } else {
-        tempfile.path().to_string_lossy().to_string()
+        path.to_string_lossy().to_string()
     };
+
+    println!("db_file={db_file}");
 
     let vfs_option = opts.vfs.clone();
 
