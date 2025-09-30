@@ -551,90 +551,89 @@ pub fn open_loop(
                 );
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
-                if let Search::RowidEq { cmp_expr } = search {
-                    let src_reg = program.alloc_register();
-                    translate_expr(
-                        program,
-                        Some(table_references),
-                        cmp_expr,
-                        src_reg,
-                        &t_ctx.resolver,
-                    )?;
-                    program.emit_insn(Insn::SeekRowid {
-                        cursor_id: table_cursor_id
-                            .expect("Search::RowidEq requires a table cursor"),
-                        src_reg,
-                        target_pc: next,
-                    });
-                } else {
-                    // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
-                    if let Search::Seek {
-                        index: Some(index), ..
-                    } = search
-                    {
-                        if index.ephemeral {
-                            let table_has_rowid = if let Table::BTree(btree) = &table.table {
-                                btree.has_rowid
-                            } else {
-                                false
-                            };
-                            Some(emit_autoindex(
-                                program,
-                                index,
-                                table_cursor_id
-                                    .expect("an ephemeral index must have a source table cursor"),
-                                index_cursor_id
-                                    .expect("an ephemeral index must have an index cursor"),
-                                table_has_rowid,
-                            )?)
-                        } else {
-                            index_cursor_id
+                match search {
+                    Search::RowidEq { cmp_expr } => {
+                        let src_reg = program.alloc_register();
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            cmp_expr,
+                            src_reg,
+                            &t_ctx.resolver,
+                        )?;
+                        program.emit_insn(Insn::SeekRowid {
+                            cursor_id: table_cursor_id
+                                .expect("Search::RowidEq requires a table cursor"),
+                            src_reg,
+                            target_pc: next,
+                        });
+                    }
+                    Search::Seek { index, .. } => {
+                        // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
+                        if let Some(index) = index {
+                            if index.ephemeral {
+                                let table_has_rowid = if let Table::BTree(btree) = &table.table {
+                                    btree.has_rowid
+                                } else {
+                                    false
+                                };
+                                let _ = emit_autoindex(
+                                    program,
+                                    index,
+                                    table_cursor_id.expect(
+                                        "an ephemeral index must have a source table cursor",
+                                    ),
+                                    index_cursor_id
+                                        .expect("an ephemeral index must have an index cursor"),
+                                    table_has_rowid,
+                                )?;
+                            }
                         }
-                    } else {
-                        index_cursor_id
-                    };
 
-                    let is_index = index_cursor_id.is_some();
-                    let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                        index_cursor_id.unwrap_or_else(|| {
-                            table_cursor_id
-                                .expect("Either ephemeral or index or table cursor must be opened")
-                        })
-                    });
-                    let Search::Seek { seek_def, .. } = search else {
-                        unreachable!("Rowid equality point lookup should have been handled above");
-                    };
+                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                            index_cursor_id.unwrap_or_else(|| {
+                                table_cursor_id.expect(
+                                    "Either ephemeral or index or table cursor must be opened",
+                                )
+                            })
+                        });
+                        let Search::Seek { seek_def, .. } = search else {
+                            unreachable!(
+                                "Rowid equality point lookup should have been handled above"
+                            );
+                        };
 
-                    let start_reg = program.alloc_registers(seek_def.key.len());
-                    emit_seek(
-                        program,
-                        table_references,
-                        seek_def,
-                        t_ctx,
-                        seek_cursor_id,
-                        start_reg,
-                        loop_end,
-                        is_index,
-                    )?;
-                    emit_seek_termination(
-                        program,
-                        table_references,
-                        seek_def,
-                        t_ctx,
-                        seek_cursor_id,
-                        start_reg,
-                        loop_start,
-                        loop_end,
-                        is_index,
-                    )?;
+                        let start_reg = program.alloc_registers(seek_def.key.len());
+                        emit_seek(
+                            program,
+                            table_references,
+                            seek_def,
+                            t_ctx,
+                            seek_cursor_id,
+                            start_reg,
+                            loop_end,
+                            index.as_ref(),
+                        )?;
+                        emit_seek_termination(
+                            program,
+                            table_references,
+                            seek_def,
+                            t_ctx,
+                            seek_cursor_id,
+                            start_reg,
+                            loop_start,
+                            loop_end,
+                            index.as_ref(),
+                        )?;
 
-                    if let Some(index_cursor_id) = index_cursor_id {
-                        if let Some(table_cursor_id) = table_cursor_id {
-                            // Don't do a btree table seek until it's actually necessary to read from the table.
-                            program.emit_insn(Insn::DeferredSeek {
-                                index_cursor_id,
-                                table_cursor_id,
-                            });
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            if let Some(table_cursor_id) = table_cursor_id {
+                                // Don't do a btree table seek until it's actually necessary to read from the table.
+                                program.emit_insn(Insn::DeferredSeek {
+                                    index_cursor_id,
+                                    table_cursor_id,
+                                });
+                            }
                         }
                     }
                 }
@@ -1141,23 +1140,53 @@ fn emit_seek(
     seek_cursor_id: usize,
     start_reg: usize,
     loop_end: BranchOffset,
-    is_index: bool,
+    seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
+    let is_index = seek_index.is_some();
     let Some(seek) = seek_def.seek.as_ref() else {
         // If there is no seek key, we start from the first or last row of the index,
         // depending on the iteration direction.
+        //
+        // Also, if we will encounter NULLs in the index at the beginning of iteration (Forward + Asc OR Backward + Desc)
+        // then, we must explicitly skip them as seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
+        //
+        // note that table seek has some rules to convert seek key values to the integer affinity + it has some logic to check for explicit NULL searches
+        // so, we emit simple Rewind/Last in case of search over table BTree
+        // (this is safe as table BTree keys are always non-null single integer)
         match seek_def.iter_dir {
             IterationDirection::Forwards => {
-                program.emit_insn(Insn::Rewind {
-                    cursor_id: seek_cursor_id,
-                    pc_if_empty: loop_end,
-                });
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Asc) {
+                    program.emit_null(start_reg, None);
+                    program.emit_insn(Insn::SeekGT {
+                        is_index,
+                        cursor_id: seek_cursor_id,
+                        start_reg,
+                        num_regs: 1,
+                        target_pc: loop_end,
+                    });
+                } else {
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: seek_cursor_id,
+                        pc_if_empty: loop_end,
+                    });
+                }
             }
             IterationDirection::Backwards => {
-                program.emit_insn(Insn::Last {
-                    cursor_id: seek_cursor_id,
-                    pc_if_empty: loop_end,
-                });
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Desc) {
+                    program.emit_null(start_reg, None);
+                    program.emit_insn(Insn::SeekLT {
+                        is_index,
+                        cursor_id: seek_cursor_id,
+                        start_reg,
+                        num_regs: 1,
+                        target_pc: loop_end,
+                    });
+                } else {
+                    program.emit_insn(Insn::Last {
+                        cursor_id: seek_cursor_id,
+                        pc_if_empty: loop_end,
+                    });
+                }
             }
         }
         return Ok(());
@@ -1254,10 +1283,37 @@ fn emit_seek_termination(
     start_reg: usize,
     loop_start: BranchOffset,
     loop_end: BranchOffset,
-    is_index: bool,
+    seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
+    let is_index = seek_index.is_some();
     let Some(termination) = seek_def.termination.as_ref() else {
         program.preassign_label_to_next_insn(loop_start);
+        // If we will encounter NULLs in the index at the end of iteration (Forward + Desc OR Backward + Asc)
+        // then, we must explicitly stop before them as seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
+        match seek_def.iter_dir {
+            IterationDirection::Forwards => {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Desc) {
+                    program.emit_null(start_reg, None);
+                    program.emit_insn(Insn::IdxGE {
+                        cursor_id: seek_cursor_id,
+                        start_reg,
+                        num_regs: 1,
+                        target_pc: loop_end,
+                    });
+                }
+            }
+            IterationDirection::Backwards => {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Asc) {
+                    program.emit_null(start_reg, None);
+                    program.emit_insn(Insn::IdxLE {
+                        cursor_id: seek_cursor_id,
+                        start_reg,
+                        num_regs: 1,
+                        target_pc: loop_end,
+                    });
+                }
+            }
+        }
         return Ok(());
     };
 

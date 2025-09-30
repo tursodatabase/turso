@@ -795,19 +795,6 @@ impl Operation {
             Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
         }
     }
-
-    pub fn returns_max_1_row(&self) -> bool {
-        match self {
-            Operation::Scan(_) => false,
-            Operation::Search(Search::RowidEq { .. }) => true,
-            Operation::Search(Search::Seek { index, seek_def }) => {
-                let Some(index) = index else {
-                    return false;
-                };
-                index.unique && seek_def.seek.as_ref().is_some_and(|seek| seek.op.eq_only())
-            }
-        }
-    }
 }
 
 impl JoinedTable {

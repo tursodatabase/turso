@@ -142,10 +142,6 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
     if !plan.indexes_to_update.iter().any(|i| Arc::ptr_eq(index, i)) {
         return Ok(());
     }
-    // Fine to use index if we aren't going to be iterating over it, since it returns at most 1 row.
-    if table_ref.op.returns_max_1_row() {
-        return Ok(());
-    }
     // Otherwise, fall back to a table scan.
     table_ref.op = Operation::Scan(Scan::BTreeTable {
         iter_dir: IterationDirection::Forwards,
