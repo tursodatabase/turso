@@ -404,7 +404,6 @@ impl ProgramState {
         self.ended_coroutine.0 = [0; 4];
         self.regex_cache.like.clear();
         self.interrupted = false;
-        self.parameters.clear();
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
