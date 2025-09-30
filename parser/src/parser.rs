@@ -181,7 +181,7 @@ impl<'a> Parser<'a> {
         } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
             Ok(Expr::Variable(from_bytes(token)))
         } else {
-            let variable_str = std::str::from_utf8(&token)
+            let variable_str = std::str::from_utf8(token)
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
             let variable_id = variable_str
                 .parse::<u32>()
