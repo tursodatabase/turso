@@ -515,7 +515,7 @@ in the `p_frame_count` parameter.
 ## Encryption
 
 The work-in-progress RFC is [here](https://github.com/tursodatabase/turso/issues/2447).
-To use encryption, you need to enable it via feature flag `encryption`.
+To use encryption, you need to enable it via flag `experimental-encryption`.
 To get started, generate a secure 32 byte key in hex: 
 
 ```shell
@@ -526,22 +526,22 @@ $ openssl rand -hex 32
 Specify the key and cipher at the time of db creation to use encryption. Here is [sample test](https://github.com/tursodatabase/turso/blob/main/tests/integration/query_processing/encryption.rs):
 
 ```shell
-$ cargo run --features encryption -- database.db
+$ cargo run -- --experimental-encryption database.db
 
 PRAGMA cipher = 'aegis256'; -- or 'aes256gcm'
 PRAGMA hexkey = '2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d';
 ```
 Alternatively you can provide the encryption parameters directly in a **URI**. For example:
 ```shell
-$ cargo run --features encryption \
+$ cargo run -- --experimental-encryption \
 "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 
 
-> **Note:**  To reopen an already *encrypted database*,the file **must** opened in URI format with the `cipher` and `hexkey` passed as URI parameters. Now, to reopen `database.db` the command below must be run:
+> **Note:**  To reopen an already *encrypted database*, the file **must** be opened in URI format with the `cipher` and `hexkey` passed as URI parameters. Now, to reopen `database.db` the command below must be run:
 
 ```shell
-$ cargo run --features encryption \
+$ cargo run -- --experimental-encryption \
    "file:database.db?cipher=aegis256hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 

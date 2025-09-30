@@ -29,4 +29,3 @@ hex = "0.4.3"
 
 [features]
 checksum = ["turso_core/checksum"]
-encryption = ["turso_core/encryption"]

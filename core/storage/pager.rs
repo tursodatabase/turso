@@ -535,6 +535,8 @@ pub struct Pager {
     #[cfg(not(feature = "omit_autovacuum"))]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
+    /// encryption is an opt-in feature. we will enable it only if the flag is passed
+    enable_encryption: AtomicBool,
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -645,6 +647,7 @@ impl Pager {
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
+            enable_encryption: AtomicBool::new(false),
         })
     }
 
@@ -2407,6 +2410,14 @@ impl Pager {
         cipher_mode: CipherMode,
         key: &EncryptionKey,
     ) -> Result<()> {
+        // we will set the encryption context only if the encryption is opted-in.
+        if !self.enable_encryption.load(Ordering::SeqCst) {
+            return Err(LimboError::InvalidArgument(
+                "encryption is an opt in feature. enable it via passing `--experimental-encryption`"
+                    .into(),
+            ));
+        }
+
         let page_size = self.get_page_size_unchecked().get() as usize;
         let encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
         {
@@ -2431,6 +2442,12 @@ impl Pager {
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
         self.set_reserved_space(value);
+    }
+
+    /// Encryption is an opt-in feature. If the flag is passed, then enable the encryption on
+    /// pager, which is then used to set it on the IOContext.
+    pub fn enable_encryption(&self, enable: bool) {
+        self.enable_encryption.store(enable, Ordering::SeqCst);
     }
 }
 

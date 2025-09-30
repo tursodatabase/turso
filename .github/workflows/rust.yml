@@ -40,10 +40,6 @@ jobs:
           python-version: "3.10"
       - name: Build
         run: cargo build --verbose
-      - name: Test Encryption
-        run: |
-          cargo test --features encryption --color=always --test integration_tests query_processing::encryption
-          cargo test --features encryption --color=always --lib storage::encryption
       - name: Test Checksums
         run: |
           cargo test --features checksum --color=always --lib storage::checksum

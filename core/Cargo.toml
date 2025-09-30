@@ -14,7 +14,7 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series"]
+default = ["fs", "uuid", "time", "json", "series", "encryption"]
 antithesis = ["dep:antithesis_sdk"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
