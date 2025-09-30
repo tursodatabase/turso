@@ -1,7 +1,5 @@
 use std::num::NonZero;
 
-pub const PARAM_PREFIX: &str = "__param_";
-
 #[derive(Clone, Debug)]
 pub enum Parameter {
     Anonymous(NonZero<usize>),
@@ -78,17 +76,6 @@ impl Parameters {
 
     pub fn push(&mut self, name: impl AsRef<str>) -> NonZero<usize> {
         match name.as_ref() {
-            param if param.is_empty() || param.starts_with(PARAM_PREFIX) => {
-                let index = self.next_index();
-                let use_idx = if let Some(idx) = param.strip_prefix(PARAM_PREFIX) {
-                    idx.parse().unwrap()
-                } else {
-                    index
-                };
-                self.list.push(Parameter::Anonymous(use_idx));
-                tracing::trace!("anonymous parameter at {use_idx}");
-                use_idx
-            }
             name if name.starts_with(['$', ':', '@', '#']) => {
                 match self
                     .list
