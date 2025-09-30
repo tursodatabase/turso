@@ -14,9 +14,6 @@ pub enum Error {
     /// Missing `]`
     #[error("non-terminated bracket at {0:?}")]
     UnterminatedBracket(#[label("here")] miette::SourceSpan),
-    /// Missing `*/`
-    #[error("non-terminated block comment at {0:?}")]
-    UnterminatedBlockComment(#[label("here")] miette::SourceSpan),
     /// Invalid parameter name
     #[error("bad variable name at {0:?}")]
     BadVariableName(#[label("here")] miette::SourceSpan),
