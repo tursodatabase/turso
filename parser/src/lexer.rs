@@ -400,6 +400,9 @@ impl<'a> Lexer<'a> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'/');
         match self.peek() {
+            // C-style comments begin with "/*" and extend up to and
+            // including the next "*/" character pair or until
+            // the end of input, whichever comes first.
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
                 loop {
@@ -412,19 +415,11 @@ impl<'a> Lexer<'a> {
                                     self.eat_and_assert(|b| b == b'/');
                                     break; // End of block comment
                                 }
-                                None => {
-                                    return Err(Error::UnterminatedBlockComment(
-                                        (start, self.offset - start).into(),
-                                    ))
-                                }
+                                None => break,
                                 _ => {}
                             }
                         }
-                        None => {
-                            return Err(Error::UnterminatedBlockComment(
-                                (start, self.offset - start).into(),
-                            ))
-                        }
+                        None => break,
                         _ => unreachable!(), // We should not reach here
                     }
                 }
@@ -1248,6 +1243,21 @@ mod tests {
                 Token {
                     value: b"1.e5".as_slice(),
                     token_type: Some(TokenType::TK_FLOAT),
+                },
+            ),
+            // issue 3425
+            (
+                b"/*".as_slice(),
+                Token {
+                    value: b"/*".as_slice(),
+                    token_type: None,
+                },
+            ),
+            (
+                b"/**".as_slice(),
+                Token {
+                    value: b"/**".as_slice(),
+                    token_type: None,
                 },
             ),
         ];
