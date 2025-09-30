@@ -8484,7 +8484,7 @@ impl Value {
                     // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
                     let s = text.as_str();
                     let mut start_byte_idx = 0;
-                    end = end - start;
+                    end -= start;
                     while start > 0 {
                         start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
                         start -= 1;
