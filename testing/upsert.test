@@ -353,6 +353,25 @@ do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
     SELECT * FROM dq;
 } {1|new}
 
+do_execsql_test_on_specific_db {:memory:} upsert-targets-chain {
+    CREATE TABLE dq (a UNIQUE, b UNIQUE, c UNIQUE, value TEXT);
+    CREATE UNIQUE INDEX dq_ab ON dq(a, b);
+    INSERT INTO dq VALUES ('a1', 'a2', 'a3', 'aaa');
+    INSERT INTO dq VALUES ('b1', 'b2', 'b3', 'bbb');
+    INSERT INTO dq VALUES ('c1', 'c2', 'c3', 'ccc');
+    INSERT INTO dq VALUES ('d1', 'd2', 'd3', 'ddd');
+    INSERT INTO dq VALUES
+      ('a1', 'a2', 'a3', 'upd1'), ('b1', 'b1', 'b1', 'upd2'), ('c2', 'c2', 'c2', 'upd3'), ('d3', 'd3', 'd3', 'upd4')
+    ON CONFLICT (a, b) DO UPDATE SET value = excluded.value || '-a'
+    ON CONFLICT (a) DO UPDATE SET value = excluded.value || '-b'
+    ON CONFLICT (b) DO UPDATE SET value = excluded.value || '-c'
+    ON CONFLICT DO UPDATE SET value = excluded.value || '-d';
+    SELECT * FROM dq;
+} {a1|a2|a3|upd1-a
+b1|b2|b3|upd2-b
+c1|c2|c3|upd3-c
+d1|d2|d3|upd4-d}
+
 # https://github.com/tursodatabase/turso/issues/3384
 do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
 	create table phonebook(name text primary key, phonenumber text, validDate date);

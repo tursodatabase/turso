@@ -839,3 +839,24 @@ pub fn delete_eq_correct() {
         limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
     );
 }
+
+#[test]
+pub fn upsert_conflict() {
+    let limbo = TempDatabase::new_empty(true);
+    let conn = limbo.db.connect().unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
+        "INSERT INTO t VALUES (1, 2, 100);",
+        "INSERT INTO t VALUES (1, 2, 0) ON CONFLICT (c) DO UPDATE SET value = 42;",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(
+        vec![vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Integer(2),
+            rusqlite::types::Value::Integer(42),
+        ]],
+        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t")
+    );
+}
