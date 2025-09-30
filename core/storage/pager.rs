@@ -677,9 +677,12 @@ impl Pager {
 
     /// From SQLITE: https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608 \
     /// The database page the [PENDING_BYTE] occupies. This page is never used.
-    pub fn pending_byte_page_id(&self) -> u32 {
+    pub fn pending_byte_page_id(&self) -> Option<u32> {
         // PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
-        (Self::get_pending_byte() / self.page_size.load(Ordering::Relaxed)) + 1
+        let page_size = self.page_size.load(Ordering::SeqCst);
+        Self::get_pending_byte()
+            .checked_div(page_size)
+            .map(|val| val + 1)
     }
 
     /// Get the maximum page count for this database
@@ -2324,7 +2327,7 @@ impl Pager {
                     let mut new_db_size = *current_db_size + 1;
 
                     // if new_db_size reaches the pending page, we need to allocate a new one
-                    if new_db_size == self.pending_byte_page_id() {
+                    if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
                             allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                         self.add_dirty(&richard_hipp_special_page);
