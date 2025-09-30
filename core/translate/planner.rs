@@ -403,11 +403,11 @@ fn parse_table(
         return Ok(());
     };
 
-    let regular_view = connection.with_schema(database_id, |schema| {
-        schema.get_view(table_name.as_str()).cloned()
-    });
+    let regular_view =
+        connection.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
+        view.process()?;
         let view_select = view.select_stmt.clone();
         let subselect = Box::new(view_select);
 
@@ -417,7 +417,7 @@ fn parse_table(
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
         // Recursively call parse_from_clause_table with the view as a SELECT
-        return parse_from_clause_table(
+        let result = parse_from_clause_table(
             ast::SelectTable::Select(*subselect.clone(), view_alias),
             resolver,
             program,
@@ -426,6 +426,8 @@ fn parse_table(
             ctes,
             connection,
         );
+        view.done();
+        return result;
     }
 
     let view = connection.with_schema(database_id, |schema| {

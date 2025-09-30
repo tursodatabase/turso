@@ -6,17 +6,71 @@ use crate::translate::expr::{
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
-/// Simple view structure for non-materialized views
 #[derive(Debug, Clone)]
+pub enum ViewState {
+    Ready,
+    InProgress,
+}
+
+/// Simple view structure for non-materialized views
+#[derive(Debug)]
 pub struct View {
     pub name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
+    pub state: Mutex<ViewState>,
+}
+
+impl View {
+    fn new(name: String, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
+        Self {
+            name,
+            sql,
+            select_stmt,
+            columns,
+            state: Mutex::new(ViewState::Ready),
+        }
+    }
+
+    pub fn process(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            ViewState::InProgress => {
+                bail_parse_error!("view {} is circularly defined", self.name)
+            }
+            ViewState::Ready => {
+                *state = ViewState::InProgress;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn done(&self) {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            ViewState::InProgress => {
+                *state = ViewState::Ready;
+            }
+            ViewState::Ready => {}
+        }
+    }
+}
+
+impl Clone for View {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            sql: self.sql.clone(),
+            select_stmt: self.select_stmt.clone(),
+            columns: self.columns.clone(),
+            state: Mutex::new(ViewState::Ready),
+        }
+    }
 }
 
 /// Type alias for regular views collection
-pub type ViewsMap = HashMap<String, View>;
+pub type ViewsMap = HashMap<String, Arc<View>>;
 
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
@@ -235,13 +289,13 @@ impl Schema {
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) {
         let name = normalize_ident(&view.name);
-        self.views.insert(name, view);
+        self.views.insert(name, Arc::new(view));
     }
 
     /// Get a regular view by name
-    pub fn get_view(&self, name: &str) -> Option<&View> {
+    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         let name = normalize_ident(name);
-        self.views.get(&name)
+        self.views.get(&name).cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
@@ -781,12 +835,8 @@ impl Schema {
                             }
 
                             // Create regular view
-                            let view = View {
-                                name: name.to_string(),
-                                sql: sql.to_string(),
-                                select_stmt: select,
-                                columns: final_columns,
-                            };
+                            let view =
+                                View::new(name.to_string(), sql.to_string(), select, final_columns);
                             self.add_view(view);
                         }
                         _ => {}
@@ -848,7 +898,11 @@ impl Clone for Schema {
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
             .collect();
-        let views = self.views.clone();
+        let views = self
+            .views
+            .iter()
+            .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
+            .collect();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
