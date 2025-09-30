@@ -960,7 +960,7 @@ mod tests {
                                     set_list.join(", ")
                                 ));
                             } else {
-                                on_conflict.push_str(&format!(" ON CONFLICT{} DO NOTHING", target));
+                                on_conflict.push_str(&format!(" ON CONFLICT{target} DO NOTHING"));
                             }
                         }
                         format!(
