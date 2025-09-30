@@ -20,7 +20,7 @@ enum CursorPosition {
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: CursorPosition,
-    table_id: i64,
+    pub table_id: i64,
     tx_id: u64,
 }
 

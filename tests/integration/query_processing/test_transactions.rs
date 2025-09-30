@@ -571,7 +571,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
         let value = i * 10;
         execute_and_log(
             &conn,
-            &format!("INSERT INTO test1 (id, value) VALUES ({}, {})", i, value),
+            &format!("INSERT INTO test1 (id, value) VALUES ({i}, {value})"),
         )
         .unwrap();
         expected_rows1.push((i, value));
@@ -592,7 +592,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
         let value = i * 20;
         execute_and_log(
             &conn,
-            &format!("INSERT INTO test2 (id, value) VALUES ({}, {})", i, value),
+            &format!("INSERT INTO test2 (id, value) VALUES ({i}, {value})"),
         )
         .unwrap();
         expected_rows2.push((i, value));

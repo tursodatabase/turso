@@ -15,7 +15,6 @@ use crate::{types::IOResult, File};
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     offset: u64,
-    needs_recovery: bool,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
@@ -136,12 +135,7 @@ impl LogRecordType {
 
 impl LogicalLog {
     pub fn new(file: Arc<dyn File>) -> Self {
-        let recover = file.size().unwrap() > 0;
-        Self {
-            file,
-            offset: 0,
-            needs_recovery: recover,
-        }
+        Self { file, offset: 0 }
     }
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
@@ -215,14 +209,6 @@ impl LogicalLog {
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
         Ok(IOResult::IO(IOCompletions::Single(c)))
-    }
-
-    pub fn needs_recover(&self) -> bool {
-        self.needs_recovery
-    }
-
-    pub fn mark_recovered(&mut self) {
-        self.needs_recovery = false;
     }
 }
 
@@ -333,7 +319,9 @@ impl StreamingLogicalLogReader {
                     let record_type = self.consume_u8(io)?;
                     let _payload_size = self.consume_u64(io)?;
                     let mut bytes_read_on_row = 17; // table_id, record_type and payload_size
-                    match LogRecordType::from_u8(record_type).unwrap() {
+                    match LogRecordType::from_u8(record_type)
+                        .unwrap_or_else(|| panic!("invalid record type: {record_type}"))
+                    {
                         LogRecordType::DeleteRow => {
                             let (rowid, n) = self.consume_varint(io)?;
                             bytes_read_on_row += n;
@@ -498,7 +486,7 @@ mod tests {
 
         let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.recover_logical_log(&io, &pager).unwrap();
+        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         let row = mvcc_store.read(tx, RowID::new(1, 1)).unwrap().unwrap();
         let record = ImmutableRecord::from_bin_record(row.data.clone());
@@ -540,7 +528,7 @@ mod tests {
 
         let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.recover_logical_log(&io, &pager).unwrap();
+        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, *rowid).unwrap().unwrap();

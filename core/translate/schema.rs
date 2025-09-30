@@ -56,9 +56,10 @@ pub fn translate_create_table(
     };
     program.extend(&opts);
 
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_tbl_name.starts_with(prefix))
+    if !connection.is_mvcc_bootstrap_connection()
+        && RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized_tbl_name.starts_with(prefix))
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",

@@ -1,15 +1,18 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MvStore, RowVersion, TxTimestampOrID, WriteRowStateMachine,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOResult, ImmutableRecord, RecordCursor};
-use crate::{CheckpointResult, Connection, IOExt, Pager, RefValue, Result, TransactionState};
+use crate::{
+    CheckpointResult, Connection, IOExt, Pager, RefValue, Result, TransactionState, Value,
+};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -79,7 +82,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// State machine for deleting rows from the B-tree
     delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     /// Cursors for the B-trees
-    cursors: HashMap<i64, Arc<RwLock<BTreeCursor>>>,
+    cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
+    /// Tables that were destroyed in this checkpoint
+    destroyed_tables: HashSet<i64>,
     /// Result of the checkpoint
     checkpoint_result: Option<CheckpointResult>,
 }
@@ -88,8 +93,14 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
 /// Special writes for CREATE TABLE / DROP TABLE ops.
 /// These are used to create/destroy B-trees during pager ops.
 pub enum SpecialWrite {
-    BTreeCreate { root_page: i64 },
-    BTreeDestroy { root_page: i64, num_columns: usize },
+    BTreeCreate {
+        table_id: i64,
+    },
+    BTreeDestroy {
+        table_id: i64,
+        root_page: u64,
+        num_columns: usize,
+    },
 }
 
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
@@ -116,6 +127,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             write_row_state_machine: None,
             delete_row_state_machine: None,
             cursors: HashMap::new(),
+            destroyed_tables: HashSet::new(),
             checkpoint_result: None,
         }
     }
@@ -134,7 +146,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // the MVCC store, so that we don't checkpoint the same row versions again on the next checkpoint.
         let mut max_timestamp = self.checkpointed_txid_max_old;
 
-        for entry in self.mvstore.rows.iter() {
+        // Since table ids are negative, and we want schema changes (table_id=-1) to be processed first, we iterate in reverse order.
+        // Reliance on SkipMap ordering is a bit yolo-swag fragile, but oh well.
+        for entry in self.mvstore.rows.iter().rev() {
+            let key = entry.key();
+            if self.destroyed_tables.contains(&key.table_id) {
+                // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
+                // There's two forms of destroyed table:
+                // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
+                // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
+                continue;
+            }
             let row_versions = entry.value().read();
             let mut exists_in_db_file = false;
             for (i, version) in row_versions.iter().enumerate() {
@@ -155,7 +177,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         continue;
                     }
 
-                    let get_root_page = |row_data: &Vec<u8>| {
+                    // Row versions in sqlite_schema are temporarily assigned a negative root page that is equal to the table id,
+                    // because the root page is not known until it's actually allocated during the checkpoint.
+                    // However, existing tables have a real root page.
+                    let get_table_id_or_root_page_from_sqlite_schema = |row_data: &Vec<u8>| {
                         let row_data = ImmutableRecord::from_bin_record(row_data.clone());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor.parse_full_header(&row_data).unwrap();
@@ -173,24 +198,47 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     max_timestamp = max_timestamp.max(current_version_ts);
                     if is_last {
                         let is_delete = version.end.is_some();
-                        let should_be_deleted_from_db_file = is_delete && exists_in_db_file;
+                        let is_delete_of_table =
+                            is_delete && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                        let is_create_of_table = !exists_in_db_file
+                            && !is_delete
+                            && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
 
                         // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
-                        let special_write =
-                            if should_be_deleted_from_db_file && version.row.id.table_id == 1 {
-                                let root_page = get_root_page(&version.row.data);
+                        let special_write = if is_delete_of_table {
+                            let root_page =
+                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
+                            assert!(root_page > 0, "rootpage is positive integer");
+                            let root_page = root_page as u64;
+                            let table_id = *self
+                                .mvstore
+                                .table_id_to_rootpage
+                                .iter()
+                                .find(|entry| entry.value().is_some_and(|r| r == root_page))
+                                .unwrap()
+                                .key();
+                            self.destroyed_tables.insert(table_id);
+
+                            if exists_in_db_file {
                                 Some(SpecialWrite::BTreeDestroy {
+                                    table_id,
                                     root_page,
                                     num_columns: version.row.column_count,
                                 })
-                            } else if !exists_in_db_file && version.row.id.table_id == 1 {
-                                let root_page = get_root_page(&version.row.data);
-                                Some(SpecialWrite::BTreeCreate { root_page })
                             } else {
                                 None
-                            };
+                            }
+                        } else if is_create_of_table {
+                            let table_id =
+                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
+                            assert!(table_id < 0, "table_id is negative integer");
+                            Some(SpecialWrite::BTreeCreate { table_id })
+                        } else {
+                            None
+                        };
 
                         // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in the database file.
+                        let should_be_deleted_from_db_file = is_delete && exists_in_db_file;
                         if !is_delete || should_be_deleted_from_db_file {
                             self.write_set.push((version.clone(), special_write));
                         }
@@ -207,6 +255,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         write_set_index: usize,
     ) -> Option<&(RowVersion, Option<SpecialWrite>)> {
         self.write_set.get(write_set_index)
+    }
+
+    /// Mutably get the current row version to write to the B-tree
+    fn get_current_row_version_mut(
+        &mut self,
+        write_set_index: usize,
+    ) -> Option<&mut (RowVersion, Option<SpecialWrite>)> {
+        self.write_set.get_mut(write_set_index)
     }
 
     /// Check if we have more rows to write
@@ -314,24 +370,36 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Handle CREATE TABLE / DROP TABLE ops
                 if let Some(special_write) = special_write {
                     match special_write {
-                        SpecialWrite::BTreeCreate { root_page } => {
-                            let created_root_page =
-                                self.pager.io.block(|| {
-                                    self.pager.btree_create(&CreateBTreeFlags::new_table())
-                                })? as i64;
-                            assert_eq!(created_root_page , root_page, "Created root page does not match expected root page: {created_root_page} != {root_page}");
+                        SpecialWrite::BTreeCreate { table_id } => {
+                            let created_root_page = self.pager.io.block(|| {
+                                self.pager.btree_create(&CreateBTreeFlags::new_table())
+                            })?;
+                            self.mvstore.insert_table_id_to_rootpage(
+                                table_id,
+                                Some(created_root_page as u64),
+                            );
                         }
                         SpecialWrite::BTreeDestroy {
+                            table_id,
                             root_page,
                             num_columns,
                         } => {
-                            let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+                            let known_root_page = self
+                                .mvstore
+                                .table_id_to_rootpage
+                                .get(&table_id)
+                                .expect("Table ID does not have a root page");
+                            let known_root_page = known_root_page
+                                .value()
+                                .expect("Table ID does not have a root page");
+                            assert_eq!(known_root_page, root_page, "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}");
+                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
                             } else {
                                 let cursor = BTreeCursor::new_table(
                                     None,
                                     self.pager.clone(),
-                                    root_page,
+                                    known_root_page as i64,
                                     num_columns,
                                 );
                                 let cursor = Arc::new(RwLock::new(cursor));
@@ -339,23 +407,79 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 cursor
                             };
                             self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            self.cursors.remove(&root_page);
+                            self.destroyed_tables.insert(table_id);
                         }
                     }
                 }
 
+                if self.destroyed_tables.contains(&table_id) {
+                    // Don't write rows for tables that will be destroyed in this checkpoint.
+                    self.state = CheckpointState::WriteRow {
+                        write_set_index: write_set_index + 1,
+                        requires_seek: true,
+                    };
+                    return Ok(TransitionResult::Continue);
+                }
+
+                let root_page = {
+                    let root_page = self
+                        .mvstore
+                        .table_id_to_rootpage
+                        .get(&table_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                                self.get_current_row_version(write_set_index).unwrap()
+                            )
+                        });
+                    root_page.value().unwrap_or_else(|| {
+                        panic!(
+                            "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                            self.get_current_row_version(write_set_index).unwrap()
+                        )
+                    })
+                };
+
+                // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
+                // So we need to rewrite the row version to use the real root page.
+                if let Some(SpecialWrite::BTreeCreate { table_id }) = special_write {
+                    let root_page = {
+                        let root_page = self
+                            .mvstore
+                            .table_id_to_rootpage
+                            .get(&table_id)
+                            .expect("Table ID does not have a root page");
+                        root_page
+                            .value()
+                            .expect("Table ID does not have a root page")
+                    };
+                    let (row_version, _) =
+                        self.get_current_row_version_mut(write_set_index).unwrap();
+                    let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
+                    let mut record_cursor = RecordCursor::new();
+                    record_cursor.parse_full_header(&record).unwrap();
+                    let values = record_cursor.get_values(&record)?;
+                    let mut values = values
+                        .into_iter()
+                        .map(|value| value.to_owned())
+                        .collect::<Vec<_>>();
+                    values[3] = Value::Integer(root_page as i64);
+                    let record = ImmutableRecord::from_values(&values, values.len());
+                    row_version.row.data = record.get_payload().to_owned();
+                }
+
                 // Get or create cursor for this table
-                let cursor = if let Some(cursor) = self.cursors.get(&table_id) {
+                let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
                     cursor.clone()
                 } else {
                     let cursor = BTreeCursor::new_table(
                         None, // Write directly to B-tree
                         self.pager.clone(),
-                        table_id,
+                        root_page as i64,
                         num_columns,
                     );
                     let cursor = Arc::new(RwLock::new(cursor));
-                    self.cursors.insert(table_id, cursor.clone());
+                    self.cursors.insert(root_page, cursor.clone());
                     cursor
                 };
 
