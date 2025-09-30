@@ -23,12 +23,13 @@ macro_rules! peek_expect {
             match token.token_type.unwrap() {
                 $($x => token,)*
                 tt => {
+                    let token_len = token.value.len();
                     // handle fallback TK_ID
                     match (TK_ID, tt.fallback_id_if_ok()) {
                         $(($x, TK_ID) => token,)*
                         _ => {
                             return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: ($parser.offset(), 1).into(),
+                                parsed_offset: ($parser.offset(), token_len).into(),
                                 expected: &[
                                     $($x,)*
                                 ],
@@ -1472,7 +1473,7 @@ impl<'a> Parser<'a> {
                     } else if tok.token_type == Some(TK_LP) {
                         if can_be_lit_str {
                             return Err(Error::ParseUnexpectedToken {
-                                parsed_offset: (self.offset(), 1).into(),
+                                parsed_offset: (self.offset() - name.len(), name.len()).into(),
                                 got: TK_STRING,
                                 expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
                             });
