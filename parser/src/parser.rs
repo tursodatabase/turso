@@ -140,6 +140,10 @@ pub struct Parser<'a> {
     /// The current token being processed
     current_token: Token<'a>,
     peekable: bool,
+
+    /// Last assigned id of positional variable
+    /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
+    last_variable_id: u32,
 }
 
 impl<'a> Iterator for Parser<'a> {
@@ -165,6 +169,25 @@ impl<'a> Parser<'a> {
                 value: &input[..0],
                 token_type: None,
             },
+            last_variable_id: 0,
+        }
+    }
+
+    fn create_variable(&mut self, token: &[u8]) -> Result<Expr> {
+        if token.is_empty() {
+            // Rewrite anonymous variables in encounter order
+            self.last_variable_id += 1;
+            Ok(Expr::Variable(format!("{}", self.last_variable_id)))
+        } else if matches!(token[0], b':' | b'@' | b'$' | b'#') {
+            Ok(Expr::Variable(from_bytes(token)))
+        } else {
+            let variable_str = std::str::from_utf8(&token)
+                .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
+            let variable_id = variable_str
+                .parse::<u32>()
+                .map_err(|e| Error::Custom(format!("non-integer positional variable id: {e}")))?;
+            self.last_variable_id = variable_id;
+            Ok(Expr::Variable(from_bytes(token)))
         }
     }
 
@@ -1344,7 +1367,7 @@ impl<'a> Parser<'a> {
             }
             TK_VARIABLE => {
                 let tok = eat_assert!(self, TK_VARIABLE);
-                Ok(Box::new(Expr::Variable(from_bytes(tok.value))))
+                Ok(Box::new(self.create_variable(tok.value)?))
             }
             TK_CAST => {
                 eat_assert!(self, TK_CAST);
@@ -4387,7 +4410,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Variable("".to_owned())),
+                                Box::new(Expr::Variable("1".to_owned())),
                                 None,
                             )],
                             from: None,
