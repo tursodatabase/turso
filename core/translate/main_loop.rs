@@ -1148,20 +1148,30 @@ fn emit_seek(
         // depending on the iteration direction.
         match seek_def.iter_dir {
             IterationDirection::Forwards => {
-                // the seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
-                // so, NULL always must be filtered out
-                // (note, that complex filters like c < ? OR c IS NULL will produce Scan operation instead of Search)
-                program.emit_insn(Insn::Null {
-                    dest: start_reg,
-                    dest_end: None,
-                });
-                program.emit_insn(Insn::SeekGT {
-                    is_index,
-                    cursor_id: seek_cursor_id,
-                    start_reg,
-                    num_regs: 1,
-                    target_pc: loop_end,
-                });
+                // table seek has some rules to convert seek key values to the integer affinity + it has some logic to check for explicit NULL searches
+                // so, we emit simple Rewind in case of search over table BTree
+                // (this is safe as table BTree keys are always non-null single integer)
+                if !is_index {
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: seek_cursor_id,
+                        pc_if_empty: loop_end,
+                    });
+                } else {
+                    // the seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
+                    // so, NULL always must be filtered out
+                    // (note, that complex filters like c < ? OR c IS NULL will produce Scan operation instead of Search)
+                    program.emit_insn(Insn::Null {
+                        dest: start_reg,
+                        dest_end: None,
+                    });
+                    program.emit_insn(Insn::SeekGT {
+                        is_index,
+                        cursor_id: seek_cursor_id,
+                        start_reg,
+                        num_regs: 1,
+                        target_pc: loop_end,
+                    });
+                }
             }
             IterationDirection::Backwards => {
                 program.emit_insn(Insn::Last {
