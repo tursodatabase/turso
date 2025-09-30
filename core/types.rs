@@ -387,6 +387,7 @@ impl Value {
         };
     }
 
+    /// Cast Value to String, if Value is NULL returns None
     pub fn cast_text(&self) -> Option<String> {
         Some(match self {
             Value::Null => return None,
