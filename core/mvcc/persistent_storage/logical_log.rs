@@ -651,6 +651,36 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
 
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+
+            // insert rows
             for ops in &txns {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
                 for (op_type, maybe_row, rowid) in ops {
