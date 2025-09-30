@@ -6,10 +6,8 @@ use aegis::aegis128x4::Aegis128X4;
 use aegis::aegis256::Aegis256;
 use aegis::aegis256x2::Aegis256X2;
 use aegis::aegis256x4::Aegis256X4;
-use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes128Gcm, Aes256Gcm, Key, Nonce,
-};
+use openssl::rand::rand_bytes;
+use openssl::symm::{decrypt_aead, encrypt_aead, Cipher as OCipher};
 use turso_macros::match_ignore_ascii_case;
 
 /// Encryption Scheme
@@ -223,17 +221,17 @@ macro_rules! define_aegis_cipher {
     };
 }
 
-macro_rules! define_aes_gcm_cipher {
-    ($struct_name:ident, $cipher_type:ty, key128, $name:literal) => {
-        define_aes_gcm_cipher!(@impl $struct_name, $cipher_type, $name, 16, as_128);
+macro_rules! define_openssl_aes_gcm_cipher {
+    ($struct_name:ident, $cipher_fn:expr, key128, $name:literal) => {
+        define_openssl_aes_gcm_cipher!(@impl $struct_name, $cipher_fn, $name, 16, as_128);
     };
-    ($struct_name:ident, $cipher_type:ty, key256, $name:literal) => {
-        define_aes_gcm_cipher!(@impl $struct_name, $cipher_type, $name, 32, as_256);
+    ($struct_name:ident, $cipher_fn:expr, key256, $name:literal) => {
+        define_openssl_aes_gcm_cipher!(@impl $struct_name, $cipher_fn, $name, 32, as_256);
     };
-    (@impl $struct_name:ident, $cipher_type:ty, $name:literal, $key_size:literal, $key_method:ident) => {
+    (@impl $struct_name:ident, $cipher_fn:expr, $name:literal, $key_size:literal, $key_method:ident) => {
         #[derive(Clone)]
         pub struct $struct_name {
-            cipher: $cipher_type,
+            key: EncryptionKey,
         }
 
         impl $struct_name {
@@ -241,34 +239,40 @@ macro_rules! define_aes_gcm_cipher {
             const NONCE_SIZE: usize = 12;
 
             fn new(key: &EncryptionKey) -> Result<Self> {
-                let key_bytes = key.$key_method()
+                let _key_bytes = key.$key_method()
                     .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
-                let cipher_key: &Key<$cipher_type> = key_bytes.into();
                 Ok(Self {
-                    cipher: <$cipher_type>::new(cipher_key),
+                    key: key.clone(),
                 })
             }
 
             fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
-                let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
-                let ciphertext = self.cipher.encrypt(&nonce, aes_gcm::aead::Payload {
-                    msg: plaintext,
-                    aad: ad,
-                }).map_err(|e| {
-                    LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
-                })?;
-                let mut nonce_array = [0u8; 12];
-                nonce_array.copy_from_slice(&nonce);
-                Ok((ciphertext, nonce_array))
+                let mut nonce = [0u8; 12];
+                rand_bytes(&mut nonce)
+                    .map_err(|e| LimboError::InternalError(format!("{} nonce generation failed: {e}", $name)))?;
+
+                let key_bytes = self.key.$key_method()
+                    .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
+
+                let mut tag = [0u8; Self::TAG_SIZE];
+                let ciphertext = encrypt_aead($cipher_fn(), key_bytes, Some(&nonce), ad, plaintext, &mut tag)
+                    .map_err(|e| LimboError::InternalError(format!("{} encryption failed: {e}", $name)))?;
+
+                let mut result = ciphertext;
+                result.extend_from_slice(&tag);
+                Ok((result, nonce))
             }
 
             fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
-                let nonce = Nonce::from_slice(nonce);
-                self.cipher
-                    .decrypt(nonce, aes_gcm::aead::Payload {
-                        msg: ciphertext,
-                        aad: ad,
-                    })
+                if ciphertext.len() < Self::TAG_SIZE {
+                    return Err(LimboError::from(CipherError::CiphertextTooShort { cipher: $name }));
+                }
+
+                let (ct, tag) = ciphertext.split_at(ciphertext.len() - Self::TAG_SIZE);
+                let key_bytes = self.key.$key_method()
+                    .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
+
+                decrypt_aead($cipher_fn(), key_bytes, Some(nonce), ad, ct, tag)
                     .map_err(|_| -> LimboError { CipherError::DecryptionFailed { cipher: $name }.into() })
             }
         }
@@ -283,11 +287,11 @@ macro_rules! define_aes_gcm_cipher {
     };
 }
 
-// AES-GCM ciphers
-define_aes_gcm_cipher!(Aes128GcmCipher, Aes128Gcm, key128, "AES-128-GCM");
-define_aes_gcm_cipher!(Aes256GcmCipher, Aes256Gcm, key256, "AES-256-GCM");
+// OpenSSL AES-GCM ciphers
+define_openssl_aes_gcm_cipher!(Aes128GcmCipher, OCipher::aes_128_gcm, key128, "AES-128-GCM");
+define_openssl_aes_gcm_cipher!(Aes256GcmCipher, OCipher::aes_256_gcm, key256, "AES-256-GCM");
 
-// AEGIS ciphers
+// AEGIS ciphers (unchanged)
 define_aegis_cipher!(Aegis256Cipher, Aegis256::<16>, key256, 32, "AEGIS-256");
 define_aegis_cipher!(
     Aegis256X2Cipher,
@@ -869,10 +873,8 @@ impl EncryptionContext {
 }
 
 fn generate_secure_nonce<const N: usize>() -> [u8; N] {
-    // use OsRng directly to fill bytes, generic over nonce size
-    use aes_gcm::aead::rand_core::RngCore;
     let mut nonce = [0u8; N];
-    OsRng.fill_bytes(&mut nonce);
+    rand_bytes(&mut nonce).expect("Failed to generate secure nonce");
     nonce
 }
 
