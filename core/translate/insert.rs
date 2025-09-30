@@ -648,7 +648,7 @@ pub fn translate_insert(
     for index in resolver.schema.get_indices(table_name.as_str()) {
         let position = upsert_actions
             .iter()
-            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::Index(x) if Arc::ptr_eq(&x, index)));
+            .position(|(target, ..)| matches!(target, ResolvedUpsertTarget::Index(x) if Arc::ptr_eq(x, index)));
         constraints_to_check.push((ResolvedUpsertTarget::Index(index.clone()), position));
     }
 
