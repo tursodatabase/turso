@@ -571,7 +571,7 @@ pub struct BTreeCursor {
     is_empty_table_state: RefCell<EmptyTableState>,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
     /// If we know the rightmost page id and are already on that page, we can skip a seek.
-    move_to_right_state: (MoveToRightState, Option<i64>),
+    move_to_right_state: (MoveToRightState, Option<usize>),
     /// State machine for [BTreeCursor::seek_to_last]
     seek_to_last_state: SeekToLastState,
     /// State machine for [BTreeCursor::rewind]
@@ -1713,7 +1713,7 @@ impl BTreeCursor {
                 {
                     let page = self.stack.get_page_at_level(old_top_idx).unwrap();
                     turso_assert!(
-                        page.get().id != *left_child_page as i64,
+                        page.get().id != *left_child_page as usize,
                         "corrupt: current page and left child page of cell {} are both {}",
                         leftmost_matching_cell,
                         page.get().id
@@ -3459,7 +3459,7 @@ impl BTreeCursor {
                     let is_table_leaf = matches!(page_type, PageType::TableLeaf);
                     // Reassign page numbers in increasing order
                     {
-                        let mut page_numbers: [i64; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
+                        let mut page_numbers: [usize; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                             [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                         for (i, page) in pages_to_balance_new
                             .iter()
@@ -4390,7 +4390,7 @@ impl BTreeCursor {
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
-        self.root_page = root.get().id;
+        self.root_page = root.get().id as i64;
         self.stack.clear();
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
@@ -4984,7 +4984,7 @@ impl BTreeCursor {
                             cell_payload[..4].try_into().expect("invalid cell payload"),
                         );
                         turso_assert!(
-                            left_child_page as i64 != parent_page_id,
+                            left_child_page as usize != parent_page_id,
                             "corrupt: current page and left child page of cell {} are both {}",
                             left_child_page,
                             parent_page_id
@@ -5965,7 +5965,7 @@ pub fn integrity_check(
                         max_intkey,
                         page_category: PageCategory::FreeListTrunk,
                     },
-                    page.get().id,
+                    page.get().id as i64,
                     errors,
                 );
             }
@@ -5979,7 +5979,7 @@ pub fn integrity_check(
                         max_intkey,
                         page_category: PageCategory::FreePage,
                     },
-                    page.get().id,
+                    page.get().id as i64,
                     errors,
                 );
             }
@@ -5999,7 +5999,7 @@ pub fn integrity_check(
                         max_intkey,
                         page_category: PageCategory::Overflow,
                     },
-                    page.get().id,
+                    page.get().id as i64,
                     errors,
                 );
             }
@@ -6007,7 +6007,7 @@ pub fn integrity_check(
         }
 
         let usable_space = pager.usable_space();
-        let mut coverage_checker = CoverageChecker::new(page.get().id);
+        let mut coverage_checker = CoverageChecker::new(page.get().id as i64);
 
         // Now we check every cell for few things:
         // 1. Check cell is in correct range. Not exceeds page and not starts before we have marked
@@ -6025,7 +6025,7 @@ pub fn integrity_check(
             if cell_start < contents.cell_content_area() as usize || cell_start > usable_space - 4 {
                 errors.push(IntegrityCheckError::CellOutOfRange {
                     cell_idx,
-                    page_id: page.get().id,
+                    page_id: page.get().id as i64,
                     cell_start,
                     cell_end: cell_start + cell_length,
                     content_area: contents.cell_content_area() as usize,
@@ -6035,7 +6035,7 @@ pub fn integrity_check(
             if cell_start + cell_length > usable_space {
                 errors.push(IntegrityCheckError::CellOverflowsPage {
                     cell_idx,
-                    page_id: page.get().id,
+                    page_id: page.get().id as i64,
                     cell_start,
                     cell_end: cell_start + cell_length,
                     content_area: contents.cell_content_area() as usize,
@@ -6053,13 +6053,13 @@ pub fn integrity_check(
                             max_intkey: table_interior_cell.rowid,
                             page_category: PageCategory::Normal,
                         },
-                        page.get().id,
+                        page.get().id as i64,
                         errors,
                     );
                     let rowid = table_interior_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
-                            page_id: page.get().id,
+                            page_id: page.get().id as i64,
                             page_category,
                             cell_idx,
                             rowid,
@@ -6074,7 +6074,7 @@ pub fn integrity_check(
                     if let Some(expected_leaf_level) = state.first_leaf_level {
                         if expected_leaf_level != level {
                             errors.push(IntegrityCheckError::LeafDepthMismatch {
-                                page_id: page.get().id,
+                                page_id: page.get().id as i64,
                                 this_page_depth: level,
                                 other_page_depth: expected_leaf_level,
                             });
@@ -6085,7 +6085,7 @@ pub fn integrity_check(
                     let rowid = table_leaf_cell.rowid;
                     if rowid > max_intkey || rowid > next_rowid {
                         errors.push(IntegrityCheckError::CellRowidOutOfRange {
-                            page_id: page.get().id,
+                            page_id: page.get().id as i64,
                             page_category,
                             cell_idx,
                             rowid,
@@ -6102,7 +6102,7 @@ pub fn integrity_check(
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
                             },
-                            page.get().id,
+                            page.get().id as i64,
                             errors,
                         );
                     }
@@ -6115,7 +6115,7 @@ pub fn integrity_check(
                             max_intkey, // we don't care about intkey in non-table pages
                             page_category: PageCategory::Normal,
                         },
-                        page.get().id,
+                        page.get().id as i64,
                         errors,
                     );
                     if let Some(first_overflow_page) = index_interior_cell.first_overflow_page {
@@ -6126,7 +6126,7 @@ pub fn integrity_check(
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
                             },
-                            page.get().id,
+                            page.get().id as i64,
                             errors,
                         );
                     }
@@ -6136,7 +6136,7 @@ pub fn integrity_check(
                     if let Some(expected_leaf_level) = state.first_leaf_level {
                         if expected_leaf_level != level {
                             errors.push(IntegrityCheckError::LeafDepthMismatch {
-                                page_id: page.get().id,
+                                page_id: page.get().id as i64,
                                 this_page_depth: level,
                                 other_page_depth: expected_leaf_level,
                             });
@@ -6152,7 +6152,7 @@ pub fn integrity_check(
                                 max_intkey,
                                 page_category: PageCategory::Overflow,
                             },
-                            page.get().id,
+                            page.get().id as i64,
                             errors,
                         );
                     }
@@ -6168,7 +6168,7 @@ pub fn integrity_check(
                     max_intkey,
                     page_category: PageCategory::Normal,
                 },
-                page.get().id,
+                page.get().id as i64,
                 errors,
             );
         }
@@ -6183,7 +6183,7 @@ pub fn integrity_check(
                 // check it doesn't go out of range
                 if pc > usable_space - 4 {
                     errors.push(IntegrityCheckError::FreeBlockOutOfRange {
-                        page_id: page.get().id,
+                        page_id: page.get().id as i64,
                         start: pc,
                         end: pc + size,
                     });
@@ -7853,8 +7853,8 @@ mod tests {
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn get_page(id: i64) -> Arc<Page> {
-        let page = Arc::new(Page::new(id));
+    fn get_page(id: usize) -> Arc<Page> {
+        let page = Arc::new(Page::new(id as i64));
 
         let inner = PageContent::new(0, Arc::new(Buffer::new_temporary(4096)));
         page.get().contents.replace(inner);
@@ -8085,7 +8085,7 @@ mod tests {
         }
         let first_page_type = child_pages.first_mut().map(|p| {
             if !p.is_loaded() {
-                let (new_page, _c) = pager.read_page(p.get().id).unwrap();
+                let (new_page, _c) = pager.read_page(p.get().id as i64).unwrap();
                 *p = new_page;
             }
             while p.is_locked() {
@@ -8096,7 +8096,7 @@ mod tests {
         if let Some(child_type) = first_page_type {
             for page in child_pages.iter_mut().skip(1) {
                 if !page.is_loaded() {
-                    let (new_page, _c) = pager.read_page(page.get().id).unwrap();
+                    let (new_page, _c) = pager.read_page(page.get().id as i64).unwrap();
                     *page = new_page;
                 }
                 while page.is_locked() {
@@ -8184,7 +8184,7 @@ mod tests {
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
-        (pager, page2.get().id, db, conn)
+        (pager, page2.get().id as i64, db, conn)
     }
 
     #[test]
@@ -9150,7 +9150,7 @@ mod tests {
         let large_payload = vec![b'A'; max_local + usable_size];
 
         // Setup overflow pages (2, 3, 4) with linking
-        let mut current_page = 2_i64;
+        let mut current_page = 2_usize;
         while current_page <= 4 {
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(Buffer::new_temporary(
@@ -9169,7 +9169,7 @@ mod tests {
                     .write_page(current_page, buf.clone(), &IOContext::default(), c)?;
             pager.io.step()?;
 
-            let (page, _c) = cursor.read_page(current_page)?;
+            let (page, _c) = cursor.read_page(current_page as i64)?;
             while page.is_locked() {
                 cursor.pager.io.step()?;
             }

@@ -424,7 +424,7 @@ impl EncryptionContext {
     }
 
     #[cfg(feature = "encryption")]
-    pub fn encrypt_page(&self, page: &[u8], page_id: i64) -> Result<Vec<u8>> {
+    pub fn encrypt_page(&self, page: &[u8], page_id: usize) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("encrypting page {}", page_id);
         assert_eq!(
@@ -480,7 +480,7 @@ impl EncryptionContext {
     }
 
     #[cfg(feature = "encryption")]
-    pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: i64) -> Result<Vec<u8>> {
+    pub fn decrypt_page(&self, encrypted_page: &[u8], page_id: usize) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
         tracing::debug!("decrypting page {}", page_id);
         assert_eq!(
@@ -577,14 +577,14 @@ impl EncryptionContext {
     }
 
     #[cfg(not(feature = "encryption"))]
-    pub fn encrypt_page(&self, _page: &[u8], _page_id: i64) -> Result<Vec<u8>> {
+    pub fn encrypt_page(&self, _page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
         Err(LimboError::InvalidArgument(
             "encryption is not enabled, cannot encrypt page. enable via passing `--features encryption`".into(),
         ))
     }
 
     #[cfg(not(feature = "encryption"))]
-    pub fn decrypt_page(&self, _encrypted_page: &[u8], _page_id: i64) -> Result<Vec<u8>> {
+    pub fn decrypt_page(&self, _encrypted_page: &[u8], _page_id: usize) -> Result<Vec<u8>> {
         Err(LimboError::InvalidArgument(
             "encryption is not enabled, cannot decrypt page. enable via passing `--features encryption`".into(),
         ))

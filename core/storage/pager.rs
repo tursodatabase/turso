@@ -52,7 +52,7 @@ impl HeaderRef {
                         return Err(LimboError::Page1NotAlloc);
                     }
 
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
                     *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
@@ -92,7 +92,7 @@ impl HeaderRefMut {
                         return Err(LimboError::Page1NotAlloc);
                     }
 
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID)?;
+                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
                     *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
@@ -124,7 +124,7 @@ impl HeaderRefMut {
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
-    pub id: i64,
+    pub id: usize,
     /// If >0, the page is pinned and not eligible for eviction from the page cache.
     /// The reason this is a counter is that multiple nested code paths may signal that
     /// a page must not be evicted from the page cache, so even if an inner code path
@@ -186,11 +186,12 @@ const PAGE_LOADED: usize = 0b10000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
+        assert!(id >= 0, "page id should be positive");
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
                 contents: None,
-                id,
+                id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
             }),
@@ -1225,7 +1226,7 @@ impl Pager {
         if let Some(page) = page_cache.get(&page_key)? {
             tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
             turso_assert!(
-                page_idx == page.get().id,
+                page_idx as usize == page.get().id,
                 "attempted to read page {page_idx} but got page {}",
                 page.get().id
             );
@@ -1233,7 +1234,7 @@ impl Pager {
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         turso_assert!(
-            page_idx == page.get().id,
+            page_idx as usize == page.get().id,
             "attempted to read page {page_idx} but got page {}",
             page.get().id
         );
@@ -1321,7 +1322,7 @@ impl Pager {
     pub fn add_dirty(&self, page: &Page) {
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id as usize);
+        dirty_pages.insert(page.get().id);
         page.set_dirty();
     }
 
@@ -1671,7 +1672,7 @@ impl Pager {
                 let content = page.get_contents();
                 content.as_ptr().copy_from_slice(raw_page);
                 turso_assert!(
-                    page.get().id == header.page_number as i64,
+                    page.get().id == header.page_number as usize,
                     "page has unexpected id"
                 );
             }
@@ -1876,7 +1877,7 @@ impl Pager {
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn free_page(&self, mut page: Option<PageRef>, page_id: i64) -> Result<IOResult<()>> {
+    pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> Result<IOResult<()>> {
         tracing::trace!("free_page(page_id={})", page_id);
         const TRUNK_PAGE_HEADER_SIZE: usize = 8;
         const LEAF_ENTRY_SIZE: usize = 4;
@@ -1893,7 +1894,7 @@ impl Pager {
         loop {
             match &mut *state {
                 FreePageState::Start => {
-                    if page_id < 2 || page_id as usize > header.database_size.get() as usize {
+                    if page_id < 2 || page_id > header.database_size.get() as usize {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
@@ -1915,7 +1916,7 @@ impl Pager {
                             (page, None)
                         }
                         None => {
-                            let (page, c) = self.read_page(page_id)?;
+                            let (page, c) = self.read_page(page_id as i64)?;
                             (page, Some(c))
                         }
                     };
@@ -1949,7 +1950,7 @@ impl Pager {
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(
-                            trunk_page.get().id == trunk_page_id as i64,
+                            trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
                         self.add_dirty(&trunk_page);
@@ -2049,7 +2050,7 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id as usize);
+                let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
@@ -2196,7 +2197,7 @@ impl Pager {
                         trunk_page.get().id
                     );
                     trunk_page.get_contents().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(trunk_page.get().id as usize);
+                    let page_key = PageCacheKey::new(trunk_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
@@ -2228,7 +2229,7 @@ impl Pager {
                         leaf_page.get().id
                     );
                     leaf_page.get_contents().as_ptr().fill(0);
-                    let page_key = PageCacheKey::new(leaf_page.get().id as usize);
+                    let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
@@ -2299,11 +2300,11 @@ impl Pager {
 
     pub fn update_dirty_loaded_page_in_cache(
         &self,
-        id: i64,
+        id: usize,
         page: PageRef,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(id as usize);
+        let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());

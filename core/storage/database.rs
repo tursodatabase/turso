@@ -62,17 +62,17 @@ impl Default for IOContext {
 pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
 
-    fn read_page(&self, page_idx: i64, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
     fn write_page(
         &self,
-        page_idx: i64,
+        page_idx: usize,
         buffer: Arc<Buffer>,
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
     fn write_pages(
         &self,
-        first_page_idx: i64,
+        first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
         io_ctx: &IOContext,
@@ -96,8 +96,10 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn read_page(&self, page_idx: i64, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
-        assert!(page_idx >= 0, "page should be positive");
+    fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
+        // casting to i64 to check some weird casting that could've happened before. This should be
+        // okay since page numbers should be u32
+        assert!(page_idx as i64 >= 0, "page should be positive");
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);
@@ -185,7 +187,7 @@ impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn write_page(
         &self,
-        page_idx: i64,
+        page_idx: usize,
         buffer: Arc<Buffer>,
         io_ctx: &IOContext,
         c: Completion,
@@ -208,7 +210,7 @@ impl DatabaseStorage for DatabaseFile {
 
     fn write_pages(
         &self,
-        first_page_idx: i64,
+        first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
         io_ctx: &IOContext,
@@ -226,12 +228,12 @@ impl DatabaseStorage for DatabaseFile {
             EncryptionOrChecksum::Encryption(ctx) => buffers
                 .into_iter()
                 .enumerate()
-                .map(|(i, buffer)| encrypt_buffer(first_page_idx + i as i64, buffer, ctx))
+                .map(|(i, buffer)| encrypt_buffer(first_page_idx + i, buffer, ctx))
                 .collect::<Vec<_>>(),
             EncryptionOrChecksum::Checksum(ctx) => buffers
                 .into_iter()
                 .enumerate()
-                .map(|(i, buffer)| checksum_buffer(first_page_idx + i as i64, buffer, ctx))
+                .map(|(i, buffer)| checksum_buffer(first_page_idx + i, buffer, ctx))
                 .collect::<Vec<_>>(),
             EncryptionOrChecksum::None => buffers,
         };
@@ -263,12 +265,12 @@ impl DatabaseFile {
     }
 }
 
-fn encrypt_buffer(page_idx: i64, buffer: Arc<Buffer>, ctx: &EncryptionContext) -> Arc<Buffer> {
+fn encrypt_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &EncryptionContext) -> Arc<Buffer> {
     let encrypted_data = ctx.encrypt_page(buffer.as_slice(), page_idx).unwrap();
     Arc::new(Buffer::new(encrypted_data.to_vec()))
 }
 
-fn checksum_buffer(page_idx: i64, buffer: Arc<Buffer>, ctx: &ChecksumContext) -> Arc<Buffer> {
+fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) -> Arc<Buffer> {
     ctx.add_checksum_to_page(buffer.as_mut_slice(), page_idx)
         .unwrap();
     buffer

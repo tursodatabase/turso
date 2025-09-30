@@ -299,17 +299,17 @@ impl PageCache {
             .clone();
         if entry.is_locked() {
             return Err(CacheError::Locked {
-                pgno: entry.get().id as usize,
+                pgno: entry.get().id,
             });
         }
         if entry.is_dirty() {
             return Err(CacheError::Dirty {
-                pgno: entry.get().id as usize,
+                pgno: entry.get().id,
             });
         }
         if entry.is_pinned() {
             return Err(CacheError::Pinned {
-                pgno: entry.get().id as usize,
+                pgno: entry.get().id,
             });
         }
         if clean_page {
@@ -538,9 +538,7 @@ impl PageCache {
             let e = &self.entries[node.slot_index];
             if let Some(ref p) = e.page {
                 if p.is_dirty() {
-                    return Err(CacheError::Dirty {
-                        pgno: p.get().id as usize,
-                    });
+                    return Err(CacheError::Dirty { pgno: p.get().id });
                 }
             }
         }
@@ -1372,8 +1370,8 @@ mod tests {
             // Verify all pages in reference_map are in cache
             for (key, page) in &reference_map {
                 let cached_page = cache.peek(key, false).expect("Page should be in cache");
-                assert_eq!(cached_page.get().id, key.0 as i64);
-                assert_eq!(page.get().id, key.0 as i64);
+                assert_eq!(cached_page.get().id, key.0);
+                assert_eq!(page.get().id, key.0);
             }
         }
     }

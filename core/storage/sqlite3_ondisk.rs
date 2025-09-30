@@ -294,7 +294,7 @@ pub struct DatabaseHeader {
 }
 
 impl DatabaseHeader {
-    pub const PAGE_ID: i64 = 1;
+    pub const PAGE_ID: usize = 1;
     pub const SIZE: usize = size_of::<Self>();
 
     const _CHECK: () = {
@@ -927,13 +927,13 @@ pub fn begin_read_page(
         finish_read_page(page_idx, buf, page.clone());
     });
     let c = Completion::new_read(buf, complete);
-    db_file.read_page(page_idx as i64, io_ctx, c)
+    db_file.read_page(page_idx, io_ctx, c)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
-    let pos = if page_idx as i64 == DatabaseHeader::PAGE_ID {
+    let pos = if page_idx == DatabaseHeader::PAGE_ID {
         DatabaseHeader::SIZE
     } else {
         0
@@ -1025,13 +1025,13 @@ pub fn write_pages_vectored(
 
     const EST_BUFF_CAPACITY: usize = 32;
     let mut run_bufs = Vec::with_capacity(EST_BUFF_CAPACITY);
-    let mut run_start_id: Option<i64> = None;
+    let mut run_start_id: Option<usize> = None;
     let mut completions = Vec::new();
 
     let mut iter = batch.iter().peekable();
     while let Some((id, buffer)) = iter.next() {
         if run_start_id.is_none() {
-            run_start_id = Some(*id as i64);
+            run_start_id = Some(*id);
         }
         run_bufs.push(buffer.clone());
 
@@ -1975,7 +1975,7 @@ pub fn begin_read_wal_frame(
                         bytes_read > 0,
                         "Expected to read some data on success for page_idx={page_idx}"
                     );
-                    match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx as i64) {
+                    match encryption_ctx.decrypt_page(encrypted_buf.as_slice(), page_idx) {
                         Ok(decrypted_data) => {
                             encrypted_buf
                                 .as_mut_slice()
@@ -1986,9 +1986,7 @@ pub fn begin_read_wal_frame(
                             tracing::error!(
                                 "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            original_complete(Err(CompletionError::DecryptionError {
-                                page_idx: page_idx as i64,
-                            }));
+                            original_complete(Err(CompletionError::DecryptionError { page_idx }));
                         }
                     }
                 });
@@ -2011,7 +2009,7 @@ pub fn begin_read_wal_frame(
                         return;
                     }
 
-                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx as i64) {
+                    match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                         Ok(_) => {
                             original_c(Ok((buf, bytes_read)));
                         }

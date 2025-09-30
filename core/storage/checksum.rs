@@ -14,7 +14,7 @@ impl ChecksumContext {
     }
 
     #[cfg(not(feature = "checksum"))]
-    pub fn add_checksum_to_page(&self, _page: &mut [u8], _page_id: i64) -> Result<()> {
+    pub fn add_checksum_to_page(&self, _page: &mut [u8], _page_id: usize) -> Result<()> {
         Ok(())
     }
 
@@ -22,13 +22,13 @@ impl ChecksumContext {
     pub fn verify_checksum(
         &self,
         _page: &mut [u8],
-        _page_id: i64,
+        _page_id: usize,
     ) -> std::result::Result<(), CompletionError> {
         Ok(())
     }
 
     #[cfg(feature = "checksum")]
-    pub fn add_checksum_to_page(&self, page: &mut [u8], _page_id: i64) -> Result<()> {
+    pub fn add_checksum_to_page(&self, page: &mut [u8], _page_id: usize) -> Result<()> {
         if page.len() != CHECKSUM_PAGE_SIZE {
             return Ok(());
         }
@@ -47,7 +47,7 @@ impl ChecksumContext {
     pub fn verify_checksum(
         &self,
         page: &mut [u8],
-        page_id: i64,
+        page_id: usize,
     ) -> std::result::Result<(), CompletionError> {
         if page.len() != CHECKSUM_PAGE_SIZE {
             return Ok(());
