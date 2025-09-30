@@ -2474,9 +2474,11 @@ pub fn op_auto_commit(
             }
         } else {
             let is_begin = !*auto_commit && !*rollback;
-            return Err(LimboError::TxError(
-                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-            ));
+            if is_begin {
+                return Err(LimboError::TxError(
+                    "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+                ));
+            }
         }
     }
 
