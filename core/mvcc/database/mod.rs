@@ -527,8 +527,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| *v.value()));
-                self.write_set
-                    .sort_by(|a, b| a.table_id.cmp(&b.table_id).then(a.row_id.cmp(&b.row_id)));
+                self.write_set.sort_by(|a, b| {
+                    // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
+                    b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
+                });
                 if self.write_set.is_empty() {
                     tx.state.store(TransactionState::Committed(end_ts));
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
