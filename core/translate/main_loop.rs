@@ -1155,7 +1155,7 @@ fn emit_seek(
         // (this is safe as table BTree keys are always non-null single integer)
         match seek_def.iter_dir {
             IterationDirection::Forwards => {
-                if seek_index.is_some() && seek_index.unwrap().columns[0].order == SortOrder::Asc {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Asc) {
                     program.emit_null(start_reg, None);
                     program.emit_insn(Insn::SeekGT {
                         is_index,
@@ -1172,7 +1172,7 @@ fn emit_seek(
                 }
             }
             IterationDirection::Backwards => {
-                if seek_index.is_some() && seek_index.unwrap().columns[0].order == SortOrder::Desc {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Desc) {
                     program.emit_null(start_reg, None);
                     program.emit_insn(Insn::SeekLT {
                         is_index,
@@ -1292,7 +1292,7 @@ fn emit_seek_termination(
         // then, we must explicitly stop before them as seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
         match seek_def.iter_dir {
             IterationDirection::Forwards => {
-                if seek_index.is_some() && seek_index.unwrap().columns[0].order == SortOrder::Desc {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Desc) {
                     program.emit_null(start_reg, None);
                     program.emit_insn(Insn::IdxGE {
                         cursor_id: seek_cursor_id,
@@ -1303,7 +1303,7 @@ fn emit_seek_termination(
                 }
             }
             IterationDirection::Backwards => {
-                if seek_index.is_some() && seek_index.unwrap().columns[0].order == SortOrder::Asc {
+                if seek_index.is_some_and(|index| index.columns[0].order == SortOrder::Asc) {
                     program.emit_null(start_reg, None);
                     program.emit_insn(Insn::IdxLE {
                         cursor_id: seek_cursor_id,
