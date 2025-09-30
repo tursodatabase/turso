@@ -1930,13 +1930,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         loop {
             match reader.next_record(&pager.io).unwrap() {
                 StreamingResult::InsertRow { row, rowid } => {
-                    tracing::trace!("read {row:?} with rowid {rowid:?}");
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         // Sqlite schema row version inserts
                         let row_data = row.data.clone();
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let record_values = record_cursor.get_values(&record).unwrap();
+                        println!("record_values: {:?}", record_values);
                         let RefValue::Integer(root_page) = record_values[3] else {
                             panic!(
                                 "Expected integer value for root page, got {:?}",

@@ -68,10 +68,10 @@ mod tests {
                     let tx = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
-                        table_id: (-1).into(),
+                        table_id: (-2).into(),
                         row_id: id,
                     };
-                    let row = generate_simple_string_row((-1).into(), id.row_id, "Hello");
+                    let row = generate_simple_string_row((-2).into(), id.row_id, "Hello");
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     let tx = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
@@ -89,10 +89,10 @@ mod tests {
                     let tx = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
-                        table_id: (-1).into(),
+                        table_id: (-2).into(),
                         row_id: id,
                     };
-                    let row = generate_simple_string_row((-1).into(), id.row_id, "World");
+                    let row = generate_simple_string_row((-2).into(), id.row_id, "World");
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     let tx = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
@@ -130,11 +130,11 @@ mod tests {
                     let tx = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
                     let id = i % 16;
                     let id = RowID {
-                        table_id: (-1).into(),
+                        table_id: (-2).into(),
                         row_id: id,
                     };
                     let row = generate_simple_string_row(
-                        (-1).into(),
+                        (-2).into(),
                         id.row_id,
                         &format!("{prefix} @{tx}"),
                     );

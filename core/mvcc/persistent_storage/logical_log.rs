@@ -452,13 +452,13 @@ mod tests {
         mvcc::{
             database::{
                 tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-                RowID,
+                Row, RowID,
             },
             persistent_storage::Storage,
             LocalClock, MvStore,
         },
-        types::ImmutableRecord,
-        OpenFlags, RefValue,
+        types::{ImmutableRecord, Text},
+        OpenFlags, RefValue, Value,
     };
 
     use super::LogRecordType;
@@ -473,8 +473,34 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-
-            let row = generate_simple_string_row((-1).into(), 1, "foo");
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            // now insert a row into table -2
+            let row = generate_simple_string_row((-2).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             conn.close().unwrap();
@@ -490,7 +516,7 @@ mod tests {
         mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         let row = mvcc_store
-            .read(tx, RowID::new((-1).into(), 1))
+            .read(tx, RowID::new((-2).into(), 1))
             .unwrap()
             .unwrap();
         let record = ImmutableRecord::from_bin_record(row.data.clone());
@@ -505,7 +531,7 @@ mod tests {
     #[test]
     fn test_logical_log_read_multiple_transactions() {
         let values = (0..100)
-            .map(|i| (RowID::new((-1).into(), i), format!("foo_{i}")))
+            .map(|i| (RowID::new((-2).into(), i), format!("foo_{i}")))
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
@@ -514,6 +540,35 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
 
+            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            // now insert a row into table -2
             // generate insert per transaction
             for (rowid, value) in &values {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
@@ -562,7 +617,7 @@ mod tests {
                 match op_type {
                     0 => {
                         let row_id = rng.next_u64();
-                        let rowid = RowID::new((-1).into(), row_id as i64);
+                        let rowid = RowID::new((-2).into(), row_id as i64);
                         let row = generate_simple_string_row(
                             rowid.table_id,
                             rowid.row_id,
