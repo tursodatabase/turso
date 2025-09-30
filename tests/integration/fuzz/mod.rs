@@ -672,6 +672,15 @@ mod tests {
 
     #[test]
     pub fn partial_index_mutation_and_upsert_fuzz() {
+        index_mutation_upsert_fuzz(1.0, 1);
+    }
+
+    #[test]
+    pub fn simple_index_mutation_and_upsert_fuzz() {
+        index_mutation_upsert_fuzz(0.0, 0);
+    }
+
+    fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
         const INNER_ITERS: usize = 500;
@@ -723,6 +732,7 @@ mod tests {
             let functions = ["lower", "upper", "length"];
 
             let num_pidx = rng.random_range(0..=3);
+            let mut conflict_match_targets = vec!["".to_string(), "(id)".to_string()];
             let mut idx_ddls: Vec<String> = Vec::new();
             for i in 0..num_pidx {
                 // Pick 1 or 2 key columns; always include "k" sometimes to get frequent conflicts.
@@ -790,13 +800,24 @@ mod tests {
                     parts.join(" AND ")
                 };
 
-                let ddl = format!(
-                    "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
-                    outer,
-                    i,
-                    key_cols.join(","),
-                    pred
-                );
+                let ddl = if rng.random_bool(partial_index_prob) {
+                    format!(
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
+                        outer,
+                        i,
+                        key_cols.join(","),
+                        pred
+                    )
+                } else {
+                    // ON CONFLICT (...) can use only column set with non-partial UNIQUE constraint
+                    conflict_match_targets.push(format!("({})", key_cols.join(",")));
+                    format!(
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({})",
+                        outer,
+                        i,
+                        key_cols.join(","),
+                    )
+                };
                 idx_ddls.push(ddl.clone());
                 // Create in both engines
                 println!("{ddl};");
@@ -817,9 +838,11 @@ mod tests {
                     vals.push(v);
                 }
                 let ins = format!("INSERT INTO t VALUES ({})", vals.join(", "));
+                println!("{ins}; -- seed");
                 // Execute on both; ignore errors due to partial unique conflicts (keep seeding going)
-                let _ = sqlite.execute(&ins, rusqlite::params![]);
-                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &ins);
+                let sqlite_res = sqlite.execute(&ins, rusqlite::params![]);
+                let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &ins);
+                assert!(sqlite_res.is_ok() == limbo_res.is_ok());
             }
 
             for _ in 0..INNER_ITERS {
@@ -909,37 +932,43 @@ mod tests {
                                 });
                             }
                         }
-                        if rng.random_bool(0.3) {
-                            // 30% chance ON CONFLICT DO UPDATE SET ...
-                            let mut set_list = Vec::new();
-                            let num_set = rng.random_range(1..=cols_list.len());
-                            let set_cols = cols_list
-                                .choose_multiple(&mut rng, num_set)
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for c in set_cols.iter() {
-                                let v = if c == "k" {
-                                    format!("'{}'", K_POOL.choose(&mut rng).unwrap())
-                                } else if rng.random_bool(0.2) {
-                                    "NULL".into()
-                                } else {
-                                    rng.random_range(-5..=15).to_string()
-                                };
-                                set_list.push(format!("{c} = {v}"));
+                        let chain_length = rng.random_range(0..=conflict_chain_max_len);
+                        let mut on_conflict = String::new();
+                        for _ in 0..chain_length {
+                            let idx = rng.random_range(0..conflict_match_targets.len());
+                            let target = &conflict_match_targets[idx];
+                            if rng.random_bool(0.8) {
+                                let mut set_list = Vec::new();
+                                let num_set = rng.random_range(1..=cols_list.len());
+                                let set_cols = cols_list
+                                    .choose_multiple(&mut rng, num_set)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for c in set_cols.iter() {
+                                    let v = if c == "k" {
+                                        format!("'{}'", K_POOL.choose(&mut rng).unwrap())
+                                    } else if rng.random_bool(0.2) {
+                                        "NULL".into()
+                                    } else {
+                                        rng.random_range(-5..=15).to_string()
+                                    };
+                                    set_list.push(format!("{c} = {v}"));
+                                }
+                                on_conflict.push_str(&format!(
+                                    " ON CONFLICT{} DO UPDATE SET {}",
+                                    target,
+                                    set_list.join(", ")
+                                ));
+                            } else {
+                                on_conflict.push_str(&format!(" ON CONFLICT{} DO NOTHING", target));
                             }
-                            format!(
-                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO UPDATE SET {}",
-                                cols_list.join(","),
-                                vals_list.join(","),
-                                set_list.join(", ")
-                            )
-                        } else {
-                            format!(
-                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO NOTHING",
-                                cols_list.join(","),
-                                vals_list.join(",")
-                            )
                         }
+                        format!(
+                            "INSERT INTO t({}) VALUES({}) {}",
+                            cols_list.join(","),
+                            vals_list.join(","),
+                            on_conflict
+                        )
                     }
                     _ => unreachable!(),
                 };
