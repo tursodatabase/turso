@@ -474,7 +474,7 @@ mod tests {
             let mvcc_store = db.get_mvcc_store();
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
 
-            let row = generate_simple_string_row(1, 1, "foo");
+            let row = generate_simple_string_row((-1).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             conn.close().unwrap();
@@ -489,7 +489,10 @@ mod tests {
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
         mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-        let row = mvcc_store.read(tx, RowID::new(1, 1)).unwrap().unwrap();
+        let row = mvcc_store
+            .read(tx, RowID::new((-1).into(), 1))
+            .unwrap()
+            .unwrap();
         let record = ImmutableRecord::from_bin_record(row.data.clone());
         let values = record.get_values();
         let foo = values.first().unwrap();
@@ -502,7 +505,7 @@ mod tests {
     #[test]
     fn test_logical_log_read_multiple_transactions() {
         let values = (0..100)
-            .map(|i| (RowID::new(1, i), format!("foo_{i}")))
+            .map(|i| (RowID::new((-1).into(), i), format!("foo_{i}")))
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
@@ -559,7 +562,7 @@ mod tests {
                 match op_type {
                     0 => {
                         let row_id = rng.next_u64();
-                        let rowid = RowID::new(1, row_id as i64);
+                        let rowid = RowID::new((-1).into(), row_id as i64);
                         let row = generate_simple_string_row(
                             rowid.table_id,
                             rowid.row_id,
