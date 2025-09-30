@@ -1148,9 +1148,19 @@ fn emit_seek(
         // depending on the iteration direction.
         match seek_def.iter_dir {
             IterationDirection::Forwards => {
-                program.emit_insn(Insn::Rewind {
+                // the seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
+                // so, NULL always must be filtered out
+                // (note, that complex filters like c < ? OR c IS NULL will produce Scan operation instead of Search)
+                program.emit_insn(Insn::Null {
+                    dest: start_reg,
+                    dest_end: None,
+                });
+                program.emit_insn(Insn::SeekGT {
+                    is_index,
                     cursor_id: seek_cursor_id,
-                    pc_if_empty: loop_end,
+                    start_reg,
+                    num_regs: 1,
+                    target_pc: loop_end,
                 });
             }
             IterationDirection::Backwards => {
