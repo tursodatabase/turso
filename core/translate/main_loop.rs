@@ -577,7 +577,7 @@ pub fn open_loop(
                                 } else {
                                     false
                                 };
-                                Some(emit_autoindex(
+                                let _ = emit_autoindex(
                                     program,
                                     index,
                                     table_cursor_id.expect(
@@ -586,7 +586,7 @@ pub fn open_loop(
                                     index_cursor_id
                                         .expect("an ephemeral index must have an index cursor"),
                                     table_has_rowid,
-                                )?);
+                                )?;
                             }
                         }
 
