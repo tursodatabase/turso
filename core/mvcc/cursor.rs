@@ -28,9 +28,10 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
     pub fn new(
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
-        table_id: MVTableId,
+        root_page_or_table_id: i64,
         pager: Arc<Pager>,
     ) -> Result<MvccLazyCursor<Clock>> {
+        let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
         db.maybe_initialize_table(table_id, pager)?;
         let cursor = Self {
             db,

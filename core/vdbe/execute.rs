@@ -1038,9 +1038,8 @@ pub fn op_open_read(
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
         let mv_store = mv_store.unwrap().clone();
-        let table_id = mv_store.get_table_id_from_root_page(*root_page);
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
@@ -6649,9 +6648,8 @@ pub fn op_open_write(
     };
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
         let mv_store = mv_store.unwrap().clone();
-        let table_id = mv_store.get_table_id_from_root_page(root_page);
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
@@ -7421,9 +7419,8 @@ pub fn op_open_ephemeral(
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
                 let mv_store = mv_store.unwrap().clone();
-                let table_id = mv_store.get_table_id_from_root_page(root_page);
                 let mv_cursor = Arc::new(RwLock::new(
-                    MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+                    MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
                 ));
                 Some(mv_cursor)
             } else {
@@ -7520,11 +7517,10 @@ pub fn op_open_dup(
 
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
         let mv_store = mv_store.unwrap().clone();
-        let table_id = mv_store.get_table_id_from_root_page(root_page);
         let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
             mv_store,
             tx_id,
-            table_id,
+            root_page,
             pager.clone(),
         )?));
         Some(mv_cursor)

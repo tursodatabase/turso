@@ -759,7 +759,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
         .begin_tx(db.conn.pager.read().clone())
         .unwrap();
 
-    let table_id = MvTableId::new(-1);
+    let table_id = -1;
     for i in initial_keys {
         let id = RowID::new(table_id, *i);
         let data = format!("row{i}");
@@ -821,7 +821,7 @@ pub(crate) fn commit_tx_no_conn(
 #[test]
 fn test_lazy_scan_cursor_basic() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 3, 4, 5]);
-    let table_id = MvTableId::new(-1);
+    let table_id = -1;
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
@@ -856,7 +856,7 @@ fn test_lazy_scan_cursor_basic() {
 #[test]
 fn test_lazy_scan_cursor_with_gaps() {
     let (db, tx_id) = setup_test_db();
-    let table_id = MvTableId::new(-1);
+    let table_id = -1;
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
@@ -892,7 +892,7 @@ fn test_lazy_scan_cursor_with_gaps() {
 #[test]
 fn test_cursor_basic() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 3, 4, 5]);
-    let table_id = MvTableId::new(-1);
+    let table_id = -1;
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
@@ -938,7 +938,7 @@ fn test_cursor_with_empty_table() {
         .mvcc_store
         .begin_tx(db.conn.pager.read().clone())
         .unwrap();
-    let table_id = MvTableId::new(-1); // Empty table
+    let table_id = -1; // Empty table
 
     // Test LazyScanCursor with empty table
     let mut cursor = MvccLazyCursor::new(
@@ -955,7 +955,7 @@ fn test_cursor_with_empty_table() {
 #[test]
 fn test_cursor_modification_during_scan() {
     let (db, tx_id) = setup_lazy_db(&[1, 2, 4, 5]);
-    let table_id = MvTableId::new(-1);
+    let table_id = -1;
 
     let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
