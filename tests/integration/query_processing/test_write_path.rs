@@ -1,4 +1,4 @@
-use crate::common::{self, maybe_setup_tracing};
+use crate::common::{self, limbo_exec_rows, maybe_setup_tracing};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
@@ -789,4 +789,25 @@ fn test_insert_with_column_names() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+pub fn delete_search_op_ignore_nulls() {
+    let limbo = TempDatabase::new_empty(true);
+    let conn = limbo.db.connect().unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
+        "CREATE UNIQUE INDEX t_idx ON t(c);",
+        "INSERT INTO t VALUES (NULL, NULL)",
+        "DELETE FROM t WHERE c < -1;",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(
+        vec![vec![
+            rusqlite::types::Value::Integer(1),
+            rusqlite::types::Value::Null
+        ]],
+        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
+    );
 }
