@@ -62,4 +62,8 @@ pub struct Opts {
         help = "Select VFS. options are io_uring (if feature enabled), memory, and syscall"
     )]
     pub vfs: Option<String>,
+
+    /// Number of tables to use
+    #[clap(long, help = "Select number of tables to create")]
+    pub tables: Option<usize>,
 }
