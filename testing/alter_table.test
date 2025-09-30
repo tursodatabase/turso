@@ -211,3 +211,12 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-notnull-col {
 	ALTER TABLE t ADD b NOT NULL;
 	SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
 } {{CREATE TABLE t (a, b NOT NULL)}}
+
+# https://github.com/tursodatabase/turso/issues/3448
+do_execsql_test_on_specific_db {:memory:} drop-column-regression {
+    CREATE TABLE t (id, col1 BLOB, col2 UNIQUE);
+    INSERT INTO t VALUES ('id', 'col1', 'col2');
+    ALTER TABLE t ADD COLUMN col3 BLOB;
+    ALTER TABLE t DROP COLUMN col1;
+    SELECT col3 FROM t;
+} {{}}
