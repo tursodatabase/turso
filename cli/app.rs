@@ -78,6 +78,8 @@ pub struct Opts {
     pub mcp: bool,
     #[clap(long, help = "Enable experimental logical log feature")]
     pub experimental_logical_log: bool,
+    #[clap(long, help = "Enable experimental encryption feature")]
+    pub experimental_encryption: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -170,6 +172,7 @@ impl Limbo {
                 opts.experimental_mvcc,
                 opts.experimental_views,
                 opts.experimental_strict,
+                opts.experimental_encryption,
             )?
         } else {
             let flags = if opts.readonly {
@@ -186,6 +189,7 @@ impl Limbo {
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
+                    .with_encryption(opts.experimental_encryption)
                     .turso_cli(),
                 None,
             )?;

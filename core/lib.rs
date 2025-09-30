@@ -108,6 +108,7 @@ pub struct DatabaseOpts {
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
+    pub enable_encryption: bool,
     enable_load_extension: bool,
 }
 
@@ -118,6 +119,7 @@ impl Default for DatabaseOpts {
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
+            enable_encryption: false,
             enable_load_extension: false,
         }
     }
@@ -151,6 +153,11 @@ impl DatabaseOpts {
 
     pub fn with_strict(mut self, enable: bool) -> Self {
         self.enable_strict = enable;
+        self
+    }
+
+    pub fn with_encryption(mut self, enable: bool) -> Self {
+        self.enable_encryption = enable;
         self
     }
 }
@@ -493,6 +500,7 @@ impl Database {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
+        pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
 
         if self.mv_store.is_some() {
@@ -1382,6 +1390,8 @@ impl Connection {
         mvcc: bool,
         views: bool,
         strict: bool,
+        // flag to opt-in encryption support
+        encryption: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1396,7 +1406,8 @@ impl Connection {
                     .with_mvcc(mvcc)
                     .with_indexes(use_indexes)
                     .with_views(views)
-                    .with_strict(strict),
+                    .with_strict(strict)
+                    .with_encryption(encryption),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1424,7 +1435,8 @@ impl Connection {
                 .with_mvcc(mvcc)
                 .with_indexes(use_indexes)
                 .with_views(views)
-                .with_strict(strict),
+                .with_strict(strict)
+                .with_encryption(encryption),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -1819,6 +1831,7 @@ impl Connection {
         }
         self.pager.write().clear_page_cache();
         let pager = self.db.init_pager(Some(size.get() as usize))?;
+        pager.enable_encryption(self.db.opts.enable_encryption);
         *self.pager.write() = Arc::new(pager);
         self.pager.read().set_initial_page_size(size);
 

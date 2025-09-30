@@ -3,6 +3,8 @@ use rand::{rng, RngCore};
 use std::panic;
 use turso_core::Row;
 
+const ENABLE_ENCRYPTION: bool = true;
+
 #[test]
 fn test_per_page_encryption() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -44,7 +46,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false, false)?;
+        let (_io, conn) =
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -59,7 +62,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false, false)?;
+        let (_io, conn) =
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
         run_query(
             &tmp_db,
             &conn,
@@ -73,7 +77,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false, false)?;
+        let (_io, conn) =
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
         run_query(
             &tmp_db,
             &conn,
@@ -95,7 +100,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false, false)?;
+        let (_io, conn) =
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
         }));
@@ -108,7 +114,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         //test connecting to encrypted db using insufficient encryption parameters in URI.This should panic.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false).unwrap();
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
+                .unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -121,7 +128,8 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             db_path.to_str().unwrap()
         );
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false).unwrap();
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
+                .unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -187,7 +195,8 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, true, false, false, false)?;
+        let (_io, conn) =
+            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
             assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
@@ -245,8 +254,15 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
         );
 
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let (_io, conn) =
-                turso_core::Connection::from_uri(&uri, true, false, false, false).unwrap();
+            let (_io, conn) = turso_core::Connection::from_uri(
+                &uri,
+                true,
+                false,
+                false,
+                false,
+                ENABLE_ENCRYPTION,
+            )
+            .unwrap();
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
         }));
 
@@ -330,8 +346,15 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
             );
 
             let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                let (_io, conn) =
-                    turso_core::Connection::from_uri(&uri, true, false, false, false).unwrap();
+                let (_io, conn) = turso_core::Connection::from_uri(
+                    &uri,
+                    true,
+                    false,
+                    false,
+                    false,
+                    ENABLE_ENCRYPTION,
+                )
+                .unwrap();
                 run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})
                     .unwrap();
             }));

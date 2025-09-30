@@ -29,7 +29,9 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            turso_core::DatabaseOpts::new()
+                .with_indexes(enable_indexes)
+                .with_encryption(true),
             None,
         )
         .unwrap();
