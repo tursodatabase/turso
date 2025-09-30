@@ -38,6 +38,7 @@ class Database {
 
   private db: NativeDatabase;
   private execLock: AsyncLock;
+  private connected: boolean = false;
   private _inTransaction: boolean = false;
 
   constructor(db: NativeDatabase) {
@@ -56,7 +57,9 @@ class Database {
    * connect database
    */
   async connect() {
+    if (this.connected) { return; }
     await this.db.connectAsync();
+    this.connected = true;
   }
 
   /**
@@ -70,7 +73,11 @@ class Database {
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this.db, this.execLock);
+      if (this.connected) {
+        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock);
+      } else {
+        return new Statement(maybePromise(this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock)
+      }
     } catch (err) {
       throw convertError(err);
     }
@@ -218,15 +225,43 @@ class Database {
   }
 }
 
+interface MaybeLazy<T> {
+  apply(fn: (value: T) => void);
+  resolve(): Promise<T>,
+  must(): T;
+}
+
+function maybePromise<T>(lazy: Promise<T>): MaybeLazy<T> {
+  let value = null;
+  return {
+    apply(fn) { lazy.then(x => { fn(x); return x; }); },
+    resolve() { return lazy.then(x => value = x); },
+    must() {
+      if (value == null) {
+        throw new Error(`database must be connected before execution the function`)
+      }
+      return value;
+    },
+  }
+}
+
+function maybeValue<T>(value: T): MaybeLazy<T> {
+  return {
+    apply(fn) { fn(value); },
+    resolve() { return Promise.resolve(value); },
+    must() { return value; },
+  }
+}
+
 /**
  * Statement represents a prepared SQL statement that can be executed.
  */
 class Statement {
-  private stmt: NativeStatement;
+  private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
   private execLock: AsyncLock;
 
-  constructor(stmt: NativeStatement, db: NativeDatabase, execLock: AsyncLock) {
+  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: AsyncLock) {
     this.stmt = stmt;
     this.db = db;
     this.execLock = execLock;
@@ -238,7 +273,7 @@ class Statement {
    * @param raw Enable or disable raw mode. If you don't pass the parameter, raw mode is enabled.
    */
   raw(raw) {
-    this.stmt.raw(raw);
+    this.stmt.apply(s => s.raw(raw));
     return this;
   }
 
@@ -248,7 +283,7 @@ class Statement {
    * @param pluckMode Enable or disable pluck mode. If you don't pass the parameter, pluck mode is enabled.
    */
   pluck(pluckMode) {
-    this.stmt.pluck(pluckMode);
+    this.stmt.apply(s => s.pluck(pluckMode));
     return this;
   }
 
@@ -258,7 +293,7 @@ class Statement {
    * @param {boolean} [toggle] - Whether to use safe integers.
    */
   safeIntegers(toggle) {
-    this.stmt.safeIntegers(toggle);
+    this.stmt.apply(s => s.safeIntegers(toggle));
     return this;
   }
 
@@ -268,7 +303,7 @@ class Statement {
    * @returns {Array} An array of column objects with name, column, table, database, and type properties.
    */
   columns() {
-    return this.stmt.columns();
+    return this.stmt.must().columns();
   }
 
   get source() {
@@ -289,13 +324,14 @@ class Statement {
   async run(...bindParameters) {
     const totalChangesBefore = this.db.totalChanges();
 
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    let stmt = await this.stmt.resolve();
+    stmt.reset();
+    bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await this.stmt.stepSync();
+        const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.db.ioLoopAsync();
           continue;
@@ -324,13 +360,15 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async get(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    let stmt = await this.stmt.resolve();
+
+    stmt.reset();
+    bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await this.stmt.stepSync();
+        const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.db.ioLoopAsync();
           continue;
@@ -339,7 +377,7 @@ class Statement {
           return undefined;
         }
         if (stepResult === STEP_ROW) {
-          return this.stmt.row();
+          return stmt.row();
         }
       }
     } finally {
@@ -353,13 +391,15 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async *iterate(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    let stmt = await this.stmt.resolve();
+
+    stmt.reset();
+    bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await this.stmt.stepSync();
+        const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.db.ioLoopAsync();
           continue;
@@ -368,7 +408,7 @@ class Statement {
           break;
         }
         if (stepResult === STEP_ROW) {
-          yield this.stmt.row();
+          yield stmt.row();
         }
       }
     } finally {
@@ -382,14 +422,16 @@ class Statement {
    * @param bindParameters - The bind parameters for executing the statement.
    */
   async all(...bindParameters) {
-    this.stmt.reset();
-    bindParams(this.stmt, bindParameters);
+    let stmt = await this.stmt.resolve();
+
+    stmt.reset();
+    bindParams(stmt, bindParameters);
     const rows: any[] = [];
 
     await this.execLock.acquire();
     try {
       while (true) {
-        const stepResult = await this.stmt.stepSync();
+        const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
           await this.db.ioLoopAsync();
           continue;
@@ -398,7 +440,7 @@ class Statement {
           break;
         }
         if (stepResult === STEP_ROW) {
-          rows.push(this.stmt.row());
+          rows.push(stmt.row());
         }
       }
       return rows;
@@ -432,7 +474,14 @@ class Statement {
   }
 
   close() {
-    this.stmt.finalize();
+    let stmt;
+    try {
+      stmt = this.stmt.must();
+    } catch (e) {
+      // ignore error - if stmt wasn't initialized it's fine
+      return;
+    }
+    stmt.finalize();
   }
 }
 
