@@ -10,7 +10,6 @@ use super::plan::TableReferences;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::parameters::PARAM_PREFIX;
 use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::ResultSetColumn;
@@ -3244,26 +3243,25 @@ where
     Ok(WalkControl::Continue)
 }
 
-/// Context needed to walk all expressions in a INSERT|UPDATE|SELECT|DELETE body,
-/// in the order they are encountered, to ensure that the parameters are rewritten from
-/// anonymous ("?") to our internal named scheme so when the columns are re-ordered we are able
-/// to bind the proper parameter values.
 pub struct ParamState {
-    /// ALWAYS starts at 1
-    pub next_param_idx: usize,
+    // flag which allow or forbid usage of parameters during translation of AST to the program
+    //
+    // for example, parameters are not allowed in the partial index definition
+    // so tursodb set allowed to false when it parsed WHERE clause of partial index definition
+    pub allowed: bool,
 }
 
 impl Default for ParamState {
     fn default() -> Self {
-        Self { next_param_idx: 1 }
+        Self { allowed: true }
     }
 }
 impl ParamState {
     pub fn is_valid(&self) -> bool {
-        self.next_param_idx > 0
+        self.allowed
     }
     pub fn disallow() -> Self {
-        Self { next_param_idx: 0 }
+        Self { allowed: false }
     }
 }
 
@@ -3296,16 +3294,10 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                // Rewrite anonymous variables in encounter order.
-                ast::Expr::Variable(var) if var.is_empty() => {
+                ast::Expr::Variable(_) => {
                     if !param_state.is_valid() {
                         crate::bail_parse_error!("Parameters are not allowed in this context");
                     }
-                    *expr = ast::Expr::Variable(format!(
-                        "{}{}",
-                        PARAM_PREFIX, param_state.next_param_idx
-                    ));
-                    param_state.next_param_idx += 1;
                 }
                 ast::Expr::Between {
                     lhs,
