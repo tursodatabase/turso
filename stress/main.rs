@@ -419,8 +419,8 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
         plan.ddl_statements
             .push(lines.next().expect("expected ddl statement").to_string());
     }
-    while let Some(line) = lines.next() {
-        if let Ok(_) = line.parse::<i64>() {
+    for line in lines {
+        if line.parse::<i64>().is_ok() {
             plan.queries_per_thread.push(Vec::new());
         } else {
             plan.queries_per_thread
@@ -479,7 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         path.to_string_lossy().to_string()
     };
 
-    println!("db_file={}", db_file);
+    println!("db_file={db_file}");
 
     let vfs_option = opts.vfs.clone();
 
