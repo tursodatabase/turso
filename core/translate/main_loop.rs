@@ -568,7 +568,7 @@ pub fn open_loop(
                             target_pc: next,
                         });
                     }
-                    Search::Seek { index, seek_def } => {
+                    Search::Seek { index, .. } => {
                         // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                         if let Some(index) = index {
                             if index.ephemeral {
