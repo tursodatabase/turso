@@ -3244,6 +3244,10 @@ where
 }
 
 pub struct ParamState {
+    // flag which allow or forbid usage of parameters during translation of AST to the program
+    //
+    // for example, parameters are not allowed in the partial index definition
+    // so tursodb set allowed to false when it parsed WHERE clause of partial index definition
     pub allowed: bool,
 }
 
