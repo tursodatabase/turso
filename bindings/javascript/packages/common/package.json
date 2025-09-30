@@ -15,11 +15,12 @@
     "README.md"
   ],
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   },
   "scripts": {
     "tsc-build": "npm exec tsc",
     "build": "npm run tsc-build",
-    "test": "echo 'no tests'"
+    "test": "vitest --run"
   }
 }

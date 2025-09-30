@@ -76,7 +76,7 @@ class Database {
       if (this.connected) {
         return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock);
       } else {
-        return new Statement(maybePromise(this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock)
+        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock)
       }
     } catch (err) {
       throw convertError(err);
@@ -231,11 +231,31 @@ interface MaybeLazy<T> {
   must(): T;
 }
 
-function maybePromise<T>(lazy: Promise<T>): MaybeLazy<T> {
+function maybePromise<T>(arg: () => Promise<T>): MaybeLazy<T> {
+  let lazy = arg;
+  let promise = null;
   let value = null;
   return {
-    apply(fn) { lazy.then(x => { fn(x); return x; }); },
-    resolve() { return lazy.then(x => value = x); },
+    apply(fn) {
+      let previous = lazy;
+      lazy = async () => {
+        const result = await previous();
+        fn(result);
+        return result;
+      }
+    },
+    async resolve() {
+      if (promise != null) {
+        return await promise;
+      }
+      let valueResolve, valueReject;
+      promise = new Promise((resolve, reject) => {
+        valueResolve = x => { resolve(x); value = x; }
+        valueReject = reject;
+      });
+      await lazy().then(valueResolve, valueReject);
+      return await promise;
+    },
     must() {
       if (value == null) {
         throw new Error(`database must be connected before execution the function`)
@@ -322,12 +342,12 @@ class Statement {
    * Executes the SQL statement and returns an info object.
    */
   async run(...bindParameters) {
-    const totalChangesBefore = this.db.totalChanges();
-
     let stmt = await this.stmt.resolve();
     stmt.reset();
+
     bindParams(stmt, bindParameters);
 
+    const totalChangesBefore = this.db.totalChanges();
     await this.execLock.acquire();
     try {
       while (true) {
@@ -485,4 +505,4 @@ class Statement {
   }
 }
 
-export { Database, Statement }
+export { Database, Statement, maybePromise, maybeValue }
