@@ -472,11 +472,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = Arc::new(plan);
 
     let tempfile = tempfile::NamedTempFile::new()?;
+    let (_, path) = tempfile.keep().unwrap();
     let db_file = if let Some(db_file) = opts.db_file {
         db_file
     } else {
-        tempfile.path().to_string_lossy().to_string()
+        path.to_string_lossy().to_string()
     };
+
+    println!("db_file={}", db_file);
 
     let vfs_option = opts.vfs.clone();
 
