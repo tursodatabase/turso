@@ -10,10 +10,11 @@ test('in-memory db', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
-test('explicit connect', async () => {
+test('implicit connect', async () => {
     const db = new Database(':memory:');
-    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
-    await db.connect();
+    const defer = db.prepare("SELECT * FROM t");
+    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
+    expect(() => db.prepare("SELECT * FROM t")).toThrowError(/no such table: t/);
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 
