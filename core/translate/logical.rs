@@ -389,13 +389,6 @@ impl Display for Column {
 /// Strip alias wrapper from an expression, returning the underlying expression.
 /// This is useful when comparing expressions where one might be aliased and the other not,
 /// such as when matching SELECT expressions with GROUP BY expressions.
-///
-/// # Examples
-/// ```ignore
-/// let aliased = LogicalExpr::Alias { expr: Box::new(col_expr), alias: "my_alias".to_string() };
-/// let stripped = strip_alias(&aliased);
-/// assert_eq!(stripped, &col_expr);
-/// ```
 pub fn strip_alias(expr: &LogicalExpr) -> &LogicalExpr {
     match expr {
         LogicalExpr::Alias { expr, .. } => expr,
