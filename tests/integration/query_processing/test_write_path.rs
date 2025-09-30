@@ -811,3 +811,31 @@ pub fn delete_search_op_ignore_nulls() {
         limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
     );
 }
+
+#[test]
+pub fn delete_eq_correct() {
+    let limbo = TempDatabase::new_empty(true);
+    let conn = limbo.db.connect().unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
+        "CREATE UNIQUE INDEX t_idx ON t(c);",
+        "INSERT INTO t VALUES (null, -1);",
+        "INSERT INTO t VALUES (null, -2);",
+        "UPDATE t SET c = NULL WHERE c = -1;",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Null
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(-2),
+            ]
+        ],
+        limbo_exec_rows(&limbo, &conn, "SELECT * FROM t ORDER BY id")
+    );
+}
