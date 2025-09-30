@@ -844,11 +844,8 @@ fn test_upsert_parameters_order() -> anyhow::Result<()> {
     stmt.bind_at(3.try_into()?, Value::Integer(3));
     stmt.bind_at(4.try_into()?, Value::Integer(40));
     stmt.bind_at(5.try_into()?, Value::Integer(66));
-    loop {
-        match stmt.step()? {
-            StepResult::Row | StepResult::IO => stmt.run_once()?,
-            _ => break,
-        }
+    while let StepResult::Row | StepResult::IO = stmt.step()? {
+        stmt.run_once()?;
     }
 
     let mut rows = Vec::new();
