@@ -163,8 +163,8 @@ pub fn gen_bool(probability_true: f64) -> bool {
     (get_random() as f64 / u64::MAX as f64) < probability_true
 }
 
-pub fn gen_schema() -> ArbitrarySchema {
-    let table_count = (get_random() % 10 + 1) as usize;
+pub fn gen_schema(table_count: Option<usize>) -> ArbitrarySchema {
+    let table_count = table_count.unwrap_or((get_random() % 10 + 1) as usize);
     let mut tables = Vec::with_capacity(table_count);
     let mut table_names = HashSet::new();
 
@@ -334,7 +334,7 @@ fn generate_random_statement(schema: &ArbitrarySchema) -> String {
 }
 
 fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let schema = gen_schema();
+    let schema = gen_schema(opts.tables);
     // Write DDL statements to log file
     let mut log_file = File::create(&opts.log_file)?;
     let ddl_statements = schema.to_sql();
