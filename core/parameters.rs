@@ -25,7 +25,7 @@ impl Parameter {
 
 #[derive(Debug)]
 pub struct Parameters {
-    index: NonZero<usize>,
+    next_index: NonZero<usize>,
     pub list: Vec<Parameter>,
 }
 
@@ -38,7 +38,7 @@ impl Default for Parameters {
 impl Parameters {
     pub fn new() -> Self {
         Self {
-            index: 1.try_into().unwrap(),
+            next_index: 1.try_into().unwrap(),
             list: vec![],
         }
     }
@@ -69,8 +69,8 @@ impl Parameters {
     }
 
     pub fn next_index(&mut self) -> NonZero<usize> {
-        let index = self.index;
-        self.index = self.index.checked_add(1).unwrap();
+        let index = self.next_index;
+        self.next_index = self.next_index.checked_add(1).unwrap();
         index
     }
 
@@ -99,8 +99,8 @@ impl Parameters {
             index => {
                 // SAFETY: Guaranteed from parser that the index is bigger than 0.
                 let index: NonZero<usize> = index.parse().unwrap();
-                if index > self.index {
-                    self.index = index.checked_add(1).unwrap();
+                if index >= self.next_index {
+                    self.next_index = index.checked_add(1).unwrap();
                 }
                 self.list.push(Parameter::Indexed(index));
                 tracing::trace!("indexed parameter at {index}");
