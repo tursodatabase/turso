@@ -136,6 +136,37 @@ test('offset-bug', async () => {
     expect(await stmt.all(1, 1)).toEqual([{ id: 2, name: 'John1', verified: 0 }])
 })
 
+test('conflict-bug', async () => {
+    const db = await connect(':memory:');
+
+    const create = db.prepare(`create table "conflict_chain_example" (
+        id integer not null unique,
+        name text not null,
+        email text not null,
+        primary key (id, name)
+    )`);
+    await create.run();
+
+    await db.prepare(`insert into "conflict_chain_example" ("id", "name", "email") values (?, ?, ?), (?, ?, ?)`).run(
+        1,
+        'John',
+        'john@example.com',
+        2,
+        'John Second',
+        '2john@example.com',
+    );
+
+    const insert = db.prepare(
+        `insert into "conflict_chain_example" ("id", "name", "email") values (?, ?, ?), (?, ?, ?) on conflict ("conflict_chain_example"."id", "conflict_chain_example"."name") do update set "email" = ? on conflict ("conflict_chain_example"."id") do nothing`,
+    );
+    await insert.run(1, 'John', 'john@example.com', 2, 'Anthony', 'idthief@example.com', 'john1@example.com');
+
+    expect(await db.prepare("SELECT * FROM conflict_chain_example").all()).toEqual([
+        { id: 1, name: 'John', email: 'john1@example.com' },
+        { id: 2, name: 'John Second', email: '2john@example.com' }
+    ]);
+})
+
 test('on-disk db', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {
