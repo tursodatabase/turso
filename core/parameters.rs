@@ -2,7 +2,6 @@ use std::num::NonZero;
 
 #[derive(Clone, Debug)]
 pub enum Parameter {
-    Anonymous(NonZero<usize>),
     Indexed(NonZero<usize>),
     Named(String, NonZero<usize>),
 }
@@ -16,7 +15,6 @@ impl PartialEq for Parameter {
 impl Parameter {
     pub fn index(&self) -> NonZero<usize> {
         match self {
-            Parameter::Anonymous(index) => *index,
             Parameter::Indexed(index) => *index,
             Parameter::Named(_, index) => *index,
         }
@@ -51,7 +49,6 @@ impl Parameters {
 
     pub fn name(&self, index: NonZero<usize>) -> Option<String> {
         self.list.iter().find_map(|p| match p {
-            Parameter::Anonymous(i) if *i == index => Some("?".to_string()),
             Parameter::Indexed(i) if *i == index => Some(format!("?{i}")),
             Parameter::Named(name, i) if *i == index => Some(name.to_owned()),
             _ => None,
