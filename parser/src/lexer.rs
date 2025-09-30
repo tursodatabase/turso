@@ -400,8 +400,8 @@ impl<'a> Lexer<'a> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'/');
         match self.peek() {
-            // C-style comments begin with "/*" and extend up to and 
-            // including the next "*/" character pair or until 
+            // C-style comments begin with "/*" and extend up to and
+            // including the next "*/" character pair or until
             // the end of input, whichever comes first.
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
