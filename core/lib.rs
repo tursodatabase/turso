@@ -583,6 +583,7 @@ impl Database {
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
+            fk_deferred_violations: AtomicIsize::new(0),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1102,6 +1103,7 @@ pub struct Connection {
     is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
+    fk_deferred_violations: AtomicIsize,
 }
 
 impl Drop for Connection {
@@ -1540,7 +1542,6 @@ impl Connection {
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
     }
-
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.swap(0, Ordering::Release)
     }

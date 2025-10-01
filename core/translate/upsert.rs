@@ -5,11 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::ast::{self, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::translate::emitter::{
-    emit_fk_child_existence_checks, emit_fk_parent_existence_checks,
-    emit_fk_parent_pk_change_counters,
-};
+use crate::schema::ROWID_SENTINEL;
 use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_pk_change_checks};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
@@ -471,176 +469,49 @@ pub fn emit_upsert(
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias);
+    let has_direct_rowid_update = set_pairs
+        .iter()
+        .any(|(idx, _)| *idx == rowid_alias_idx.unwrap_or(ROWID_SENTINEL));
+    let has_user_provided_rowid = if let Some(i) = rowid_alias_idx {
+        set_pairs.iter().any(|(idx, _)| *idx == i) || has_direct_rowid_update
+    } else {
+        has_direct_rowid_update
+    };
 
+    let rowid_set_clause_reg = if has_user_provided_rowid {
+        Some(new_rowid_reg.unwrap_or(conflict_rowid_reg))
+    } else {
+        None
+    };
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled() {
             let rowid_new_reg = new_rowid_reg.unwrap_or(conflict_rowid_reg);
 
             // Child-side checks
             if resolver.schema.has_child_fks(bt.name.as_str()) {
-                emit_fk_child_existence_checks(
+                emit_fk_child_update_counters(
                     program,
                     resolver,
                     &bt,
                     table.get_name(),
+                    tbl_cursor_id,
                     new_start,
                     rowid_new_reg,
                     &changed_cols,
                 )?;
             }
-
-            // Parent-side checks only if any incoming FK could care
-            if resolver
-                .schema
-                .any_resolved_fks_referencing(table.get_name())
-            {
-                // if parent key can't change, skip
-                let updated_parent_positions: HashSet<usize> =
-                    set_pairs.iter().map(|(i, _)| *i).collect();
-                let incoming = resolver.schema.resolved_fks_referencing(table.get_name());
-                let parent_key_may_change = incoming
-                    .iter()
-                    .any(|r| r.parent_key_may_change(&updated_parent_positions, &bt));
-
-                if parent_key_may_change {
-                    let skip_parent_fk = program.allocate_label();
-                    let pk_len = bt.primary_key_columns.len();
-
-                    match pk_len {
-                        0 => {
-                            // implicit rowid
-                            program.emit_insn(Insn::Eq {
-                                lhs: rowid_new_reg,
-                                rhs: conflict_rowid_reg,
-                                target_pc: skip_parent_fk,
-                                flags: CmpInsFlags::default(),
-                                collation: program.curr_collation(),
-                            });
-                            emit_fk_parent_existence_checks(
-                                program,
-                                resolver,
-                                table.get_name(),
-                                tbl_cursor_id,
-                                conflict_rowid_reg,
-                            )?;
-                            program.preassign_label_to_next_insn(skip_parent_fk);
-                        }
-                        1 => {
-                            // single-col declared PK
-                            let (pk_name, _) = &bt.primary_key_columns[0];
-                            let (pos, col) = bt.get_column(pk_name).unwrap();
-
-                            let old_reg = program.alloc_register();
-                            if col.is_rowid_alias {
-                                program.emit_insn(Insn::RowId {
-                                    cursor_id: tbl_cursor_id,
-                                    dest: old_reg,
-                                });
-                            } else {
-                                program.emit_insn(Insn::Column {
-                                    cursor_id: tbl_cursor_id,
-                                    column: pos,
-                                    dest: old_reg,
-                                    default: None,
-                                });
-                            }
-                            let new_reg = new_start + pos;
-
-                            let skip = program.allocate_label();
-                            program.emit_insn(Insn::Eq {
-                                lhs: old_reg,
-                                rhs: new_reg,
-                                target_pc: skip,
-                                flags: CmpInsFlags::default(),
-                                collation: program.curr_collation(),
-                            });
-                            emit_fk_parent_existence_checks(
-                                program,
-                                resolver,
-                                table.get_name(),
-                                tbl_cursor_id,
-                                conflict_rowid_reg,
-                            )?;
-                            program.preassign_label_to_next_insn(skip);
-                        }
-                        _ => {
-                            // composite PK: build OLD/NEW vectors and do the 2-pass counter logic
-                            let old_pk_start = program.alloc_registers(pk_len);
-                            for (i, (pk_name, _)) in bt.primary_key_columns.iter().enumerate() {
-                                let (pos, col) = bt.get_column(pk_name).unwrap();
-                                if col.is_rowid_alias {
-                                    // old rowid (UPSERT target) == conflict_rowid_reg
-                                    program.emit_insn(Insn::Copy {
-                                        src_reg: conflict_rowid_reg,
-                                        dst_reg: old_pk_start + i,
-                                        extra_amount: 0,
-                                    });
-                                } else {
-                                    program.emit_insn(Insn::Column {
-                                        cursor_id: tbl_cursor_id,
-                                        column: pos,
-                                        dest: old_pk_start + i,
-                                        default: None,
-                                    });
-                                }
-                            }
-
-                            let new_pk_start = program.alloc_registers(pk_len);
-                            for (i, (pk_name, _)) in bt.primary_key_columns.iter().enumerate() {
-                                let (pos, col) = bt.get_column(pk_name).unwrap();
-                                let src = if col.is_rowid_alias {
-                                    rowid_new_reg
-                                } else {
-                                    new_start + pos
-                                };
-                                program.emit_insn(Insn::Copy {
-                                    src_reg: src,
-                                    dst_reg: new_pk_start + i,
-                                    extra_amount: 0,
-                                });
-                            }
-
-                            // Compare OLD vs NEW, if all equal then skip
-                            let skip = program.allocate_label();
-                            let changed = program.allocate_label();
-                            for i in 0..pk_len {
-                                if i == pk_len - 1 {
-                                    program.emit_insn(Insn::Eq {
-                                        lhs: old_pk_start + i,
-                                        rhs: new_pk_start + i,
-                                        target_pc: skip,
-                                        flags: CmpInsFlags::default(),
-                                        collation: program.curr_collation(),
-                                    });
-                                    program.emit_insn(Insn::Goto { target_pc: changed });
-                                } else {
-                                    let next = program.allocate_label();
-                                    program.emit_insn(Insn::Eq {
-                                        lhs: old_pk_start + i,
-                                        rhs: new_pk_start + i,
-                                        target_pc: next,
-                                        flags: CmpInsFlags::default(),
-                                        collation: program.curr_collation(),
-                                    });
-                                    program.emit_insn(Insn::Goto { target_pc: changed });
-                                    program.preassign_label_to_next_insn(next);
-                                }
-                            }
-
-                            program.preassign_label_to_next_insn(changed);
-                            emit_fk_parent_pk_change_counters(
-                                program,
-                                &incoming,
-                                resolver,
-                                old_pk_start,
-                                new_pk_start,
-                                pk_len,
-                            )?;
-                            program.preassign_label_to_next_insn(skip);
-                        }
-                    }
-                }
-            }
+            emit_parent_pk_change_checks(
+                program,
+                resolver,
+                &bt,
+                tbl_cursor_id,
+                conflict_rowid_reg,
+                new_start,
+                new_rowid_reg.unwrap_or(conflict_rowid_reg),
+                rowid_set_clause_reg,
+                set_pairs,
+            )?;
         }
     }
 

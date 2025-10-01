@@ -832,7 +832,6 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-
         if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
@@ -914,6 +913,9 @@ impl Program {
                 if self.change_cnt_on {
                     self.connection
                         .set_changes(self.n_change.load(Ordering::SeqCst));
+                }
+                if connection.foreign_keys_enabled() {
+                    connection.clear_deferred_foreign_key_violations();
                 }
                 Ok(IOResult::Done(()))
             }

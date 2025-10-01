@@ -8,13 +8,17 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, Affinity, Index, Table};
+use crate::schema::{self, Affinity, BTreeTable, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
     BindingBehavior, ReturningValueRegisters, WalkControl,
+};
+use crate::translate::fkeys::{
+    build_index_affinity_string, emit_fk_scope_if_needed, emit_fk_violation, index_probe,
+    open_read_index, open_read_table,
 };
 use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID_STRS;
@@ -134,11 +138,6 @@ pub fn translate_insert(
     if !btree_table.has_rowid {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
-    let has_child_fks = fk_enabled && !btree_table.foreign_keys.is_empty();
-    let has_parent_fks = fk_enabled
-        && resolver
-            .schema
-            .any_resolved_fks_referencing(table_name.as_str());
 
     let root_page = btree_table.root_page;
 
@@ -242,14 +241,11 @@ pub fn translate_insert(
         connection,
     )?;
 
-    if has_child_fks || has_parent_fks {
-        program.emit_insn(Insn::FkCounter {
-            increment_value: 1,
-            check_abort: false,
-            is_scope: true,
-        });
-    }
-
+    let has_fks = if fk_enabled {
+        emit_fk_scope_if_needed(&mut program, resolver, table_name.as_str(), true)?
+    } else {
+        false
+    };
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
     let (num_values, cursor_id) = match body {
@@ -274,7 +270,6 @@ pub fn translate_insert(
 
                 let query_destination = QueryDestination::CoroutineYield {
                     yield_reg,
-                    // keep implementation_start as halt_label (producer internals)
                     coroutine_implementation_start: halt_label,
                 };
                 program.incr_nesting();
@@ -1043,13 +1038,14 @@ pub fn translate_insert(
             }
         }
     }
-    if has_child_fks || has_parent_fks {
-        emit_fk_checks_for_insert(
+    if has_fks {
+        // Child-side check must run before Insert (may HALT or increment deferred counter)
+        emit_fk_child_insert_checks(
             &mut program,
             resolver,
-            &insertion,
-            table_name.as_str(),
-            !inserting_multiple_rows,
+            &btree_table,
+            insertion.first_col_register(),
+            insertion.key_register(),
         )?;
     }
 
@@ -1060,6 +1056,11 @@ pub fn translate_insert(
         flag: InsertFlags::new(),
         table_name: table_name.to_string(),
     });
+
+    if has_fks {
+        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
+        emit_parent_side_fk_decrement_on_insert(&mut program, resolver, &btree_table, &insertion)?;
+    }
 
     if let Some((seq_cursor_id, r_seq, r_seq_rowid, table_name_reg)) = autoincrement_meta {
         let no_update_needed_label = program.allocate_label();
@@ -1151,6 +1152,7 @@ pub fn translate_insert(
                 &mut result_columns,
                 cdc_table.as_ref().map(|c| c.0),
                 row_done_label,
+                connection,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1198,13 +1200,8 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(stmt_epilogue);
-    if has_child_fks || has_parent_fks {
-        // close FK scope and surface deferred violations
-        program.emit_insn(Insn::FkCounter {
-            increment_value: -1,
-            check_abort: true,
-            is_scope: true,
-        });
+    if has_fks {
+        emit_fk_scope_if_needed(&mut program, resolver, table_name.as_str(), false)?;
     }
 
     program.resolve_label(halt_label, program.offset());
@@ -1900,38 +1897,29 @@ fn emit_update_sqlite_sequence(
     Ok(())
 }
 
-/// Emit child->parent foreign key checks for an INSERT, for the current row
-fn emit_fk_checks_for_insert(
+/// Child-side FK checks for INSERT of a single row:
+/// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
+/// verify that the referenced parent key exists.
+pub fn emit_fk_child_insert_checks(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    insertion: &Insertion,
-    table_name: &str,
-    single_row_insert: bool,
-) -> Result<()> {
-    let after_all = program.allocate_label();
-    program.emit_insn(Insn::FkIfZero {
-        target_pc: after_all,
-        if_zero: true,
-    });
+    child_tbl: &BTreeTable,
+    new_start_reg: usize,
+    new_rowid_reg: usize,
+) -> crate::Result<()> {
+    for fk_ref in resolver.schema.resolved_fks_for_child(&child_tbl.name)? {
+        let ncols = fk_ref.child_cols.len();
+        let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
-    // Iterate child FKs declared on this table
-    for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
-        let parent_tbl = resolver
-            .schema
-            .get_btree_table(&fk_ref.fk.parent_table)
-            .expect("parent table");
-        let num_child_cols = fk_ref.child_cols.len();
-        let is_self_single =
-            table_name.eq_ignore_ascii_case(&fk_ref.fk.parent_table) && single_row_insert;
-        // if any child FK value is NULL, this row doesn't reference the parent.
+        // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
-        for &pos_in_child in fk_ref.child_pos.iter() {
-            // Map INSERT image register for that column
-            let src = insertion
-                .col_mappings
-                .get(pos_in_child)
-                .expect("col must be present")
-                .register;
+        for cname in &fk_ref.child_cols {
+            let (i, col) = child_tbl.get_column(cname).unwrap();
+            let src = if col.is_rowid_alias {
+                new_rowid_reg
+            } else {
+                new_start_reg + i
+            };
             program.emit_insn(Insn::IsNull {
                 reg: src,
                 target_pc: fk_ok,
@@ -1939,36 +1927,29 @@ fn emit_fk_checks_for_insert(
         }
 
         if fk_ref.parent_uses_rowid {
-            // Parent is rowid/alias: single-reg probe
-            let pcur = program.alloc_cursor_id(CursorType::BTreeTable(parent_tbl.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id: pcur,
-                root_page: parent_tbl.root_page,
-                db: 0,
-            });
-            let rowid_pos = 0; // guaranteed if parent_uses_rowid
-            let src = insertion
-                .get_col_mapping_by_name(fk_ref.child_cols[rowid_pos].as_str())
-                .unwrap()
-                .register;
-            let violation = program.allocate_label();
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let pcur = open_read_table(program, &parent_tbl);
+
+            // first child col carries rowid
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let val_reg = if col_child.is_rowid_alias {
+                new_rowid_reg
+            } else {
+                new_start_reg + i_child
+            };
+
             let tmp = program.alloc_register();
             program.emit_insn(Insn::Copy {
-                src_reg: src,
+                src_reg: val_reg,
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            // coerce to INT (parent rowid affinity)
             program.emit_insn(Insn::MustBeInt { reg: tmp });
-            if is_self_single {
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: insertion.key_register(),
-                    target_pc: fk_ok,
-                    flags: CmpInsFlags::default(),
-                    collation: None,
-                });
-            }
+
+            let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
                 rowid_reg: tmp,
@@ -1980,102 +1961,296 @@ fn emit_fk_checks_for_insert(
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
 
-            // Deferred vs immediate
-            if fk_ref.fk.deferred {
+            // Self-ref: count (don’t halt). Non-self: standard behavior.
+            if is_self_ref {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {
-                program.emit_insn(Insn::Halt {
-                    err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
-                    description: "FOREIGN KEY constraint failed".to_string(),
-                });
+                emit_fk_violation(program, &fk_ref.fk)?;
             }
-        } else if let Some(ix) = &fk_ref.parent_unique_index {
-            if is_self_single {
-                let skip_probe = program.allocate_label();
-                for (i, &pos_in_child) in fk_ref.child_pos.iter().enumerate() {
-                    let child_reg = insertion.col_mappings.get(pos_in_child).unwrap().register;
-                    let parent_reg = insertion
-                        .get_col_mapping_by_name(fk_ref.parent_cols[i].as_str())
-                        .unwrap()
-                        .register;
-                    program.emit_insn(Insn::Ne {
-                        lhs: child_reg,
-                        rhs: parent_reg,
-                        target_pc: skip_probe, // any mismatch and we do the normal probe
-                        flags: CmpInsFlags::default().jump_if_null(),
-                        collation: None,
+        } else {
+            // Parent by unique index
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let idx = fk_ref
+                .parent_unique_index
+                .as_ref()
+                .expect("parent unique index required");
+            let icur = open_read_index(program, idx);
+
+            // Build NEW probe from child NEW values; apply parent index affinities
+            let probe = {
+                let start = program.alloc_registers(ncols);
+                for (k, cname) in fk_ref.child_cols.iter().enumerate() {
+                    let (i, col) = child_tbl.get_column(cname).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: if col.is_rowid_alias {
+                            new_rowid_reg
+                        } else {
+                            new_start_reg + i
+                        },
+                        dst_reg: start + k,
+                        extra_amount: 0,
                     });
                 }
-                // all matched, OK
-                program.emit_insn(Insn::Goto { target_pc: fk_ok });
-                program.preassign_label_to_next_insn(skip_probe);
-            }
+                if let Some(cnt) = NonZeroUsize::new(ncols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: start,
+                        count: cnt,
+                        affinities: build_index_affinity_string(idx, &parent_tbl),
+                    });
+                }
+                start
+            };
+            index_probe(
+                program,
+                icur,
+                probe,
+                ncols,
+                |_p| Ok(()),
+                |p| {
+                    if is_self_ref {
+                        p.emit_insn(Insn::FkCounter {
+                            increment_value: 1,
+                            is_scope: false,
+                        });
+                    } else {
+                        emit_fk_violation(p, &fk_ref.fk)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            program.emit_insn(Insn::Goto { target_pc: fk_ok });
+        }
 
-            // Parent has a UNIQUE index exactly on parent_cols: use Found against that index
-            let icur = program.alloc_cursor_id(CursorType::BTreeIndex(ix.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id: icur,
-                root_page: ix.root_page,
-                db: 0,
-            });
+        program.preassign_label_to_next_insn(fk_ok);
+    }
+    Ok(())
+}
 
-            // Build probe (child values order == parent index order by construction)
-            let probe_start = program.alloc_registers(num_child_cols);
-            for (i, &pos_in_child) in fk_ref.child_pos.iter().enumerate() {
-                let src = insertion.col_mappings.get(pos_in_child).unwrap().register;
+/// Build NEW parent key image in FK parent-column order into a contiguous register block.
+/// Handles 3 shapes:
+/// - parent_uses_rowid: single "rowid" component
+/// - explicit fk.parent_columns
+/// - fk.parent_columns empty => use parent's declared PK columns (order-preserving)
+fn build_parent_key_image_for_insert(
+    program: &mut ProgramBuilder,
+    parent_table: &BTreeTable,
+    pref: &ResolvedFkRef,
+    insertion: &Insertion,
+) -> crate::Result<(usize, usize)> {
+    // Decide column list
+    let parent_cols: Vec<String> = if pref.parent_uses_rowid {
+        vec!["rowid".to_string()]
+    } else if !pref.fk.parent_columns.is_empty() {
+        pref.fk.parent_columns.clone()
+    } else {
+        // fall back to the declared PK of the parent table, in schema order
+        parent_table
+            .primary_key_columns
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+
+    let ncols = parent_cols.len();
+    let start = program.alloc_registers(ncols);
+    // Copy from the would-be parent insertion
+    for (i, pname) in parent_cols.iter().enumerate() {
+        let src = if pname.eq_ignore_ascii_case("rowid") {
+            insertion.key_register()
+        } else {
+            // For rowid-alias parents, get_col_mapping_by_name will return the key mapping,
+            // not the NULL placeholder in col_mappings.
+            insertion
+                .get_col_mapping_by_name(pname)
+                .ok_or_else(|| {
+                    crate::LimboError::PlanningError(format!(
+                        "Column '{}' not present in INSERT image for parent {}",
+                        pname, parent_table.name
+                    ))
+                })?
+                .register
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg: src,
+            dst_reg: start + i,
+            extra_amount: 0,
+        });
+    }
+
+    // Apply affinities of the parent columns (or integer for rowid)
+    let aff: String = if pref.parent_uses_rowid {
+        "i".to_string()
+    } else {
+        parent_cols
+            .iter()
+            .map(|name| {
+                let (_, col) = parent_table.get_column(name).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("parent col {name} missing"))
+                })?;
+                Ok::<_, crate::LimboError>(col.affinity().aff_mask())
+            })
+            .collect::<Result<String, _>>()?
+    };
+    if let Some(count) = NonZeroUsize::new(ncols) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: start,
+            count,
+            affinities: aff,
+        });
+    }
+
+    Ok((start, ncols))
+}
+
+/// Parent-side: when inserting into the parent, decrement the counter
+/// if any child rows reference the NEW parent key.
+/// We *always* do this for deferred FKs, and we *also* do it for
+/// self-referential FKs (even if immediate) because the insert can
+/// “repair” a prior child-insert count recorded earlier in the same statement.
+pub fn emit_parent_side_fk_decrement_on_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_table: &BTreeTable,
+    insertion: &Insertion,
+) -> crate::Result<()> {
+    for pref in resolver
+        .schema
+        .resolved_fks_referencing(&parent_table.name)?
+    {
+        let is_self_ref = pref
+            .child_table
+            .name
+            .eq_ignore_ascii_case(&parent_table.name);
+        // Skip only when it cannot repair anything: non-deferred and not self-ref.
+        if !pref.fk.deferred && !is_self_ref {
+            continue;
+        }
+        let (new_pk_start, n_cols) =
+            build_parent_key_image_for_insert(program, parent_table, &pref, insertion)?;
+
+        let child_tbl = &pref.child_table;
+        let child_cols = &pref.fk.child_columns;
+        let idx = resolver.schema.get_indices(&child_tbl.name).find(|ix| {
+            ix.columns.len() == child_cols.len()
+                && ix
+                    .columns
+                    .iter()
+                    .zip(child_cols.iter())
+                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+        });
+
+        if let Some(ix) = idx {
+            let icur = open_read_index(program, ix);
+            // Copy key into probe regs and apply child-index affinities
+            let probe_start = program.alloc_registers(n_cols);
+            for i in 0..n_cols {
                 program.emit_insn(Insn::Copy {
-                    src_reg: src,
+                    src_reg: new_pk_start + i,
                     dst_reg: probe_start + i,
                     extra_amount: 0,
                 });
             }
-
-            let aff: String = ix
-                .columns
-                .iter()
-                .map(|c| parent_tbl.columns[c.pos_in_table].affinity().aff_mask())
-                .collect();
-            program.emit_insn(Insn::Affinity {
-                start_reg: probe_start,
-                count: std::num::NonZeroUsize::new(num_child_cols).unwrap(),
-                affinities: aff,
-            });
+            if let Some(count) = NonZeroUsize::new(n_cols) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: probe_start,
+                    count,
+                    affinities: build_index_affinity_string(ix, child_tbl),
+                });
+            }
 
             let found = program.allocate_label();
             program.emit_insn(Insn::Found {
                 cursor_id: icur,
                 target_pc: found,
                 record_reg: probe_start,
-                num_regs: num_child_cols,
+                num_regs: n_cols,
             });
 
-            // Not found: violation
+            // Not found => nothing to decrement
             program.emit_insn(Insn::Close { cursor_id: icur });
-            if fk_ref.fk.deferred {
-                program.emit_insn(Insn::FkCounter {
-                    increment_value: 1,
-                    check_abort: false,
-                    is_scope: false,
+            let skip = program.allocate_label();
+            program.emit_insn(Insn::Goto { target_pc: skip });
+
+            // Found => guarded decrement
+            program.resolve_label(found, program.offset());
+            program.emit_insn(Insn::Close { cursor_id: icur });
+            program.emit_insn(Insn::FkIfZero {
+                is_scope: false,
+                target_pc: skip,
+            });
+            program.emit_insn(Insn::FkCounter {
+                increment_value: -1,
+                is_scope: false,
+            });
+            program.resolve_label(skip, program.offset());
+        } else {
+            // fallback scan :(
+            let ccur = open_read_table(program, child_tbl);
+            let done = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: ccur,
+                pc_if_empty: done,
+            });
+            let loop_top = program.allocate_label();
+            let next_row = program.allocate_label();
+            program.resolve_label(loop_top, program.offset());
+
+            for (i, child_name) in child_cols.iter().enumerate() {
+                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
+                })?;
+                let tmp = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: ccur,
+                    column: pos,
+                    dest: tmp,
+                    default: None,
                 });
-            } else {
-                program.emit_insn(Insn::Halt {
-                    err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
-                    description: "FOREIGN KEY constraint failed".to_string(),
+
+                program.emit_insn(Insn::IsNull {
+                    reg: tmp,
+                    target_pc: next_row,
                 });
+
+                let cont = program.allocate_label();
+                program.emit_insn(Insn::Eq {
+                    lhs: tmp,
+                    rhs: new_pk_start + i,
+                    target_pc: cont,
+                    flags: CmpInsFlags::default().jump_if_null(),
+                    collation: Some(super::collate::CollationSeq::Binary),
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: next_row,
+                });
+                program.resolve_label(cont, program.offset());
             }
-            program.emit_insn(Insn::Goto { target_pc: fk_ok });
-            // Found OK
-            program.preassign_label_to_next_insn(found);
-            program.emit_insn(Insn::Close { cursor_id: icur });
+
+            // Matched one child row -> guarded decrement
+            program.emit_insn(Insn::FkIfZero {
+                is_scope: false,
+                target_pc: next_row,
+            });
+            program.emit_insn(Insn::FkCounter {
+                is_scope: false,
+                increment_value: -1,
+            });
+
+            program.resolve_label(next_row, program.offset());
+            program.emit_insn(Insn::Next {
+                cursor_id: ccur,
+                pc_if_next: loop_top,
+            });
+
+            program.resolve_label(done, program.offset());
+            program.emit_insn(Insn::Close { cursor_id: ccur });
         }
-
-        program.preassign_label_to_next_insn(fk_ok);
     }
-
-    program.preassign_label_to_next_insn(after_all);
     Ok(())
 }

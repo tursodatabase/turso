@@ -2169,6 +2169,17 @@ pub fn halt(
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
+        if program.connection.foreign_keys_enabled()
+            && program
+                .connection
+                .fk_deferred_violations
+                .swap(0, Ordering::AcqRel)
+                > 0
+        {
+            return Err(LimboError::Constraint(
+                "foreign key constraint failed".to_string(),
+            ));
+        }
         program
             .commit_txn(pager.clone(), state, mv_store, false)
             .map(Into::into)
@@ -2263,12 +2274,13 @@ pub fn op_transaction_inner(
                 if write && conn.db.open_flags.get().contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
                 }
-
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let (new_transaction_state, updated) = if conn.is_nested_stmt.load(Ordering::SeqCst)
+                let (new_transaction_state, updated, should_clear_deferred_violations) = if conn
+                    .is_nested_stmt
+                    .load(Ordering::SeqCst)
                 {
-                    (current_state, false)
+                    (current_state, false, false)
                 } else {
                     match (current_state, write) {
                         // pending state means that we tried beginning a tx and the method returned IO.
@@ -2283,30 +2295,36 @@ pub fn op_transaction_inner(
                                     schema_did_change: false,
                                 },
                                 true,
+                                true,
                             )
                         }
                         (TransactionState::Write { schema_did_change }, true) => {
-                            (TransactionState::Write { schema_did_change }, false)
+                            (TransactionState::Write { schema_did_change }, false, false)
                         }
                         (TransactionState::Write { schema_did_change }, false) => {
-                            (TransactionState::Write { schema_did_change }, false)
+                            (TransactionState::Write { schema_did_change }, false, false)
                         }
                         (TransactionState::Read, true) => (
                             TransactionState::Write {
                                 schema_did_change: false,
                             },
                             true,
+                            true,
                         ),
-                        (TransactionState::Read, false) => (TransactionState::Read, false),
+                        (TransactionState::Read, false) => (TransactionState::Read, false, false),
                         (TransactionState::None, true) => (
                             TransactionState::Write {
                                 schema_did_change: false,
                             },
                             true,
+                            true,
                         ),
-                        (TransactionState::None, false) => (TransactionState::Read, true),
+                        (TransactionState::None, false) => (TransactionState::Read, true, false),
                     }
                 };
+                if should_clear_deferred_violations {
+                    conn.fk_deferred_violations.store(0, Ordering::Release);
+                }
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = &mv_store {
@@ -2383,8 +2401,8 @@ pub fn op_transaction_inner(
                             return Err(LimboError::Busy);
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
-                            // set the transaction state to pending so we don't have to
                             // end the read transaction.
+                            // set the transaction state to pending so we don't have to
                             program
                                 .connection
                                 .set_tx_state(TransactionState::PendingUpgrade);
@@ -2448,15 +2466,20 @@ pub fn op_auto_commit(
         },
         insn
     );
-    let conn = program.connection.clone();
     if matches!(state.commit_state, CommitState::Committing) {
         return program
             .commit_txn(pager.clone(), state, mv_store, *rollback)
             .map(Into::into);
     }
 
+    let conn = program.connection.clone();
     if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
+            program // reset deferred fk violations on ROLLBACK
+                .connection
+                .fk_deferred_violations
+                .store(0, Ordering::Release);
+
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -2468,6 +2491,15 @@ pub fn op_auto_commit(
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
+            if conn.foreign_keys_enabled() {
+                let violations = conn.fk_deferred_violations.swap(0, Ordering::AcqRel);
+                if violations > 0 {
+                    // Fail the commit
+                    return Err(LimboError::Constraint(
+                        "FOREIGN KEY constraint failed".into(),
+                    ));
+                }
+            }
             conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
         }
     } else {
@@ -2491,6 +2523,15 @@ pub fn op_auto_commit(
             if is_begin {
                 return Err(LimboError::TxError(
                     "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+                ));
+            }
+        }
+        if conn.foreign_keys_enabled() {
+            let violations = conn.fk_deferred_violations.swap(0, Ordering::AcqRel);
+            if violations > 0 {
+                // Fail the commit
+                return Err(LimboError::Constraint(
+                    "FOREIGN KEY constraint failed".into(),
                 ));
             }
         }
@@ -8289,35 +8330,18 @@ pub fn op_fk_counter(
     load_insn!(
         FkCounter {
             increment_value,
-            check_abort,
             is_scope,
         },
         insn
     );
     if *is_scope {
-        // Adjust FK scope depth
         state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
-
-        // raise if there were deferred violations in this statement.
-        if *check_abort {
-            if state.fk_scope_counter < 0 {
-                return Err(LimboError::Constraint(
-                    "FOREIGN KEY constraint failed".into(),
-                ));
-            }
-            if state.fk_scope_counter == 0 && state.fk_deferred_violations > 0 {
-                // Clear violations for safety, a new statement will re-open scope.
-                state.fk_deferred_violations = 0;
-                return Err(LimboError::Constraint(
-                    "FOREIGN KEY constraint failed".into(),
-                ));
-            }
-        }
     } else {
-        // Adjust deferred violations counter
-        state.fk_deferred_violations = state
+        // Transaction-level counter: add/subtract for deferred FKs.
+        program
+            .connection
             .fk_deferred_violations
-            .saturating_add(*increment_value);
+            .fetch_add(*increment_value, Ordering::AcqRel);
     }
 
     state.pc += 1;
@@ -8331,29 +8355,37 @@ pub fn op_fk_if_zero(
     _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(FkIfZero { target_pc, if_zero }, insn);
+    load_insn!(
+        FkIfZero {
+            is_scope,
+            target_pc,
+        },
+        insn
+    );
     let fk_enabled = program.connection.foreign_keys_enabled();
 
     // Jump if any:
     // Foreign keys are disabled globally
     // p1 is true AND deferred constraint counter is zero
     // p1 is false AND deferred constraint counter is non-zero
-    let scope_zero = state.fk_scope_counter == 0;
-
-    let should_jump = if !fk_enabled {
-        true
-    } else if *if_zero {
-        scope_zero
+    if !fk_enabled {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let v = if !*is_scope {
+        program
+            .connection
+            .fk_deferred_violations
+            .load(Ordering::Acquire)
     } else {
-        !scope_zero
+        state.fk_scope_counter
     };
 
-    if should_jump {
-        state.pc = target_pc.as_offset_int();
+    state.pc = if v == 0 {
+        target_pc.as_offset_int()
     } else {
-        state.pc += 1;
-    }
-
+        state.pc + 1
+    };
     Ok(InsnFunctionStepResult::Step)
 }
 

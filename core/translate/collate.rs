@@ -371,6 +371,7 @@ mod tests {
                     hidden: false,
                 }],
                 unique_sets: vec![],
+                foreign_keys: vec![],
             })),
         });
 
@@ -413,6 +414,7 @@ mod tests {
                     hidden: false,
                 }],
                 unique_sets: vec![],
+                foreign_keys: vec![],
             })),
         });
         // Right table t2(id=2)
@@ -446,6 +448,7 @@ mod tests {
                     hidden: false,
                 }],
                 unique_sets: vec![],
+                foreign_keys: vec![],
             })),
         });
         table_references
@@ -486,6 +489,7 @@ mod tests {
                     hidden: false,
                 }],
                 unique_sets: vec![],
+                foreign_keys: vec![],
             })),
         });
         table_references

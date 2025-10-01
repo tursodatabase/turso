@@ -124,16 +124,12 @@ do_execsql_test_in_memory_any_error fk-composite-unique-missing {
     INSERT INTO child  VALUES (2,'A','X');     -- no ('A','X') in parent
 }
 
-# SQLite doesnt let you name a foreign key constraint 'rowid' explicitly...
-# well it does.. but it throws a parse error only when you try to insert into the table -_-
-# We will throw a parse error when you create the table instead, because that is 
-# obviously the only sane thing to do
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
-    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid)); -- we error here
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
     INSERT INTO t VALUES (100,'x');
-    INSERT INTO c VALUES (1, 100); - sqlite errors here
+    INSERT INTO c VALUES (1, 100);
 }
 
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent-missing {
@@ -399,3 +395,712 @@ do_execsql_test_in_memory_any_error fk-self-multirow-one-bad {
                    FOREIGN KEY(rid) REFERENCES t(id));
     INSERT INTO t(id,rid) VALUES (1,1),(3,99); -- 99 has no parent -> error
 }
+
+# doesnt fail because tx is un-committed
+do_execsql_test_on_specific_db {:memory:} fk-deferred-commit-doesnt-fail-early {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 99); -- shouldnt fail because we are mid-tx
+} {}
+
+# it should fail here because we actuall COMMIT
+do_execsql_test_in_memory_any_error fk-deferred-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 99);
+  COMMIT;
+}
+
+
+# If we fix it before COMMIT, COMMIT succeeds
+do_execsql_test_on_specific_db {:memory:} fk-deferred-fix-before-commit-succeeds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 99);   -- temporary violation
+    INSERT INTO p VALUES(99);      -- fix parent
+  COMMIT;
+  SELECT * FROM p ORDER BY 1;
+} {99}
+
+#  ROLLBACK clears deferred state; a new tx can still fail if violation persists
+do_execsql_test_on_specific_db {:memory:} fk-deferred-rollback-clears {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 123);
+  ROLLBACK;
+
+  -- Now start over and *fix* it, COMMIT should pass.
+  BEGIN;
+    INSERT INTO p VALUES(123);
+    INSERT INTO c VALUES(1, 123);
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|123}
+
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-insert-parent-fixes-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 50); -- violation
+    INSERT INTO p VALUES(50);    -- resolve
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|50}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-fixes-child-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 50); -- violation
+    INSERT INTO p VALUES(32);
+	UPDATE c SET pid=32 WHERE id=1; -- resolve child
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|32}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-fixes-child-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 50); -- violation
+    INSERT INTO p VALUES(32);
+	DELETE FROM c WHERE id=1; -- resolve by deleting child
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-fixes-parent-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 50); -- violation
+    INSERT INTO p VALUES(32);
+	UPDATE p SET id=50 WHERE id=32; -- resolve via parent
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|50}
+
+# Self-referential: row referencing itself should succeed
+do_execsql_test_on_specific_db {:memory:} fk-deferred-self-ref-succeeds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO t VALUES(1, 1);    -- self-match
+  COMMIT;
+  SELECT * FROM t ORDER BY 1;
+} {1|1}
+
+# Two-step self-ref: insert invalid, then create parent before COMMIT
+do_execsql_test_on_specific_db {:memory:} fk-deferred-self-ref-late-parent {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO t VALUES(2, 3);  -- currently invalid
+    INSERT INTO t VALUES(3, 3);  -- now parent exists
+  COMMIT;
+  SELECT * FROM t ORDER BY 1;
+} {2|3
+3|3}
+
+
+# counter must not be neutralized by later good statements
+do_execsql_test_in_memory_any_error fk-deferred-neutralize.1 {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id INTEGER PRIMARY KEY);
+  CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+  CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT,
+    FOREIGN KEY(pid) REFERENCES parent(id));
+
+  CREATE TABLE child_comp_deferred(id INTEGER PRIMARY KEY, ca INT, cb INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b));
+  INSERT INTO parent_comp VALUES (4,-1);
+  BEGIN;
+    INSERT INTO child_deferred VALUES (1, 999);
+    INSERT INTO child_comp_deferred VALUES (2, 4, -1);
+  COMMIT;
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-upsert-late-parent {
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE p(id INTEGER PRIMARY KEY);
+CREATE TABLE c(
+  id  INTEGER PRIMARY KEY,
+  pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+);
+
+BEGIN;
+  INSERT INTO c VALUES(1, 50);                 -- deferred violation
+  INSERT INTO p VALUES(32);                    -- parent exists, but pid still 50
+  INSERT INTO c(id,pid) VALUES(1,32)
+    ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;  -- resolve child via UPSERT
+COMMIT;
+-- Expect: row is (1,32) and no violations remain
+SELECT * FROM c ORDER BY id;
+} {1|32}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-upsert-late-child {
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE p(
+  id INTEGER PRIMARY KEY,
+  u  INT UNIQUE
+);
+CREATE TABLE c(
+  id  INTEGER PRIMARY KEY,
+  pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+);
+BEGIN;
+  INSERT INTO c VALUES(1, 50);                 -- deferred violation (no parent 50)
+  INSERT INTO p VALUES(32, 7);                 -- parent row with u=7
+  -- Trigger DO UPDATE via conflict on p.u, then change the PK id to 50,
+  -- which satisfies the child reference.
+  INSERT INTO p(id,u) VALUES(999,7)
+    ON CONFLICT(u) DO UPDATE SET id=50;
+COMMIT;
+-- Expect: parent is now (50,7), child (1,50), no violations remain
+SELECT p.id, c.id FROM p  join c on c.pid = p.id;
+} {50|1}
+
+do_execsql_test_in_memory_any_error fk-deferred-insert-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 99);  -- no parent -> deferred violation
+  COMMIT;                          -- must fail
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-insert-parent-fix-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 99);   -- violation
+    INSERT INTO p VALUES(99);      -- fix by inserting parent
+  COMMIT;
+  SELECT id, pid FROM c ORDER BY id;
+} {1|99}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-insert-multi-children-one-parent-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO c VALUES(2, 50);   -- two violations pointing to same parent
+    INSERT INTO p VALUES(50);      -- one parent fixes both
+  COMMIT;
+  SELECT id, pid FROM c ORDER BY id;
+} {1|50 2|50}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-insert-then-delete-child-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 77);   -- violation
+    DELETE FROM c WHERE id=1;      -- resolve by removing the child
+  COMMIT;
+  SELECT count(*) FROM c;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-insert-self-ref-succeeds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO t VALUES(1, 1);    -- self-reference, legal at COMMIT
+  COMMIT;
+  SELECT id, pid FROM t;
+} {1|1}
+
+do_execsql_test_in_memory_any_error fk-deferred-update-child-breaks-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);     -- valid
+  BEGIN;
+    UPDATE c SET pid=99 WHERE id=1;  -- create violation
+  COMMIT;                             -- must fail
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-child-fix-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);
+  BEGIN;
+    UPDATE c SET pid=99 WHERE id=1;  -- violation
+    UPDATE c SET pid=10 WHERE id=1;  -- fix child back
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|10}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-child-fix-by-inserting-parent {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);
+  BEGIN;
+    UPDATE c SET pid=50 WHERE id=1;  -- violation
+    INSERT INTO p VALUES(50);        -- fix by adding parent
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|50}
+
+do_execsql_test_in_memory_any_error fk-deferred-update-parent-breaks-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(32);
+  INSERT INTO c VALUES(1, 32);      -- valid
+  BEGIN;
+    UPDATE p SET id=50 WHERE id=32;  -- break child reference
+  COMMIT;                            -- must fail (no fix)
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-parent-fix-by-updating-child {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(32);
+  INSERT INTO c VALUES(1, 32); 
+  BEGIN;
+    UPDATE p SET id=50 WHERE id=32;  -- break
+    UPDATE c SET pid=50 WHERE id=1;  -- fix child to new parent key
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|50}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-parent-fix-by-reverting-parent {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(32);
+  INSERT INTO c VALUES(1, 32);
+  BEGIN;
+    UPDATE p SET id=50 WHERE id=32;  -- break
+    UPDATE p SET id=32 WHERE id=50;  -- revert (fix)
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|32}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-self-ref-id-change-and-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  INSERT INTO t VALUES(1,1);
+  BEGIN;
+    UPDATE t SET id=2 WHERE id=1;   -- break self-ref
+    UPDATE t SET pid=2 WHERE id=2;  -- fix to new self
+  COMMIT;
+  SELECT id, pid FROM t;
+} {2|2}
+
+do_execsql_test_in_memory_any_error fk-deferred-delete-parent-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);      -- valid
+  BEGIN;
+    DELETE FROM p WHERE id=10;      -- break reference
+  COMMIT;                            -- must fail
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-parent-then-delete-child-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);
+  BEGIN;
+    DELETE FROM p WHERE id=10;      -- break
+    DELETE FROM c WHERE id=1;       -- fix by removing child
+  COMMIT;
+  SELECT count(*) FROM p, c;        -- both empty
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-parent-then-reinsert-parent-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  INSERT INTO c VALUES(1, 10);
+  BEGIN;
+    DELETE FROM p WHERE id=10;      -- break
+    INSERT INTO p VALUES(10);       -- fix by re-creating parent
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|10}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-self-ref-row-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  INSERT INTO t VALUES(1,1);        -- valid
+  BEGIN;
+    DELETE FROM t WHERE id=1;       -- removes both child+parent (same row)
+  COMMIT;                           -- should succeed
+  SELECT count(*) FROM t;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-parent-then-update-child-to-null-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  INSERT INTO p VALUES(5);
+  INSERT INTO c VALUES(1,5);
+  BEGIN;
+    DELETE FROM p WHERE id=5;       -- break
+    UPDATE c SET pid=NULL WHERE id=1;  -- fix (NULL never violates)
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|}
+
+# AUTOCOMMIT: deferred FK still fails at end-of-statement
+do_execsql_test_in_memory_any_error fk-deferred-autocommit-insert-missing-parent {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id INTEGER PRIMARY KEY);
+  CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO child VALUES(1, 3);   -- no BEGIN; should fail at statement end
+}
+
+# AUTOCOMMIT: self-referential insert is OK (parent is same row)
+do_execsql_test_on_specific_db {:memory:} fk-deferred-autocommit-selfref-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO t VALUES(1,1);
+  SELECT * FROM t;
+} {1|1}
+
+# AUTOCOMMIT: deleting a parent that has a child → fails at statement end
+do_execsql_test_in_memory_any_error fk-deferred-autocommit-delete-parent-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(1);
+  INSERT INTO c VALUES(10,1);
+  DELETE FROM p WHERE id=1;   -- no BEGIN; should fail at statement end
+}
+
+# TX: delete a referenced parent then reinsert before COMMIT -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-tx-delete-parent-then-reinsert-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(5);
+  INSERT INTO c VALUES(1,5);
+  BEGIN;
+    DELETE FROM p WHERE id=5;  -- violation (deferred)
+    INSERT INTO p VALUES(5);   -- fix in same tx
+  COMMIT;
+  SELECT count(*) FROM p WHERE id=5;
+} {1}
+
+# TX: multiple violating children, later insert parent, COMMIT -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-tx-multi-children-fixed-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1,99);
+    INSERT INTO c VALUES(2,99);
+    INSERT INTO p VALUES(99);
+  COMMIT;
+  SELECT id,pid FROM c ORDER BY id;
+} {1|99 2|99}
+
+#  one of several children left unfixed -> COMMIT fails
+do_execsql_test_in_memory_any_error fk-deferred-tx-multi-children-one-left-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1,42);
+    INSERT INTO c VALUES(2,42);
+    INSERT INTO p VALUES(42);
+    UPDATE c SET pid=777 WHERE id=2;  -- reintroduce a bad reference
+  COMMIT;  -- should fail
+}
+
+# composite PK parent, fix via parent UPDATE before COMMIT -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-composite-parent-update-fix {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+  CREATE TABLE child(id INT PRIMARY KEY, ca INT, cb INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO parent VALUES(1,1);
+  BEGIN;
+    INSERT INTO child VALUES(10, 7, 7);        -- violation
+    UPDATE parent SET a=7, b=7 WHERE a=1 AND b=1;  -- fix composite PK
+  COMMIT;
+  SELECT id, ca, cb FROM child;
+} {10|7|7}
+
+# TX: NULL in child FK -> never a violation
+do_execsql_test_on_specific_db {:memory:} fk-deferred-null-fk-never-violates {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, NULL);  -- always OK
+  COMMIT;
+  SELECT id, pid FROM c;
+} {1|}
+
+# TX: child UPDATE to NULL resolves before COMMIT
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-child-null-resolves {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 500);  -- violation
+    UPDATE c SET pid=NULL WHERE id=1; -- resolves
+  COMMIT;
+  SELECT * FROM c;
+} {1|}
+
+# TX: delete violating child resolves before COMMIT
+do_execsql_test_on_specific_db {:memory:} fk-deferred-delete-child-resolves {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 777);  -- violation
+    DELETE FROM c WHERE id=1;      -- resolves
+  COMMIT;
+  SELECT count(*) FROM c;
+} {0}
+
+# TX: update parent PK to match child before COMMIT -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-parent-pk-resolves {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO p VALUES(10);
+  BEGIN;
+    INSERT INTO c VALUES(1, 20);   -- violation
+    UPDATE p SET id=20 WHERE id=10; -- resolve via parent
+  COMMIT;
+  SELECT * FROM c;
+} {1|20}
+
+# Two-table cycle; both inserted before COMMIT -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-cycle-two-tables-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE a(id INT PRIMARY KEY, b_id INT, FOREIGN KEY(b_id) REFERENCES b(id) DEFERRABLE INITIALLY DEFERRED);
+  CREATE TABLE b(id INT PRIMARY KEY, a_id INT, FOREIGN KEY(a_id) REFERENCES a(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO a VALUES(1, 1);  -- refers to b(1) (not yet present)
+    INSERT INTO b VALUES(1, 1);  -- refers to a(1)
+  COMMIT;
+  SELECT count(b.id), count(a.id) FROM a, b;
+} {1|1}
+
+# Delete a row that self-references (child==parent) within a tx -> OK
+do_execsql_test_on_specific_db {:memory:} fk-deferred-selfref-delete-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+  INSERT INTO t VALUES(1,1);
+  BEGIN;
+    DELETE FROM t WHERE id=1;
+  COMMIT;
+  SELECT count(*) FROM t;
+} {0}
+
+
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-donothing-noconflict-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent (id INTEGER PRIMARY KEY, a INT, b INT);
+  CREATE TABLE child_deferred (
+    id INTEGER PRIMARY KEY, pid INT, x INT,
+    FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred (
+    id INTEGER PRIMARY KEY, ca INT, cb INT, z INT,
+    FOREIGN KEY (ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  -- No conflict on (a,b); should insert 1 row, no FK noise
+  INSERT INTO parent_comp VALUES (-1,-1,9) ON CONFLICT DO NOTHING;
+  SELECT a,b,c FROM parent_comp ORDER BY a,b;
+} {-1|-1|9}
+
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-donothing-conflict-noop {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred (
+    id INTEGER PRIMARY KEY, ca INT, cb INT, z INT,
+    FOREIGN KEY (ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  INSERT INTO parent_comp VALUES (10,20,1);
+  -- Conflicts with existing (10,20); must do nothing (no triggers, no FK scans that mutate counters)
+  INSERT INTO parent_comp VALUES (10,20,999) ON CONFLICT DO NOTHING;
+  SELECT a,b,c FROM parent_comp;
+} {10|20|1}
+
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-donothing-unrelated-immediate-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent (id INTEGER PRIMARY KEY);
+  CREATE TABLE child_immediate (
+    id INTEGER PRIMARY KEY, pid INT,
+    FOREIGN KEY(pid) REFERENCES parent(id)          -- IMMEDIATE
+  );
+  CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred (
+    id INTEGER PRIMARY KEY, ca INT, cb INT, z INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  INSERT INTO parent_comp VALUES (-1,-1,9) ON CONFLICT DO NOTHING;
+  SELECT a,b,c FROM parent_comp;
+} {-1|-1|9}
+
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-deferred-fix-inside-tx-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred (
+    id INTEGER PRIMARY KEY, ca INT, cb INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  BEGIN;
+    INSERT INTO child_comp_deferred VALUES (1, -5, -6);  -- violation
+    INSERT INTO parent_comp VALUES (-5, -6, 9);          -- fix via parent insert
+  COMMIT;
+  SELECT id,ca,cb FROM child_comp_deferred;
+} {1|-5|-6}
+
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-autocommit-unrelated-children-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred (
+    id INTEGER PRIMARY KEY, ca INT, cb INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  INSERT INTO parent_comp VALUES (1,1,0);
+  INSERT INTO child_comp_deferred VALUES (10,1,1);    -- valid
+  INSERT INTO parent_comp VALUES (2,2,0) ON CONFLICT DO NOTHING;  -- unrelated insert; must not raise
+  SELECT a,b,c FROM parent_comp ORDER BY a,b;
+} {1|1|0
+2|2|0}
+
+# ROLLBACK must clear any deferred state; next statement must not trip.
+do_execsql_test_on_specific_db {:memory:} fk-rollback-clears-then-donothing-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+
+  BEGIN;
+    INSERT INTO c VALUES(1, 456);   -- create deferred violation
+  ROLLBACK;                          -- must clear counters
+
+  INSERT INTO parent_comp VALUES(-2,-2,0) ON CONFLICT DO NOTHING;
+  SELECT a,b,c FROM parent_comp;
+} {-2|-2|0}
+
+# DO NOTHING conflict path must touch no FK maintenance at all.
+do_execsql_test_on_specific_db {:memory:} fk-parentcomp-donothing-conflict-stays-quiet {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+  CREATE TABLE child_comp_deferred(
+    id INTEGER PRIMARY KEY, ca INT, cb INT,
+    FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED
+  );
+
+  INSERT INTO parent_comp VALUES(10,20,1);
+  -- This conflicts with (10,20) and must be a no-op; if counters move here, it’s a bug.
+  INSERT INTO parent_comp VALUES(10,20,999) ON CONFLICT DO NOTHING;
+
+  -- Prove DB is sane afterwards (no stray FK error)
+  INSERT INTO parent_comp VALUES(11,22,3) ON CONFLICT DO NOTHING;
+  SELECT a,b FROM parent_comp ORDER BY a,b;
+} {10|20
+11|22}
+
+# Two-statement fix inside an explicit transaction (separate statements).
+#Insert child (violation), then insert parent in a new statement; commit must pass.
+do_execsql_test_on_specific_db {:memory:} fk-deferred-two-stmt-fix-inside-tx-ok {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 777);   -- violation recorded in tx
+    INSERT INTO p VALUES(777);      -- next statement fixes it
+  COMMIT;
+  SELECT * FROM c;
+} {1|777}
+
+do_execsql_test_on_specific_db {:memory:} fk-delete-composite-bounds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY(a,b));
+  CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, w INT,
+                 FOREIGN KEY(x,y) REFERENCES p(a,b));
+
+  INSERT INTO p VALUES (5,1,0),(5,2,0),(5,4,0);
+  INSERT INTO c VALUES (1,5,4,0);  -- child references (5,4)
+
+  -- This should be a no-op (no row (5,3)), and MUST NOT error.
+  DELETE FROM p WHERE a=5 AND b=3;
+} {}

@@ -1173,7 +1173,6 @@ pub enum Insn {
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
-        check_abort: bool,
         increment_value: isize,
         is_scope: bool,
     },
@@ -1181,7 +1180,7 @@ pub enum Insn {
     // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).
     // If P1 is zero, the jump is taken if the statement constraint-counter is zero (immediate foreign key constraint violations).
     FkIfZero {
-        if_zero: bool,
+        is_scope: bool,
         target_pc: BranchOffset,
     },
 }
