@@ -246,16 +246,8 @@ impl Schema {
         self.views.get(&name)
     }
 
-    pub fn add_btree_table(&mut self, mut table: Arc<BTreeTable>) -> Result<()> {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
         let name = normalize_ident(&table.name);
-        let mut validated_fks: Vec<Arc<ForeignKey>> = Vec::with_capacity(table.foreign_keys.len());
-        // when we built the BTreeTable from SQL, we didn't have access to the Schema to validate
-        // any FK relationships, so we do that now
-        self.validate_btree_foreign_keys(&table, &mut validated_fks)?;
-
-        // there should only be 1 reference to the table so Arc::make_mut shouldnt copy
-        let t = Arc::make_mut(&mut table);
-        t.foreign_keys = validated_fks;
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -804,155 +796,20 @@ impl Schema {
         Ok(())
     }
 
-    /// Validate and normalize all FOREIGN KEYs declared on a BTree table,
-    /// then append resolved entries into `resolved_fks`.
-    ///
-    /// - Parent table must exist.
-    /// - Child/parent column counts must match.
-    /// - All referenced columns must exist (allowing the `rowid` sentinel).
-    /// - The parent key must be UNIQUE: either the parent's declared PRIMARY KEY,
-    ///   a single `rowid`/rowid-alias, or an explicit UNIQUE index over the parent cols.
-    fn validate_btree_foreign_keys(
-        &self,
-        table: &Arc<BTreeTable>,
-        resolved_fks: &mut Vec<Arc<ForeignKey>>,
-    ) -> Result<()> {
-        for key in &table.foreign_keys {
-            let parent = if key.parent_table.eq_ignore_ascii_case(table.name.as_str()) {
-                table.clone()
-            } else if let Some(arc) = self.get_btree_table(&key.parent_table) {
-                arc
-            } else {
-                return Err(LimboError::ParseError(format!(
-                    "Foreign key references missing table {}",
-                    key.parent_table
-                )));
-            };
-
-            let child_cols: Vec<String> = key.child_columns.clone();
-            for c in &child_cols {
-                if table.get_column(c).is_none() && !c.eq_ignore_ascii_case("rowid") {
-                    return Err(LimboError::ParseError(format!(
-                        "Foreign key child column not found: {}.{}",
-                        table.name, c
-                    )));
-                }
-            }
-
-            // Resolve parent cols:
-            // if explicitly listed, we normalize them
-            // else, we default to parent's PRIMARY KEY columns.
-            // if parent has no declared PK, SQLite defaults to single "rowid"
-            // Resolve parent cols
-            let parent_cols: Vec<String> = if key.parent_columns.is_empty() {
-                if !parent.primary_key_columns.is_empty() {
-                    parent
-                        .primary_key_columns
-                        .iter()
-                        .map(|(col, _)| col)
-                        .cloned()
-                        .collect()
-                } else {
-                    return Err(LimboError::ParseError(format!(
-            "foreign key mismatch - \"{}\" referencing \"{}\" (parent has no PRIMARY KEY)",
-                table.name, key.parent_table
-                    )));
-                }
-            } else {
-                key.parent_columns
-                    .iter()
-                    .map(|c| normalize_ident(c))
-                    .collect()
-            };
-
-            if !key.parent_columns.is_empty()
-                && parent_cols.iter().any(|c| c.eq_ignore_ascii_case("rowid"))
-            {
-                return Err(LimboError::ParseError(
-            "FOREIGN KEY cannot reference ROWID explicitly; use the INTEGER PRIMARY KEY column name"
-                .to_string(),
-                ));
-            }
-
-            if parent_cols.len() != child_cols.len() {
-                return Err(LimboError::ParseError(format!(
-                    "Foreign key column count mismatch: child {child_cols:?} vs parent {parent_cols:?}",
-                )));
-            }
-
-            // Ensure each parent col exists
-            for col in &parent_cols {
-                if !col.eq_ignore_ascii_case("rowid") && parent.get_column(col).is_none() {
-                    return Err(LimboError::ParseError(format!(
-                        "Foreign key references missing column {}.{col}",
-                        key.parent_table
-                    )));
-                }
-            }
-
-            let parent_is_rowid =
-                parent_cols.len() == 1 && parent_cols[0].eq_ignore_ascii_case("rowid");
-
-            let parent_has_declared_unique = parent.unique_sets.iter().any(|us| {
-                us.columns.len() == parent_cols.len()
-                    && us
-                        .columns
-                        .iter()
-                        .zip(&parent_cols)
-                        .all(|((n, _ord), pc)| n.eq_ignore_ascii_case(pc))
-            });
-
-            // Parent side must be UNIQUE/PK, rowid counts as unique
-            let parent_is_pk = !parent.primary_key_columns.is_empty()
-                && parent_cols.len() == parent.primary_key_columns.len()
-                && parent_cols
-                    .iter()
-                    .zip(&parent.primary_key_columns)
-                    .all(|(a, (b, _))| a.eq_ignore_ascii_case(b));
-
-            let parent_has_unique_index = self.get_indices(&parent.name).any(|idx| {
-                idx.unique
-                    && idx.columns.len() == parent_cols.len()
-                    && idx
-                        .columns
-                        .iter()
-                        .zip(&parent_cols)
-                        .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
-            });
-
-            let parent_is_unique = parent_is_pk
-                || parent_is_rowid
-                || parent_has_declared_unique
-                || parent_has_unique_index;
-
-            if !parent_is_unique {
-                return Err(LimboError::ParseError(format!(
-                    "foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
-                    key.parent_table, parent_cols
-                )));
-            }
-            let fk = ForeignKey {
-                parent_table: key.parent_table.clone(),
-                parent_columns: parent_cols,
-                child_columns: child_cols,
-                on_delete: key.on_delete,
-                on_update: key.on_update,
-                deferred: key.deferred,
-            };
-            resolved_fks.push(Arc::new(fk));
-        }
-        Ok(())
-    }
-
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
     /// Each item contains the child table, normalized columns/positions, and the parent lookup
     /// strategy (rowid vs. UNIQUE index or PK).
-    pub fn resolved_fks_referencing(&self, table_name: &str) -> Vec<ResolvedFkRef> {
+    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+        let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
+            crate::LimboError::Constraint(format!(
+                "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+            ))
+        };
         let target = normalize_ident(table_name);
         let mut out = Vec::with_capacity(4); // arbitrary estimate
         let parent_tbl = self
             .get_btree_table(&target)
-            .expect("parent table must exist");
+            .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
@@ -973,60 +830,56 @@ impl Schema {
             let Some(child) = t.btree() else {
                 continue;
             };
-
             for fk in &child.foreign_keys {
-                if fk.parent_table != target {
+                if !fk.parent_table.eq_ignore_ascii_case(&target) {
                     continue;
                 }
-
-                // Resolve + normalize columns
+                if fk.child_columns.is_empty() {
+                    // SQLite requires an explicit child column list unless the table has a single-column PK that
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
                 let child_cols: Vec<String> = fk.child_columns.clone();
+                let mut child_pos = Vec::with_capacity(child_cols.len());
 
-                // If no explicit parent columns were given, they were validated in add_btree_table()
-                // to match the parent's PK. We resolve them the same way here.
+                for cname in &child_cols {
+                    let (i, _) = child
+                        .get_column(cname)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                    child_pos.push(i);
+                }
                 let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
-                    parent_tbl
-                        .primary_key_columns
-                        .iter()
-                        .map(|(col, _)| col)
-                        .cloned()
-                        .collect()
+                    if !parent_tbl.primary_key_columns.is_empty() {
+                        parent_tbl
+                            .primary_key_columns
+                            .iter()
+                            .map(|(col, _)| col)
+                            .cloned()
+                            .collect()
+                    } else {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    }
                 } else {
                     fk.parent_columns.clone()
                 };
 
-                // Child positions
-                let child_pos: Vec<usize> = child_cols
-                    .iter()
-                    .map(|cname| {
-                        child
-                            .get_column(cname)
-                            .map(|(i, _)| i)
-                            .unwrap_or_else(|| panic!("child col {}.{} missing", child.name, cname))
-                    })
-                    .collect();
+                // Same length required
+                if parent_cols.len() != child_cols.len() {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
 
-                let parent_pos: Vec<usize> = parent_cols
-                    .iter()
-                    .map(|cname| {
-                        // Allow "rowid" sentinel; return 0 but it won't be used when parent_uses_rowid == true
-                        parent_tbl
-                            .get_column(cname)
-                            .map(|(i, _)| i)
-                            .or_else(|| {
-                                if cname.eq_ignore_ascii_case("rowid") {
-                                    Some(0)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| {
-                                panic!("parent col {}.{cname} missing", parent_tbl.name)
-                            })
-                    })
-                    .collect();
+                let mut parent_pos = Vec::with_capacity(parent_cols.len());
+                for pc in &parent_cols {
+                    let pos = parent_tbl
+                        .get_column(pc)
+                        .map(|(i, _)| i)
+                        .or_else(|| pc.eq_ignore_ascii_case("rowid").then_some(0));
+                    let Some(p) = pos else {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    };
+                    parent_pos.push(p);
+                }
 
-                // Detect parent rowid usage (single-column and rowid/alias)
+                // Determine if parent key is ROWID/alias
                 let parent_uses_rowid = parent_cols.len() == 1 && {
                     let c = parent_cols[0].as_str();
                     c.eq_ignore_ascii_case("rowid")
@@ -1039,10 +892,13 @@ impl Schema {
                         })
                 };
 
+                // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
                 let parent_unique_index = if parent_uses_rowid {
                     None
                 } else {
                     find_parent_unique(&parent_cols)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
+                        .into()
                 };
 
                 out.push(ResolvedFkRef {
@@ -1057,76 +913,74 @@ impl Schema {
                 });
             }
         }
-        out
+        Ok(out)
     }
 
     /// Compute all resolved FKs *declared by* `child_table`
-    pub fn resolved_fks_for_child(&self, child_table: &str) -> Vec<ResolvedFkRef> {
-        let child_name = normalize_ident(child_table);
-        let Some(child) = self.get_btree_table(&child_name) else {
-            return vec![];
+    pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
+        let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
+            crate::LimboError::Constraint(format!(
+                "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+            ))
         };
-
-        // Helper to find the UNIQUE/index on the parent that matches the resolved parent cols
-        let find_parent_unique =
-            |parent_tbl: &BTreeTable, cols: &Vec<String>| -> Option<Arc<Index>> {
-                self.get_indices(&parent_tbl.name)
-                    .find(|idx| {
-                        idx.unique
-                            && idx.columns.len() == cols.len()
-                            && idx
-                                .columns
-                                .iter()
-                                .zip(cols.iter())
-                                .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
-                    })
-                    .cloned()
-            };
+        let child_name = normalize_ident(child_table);
+        let child = self
+            .get_btree_table(&child_name)
+            .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
         let mut out = Vec::with_capacity(child.foreign_keys.len());
-        for fk in &child.foreign_keys {
-            let parent_name = &fk.parent_table;
-            let Some(parent_tbl) = self.get_btree_table(parent_name) else {
-                continue;
-            };
 
-            // Normalize columns
-            let child_cols: Vec<String> = fk
-                .child_columns
-                .iter()
-                .map(|s| normalize_ident(s))
-                .collect();
+        for fk in &child.foreign_keys {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let parent_tbl = self
+                .get_btree_table(&parent_name)
+                .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+
+            let child_cols: Vec<String> = fk.child_columns.clone();
+            if child_cols.is_empty() {
+                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            }
+
+            // Child positions exist
+            let mut child_pos = Vec::with_capacity(child_cols.len());
+            for cname in &child_cols {
+                let (i, _) = child
+                    .get_column(cname)
+                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                child_pos.push(i);
+            }
+
             let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
                 if !parent_tbl.primary_key_columns.is_empty() {
                     parent_tbl
                         .primary_key_columns
                         .iter()
-                        .map(|(n, _)| normalize_ident(n))
+                        .map(|(col, _)| col)
+                        .cloned()
                         .collect()
                 } else {
-                    vec!["rowid".to_string()]
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
                 }
             } else {
-                fk.parent_columns
-                    .iter()
-                    .map(|s| normalize_ident(s))
-                    .collect()
+                fk.parent_columns.clone()
             };
 
-            let child_pos: Vec<usize> = child_cols
-                .iter()
-                .map(|c| child.get_column(c).expect("child col missing").0)
-                .collect();
-            let parent_pos: Vec<usize> = parent_cols
-                .iter()
-                .map(|c| {
-                    parent_tbl
-                        .get_column(c)
-                        .map(|(i, _)| i)
-                        .or_else(|| c.eq_ignore_ascii_case("rowid").then_some(0))
-                        .expect("parent col missing")
-                })
-                .collect();
+            if parent_cols.len() != child_cols.len() {
+                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            }
+
+            // Parent positions exist, or rowid sentinel
+            let mut parent_pos = Vec::with_capacity(parent_cols.len());
+            for pc in &parent_cols {
+                let pos = parent_tbl
+                    .get_column(pc)
+                    .map(|(i, _)| i)
+                    .or_else(|| pc.eq_ignore_ascii_case("rowid").then_some(0));
+                let Some(p) = pos else {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                };
+                parent_pos.push(p);
+            }
 
             let parent_uses_rowid = parent_cols.len() == 1 && {
                 let c = parent_cols[0].as_str();
@@ -1140,10 +994,24 @@ impl Schema {
                     })
             };
 
+            // Must be PK or a non-partial UNIQUE on exactly those columns.
             let parent_unique_index = if parent_uses_rowid {
                 None
             } else {
-                find_parent_unique(&parent_tbl, &parent_cols)
+                self.get_indices(&parent_tbl.name)
+                    .find(|idx| {
+                        idx.unique
+                            && idx.where_clause.is_none()
+                            && idx.columns.len() == parent_cols.len()
+                            && idx
+                                .columns
+                                .iter()
+                                .zip(parent_cols.iter())
+                                .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                    })
+                    .cloned()
+                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
+                    .into()
             };
 
             out.push(ResolvedFkRef {
@@ -1157,7 +1025,8 @@ impl Schema {
                 parent_unique_index,
             });
         }
-        out
+
+        Ok(out)
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
@@ -1628,7 +1497,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 constraints,
             } in columns
             {
-                let name = normalize_ident(col_name.as_str());
+                let name = col_name.as_str().to_string();
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -1767,7 +1636,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 }
 
                 cols.push(Column {
-                    name: Some(name),
+                    name: Some(normalize_ident(&name)),
                     ty,
                     ty_str,
                     primary_key,

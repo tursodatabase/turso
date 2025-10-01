@@ -1037,7 +1037,10 @@ pub fn emit_fk_parent_existence_checks(
         .get_btree_table(parent_table_name)
         .ok_or_else(|| crate::LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in resolver.schema.resolved_fks_referencing(parent_table_name) {
+    for fk_ref in resolver
+        .schema
+        .resolved_fks_referencing(parent_table_name)?
+    {
         // Resolve parent key columns
         let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
             parent_bt
@@ -1708,7 +1711,7 @@ fn emit_update_insns(
                     plan.set_clauses.iter().map(|(i, _)| *i).collect();
 
                 // If no incoming FK’s parent key can be affected by these updates, skip the whole parent-FK block.
-                let incoming = t_ctx.resolver.schema.resolved_fks_referencing(table_name);
+                let incoming = t_ctx.resolver.schema.resolved_fks_referencing(table_name)?;
                 let parent_tbl = &table_btree;
                 let maybe_affects_parent_key = incoming
                     .iter()
@@ -2340,7 +2343,7 @@ pub fn emit_fk_child_existence_checks(
     rowid_reg: usize,
     updated_cols: &HashSet<usize>,
 ) -> Result<()> {
-    for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
+    for fk_ref in resolver.schema.resolved_fks_for_child(table_name)? {
         // Skip when the child key is untouched
         if !fk_ref.child_key_changed(updated_cols, table) {
             continue;

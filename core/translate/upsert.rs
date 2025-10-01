@@ -497,7 +497,7 @@ pub fn emit_upsert(
                 // if parent key can't change, skip
                 let updated_parent_positions: HashSet<usize> =
                     set_pairs.iter().map(|(i, _)| *i).collect();
-                let incoming = resolver.schema.resolved_fks_referencing(table.get_name());
+                let incoming = resolver.schema.resolved_fks_referencing(table.get_name())?;
                 let parent_key_may_change = incoming
                     .iter()
                     .any(|r| r.parent_key_may_change(&updated_parent_positions, &bt));

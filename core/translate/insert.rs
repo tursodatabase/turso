@@ -273,7 +273,6 @@ pub fn translate_insert(
 
                 let query_destination = QueryDestination::CoroutineYield {
                     yield_reg,
-                    // keep implementation_start as halt_label (producer internals)
                     coroutine_implementation_start: halt_label,
                 };
                 program.incr_nesting();
@@ -1901,7 +1900,7 @@ fn emit_fk_checks_for_insert(
     single_row_insert: bool,
 ) -> Result<()> {
     // Iterate child FKs declared on this table
-    for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
+    for fk_ref in resolver.schema.resolved_fks_for_child(table_name)? {
         let parent_tbl = resolver
             .schema
             .get_btree_table(&fk_ref.fk.parent_table)
@@ -1944,7 +1943,6 @@ fn emit_fk_checks_for_insert(
                 dst_reg: tmp,
                 extra_amount: 0,
             });
-            // coerce to INT (parent rowid affinity)
             program.emit_insn(Insn::MustBeInt { reg: tmp });
             if is_self_single {
                 program.emit_insn(Insn::Eq {
