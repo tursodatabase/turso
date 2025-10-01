@@ -69,6 +69,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
+    task::Waker,
 };
 use tracing::{instrument, Level};
 
@@ -530,9 +531,10 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         match query_mode {
-            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
         }
@@ -645,6 +647,7 @@ impl Program {
         state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
