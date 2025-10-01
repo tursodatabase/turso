@@ -1732,13 +1732,15 @@ impl Connection {
                 // No active transaction
             }
             _ => {
-                let pager = self.pager.read();
-                pager.io.block(|| {
-                    pager.end_tx(
-                        true, // rollback = true for close
-                        self,
-                    )
-                })?;
+                if !self.mvcc_enabled() {
+                    let pager = self.pager.read();
+                    pager.io.block(|| {
+                        pager.end_tx(
+                            true, // rollback = true for close
+                            self,
+                        )
+                    })?;
+                }
                 self.set_tx_state(TransactionState::None);
             }
         }
