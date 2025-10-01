@@ -399,3 +399,20 @@ do_execsql_test_in_memory_any_error fk-self-multirow-one-bad {
                    FOREIGN KEY(rid) REFERENCES t(id));
     INSERT INTO t(id,rid) VALUES (1,1),(3,99); -- 99 has no parent -> error
 }
+
+do_execsql_test_on_specific_db {:memory:} fk-deferred-commit-doesnt-fail-early {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 99); -- shouldnt fail because we are mid-tx
+} {}
+
+do_execsql_test_in_memory_any_error fk-deferred-commit-fails {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+  BEGIN;
+    INSERT INTO c VALUES(1, 99); -- shouldnt fail because we are mid-tx
+  COMMIT;
+}
