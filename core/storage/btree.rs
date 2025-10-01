@@ -4718,7 +4718,8 @@ impl BTreeCursor {
         match &self.mv_cursor {
             Some(mv_cursor) => match key.maybe_rowid() {
                 Some(rowid) => {
-                    let row_id = crate::mvcc::database::RowID::new(self.table_id(), rowid);
+                    let row_id =
+                        crate::mvcc::database::RowID::new(mv_cursor.read().table_id, rowid);
                     let record_buf = key.get_record().unwrap().get_payload().to_vec();
                     let num_columns = match key {
                         BTreeKey::IndexKey(record) => record.column_count(),
@@ -5462,10 +5463,6 @@ impl BTreeCursor {
 
         self.pager.add_dirty(root_page);
         btree_init_page(root_page, page_type, 0, self.pager.usable_space());
-    }
-
-    pub fn table_id(&self) -> i64 {
-        self.root_page
     }
 
     pub fn overwrite_cell(

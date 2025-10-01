@@ -68,7 +68,7 @@ fn bench(c: &mut Criterion) {
                 .read(
                     tx_id,
                     RowID {
-                        table_id: 1,
+                        table_id: (-2).into(),
                         row_id: 1,
                     },
                 )
@@ -98,7 +98,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     Row {
                         id: RowID {
-                            table_id: 1,
+                            table_id: (-2).into(),
                             row_id: 1,
                         },
                         data: record_data.clone(),
@@ -126,7 +126,7 @@ fn bench(c: &mut Criterion) {
             tx_id,
             Row {
                 id: RowID {
-                    table_id: 1,
+                    table_id: (-2).into(),
                     row_id: 1,
                 },
                 data: record_data.clone(),
@@ -140,7 +140,7 @@ fn bench(c: &mut Criterion) {
                 .read(
                     tx_id,
                     RowID {
-                        table_id: 1,
+                        table_id: (-2).into(),
                         row_id: 1,
                     },
                 )
@@ -155,7 +155,7 @@ fn bench(c: &mut Criterion) {
             tx_id,
             Row {
                 id: RowID {
-                    table_id: 1,
+                    table_id: (-2).into(),
                     row_id: 1,
                 },
                 data: record_data.clone(),
@@ -170,7 +170,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     Row {
                         id: RowID {
-                            table_id: 1,
+                            table_id: (-2).into(),
                             row_id: 1,
                         },
                         data: record_data.clone(),

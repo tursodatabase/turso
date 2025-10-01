@@ -65,6 +65,23 @@ impl TempDatabase {
         )
     }
 
+    pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+        )
+        .unwrap();
+        Self {
+            path: db_path.to_path_buf(),
+            io,
+            db,
+        }
+    }
+
     pub fn new_with_existent_with_flags(
         db_path: &Path,
         flags: turso_core::OpenFlags,

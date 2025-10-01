@@ -645,9 +645,6 @@ impl Schema {
                         )?
                     };
                     self.add_virtual_table(vtab);
-                    if let Some(mv_store) = mv_store {
-                        mv_store.mark_table_as_loaded(root_page);
-                    }
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
 
@@ -681,9 +678,6 @@ impl Schema {
                         }
                     }
 
-                    if let Some(mv_store) = mv_store {
-                        mv_store.mark_table_as_loaded(root_page);
-                    }
                     self.add_btree_table(Arc::new(table));
                 }
             }

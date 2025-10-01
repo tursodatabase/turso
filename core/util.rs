@@ -135,9 +135,9 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
-    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
+    let mv_store = rows.mv_store.clone();
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
@@ -173,7 +173,7 @@ pub fn parse_schema_rows(
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                    mv_store,
+                    mv_store.as_ref(),
                 )?
             }
             StepResult::IO => {

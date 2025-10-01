@@ -1037,10 +1037,9 @@ pub fn op_open_read(
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = *root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
@@ -2244,7 +2243,6 @@ pub fn op_transaction_inner(
         },
         insn
     );
-    tracing::info!("op_transaction: mv_store.is_some()={}", mv_store.is_some());
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
@@ -6649,10 +6647,9 @@ pub fn op_open_write(
         _ => None,
     };
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
@@ -6739,7 +6736,7 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store {
         let root_page = mv_store.get_next_table_id();
-        state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+        state.registers[*root] = Register::Value(Value::Integer(root_page));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -6959,7 +6956,6 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
-                mv_store,
             )
         })
     } else {
@@ -6975,7 +6971,6 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
-                mv_store,
             )
         })
     };
@@ -7423,10 +7418,9 @@ pub fn op_open_ephemeral(
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
             let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let table_id = root_page;
                 let mv_store = mv_store.unwrap().clone();
                 let mv_cursor = Arc::new(RwLock::new(
-                    MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+                    MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
                 ));
                 Some(mv_cursor)
             } else {
@@ -7522,12 +7516,11 @@ pub fn op_open_dup(
     let pager = &original_cursor.pager;
 
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
             mv_store,
             tx_id,
-            table_id,
+            root_page,
             pager.clone(),
         )?));
         Some(mv_cursor)

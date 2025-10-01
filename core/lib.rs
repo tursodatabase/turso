@@ -450,6 +450,13 @@ impl Database {
             buffer_pool: BufferPool::begin_init(&io, arena_size),
             n_connections: AtomicUsize::new(0),
         });
+
+        if opts.enable_mvcc {
+            let mv_store = db.mv_store.as_ref().unwrap();
+            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            mv_store.bootstrap(mvcc_bootstrap_conn)?;
+        }
+
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
 
@@ -494,18 +501,27 @@ impl Database {
                 Ok(())
             })?;
         }
+
         Ok(db)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        self._connect(false)
+    }
+
+    pub(crate) fn connect_mvcc_bootstrap(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        self._connect(true)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn _connect(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+    ) -> Result<Arc<Connection>> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
-
-        if self.mv_store.is_some() {
-            self.maybe_recover_logical_log(pager.clone())?;
-        }
 
         let page_size = pager.get_page_size_unchecked();
 
@@ -547,6 +563,7 @@ impl Database {
             sync_mode: RwLock::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
+            is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -554,17 +571,6 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
-    }
-
-    pub fn maybe_recover_logical_log(self: &Arc<Database>, pager: Arc<Pager>) -> Result<()> {
-        let Some(mv_store) = self.mv_store.clone() else {
-            panic!("tryign to recover logical log without mvcc");
-        };
-        if !mv_store.needs_recover() {
-            return Ok(());
-        }
-
-        mv_store.recover_logical_log(&self.io, &pager)
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -1060,6 +1066,8 @@ pub struct Connection {
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
     busy_timeout: RwLock<std::time::Duration>,
+    /// Whether this is an internal connection used for MVCC bootstrap
+    is_mvcc_bootstrap_connection: AtomicBool,
 }
 
 impl Drop for Connection {
@@ -1074,8 +1082,20 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        if self.is_mvcc_bootstrap_connection() {
+            // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
+            return self._prepare(sql, None);
+        }
+        self._prepare(sql, self.db.mv_store.clone())
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn _prepare(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        mv_store: Option<Arc<MvStore>>,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1108,12 +1128,19 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(
-            program,
-            self.db.mv_store.clone(),
-            pager,
-            mode,
-        ))
+        Ok(Statement::new(program, mv_store, pager, mode))
+    }
+
+    /// Whether this is an internal connection used for MVCC bootstrap
+    pub fn is_mvcc_bootstrap_connection(&self) -> bool {
+        self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst)
+    }
+
+    /// Promote MVCC bootstrap connection to a regular connection so it reads from the MV store again.
+    pub fn promote_to_regular_connection(&self) {
+        assert!(self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst));
+        self.is_mvcc_bootstrap_connection
+            .store(false, Ordering::SeqCst);
     }
 
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
@@ -1214,14 +1241,7 @@ impl Connection {
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(
-            stmt,
-            &mut fresh,
-            &self.syms.read(),
-            None,
-            existing_views,
-            self.db.mv_store.as_ref(),
-        )?;
+        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), None, existing_views)?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -1732,7 +1752,7 @@ impl Connection {
     }
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst)
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.mv_store.is_some()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -1875,14 +1895,9 @@ impl Connection {
         let syms = self.syms.read();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
-                rows,
-                schema,
-                &syms,
-                None,
-                existing_views,
-                self.db.mv_store.as_ref(),
-            ) {
+            if let Err(LimboError::ExtensionError(e)) =
+                parse_schema_rows(rows, schema, &syms, None, existing_views)
+            {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");
