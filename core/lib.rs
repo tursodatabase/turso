@@ -62,6 +62,8 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
+#[cfg(not(feature = "simulator"))]
+use std::sync::{LazyLock, Weak};
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -72,7 +74,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex, Weak,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -198,6 +200,7 @@ pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
 /// `Database` object per a database file. We need because it is not safe
 /// to have multiple independent WAL files open because coordination
 /// happens at process-level POSIX file advisory locks.
+#[cfg(not(feature = "simulator"))]
 static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -352,16 +355,19 @@ impl Database {
             );
         }
 
+        #[cfg(not(feature = "simulator"))]
         let mut registry = DATABASE_MANAGER.lock().unwrap();
-
+        #[cfg(not(feature = "simulator"))]
         let canonical_path = std::fs::canonicalize(path)
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| path.to_string());
 
+        #[cfg(not(feature = "simulator"))]
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             return Ok(db);
         }
+
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
@@ -371,7 +377,10 @@ impl Database {
             opts,
             encryption_opts,
         )?;
-        registry.insert(canonical_path, Arc::downgrade(&db));
+        #[cfg(not(feature = "simulator"))]
+        {
+            registry.insert(canonical_path, Arc::downgrade(&db));
+        }
         Ok(db)
     }
 
