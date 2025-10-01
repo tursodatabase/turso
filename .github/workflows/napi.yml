@@ -1,6 +1,7 @@
 name: Build & publish @tursodatabase/database
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
