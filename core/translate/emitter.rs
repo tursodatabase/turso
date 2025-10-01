@@ -1039,12 +1039,6 @@ pub fn emit_fk_parent_existence_checks(
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
 ) -> Result<()> {
-    let after_all = program.allocate_label();
-    program.emit_insn(Insn::FkIfZero {
-        target_pc: after_all,
-        if_zero: true,
-    });
-
     let parent_bt = resolver
         .schema
         .get_btree_table(parent_table_name)
@@ -1130,6 +1124,25 @@ pub fn emit_fk_parent_existence_checks(
                     extra_amount: 0,
                 });
             }
+            if let Some(count) = NonZeroUsize::new(parent_cols_len) {
+                // Apply index affinities for composite comparison
+                let aff: String = idx
+                    .columns
+                    .iter()
+                    .map(|ic| {
+                        let (_, col) = fk_ref
+                            .child_table
+                            .get_column(&ic.name)
+                            .expect("indexed child column not found");
+                        col.affinity().aff_mask()
+                    })
+                    .collect();
+                program.emit_insn(Insn::Affinity {
+                    start_reg: probe_start,
+                    count,
+                    affinities: aff,
+                });
+            }
 
             let ok = program.allocate_label();
             program.emit_insn(Insn::NotFound {
@@ -1205,7 +1218,7 @@ pub fn emit_fk_parent_existence_checks(
                     lhs: tmp,
                     rhs: parent_key_start + i,
                     target_pc: cont_i,
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().jump_if_null(),
                     collation: program.curr_collation(),
                 });
                 // Not equal -> skip this child row
@@ -1242,7 +1255,6 @@ pub fn emit_fk_parent_existence_checks(
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
     }
-    program.resolve_label(after_all, program.offset());
     Ok(())
 }
 
@@ -2339,12 +2351,6 @@ pub fn emit_fk_child_existence_checks(
     rowid_reg: usize,
     updated_cols: &HashSet<usize>,
 ) -> Result<()> {
-    let after_all = program.allocate_label();
-    program.emit_insn(Insn::FkIfZero {
-        target_pc: after_all,
-        if_zero: true,
-    });
-
     for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
         // Skip when the child key is untouched (including rowid-alias special case)
         if !fk_ref.child_key_changed(updated_cols, table) {
@@ -2387,11 +2393,17 @@ pub fn emit_fk_child_existence_checks(
             } else {
                 start_reg + i_child
             };
-
+            let tmp = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: val_reg,
+                dst_reg: tmp,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MustBeInt { reg: tmp });
             let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
-                rowid_reg: val_reg,
+                rowid_reg: tmp,
                 target_pc: violation,
             });
             program.emit_insn(Insn::Close { cursor_id: pcur });
@@ -2440,6 +2452,16 @@ pub fn emit_fk_child_existence_checks(
                 });
             }
 
+            let aff: String = parent_idx
+                .columns
+                .iter()
+                .map(|ic| table.columns[ic.pos_in_table].affinity().aff_mask())
+                .collect();
+            program.emit_insn(Insn::Affinity {
+                start_reg: probe_start,
+                count: NonZeroUsize::new(n).unwrap(),
+                affinities: aff,
+            });
             let found = program.allocate_label();
             program.emit_insn(Insn::Found {
                 cursor_id: icur,
@@ -2471,8 +2493,6 @@ pub fn emit_fk_child_existence_checks(
 
         program.preassign_label_to_next_insn(fk_ok);
     }
-
-    program.resolve_label(after_all, program.offset());
     Ok(())
 }
 
