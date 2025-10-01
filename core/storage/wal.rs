@@ -849,6 +849,7 @@ impl Wal for WalFile {
                 .store(lock_0_idx, Ordering::Release);
             self.min_frame.store(nbackfills + 1, Ordering::Release);
             self.last_checksum = last_checksum;
+            self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
             return Ok(db_changed);
         }
 
@@ -942,6 +943,8 @@ impl Wal for WalFile {
         self.max_frame.store(best_mark as u64, Ordering::Release);
         self.max_frame_read_lock_index
             .store(best_idx as usize, Ordering::Release);
+        self.last_checksum = last_checksum;
+        self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
@@ -990,6 +993,9 @@ impl Wal for WalFile {
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
             (mx, nb, ck, checkpoint_seq)
         };
+        // dbg!(shared_max != self.max_frame.load(Ordering::Acquire));
+        // dbg!(last_checksum != self.last_checksum);
+        // dbg!(checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire));
         let db_changed = shared_max != self.max_frame.load(Ordering::Acquire)
             || last_checksum != self.last_checksum
             || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
