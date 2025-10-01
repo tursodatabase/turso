@@ -1135,7 +1135,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: un-ignore when UNIQUE constraints are fixed
     pub fn fk_composite_pk_mutation_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
