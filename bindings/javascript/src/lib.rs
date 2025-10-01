@@ -52,10 +52,15 @@ pub struct DatabaseInner {
     path: String,
     opts: Option<DatabaseOpts>,
     io: Arc<dyn turso_core::IO>,
-    db: OnceLock<Option<Arc<turso_core::Database>>>,
-    conn: OnceLock<Option<Arc<turso_core::Connection>>>,
-    is_connected: OnceLock<bool>,
+    connect: OnceLock<DatabaseConnect>,
     default_safe_integers: Mutex<bool>,
+}
+
+pub struct DatabaseConnect {
+    // hold db reference in order to keep it alive
+    // _db can be None if DB is controlled externally (for example, by sync-engine)
+    _db: Option<Arc<turso_core::Database>>,
+    conn: Arc<turso_core::Connection>,
 }
 
 pub(crate) fn is_memory(path: &str) -> bool {
@@ -152,7 +157,7 @@ fn create_error(status: napi::Status, message: &str) -> napi::Error {
 }
 
 fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
-    if db.is_connected.get() == Some(&true) {
+    if db.connect.get().is_some() {
         return Ok(());
     }
 
@@ -170,7 +175,6 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
         }
     }
-    tracing::info!("flags: {:?}", flags);
     let io = &db.io;
     let file = io
         .open_file(&db.path, flags, false)
@@ -197,15 +201,12 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         conn.set_busy_timeout(busy_timeout);
     }
 
-    db.is_connected
-        .set(true)
-        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
-    db.db
-        .set(Some(db_core))
-        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
-    db.conn
-        .set(Some(conn))
-        .map_err(|_| create_generic_error("db already connected, API misuse"))?;
+    let connect = DatabaseConnect {
+        _db: Some(db_core),
+        conn,
+    };
+    // there can be races between concurrent connect - so let's ignore error in case of
+    let _ = db.connect.set(connect);
     Ok(())
 }
 
@@ -249,9 +250,7 @@ impl Database {
                 path,
                 opts,
                 io,
-                db: OnceLock::new(),
-                conn: OnceLock::new(),
-                is_connected: OnceLock::new(),
+                connect: OnceLock::new(),
                 default_safe_integers: Mutex::new(false),
             })),
         })
@@ -260,18 +259,8 @@ impl Database {
     pub fn set_connected(&self, conn: Arc<turso_core::Connection>) -> napi::Result<()> {
         let inner = self.inner()?;
         inner
-            .db
-            .set(None)
-            .map_err(|_| create_generic_error("database was already connected"))?;
-
-        inner
-            .conn
-            .set(Some(conn))
-            .map_err(|_| create_generic_error("database was already connected"))?;
-
-        inner
-            .is_connected
-            .set(true)
+            .connect
+            .set(DatabaseConnect { _db: None, conn })
             .map_err(|_| create_generic_error("database was already connected"))?;
 
         Ok(())
@@ -301,7 +290,7 @@ impl Database {
     }
 
     fn conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let Some(Some(conn)) = self.inner()?.conn.get() else {
+        let Some(DatabaseConnect { conn, .. }) = self.inner()?.connect.get() else {
             return Err(create_generic_error("database must be connected"));
         };
         Ok(conn.clone())
@@ -331,7 +320,7 @@ impl Database {
         if self.inner.is_none() {
             return Ok(false);
         }
-        Ok(self.inner()?.is_connected.get() == Some(&true))
+        Ok(self.inner()?.connect.get().is_some())
     }
 
     /// Prepares a statement for execution.

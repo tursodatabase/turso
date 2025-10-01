@@ -1,7 +1,15 @@
 import { expect, test } from 'vitest'
-import { connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
+import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
+
+test('implicit connect', async () => {
+    const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    const defer = db.prepare("SELECT * FROM not_found");
+    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
+    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+})
 
 test('select-after-push', async () => {
     {

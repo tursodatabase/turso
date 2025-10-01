@@ -3,7 +3,7 @@
     "skipLibCheck": true,
     "declaration": true,
     "declarationMap": true,
-    "module": "esnext",
+    "module": "nodenext",
     "target": "esnext",
     "outDir": "dist/",
     "lib": [
