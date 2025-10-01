@@ -119,13 +119,15 @@ pub fn translate_alter_table(
 
             for index in table_indexes.iter() {
                 // Referenced in regular index
-                if index
+                let maybe_indexed_col = index
                     .columns
                     .iter()
-                    .any(|col| col.pos_in_table == dropped_index)
-                {
+                    .enumerate()
+                    .find(|(_, col)| col.pos_in_table == dropped_index);
+                if let Some((pos_in_index, indexed_col)) = maybe_indexed_col {
                     return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": indexed"
+                        "cannot drop column \"{column_name}\": it is referenced in the index {}; position in index is {pos_in_index}, position in table is {}",
+                        index.name, indexed_col.pos_in_table
                     )));
                 }
                 // Referenced in partial index

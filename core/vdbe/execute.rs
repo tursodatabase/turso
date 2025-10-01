@@ -7913,7 +7913,7 @@ pub fn op_drop_column(
             .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table = Arc::get_mut(table).expect("this should be the only strong reference");
 
         let Table::BTree(btree) = table else {
             panic!("only btree tables can be renamed");
@@ -7923,29 +7923,49 @@ pub fn op_drop_column(
         btree.columns.remove(*column_index)
     });
 
-    let schema = conn.schema.read();
-    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
-        for index in indexes {
-            if index
-                .columns
-                .iter()
-                .any(|column| column.pos_in_table == *column_index)
-            {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": indexed"
-                )));
+    {
+        let schema = conn.schema.read();
+        if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+            for index in indexes {
+                if index
+                    .columns
+                    .iter()
+                    .any(|column| column.pos_in_table == *column_index)
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop column \"{column_name}\": indexed"
+                    )));
+                }
             }
         }
     }
 
-    for (view_name, view) in schema.views.iter() {
-        let view_select_sql = format!("SELECT * FROM {view_name}");
-        conn.prepare(view_select_sql.as_str()).map_err(|e| {
-            LimboError::ParseError(format!(
-                "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
-                column_name, view.sql,
-            ))
-        })?;
+    // Update index.pos_in_table for all indexes.
+    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_schema_mut(|schema| {
+        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
+            for index in indexes {
+                let index = Arc::get_mut(index).expect("this should be the only strong reference");
+                for index_column in index.columns.iter_mut() {
+                    if index_column.pos_in_table > *column_index {
+                        index_column.pos_in_table -= 1;
+                    }
+                }
+            }
+        }
+    });
+
+    {
+        let schema = conn.schema.read();
+        for (view_name, view) in schema.views.iter() {
+            let view_select_sql = format!("SELECT * FROM {view_name}");
+            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                LimboError::ParseError(format!(
+                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                    column_name, view.sql,
+                ))
+            })?;
+        }
     }
 
     state.pc += 1;

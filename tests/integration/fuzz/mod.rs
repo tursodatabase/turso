@@ -2508,7 +2508,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     pub fn fuzz_long_create_table_drop_table_alter_table() {
         let db = TempDatabase::new_empty(true);
         let limbo_conn = db.connect_limbo();
@@ -2529,7 +2528,7 @@ mod tests {
 
         let mut undroppable_cols = HashSet::new();
 
-        for iteration in 0..50000 {
+        for iteration in 0..5000 {
             println!("iteration: {iteration} (seed: {seed})");
             let operation = rng.random_range(0..100); // 0: create, 1: drop, 2: alter, 3: alter rename
 
