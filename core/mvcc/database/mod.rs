@@ -1973,6 +1973,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     self.delete(tx_id, rowid)?;
                 }
                 StreamingResult::Eof => {
+                    // Set offset to the end so that next writes go to the end of the file
+                    self.storage.logical_log.write().unwrap().offset = reader.offset as u64;
                     break;
                 }
             }
