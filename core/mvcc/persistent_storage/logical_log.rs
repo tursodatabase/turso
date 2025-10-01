@@ -428,7 +428,7 @@ impl StreamingLogicalLogReader {
             let mut buffer = buffer.write().unwrap();
             let Ok((buf, bytes_read)) = res else {
                 tracing::trace!("couldn't ready log err={:?}", res,);
-                return ;
+                return;
             };
             turso_assert!(
                 bytes_read as usize >= need,
