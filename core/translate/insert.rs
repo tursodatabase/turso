@@ -23,7 +23,7 @@ use crate::translate::upsert::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
-use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -135,6 +135,10 @@ pub fn translate_insert(
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
     let has_child_fks = fk_enabled && !btree_table.foreign_keys.is_empty();
+    let has_parent_fks = fk_enabled
+        && resolver
+            .schema
+            .any_resolved_fks_referencing(table_name.as_str());
 
     let root_page = btree_table.root_page;
 
@@ -238,7 +242,7 @@ pub fn translate_insert(
         connection,
     )?;
 
-    if has_child_fks {
+    if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
             check_abort: false,
@@ -1039,8 +1043,14 @@ pub fn translate_insert(
             }
         }
     }
-    if has_child_fks {
-        emit_fk_checks_for_insert(&mut program, resolver, &insertion, table_name.as_str())?;
+    if has_child_fks || has_parent_fks {
+        emit_fk_checks_for_insert(
+            &mut program,
+            resolver,
+            &insertion,
+            table_name.as_str(),
+            !inserting_multiple_rows,
+        )?;
     }
 
     program.emit_insn(Insn::Insert {
@@ -1188,7 +1198,7 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(stmt_epilogue);
-    if has_child_fks {
+    if has_child_fks || has_parent_fks {
         // close FK scope and surface deferred violations
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
@@ -1896,6 +1906,7 @@ fn emit_fk_checks_for_insert(
     resolver: &Resolver,
     insertion: &Insertion,
     table_name: &str,
+    single_row_insert: bool,
 ) -> Result<()> {
     let after_all = program.allocate_label();
     program.emit_insn(Insn::FkIfZero {
@@ -1910,7 +1921,8 @@ fn emit_fk_checks_for_insert(
             .get_btree_table(&fk_ref.fk.parent_table)
             .expect("parent table");
         let num_child_cols = fk_ref.child_cols.len();
-
+        let is_self_single =
+            table_name.eq_ignore_ascii_case(&fk_ref.fk.parent_table) && single_row_insert;
         // if any child FK value is NULL, this row doesn't reference the parent.
         let fk_ok = program.allocate_label();
         for &pos_in_child in fk_ref.child_pos.iter() {
@@ -1934,16 +1946,32 @@ fn emit_fk_checks_for_insert(
                 root_page: parent_tbl.root_page,
                 db: 0,
             });
-            let only = 0; // n == 1 guaranteed if parent_uses_rowid
+            let rowid_pos = 0; // guaranteed if parent_uses_rowid
             let src = insertion
-                .col_mappings
-                .get(fk_ref.child_pos[only])
+                .get_col_mapping_by_name(fk_ref.child_cols[rowid_pos].as_str())
                 .unwrap()
                 .register;
             let violation = program.allocate_label();
+            let tmp = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: src,
+                dst_reg: tmp,
+                extra_amount: 0,
+            });
+            // coerce to INT (parent rowid affinity)
+            program.emit_insn(Insn::MustBeInt { reg: tmp });
+            if is_self_single {
+                program.emit_insn(Insn::Eq {
+                    lhs: tmp,
+                    rhs: insertion.key_register(),
+                    target_pc: fk_ok,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
-                rowid_reg: src,
+                rowid_reg: tmp,
                 target_pc: violation,
             });
             program.emit_insn(Insn::Close { cursor_id: pcur });
@@ -1966,6 +1994,27 @@ fn emit_fk_checks_for_insert(
                 });
             }
         } else if let Some(ix) = &fk_ref.parent_unique_index {
+            if is_self_single {
+                let skip_probe = program.allocate_label();
+                for (i, &pos_in_child) in fk_ref.child_pos.iter().enumerate() {
+                    let child_reg = insertion.col_mappings.get(pos_in_child).unwrap().register;
+                    let parent_reg = insertion
+                        .get_col_mapping_by_name(fk_ref.parent_cols[i].as_str())
+                        .unwrap()
+                        .register;
+                    program.emit_insn(Insn::Ne {
+                        lhs: child_reg,
+                        rhs: parent_reg,
+                        target_pc: skip_probe, // any mismatch and we do the normal probe
+                        flags: CmpInsFlags::default().jump_if_null(),
+                        collation: None,
+                    });
+                }
+                // all matched, OK
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(skip_probe);
+            }
+
             // Parent has a UNIQUE index exactly on parent_cols: use Found against that index
             let icur = program.alloc_cursor_id(CursorType::BTreeIndex(ix.clone()));
             program.emit_insn(Insn::OpenRead {

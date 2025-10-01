@@ -124,14 +124,17 @@ do_execsql_test_in_memory_any_error fk-composite-unique-missing {
     INSERT INTO child  VALUES (2,'A','X');     -- no ('A','X') in parent
 }
 
-do_execsql_test_on_specific_db {:memory:} fk-rowid-alias-parent-ok {
+# SQLite doesnt let you name a foreign key constraint 'rowid' explicitly...
+# well it does.. but it throws a parse error only when you try to insert into the table -_-
+# We will throw a parse error when you create the table instead, because that is 
+# obviously the only sane thing to do
+do_execsql_test_in_memory_any_error fk-rowid-alias-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
-    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid)); -- we error here
     INSERT INTO t VALUES (100,'x');
-    INSERT INTO c VALUES (1, 100);
-    SELECT cid, rid FROM c;
-} {1|100}
+    INSERT INTO c VALUES (1, 100); - sqlite errors here
+}
 
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent-missing {
     PRAGMA foreign_keys=ON;
@@ -192,3 +195,139 @@ do_execsql_test_in_memory_any_error fk-composite-pk-delete-violate {
   -- Deleting the referenced tuple should fail
   DELETE FROM p WHERE a=2 AND b=3;
 }
+
+# Parent columns omitted: should default to parent's declared PRIMARY KEY (composite)
+do_execsql_test_on_specific_db {:memory:} fk-default-parent-pk-composite-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(
+      a INT NOT NULL,
+      b INT NOT NULL,
+      PRIMARY KEY(a,b)
+    );
+    -- Parent columns omitted in REFERENCES p
+    CREATE TABLE c(
+      id INT PRIMARY KEY,
+      x INT, y INT,
+      FOREIGN KEY(x,y) REFERENCES p
+    );
+    INSERT INTO p VALUES (1,1), (1,2);
+    INSERT INTO c VALUES (10,1,1), (11,1,2), (12,NULL,2);  -- NULL in child allowed
+    SELECT id,x,y FROM c ORDER BY id;
+} {10|1|1
+11|1|2
+12||2}
+
+do_execsql_test_in_memory_any_error fk-default-parent-pk-composite-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p);        -- omit parent cols
+    INSERT INTO p VALUES (1,1);
+    INSERT INTO c VALUES (20,1,2);                         -- (1,2) missing in parent
+}
+
+# Parent has no explicitly declared PK, so we throw parse error when referencing bare table
+do_execsql_test_in_memory_any_error fk-default-parent-rowid-no-parent-pk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p_no_pk(v TEXT);
+    CREATE TABLE c_rowid(id INT PRIMARY KEY,
+                         r REFERENCES p_no_pk);
+    INSERT INTO p_no_pk(v) VALUES ('a'), ('b');
+    INSERT INTO c_rowid VALUES (1, 1);
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-parent-omit-cols-parent-has-pk {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p_pk(id INTEGER PRIMARY KEY, v TEXT);
+  CREATE TABLE c_ok(id INT PRIMARY KEY, r REFERENCES p_pk);  -- binds to p_pk(id)
+  INSERT INTO p_pk VALUES (1,'a'),(2,'b');
+  INSERT INTO c_ok VALUES (10,1);
+  INSERT INTO c_ok VALUES (11,2);
+  SELECT id, r FROM c_ok ORDER BY id;
+} {10|1 11|2}
+
+
+# Self-reference (same table) with INTEGER PRIMARY KEY: single-row insert should pass
+do_execsql_test_on_specific_db {:memory:} fk-self-ipk-single-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      id  INTEGER PRIMARY KEY,
+      rid REFERENCES t(id)          -- child->parent in same table
+    );
+    INSERT INTO t(id,rid) VALUES(5,5);       -- self-reference, single-row
+    SELECT id, rid FROM t;
+} {5|5}
+
+# Self-reference with mismatched value: should fail immediately (no counter semantics used)
+do_execsql_test_in_memory_any_error fk-self-ipk-single-mismatch {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      id  INTEGER PRIMARY KEY,
+      rid REFERENCES t(id)
+    );
+    INSERT INTO t(id,rid) VALUES(5,4);       -- rid!=id -> FK violation
+}
+
+# Self-reference on composite PRIMARY KEY: single-row insert should pass
+do_execsql_test_on_specific_db {:memory:} fk-self-composite-single-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      a INT NOT NULL,
+      b INT NOT NULL,
+      x INT, 
+      y INT,
+      PRIMARY KEY(a,b),
+      FOREIGN KEY(x,y) REFERENCES t(a,b)
+    );
+    INSERT INTO t(a,b,x,y) VALUES(1,2,1,2);  -- self-reference matches PK
+    SELECT a,b,x,y FROM t;
+} {1|2|1|2}
+
+# Rowid parent path: text '10' must be coerced to integer (MustBeInt) and succeed
+do_execsql_test_on_specific_db {:memory:} fk-rowid-mustbeint-coercion-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p(id) VALUES(10);
+    INSERT INTO c VALUES(1, '10');           -- text -> int via MustBeInt; should match
+    SELECT pid FROM c;
+} {10}
+
+# Rowid parent path: non-numeric text cannot be coerced -> violation
+do_execsql_test_in_memory_any_error fk-rowid-mustbeint-coercion-fail {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p(id) VALUES(10);
+    INSERT INTO c VALUES(2, 'abc');          -- MustBeInt fails to match any parent row
+}
+
+# Parent match via UNIQUE index (non-rowid), success path
+do_execsql_test_on_specific_db {:memory:} fk-parent-unique-index-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT,
+                       FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0),('A','C',0);
+    INSERT INTO child  VALUES (1,'A','B');
+    SELECT id, cu, cv FROM child ORDER BY id;
+} {1|A|B}
+
+# Parent UNIQUE index path: missing key -> immediate violation
+do_execsql_test_in_memory_any_error fk-parent-unique-index-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT,
+                       FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0);
+    INSERT INTO child  VALUES (2,'A','X');   -- no ('A','X') in parent
+}
+
+# NULL in child short-circuits FK check
+do_execsql_test_on_specific_db {:memory:} fk-child-null-shortcircuit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO c VALUES (1, NULL);          -- NULL child is allowed
+    SELECT id, pid FROM c;
+} {1|}
