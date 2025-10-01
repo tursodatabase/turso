@@ -248,14 +248,14 @@ impl Schema {
 
     pub fn add_btree_table(&mut self, mut table: Arc<BTreeTable>) -> Result<()> {
         let name = normalize_ident(&table.name);
-        let mut resolved_fks: Vec<Arc<ForeignKey>> = Vec::with_capacity(table.foreign_keys.len());
+        let mut validated_fks: Vec<Arc<ForeignKey>> = Vec::with_capacity(table.foreign_keys.len());
         // when we built the BTreeTable from SQL, we didn't have access to the Schema to validate
         // any FK relationships, so we do that now
-        self.validate_and_normalize_btree_foreign_keys(&table, &mut resolved_fks)?;
+        self.validate_btree_foreign_keys(&table, &mut validated_fks)?;
 
         // there should only be 1 reference to the table so Arc::make_mut shouldnt copy
         let t = Arc::make_mut(&mut table);
-        t.foreign_keys = resolved_fks;
+        t.foreign_keys = validated_fks;
         self.tables.insert(name, Table::BTree(table).into());
         Ok(())
     }
@@ -812,7 +812,7 @@ impl Schema {
     /// - All referenced columns must exist (allowing the `rowid` sentinel).
     /// - The parent key must be UNIQUE: either the parent's declared PRIMARY KEY,
     ///   a single `rowid`/rowid-alias, or an explicit UNIQUE index over the parent cols.
-    fn validate_and_normalize_btree_foreign_keys(
+    fn validate_btree_foreign_keys(
         &self,
         table: &Arc<BTreeTable>,
         resolved_fks: &mut Vec<Arc<ForeignKey>>,

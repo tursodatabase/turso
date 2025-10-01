@@ -124,14 +124,17 @@ do_execsql_test_in_memory_any_error fk-composite-unique-missing {
     INSERT INTO child  VALUES (2,'A','X');     -- no ('A','X') in parent
 }
 
-do_execsql_test_on_specific_db {:memory:} fk-rowid-alias-parent-ok {
+# SQLite doesnt let you name a foreign key constraint 'rowid' explicitly...
+# well it does.. but it throws a parse error only when you try to insert into the table -_-
+# We will throw a parse error when you create the table instead, because that is 
+# obviously the only sane thing to do
+do_execsql_test_in_memory_any_error fk-rowid-alias-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
-    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid)); -- we error here
     INSERT INTO t VALUES (100,'x');
-    INSERT INTO c VALUES (1, 100);
-    SELECT cid, rid FROM c;
-} {1|100}
+    INSERT INTO c VALUES (1, 100); - sqlite errors here
+}
 
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent-missing {
     PRAGMA foreign_keys=ON;
@@ -192,3 +195,53 @@ do_execsql_test_in_memory_any_error fk-composite-pk-delete-violate {
   -- Deleting the referenced tuple should fail
   DELETE FROM p WHERE a=2 AND b=3;
 }
+
+# Parent columns omitted: should default to parent's declared PRIMARY KEY (composite)
+do_execsql_test_on_specific_db {:memory:} fk-default-parent-pk-composite-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(
+      a INT NOT NULL,
+      b INT NOT NULL,
+      PRIMARY KEY(a,b)
+    );
+    -- Parent columns omitted in REFERENCES p
+    CREATE TABLE c(
+      id INT PRIMARY KEY,
+      x INT, y INT,
+      FOREIGN KEY(x,y) REFERENCES p
+    );
+    INSERT INTO p VALUES (1,1), (1,2);
+    INSERT INTO c VALUES (10,1,1), (11,1,2), (12,NULL,2);  -- NULL in child allowed
+    SELECT id,x,y FROM c ORDER BY id;
+} {10|1|1
+11|1|2
+12||2}
+
+do_execsql_test_in_memory_any_error fk-default-parent-pk-composite-missing {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p);        -- omit parent cols
+    INSERT INTO p VALUES (1,1);
+    INSERT INTO c VALUES (20,1,2);                         -- (1,2) missing in parent
+}
+
+# Parent has no explicitly declared PK, so we throw parse error when referencing bare table
+do_execsql_test_in_memory_any_error fk-default-parent-rowid-no-parent-pk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p_no_pk(v TEXT);
+    CREATE TABLE c_rowid(id INT PRIMARY KEY,
+                         r REFERENCES p_no_pk);
+    INSERT INTO p_no_pk(v) VALUES ('a'), ('b');
+    INSERT INTO c_rowid VALUES (1, 1);
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-parent-omit-cols-parent-has-pk {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p_pk(id INTEGER PRIMARY KEY, v TEXT);
+  CREATE TABLE c_ok(id INT PRIMARY KEY, r REFERENCES p_pk);  -- binds to p_pk(id)
+  INSERT INTO p_pk VALUES (1,'a'),(2,'b');
+  INSERT INTO c_ok VALUES (10,1);
+  INSERT INTO c_ok VALUES (11,2);
+  SELECT id, r FROM c_ok ORDER BY id;
+} {10|1 11|2}
