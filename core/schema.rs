@@ -825,11 +825,7 @@ impl Schema {
                 )));
             };
 
-            let child_cols: Vec<String> = key
-                .child_columns
-                .iter()
-                .map(|c| normalize_ident(c))
-                .collect();
+            let child_cols: Vec<String> = key.child_columns.clone();
             for c in &child_cols {
                 if table.get_column(c).is_none() && !c.eq_ignore_ascii_case("rowid") {
                     return Err(LimboError::ParseError(format!(
@@ -843,15 +839,20 @@ impl Schema {
             // if explicitly listed, we normalize them
             // else, we default to parent's PRIMARY KEY columns.
             // if parent has no declared PK, SQLite defaults to single "rowid"
+            // Resolve parent cols
             let parent_cols: Vec<String> = if key.parent_columns.is_empty() {
                 if !parent.primary_key_columns.is_empty() {
                     parent
                         .primary_key_columns
                         .iter()
-                        .map(|(n, _)| normalize_ident(n))
+                        .map(|(col, _)| col)
+                        .cloned()
                         .collect()
                 } else {
-                    vec!["rowid".to_string()]
+                    return Err(LimboError::ParseError(format!(
+            "foreign key mismatch - \"{}\" referencing \"{}\" (parent has no PRIMARY KEY)",
+                table.name, key.parent_table
+                    )));
                 }
             } else {
                 key.parent_columns
@@ -859,6 +860,15 @@ impl Schema {
                     .map(|c| normalize_ident(c))
                     .collect()
             };
+
+            if !key.parent_columns.is_empty()
+                && parent_cols.iter().any(|c| c.eq_ignore_ascii_case("rowid"))
+            {
+                return Err(LimboError::ParseError(
+            "FOREIGN KEY cannot reference ROWID explicitly; use the INTEGER PRIMARY KEY column name"
+                .to_string(),
+                ));
+            }
 
             if parent_cols.len() != child_cols.len() {
                 return Err(LimboError::ParseError(format!(
@@ -906,16 +916,15 @@ impl Schema {
                 )));
             }
 
-            let resolved = ForeignKey {
-                parent_table: normalize_ident(&key.parent_table),
+            let fk = ForeignKey {
+                parent_table: key.parent_table.clone(),
                 parent_columns: parent_cols,
                 child_columns: child_cols,
                 on_delete: key.on_delete,
                 on_update: key.on_update,
-                on_insert: key.on_insert,
                 deferred: key.deferred,
             };
-            resolved_fks.push(Arc::new(resolved));
+            resolved_fks.push(Arc::new(fk));
         }
         Ok(())
     }
@@ -932,7 +941,6 @@ impl Schema {
 
         // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
-            // Leave None only for rowid/alias case (handled separately) or if truly not found.
             self.get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
@@ -952,16 +960,12 @@ impl Schema {
             };
 
             for fk in &child.foreign_keys {
-                if normalize_ident(&fk.parent_table) != target {
+                if fk.parent_table != target {
                     continue;
                 }
 
                 // Resolve + normalize columns
-                let child_cols: Vec<String> = fk
-                    .child_columns
-                    .iter()
-                    .map(|c| normalize_ident(c))
-                    .collect();
+                let child_cols: Vec<String> = fk.child_columns.clone();
 
                 // If no explicit parent columns were given, they were validated in add_btree_table()
                 // to match the parent's PK. We resolve them the same way here.
@@ -969,13 +973,11 @@ impl Schema {
                     parent_tbl
                         .primary_key_columns
                         .iter()
-                        .map(|(n, _)| normalize_ident(n))
+                        .map(|(col, _)| col)
+                        .cloned()
                         .collect()
                 } else {
-                    fk.parent_columns
-                        .iter()
-                        .map(|c| normalize_ident(c))
-                        .collect()
+                    fk.parent_columns.clone()
                 };
 
                 // Child positions
@@ -1068,8 +1070,8 @@ impl Schema {
 
         let mut out = Vec::with_capacity(child.foreign_keys.len());
         for fk in &child.foreign_keys {
-            let parent_name = normalize_ident(&fk.parent_table);
-            let Some(parent_tbl) = self.get_btree_table(&parent_name) else {
+            let parent_name = &fk.parent_table;
+            let Some(parent_tbl) = self.get_btree_table(parent_name) else {
                 continue;
             };
 
@@ -1546,7 +1548,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .collect();
-
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Vec<String> = clause
@@ -1555,8 +1556,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .collect();
 
-                    // arity check
-                    if child_columns.len() != parent_columns.len() {
+                    // Only check arity if parent columns were explicitly listed
+                    if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
                         crate::bail_parse_error!(
                             "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
                             tbl_name,
@@ -1590,17 +1591,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 }
                             })
                             .unwrap_or(RefAct::NoAction),
-                        on_insert: clause
-                            .args
-                            .iter()
-                            .find_map(|a| {
-                                if let ast::RefArg::OnInsert(x) = a {
-                                    Some(*x)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(RefAct::NoAction),
                         on_update: clause
                             .args
                             .iter()
@@ -1623,7 +1613,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 constraints,
             } in columns
             {
-                let name = col_name.as_str().to_string();
+                let name = normalize_ident(col_name.as_str());
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -1706,28 +1696,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             defer_clause,
                         } => {
                             let fk = ForeignKey {
-                                parent_table: clause.tbl_name.to_string(),
+                                parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause
                                     .columns
                                     .iter()
-                                    .map(|c| c.col_name.as_str().to_string())
+                                    .map(|c| normalize_ident(c.col_name.as_str()))
                                     .collect(),
                                 on_delete: clause
                                     .args
                                     .iter()
                                     .find_map(|arg| {
                                         if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_insert: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnInsert(act) = arg {
                                             Some(*act)
                                         } else {
                                             None
@@ -1746,7 +1725,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     })
                                     .unwrap_or(RefAct::NoAction),
                                 child_columns: vec![name.clone()],
-                                deferred: defer_clause.is_some(),
+                                deferred: match defer_clause {
+                                    Some(d) => {
+                                        d.deferrable
+                                            && matches!(
+                                                d.init_deferred,
+                                                Some(InitDeferredPred::InitiallyDeferred)
+                                            )
+                                    }
+                                    None => false,
+                                },
                             };
                             foreign_keys.push(Arc::new(fk));
                         }
@@ -1764,7 +1752,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 }
 
                 cols.push(Column {
-                    name: Some(normalize_ident(&name)),
+                    name: Some(name),
                     ty,
                     ty_str,
                     primary_key,
@@ -1897,7 +1885,6 @@ pub struct ForeignKey {
     pub parent_columns: Vec<String>,
     pub on_delete: RefAct,
     pub on_update: RefAct,
-    pub on_insert: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
 }
