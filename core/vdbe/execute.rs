@@ -9134,13 +9134,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                             return true;
                         }
                         Value::Float(fl) => {
-                            // For Numeric affinity, try to convert float to int if exact
-                            if affinity == Affinity::Numeric {
-                                return try_float_to_integer_affinity(value, fl);
-                            } else {
-                                *value = Value::Float(fl);
-                                return true;
-                            }
+                            return try_float_to_integer_affinity(value, fl);
                         }
                         other => {
                             *value = other;
