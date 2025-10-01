@@ -244,25 +244,12 @@ impl Property {
     pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
         match self {
             Property::TableHasExpectedContent { table } => {
-                let table = table.to_string();
-                let table_name = table.clone();
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", table.clone()),
-                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        let conn_tables = env.get_conn_tables(connection_index);
-                        if conn_tables.iter().any(|t| t.name == table_name) {
-                            Ok(Ok(()))
-                        } else {
-                            Ok(Err(format!("table {table_name} does not exist")))
-                        }
-                    },
-                ));
-
+                let assumption = InteractionType::Assumption(Assertion::table_exists(&table));
                 let select_interaction = InteractionType::Query(Query::Select(Select::simple(
                     table.clone(),
                     Predicate::true_(),
                 )));
-
+                let table = table.clone();
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!("table {} should have the expected content", table.clone()),
                     move |stack: &Vec<ResultSet>, env| {
@@ -593,26 +580,7 @@ impl Property {
                 queries,
                 select,
             } => {
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {table} exists"),
-                    {
-                        let table = table.clone();
-                        move |_, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table) {
-                                Ok(Ok(()))
-                            } else {
-                                {
-                                    let available_tables: Vec<String> =
-                                        conn_tables.iter().map(|t| t.name.clone()).collect();
-                                    Ok(Err(format!(
-                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
-                                    )))
-                                }
-                            }
-                        }
-                    },
-                ));
+                let assumption = InteractionType::Assumption(Assertion::table_exists(&table));
 
                 let table_name = table.clone();
 
