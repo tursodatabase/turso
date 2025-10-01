@@ -52,8 +52,7 @@ struct Args {
     io: Option<IoOption>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_ansi(false)
@@ -61,6 +60,15 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads)
+        .build()
+        .unwrap();
+
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
     let db_path = "write_throughput_test.db";
     if std::path::Path::new(db_path).exists() {
         std::fs::remove_file(db_path).expect("Failed to remove existing database");
