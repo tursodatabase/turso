@@ -419,17 +419,21 @@ impl StreamingLogicalLogReader {
         if bytes_can_read >= need {
             return Ok(());
         }
-        let to_read = 4096;
+        let to_read = 4096.max(need);
         let to_read = to_read.min(self.file_size - self.offset);
         let header_buf = Arc::new(Buffer::new_temporary(to_read));
         let buffer = self.buffer.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let buffer = buffer.clone();
             let mut buffer = buffer.write().unwrap();
-            let Ok((buf, _bytes_read)) = res else {
+            let Ok((buf, bytes_read)) = res else {
                 tracing::trace!("couldn't ready log err={:?}", res,);
-                return;
+                return ;
             };
+            turso_assert!(
+                bytes_read as usize >= need,
+                "couldn't read enough data. Requested={need} got={bytes_read}"
+            );
             let buf = buf.as_slice();
             buffer.extend_from_slice(buf);
         });
