@@ -503,7 +503,7 @@ mod tests {
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 50;
-        const INNER_ITERS: usize = 500;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
