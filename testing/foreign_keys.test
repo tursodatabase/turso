@@ -299,7 +299,7 @@ do_execsql_test_in_memory_any_error fk-rowid-mustbeint-coercion-fail {
     CREATE TABLE p(id INTEGER PRIMARY KEY);
     CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));
     INSERT INTO p(id) VALUES(10);
-    INSERT INTO c VALUES(2, 'abc');          -- MustBeInt fails to match any parent row
+    INSERT INTO c VALUES(2, 'abc'); -- MustBeInt fails to match any parent row
 }
 
 # Parent match via UNIQUE index (non-rowid), success path
@@ -331,3 +331,71 @@ do_execsql_test_on_specific_db {:memory:} fk-child-null-shortcircuit {
     INSERT INTO c VALUES (1, NULL);          -- NULL child is allowed
     SELECT id, pid FROM c;
 } {1|}
+
+do_execsql_test_on_specific_db {:memory:} fk-self-unique-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      u TEXT,
+      v TEXT,
+      cu TEXT,
+      cv TEXT,
+      UNIQUE(u,v),
+      FOREIGN KEY(cu,cv) REFERENCES t(u,v)
+    );
+    -- Single row insert where child points to its own (u,v): allowed
+    INSERT INTO t(u,v,cu,cv) VALUES('A','B','A','B');
+    SELECT u, v, cu, cv FROM t;
+} {A|B|A|B}
+
+do_execsql_test_in_memory_any_error fk-self-unique-mismatch {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      u TEXT,
+      v TEXT,
+      cu TEXT,
+      cv TEXT,
+      UNIQUE(u,v),
+      FOREIGN KEY(cu,cv) REFERENCES t(u,v)
+    );
+    -- Child points to a different (u,v) that doesn't exist: must fail
+    INSERT INTO t(u,v,cu,cv) VALUES('A','B','A','X');
+}
+
+do_execsql_test_on_specific_db {:memory:} fk-self-unique-reference-existing-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      u TEXT,
+      v TEXT,
+      cu TEXT,
+      cv TEXT,
+      UNIQUE(u,v),
+      FOREIGN KEY(cu,cv) REFERENCES t(u,v)
+    );
+    -- Insert a parent row first
+    INSERT INTO t(u,v,cu,cv) VALUES('P','Q',NULL,NULL);
+    -- Now insert a row whose FK references the existing ('P','Q'): OK
+    INSERT INTO t(u,v,cu,cv) VALUES('X','Y','P','Q');
+    SELECT u, v, cu, cv FROM t ORDER BY u, v, cu, cv;
+} {P|Q|| X|Y|P|Q}
+
+do_execsql_test_on_specific_db {:memory:} fk-self-unique-multirow-no-fastpath {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+      u TEXT,
+      v TEXT,
+      cu TEXT,
+      cv TEXT,
+      UNIQUE(u,v),
+      FOREIGN KEY(cu,cv) REFERENCES t(u,v)
+    );
+    INSERT INTO t(u,v,cu,cv) VALUES
+        ('C','D','C','D'),
+        ('E','F','E','F');
+} {}
+
+do_execsql_test_in_memory_any_error fk-self-multirow-one-bad {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rid INTEGER,
+                   FOREIGN KEY(rid) REFERENCES t(id));
+    INSERT INTO t(id,rid) VALUES (1,1),(3,99); -- 99 has no parent -> error
+}
