@@ -983,12 +983,17 @@ impl Wal for WalFile {
         if !shared.write_lock.write() {
             return Err(LimboError::Busy);
         }
-        let (shared_max, nbackfills, last_checksum) = (
-            shared.max_frame.load(Ordering::Acquire),
-            shared.nbackfills.load(Ordering::Acquire),
-            shared.last_checksum,
-        );
-        if self.max_frame.load(Ordering::Acquire) == shared_max {
+        let (shared_max, nbackfills, last_checksum, checkpoint_seq) = {
+            let mx = shared.max_frame.load(Ordering::Acquire);
+            let nb = shared.nbackfills.load(Ordering::Acquire);
+            let ck = shared.last_checksum;
+            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
+            (mx, nb, ck, checkpoint_seq)
+        };
+        let db_changed = shared_max != self.max_frame.load(Ordering::Acquire)
+            || last_checksum != self.last_checksum
+            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
+        if db_changed {
             // Snapshot still valid; adopt counters
             drop(shared);
             self.last_checksum = last_checksum;
