@@ -14,9 +14,9 @@ function cleanup(path) {
 
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
-    const defer = db.prepare("SELECT * FROM t");
-    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
-    expect(() => db.prepare("SELECT * FROM t")).toThrowError(/no such table: t/);
+    const defer = db.prepare("SELECT * FROM not_found");
+    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
+    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
 

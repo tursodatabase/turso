@@ -38,8 +38,8 @@ class Database {
 
   private db: NativeDatabase;
   private execLock: AsyncLock;
-  private connected: boolean = false;
   private _inTransaction: boolean = false;
+  protected connected: boolean = false;
 
   constructor(db: NativeDatabase) {
     this.db = db;

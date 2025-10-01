@@ -83,7 +83,9 @@ class Database extends DatabasePromise {
      * connect database and initialize it in case of clean start
      */
     override async connect() {
+        if (this.connected) { return; }
         await run(this.#runOpts, this.#io, this.#engine, this.#engine.connect());
+        this.connected = true;
     }
     /**
      * pull new changes from the remote database
