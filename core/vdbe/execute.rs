@@ -7417,15 +7417,6 @@ pub fn op_open_ephemeral(
             let root_page = return_if_io!(pager.btree_create(flag)) as i64;
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store.unwrap().clone();
-                let mv_cursor = Arc::new(RwLock::new(
-                    MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
-                ));
-                Some(mv_cursor)
-            } else {
-                None
-            };
 
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -7434,9 +7425,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(mv_cursor, pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index(None, pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns)
+                BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
