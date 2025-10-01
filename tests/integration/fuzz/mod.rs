@@ -503,7 +503,7 @@ mod tests {
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 50;
-        const INNER_ITERS: usize = 200;
+        const INNER_ITERS: usize = 500;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
@@ -550,8 +550,8 @@ mod tests {
                 let a = rng.random_range(-5..=25);
                 let b = rng.random_range(-5..=25);
                 let stmt = log_and_exec(&format!("INSERT INTO p VALUES ({id}, {a}, {b})"));
-                limbo_exec_rows(&limbo_db, &limbo, &stmt);
-                sqlite.execute(&stmt, params![]).unwrap();
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let _ = sqlite.execute(&stmt, params![]);
             }
 
             // Seed child
@@ -663,8 +663,7 @@ mod tests {
                             let a = rng.random_range(-5..=25);
                             let b = rng.random_range(-5..=25);
                             format!(
-                                "INSERT INTO p VALUES({pick}, {a}, {b}) \
-                             ON CONFLICT(id) DO UPDATE SET a=excluded.a, b=excluded.b"
+                                "INSERT INTO p VALUES({pick}, {a}, {b}) ON CONFLICT(id) DO UPDATE SET a=excluded.a, b=excluded.b"
                             )
                         } else {
                             let a = rng.random_range(-5..=25);
@@ -778,6 +777,361 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    pub fn fk_edgecases_fuzzing() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time();
+        println!("fk_edgecases_minifuzz seed: {seed}");
+
+        const OUTER_ITERS: usize = 20;
+        const INNER_ITERS: usize = 150;
+
+        fn assert_parity(
+            seed: u64,
+            stmts: &[String],
+            sqlite_res: rusqlite::Result<usize>,
+            limbo_res: Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError>,
+            last_stmt: &str,
+            tag: &str,
+        ) {
+            match (sqlite_res.is_ok(), limbo_res.is_ok()) {
+                (true, true) | (false, false) => (),
+                _ => {
+                    eprintln!("\n=== {tag} mismatch ===");
+                    eprintln!("seed: {seed}");
+                    eprintln!("sqlite: {sqlite_res:?}, limbo: {limbo_res:?}");
+                    eprintln!("stmt: {last_stmt}");
+                    eprintln!("--- replay statements ({}) ---", stmts.len());
+                    for (i, s) in stmts.iter().enumerate() {
+                        eprintln!("{:04}: {};", i + 1, s);
+                    }
+                    panic!("{tag}: engines disagree");
+                }
+            }
+        }
+
+        // parent rowid, child textified integers -> MustBeInt coercion path
+        for outer in 0..OUTER_ITERS {
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let log = |s: &str, stmts: &mut Vec<String>| {
+                stmts.push(s.to_string());
+                s.to_string()
+            };
+
+            for s in [
+                "PRAGMA foreign_keys=ON",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, a INT)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, FOREIGN KEY(x) REFERENCES p(id))",
+            ] {
+                let s = log(s, &mut stmts);
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &s);
+                let _ = sqlite.execute(&s, params![]);
+            }
+
+            // Seed a few parents
+            for _ in 0..rng.random_range(2..=5) {
+                let id = rng.random_range(1..=15);
+                let a = rng.random_range(-5..=5);
+                let s = log(&format!("INSERT INTO p VALUES({id},{a})"), &mut stmts);
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &s);
+                let _ = sqlite.execute(&s, params![]);
+            }
+
+            // try random child inserts with weird text-ints
+            for i in 0..INNER_ITERS {
+                let id = 1000 + i as i64;
+                let raw = if rng.random_bool(0.7) {
+                    1 + rng.random_range(0..=15)
+                } else {
+                    rng.random_range(100..=200) as i64
+                };
+
+                // Randomly decorate the integer as text with spacing/zeros/plus
+                let pad_left_zeros = rng.random_range(0..=2);
+                let spaces_left = rng.random_range(0..=2);
+                let spaces_right = rng.random_range(0..=2);
+                let plus = if rng.random_bool(0.3) { "+" } else { "" };
+                let txt_num = format!(
+                    "{plus}{:0width$}",
+                    raw,
+                    width = (1 + pad_left_zeros) as usize
+                );
+                let txt = format!(
+                    "'{}{}{}'",
+                    " ".repeat(spaces_left),
+                    txt_num,
+                    " ".repeat(spaces_right)
+                );
+
+                let stmt = log(&format!("INSERT INTO c VALUES({id}, {txt})"), &mut stmts);
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "A: rowid-coercion");
+            }
+            println!("A {}/{} ok", outer + 1, OUTER_ITERS);
+        }
+
+        // slf-referential rowid FK
+        for outer in 0..OUTER_ITERS {
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let log = |s: &str, stmts: &mut Vec<String>| {
+                stmts.push(s.to_string());
+                s.to_string()
+            };
+
+            for s in [
+                "PRAGMA foreign_keys=ON",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, rid REFERENCES t(id))",
+            ] {
+                let s = log(s, &mut stmts);
+                limbo_exec_rows(&limbo_db, &limbo, &s);
+                sqlite.execute(&s, params![]).unwrap();
+            }
+
+            // Self-match should succeed for many ids
+            for _ in 0..INNER_ITERS {
+                let id = rng.random_range(1..=500);
+                let stmt = log(
+                    &format!("INSERT INTO t(id,rid) VALUES({id},{id})"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "B1: self-row ok");
+            }
+
+            // Mismatch (rid != id) should fail (unless the referenced id already exists).
+            for _ in 0..rng.random_range(1..=10) {
+                let id = rng.random_range(1..=20);
+                let s = log(
+                    &format!("INSERT INTO t(id,rid) VALUES({id},{id})"),
+                    &mut stmts,
+                );
+                let s_res = sqlite.execute(&s, params![]);
+                let turso_rs = limbo_exec_rows_fallible(&limbo_db, &limbo, &s);
+                match (s_res.is_ok(), turso_rs.is_ok()) {
+                    (true, true) | (false, false) => {}
+                    _ => panic!("Seeding self-ref failed differently"),
+                }
+            }
+
+            for _ in 0..INNER_ITERS {
+                let id = rng.random_range(600..=900);
+                let ref_ = rng.random_range(1..=25);
+                let stmt = log(
+                    &format!("INSERT INTO t(id,rid) VALUES({id},{ref_})"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "B2: self-row mismatch");
+            }
+            println!("B {}/{} ok", outer + 1, OUTER_ITERS);
+        }
+
+        // self-referential UNIQUE(u,v) parent (fast-path for composite)
+        for outer in 0..OUTER_ITERS {
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let log = |s: &str, stmts: &mut Vec<String>| {
+                stmts.push(s.to_string());
+                s.to_string()
+            };
+
+            let s = log("PRAGMA foreign_keys=ON", &mut stmts);
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Variant the schema a bit: TEXT/TEXT, NUMERIC/TEXT, etc.
+            let decls = [
+                ("TEXT", "TEXT"),
+                ("TEXT", "NUMERIC"),
+                ("NUMERIC", "TEXT"),
+                ("TEXT", "BLOB"),
+            ];
+            let (tu, tv) = decls[rng.random_range(0..decls.len())];
+
+            let s = log(
+                &format!(
+                    "CREATE TABLE sr(u {tu}, v {tv}, cu {tu}, cv {tv}, UNIQUE(u,v), \
+             FOREIGN KEY(cu,cv) REFERENCES sr(u,v))"
+                ),
+                &mut stmts,
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Self-matching composite rows should succeed
+            for _ in 0..INNER_ITERS {
+                // Random small tokens, possibly padded
+                let u = format!("U{}", rng.random_range(0..50));
+                let v = format!("V{}", rng.random_range(0..50));
+                let mut cu = u.clone();
+                let mut cv = v.clone();
+
+                // occasionally wrap child refs as blobs/text to stress coercion on parent index
+                if rng.random_bool(0.2) {
+                    // child cv as hex blob of ascii v
+                    let hex: String = v.bytes().map(|b| format!("{b:02X}")).collect();
+                    cv = format!("x'{hex}'");
+                } else {
+                    cu = format!("'{cu}'");
+                    cv = format!("'{cv}'");
+                }
+
+                let stmt = log(
+                    &format!("INSERT INTO sr(u,v,cu,cv) VALUES('{u}','{v}',{cu},{cv})"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "C1: self-UNIQUE ok");
+            }
+
+            // Non-self-match likely fails unless earlier rows happen to satisfy (u,v)
+            for _ in 0..INNER_ITERS {
+                let u = format!("U{}", rng.random_range(60..100));
+                let v = format!("V{}", rng.random_range(60..100));
+                let cu = format!("'U{}'", rng.random_range(0..40));
+                let cv = format!("'{}{}'", "V", rng.random_range(0..40));
+                let stmt = log(
+                    &format!("INSERT INTO sr(u,v,cu,cv) VALUES('{u}','{v}',{cu},{cv})"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "C2: self-UNIQUE mismatch");
+            }
+            println!("C {}/{} ok", outer + 1, OUTER_ITERS);
+        }
+
+        // parent TEXT UNIQUE(u,v), child types differ; rely on parent-index affinities
+        for outer in 0..OUTER_ITERS {
+            let limbo_db = TempDatabase::new_empty(true);
+            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let log = |s: &str, stmts: &mut Vec<String>| {
+                stmts.push(s.to_string());
+                s.to_string()
+            };
+
+            for s in [
+                "PRAGMA foreign_keys=ON",
+                "CREATE TABLE parent(u TEXT, v TEXT, UNIQUE(u,v))",
+                "CREATE TABLE child(id INTEGER PRIMARY KEY, cu INT, cv BLOB, \
+                                FOREIGN KEY(cu,cv) REFERENCES parent(u,v))",
+            ] {
+                let s = log(s, &mut stmts);
+                limbo_exec_rows(&limbo_db, &limbo, &s);
+                sqlite.execute(&s, params![]).unwrap();
+            }
+
+            for _ in 0..rng.random_range(3..=8) {
+                let u_raw = rng.random_range(0..=9);
+                let v_raw = rng.random_range(0..=9);
+                let u = if rng.random_bool(0.4) {
+                    format!("+{u_raw}")
+                } else {
+                    format!("{u_raw}")
+                };
+                let v = if rng.random_bool(0.5) {
+                    format!("{v_raw:02}",)
+                } else {
+                    format!("{v_raw}")
+                };
+                let s = log(
+                    &format!("INSERT INTO parent VALUES('{u}','{v}')"),
+                    &mut stmts,
+                );
+                let l_res = limbo_exec_rows_fallible(&limbo_db, &limbo, &s);
+                let s_res = sqlite.execute(&s, params![]);
+                match (s_res, l_res) {
+                    (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
+                    (x, y) => {
+                        panic!("Parent seeding mismatch: sqlite {x:?}, limbo {y:?}");
+                    }
+                }
+            }
+
+            for i in 0..INNER_ITERS {
+                let id = i as i64 + 1;
+                let u_txt = if rng.random_bool(0.7) {
+                    format!("+{}", rng.random_range(0..=9))
+                } else {
+                    format!("{}", rng.random_range(0..=9))
+                };
+                let v_txt = if rng.random_bool(0.5) {
+                    format!("{:02}", rng.random_range(0..=9))
+                } else {
+                    format!("{}", rng.random_range(0..=9))
+                };
+
+                // produce child literals that *look different* but should match under TEXT affinity
+                // cu uses integer-ish form of u; cv uses blob of ASCII v or quoted v randomly.
+                let cu = if let Ok(u_int) = u_txt.trim().trim_start_matches('+').parse::<i64>() {
+                    if rng.random_bool(0.5) {
+                        format!("{u_int}",)
+                    } else {
+                        format!("'{u_txt}'")
+                    }
+                } else {
+                    format!("'{u_txt}'")
+                };
+                let cv = if rng.random_bool(0.6) {
+                    let hex: String = v_txt
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect();
+                    format!("x'{hex}'")
+                } else {
+                    format!("'{v_txt}'")
+                };
+
+                let stmt = log(
+                    &format!("INSERT INTO child VALUES({id}, {cu}, {cv})"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "D1: parent-index affinity");
+            }
+
+            for i in 0..(INNER_ITERS / 3) {
+                let id = 10_000 + i as i64;
+                let cu = rng.random_range(0..=9);
+                let miss = rng.random_range(10..=19);
+                let stmt = log(
+                    &format!("INSERT INTO child VALUES({id}, {cu}, x'{miss:02X}')"),
+                    &mut stmts,
+                );
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                assert_parity(seed, &stmts, sres, lres, &stmt, "D2: parent-index negative");
+            }
+            println!("D {}/{} ok", outer + 1, OUTER_ITERS);
+        }
+
+        println!("fk_edgecases_minifuzz complete (seed {seed})");
     }
 
     #[test]
