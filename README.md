@@ -32,8 +32,8 @@
 
 Turso Database is an in-process SQL database written in Rust, compatible with SQLite.
 
-> **⚠️ Warning:** This software is ALPHA, only use for development, testing, and experimentation. We are working to make it production ready, but do not use it for critical data right now.
-> 
+> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
+
 ## Features and Roadmap
 
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]

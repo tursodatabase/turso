@@ -267,7 +267,7 @@ impl Limbo {
             }
 
             self.writeln(
-                "This software is ALPHA, only use for development, testing, and experimentation.",
+                "This software is in BETA, use caution with production data and ensure you have backups."
             )?;
             self.display_in_memory()?;
         }

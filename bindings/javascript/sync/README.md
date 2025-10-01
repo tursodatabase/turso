@@ -16,7 +16,7 @@
 
 This package is for syncing local Turso databases to the Turso Cloud and back.
 
-> **⚠️ Warning:** This software is ALPHA, only use for development, testing, and experimentation. We are working to make it production ready, but do not use it for critical data right now.
+> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
 
 ## Installation
 
