@@ -245,7 +245,6 @@ pub fn translate_insert(
     if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -1196,7 +1195,6 @@ pub fn translate_insert(
         // close FK scope and surface deferred violations
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -1972,7 +1970,6 @@ fn emit_fk_checks_for_insert(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {
@@ -2046,7 +2043,6 @@ fn emit_fk_checks_for_insert(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {

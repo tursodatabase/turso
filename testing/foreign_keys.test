@@ -435,7 +435,7 @@ do_execsql_test_on_specific_db {:memory:} fk-deferred-fix-before-commit-succeeds
   SELECT * FROM p ORDER BY 1;
 } {99}
 
-# D) ROLLBACK clears deferred state; a new tx can still fail if violation persists
+#  ROLLBACK clears deferred state; a new tx can still fail if violation persists
 do_execsql_test_on_specific_db {:memory:} fk-deferred-rollback-clears {
   PRAGMA foreign_keys=ON;
   CREATE TABLE p(id INTEGER PRIMARY KEY);

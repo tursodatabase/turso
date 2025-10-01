@@ -8196,7 +8196,6 @@ pub fn op_fk_counter(
     load_insn!(
         FkCounter {
             increment_value,
-            check_abort,
             is_scope,
         },
         insn

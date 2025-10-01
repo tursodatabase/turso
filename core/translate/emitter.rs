@@ -446,7 +446,6 @@ fn emit_program_for_delete(
     if has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -492,7 +491,6 @@ fn emit_program_for_delete(
     if has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -815,7 +813,6 @@ pub fn emit_fk_parent_pk_change_counters(
             program.emit_insn(Insn::Close { cursor_id: icur });
             program.emit_insn(Insn::FkCounter {
                 increment_value: 1,
-                check_abort: false,
                 is_scope: false,
             });
             program.preassign_label_to_next_insn(skip);
@@ -856,7 +853,6 @@ pub fn emit_fk_parent_pk_change_counters(
                     target_pc: next_row,
                 });
 
-                // Eq(tmp, old_pk[i]) with Binary collation, jump-if-NULL enabled
                 let cont = program.allocate_label();
                 program.emit_insn(Insn::Eq {
                     lhs: tmp,
@@ -874,7 +870,6 @@ pub fn emit_fk_parent_pk_change_counters(
             // All columns matched OLD -> increment
             program.emit_insn(Insn::FkCounter {
                 increment_value: 1,
-                check_abort: false,
                 is_scope: false,
             });
 
@@ -948,7 +943,6 @@ pub fn emit_fk_parent_pk_change_counters(
             program.emit_insn(Insn::Close { cursor_id: icur });
             program.emit_insn(Insn::FkCounter {
                 increment_value: -1,
-                check_abort: false,
                 is_scope: false,
             });
             program.preassign_label_to_next_insn(skip);
@@ -1005,7 +999,6 @@ pub fn emit_fk_parent_pk_change_counters(
             // All columns matched NEW: decrement
             program.emit_insn(Insn::FkCounter {
                 increment_value: -1,
-                check_abort: false,
                 is_scope: false,
             });
 
@@ -1157,7 +1150,6 @@ pub fn emit_fk_parent_existence_checks(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {
@@ -1234,7 +1226,6 @@ pub fn emit_fk_parent_existence_checks(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {
@@ -1316,7 +1307,6 @@ fn emit_program_for_update(
     if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -1391,7 +1381,6 @@ fn emit_program_for_update(
     if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: false,
             is_scope: true,
         });
     }
@@ -2352,7 +2341,7 @@ pub fn emit_fk_child_existence_checks(
     updated_cols: &HashSet<usize>,
 ) -> Result<()> {
     for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
-        // Skip when the child key is untouched (including rowid-alias special case)
+        // Skip when the child key is untouched
         if !fk_ref.child_key_changed(updated_cols, table) {
             continue;
         }
@@ -2414,7 +2403,6 @@ pub fn emit_fk_child_existence_checks(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {
@@ -2475,7 +2463,6 @@ pub fn emit_fk_child_existence_checks(
             if fk_ref.fk.deferred {
                 program.emit_insn(Insn::FkCounter {
                     increment_value: 1,
-                    check_abort: false,
                     is_scope: false,
                 });
             } else {

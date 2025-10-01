@@ -1786,11 +1786,11 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{check_abort, increment_value, is_scope } => (
+        Insn::FkCounter{increment_value, is_scope } => (
         "FkCounter",
-            *check_abort as i32,
             *increment_value as i32,
             *is_scope as i32,
+            0,
             Value::build_text(""),
             0,
             String::new(),
