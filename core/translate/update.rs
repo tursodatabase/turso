@@ -113,6 +113,9 @@ pub fn prepare_update_plan(
     if body.or_conflict.is_some() {
         bail_parse_error!("ON CONFLICT clause is not supported in UPDATE");
     }
+    if body.from.is_some() {
+        bail_parse_error!("FROM clause is not supported in UPDATE");
+    }
     if body
         .indexed
         .as_ref()
