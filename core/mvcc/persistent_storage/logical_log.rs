@@ -14,7 +14,7 @@ use crate::{types::IOResult, File};
 
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
-    offset: u64,
+    pub offset: u64,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
@@ -231,7 +231,7 @@ enum StreamingState {
 pub struct StreamingLogicalLogReader {
     file: Arc<dyn File>,
     /// Offset to read from file
-    offset: usize,
+    pub offset: usize,
     /// Log Header
     header: Option<Arc<LogHeader>>,
     /// Cached buffer after io read
