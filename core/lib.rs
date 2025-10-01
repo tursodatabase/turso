@@ -62,6 +62,7 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
+use std::sync::atomic::AtomicIsize;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -565,6 +566,7 @@ impl Database {
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
+            fk_deferred_violations: AtomicIsize::new(0),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1085,6 +1087,7 @@ pub struct Connection {
     is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
+    fk_deferred_violations: AtomicIsize,
 }
 
 impl Drop for Connection {

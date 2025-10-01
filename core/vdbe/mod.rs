@@ -303,7 +303,6 @@ pub struct ProgramState {
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     fk_scope_counter: isize,
-    fk_deferred_violations: isize,
 }
 
 impl ProgramState {
@@ -349,7 +348,6 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             fk_scope_counter: 0,
-            fk_deferred_violations: 0,
         }
     }
 
@@ -815,6 +813,17 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        let violations = self
+            .connection
+            .fk_deferred_violations
+            .swap(0, Ordering::AcqRel);
+
+        if violations > 0 {
+            // Fail the commit
+            return Err(LimboError::Constraint(
+                "FOREIGN KEY constraint failed".into(),
+            ));
+        }
         // Apply view deltas with I/O handling
         match self.apply_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),

@@ -2255,6 +2255,12 @@ pub fn op_transaction_inner(
                 if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
                 }
+                if write {
+                    program // reset deferred fk violations on BEGIN write tx
+                        .connection
+                        .fk_deferred_violations
+                        .store(0, Ordering::Release);
+                }
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
@@ -2447,6 +2453,11 @@ pub fn op_auto_commit(
 
     if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
+            program // reset deferred fk violations on ROLLBACK
+                .connection
+                .fk_deferred_violations
+                .store(0, Ordering::Release);
+
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -8191,29 +8202,13 @@ pub fn op_fk_counter(
         insn
     );
     if *is_scope {
-        // Adjust FK scope depth
         state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
-
-        // raise if there were deferred violations in this statement.
-        if *check_abort {
-            if state.fk_scope_counter < 0 {
-                return Err(LimboError::Constraint(
-                    "FOREIGN KEY constraint failed".into(),
-                ));
-            }
-            if state.fk_scope_counter == 0 && state.fk_deferred_violations > 0 {
-                // Clear violations for safety, a new statement will re-open scope.
-                state.fk_deferred_violations = 0;
-                return Err(LimboError::Constraint(
-                    "FOREIGN KEY constraint failed".into(),
-                ));
-            }
-        }
     } else {
-        // Adjust deferred violations counter
-        state.fk_deferred_violations = state
+        // Transaction-level counter: add/subtract for deferred FKs.
+        program
+            .connection
             .fk_deferred_violations
-            .saturating_add(*increment_value);
+            .fetch_add(*increment_value, Ordering::AcqRel);
     }
 
     state.pc += 1;
@@ -8234,21 +8229,22 @@ pub fn op_fk_if_zero(
     // Foreign keys are disabled globally
     // p1 is true AND deferred constraint counter is zero
     // p1 is false AND deferred constraint counter is non-zero
-    let scope_zero = state.fk_scope_counter == 0;
-
-    let should_jump = if !fk_enabled {
+    let txn = program
+        .connection
+        .fk_deferred_violations
+        .load(Ordering::Acquire);
+    let jump = if !fk_enabled {
         true
     } else if *if_zero {
-        scope_zero
+        txn == 0
     } else {
-        !scope_zero
+        txn != 0
     };
-
-    if should_jump {
-        state.pc = target_pc.as_offset_int();
+    state.pc = if jump {
+        target_pc.as_offset_int()
     } else {
-        state.pc += 1;
-    }
+        state.pc + 1
+    };
 
     Ok(InsnFunctionStepResult::Step)
 }

@@ -1196,7 +1196,7 @@ pub fn translate_insert(
         // close FK scope and surface deferred violations
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: true,
+            check_abort: false,
             is_scope: true,
         });
     }
@@ -1902,12 +1902,6 @@ fn emit_fk_checks_for_insert(
     table_name: &str,
     single_row_insert: bool,
 ) -> Result<()> {
-    let after_all = program.allocate_label();
-    program.emit_insn(Insn::FkIfZero {
-        target_pc: after_all,
-        if_zero: true,
-    });
-
     // Iterate child FKs declared on this table
     for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
         let parent_tbl = resolver
@@ -2035,7 +2029,7 @@ fn emit_fk_checks_for_insert(
                 .collect();
             program.emit_insn(Insn::Affinity {
                 start_reg: probe_start,
-                count: std::num::NonZeroUsize::new(num_child_cols).unwrap(),
+                count: NonZeroUsize::new(num_child_cols).unwrap(),
                 affinities: aff,
             });
 
@@ -2069,7 +2063,5 @@ fn emit_fk_checks_for_insert(
 
         program.preassign_label_to_next_insn(fk_ok);
     }
-
-    program.preassign_label_to_next_insn(after_all);
     Ok(())
 }
