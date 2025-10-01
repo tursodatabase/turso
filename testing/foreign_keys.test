@@ -400,6 +400,7 @@ do_execsql_test_in_memory_any_error fk-self-multirow-one-bad {
     INSERT INTO t(id,rid) VALUES (1,1),(3,99); -- 99 has no parent -> error
 }
 
+# doesnt fail because tx is un-committed
 do_execsql_test_on_specific_db {:memory:} fk-deferred-commit-doesnt-fail-early {
   PRAGMA foreign_keys=ON;
   CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -408,6 +409,7 @@ do_execsql_test_on_specific_db {:memory:} fk-deferred-commit-doesnt-fail-early {
     INSERT INTO c VALUES(1, 99); -- shouldnt fail because we are mid-tx
 } {}
 
+# it should fail here because we actuall COMMIT
 do_execsql_test_in_memory_any_error fk-deferred-commit-fails {
   PRAGMA foreign_keys=ON;
   CREATE TABLE p(id INTEGER PRIMARY KEY);
@@ -415,4 +417,96 @@ do_execsql_test_in_memory_any_error fk-deferred-commit-fails {
   BEGIN;
     INSERT INTO c VALUES(1, 99); -- shouldnt fail because we are mid-tx
   COMMIT;
+}
+
+
+# If we fix it before COMMIT, COMMIT succeeds
+do_execsql_test_on_specific_db {:memory:} fk-deferred-fix-before-commit-succeeds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 99);   -- temporary violation
+    INSERT INTO p VALUES(99);      -- fix parent
+  COMMIT;
+  SELECT * FROM p ORDER BY 1;
+} {99}
+
+# D) ROLLBACK clears deferred state; a new tx can still fail if violation persists
+do_execsql_test_on_specific_db {:memory:} fk-deferred-rollback-clears {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 123);  -- temporary violation
+  ROLLBACK;
+
+  -- Now start over and *fix* it, COMMIT should pass.
+  BEGIN;
+    INSERT INTO p VALUES(123);
+    INSERT INTO c VALUES(1, 123);
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|123}
+
+
+# Fix via UPDATE before COMMIT
+do_execsql_test_on_specific_db {:memory:} fk-deferred-update-fixes-before-commit {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO c VALUES(1, 50);   -- violation
+    INSERT INTO p VALUES(50);      -- resolve
+    UPDATE c SET pid=50 WHERE id=1;
+  COMMIT;
+  SELECT * FROM c ORDER BY 1;
+} {1|50}
+
+# Self-referential: row referencing itself should succeed
+do_execsql_test_on_specific_db {:memory:} fk-deferred-self-ref-succeeds {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO t VALUES(1, 1);    -- self-match
+  COMMIT;
+  SELECT * FROM t ORDER BY 1;
+} {1|1}
+
+# Two-step self-ref: insert invalid, then create parent before COMMIT
+do_execsql_test_on_specific_db {:memory:} fk-deferred-self-ref-late-parent {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE t(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED
+  );
+  BEGIN;
+    INSERT INTO t VALUES(2, 3);    -- currently invalid
+    INSERT INTO t VALUES(3, 3);    -- now parent exists (and self-valid)
+  COMMIT;
+  SELECT * FROM t ORDER BY 1;
+} {2|3
+3|3}
+
+# Control: NON-deferrable FK should fail immediately on the INSERT
+do_execsql_test_in_memory_any_error fk-immediate-fails-early {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(
+    id  INTEGER PRIMARY KEY,
+    pid INT REFERENCES p(id)          -- NOT deferrable
+  );
+  INSERT INTO c VALUES(1, 99);        -- should error immediately
 }
