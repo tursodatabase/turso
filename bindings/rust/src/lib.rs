@@ -46,10 +46,13 @@ pub use params::params_from_iter;
 pub use params::IntoParams;
 
 use std::fmt::Debug;
+use std::future::Future;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 pub use turso_core::EncryptionOpts;
 use turso_core::OpenFlags;
+
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -464,6 +467,45 @@ impl Clone for Statement {
 unsafe impl Send for Statement {}
 unsafe impl Sync for Statement {}
 
+struct Execute {
+    stmt: Arc<Mutex<turso_core::Statement>>,
+}
+
+unsafe impl Send for Execute {}
+unsafe impl Sync for Execute {}
+
+impl Future for Execute {
+    type Output = Result<u64>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut stmt = self.stmt.lock().unwrap();
+        match stmt.step_with_waker(cx.waker()) {
+            Ok(turso_core::StepResult::Row) => Poll::Ready(Err(Error::SqlExecutionFailure(
+                "unexpected row during execution".to_string(),
+            ))),
+            Ok(turso_core::StepResult::Done) => {
+                let changes = stmt.n_change();
+                assert!(changes >= 0);
+                Poll::Ready(Ok(changes as u64))
+            }
+            Ok(turso_core::StepResult::IO) => {
+                stmt.run_once()?;
+                Poll::Pending
+            }
+            Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(
+                "database is locked".to_string(),
+            ))),
+            Ok(turso_core::StepResult::Interrupt) => {
+                Poll::Ready(Err(Error::SqlExecutionFailure("interrupted".to_string())))
+            }
+            Err(err) => Poll::Ready(Err(err.into())),
+        }
+    }
+}
+
 impl Statement {
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
@@ -514,33 +556,11 @@ impl Statement {
                 }
             }
         }
-        loop {
-            let mut stmt = self.inner.lock().unwrap();
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    return Err(Error::SqlExecutionFailure(
-                        "unexpected row during execution".to_string(),
-                    ));
-                }
-                Ok(turso_core::StepResult::Done) => {
-                    let changes = stmt.n_change();
-                    assert!(changes >= 0);
-                    return Ok(changes as u64);
-                }
-                Ok(turso_core::StepResult::IO) => {
-                    stmt.run_once()?;
-                }
-                Ok(turso_core::StepResult::Busy) => {
-                    return Err(Error::SqlExecutionFailure("database is locked".to_string()));
-                }
-                Ok(turso_core::StepResult::Interrupt) => {
-                    return Err(Error::SqlExecutionFailure("interrupted".to_string()));
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
+
+        let execute = Execute {
+            stmt: self.inner.clone(),
+        };
+        execute.await
     }
 
     /// Returns columns of the result of this prepared statement.

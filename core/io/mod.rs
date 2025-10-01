@@ -3,11 +3,13 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 use std::{fmt::Debug, pin::Pin};
 
 pub trait File: Send + Sync {
@@ -139,12 +141,64 @@ pub struct Completion {
     inner: Option<Arc<CompletionInner>>,
 }
 
+#[derive(Debug, Default)]
+struct ContextInner {
+    waker: Option<Waker>,
+    // TODO: add abort signal
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {
+    inner: Arc<Mutex<ContextInner>>,
+}
+
+impl ContextInner {
+    pub fn new() -> Self {
+        Self { waker: None }
+    }
+
+    pub fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    pub fn set_waker(&mut self, waker: &Waker) {
+        if let Some(curr_waker) = self.waker.as_mut() {
+            // only call and change waker if it would awake a different task
+            if !curr_waker.will_wake(waker) {
+                let prev_waker = std::mem::replace(curr_waker, waker.clone());
+                prev_waker.wake();
+            }
+        } else {
+            self.waker = Some(waker.clone());
+        }
+    }
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ContextInner::new())),
+        }
+    }
+
+    pub fn wake(&self) {
+        self.inner.lock().wake();
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        self.inner.lock().set_waker(waker);
+    }
+}
+
 struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
     needs_link: bool,
+    context: Context,
     /// Optional parent group this completion belongs to
     parent: OnceLock<Arc<GroupCompletionInner>>,
 }
@@ -293,26 +347,28 @@ pub enum CompletionType {
     Yield,
 }
 
+impl CompletionInner {
+    fn new(completion_type: CompletionType, needs_link: bool) -> Self {
+        Self {
+            completion_type,
+            result: OnceLock::new(),
+            needs_link,
+            context: Context::new(),
+            parent: OnceLock::new(),
+        }
+    }
+}
+
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
-            inner: Some(Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: false,
-                parent: OnceLock::new(),
-            })),
+            inner: Some(Arc::new(CompletionInner::new(completion_type, false))),
         }
     }
 
     pub fn new_linked(completion_type: CompletionType) -> Self {
         Self {
-            inner: Some(Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: true,
-                parent: OnceLock::new(),
-            })),
+            inner: Some(Arc::new(CompletionInner::new(completion_type, true))),
         }
     }
 
@@ -373,6 +429,18 @@ impl Completion {
     /// allocating memory.
     pub fn new_yield() -> Self {
         Self { inner: None }
+    }
+
+    pub fn wake(&self) {
+        self.get_inner().context.wake();
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        if self.finished() || self.inner.is_none() {
+            waker.wake_by_ref();
+        } else {
+            self.get_inner().context.set_waker(waker);
+        }
     }
 
     pub fn succeeded(&self) -> bool {
@@ -465,6 +533,8 @@ impl Completion {
 
             result.err()
         });
+        // call the waker regardless
+        inner.context.wake();
     }
 
     /// only call this method if you are sure that the completion is
