@@ -3,11 +3,12 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use parking_lot::Once;
+use parking_lot::{Mutex, Once};
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 use std::{fmt::Debug, pin::Pin};
 
 pub trait File: Send + Sync {
@@ -136,6 +137,57 @@ pub struct Completion {
     inner: Arc<CompletionInner>,
 }
 
+#[derive(Debug, Default)]
+struct ContextInner {
+    waker: Option<Waker>,
+    // TODO: add abort signal
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {
+    inner: Arc<Mutex<ContextInner>>,
+}
+
+impl ContextInner {
+    pub fn new() -> Self {
+        Self { waker: None }
+    }
+
+    pub fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    pub fn set_waker(&mut self, waker: &Waker) {
+        if let Some(curr_waker) = self.waker.as_mut() {
+            // only call and change waker if it would awake a different task
+            if !curr_waker.will_wake(waker) {
+                let prev_waker = std::mem::replace(curr_waker, waker.clone());
+                prev_waker.wake();
+            }
+        } else {
+            self.waker = Some(waker.clone());
+        }
+    }
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ContextInner::new())),
+        }
+    }
+
+    pub fn wake(&self) {
+        self.inner.lock().wake();
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        self.inner.lock().set_waker(waker);
+    }
+}
+
 #[derive(Debug)]
 struct CompletionInner {
     completion_type: CompletionType,
@@ -145,6 +197,7 @@ struct CompletionInner {
     needs_link: bool,
     /// before calling callback we check if done is true
     done: Once,
+    context: Context,
 }
 
 impl Debug for CompletionType {
@@ -165,26 +218,28 @@ pub enum CompletionType {
     Truncate(TruncateCompletion),
 }
 
+impl CompletionInner {
+    fn new(completion_type: CompletionType, needs_link: bool) -> Self {
+        Self {
+            completion_type,
+            result: OnceLock::new(),
+            needs_link,
+            done: Once::new(),
+            context: Context::new(),
+        }
+    }
+}
+
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
-            inner: Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: false,
-                done: Once::new(),
-            }),
+            inner: Arc::new(CompletionInner::new(completion_type, false)),
         }
     }
 
     pub fn new_linked(completion_type: CompletionType) -> Self {
         Self {
-            inner: Arc::new(CompletionInner {
-                completion_type,
-                result: OnceLock::new(),
-                needs_link: true,
-                done: Once::new(),
-            }),
+            inner: Arc::new(CompletionInner::new(completion_type, true)),
         }
     }
 
@@ -244,6 +299,18 @@ impl Completion {
         c
     }
 
+    pub fn wake(&self) {
+        self.inner.context.wake();
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        if self.finished() {
+            waker.wake_by_ref();
+        } else {
+            self.inner.context.set_waker(waker);
+        }
+    }
+
     pub fn is_completed(&self) -> bool {
         self.inner.result.get().is_some_and(|val| val.is_none())
     }
@@ -288,6 +355,8 @@ impl Completion {
                 .set(result.err())
                 .expect("result must be set only once");
         });
+        // call the waker regardless
+        self.inner.context.wake();
     }
 
     /// only call this method if you are sure that the completion is
