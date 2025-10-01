@@ -490,11 +490,14 @@ pub fn emit_upsert(
             }
 
             // Parent-side checks only if any incoming FK could care
-            if resolver.schema.any_incoming_fk_to(table.get_name()) {
+            if resolver
+                .schema
+                .any_resolved_fks_referencing(table.get_name())
+            {
                 // if parent key can't change, skip
                 let updated_parent_positions: HashSet<usize> =
                     set_pairs.iter().map(|(i, _)| *i).collect();
-                let incoming = resolver.schema.incoming_fks_to(table.get_name());
+                let incoming = resolver.schema.resolved_fks_referencing(table.get_name());
                 let parent_key_may_change = incoming
                     .iter()
                     .any(|r| r.parent_key_may_change(&updated_parent_positions, &bt));

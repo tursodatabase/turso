@@ -440,7 +440,7 @@ fn emit_program_for_delete(
             .unwrap()
             .table
             .get_name();
-        resolver.schema.any_incoming_fk_to(table_name)
+        resolver.schema.any_resolved_fks_referencing(table_name)
     };
     // Open FK scope for the whole statement
     if has_parent_fks {
@@ -542,7 +542,10 @@ fn emit_delete_insns(
 
     if connection.foreign_keys_enabled()
         && unsafe { &*table_reference }.btree().is_some()
-        && t_ctx.resolver.schema.any_incoming_fk_to(table_name)
+        && t_ctx
+            .resolver
+            .schema
+            .any_resolved_fks_referencing(table_name)
     {
         emit_fk_parent_existence_checks(
             program,
@@ -1047,7 +1050,7 @@ pub fn emit_fk_parent_existence_checks(
         .get_btree_table(parent_table_name)
         .ok_or_else(|| crate::LimboError::InternalError("parent not btree".into()))?;
 
-    for fk_ref in resolver.schema.incoming_fks_to(parent_table_name) {
+    for fk_ref in resolver.schema.resolved_fks_referencing(parent_table_name) {
         // Resolve parent key columns
         let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
             parent_bt
@@ -1295,8 +1298,8 @@ fn emit_program_for_update(
         .unwrap()
         .table
         .get_name();
-    let has_child_fks = fk_enabled && !resolver.schema.get_fks_for_table(table_name).is_empty();
-    let has_parent_fks = fk_enabled && resolver.schema.any_incoming_fk_to(table_name);
+    let has_child_fks = fk_enabled && resolver.schema.has_child_fks(table_name);
+    let has_parent_fks = fk_enabled && resolver.schema.any_resolved_fks_referencing(table_name);
     // statement-level FK scope open
     if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
@@ -1695,12 +1698,16 @@ fn emit_update_insns(
             // We only need to do work if the referenced key (the parent key) might change.
             // we detect that by comparing OLD vs NEW primary key representation
             // then run parent FK checks only when it actually changes.
-            if t_ctx.resolver.schema.any_incoming_fk_to(table_name) {
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
                 let updated_parent_positions: HashSet<usize> =
                     plan.set_clauses.iter().map(|(i, _)| *i).collect();
 
                 // If no incoming FK’s parent key can be affected by these updates, skip the whole parent-FK block.
-                let incoming = t_ctx.resolver.schema.incoming_fks_to(table_name);
+                let incoming = t_ctx.resolver.schema.resolved_fks_referencing(table_name);
                 let parent_tbl = &table_btree;
                 let maybe_affects_parent_key = incoming
                     .iter()
@@ -2338,7 +2345,7 @@ pub fn emit_fk_child_existence_checks(
         if_zero: true,
     });
 
-    for fk_ref in resolver.schema.outgoing_fks_of(table_name) {
+    for fk_ref in resolver.schema.resolved_fks_for_child(table_name) {
         // Skip when the child key is untouched (including rowid-alias special case)
         if !fk_ref.child_key_changed(updated_cols, table) {
             continue;
