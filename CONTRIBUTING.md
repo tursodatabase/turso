@@ -33,7 +33,47 @@ Run tests:
 cargo test
 ```
 
+### Configuring `mold` Linker
+
+The `mold` linker can reduce your build time from a minute to just few seconds.
+
+First, install `mold`:
+
+```console
+# Fedora/RHEL
+sudo dnf install mold
+
+# Ubuntu/Debian
+sudo apt install mold
+
+# macOS
+brew install mold
+```
+
+Then configure Cargo to use mold by creating `.cargo/config.toml`:
+
+**For Linux:**
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
+**For macOS:**
+
+```toml
+[target.x86_64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+```
+
 ### Running Tests On Linux
+
 > [!NOTE]
 > These steps have been tested on Ubuntu Noble 24.04.2 LTS
 
