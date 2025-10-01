@@ -1014,6 +1014,8 @@ impl InteractionType {
 fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
+    let mvcc = env.profile.experimental_mvcc;
+    let indexes = env.profile.query.gen_opts.indexes;
     let num_conns = env.connections.len();
     env.connections.clear();
 
@@ -1036,8 +1038,8 @@ fn reopen_database(env: &mut SimulatorEnv) {
             let db = match turso_core::Database::open_file(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
-                false,
-                true,
+                mvcc,
+                indexes,
             ) {
                 Ok(db) => db,
                 Err(e) => {
