@@ -286,6 +286,7 @@ pub fn emit_query<'a>(
     // Allocate registers for result columns
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
+        program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
     // Initialize cursors and other resources needed for query execution
