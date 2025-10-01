@@ -11,8 +11,8 @@ mod tests {
 
     use crate::{
         common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time, sqlite_exec_rows,
-            TempDatabase,
+            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, maybe_setup_tracing,
+            rng_from_time, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
         },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
     };
@@ -168,21 +168,6 @@ mod tests {
         // values.push("(SELECT 1)".to_string()); subqueries ain't implemented yet homes.
 
         values
-    }
-
-    fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-        let seed = std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            |v| {
-                v.parse()
-                    .expect("Failed to parse SEED environment variable as u64")
-            },
-        );
-        let rng = ChaCha8Rng::seed_from_u64(seed);
-        (rng, seed)
     }
 
     #[test]
@@ -2679,5 +2664,63 @@ mod tests {
             "create_table_drop_table_fuzz completed successfully with {} tables remaining",
             current_tables.len()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "test_helper")]
+    pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
+        use crate::common::rusqlite_integrity_check;
+
+        maybe_setup_tracing();
+        let (mut rng, seed) = rng_from_time_or_env();
+        tracing::debug!(seed);
+
+        // TODO: currently assume that page size is 4096 bytes (4 Kib)
+        const PAGE_SIZE: u32 = 4 * 2u32.pow(10);
+
+        /// 100 Mib
+        const MAX_DB_SIZE_BYTES: u32 = 100 * 2u32.pow(20);
+
+        const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
+
+        for _ in 0..10 {
+            // generate a random pending page that is smaller than the 100 MB mark
+
+            let pending_byte_pgno = rng.random_range(2..MAX_PAGENO);
+            let pending_byte = pending_byte_pgno * PAGE_SIZE;
+
+            tracing::debug!(pending_byte_pgno, pending_byte);
+
+            let db_path = tempfile::NamedTempFile::new()?;
+
+            {
+                let db = TempDatabase::new_with_existent(db_path.path(), true);
+
+                let prev_pending_byte = TempDatabase::get_pending_byte();
+                tracing::debug!(prev_pending_byte);
+
+                TempDatabase::set_pending_byte(pending_byte);
+
+                let new_pending_byte = TempDatabase::get_pending_byte();
+                tracing::debug!(new_pending_byte);
+
+                // Insert more than enough to pass the PENDING_BYTE
+                let query = format!("insert into t select replace(zeroblob({PAGE_SIZE}), x'00', 'A') from generate_series(1, {});", MAX_PAGENO * 2);
+
+                let conn = db.connect_limbo();
+
+                conn.execute("create table t(x);")?;
+
+                conn.execute(&query)?;
+
+                conn.close()?;
+            }
+
+            rusqlite_integrity_check(db_path.path())?;
+
+            TempDatabase::reset_pending_byte();
+        }
+
+        Ok(())
     }
 }

@@ -36,4 +36,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 
 [features]
+default = ["test_helper"]
 checksum = ["turso_core/checksum"]
+test_helper = ["turso_core/test_helper"]

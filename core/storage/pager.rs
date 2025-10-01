@@ -35,6 +35,14 @@ use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 const RESERVED_SPACE_NOT_SET: u16 = u16::MAX;
 
+#[cfg(feature = "test_helper")]
+/// Used for testing purposes to change the position of the PENDING BYTE
+static PENDING_BYTE: AtomicU32 = AtomicU32::new(0x40000000);
+
+#[cfg(not(feature = "test_helper"))]
+/// Byte offset that signifies the start of the ignored page - 1 GB mark
+const PENDING_BYTE: u32 = 0x40000000;
+
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
 
@@ -649,6 +657,32 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn get_pending_byte() -> u32 {
+        PENDING_BYTE.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "test_helper")]
+    /// Used in testing to allow for pending byte pages in smaller dbs
+    pub fn set_pending_byte(val: u32) {
+        PENDING_BYTE.store(val, Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "test_helper"))]
+    pub const fn get_pending_byte() -> u32 {
+        PENDING_BYTE
+    }
+
+    /// From SQLITE: https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608 \
+    /// The database page the [PENDING_BYTE] occupies. This page is never used.
+    pub fn pending_byte_page_id(&self) -> Option<u32> {
+        // PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
+        let page_size = self.page_size.load(Ordering::SeqCst);
+        Self::get_pending_byte()
+            .checked_div(page_size)
+            .map(|val| val + 1)
     }
 
     /// Get the maximum page count for this database
@@ -2290,7 +2324,23 @@ impl Pager {
                     return Ok(IOResult::Done(leaf_page));
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
-                    let new_db_size = *current_db_size + 1;
+                    let mut new_db_size = *current_db_size + 1;
+
+                    // if new_db_size reaches the pending page, we need to allocate a new one
+                    if Some(new_db_size) == self.pending_byte_page_id() {
+                        let richard_hipp_special_page =
+                            allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                        self.add_dirty(&richard_hipp_special_page);
+                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
+                        {
+                            let mut cache = self.page_cache.write();
+                            cache
+                                .insert(page_key, richard_hipp_special_page.clone())
+                                .unwrap();
+                        }
+                        // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
+                        new_db_size += 1;
+                    }
 
                     // Check if allocating a new page would exceed the maximum page count
                     let max_page_count = self.get_max_page_count();
