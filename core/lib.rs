@@ -854,6 +854,10 @@ impl Database {
         self.opts.enable_mvcc
     }
 
+    pub fn indexes_enabled(&self) -> bool {
+        self.opts.enable_indexes
+    }
+
     #[cfg(feature = "test_helper")]
     pub fn set_pending_byte(val: u32) {
         Pager::set_pending_byte(val);
