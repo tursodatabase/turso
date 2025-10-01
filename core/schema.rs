@@ -818,7 +818,11 @@ impl Schema {
         resolved_fks: &mut Vec<Arc<ForeignKey>>,
     ) -> Result<()> {
         for key in &table.foreign_keys {
-            let Some(parent) = self.get_btree_table(&key.parent_table) else {
+            let parent = if key.parent_table.eq_ignore_ascii_case(table.name.as_str()) {
+                table.clone()
+            } else if let Some(arc) = self.get_btree_table(&key.parent_table) {
+                arc
+            } else {
                 return Err(LimboError::ParseError(format!(
                     "Foreign key references missing table {}",
                     key.parent_table
@@ -886,6 +890,18 @@ impl Schema {
                 }
             }
 
+            let parent_is_rowid =
+                parent_cols.len() == 1 && parent_cols[0].eq_ignore_ascii_case("rowid");
+
+            let parent_has_declared_unique = parent.unique_sets.iter().any(|us| {
+                us.columns.len() == parent_cols.len()
+                    && us
+                        .columns
+                        .iter()
+                        .zip(&parent_cols)
+                        .all(|((n, _ord), pc)| n.eq_ignore_ascii_case(pc))
+            });
+
             // Parent side must be UNIQUE/PK, rowid counts as unique
             let parent_is_pk = !parent.primary_key_columns.is_empty()
                 && parent_cols.len() == parent.primary_key_columns.len()
@@ -894,28 +910,27 @@ impl Schema {
                     .zip(&parent.primary_key_columns)
                     .all(|(a, (b, _))| a.eq_ignore_ascii_case(b));
 
-            let parent_is_rowid =
-                parent_cols.len() == 1 && parent_cols[0].eq_ignore_ascii_case("rowid");
+            let parent_has_unique_index = self.get_indices(&parent.name).any(|idx| {
+                idx.unique
+                    && idx.columns.len() == parent_cols.len()
+                    && idx
+                        .columns
+                        .iter()
+                        .zip(&parent_cols)
+                        .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+            });
 
             let parent_is_unique = parent_is_pk
                 || parent_is_rowid
-                || self.get_indices(&parent.name).any(|idx| {
-                    idx.unique
-                        && idx.columns.len() == parent_cols.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(&parent_cols)
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
-                });
+                || parent_has_declared_unique
+                || parent_has_unique_index;
 
             if !parent_is_unique {
                 return Err(LimboError::ParseError(format!(
-                    "Foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
+                    "foreign key references {}({:?}) which is not UNIQUE or PRIMARY KEY",
                     key.parent_table, parent_cols
                 )));
             }
-
             let fk = ForeignKey {
                 parent_table: key.parent_table.clone(),
                 parent_columns: parent_cols,
