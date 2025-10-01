@@ -3370,14 +3370,15 @@ pub fn bind_and_rewrite_expr<'a>(
                                             id.as_str()
                                         );
                                     }
+                                } else {
+                                    let col =
+                                        joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                                    match_result = Some((
+                                        joined_table.internal_id,
+                                        col_idx.unwrap(),
+                                        col.is_rowid_alias,
+                                    ));
                                 }
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias,
-                                ));
                             // only if we haven't found a match, check for explicit rowid reference
                             } else if let Some(row_id_expr) = parse_row_id(
                                 &normalized_id,
