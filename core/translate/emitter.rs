@@ -492,7 +492,7 @@ fn emit_program_for_delete(
     if has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: true,
+            check_abort: false,
             is_scope: true,
         });
     }
@@ -1391,7 +1391,7 @@ fn emit_program_for_update(
     if has_child_fks || has_parent_fks {
         program.emit_insn(Insn::FkCounter {
             increment_value: -1,
-            check_abort: true,
+            check_abort: false,
             is_scope: true,
         });
     }
