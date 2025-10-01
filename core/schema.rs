@@ -846,28 +846,18 @@ impl Schema {
         Ok(())
     }
 
-    pub fn incoming_fks_to(&self, table_name: &str) -> Vec<ResolvedFkRef> {
+    /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
+    /// Each item contains the child table, normalized columns/positions, and the parent lookup
+    /// strategy (rowid vs. UNIQUE index or PK).
+    pub fn resolved_fks_referencing(&self, table_name: &str) -> Vec<ResolvedFkRef> {
         let target = normalize_ident(table_name);
-        let mut out = vec![];
+        let mut out = Vec::with_capacity(4); // arbitrary estimate
         let parent_tbl = self
             .get_btree_table(&target)
-            .expect("incoming_fks_to: parent table must exist");
+            .expect("parent table must exist");
 
         // Precompute helper to find parent unique index, if it's not the rowid
         let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
-            // If matches PK exactly, we don't need a secondary index probe
-            let matches_pk = !parent_tbl.primary_key_columns.is_empty()
-                && parent_tbl.primary_key_columns.len() == cols.len()
-                && parent_tbl
-                    .primary_key_columns
-                    .iter()
-                    .zip(cols.iter())
-                    .all(|((n, _ord), c)| n.eq_ignore_ascii_case(c));
-
-            if matches_pk {
-                return None;
-            }
-
             self.get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
@@ -887,16 +877,12 @@ impl Schema {
             };
 
             for fk in &child.foreign_keys {
-                if normalize_ident(&fk.parent_table) != target {
+                if fk.parent_table != target {
                     continue;
                 }
 
                 // Resolve + normalize columns
-                let child_cols: Vec<String> = fk
-                    .child_columns
-                    .iter()
-                    .map(|c| normalize_ident(c))
-                    .collect();
+                let child_cols: Vec<String> = fk.child_columns.clone();
 
                 // If no explicit parent columns were given, they were validated in add_btree_table()
                 // to match the parent's PK. We resolve them the same way here.
@@ -904,25 +890,21 @@ impl Schema {
                     parent_tbl
                         .primary_key_columns
                         .iter()
-                        .map(|(n, _)| normalize_ident(n))
+                        .map(|(col, _)| col)
+                        .cloned()
                         .collect()
                 } else {
-                    fk.parent_columns
-                        .iter()
-                        .map(|c| normalize_ident(c))
-                        .collect()
+                    fk.parent_columns.clone()
                 };
 
                 // Child positions
                 let child_pos: Vec<usize> = child_cols
                     .iter()
                     .map(|cname| {
-                        child.get_column(cname).map(|(i, _)| i).unwrap_or_else(|| {
-                            panic!(
-                                "incoming_fks_to: child col {}.{} missing",
-                                child.name, cname
-                            )
-                        })
+                        child
+                            .get_column(cname)
+                            .map(|(i, _)| i)
+                            .unwrap_or_else(|| panic!("child col {}.{} missing", child.name, cname))
                     })
                     .collect();
 
@@ -941,10 +923,7 @@ impl Schema {
                                 }
                             })
                             .unwrap_or_else(|| {
-                                panic!(
-                                    "incoming_fks_to: parent col {}.{cname} missing",
-                                    parent_tbl.name
-                                )
+                                panic!("parent col {}.{cname} missing", parent_tbl.name)
                             })
                     })
                     .collect();
@@ -983,7 +962,8 @@ impl Schema {
         out
     }
 
-    pub fn outgoing_fks_of(&self, child_table: &str) -> Vec<ResolvedFkRef> {
+    /// Compute all resolved FKs *declared by* `child_table`
+    pub fn resolved_fks_for_child(&self, child_table: &str) -> Vec<ResolvedFkRef> {
         let child_name = normalize_ident(child_table);
         let Some(child) = self.get_btree_table(&child_name) else {
             return vec![];
@@ -992,16 +972,6 @@ impl Schema {
         // Helper to find the UNIQUE/index on the parent that matches the resolved parent cols
         let find_parent_unique =
             |parent_tbl: &BTreeTable, cols: &Vec<String>| -> Option<Arc<Index>> {
-                let matches_pk = !parent_tbl.primary_key_columns.is_empty()
-                    && parent_tbl.primary_key_columns.len() == cols.len()
-                    && parent_tbl
-                        .primary_key_columns
-                        .iter()
-                        .zip(cols.iter())
-                        .all(|((n, _), c)| n.eq_ignore_ascii_case(c));
-                if matches_pk {
-                    return None;
-                }
                 self.get_indices(&parent_tbl.name)
                     .find(|idx| {
                         idx.unique
@@ -1015,14 +985,14 @@ impl Schema {
                     .cloned()
             };
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(child.foreign_keys.len());
         for fk in &child.foreign_keys {
-            let parent_name = normalize_ident(&fk.parent_table);
-            let Some(parent_tbl) = self.get_btree_table(&parent_name) else {
+            let parent_name = &fk.parent_table;
+            let Some(parent_tbl) = self.get_btree_table(parent_name) else {
                 continue;
             };
 
-            // Normalize columns (same rules you used in validation)
+            // Normalize columns
             let child_cols: Vec<String> = fk
                 .child_columns
                 .iter()
@@ -1045,7 +1015,6 @@ impl Schema {
                     .collect()
             };
 
-            // Positions
             let child_pos: Vec<usize> = child_cols
                 .iter()
                 .map(|c| child.get_column(c).expect("child col missing").0)
@@ -1061,7 +1030,6 @@ impl Schema {
                 })
                 .collect();
 
-            // Parent uses rowid?
             let parent_uses_rowid = parent_cols.len() == 1 && {
                 let c = parent_cols[0].as_str();
                 c.eq_ignore_ascii_case("rowid")
@@ -1094,7 +1062,8 @@ impl Schema {
         out
     }
 
-    pub fn any_incoming_fk_to(&self, table_name: &str) -> bool {
+    /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
+    pub fn any_resolved_fks_referencing(&self, table_name: &str) -> bool {
         self.tables.values().any(|t| {
             let Some(bt) = t.btree() else {
                 return false;
@@ -1105,35 +1074,11 @@ impl Schema {
         })
     }
 
-    /// Returns if this table declares any outgoing FKs (is a child of some parent)
+    /// Returns true if `table_name` declares any FOREIGN KEYs
     pub fn has_child_fks(&self, table_name: &str) -> bool {
         self.get_table(table_name)
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
-    }
-
-    /// Return the *declared* (unresolved) FKs for a table. Callers that need
-    /// positions/rowid/unique info should use `incoming_fks_to` instead.
-    pub fn get_fks_for_table(&self, table_name: &str) -> Vec<Arc<ForeignKey>> {
-        self.get_table(table_name)
-            .and_then(|t| t.btree())
-            .map(|t| t.foreign_keys.clone())
-            .unwrap_or_default()
-    }
-
-    /// Return pairs of (child_table_name, FK) for FKs that reference `parent_table`
-    pub fn get_referencing_fks(&self, parent_table: &str) -> Vec<(String, Arc<ForeignKey>)> {
-        let mut refs = Vec::new();
-        for table in self.tables.values() {
-            if let Table::BTree(btree) = table.deref() {
-                for fk in &btree.foreign_keys {
-                    if fk.parent_table == parent_table {
-                        refs.push((btree.name.as_str().to_string(), fk.clone()));
-                    }
-                }
-            }
-        }
-        refs
     }
 }
 
@@ -1524,7 +1469,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .iter()
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .collect();
-
                     // derive parent columns: explicit or default to parent PK
                     let parent_table = normalize_ident(clause.tbl_name.as_str());
                     let parent_columns: Vec<String> = clause
@@ -1533,8 +1477,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .collect();
 
-                    // arity check
-                    if child_columns.len() != parent_columns.len() {
+                    // Only check arity if parent columns were explicitly listed
+                    if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
                         crate::bail_parse_error!(
                             "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
                             tbl_name,
@@ -1568,17 +1512,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 }
                             })
                             .unwrap_or(RefAct::NoAction),
-                        on_insert: clause
-                            .args
-                            .iter()
-                            .find_map(|a| {
-                                if let ast::RefArg::OnInsert(x) = a {
-                                    Some(*x)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(RefAct::NoAction),
                         on_update: clause
                             .args
                             .iter()
@@ -1601,7 +1534,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 constraints,
             } in columns
             {
-                let name = col_name.as_str().to_string();
+                let name = normalize_ident(col_name.as_str());
                 // Regular sqlite tables have an integer rowid that uniquely identifies a row.
                 // Even if you create a table with a column e.g. 'id INT PRIMARY KEY', there will still
                 // be a separate hidden rowid, and the 'id' column will have a separate index built for it.
@@ -1684,28 +1617,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             defer_clause,
                         } => {
                             let fk = ForeignKey {
-                                parent_table: clause.tbl_name.to_string(),
+                                parent_table: normalize_ident(clause.tbl_name.as_str()),
                                 parent_columns: clause
                                     .columns
                                     .iter()
-                                    .map(|c| c.col_name.as_str().to_string())
+                                    .map(|c| normalize_ident(c.col_name.as_str()))
                                     .collect(),
                                 on_delete: clause
                                     .args
                                     .iter()
                                     .find_map(|arg| {
                                         if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_insert: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnInsert(act) = arg {
                                             Some(*act)
                                         } else {
                                             None
@@ -1724,7 +1646,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     })
                                     .unwrap_or(RefAct::NoAction),
                                 child_columns: vec![name.clone()],
-                                deferred: defer_clause.is_some(),
+                                deferred: match defer_clause {
+                                    Some(d) => {
+                                        d.deferrable
+                                            && matches!(
+                                                d.init_deferred,
+                                                Some(InitDeferredPred::InitiallyDeferred)
+                                            )
+                                    }
+                                    None => false,
+                                },
                             };
                             foreign_keys.push(Arc::new(fk));
                         }
@@ -1742,7 +1673,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 }
 
                 cols.push(Column {
-                    name: Some(normalize_ident(&name)),
+                    name: Some(name),
                     ty,
                     ty_str,
                     primary_key,
@@ -1875,7 +1806,6 @@ pub struct ForeignKey {
     pub parent_columns: Vec<String>,
     pub on_delete: RefAct,
     pub on_update: RefAct,
-    pub on_insert: RefAct,
     /// DEFERRABLE INITIALLY DEFERRED
     pub deferred: bool,
 }

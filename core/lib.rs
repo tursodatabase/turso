@@ -1100,6 +1100,7 @@ pub struct Connection {
     busy_timeout: RwLock<std::time::Duration>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
+    /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
 }
 
