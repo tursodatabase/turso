@@ -28,11 +28,6 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!(
-        "Running write throughput benchmark with {} threads, {} batch size, {} iterations",
-        args.threads, args.batch_size, args.iterations
-    );
-
     let db_path = "write_throughput_test.db";
     if std::path::Path::new(db_path).exists() {
         std::fs::remove_file(db_path).expect("Failed to remove existing database");
@@ -86,17 +81,9 @@ fn main() -> Result<()> {
     let overall_elapsed = overall_start.elapsed();
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
-    println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {total_inserts}",);
-    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
-    println!("Threads: {}", args.threads);
-    println!("Batch size: {}", args.batch_size);
-    println!("Iterations per thread: {}", args.iterations);
-
     println!(
-        "Database file exists: {}",
-        std::path::Path::new(db_path).exists()
+        "SQLite,{},{},{},{:.2}",
+        args.threads, args.batch_size, args.compute, overall_throughput
     );
 
     Ok(())
@@ -116,7 +103,6 @@ fn setup_database(db_path: &str) -> Result<Connection> {
         [],
     )?;
 
-    println!("Database created at: {db_path}");
     Ok(conn)
 }
 
@@ -134,7 +120,6 @@ fn worker_thread(
 
     start_barrier.wait();
 
-    let start_time = Instant::now();
     let mut total_inserts = 0;
 
     for iteration in 0..iterations {
@@ -154,17 +139,6 @@ fn worker_thread(
 
         conn.execute("COMMIT", [])?;
     }
-
-    let elapsed = start_time.elapsed();
-    let throughput = (total_inserts as f64) / elapsed.as_secs_f64();
-
-    println!(
-        "Thread {}: {} inserts in {:.2}s ({:.2} inserts/sec)",
-        thread_id,
-        total_inserts,
-        elapsed.as_secs_f64(),
-        throughput
-    );
 
     Ok(total_inserts)
 }

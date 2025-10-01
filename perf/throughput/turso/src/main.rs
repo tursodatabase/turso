@@ -61,11 +61,6 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    println!(
-        "Running write throughput benchmark with {} threads, {} batch size, {} iterations, mode: {:?}",
-        args.threads, args.batch_size, args.iterations, args.mode
-    );
-
     let db_path = "write_throughput_test.db";
     if std::path::Path::new(db_path).exists() {
         std::fs::remove_file(db_path).expect("Failed to remove existing database");
@@ -120,21 +115,10 @@ async fn main() -> Result<()> {
     let overall_elapsed = overall_start.elapsed();
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
-    println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {total_inserts}");
-    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
-    println!("Threads: {}", args.threads);
-    println!("Batch size: {}", args.batch_size);
-    println!("Iterations per thread: {}", args.iterations);
-
     println!(
-        "Database file exists: {}",
-        std::path::Path::new(db_path).exists()
+        "Turso,{},{},{},{:.2}",
+        args.threads, args.batch_size, args.compute, overall_throughput
     );
-    if let Ok(metadata) = std::fs::metadata(db_path) {
-        println!("Database file size: {} bytes", metadata.len());
-    }
 
     Ok(())
 }
@@ -187,7 +171,6 @@ async fn worker_thread(
 ) -> Result<u64> {
     start_barrier.wait();
 
-    let start_time = Instant::now();
     let total_inserts = Arc::new(AtomicU64::new(0));
 
     let mut tx_futs = vec![];
@@ -234,17 +217,7 @@ async fn worker_thread(
         result?;
     }
 
-    let elapsed = start_time.elapsed();
     let final_inserts = total_inserts.load(Ordering::Relaxed);
-    let throughput = (final_inserts as f64) / elapsed.as_secs_f64();
-
-    println!(
-        "Thread {}: {} inserts in {:.2}s ({:.2} inserts/sec)",
-        thread_id,
-        final_inserts,
-        elapsed.as_secs_f64(),
-        throughput
-    );
 
     Ok(final_inserts)
 }
