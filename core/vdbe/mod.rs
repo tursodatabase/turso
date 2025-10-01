@@ -665,6 +665,7 @@ impl Program {
             }
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
+                    io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
@@ -697,6 +698,7 @@ impl Program {
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
+                    io.set_waker(waker);
                     state.io_completions = Some(io);
                     return Ok(StepResult::IO);
                 }

@@ -17,6 +17,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
+use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -2392,6 +2393,17 @@ impl IOCompletions {
         match self {
             IOCompletions::Single(c) => c.get_error(),
             IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
+        }
+    }
+
+    pub fn set_waker(&self, waker: Option<&Waker>) {
+        if let Some(waker) = waker {
+            match self {
+                IOCompletions::Single(c) => c.set_waker(waker),
+                IOCompletions::Many(completions) => {
+                    completions.iter().for_each(|c| c.set_waker(waker))
+                }
+            }
         }
     }
 }
