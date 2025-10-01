@@ -18,11 +18,11 @@ struct Args {
     iterations: usize,
 
     #[arg(
-        long = "think",
+        long = "compute",
         default_value = "0",
-        help = "Per transaction think time (ms)"
+        help = "Per transaction compute time (us)"
     )]
-    think: u64,
+    compute: u64,
 }
 
 fn main() -> Result<()> {
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
                 args.batch_size,
                 args.iterations,
                 barrier,
-                args.think,
+                args.compute,
             )
         });
 
@@ -126,7 +126,7 @@ fn worker_thread(
     batch_size: usize,
     iterations: usize,
     start_barrier: Arc<Barrier>,
-    think_ms: u64,
+    compute_usec: u64,
 ) -> Result<u64> {
     let conn = Connection::open(&db_path)?;
 
@@ -142,14 +142,16 @@ fn worker_thread(
 
         conn.execute("BEGIN", [])?;
 
+        let result = perform_compute(thread_id, compute_usec);
+
+        std::hint::black_box(result);
+
         for i in 0..batch_size {
             let id = thread_id * iterations * batch_size + iteration * batch_size + i;
             stmt.execute([&id.to_string(), &format!("data_{id}")])?;
             total_inserts += 1;
         }
-        if think_ms > 0 {
-            thread::sleep(std::time::Duration::from_millis(think_ms));
-        }
+
         conn.execute("COMMIT", [])?;
     }
 
@@ -165,4 +167,18 @@ fn worker_thread(
     );
 
     Ok(total_inserts)
+}
+
+// Busy loop to simulate CPU or GPU bound computation (for example, parsing,
+// data aggregation or ML inference).
+fn perform_compute(thread_id: usize, usec: u64) -> u64 {
+    if usec == 0 {
+        return 0;
+    }
+    let start = Instant::now();
+    let mut sum: u64 = 0;
+    while start.elapsed().as_micros() < usec as u128 {
+        sum = sum.wrapping_add(thread_id as u64);
+    }
+    sum
 }

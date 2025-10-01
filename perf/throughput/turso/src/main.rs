@@ -35,11 +35,11 @@ struct Args {
     mode: TransactionMode,
 
     #[arg(
-        long = "think",
+        long = "compute",
         default_value = "0",
-        help = "Per transaction think time (ms)"
+        help = "Per transaction compute time (us)"
     )]
-    think: u64,
+    compute: u64,
 
     #[arg(
         long = "timeout",
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
             args.iterations,
             barrier,
             args.mode,
-            args.think,
+            args.compute,
             timeout,
         ));
 
@@ -171,7 +171,6 @@ async fn setup_database(
     )
     .await?;
 
-    println!("Database created at: {db_path}");
     Ok(db)
 }
 
@@ -183,7 +182,7 @@ async fn worker_thread(
     iterations: usize,
     start_barrier: Arc<Barrier>,
     mode: TransactionMode,
-    think_ms: u64,
+    compute_usec: u64,
     timeout: Duration,
 ) -> Result<u64> {
     start_barrier.wait();
@@ -208,6 +207,9 @@ async fn worker_thread(
             };
             conn.execute(begin_stmt, ()).await?;
 
+            let result = perform_compute(thread_id, compute_usec);
+            std::hint::black_box(result);
+
             for i in 0..batch_size {
                 let id = thread_id * iterations * batch_size + iteration * batch_size + i;
                 stmt.execute(turso::params::Params::Positional(vec![
@@ -216,10 +218,6 @@ async fn worker_thread(
                 ]))
                 .await?;
                 total_inserts.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if think_ms > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(think_ms)).await;
             }
 
             conn.execute("COMMIT", ()).await?;
@@ -249,4 +247,18 @@ async fn worker_thread(
     );
 
     Ok(final_inserts)
+}
+
+// Busy loop to simulate CPU or GPU bound computation (for example, parsing,
+// data aggregation or ML inference).
+fn perform_compute(thread_id: usize, usec: u64) -> u64 {
+    if usec == 0 {
+        return 0;
+    }
+    let start = Instant::now();
+    let mut sum: u64 = 0;
+    while start.elapsed().as_micros() < usec as u128 {
+        sum = sum.wrapping_add(thread_id as u64);
+    }
+    sum
 }
