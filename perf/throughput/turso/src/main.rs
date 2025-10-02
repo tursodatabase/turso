@@ -2,7 +2,9 @@ use clap::{Parser, ValueEnum};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -53,11 +55,18 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+    #[cfg(feature = "console")]
+    let console_layer = console_subscriber::spawn();
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_thread_ids(true)
-        .init();
+        .with_filter(EnvFilter::from_default_env());
+    let registry = tracing_subscriber::registry();
+    #[cfg(feature = "console")]
+    let registry = registry.with(console_layer);
+    let registry = registry.with(fmt_layer);
+
+    registry.init();
     let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
