@@ -7,7 +7,6 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
-use crate::translate::plan::ResultSetColumn;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     plan::Aggregate,
@@ -19,7 +18,7 @@ use crate::translate::{
 };
 use crate::{
     schema::PseudoCursorType,
-    translate::collate::CollationSeq,
+    translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -28,6 +27,7 @@ use crate::{
     },
     Result,
 };
+use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
 
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]
@@ -144,24 +144,7 @@ pub fn init_group_by<'a>(
         let collations = group_by
             .exprs
             .iter()
-            .map(|expr| match expr {
-                ast::Expr::Collate(_, collation_name) => {
-                    CollationSeq::new(collation_name.as_str()).map(Some)
-                }
-                ast::Expr::Column { table, column, .. } => {
-                    let table_reference = plan
-                        .table_references
-                        .find_joined_table_by_internal_id(*table)
-                        .unwrap();
-
-                    let Some(table_column) = table_reference.table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
-                    };
-
-                    Ok(table_column.collation)
-                }
-                _ => Ok(Some(CollationSeq::default())),
-            })
+            .map(|expr| get_collseq_from_expr(expr, &plan.table_references))
             .collect::<Result<Vec<_>>>()?;
 
         program.emit_insn(Insn::SorterOpen {
