@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
+use turso_parser::parser::Parser;
+
 use crate::{
     database_tape::{run_stmt_once, DatabaseReplaySessionOpts},
     errors::Error,
@@ -211,9 +213,43 @@ impl DatabaseReplayGenerator {
                             after.last()
                         )));
                     };
+                    let mut parser = Parser::new(sql.as_str().as_bytes());
+                    let mut ast = parser
+                        .next()
+                        .ok_or_else(|| {
+                            Error::DatabaseTapeError(format!(
+                                "unexpected DDL query: {}",
+                                sql.as_str()
+                            ))
+                        })?
+                        .map_err(|e| {
+                            Error::DatabaseTapeError(format!(
+                                "unexpected DDL query {}: {}",
+                                e,
+                                sql.as_str()
+                            ))
+                        })?;
+                    let turso_parser::ast::Cmd::Stmt(stmt) = &mut ast else {
+                        return Err(Error::DatabaseTapeError(format!(
+                            "unexpected DDL query: {}",
+                            sql.as_str()
+                        )));
+                    };
+                    match stmt {
+                        turso_parser::ast::Stmt::CreateTable { if_not_exists, .. }
+                        | turso_parser::ast::Stmt::CreateIndex { if_not_exists, .. }
+                        | turso_parser::ast::Stmt::CreateTrigger { if_not_exists, .. }
+                        | turso_parser::ast::Stmt::CreateMaterializedView {
+                            if_not_exists, ..
+                        }
+                        | turso_parser::ast::Stmt::CreateView { if_not_exists, .. } => {
+                            *if_not_exists = true
+                        }
+                        _ => {}
+                    }
                     let insert = ReplayInfo {
                         change_type: DatabaseChangeType::Insert,
-                        query: sql.as_str().to_string(),
+                        query: ast.to_string(),
                         pk_column_indices: None,
                         column_names: Vec::new(),
                         is_ddl_replay: true,
