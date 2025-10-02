@@ -643,6 +643,30 @@ do_execsql_test substring-with-numbers {
     select substr(12345678987654, 0);
 } {12345678987654}
 
+do_execsql_test substring-emoji-1 {
+    SELECT substr('😁😅', 1, 1);
+} {😁}
+
+do_execsql_test substring-emoji-2 {
+    SELECT substr('😁😅', 1, 2);
+} {😁😅}
+
+do_execsql_test substring-emoji-3 {
+    SELECT substr('😁😅', 1);
+} {😁😅}
+
+do_execsql_test substring-utf8-emoji-1 {
+    SELECT substr('a😁ã😅', 2, 1);
+} {😁}
+
+do_execsql_test substring-utf8-emoji-2 {
+    SELECT substr('a😁ã😅', 2, 2);
+} {😁ã}
+
+do_execsql_test substring-utf8-emoji-3 {
+    SELECT substr('a😁ã😅', 2, 3);
+} {😁ã😅}
+
 do_execsql_test typeof-null {
   SELECT typeof(null);
 } {null}

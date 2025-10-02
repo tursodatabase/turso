@@ -8430,31 +8430,96 @@ impl Value {
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
-        if let (Some(str), Value::Integer(start)) = (value.cast_text(), start_value) {
-            let str_len = str.len() as i64;
+        /// Function is stabilized but not released for version 1.88 \
+        /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
+        const fn ceil_char_boundary(s: &str, index: usize) -> usize {
+            const fn is_utf8_char_boundary(c: u8) -> bool {
+                // This is bit magic equivalent to: b < 128 || b >= 192
+                (c as i8) >= -0x40
+            }
+
+            if index >= s.len() {
+                s.len()
+            } else {
+                let mut i = index;
+                while i < s.len() {
+                    if is_utf8_char_boundary(s.as_bytes()[i]) {
+                        break;
+                    }
+                    i += 1;
+                }
+
+                //  The character boundary will be within four bytes of the index
+                debug_assert!(i <= index + 3);
+
+                i
+            }
+        }
+
+        fn calculate_postions(
+            start: i64,
+            bytes_len: usize,
+            length_value: Option<&Value>,
+        ) -> (usize, usize) {
+            let bytes_len = bytes_len as i64;
 
             // The left-most character of X is number 1.
             // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
-            let first_position = if *start < 0 {
-                str_len.saturating_sub((*start).abs())
+            let first_position = if start < 0 {
+                bytes_len.saturating_sub((start).abs())
             } else {
-                *start - 1
+                start - 1
             };
             // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
             let last_position = match length_value {
                 Some(Value::Integer(length)) => first_position + *length,
-                _ => str_len,
+                _ => bytes_len,
             };
+
             let (start, end) = if first_position <= last_position {
                 (first_position, last_position)
             } else {
                 (last_position, first_position)
             };
-            Value::build_text(
-                &str.as_str()[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize],
+
+            (
+                start.clamp(-0, bytes_len) as usize,
+                end.clamp(0, bytes_len) as usize,
             )
-        } else {
-            Value::Null
+        }
+
+        let start_value = start_value.exec_cast("INT");
+        let length_value = length_value.map(|value| value.exec_cast("INT"));
+
+        match (value, start_value) {
+            (Value::Blob(b), Value::Integer(start)) => {
+                let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
+                Value::from_blob(b[start..end].to_vec())
+            }
+            (value, Value::Integer(start)) => {
+                if let Some(text) = value.cast_text() {
+                    let (mut start, mut end) =
+                        calculate_postions(start, text.len(), length_value.as_ref());
+
+                    // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
+                    let s = text.as_str();
+                    let mut start_byte_idx = 0;
+                    end -= start;
+                    while start > 0 {
+                        start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
+                        start -= 1;
+                    }
+                    let mut end_byte_idx = start_byte_idx;
+                    while end > 0 {
+                        end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
+                        end -= 1;
+                    }
+                    Value::build_text(&s[start_byte_idx..end_byte_idx])
+                } else {
+                    Value::Null
+                }
+            }
+            _ => Value::Null,
         }
     }
 
