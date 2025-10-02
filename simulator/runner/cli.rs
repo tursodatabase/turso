@@ -12,7 +12,12 @@ use crate::profiles::ProfileType;
 #[command(name = "limbo-simulator")]
 #[command(author, version, about, long_about = None)]
 pub struct SimulatorCLI {
-    #[clap(short, long, help = "set seed for reproducible runs", conflicts_with = "load")]
+    #[clap(
+        short,
+        long,
+        help = "set seed for reproducible runs",
+        conflicts_with = "load"
+    )]
     pub seed: Option<u64>,
     #[clap(
         short,
@@ -44,7 +49,12 @@ pub struct SimulatorCLI {
         default_value_t = 60 * 60 // default to 1 hour
     )]
     pub maximum_time: usize,
-    #[clap(short = 'l', long, help = "load plan from the bug base", conflicts_with = "seed")]
+    #[clap(
+        short = 'l',
+        long,
+        help = "load plan from the bug base",
+        conflicts_with = "seed"
+    )]
     pub load: Option<String>,
     #[clap(
         short = 'w',
@@ -52,7 +62,11 @@ pub struct SimulatorCLI {
         help = "enable watch mode that reruns the simulation on file changes"
     )]
     pub watch: bool,
-    #[clap(long, help = "run differential testing between sqlite and Limbo", conflicts_with = "doublecheck")]
+    #[clap(
+        long,
+        help = "run differential testing between sqlite and Limbo",
+        conflicts_with = "doublecheck"
+    )]
     pub differential: bool,
     #[clap(
         long,
