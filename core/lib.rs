@@ -2264,6 +2264,12 @@ impl Connection {
         self.set_encryption_context()
     }
 
+    pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
+        let pager = self.pager.read();
+        pager.set_reserved_space_bytes(reserved_bytes);
+        Ok(())
+    }
+
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
         *self.encryption_cipher_mode.read()
     }
