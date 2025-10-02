@@ -48,8 +48,12 @@ impl IOContext {
 
 impl Default for IOContext {
     fn default() -> Self {
+        #[cfg(feature = "checksum")]
+        let encryption_or_checksum = EncryptionOrChecksum::Checksum(ChecksumContext::default());
+        #[cfg(not(feature = "checksum"))]
+        let encryption_or_checksum = EncryptionOrChecksum::None;
         Self {
-            encryption_or_checksum: EncryptionOrChecksum::Checksum(ChecksumContext::default()),
+            encryption_or_checksum,
         }
     }
 }
