@@ -12,28 +12,31 @@ use crate::profiles::ProfileType;
 #[command(name = "limbo-simulator")]
 #[command(author, version, about, long_about = None)]
 pub struct SimulatorCLI {
-    #[clap(short, long, help = "set seed for reproducible runs", default_value = None)]
+    #[clap(short, long, help = "set seed for reproducible runs", conflicts_with = "load")]
     pub seed: Option<u64>,
     #[clap(
         short,
         long,
-        help = "enable doublechecking, run the simulator with the plan twice and check output equality"
+        help = "enable doublechecking, run the simulator with the plan twice and check output equality",
+        conflicts_with = "differential"
     )]
     pub doublecheck: bool,
     #[clap(
         short = 'n',
         long,
         help = "change the maximum size of the randomly generated sequence of interactions",
-        default_value_t = 5000
+        default_value_t = 5000,
+        value_parser = clap::value_parser!(u32).range(1..)
     )]
-    pub maximum_tests: usize,
+    pub maximum_tests: u32,
     #[clap(
         short = 'k',
         long,
         help = "change the minimum size of the randomly generated sequence of interactions",
-        default_value_t = 1000
+        default_value_t = 1000,
+        value_parser = clap::value_parser!(u32).range(1..)
     )]
-    pub minimum_tests: usize,
+    pub minimum_tests: u32,
     #[clap(
         short = 't',
         long,
@@ -41,7 +44,7 @@ pub struct SimulatorCLI {
         default_value_t = 60 * 60 // default to 1 hour
     )]
     pub maximum_time: usize,
-    #[clap(short = 'l', long, help = "load plan from the bug base")]
+    #[clap(short = 'l', long, help = "load plan from the bug base", conflicts_with = "seed")]
     pub load: Option<String>,
     #[clap(
         short = 'w',
@@ -49,7 +52,7 @@ pub struct SimulatorCLI {
         help = "enable watch mode that reruns the simulation on file changes"
     )]
     pub watch: bool,
-    #[clap(long, help = "run differential testing between sqlite and Limbo")]
+    #[clap(long, help = "run differential testing between sqlite and Limbo", conflicts_with = "doublecheck")]
     pub differential: bool,
     #[clap(
         long,
@@ -58,19 +61,19 @@ pub struct SimulatorCLI {
     pub enable_brute_force_shrinking: bool,
     #[clap(subcommand)]
     pub subcommand: Option<SimulatorCommand>,
-    #[clap(long, help = "disable BugBase", default_value_t = false)]
+    #[clap(long, help = "disable BugBase")]
     pub disable_bugbase: bool,
-    #[clap(long, help = "disable heuristic shrinking", default_value_t = false)]
+    #[clap(long, help = "disable heuristic shrinking")]
     pub disable_heuristic_shrinking: bool,
-    #[clap(long, help = "disable UPDATE Statement", default_value_t = false)]
+    #[clap(long, help = "disable UPDATE Statement")]
     pub disable_update: bool,
-    #[clap(long, help = "disable DELETE Statement", default_value_t = false)]
+    #[clap(long, help = "disable DELETE Statement")]
     pub disable_delete: bool,
-    #[clap(long, help = "disable CREATE Statement", default_value_t = false)]
+    #[clap(long, help = "disable CREATE Statement")]
     pub disable_create: bool,
-    #[clap(long, help = "disable CREATE INDEX Statement", default_value_t = false)]
+    #[clap(long, help = "disable CREATE INDEX Statement")]
     pub disable_create_index: bool,
-    #[clap(long, help = "disable DROP Statement", default_value_t = false)]
+    #[clap(long, help = "disable DROP Statement")]
     pub disable_drop: bool,
     #[clap(
         long,
@@ -84,11 +87,11 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub disable_double_create_failure: bool,
-    #[clap(long, help = "disable Select-Limit Property", default_value_t = false)]
+    #[clap(long, help = "disable Select-Limit Property")]
     pub disable_select_limit: bool,
-    #[clap(long, help = "disable Delete-Select Property", default_value_t = false)]
+    #[clap(long, help = "disable Delete-Select Property")]
     pub disable_delete_select: bool,
-    #[clap(long, help = "disable Drop-Select Property", default_value_t = false)]
+    #[clap(long, help = "disable Drop-Select Property")]
     pub disable_drop_select: bool,
     #[clap(
         long,
@@ -110,12 +113,12 @@ pub struct SimulatorCLI {
     pub disable_union_all_preserves_cardinality: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
-    #[clap(long, help = "disable FaultyQuery Property", default_value_t = false)]
+    #[clap(long, help = "disable FaultyQuery Property")]
     pub disable_faulty_query: bool,
-    #[clap(long, help = "disable Reopen-Database fault", default_value_t = false)]
+    #[clap(long, help = "disable Reopen-Database fault")]
     pub disable_reopen_database: bool,
-    #[clap(long = "latency-prob", help = "added IO latency probability")]
-    pub latency_probability: Option<usize>,
+    #[clap(long = "latency-prob", help = "added IO latency probability", value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub latency_probability: Option<u8>,
     #[clap(long, help = "Minimum tick time in microseconds for simulated time")]
     pub min_tick: Option<u64>,
     #[clap(long, help = "Maximum tick time in microseconds for simulated time")]
@@ -177,13 +180,6 @@ pub enum SimulatorCommand {
 
 impl SimulatorCLI {
     pub fn validate(&mut self) -> anyhow::Result<()> {
-        if self.minimum_tests < 1 {
-            anyhow::bail!("minimum size must be at least 1");
-        }
-        if self.maximum_tests < 1 {
-            anyhow::bail!("maximum size must be at least 1");
-        }
-
         if self.minimum_tests > self.maximum_tests {
             tracing::warn!(
                 "minimum size '{}' is greater than '{}' maximum size, setting both to '{}'",
@@ -191,22 +187,7 @@ impl SimulatorCLI {
                 self.maximum_tests,
                 self.maximum_tests
             );
-            self.minimum_tests = self.maximum_tests - 1;
-        }
-
-        if self.seed.is_some() && self.load.is_some() {
-            anyhow::bail!("Cannot set seed and load plan at the same time");
-        }
-
-        if self.latency_probability.is_some_and(|prob| prob > 100) {
-            anyhow::bail!(
-                "latency probability must be a number between 0 and 100. Got `{}`",
-                self.latency_probability.unwrap()
-            );
-        }
-
-        if self.doublecheck && self.differential {
-            anyhow::bail!("Cannot run doublecheck and differential testing at the same time");
+            self.minimum_tests = self.maximum_tests;
         }
 
         Ok(())
