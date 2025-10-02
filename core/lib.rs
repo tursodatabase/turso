@@ -2514,6 +2514,9 @@ impl Statement {
         if let Some(busy_timeout) = self.busy_timeout.as_ref() {
             if self.pager.io.now() < busy_timeout.timeout {
                 // Yield the query as the timeout has not been reached yet
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
                 return Ok(StepResult::IO);
             }
         }
@@ -2578,6 +2581,9 @@ impl Statement {
             };
 
             if now < self.busy_timeout.as_ref().unwrap().timeout {
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
                 res = Ok(StepResult::IO);
             }
         }
