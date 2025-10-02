@@ -266,6 +266,20 @@ pub(crate) fn limbo_exec_rows(
     rows
 }
 
+pub(crate) fn limbo_stmt_get_column_names(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Vec<String> {
+    let stmt = conn.prepare(query).unwrap();
+
+    let mut names = vec![];
+    for i in 0..stmt.num_columns() {
+        names.push(stmt.get_column_name(i).to_string());
+    }
+    names
+}
+
 pub(crate) fn limbo_exec_rows_fallible(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,

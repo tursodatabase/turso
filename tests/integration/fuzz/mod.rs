@@ -4,6 +4,7 @@ pub mod grammar_generator;
 mod tests {
     use rand::seq::{IndexedRandom, SliceRandom};
     use std::collections::HashSet;
+    use turso_core::DatabaseOpts;
 
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -11,8 +12,9 @@ mod tests {
 
     use crate::{
         common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, maybe_setup_tracing,
-            rng_from_time, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
+            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, sqlite_exec_rows,
+            TempDatabase,
         },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
     };
@@ -2509,11 +2511,23 @@ mod tests {
 
     #[test]
     pub fn fuzz_long_create_table_drop_table_alter_table() {
-        let db = TempDatabase::new_empty(true);
+        _fuzz_long_create_table_drop_table_alter_table(false);
+    }
+
+    #[test]
+    pub fn fuzz_long_create_table_drop_table_alter_table_mvcc() {
+        _fuzz_long_create_table_drop_table_alter_table(true);
+    }
+
+    fn _fuzz_long_create_table_drop_table_alter_table(mvcc: bool) {
+        let db = TempDatabase::new_with_opts(
+            "fuzz_long_create_table_drop_table_alter_table",
+            DatabaseOpts::new().with_mvcc(mvcc).with_indexes(!mvcc),
+        );
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        tracing::info!("create_table_drop_table_fuzz seed: {}", seed);
+        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
@@ -2528,7 +2542,7 @@ mod tests {
 
         let mut undroppable_cols = HashSet::new();
 
-        for iteration in 0..5000 {
+        for iteration in 0..2000 {
             println!("iteration: {iteration} (seed: {seed})");
             let operation = rng.random_range(0..100); // 0: create, 1: drop, 2: alter, 3: alter rename
 
@@ -2556,9 +2570,17 @@ mod tests {
 
                             let col_type = COLUMN_TYPES[rng.random_range(0..COLUMN_TYPES.len())];
                             let constraint = if i == 0 && rng.random_bool(0.2) {
-                                " PRIMARY KEY"
+                                if !mvcc || col_type == "INTEGER" {
+                                    " PRIMARY KEY"
+                                } else {
+                                    ""
+                                }
                             } else if rng.random_bool(0.1) {
-                                " UNIQUE"
+                                if !mvcc {
+                                    " UNIQUE"
+                                } else {
+                                    ""
+                                }
                             } else {
                                 ""
                             };
@@ -2571,19 +2593,29 @@ mod tests {
                         }
 
                         let create_sql =
-                            format!("CREATE TABLE {} ({})", table_name, columns.join(", "));
+                            format!("CREATE TABLE {table_name} ({})", columns.join(", "));
 
                         // Execute the create table statement
                         limbo_exec_rows(&db, &limbo_conn, &create_sql);
 
-                        // Successfully created table, update our tracking
-                        current_tables.insert(
-                            table_name.clone(),
-                            columns
-                                .iter()
-                                .map(|c| c.split_whitespace().next().unwrap().to_string())
-                                .collect(),
+                        let column_names = columns
+                            .iter()
+                            .map(|c| c.split_whitespace().next().unwrap().to_string())
+                            .collect::<Vec<_>>();
+
+                        // Insert a single row into the table
+                        let insert_sql = format!(
+                            "INSERT INTO {table_name} ({}) VALUES ({})",
+                            column_names.join(", "),
+                            (0..columns.len())
+                                .map(|i| i.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
+                        limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+
+                        // Successfully created table, update our tracking
+                        current_tables.insert(table_name.clone(), column_names);
                     }
                 }
 
@@ -2656,11 +2688,36 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+
+            // Do SELECT * FROM <table> for all current tables and just verify there is 1 row and the column count and names match the expected columns in the table
+            for (table_name, columns) in current_tables.iter() {
+                let select_sql = format!("SELECT * FROM {table_name}");
+                let col_names_actual = limbo_stmt_get_column_names(&db, &limbo_conn, &select_sql);
+                let col_names_expected = columns
+                    .iter()
+                    .map(|c| c.split_whitespace().next().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    col_names_actual, col_names_expected,
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+                let limbo = limbo_exec_rows(&db, &limbo_conn, &select_sql);
+                assert_eq!(
+                    limbo.len(),
+                    1,
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+                assert_eq!(
+                    limbo[0].len(),
+                    columns.len(),
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+            }
         }
 
         // Final verification - the test passes if we didn't crash
         println!(
-            "create_table_drop_table_fuzz completed successfully with {} tables remaining",
+            "create_table_drop_table_fuzz completed successfully with {} tables remaining. (mvcc: {mvcc}, seed: {seed})",
             current_tables.len()
         );
     }
