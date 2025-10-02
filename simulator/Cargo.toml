@@ -18,8 +18,6 @@ path = "main.rs"
 turso_core = { workspace = true, features = ["simulator"]}
 rand = { workspace = true }
 rand_chacha = { workspace = true }
-log = "0.4.20"
-env_logger = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",
