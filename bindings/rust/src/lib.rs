@@ -48,7 +48,7 @@ pub use params::IntoParams;
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
-use turso_core::OpenFlags;
+use turso_core::{EncryptionOpts, OpenFlags};
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -84,6 +84,7 @@ pub struct Builder {
     enable_mvcc: bool,
     enable_encryption: bool,
     vfs: Option<String>,
+    encryption_opts: Option<EncryptionOpts>,
 }
 
 impl Builder {
@@ -94,6 +95,7 @@ impl Builder {
             enable_mvcc: false,
             enable_encryption: false,
             vfs: None,
+            encryption_opts: None,
         }
     }
 
@@ -104,6 +106,11 @@ impl Builder {
 
     pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
         self.enable_encryption = encryption_enabled;
+        self
+    }
+
+    pub fn with_encryption(mut self, opts: EncryptionOpts) -> Self {
+        self.encryption_opts = Some(opts);
         self
     }
 
@@ -124,7 +131,7 @@ impl Builder {
             self.path.as_str(),
             OpenFlags::default(),
             opts,
-            None,
+            self.encryption_opts.clone(),
         )?;
         Ok(Database { inner: db })
     }
