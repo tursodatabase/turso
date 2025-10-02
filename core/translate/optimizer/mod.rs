@@ -212,6 +212,13 @@ fn optimize_table_access(
             .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
         {
             t.join_info.as_mut().unwrap().outer = false;
+            for term in where_clause.iter_mut() {
+                if let Some(from_outer_join) = term.from_outer_join {
+                    if from_outer_join == t.internal_id {
+                        term.from_outer_join = None;
+                    }
+                }
+            }
             continue;
         }
     }

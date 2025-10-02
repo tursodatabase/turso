@@ -73,11 +73,25 @@ pub struct GroupBy {
 pub struct WhereTerm {
     /// The original condition expression.
     pub expr: ast::Expr,
-    /// Is this condition originally from an OUTER JOIN, and if so, what is the internal ID of the [TableReference] that it came from?
-    /// The ID is always the right-hand-side table of the OUTER JOIN.
-    /// If `from_outer_join` is Some, we need to evaluate this term at the loop of the the corresponding table,
-    /// regardless of which tables it references.
-    /// We also cannot e.g. short circuit the entire query in the optimizer if the condition is statically false.
+    /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
+    /// and let the optimizer determine when each should be evaluated based on the tables they reference.
+    /// See e.g. [EvalAt].
+    /// For example, in "SELECT * FROM x JOIN y WHERE x.a = 2", we want to evaluate x.a = 2 right after opening x
+    /// since it only depends on x.
+    ///
+    /// However, OUTER JOIN conditions require special handling. Consider:
+    ///   SELECT * FROM t LEFT JOIN s ON t.a = 2
+    ///
+    /// Even though t.a = 2 only references t, we cannot evaluate it during t's loop and skip rows where t.a != 2.
+    /// Instead, we must:
+    /// 1. Process ALL rows from t
+    /// 2. For each t row where t.a != 2, emit NULL values for s's columns
+    /// 3. For each t row where t.a = 2, emit the actual s values
+    ///
+    /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
+    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
+    /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
+    /// is set, we force evaluation to happen during that table's loop.
     pub from_outer_join: Option<TableInternalId>,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
