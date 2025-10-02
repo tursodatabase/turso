@@ -2472,7 +2472,7 @@ impl Statement {
         let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
-                self.mv_store.clone(),
+                self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
             )
@@ -2480,7 +2480,7 @@ impl Statement {
             const MAX_SCHEMA_RETRY: usize = 50;
             let mut res = self.program.step(
                 &mut self.state,
-                self.mv_store.clone(),
+                self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
             );
@@ -2493,7 +2493,7 @@ impl Statement {
                 self.reprepare()?;
                 res = self.program.step(
                     &mut self.state,
-                    self.mv_store.clone(),
+                    self.mv_store.as_ref(),
                     self.pager.clone(),
                     self.query_mode,
                 );

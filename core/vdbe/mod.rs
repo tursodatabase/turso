@@ -512,7 +512,7 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<Arc<MvStore>>,
+        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
     ) -> Result<StepResult> {
@@ -526,7 +526,7 @@ impl Program {
     fn explain_step(
         &self,
         state: &mut ProgramState,
-        _mv_store: Option<Arc<MvStore>>,
+        _mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
@@ -580,7 +580,7 @@ impl Program {
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
-        _mv_store: Option<Arc<MvStore>>,
+        _mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
@@ -628,7 +628,7 @@ impl Program {
     fn normal_step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<Arc<MvStore>>,
+        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
@@ -650,7 +650,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -665,7 +665,7 @@ impl Program {
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
+            match insn_function(self, state, insn, &pager, mv_store) {
                 Ok(InsnFunctionStepResult::Step) => {
                     // Instruction completed, moving to next
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -694,7 +694,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
                     return Err(err);
                 }
             }
