@@ -395,7 +395,6 @@ impl ProgramState {
             self.registers
                 .resize_with(max_resgisters, || Register::Value(Value::Null));
         }
-        self.cursors.iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
