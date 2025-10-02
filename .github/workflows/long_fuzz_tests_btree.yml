@@ -1,6 +1,7 @@
 name: Run long fuzz tests on Btree
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'core/storage/btree.rs'

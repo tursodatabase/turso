@@ -1,6 +1,7 @@
 name: Rust Benchmarks+Nyrkiö
 
 on:
+  workflow_dispatch:
   push:
     branches: ["main", "master", "notmain"]
   pull_request:

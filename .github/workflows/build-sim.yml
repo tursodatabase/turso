@@ -1,6 +1,7 @@
 name: Build and push limbo-sim image
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
