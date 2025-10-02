@@ -482,7 +482,10 @@ impl Statement {
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
                     let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
+                    let i = stmt.parameters().index(&name).ok_or(
+                        turso_core::LimboError::InvalidArgument(
+                            format!("Unknown parameter '{name}' for query '{}'. Make sure you're using the correct parameter syntax - named: (:foo), positional: (?, ?)", stmt.get_sql())
+                        ))?;
                     stmt.bind_at(i, value.into());
                 }
             }
