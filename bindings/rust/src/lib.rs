@@ -48,7 +48,8 @@ pub use params::IntoParams;
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
-use turso_core::{EncryptionOpts, OpenFlags};
+pub use turso_core::EncryptionOpts;
+use turso_core::OpenFlags;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
