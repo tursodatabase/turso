@@ -490,12 +490,25 @@ pub fn group_by_process_single_group(
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
     };
 
+    let mut compare_key_info = group_by
+        .exprs
+        .iter()
+        .map(|_| KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::default(),
+        })
+        .collect::<Vec<_>>();
+    for i in 0..group_by.exprs.len() {
+        let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
+        compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+    }
+
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not
     program.emit_insn(Insn::Compare {
         start_reg_a: registers.reg_group_exprs_cmp,
         start_reg_b: groups_start_reg,
         count: group_by.exprs.len(),
-        collation: program.curr_collation(),
+        key_info: compare_key_info,
     });
 
     program.add_comment(

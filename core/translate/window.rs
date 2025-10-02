@@ -1,5 +1,6 @@
 use crate::schema::{BTreeTable, Table};
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
+use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::order_by::order_by_sorter_insert;
@@ -9,10 +10,12 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
+use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
 use crate::vdbe::insn::{InsertFlags, Insn};
 use crate::vdbe::{BranchOffset, CursorID};
+use crate::Result;
 use std::mem;
 use std::sync::Arc;
 use turso_parser::ast::Name;
@@ -220,7 +223,7 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
-    );
+    )?;
 
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
@@ -657,9 +660,9 @@ pub fn emit_window_loop_source(
     let window = plan.window.as_ref().expect("missing window");
 
     emit_load_order_by_columns(program, window, registers);
-    emit_flush_buffer_if_new_partition(program, labels, registers, window);
+    emit_flush_buffer_if_new_partition(program, labels, registers, window, plan)?;
     emit_reset_state_if_new_partition(program, registers, window);
-    emit_flush_buffer_if_not_peer(program, labels, registers, window);
+    emit_flush_buffer_if_not_peer(program, labels, registers, window, plan)?;
     emit_insert_row_into_buffer(
         program,
         registers,
@@ -677,7 +680,8 @@ fn emit_flush_buffer_if_new_partition(
     labels: &WindowLabels,
     registers: &WindowRegisters,
     window: &Window,
-) {
+    plan: &SelectPlan,
+) -> Result<()> {
     if let Some(reg_partition_start) = registers.partition_start {
         let same_partition_label = program.allocate_label();
         let new_partition_label = program.allocate_label();
@@ -692,11 +696,22 @@ fn emit_flush_buffer_if_new_partition(
             program.offset(),
             "compare partition keys to detect new partition",
         );
+        let mut compare_key_info = (0..window.partition_by.len())
+            .map(|_| KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::default(),
+            })
+            .collect::<Vec<_>>();
+        for i in 0..window.partition_by.len() {
+            let maybe_collation =
+                get_collseq_from_expr(&window.partition_by[i], &plan.table_references)?;
+            compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+        }
         program.emit_insn(Insn::Compare {
             start_reg_a: registers.src_columns_start,
             start_reg_b: reg_partition_start,
             count: partition_by_len,
-            collation: program.curr_collation(),
+            key_info: compare_key_info,
         });
         program.emit_insn(Insn::Jump {
             target_pc_lt: new_partition_label,
@@ -723,6 +738,8 @@ fn emit_flush_buffer_if_new_partition(
 
         program.resolve_label(same_partition_label, program.offset());
     }
+
+    Ok(())
 }
 
 fn emit_reset_state_if_new_partition(
@@ -768,7 +785,8 @@ fn emit_flush_buffer_if_not_peer(
     labels: &WindowLabels,
     registers: &WindowRegisters,
     window: &Window,
-) {
+    plan: &SelectPlan,
+) -> Result<()> {
     if let Some(reg_new_order_by_columns_start) = registers.new_order_by_columns_start {
         let label_peer = program.allocate_label();
         let label_not_peer = program.allocate_label();
@@ -778,11 +796,22 @@ fn emit_flush_buffer_if_not_peer(
             .expect("prev_order_by_columns_start must exist");
 
         program.add_comment(program.offset(), "compare ORDER BY columns to detect peer");
+        let mut compare_key_info = (0..window.order_by.len())
+            .map(|_| KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: CollationSeq::default(),
+            })
+            .collect::<Vec<_>>();
+        for i in 0..window.order_by.len() {
+            let maybe_collation =
+                get_collseq_from_expr(&window.order_by[i].0, &plan.table_references)?;
+            compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+        }
         program.emit_insn(Insn::Compare {
             start_reg_a: reg_prev_order_by_columns_start,
             start_reg_b: reg_new_order_by_columns_start,
             count: order_by_len,
-            collation: program.curr_collation(),
+            key_info: compare_key_info,
         });
         program.emit_insn(Insn::Jump {
             target_pc_lt: label_not_peer,
@@ -804,6 +833,8 @@ fn emit_flush_buffer_if_not_peer(
 
         program.resolve_label(label_peer, program.offset());
     }
+
+    Ok(())
 }
 
 fn emit_load_order_by_columns(
