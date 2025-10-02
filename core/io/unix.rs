@@ -309,12 +309,12 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            #[cfg(not(target_vendor = "apple"))]
             {
                 libc::fsync(file.as_raw_fd())
             }
 
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(target_vendor = "apple")]
             {
                 libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
             }
@@ -324,10 +324,10 @@ impl File for UnixFile {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
 
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(target_vendor = "apple")]
             trace!("fcntl(F_FULLSYNC)");
 
             c.complete(0);

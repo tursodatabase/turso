@@ -429,7 +429,7 @@ impl Arena {
 
 #[cfg(unix)]
 mod arena {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     use libc::MAP_ANON as MAP_ANONYMOUS;
     #[cfg(target_os = "linux")]
     use libc::MAP_ANONYMOUS;
