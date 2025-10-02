@@ -414,7 +414,9 @@ impl ProgramState {
             deleted_record: None,
         };
         self.op_idx_delete_state = None;
-        self.op_integrity_check_state = OpIntegrityCheckState::Start;
+        if !matches!(self.op_integrity_check_state, OpIntegrityCheckState::Start) {
+            self.op_integrity_check_state = OpIntegrityCheckState::Start;
+        }
         self.metrics = StatementMetrics::new();
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
