@@ -277,6 +277,7 @@ impl Property {
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
                         if rows.len() != sim_table.rows.len() {
+                            print_diff(&sim_table.rows, rows, "simulator", "database");
                             return Ok(Err(format!(
                                 "expected {} rows but got {} for table {}",
                                 sim_table.rows.len(),
@@ -286,6 +287,7 @@ impl Property {
                         }
                         for expected_row in sim_table.rows.iter() {
                             if !rows.contains(expected_row) {
+                                print_diff(&sim_table.rows, rows, "simulator", "database");
                                 return Ok(Err(format!(
                                     "expected row {:?} not found in table {}",
                                     expected_row,
@@ -336,6 +338,17 @@ impl Property {
                                 for row in rows {
                                     for (i, (col, val)) in update.set_values.iter().enumerate() {
                                         if &row[i] != val {
+                                            let update_rows = update
+                                                .set_values
+                                                .iter()
+                                                .map(|(_, val)| val.clone())
+                                                .collect::<Vec<_>>();
+                                            print_diff(
+                                                &[row.to_vec()],
+                                                &[update_rows],
+                                                "database",
+                                                "update-clause",
+                                            );
                                             return Ok(Err(format!(
                                                 "updated row {} has incorrect value for column {col}: expected {val}, got {}",
                                                 i, row[i]
