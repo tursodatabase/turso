@@ -7,6 +7,7 @@ use std::{
 use crate::{
     schema::{Column, Index},
     translate::{
+        collate::get_collseq_from_expr,
         expr::as_binary_components,
         plan::{JoinOrderMember, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
@@ -54,6 +55,9 @@ pub struct Constraint {
     /// An estimated selectivity factor (0.0 to 1.0) indicating the fraction of rows
     /// expected to satisfy this constraint. Used for cost and cardinality estimation.
     pub selectivity: f64,
+    /// Whether the constraint is usable for an index seek.
+    /// This is explicitly set to false if the constraint has a different collation than the constrained column.
+    pub usable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -74,6 +78,19 @@ impl Constraint {
             lhs.clone()
         } else {
             rhs.clone()
+        }
+    }
+
+    pub fn get_constraining_expr_ref<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let (idx, side) = self.where_clause_pos;
+        let where_term = &where_clause[idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("Expected a valid binary expression");
+        };
+        if side == BinaryExprSide::Lhs {
+            &lhs
+        } else {
+            &rhs
         }
     }
 }
@@ -235,6 +252,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            usable: true,
                         });
                     }
                 }
@@ -251,6 +269,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(rhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            usable: true,
                         });
                     }
                 }
@@ -266,6 +285,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: *column,
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            usable: true,
                         });
                     }
                 }
@@ -279,6 +299,7 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column.unwrap(),
                             lhs_mask: table_mask_from_expr(lhs, table_references)?,
                             selectivity: estimate_selectivity(table_column, operator),
+                            usable: true,
                         });
                     }
                 }
@@ -298,7 +319,19 @@ pub fn constraints_from_where_clause(
         });
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
-        for (i, constraint) in cs.constraints.iter().enumerate() {
+        for (i, constraint) in cs.constraints.iter_mut().enumerate() {
+            let constrained_column = &table_reference.table.columns()[constraint.table_col_pos];
+            let column_collation = constrained_column.collation.unwrap_or_default();
+            let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
+            // Index seek keys must use the same collation as the constrained column.
+            match get_collseq_from_expr(constraining_expr, table_references)? {
+                Some(collation) if collation != column_collation => {
+                    constraint.usable = false;
+                    continue;
+                }
+                _ => {}
+            }
+
             if rowid_alias_column == Some(constraint.table_col_pos) {
                 let rowid_candidate = cs
                     .candidates
