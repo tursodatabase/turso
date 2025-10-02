@@ -87,3 +87,15 @@ impl std::ops::Sub<Duration> for Instant {
 pub trait Clock {
     fn now(&self) -> Instant;
 }
+
+pub struct DefaultClock;
+
+impl Clock for DefaultClock {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
+    }
+}
