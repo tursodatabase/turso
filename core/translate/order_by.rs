@@ -3,7 +3,11 @@ use turso_parser::ast::{self, SortOrder};
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
+    translate::{
+        collate::{get_collseq_from_expr, CollationSeq},
+        group_by::is_orderby_agg_or_const,
+        plan::Aggregate,
+    },
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -70,21 +74,7 @@ pub fn init_order_by(
      */
     let mut collations = order_by
         .iter()
-        .map(|(expr, _)| match expr.as_ref() {
-            ast::Expr::Collate(_, collation_name) => {
-                CollationSeq::new(collation_name.as_str()).map(Some)
-            }
-            ast::Expr::Column { table, column, .. } => {
-                let table = referenced_tables.find_table_by_internal_id(*table).unwrap();
-
-                let Some(table_column) = table.get_column_at(*column) else {
-                    crate::bail_parse_error!("column index out of bounds");
-                };
-
-                Ok(table_column.collation)
-            }
-            _ => Ok(Some(CollationSeq::default())),
-        })
+        .map(|(expr, _)| get_collseq_from_expr(expr, referenced_tables))
         .collect::<Result<Vec<_>>>()?;
 
     if has_sequence {
