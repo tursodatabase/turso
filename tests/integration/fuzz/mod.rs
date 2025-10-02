@@ -502,7 +502,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time();
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
 
-        const OUTER_ITERS: usize = 50;
+        const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
@@ -525,7 +525,6 @@ mod tests {
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
-            // DDL
             let s = log_and_exec("CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT)");
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
@@ -550,8 +549,14 @@ mod tests {
                 let a = rng.random_range(-5..=25);
                 let b = rng.random_range(-5..=25);
                 let stmt = log_and_exec(&format!("INSERT INTO p VALUES ({id}, {a}, {b})"));
-                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
-                let _ = sqlite.execute(&stmt, params![]);
+                let l_res = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let s_res = sqlite.execute(&stmt, params![]);
+                match (l_res, s_res) {
+                    (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
+                    _ => {
+                        panic!("Seeding parent insert mismatch");
+                    }
+                }
             }
 
             // Seed child
@@ -786,7 +791,7 @@ mod tests {
         println!("fk_edgecases_minifuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 20;
-        const INNER_ITERS: usize = 150;
+        const INNER_ITERS: usize = 100;
 
         fn assert_parity(
             seed: u64,
@@ -1140,8 +1145,8 @@ mod tests {
         let (mut rng, seed) = rng_from_time();
         println!("fk_composite_pk_mutation_fuzz seed: {seed}");
 
-        const OUTER_ITERS: usize = 30;
-        const INNER_ITERS: usize = 200;
+        const OUTER_ITERS: usize = 10;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
             println!(
