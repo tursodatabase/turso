@@ -1200,7 +1200,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Integer(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
-                                "CREATE INDEX t_idx ON t (y)"
+                                "CREATE INDEX IF NOT EXISTS t_idx ON t (y)"
                             )),
                         ]
                     ]
