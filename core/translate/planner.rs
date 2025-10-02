@@ -315,7 +315,7 @@ fn parse_from_clause_table(
                 subplan,
                 None,
                 program.table_reference_counter.next(),
-            ));
+            )?);
             Ok(())
         }
         ast::SelectTable::TableCall(qualified_name, args, maybe_alias) => parse_table(
@@ -662,7 +662,7 @@ pub fn parse_from(
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
-            ));
+            )?);
         }
     }
 
