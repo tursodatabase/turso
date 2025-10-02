@@ -2,7 +2,7 @@ pub mod grammar_generator;
 
 #[cfg(test)]
 mod tests {
-    use rand::seq::{IndexedRandom, SliceRandom};
+    use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};

@@ -124,16 +124,12 @@ do_execsql_test_in_memory_any_error fk-composite-unique-missing {
     INSERT INTO child  VALUES (2,'A','X');     -- no ('A','X') in parent
 }
 
-# SQLite doesnt let you name a foreign key constraint 'rowid' explicitly...
-# well it does.. but it throws a parse error only when you try to insert into the table -_-
-# We will throw a parse error when you create the table instead, because that is 
-# obviously the only sane thing to do
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
-    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid)); -- we error here
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
     INSERT INTO t VALUES (100,'x');
-    INSERT INTO c VALUES (1, 100); - sqlite errors here
+    INSERT INTO c VALUES (1, 100);
 }
 
 do_execsql_test_in_memory_any_error fk-rowid-alias-parent-missing {
