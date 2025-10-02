@@ -50,6 +50,7 @@ Welcome to Turso database manual!
     - [MVCC](#mvcc)
     - [Pager](#pager)
     - [I/O](#io)
+    - [Encryption](#encryption-1)
     - [References](#references)
 
 ## Introduction
@@ -823,6 +824,92 @@ The `IOResult` struct looks as follows:
   ```
 
 This implies that when a function returns an `IOResult`, it must be called again until it returns an `IOResult::Done` variant. This works similarly to how `Future`s are polled in rust. When you receive a `Poll::Ready(None)`, it means that the future stopped it's execution. In a similar vein, if we receive `IOResult::Done`, the function/state machine has reached the end of it's execution. `IOCompletions` is here to signal that, if we are executing any I/O operation, that we need to propagate the completions that are generated from it. This design forces us to handle the fact that a function is asynchronous in nature. This is essentially [function coloring](https://www.tedinski.com/2018/11/13/function-coloring.html), but done at the application level instead of the compiler level.
+
+### Encryption
+
+#### Goals
+
+- Per-page encryption as an opt-in feature, so users don't have to compile/load the encryption extension
+- All pages in db and WAL file to be encrypted on disk
+- Least performance overhead as possible
+
+#### Design
+
+1. We do encryption at the page level, i.e., each page is encrypted and decrypted individually.
+2. At db creation, we take key and cipher scheme information. We store the scheme information (also version) in the db file itself.
+3. The key is not stored anywhere. So each connection should carry an encryption key. Trying to open a db with an invalid or empty key should return an error.
+4. We generate a new randomized, cryptographically safe nonce every time we write a page.
+5. We store the authentication tag and the nonce in the page itself.
+6. We can support different cipher algorithms: AES, ChachaPoly, AEGIS, etc.
+7. We can support key rotation. But rekeying would require writing the entire database.
+8. We should also add import/export functionality to the CLI for better DX and compatibility with SQLite.
+
+#### Metadata management
+
+We store the nonce and tag (or the verification bits) in the page itself. During decryption, we will load these to decrypt and verify the data.
+
+Example: Assume the page size is 4096 bytes and we use AEGIS 256. So we reserve the last 48 bytes
+for the nonce (32 bytes) and tag (16 bytes).
+
+```ignore
+            Unencrypted Page              Encrypted Page
+            ┌───────────────┐            ┌───────────────┐
+            │               │            │               │
+            │ Page Content  │            │   Encrypted   │
+            │ (4048 bytes)  │  ────────► │    Content    │
+            │               │            │ (4048 bytes)  │
+            ├───────────────┤            ├───────────────┤
+            │   Reserved    │            │    Tag (16)   │
+            │  (48 bytes)   │            ├───────────────┤
+            │   [empty]     │            │   Nonce (32)  │
+            └───────────────┘            └───────────────┘
+               4096 bytes                   4096 bytes
+```
+
+The above applies to all the pages except Page 1. Page 1 contains the SQLite header (the first 100 bytes). Specifically, bytes 16 to 24 contain metadata which is required to initialize the connection, which happens before we can set up the encryption context. So, we don't encrypt the header but instead use the header data as additional data (AD) for the encryption of the rest of the page. This provides us protection against tampering and corruption for the unencrypted portion.
+
+On disk, the encrypted page 1 contains special bytes replacing SQLite's magic bytes (the
+first 16 bytes):
+
+```ignore
+                   Turso Header (16 bytes)
+       ┌─────────┬───────┬────────┬──────────────────┐
+       │         │       │        │                  │
+       │ "Turso" │Version│ Cipher │     Unused       │
+       │  (5)    │ (1)   │  (1)   │    (9 bytes)     │
+       │         │       │        │                  │
+       └─────────┴───────┴────────┴──────────────────┘
+        0-4      5       6        7-15
+
+       Standard SQLite Header: "SQLite format 3\0" (16 bytes)
+                           ↓
+       Turso Encrypted Header: "Turso" + Version + Cipher ID + Unused
+```
+
+The current version is 0x00. The cipher IDs are:
+
+| Algorithm | Cipher ID |
+|-----------|-----------|
+| AES-GCM (128-bit) | 1 |
+| AES-GCM (256-bit) | 2 |
+| AEGIS-256 | 3 |
+| AEGIS-256-X2 | 4 |
+| AEGIS-256-X4 | 5 |
+| AEGIS-128L | 6 |
+| AEGIS-128-X2 | 7 |
+| AEGIS-128-X4 | 8 |
+
+#### Future work
+1. I have omitted the key derivation aspect. We can later add passphrase and key derivation support.
+2. Pages in memory are unencrypted. We can explore memory enclaves and other mechanisms.
+
+#### Other Considerations
+
+You may check the [RFC discussion](https://github.com/tursodatabase/turso/issues/2447) and also [Checksum RFC discussion](https://github.com/tursodatabase/turso/issues/2178) for the design decisions.
+
+- SQLite has some unused bytes in the header left for future expansion. We considered using this portion to store the cipher information metadata but decided not to because these may get used in the future.
+- Another alternative was to truncate tag bytes of page 1, then store the meta information. Ultimately, it seemed much better to store the metadata in the magic bytes.
+- For per-page metadata, we decided to store it in the reserved space. The reserved space is for extensions; however, I could not find any usage of it other than the official Checksum shim and other encryption extensions.
 
 ### References
 
