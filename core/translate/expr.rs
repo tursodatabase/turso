@@ -3761,6 +3761,7 @@ pub fn get_expr_affinity(
             }
             Affinity::Blob
         }
+        ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
                 crate::schema::affinity(&type_name.name)
