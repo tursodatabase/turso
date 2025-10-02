@@ -1,4 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
+use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
@@ -382,21 +383,27 @@ fn create_dedupe_index(
         crate::bail_parse_error!("UNION OR INTERSECT or EXCEPT is not supported without indexes");
     }
 
+    let mut dedupe_columns = select
+        .result_columns
+        .iter()
+        .map(|c| IndexColumn {
+            name: c
+                .name(&select.table_references)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            order: SortOrder::Asc,
+            pos_in_table: 0,
+            default: None,
+            collation: None,
+        })
+        .collect::<Vec<_>>();
+    for (i, column) in dedupe_columns.iter_mut().enumerate() {
+        column.collation =
+            get_collseq_from_expr(&select.result_columns[i].expr, &select.table_references)?;
+    }
+
     let dedupe_index = Arc::new(Index {
-        columns: select
-            .result_columns
-            .iter()
-            .map(|c| IndexColumn {
-                name: c
-                    .name(&select.table_references)
-                    .map(|n| n.to_string())
-                    .unwrap_or_default(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                default: None,
-                collation: None, // FIXME: this should be inferred
-            })
-            .collect(),
+        columns: dedupe_columns,
         name: "compound_dedupe".to_string(),
         root_page: 0,
         ephemeral: true,
