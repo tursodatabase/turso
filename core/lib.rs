@@ -451,15 +451,6 @@ impl Database {
             n_connections: AtomicUsize::new(0),
         });
 
-        if opts.enable_mvcc {
-            let mv_store = db.mv_store.as_ref().unwrap();
-            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
-            mv_store.bootstrap(mvcc_bootstrap_conn)?;
-        }
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
-
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
             // parse schema
@@ -501,6 +492,15 @@ impl Database {
                 Ok(())
             })?;
         }
+
+        if opts.enable_mvcc {
+            let mv_store = db.mv_store.as_ref().unwrap();
+            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            mv_store.bootstrap(mvcc_bootstrap_conn)?;
+        }
+
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
 
         Ok(db)
     }

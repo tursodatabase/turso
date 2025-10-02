@@ -646,6 +646,43 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
     assert_eq!(rows, expected2);
 }
 
+#[test]
+fn test_non_mvcc_to_mvcc() {
+    // Create non-mvcc database
+    let tmp_db = TempDatabase::new("test_non_mvcc_to_mvcc.db", false);
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert data
+    execute_and_log(
+        &conn,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "INSERT INTO test VALUES (1, 'hello')").unwrap();
+
+    // Checkpoint to persist changes
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen in mvcc mode
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Query should work
+    let stmt = query_and_log(&conn, "SELECT * FROM test").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][1], Value::Text("hello".into()));
+}
+
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
     loop {
