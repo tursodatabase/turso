@@ -416,3 +416,49 @@ async fn test_concurrent_unique_constraint_regression() {
         handle.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_existing_db() {
+    let db_file = "test.db";
+    {
+        let builder = Builder::new_local(db_file);
+        let db = builder.build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO test (value) VALUES ('Hello, World!')", ())
+            .await
+            .unwrap();
+        let mut row_count = 0;
+        let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        }
+        assert_eq!(row_count, 1);
+    }
+
+    // lets verify we can open an existing db
+    {
+        let builder = Builder::new_local(db_file);
+        let db = builder.build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut row_count = 0;
+        let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        }
+        assert_eq!(row_count, 1);
+    }
+
+    fs::remove_file("test.db").await.unwrap();
+    fs::remove_file("test.db-wal").await.unwrap();
+}
