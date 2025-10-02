@@ -13,6 +13,8 @@ static double probabilities[] = {
 	[EIO] = 0.01,
 };
 
+static double short_write_probability = 0.05; // 5% chance of a short write
+
 static bool chance(double probability)
 {
 	double event = drand48();
@@ -37,6 +39,13 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
 	if (libc_pwrite == NULL) {
 		libc_pwrite = dlsym(RTLD_NEXT, "pwrite");
 	}
+
+	if (count > 1 && chance(short_write_probability)) {
+        size_t short_count = 1 + (lrand48() % (count - 1));
+        printf("%s: injecting fault SHORT WRITE (requesting %zu instead of %zu)\n", __func__, short_count, count);
+        return libc_pwrite(fd, buf, short_count, offset);
+    }
+
 	if (inject_fault(ENOSPC)) {
 		printf("%s: injecting fault NOSPC\n", __func__);
 		return -1;
