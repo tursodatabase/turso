@@ -249,7 +249,6 @@ impl SyncEngine {
             reserved_bytes: self
                 .opts
                 .remote_encryption
-                .clone()
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
         };
