@@ -22,15 +22,25 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     const requestType = request.request();
     const completion = request.completion();
     if (requestType.type == 'Http') {
+        let url: string | null = null;
+        if (typeof opts.url == "function") {
+            url = opts.url();
+        } else {
+            url = opts.url;
+        }
+        if (url == null) {
+            completion.poison(`url is empty - sync is paused`);
+            return;
+        }
         try {
-            let headers = typeof opts.headers === "function" ? opts.headers() : opts.headers;
+            let headers = typeof opts.headers === "function" ? await opts.headers() : opts.headers;
             if (requestType.headers != null && requestType.headers.length > 0) {
                 headers = { ...opts.headers };
                 for (let header of requestType.headers) {
                     headers[header[0]] = header[1];
                 }
             }
-            const response = await fetch(`${opts.url}${requestType.path}`, {
+            const response = await fetch(`${url}${requestType.path}`, {
                 method: requestType.method,
                 headers: headers,
                 body: requestType.body != null ? new Uint8Array(requestType.body) : null,
