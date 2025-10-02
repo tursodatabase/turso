@@ -4139,21 +4139,24 @@ fn determine_column_alias(
         return Some("rowid".to_string());
     }
 
-    // For column references, use special handling
+    // For column references, always use the column name from the table
     if let Expr::Column {
         column,
         is_rowid_alias,
         ..
     } = expr
     {
-        if *is_rowid_alias {
+        if let Some(name) = table
+            .columns()
+            .get(*column)
+            .and_then(|col| col.name.clone())
+        {
+            return Some(name);
+        } else if *is_rowid_alias {
+            // If it's a rowid alias, return "rowid"
             return Some("rowid".to_string());
         } else {
-            // Get the column name from the table
-            return table
-                .columns()
-                .get(*column)
-                .and_then(|col| col.name.clone());
+            return None;
         }
     }
 
