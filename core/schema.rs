@@ -858,6 +858,13 @@ impl Schema {
                         return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
                     }
                 } else {
+                    if fk
+                        .parent_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case("rowid"))
+                    {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    }
                     fk.parent_columns.clone()
                 };
 
@@ -879,16 +886,19 @@ impl Schema {
                 }
 
                 // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_cols.len() == 1 && {
-                    let c = parent_cols[0].as_str();
-                    c.eq_ignore_ascii_case("rowid")
-                        || parent_tbl.columns.iter().any(|col| {
-                            col.is_rowid_alias
-                                && col
-                                    .name
+                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
+                    if parent_tbl.primary_key_columns.len() == 1 {
+                        let pk_name = &parent_tbl.primary_key_columns[0].0;
+                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
+                        parent_tbl.columns.iter().any(|c| {
+                            c.is_rowid_alias
+                                && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(c))
-                        })
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
+                        }) || pk_name.eq_ignore_ascii_case("rowid")
+                    } else {
+                        false
+                    }
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
@@ -961,6 +971,13 @@ impl Schema {
                     return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
                 }
             } else {
+                if fk
+                    .parent_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case("rowid"))
+                {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
                 fk.parent_columns.clone()
             };
 
@@ -981,7 +998,7 @@ impl Schema {
                 parent_pos.push(p);
             }
 
-            let parent_uses_rowid = parent_cols.len() == 1 && {
+            let parent_uses_rowid = parent_cols.len().eq(&1) && {
                 let c = parent_cols[0].as_str();
                 c.eq_ignore_ascii_case("rowid")
                     || parent_tbl.columns.iter().any(|col| {

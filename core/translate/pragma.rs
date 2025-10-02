@@ -4,7 +4,7 @@
 use chrono::Datelike;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
