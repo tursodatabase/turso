@@ -1,6 +1,6 @@
 use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
-use crate::io::clock::{Clock, Instant};
+use crate::io::clock::{Clock, DefaultClock, Instant};
 use crate::io::common;
 use crate::Result;
 use parking_lot::Mutex;
@@ -27,11 +27,7 @@ impl UnixIO {
 
 impl Clock for UnixIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 
