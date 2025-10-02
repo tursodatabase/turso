@@ -1565,18 +1565,10 @@ mod tests {
             unique_sets: vec![],
         };
 
-        schema
-            .add_btree_table(Arc::new(customers_table))
-            .expect("failed to add table");
-        schema
-            .add_btree_table(Arc::new(orders_table))
-            .expect("failed to add table");
-        schema
-            .add_btree_table(Arc::new(products_table))
-            .expect("failed to add table");
-        schema
-            .add_btree_table(Arc::new(logs_table))
-            .expect("failed to add table");
+        schema.add_btree_table(Arc::new(customers_table));
+        schema.add_btree_table(Arc::new(orders_table));
+        schema.add_btree_table(Arc::new(products_table));
+        schema.add_btree_table(Arc::new(logs_table));
         schema
     }
 

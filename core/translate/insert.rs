@@ -1143,6 +1143,7 @@ pub fn translate_insert(
                 &mut result_columns,
                 cdc_table.as_ref().map(|c| c.0),
                 row_done_label,
+                connection,
             )?;
         } else {
             // UpsertDo::Nothing case

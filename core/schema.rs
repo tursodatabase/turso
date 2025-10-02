@@ -246,10 +246,9 @@ impl Schema {
         self.views.get(&name)
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::BTree(table).into());
-        Ok(())
     }
 
     pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
@@ -681,7 +680,7 @@ impl Schema {
                             }
                         }
                     }
-                    self.add_btree_table(Arc::new(table))?;
+                    self.add_btree_table(Arc::new(table));
                 }
             }
             "index" => {
