@@ -2414,6 +2414,7 @@ pub fn op_transaction_inner(
                 }
 
                 state.pc += 1;
+                state.op_transaction_state = OpTransactionState::Start;
                 return Ok(InsnFunctionStepResult::Step);
             }
         }

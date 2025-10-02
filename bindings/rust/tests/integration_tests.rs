@@ -339,3 +339,80 @@ async fn test_index() {
     assert!(row.get::<String>(1).unwrap() == "b@d.e");
     assert!(rows.next().await.unwrap().is_none());
 }
+
+#[tokio::test]
+/// Tests that concurrent statements that error out and rollback can do so without panicking
+async fn test_concurrent_unique_constraint_regression() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            created_at DATETIME
+        )",
+        (),
+    )
+    .await
+    .unwrap();
+
+    // Insert initial seed data
+    conn.execute(
+        "INSERT INTO users (email, created_at) VALUES (:email, :created_at)",
+        vec![
+            (":email".to_string(), Value::Text("seed@example.com".into())),
+            (":created_at".to_string(), Value::Text("whatever".into())),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+
+    // Spawn 8 concurrent workers
+    for _ in 0..8 {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+
+            let mut prepared_stmt = conn
+                .prepare("INSERT INTO users (email, created_at) VALUES (:email, :created_at)")
+                .await
+                .unwrap();
+            for i in 0..1000 {
+                let email = match i % 3 {
+                    0 => "seed@example.com",
+                    1 => "dup@example.com",
+                    2 => "dapper@example.com",
+                    _ => panic!("Invalid email index: {i}"),
+                };
+                let result = prepared_stmt
+                    .execute(vec![
+                        (":email".to_string(), Value::Text(email.into())),
+                        (":created_at".to_string(), Value::Text("whatever".into())),
+                    ])
+                    .await;
+                match result {
+                    Ok(_) => (),
+                    Err(Error::SqlExecutionFailure(e))
+                        if e.contains("UNIQUE constraint failed") => {}
+                    Err(e) => {
+                        panic!("Error executing statement: {e:?}");
+                    }
+                }
+            }
+        }));
+    }
+
+    // Wait for all workers to complete
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
