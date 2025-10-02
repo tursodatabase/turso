@@ -15,7 +15,6 @@ for arg in "$@"; do
         FEATURES="--features checksum"
         CHECKSUM_ENABLED=true
     elif [[ "$arg" == "--enable-encryption" ]]; then
-        FEATURES="--features encryption"
         ENCRYPTION_ENABLED=true
         ARGS+=("$arg")
     else

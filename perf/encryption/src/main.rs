@@ -4,13 +4,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-use turso::{Builder, Database, Result};
-
-#[derive(Debug, Clone)]
-struct EncryptionOpts {
-    cipher: String,
-    hexkey: String,
-}
+use turso::{Builder, Database, EncryptionOpts, Result};
 
 #[derive(Parser)]
 #[command(name = "encryption-throughput")]
@@ -315,6 +309,14 @@ async fn setup_database(
     encryption_opts: &Option<EncryptionOpts>,
 ) -> Result<Database> {
     let builder = Builder::new_local(db_path);
+    let builder = if let Some(opts) = encryption_opts {
+        builder
+            .experimental_encryption(true)
+            .with_encryption(opts.clone())
+    } else {
+        builder
+    };
+
     let db = builder.build().await?;
     let conn = db.connect()?;
 

@@ -1,5 +1,5 @@
 use tokio::fs;
-use turso::{Builder, Error, Value};
+use turso::{Builder, EncryptionOpts, Error, Value};
 
 #[tokio::test]
 async fn test_rows_next() {
@@ -415,4 +415,64 @@ async fn test_concurrent_unique_constraint_regression() {
     for handle in handles {
         handle.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_encryption() {
+    let db_file = "test-encrypted.db";
+    let encryption_opts = EncryptionOpts {
+        hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
+        cipher: "aegis256".to_string(),
+    };
+    let pragma_hexkey = format!("PRAGMA hexkey = '{}';", encryption_opts.hexkey);
+    let pragma_cipher = format!("PRAGMA cipher = '{}';", encryption_opts.cipher);
+    {
+        let builder = Builder::new_local(db_file)
+            .experimental_encryption(true)
+            .with_encryption(encryption_opts.clone());
+        let db = builder.build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(&pragma_hexkey, ()).await.unwrap();
+        conn.execute(&pragma_cipher, ()).await.unwrap();
+        conn.execute(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO test (value) VALUES ('Hello, World!')", ())
+            .await
+            .unwrap();
+        let mut row_count = 0;
+        let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        }
+        assert_eq!(row_count, 1);
+    }
+
+    // lets verify we can open an existing encrypted db
+    {
+        let builder = Builder::new_local(db_file)
+            .experimental_encryption(true)
+            .with_encryption(encryption_opts.clone());
+        let db = builder.build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(&pragma_hexkey, ()).await.unwrap();
+        conn.execute(&pragma_cipher, ()).await.unwrap();
+
+        let mut row_count = 0;
+        let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            assert_eq!(row.get::<i64>(0).unwrap(), 1);
+            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            row_count += 1;
+        }
+        assert_eq!(row_count, 1);
+    }
+
+    fs::remove_file("test-encrypted.db").await.unwrap();
+    fs::remove_file("test-encrypted.db-wal").await.unwrap();
 }

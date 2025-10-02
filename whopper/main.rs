@@ -141,7 +141,8 @@ fn main() -> anyhow::Result<()> {
     let db = {
         let opts = DatabaseOpts::new()
             .with_mvcc(args.enable_mvcc)
-            .with_indexes(true);
+            .with_indexes(true)
+            .with_encryption(encryption_opts.is_some());
 
         match Database::open_file_with_flags(
             io.clone(),

@@ -2478,6 +2478,11 @@ impl Pager {
             return Ok(());
         };
         wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+        // whenever we set the encryption context, lets reset the page cache. The page cache
+        // might have been loaded with page 1 to initialise the connection. During initialisation,
+        // we only read the header which is unencrypted, but the rest of the page is. If so, lets
+        // clear the cache.
+        self.clear_page_cache();
         Ok(())
     }
 
