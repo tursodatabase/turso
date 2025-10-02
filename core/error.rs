@@ -132,6 +132,8 @@ pub enum CompletionError {
         expected: u64,
         actual: u64,
     },
+    #[error("tursodb not compiled with checksum feature")]
+    ChecksumNotEnabled,
 }
 
 #[macro_export]

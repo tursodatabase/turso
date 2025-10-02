@@ -15,7 +15,11 @@ impl ChecksumContext {
 
     #[cfg(not(feature = "checksum"))]
     pub fn add_checksum_to_page(&self, _page: &mut [u8], _page_id: usize) -> Result<()> {
-        Ok(())
+        use crate::LimboError;
+        Err(LimboError::InternalError(
+            "tursodb must be recompiled with checksum feature in order to use checksums"
+                .to_string(),
+        ))
     }
 
     #[cfg(not(feature = "checksum"))]
@@ -24,7 +28,7 @@ impl ChecksumContext {
         _page: &mut [u8],
         _page_id: usize,
     ) -> std::result::Result<(), CompletionError> {
-        Ok(())
+        Err(CompletionError::ChecksumNotEnabled)
     }
 
     #[cfg(feature = "checksum")]
