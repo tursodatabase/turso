@@ -538,14 +538,14 @@ pub fn op_compare(
     }
 
     let mut cmp = std::cmp::Ordering::Equal;
-    for i in 0..count {
+    for (i, key_col) in key_info.iter().enumerate().take(count) {
         // TODO (https://github.com/tursodatabase/turso/issues/2304): this logic is almost the same as compare_immutable()
         // but that one works on RefValue and this works on Value. There are tons of cases like this where we could reuse
         // functionality if we had a trait that both RefValue and Value implement.
         let a = state.registers[start_reg_a + i].get_value();
         let b = state.registers[start_reg_b + i].get_value();
-        let column_order = key_info[i].sort_order;
-        let collation = key_info[i].collation;
+        let column_order = key_col.sort_order;
+        let collation = key_col.collation;
         cmp = match (a, b) {
             (Value::Text(left), Value::Text(right)) => {
                 collation.compare_strings(left.as_str(), right.as_str())

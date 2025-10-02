@@ -88,9 +88,9 @@ impl Constraint {
             panic!("Expected a valid binary expression");
         };
         if side == BinaryExprSide::Lhs {
-            &lhs
+            lhs
         } else {
-            &rhs
+            rhs
         }
     }
 }

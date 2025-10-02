@@ -498,9 +498,13 @@ pub fn group_by_process_single_group(
             collation: CollationSeq::default(),
         })
         .collect::<Vec<_>>();
-    for i in 0..group_by.exprs.len() {
+    for (i, c) in compare_key_info
+        .iter_mut()
+        .enumerate()
+        .take(group_by.exprs.len())
+    {
         let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
-        compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+        c.collation = maybe_collation.unwrap_or_default();
     }
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not

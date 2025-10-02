@@ -340,8 +340,8 @@ fn optimize_table_access(
                     let usable_constraints = table_constraints
                         .constraints
                         .iter()
-                        .cloned()
                         .filter(|c| c.usable)
+                        .cloned()
                         .collect::<Vec<_>>();
                     let temp_constraint_refs = (0..usable_constraints.len())
                         .map(|i| ConstraintRef {

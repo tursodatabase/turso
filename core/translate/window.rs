@@ -702,10 +702,14 @@ fn emit_flush_buffer_if_new_partition(
                 collation: CollationSeq::default(),
             })
             .collect::<Vec<_>>();
-        for i in 0..window.partition_by.len() {
+        for (i, c) in compare_key_info
+            .iter_mut()
+            .enumerate()
+            .take(window.partition_by.len())
+        {
             let maybe_collation =
                 get_collseq_from_expr(&window.partition_by[i], &plan.table_references)?;
-            compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+            c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {
             start_reg_a: registers.src_columns_start,
@@ -802,10 +806,14 @@ fn emit_flush_buffer_if_not_peer(
                 collation: CollationSeq::default(),
             })
             .collect::<Vec<_>>();
-        for i in 0..window.order_by.len() {
+        for (i, c) in compare_key_info
+            .iter_mut()
+            .enumerate()
+            .take(window.order_by.len())
+        {
             let maybe_collation =
                 get_collseq_from_expr(&window.order_by[i].0, &plan.table_references)?;
-            compare_key_info[i].collation = maybe_collation.unwrap_or_default();
+            c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {
             start_reg_a: reg_prev_order_by_columns_start,
