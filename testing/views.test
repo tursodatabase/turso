@@ -229,3 +229,15 @@ do_execsql_test_on_specific_db {:memory:} view-with-having {
     SELECT * FROM high_volume_products ORDER BY total_units DESC;
 } {C|380
 A|250}
+
+do_execsql_test_error view-self-circle-detection {
+    CREATE VIEW v AS SELECT * FROM v;
+    SELECT * FROM v;
+} {view v is circularly defined}
+
+
+do_execsql_test_error view-mutual-circle-detection {
+    CREATE VIEW v AS SELECT * FROM vv;
+    CREATE VIEW vv AS SELECT * FROM v;
+    SELECT * FROM v;
+} {view v is circularly defined}
