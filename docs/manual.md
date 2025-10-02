@@ -70,7 +70,6 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/tursodatabase/turso/releases/latest/download/turso_cli-installer.sh | sh
 ```
 
-Or alternatively, on MacOS, you can use Homebrew:
 
 ```
 brew install turso
@@ -102,6 +101,17 @@ Turso aims towards full SQLite compatibility but has the following limitations:
 * UTF-8 is the only supported character encoding
 
 For more detailed list of SQLite compatibility, please refer to [COMPAT.md](../COMPAT.md).
+
+#### MVCC limitations
+
+The MVCC implementation is experimental and has the following limitations:
+
+* Indexes cannot be created and databases with indexes cannot be used.
+* All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
+* Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
+* Many features may not work, work incorrectly, and/or cause a panic.
+* Queries may return incorrect results
+* If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
 
 ## The SQL shell
 
