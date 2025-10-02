@@ -2,6 +2,7 @@ import { expect, test } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
+const intCompare = (a, b) => a.x - b.x;
 
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
@@ -10,6 +11,91 @@ test('implicit connect', async () => {
     expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
 })
+
+test('simple-db', async () => {
+    const db = new Database({ path: ':memory:' });
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }])
+    await db.exec("CREATE TABLE t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
+    await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
+})
+
+test('implicit connect', async () => {
+    const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    const defer = db.prepare("SELECT * FROM not_found");
+    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: not_found/);
+    expect(() => db.prepare("SELECT * FROM not_found")).toThrowError(/no such table: not_found/);
+    expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+})
+
+test('defered sync', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+        await db.exec("DELETE FROM t");
+        await db.exec("INSERT INTO t VALUES (100)");
+        await db.push();
+        await db.close();
+    }
+
+    let url = null;
+    const db = new Database({ path: ':memory:', url: () => url });
+    await db.prepare("CREATE TABLE t(x)").run();
+    await db.prepare("INSERT INTO t VALUES (1), (2), (3), (42)").run();
+    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+    await expect(async () => await db.pull()).rejects.toThrow(/url is empty - sync is paused/);
+    url = process.env.VITE_TURSO_DB_URL;
+    await db.pull();
+    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
+})
+
+test('encryption sync', async () => {
+    const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
+    const URL = 'http://encrypted--a--a.localhost:10000';
+    {
+        const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+        await db.exec("DELETE FROM t");
+        await db.push();
+        await db.close();
+    }
+    const db1 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+    const db2 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+    await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
+    await db2.exec("INSERT INTO t VALUES (4), (5), (6)");
+    expect(await db1.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+    expect(await db2.prepare("SELECT * FROM t").all()).toEqual([{ x: 4 }, { x: 5 }, { x: 6 }]);
+    await Promise.all([db1.push(), db2.push()]);
+    await Promise.all([db1.pull(), db2.pull()]);
+    const expected = [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }];
+    expect((await db1.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
+    expect((await db2.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
+});
+
+test('defered encryption sync', async () => {
+    const URL = 'http://encrypted--a--a.localhost:10000';
+    const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
+    let url = null;
+    {
+        const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+        await db.exec("DELETE FROM t");
+        await db.exec("INSERT INTO t VALUES (100)");
+        await db.push();
+        await db.close();
+    }
+    const db = await connect({ path: ':memory:', url: () => url, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+    await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+
+    url = URL;
+    await db.pull();
+
+    const expected = [{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }];
+    expect((await db.prepare("SELECT * FROM t").all())).toEqual(expected);
+});
 
 test('select-after-push', async () => {
     {

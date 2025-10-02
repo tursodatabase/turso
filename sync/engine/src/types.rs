@@ -65,7 +65,7 @@ pub struct SyncEngineStats {
     pub cdc_operations: i64,
     pub main_wal_size: u64,
     pub revert_wal_size: u64,
-    pub last_pull_unix_time: i64,
+    pub last_pull_unix_time: Option<i64>,
     pub last_push_unix_time: Option<i64>,
     pub revision: Option<String>,
 }
@@ -90,7 +90,7 @@ pub struct DatabaseMetadata {
     pub revert_since_wal_salt: Option<Vec<u32>>,
     pub revert_since_wal_watermark: u64,
     /// Unix time of last successful pull
-    pub last_pull_unix_time: i64,
+    pub last_pull_unix_time: Option<i64>,
     /// Unix time of last successful push
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
