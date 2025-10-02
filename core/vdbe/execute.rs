@@ -6766,6 +6766,11 @@ pub fn op_destroy(
     if *is_temp == 1 {
         todo!("temp databases not implemented yet.");
     }
+    if mv_store.is_some() {
+        // MVCC only does pager operations in checkpoint
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
     let mut cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
     let former_root_page_result = cursor.btree_destroy()?;
