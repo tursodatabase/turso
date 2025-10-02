@@ -356,6 +356,13 @@ fn optimize_table_access(
                         });
                         continue;
                     }
+                    // We can mark constraints as consumed when used for ephemeral index seeks
+                    // The ephemeral index is built using the join condition, and the seek
+                    // into that index already ensures the join condition is satisfied
+                    for cref in usable_constraint_refs {
+                        let constraint = &table_constraints.constraints[cref.constraint_vec_pos];
+                        where_clause[constraint.where_clause_pos.0].consumed = true;
+                    }
                     let ephemeral_index = ephemeral_index_build(
                         &joined_tables[table_idx],
                         &table_constraints.constraints,
