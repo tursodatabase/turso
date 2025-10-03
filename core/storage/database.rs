@@ -87,12 +87,11 @@ pub trait DatabaseStorage: Send + Sync {
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
 }
 
-#[cfg(feature = "fs")]
+#[derive(Clone)]
 pub struct DatabaseFile {
     file: Arc<dyn crate::io::File>,
 }
 
-#[cfg(feature = "fs")]
 impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_header(&self, c: Completion) -> Result<Completion> {

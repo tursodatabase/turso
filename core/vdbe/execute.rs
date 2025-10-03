@@ -7376,7 +7376,7 @@ pub fn op_open_ephemeral(
 
                 db_file_io = Arc::new(MemoryIO::new());
                 let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
+                db_file = DatabaseFile::new(file);
             }
             #[cfg(not(target_family = "wasm"))]
             {
@@ -7389,7 +7389,7 @@ pub fn op_open_ephemeral(
                     ));
                 };
                 let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
+                db_file = DatabaseFile::new(file);
                 db_file_io = io;
             }
 
