@@ -76,8 +76,6 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
-    #[clap(long, help = "Enable experimental logical log feature")]
-    pub experimental_logical_log: bool,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
 }
