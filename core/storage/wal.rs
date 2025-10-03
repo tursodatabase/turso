@@ -849,6 +849,7 @@ impl Wal for WalFile {
                 .store(lock_0_idx, Ordering::Release);
             self.min_frame.store(nbackfills + 1, Ordering::Release);
             self.last_checksum = last_checksum;
+            self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
             return Ok(db_changed);
         }
 
@@ -942,6 +943,8 @@ impl Wal for WalFile {
         self.max_frame.store(best_mark as u64, Ordering::Release);
         self.max_frame_read_lock_index
             .store(best_idx as usize, Ordering::Release);
+        self.last_checksum = last_checksum;
+        self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
@@ -983,12 +986,17 @@ impl Wal for WalFile {
         if !shared.write_lock.write() {
             return Err(LimboError::Busy);
         }
-        let (shared_max, nbackfills, last_checksum) = (
-            shared.max_frame.load(Ordering::Acquire),
-            shared.nbackfills.load(Ordering::Acquire),
-            shared.last_checksum,
-        );
-        if self.max_frame.load(Ordering::Acquire) == shared_max {
+        let (shared_max, nbackfills, last_checksum, checkpoint_seq) = {
+            let mx = shared.max_frame.load(Ordering::Acquire);
+            let nb = shared.nbackfills.load(Ordering::Acquire);
+            let ck = shared.last_checksum;
+            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
+            (mx, nb, ck, checkpoint_seq)
+        };
+        let db_changed = shared_max != self.max_frame.load(Ordering::Acquire)
+            || last_checksum != self.last_checksum
+            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
+        if !db_changed {
             // Snapshot still valid; adopt counters
             drop(shared);
             self.last_checksum = last_checksum;
