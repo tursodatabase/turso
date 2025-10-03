@@ -18,6 +18,10 @@ function timeoutMs(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function normalizeUrl(url: string): string {
+    return url.replace(/^libsql:\/\//, 'https://');
+}
+
 async function process(opts: RunOpts, io: ProtocolIo, request: any) {
     const requestType = request.request();
     const completion = request.completion();
@@ -32,6 +36,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
             completion.poison(`url is empty - sync is paused`);
             return;
         }
+        url = normalizeUrl(url);
         try {
             let headers = typeof opts.headers === "function" ? await opts.headers() : opts.headers;
             if (requestType.headers != null && requestType.headers.length > 0) {
