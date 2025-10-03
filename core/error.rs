@@ -109,7 +109,7 @@ impl From<std::io::Error> for CompletionError {
     }
 }
 
-#[derive(Debug, Copy, Clone, Error)]
+#[derive(Debug, Copy, Clone, PartialEq, Error)]
 pub enum CompletionError {
     #[error("I/O error: {0}")]
     IOError(std::io::ErrorKind),
