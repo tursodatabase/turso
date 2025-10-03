@@ -993,9 +993,6 @@ impl Wal for WalFile {
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
             (mx, nb, ck, checkpoint_seq)
         };
-        // dbg!(shared_max != self.max_frame.load(Ordering::Acquire));
-        // dbg!(last_checksum != self.last_checksum);
-        // dbg!(checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire));
         let db_changed = shared_max != self.max_frame.load(Ordering::Acquire)
             || last_checksum != self.last_checksum
             || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
