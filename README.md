@@ -53,6 +53,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 The database has the following experimental features:
 
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
+* **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view mainatenance and query subscriptions.
 
 The following features are on our current roadmap:
