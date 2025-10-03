@@ -1929,9 +1929,9 @@ impl StreamingWalReader {
     }
 }
 
-pub fn begin_read_wal_frame_raw(
+pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
     buffer_pool: &Arc<BufferPool>,
-    io: &Arc<dyn File>,
+    io: &F,
     offset: u64,
     complete: Box<ReadComplete>,
 ) -> Result<Completion> {
@@ -1942,8 +1942,8 @@ pub fn begin_read_wal_frame_raw(
     Ok(c)
 }
 
-pub fn begin_read_wal_frame(
-    io: &Arc<dyn File>,
+pub fn begin_read_wal_frame<F: File + ?Sized>(
+    io: &F,
     offset: u64,
     buffer_pool: Arc<BufferPool>,
     complete: Box<ReadComplete>,
@@ -2083,7 +2083,7 @@ pub fn prepare_wal_frame(
     (final_checksum, Arc::new(buffer))
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
+pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> Result<Completion> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let buffer = Buffer::new_temporary(WAL_HEADER_SIZE);

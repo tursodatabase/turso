@@ -1126,7 +1126,7 @@ impl Wal for WalFile {
             shared.file.as_ref().unwrap().clone()
         };
         begin_read_wal_frame(
-            &file,
+            file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
             buffer_pool,
             complete,
@@ -1186,7 +1186,7 @@ impl Wal for WalFile {
         let shared = self.get_shared();
         assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
-        let c = begin_read_wal_frame_raw(&self.buffer_pool, file, offset, complete)?;
+        let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
     }
 
@@ -1246,7 +1246,7 @@ impl Wal for WalFile {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             let file = shared.file.as_ref().unwrap();
             let c = begin_read_wal_frame(
-                file,
+                file.as_ref(),
                 offset + WAL_FRAME_HEADER_SIZE as u64,
                 buffer_pool,
                 complete,
@@ -1448,7 +1448,7 @@ impl Wal for WalFile {
         let shared = self.get_shared();
         assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
-        let c = sqlite3_ondisk::begin_write_wal_header(file, &shared.wal_header.lock())?;
+        let c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &shared.wal_header.lock())?;
         Ok(Some(c))
     }
 
@@ -2245,7 +2245,7 @@ impl WalFile {
         assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
         let c = begin_read_wal_frame(
-            file,
+            file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
             self.buffer_pool.clone(),
             complete,
