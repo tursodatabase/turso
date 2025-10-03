@@ -50,8 +50,9 @@ fn try_pwritev_raw(
     let mut iov_count = 0;
     for (i, b) in bufs.iter().enumerate().skip(start_idx).take(iov_len) {
         let s = b.as_slice();
-        let ptr = if i == start_idx { &s[start_off..] } else { s }.as_ptr();
-        let len = b.len();
+        let slice = if i == start_idx { &s[start_off..] } else { s };
+        let ptr = slice.as_ptr();
+        let len = slice.len();
 
         if let Some((last_ptr, last_len)) = last_end {
             // Check if this buffer is adjacent to the last
