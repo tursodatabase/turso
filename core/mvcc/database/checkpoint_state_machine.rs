@@ -330,7 +330,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Start a pager transaction to write committed versions to B-tree
                 let result = self.pager.begin_read_tx();
                 if let Err(crate::LimboError::Busy) = result {
-
                     return Err(crate::LimboError::Busy);
                 }
                 result?;
