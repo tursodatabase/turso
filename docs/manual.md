@@ -149,7 +149,9 @@ The SQL shell supports the following command line options:
 | `-h`, `--help` | Print help |
 | `-V`, `--version` | Print version |
 | `--mcp` | Start a MCP server instead of the interactive shell |
-| `--experimental-mvcc` | Enable experimental MVCC feature. **Note:**  the feature is not production ready so do not use it for critical data right now. |
+| `--experimental-encryption` | Enable experimental encryption at rest feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
+| `--experimental-mvcc` | Enable experimental MVCC feature. **Note:** the feature is not production ready so do not use it for critical data right now. |
+| `--experimental-strict` | Enable experimental strict schema feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 | `--experimental-views` | Enable experimental views feature. **Note**: the feature is not production ready so do not use it for critical data right now. |
 
 ## Transactions
