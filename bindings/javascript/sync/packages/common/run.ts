@@ -35,7 +35,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
         try {
             let headers = typeof opts.headers === "function" ? await opts.headers() : opts.headers;
             if (requestType.headers != null && requestType.headers.length > 0) {
-                headers = { ...opts.headers };
+                headers = { ...headers };
                 for (let header of requestType.headers) {
                     headers[header[0]] = header[1];
                 }
