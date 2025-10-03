@@ -7,9 +7,10 @@ use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
-use crate::types::{IOResult, ImmutableRecord, RecordCursor};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
 use crate::{
-    CheckpointResult, Connection, IOExt, Pager, RefValue, Result, TransactionState, Value,
+    CheckpointResult, Completion, Connection, IOExt, Pager, RefValue, Result, TransactionState,
+    Value,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -271,12 +272,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 
     /// Fsync the logical log file
-    fn fsync_logical_log(&self) -> Result<IOResult<()>> {
+    fn fsync_logical_log(&self) -> Result<Completion> {
         self.mvstore.storage.sync()
     }
 
     /// Truncate the logical log file
-    fn truncate_logical_log(&self) -> Result<IOResult<()>> {
+    fn truncate_logical_log(&self) -> Result<Completion> {
         self.mvstore.storage.truncate()
     }
 
@@ -572,30 +573,25 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
-                match self.truncate_logical_log()? {
-                    IOResult::Done(_) => {
-                        self.state = CheckpointState::FsyncLogicalLog;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        if io.finished() {
-                            self.state = CheckpointState::CheckpointWal;
-                            Ok(TransitionResult::Continue)
-                        } else {
-                            Ok(TransitionResult::Io(io))
-                        }
-                    }
+                let c = self.truncate_logical_log()?;
+                self.state = CheckpointState::FsyncLogicalLog;
+                // if Completion Completed without errors we can continue
+                if c.is_completed() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
             }
 
             CheckpointState::FsyncLogicalLog => {
                 tracing::debug!("Fsyncing logical log file");
-                match self.fsync_logical_log()? {
-                    IOResult::Done(_) => {
-                        self.state = CheckpointState::CheckpointWal;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                let c = self.fsync_logical_log()?;
+                self.state = CheckpointState::CheckpointWal;
+                // if Completion Completed without errors we can continue
+                if c.is_completed() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
             }
 
