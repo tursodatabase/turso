@@ -14,7 +14,8 @@
     "sync/packages/native",
     "sync/packages/wasm",
     "examples/database-node",
-    "examples/database-wasm-vite"
+    "examples/database-wasm-vite",
+    "examples/sync-node"
   ],
   "version": "0.2.0"
 }

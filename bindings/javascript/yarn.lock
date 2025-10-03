@@ -1648,7 +1648,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync@workspace:sync/packages/native":
+"@tursodatabase/sync@npm:^0.2.0, @tursodatabase/sync@workspace:sync/packages/native":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
@@ -3671,6 +3671,14 @@ __metadata:
   checksum: 10c0/d81657f84aba42d4bbaf2a677f7e7f34c1f3de5a6726db8bc1797f9c0b303ba54d4660383a74bde43df401cf37cce1dff2c842c55b077a4ceee11f9e31fba828
   languageName: node
   linkType: hard
+
+"sync-node@workspace:examples/sync-node":
+  version: 0.0.0-use.local
+  resolution: "sync-node@workspace:examples/sync-node"
+  dependencies:
+    "@tursodatabase/sync": "npm:^0.2.0"
+  languageName: unknown
+  linkType: soft
 
 "tar-fs@npm:^2.0.0":
   version: 2.1.4
