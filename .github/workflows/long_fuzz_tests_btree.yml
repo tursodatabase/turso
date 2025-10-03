@@ -1,13 +1,15 @@
-name: Run long fuzz tests on Btree
+name: Run long fuzz tests and stress test
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - 'core/storage/btree.rs'
+    branches:
+      - main
+    tags:
+      - v*
   pull_request:
-    paths:
-      - 'core/storage/btree.rs'
+    branches:
+      - main
 
 jobs:
   run-long-tests:
@@ -45,6 +47,6 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run ignored long tests
-      run: cargo run -p turso_stress -- -t 1 -i 10000 -s
+      run: cargo run -p turso_stress -- -t 2 -i 10000 -s
       env:
         RUST_BACKTRACE: 1
