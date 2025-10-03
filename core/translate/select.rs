@@ -189,7 +189,6 @@ fn prepare_one_select_plan(
             group_by,
             distinctness,
             window_clause,
-            ..
         } => {
             if !resolver.schema.indexes_enabled() && distinctness.is_some() {
                 crate::bail_parse_error!(
