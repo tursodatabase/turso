@@ -1,0 +1,16 @@
+{
+  "name": "database-node",
+  "version": "1.0.0",
+  "main": "index.mjs",
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "scripts": {
+    "tsc-build": "echo 'no tsc-build'",
+    "build": "echo 'no build'",
+    "test": "echo 'no tests'"
+  },
+  "dependencies": {
+    "@tursodatabase/database": "^0.2.0"
+  }
+}

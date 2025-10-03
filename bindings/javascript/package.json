@@ -12,7 +12,11 @@
     "packages/wasm",
     "sync/packages/common",
     "sync/packages/native",
-    "sync/packages/wasm"
+    "sync/packages/wasm",
+    "examples/database-node",
+    "examples/database-wasm-vite",
+    "examples/sync-node",
+    "examples/sync-wasm-vite"
   ],
   "version": "0.2.0"
 }
