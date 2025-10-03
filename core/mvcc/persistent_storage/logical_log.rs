@@ -5,12 +5,12 @@ use crate::{
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowVersion},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
-    types::{IOCompletions, ImmutableRecord},
+    types::ImmutableRecord,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 use std::sync::{Arc, RwLock};
 
-use crate::{types::IOResult, File};
+use crate::File;
 
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
@@ -143,7 +143,7 @@ impl LogicalLog {
         Self { file, offset: 0 }
     }
 
-    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
+    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
         let mut buffer = Vec::new();
 
         // 1. Serialize log header if it's first write
@@ -194,18 +194,18 @@ impl LogicalLog {
         let buffer_len = buffer.len();
         let c = self.file.pwrite(self.offset, buffer, c)?;
         self.offset += buffer_len as u64;
-        Ok(IOResult::IO(IOCompletions::Single(c)))
+        Ok(c)
     }
 
-    pub fn sync(&mut self) -> Result<IOResult<()>> {
+    pub fn sync(&mut self) -> Result<Completion> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
         });
         let c = self.file.sync(completion)?;
-        Ok(IOResult::IO(IOCompletions::Single(c)))
+        Ok(c)
     }
 
-    pub fn truncate(&mut self) -> Result<IOResult<()>> {
+    pub fn truncate(&mut self) -> Result<Completion> {
         let completion = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
@@ -213,7 +213,7 @@ impl LogicalLog {
         });
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
-        Ok(IOResult::IO(IOCompletions::Single(c)))
+        Ok(c)
     }
 }
 

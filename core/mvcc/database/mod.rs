@@ -611,27 +611,24 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         )));
                     }
                 }
-                let result = mvcc_store.storage.log_tx(log_record)?;
+                let c = mvcc_store.storage.log_tx(log_record)?;
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
-                match result {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(io) => {
-                        if !io.finished() {
-                            return Ok(TransitionResult::Io(io));
-                        }
-                    }
+                // if Completion Completed without errors we can continue
+                if c.is_completed() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
-                return Ok(TransitionResult::Continue);
             }
             CommitState::SyncLogicalLog { end_ts } => {
-                let result = mvcc_store.storage.sync()?;
+                let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                if let IOResult::IO(io) = result {
-                    if !io.finished() {
-                        return Ok(TransitionResult::Io(io));
-                    }
+                // if Completion Completed without errors we can continue
+                if c.is_completed() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
-                return Ok(TransitionResult::Continue);
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
                 let connection = self.connection.clone();

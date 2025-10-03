@@ -4,8 +4,7 @@ use std::sync::{Arc, RwLock};
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
 use crate::mvcc::persistent_storage::logical_log::LogicalLog;
-use crate::types::IOResult;
-use crate::{File, Result};
+use crate::{Completion, File, Result};
 
 pub struct Storage {
     pub logical_log: RwLock<LogicalLog>,
@@ -20,7 +19,7 @@ impl Storage {
 }
 
 impl Storage {
-    pub fn log_tx(&self, m: &LogRecord) -> Result<IOResult<()>> {
+    pub fn log_tx(&self, m: &LogRecord) -> Result<Completion> {
         self.logical_log.write().unwrap().log_tx(m)
     }
 
@@ -28,11 +27,11 @@ impl Storage {
         todo!()
     }
 
-    pub fn sync(&self) -> Result<IOResult<()>> {
+    pub fn sync(&self) -> Result<Completion> {
         self.logical_log.write().unwrap().sync()
     }
 
-    pub fn truncate(&self) -> Result<IOResult<()>> {
+    pub fn truncate(&self) -> Result<Completion> {
         self.logical_log.write().unwrap().truncate()
     }
 
