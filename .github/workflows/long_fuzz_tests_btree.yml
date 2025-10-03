@@ -47,6 +47,6 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run ignored long tests
-      run: cargo run -p turso_stress -- -t 2 -i 10000 -s
+      run: cargo run -p turso_stress -- -t 2 -i 10000 -s --tables 1
       env:
         RUST_BACKTRACE: 1
