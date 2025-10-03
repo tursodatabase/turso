@@ -58,7 +58,7 @@ impl MvccTestDbNoConn {
         let log_path_filename = log_path
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-lg"))
+            .map(|s| format!("{s}-log"))
             .unwrap();
         log_path.set_file_name(log_path_filename);
         Self {

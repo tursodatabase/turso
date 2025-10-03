@@ -480,7 +480,7 @@ fn test_mvcc_checkpoint_works() {
         conn.execute("COMMIT").unwrap();
     }
 
-    // Before checkpoint: assert that the DB file size is exactly 4096, .db-wal size is exactly 32, and there is a nonzero size .db-lg file
+    // Before checkpoint: assert that the DB file size is exactly 4096, .db-wal size is exactly 32, and there is a nonzero size .db-log file
     let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
     assert!(db_file_size == 4096);
     let wal_file_size = std::fs::metadata(tmp_db.path.with_extension("db-wal"))
@@ -490,7 +490,7 @@ fn test_mvcc_checkpoint_works() {
         wal_file_size == 0,
         "wal file size should be 0 bytes, but is {wal_file_size} bytes"
     );
-    let lg_file_size = std::fs::metadata(tmp_db.path.with_extension("db-lg"))
+    let lg_file_size = std::fs::metadata(tmp_db.path.with_extension("db-log"))
         .unwrap()
         .len();
     assert!(lg_file_size > 0);
@@ -521,7 +521,7 @@ fn test_mvcc_checkpoint_works() {
 
     assert_eq!(rows, expected);
 
-    // Assert that the db file size is larger than 4096, assert .db-wal size is 32 bytes, assert there is no .db-lg file
+    // Assert that the db file size is larger than 4096, assert .db-wal size is 32 bytes, assert there is no .db-log file
     let db_file_size = std::fs::metadata(&tmp_db.path).unwrap().len();
     assert!(db_file_size > 4096);
     assert!(db_file_size % 4096 == 0);
@@ -532,7 +532,7 @@ fn test_mvcc_checkpoint_works() {
         wal_size == 0,
         "wal size should be 0 bytes, but is {wal_size} bytes"
     );
-    let log_size = std::fs::metadata(tmp_db.path.with_extension("db-lg"))
+    let log_size = std::fs::metadata(tmp_db.path.with_extension("db-log"))
         .unwrap()
         .len();
     assert!(
