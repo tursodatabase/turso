@@ -407,6 +407,31 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
+        // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+        if opts.enable_mvcc
+            && std::path::Path::exists(std::path::Path::new(wal_path))
+            && std::path::Path::new(wal_path).metadata().unwrap().len() > 0
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                    "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
+                )));
+        }
+
+        // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
+        // because the changes in the logical log would not be visible to the non-MVCC connections.
+        if !opts.enable_mvcc {
+            let db_path = std::path::Path::new(path);
+            let log_path = db_path.with_extension("db-log");
+            if std::path::Path::exists(log_path.as_path())
+                && log_path.as_path().metadata().unwrap().len() > 0
+            {
+                return Err(LimboError::InvalidArgument(format!(
+                    "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                )));
+            }
+        }
+
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
