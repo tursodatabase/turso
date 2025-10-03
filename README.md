@@ -221,9 +221,24 @@ Start the MCP server with:
 tursodb your_database.db --mcp
 ```
 
-The MCP server provides seven tools for database interaction:
+### Configuration
 
-#### Available Tools
+Add Turso to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "turso": {
+      "command": "/path/to/.turso/tursodb",
+      "args": ["/path/to/your/database.db", "--mcp"]
+    }
+  }
+}
+```
+
+### Available Tools
+
+The MCP server provides nine tools for database interaction:
 
 1. **`open_database`** - Open a new database
 2. **`current_database`** - Describe the current database
@@ -235,9 +250,114 @@ The MCP server provides seven tools for database interaction:
 8. **`delete_data`** - Delete data from tables
 9. **`schema_change`** - Execute schema modification statements (CREATE TABLE, ALTER TABLE, DROP TABLE)
 
+Once connected, you can ask your AI assistant:
+
+- "Show me all tables in the database"
+- "What's the schema for the users table?"
+- "Find all posts with more than 100 upvotes"
+- "Insert a new user with name 'Alice' and email 'alice@example.com'"
+
+### MCP Clients
+
+<details>
+<summary>Claude Code</summary>
+
+If you're using [Claude Code](https://claude.ai/code), you can easily connect to your Turso MCP server using the built-in MCP management commands:
+
+#### Quick Setup
+
+1. **Add the MCP server** to Claude Code:
+
+   ```bash
+   claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
+   ```
+
+2. **Restart Claude Code** to activate the connection
+
+3. **Start querying** your database through natural language!
+
+#### Command Breakdown
+
+```bash
+claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
+#              ↑            ↑       ↑                           ↑
+#              |            |       |                           |
+#              Name         |       Database path               MCP flag
+#                          Separator
+```
+
+- **`my-database`** - Choose any name for your MCP server
+- **`--`** - Required separator between Claude options and your command
+- **`tursodb`** - The Turso database CLI
+- **`./path/to/your/database.db`** - Path to your SQLite database file
+- **`--mcp`** - Enables MCP server mode
+
 #### Example Usage
 
-The MCP server runs as a single process that handles multiple JSON-RPC requests over stdin/stdout. Here's how to interact with it:
+```bash
+# For a local project database
+cd /your/project
+claude mcp add my-project-db -- tursodb ./data/app.db --mcp
+
+# For an absolute path
+claude mcp add analytics-db -- tursodb /Users/you/databases/analytics.db --mcp
+
+# For a specific project (local scope)
+claude mcp add project-db --local -- tursodb ./database.db --mcp
+```
+
+#### Managing MCP Servers
+
+```bash
+# List all configured MCP servers
+claude mcp list
+
+# Get details about a specific server
+claude mcp get my-database
+
+# Remove an MCP server
+claude mcp remove my-database
+```
+
+</details>
+
+<details>
+<summary>Claude Desktop</summary>
+
+For Claude Desktop, add the configuration to your `claude_desktop_config.json` file:
+
+```json
+{
+  "mcpServers": {
+    "turso": {
+      "command": "/path/to/.turso/tursodb",
+      "args": ["./path/to/your/database.db.db", "--mcp"]
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Cursor</summary>
+
+For Cursor, configure MCP in your settings:
+
+1. Open Cursor settings
+2. Navigate to Extensions → MCP
+3. Add a new server with:
+   - **Name**: `turso`
+   - **Command**: `/path/to/.turso/tursodb`
+   - **Args**: `["./path/to/your/database.db.db", "--mcp"]`
+
+Alternatively, you can add it to your Cursor configuration file directly.
+
+</details>
+
+### Direct JSON-RPC Usage
+
+The MCP server runs as a single process that handles multiple JSON-RPC requests over stdin/stdout. Here's how to interact with it directly:
 
 #### Example with In-Memory Database
 
@@ -261,69 +381,6 @@ cat << 'EOF' | tursodb mydb.db --mcp
 EOF
 ```
 
-#### Using with Claude Code
-
-If you're using [Claude Code](https://claude.ai/code), you can easily connect to your Turso MCP server using the built-in MCP management commands:
-
-##### Quick Setup
-
-1. **Add the MCP server** to Claude Code:
-   ```bash
-   claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
-   ```
-
-2. **Restart Claude Code** to activate the connection
-
-3. **Start querying** your database through natural language!
-
-##### Command Breakdown
-
-```bash
-claude mcp add my-database -- tursodb ./path/to/your/database.db --mcp
-#              ↑            ↑       ↑                           ↑
-#              |            |       |                           |
-#              Name         |       Database path               MCP flag
-#                          Separator
-```
-
-- **`my-database`** - Choose any name for your MCP server
-- **`--`** - Required separator between Claude options and your command
-- **`tursodb`** - The Turso database CLI
-- **`./path/to/your/database.db`** - Path to your SQLite database file
-- **`--mcp`** - Enables MCP server mode
-
-##### Example Usage
-
-```bash
-# For a local project database
-cd /your/project
-claude mcp add my-project-db -- tursodb ./data/app.db --mcp
-
-# For an absolute path
-claude mcp add analytics-db -- tursodb /Users/you/databases/analytics.db --mcp
-
-# For a specific project (local scope)
-claude mcp add project-db --local -- tursodb ./database.db --mcp
-```
-
-##### Managing MCP Servers
-
-```bash
-# List all configured MCP servers
-claude mcp list
-
-# Get details about a specific server
-claude mcp get my-database
-
-# Remove an MCP server
-claude mcp remove my-database
-```
-
-Once configured, you can ask Claude Code to:
-- "Show me all tables in the database"
-- "What's the schema for the users table?"
-- "Find all posts with more than 100 upvotes"
-- "Insert a new user with name 'Alice' and email 'alice@example.com'"
 </details>
 
 ## Contributing
