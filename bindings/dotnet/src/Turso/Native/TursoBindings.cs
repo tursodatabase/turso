@@ -1,0 +1,39 @@
+﻿using System.Runtime.InteropServices;
+
+namespace Turso.Native;
+
+public static class TursoBindings
+{
+    private const string DllName = "turso_dotnet.dll";
+
+    [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr OpenDatabase(string path, IntPtr errorHandle);
+
+    [DllImport(DllName, EntryPoint = "db_close", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void CloseDatabase(IntPtr db);
+
+    [DllImport(DllName, EntryPoint = "free_error", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void FreeError(IntPtr errorPtr);
+    
+    [DllImport(DllName, EntryPoint = "db_prepare_statement", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr PrepareStatement(IntPtr db, string statement, IntPtr errorHandle);
+    
+    [DllImport(DllName, EntryPoint = "free_statement", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void FreeStatement(IntPtr statement);
+    
+    [DllImport(DllName, EntryPoint = "bind_parameter", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void BindParameter(IntPtr statement, int index, IntPtr tursoValue);
+
+    [DllImport(DllName, EntryPoint = "bind_named_parameter", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void BindNamedParameter(IntPtr statement, string parameterName, IntPtr tursoValue);
+
+    [DllImport(DllName, EntryPoint = "db_statement_execute_step", CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool StatementExecuteStep(IntPtr statement, IntPtr errorHandle);
+    
+    [DllImport(DllName, EntryPoint = "db_statement_nchange", CallingConvention = CallingConvention.Cdecl)]
+    public static extern long StatementRowsAffected(IntPtr statement);
+
+    [DllImport(DllName, EntryPoint = "db_statement_get_value", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoNativeValue GetValueFromStatement(IntPtr statement, int columnIndex);
+}
