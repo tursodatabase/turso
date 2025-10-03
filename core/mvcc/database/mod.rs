@@ -327,7 +327,6 @@ pub enum CommitState<Clock: LogicalClock> {
         end_ts: u64,
     },
     Checkpoint {
-        end_ts: u64,
         state_machine: RefCell<StateMachine<CheckpointStateMachine<Clock>>>,
     },
     CommitEnd {
@@ -640,19 +639,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 }
             }
 
-            CommitState::Checkpoint {
-                end_ts,
-                state_machine,
-            } => {
-                match state_machine.borrow_mut().step(&())? {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(iocompletions) => {
-                        return Ok(TransitionResult::Io(iocompletions));
-                    }
-                }
-                self.finalize(mvcc_store)?;
-                return Ok(TransitionResult::Done(()));
-            }
             CommitState::SyncLogicalLog { end_ts } => {
                 let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
@@ -719,15 +705,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         false,
                     ));
                     let state_machine = RefCell::new(state_machine);
-                    self.state = CommitState::Checkpoint {
-                        end_ts: *end_ts,
-                        state_machine,
-                    };
+                    self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
                 Ok(TransitionResult::Done(()))
+            }
+            CommitState::Checkpoint { state_machine } => {
+                match state_machine.borrow_mut().step(&())? {
+                    IOResult::Done(_) => {}
+                    IOResult::IO(iocompletions) => {
+                        return Ok(TransitionResult::Io(iocompletions));
+                    }
+                }
+                self.finalize(mvcc_store)?;
+                return Ok(TransitionResult::Done(()));
             }
         }
     }
@@ -2178,13 +2171,7 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
                 .debug_struct("SyncLogicalLog")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::Checkpoint {
-                end_ts,
-                state_machine: _,
-            } => f
-                .debug_struct("Checkpoint")
-                .field("end_ts", end_ts)
-                .finish(),
+            Self::Checkpoint { state_machine: _ } => f.debug_struct("Checkpoint").finish(),
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
             }
