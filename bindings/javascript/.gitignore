@@ -199,3 +199,9 @@ Cargo.lock
 
 npm
 bundle
+
+*.db
+*.db-wal
+*.db-changes
+*.db-wal-revert
+*.db-info
