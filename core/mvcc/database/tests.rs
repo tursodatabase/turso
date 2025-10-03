@@ -1507,3 +1507,32 @@ fn transaction_display() {
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }
+
+#[test]
+fn test_should_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    assert!(!mv_store.storage.should_checkpoint());
+    mv_store.set_checkpoint_threshold(0);
+    assert!(mv_store.storage.should_checkpoint());
+}
+
+#[test]
+fn test_insert_with_checkpoint() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    // force checkpoint on every transaction
+    mv_store.set_checkpoint_threshold(0);
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 1);
+    let row = rows.first().unwrap();
+    assert_eq!(row.len(), 1);
+    let value = row.first().unwrap();
+    match value {
+        Value::Integer(i) => assert_eq!(*i, 1),
+        _ => unreachable!(),
+    }
+}
