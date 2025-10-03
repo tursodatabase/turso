@@ -279,17 +279,24 @@ fn parse_from_clause_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     match table {
-        ast::SelectTable::Table(qualified_name, maybe_alias, _) => parse_table(
-            table_references,
-            resolver,
-            program,
-            ctes,
-            vtab_predicates,
-            &qualified_name,
-            maybe_alias.as_ref(),
-            &[],
-            connection,
-        ),
+        ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
+            if indexed.is_some() {
+                crate::bail_parse_error!(
+                    "INDEXED BY / NOT INDEXED clauses are not supported yet in FROM clause"
+                );
+            }
+            parse_table(
+                table_references,
+                resolver,
+                program,
+                ctes,
+                vtab_predicates,
+                &qualified_name,
+                maybe_alias.as_ref(),
+                &[],
+                connection,
+            )
+        }
         ast::SelectTable::Select(subselect, maybe_alias) => {
             let Plan::Select(subplan) = prepare_select_plan(
                 subselect,
