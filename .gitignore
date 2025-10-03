@@ -48,4 +48,4 @@ simulator-output/
 bisected.sql
 *.log
 
-*.db-lg
+*.db-log

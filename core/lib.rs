@@ -410,7 +410,7 @@ impl Database {
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
         let mv_store = if opts.enable_mvcc {
-            let file = io.open_file(&format!("{path}-lg"), OpenFlags::default(), false)?;
+            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
             Some(Arc::new(mv_store))
