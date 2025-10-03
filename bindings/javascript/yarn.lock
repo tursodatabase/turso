@@ -1632,7 +1632,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync-wasm@workspace:sync/packages/wasm":
+"@tursodatabase/sync-wasm@npm:^0.2.0, @tursodatabase/sync-wasm@workspace:sync/packages/wasm":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
@@ -3677,6 +3677,15 @@ __metadata:
   resolution: "sync-node@workspace:examples/sync-node"
   dependencies:
     "@tursodatabase/sync": "npm:^0.2.0"
+  languageName: unknown
+  linkType: soft
+
+"sync-wasm-vite@workspace:examples/sync-wasm-vite":
+  version: 0.0.0-use.local
+  resolution: "sync-wasm-vite@workspace:examples/sync-wasm-vite"
+  dependencies:
+    "@tursodatabase/sync-wasm": "npm:^0.2.0"
+    vite: "npm:^7.1.9"
   languageName: unknown
   linkType: soft
 

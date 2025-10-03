@@ -2,11 +2,14 @@
   "name": "sync-node",
   "version": "1.0.0",
   "main": "index.mjs",
-  "scripts": {
-  },
   "author": "",
   "license": "ISC",
   "description": "",
+  "scripts": {
+    "tsc-build": "echo 'no tsc-build'",
+    "build": "echo 'no build'",
+    "test": "echo 'no tests'"
+  },
   "dependencies": {
     "@tursodatabase/sync": "^0.2.0"
   }

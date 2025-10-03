@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "serve": "node server.mjs"
+    "serve": "node server.mjs",
+    "tsc-build": "echo 'no tsc-build'",
+    "test": "echo 'no tests'"
   },
   "author": "",
   "license": "ISC",
