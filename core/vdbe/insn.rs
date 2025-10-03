@@ -8,6 +8,7 @@ use crate::{
     schema::{Affinity, BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
+    types::KeyInfo,
     Value,
 };
 use strum::EnumCount;
@@ -217,7 +218,7 @@ pub enum Insn {
         start_reg_a: usize,
         start_reg_b: usize,
         count: usize,
-        collation: Option<CollationSeq>,
+        key_info: Vec<KeyInfo>,
     },
     /// Place the result of rhs bitwise AND lhs in third register.
     BitAnd {

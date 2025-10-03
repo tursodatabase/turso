@@ -337,15 +337,21 @@ fn optimize_table_access(
                         });
                         continue;
                     };
-                    let temp_constraint_refs = (0..table_constraints.constraints.len())
+                    let usable_constraints = table_constraints
+                        .constraints
+                        .iter()
+                        .filter(|c| c.usable)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let temp_constraint_refs = (0..usable_constraints.len())
                         .map(|i| ConstraintRef {
                             constraint_vec_pos: i,
-                            index_col_pos: table_constraints.constraints[i].table_col_pos,
+                            index_col_pos: usable_constraints[i].table_col_pos,
                             sort_order: SortOrder::Asc,
                         })
                         .collect::<Vec<_>>();
                     let usable_constraint_refs = usable_constraints_for_join_order(
-                        &table_constraints.constraints,
+                        &usable_constraints,
                         &temp_constraint_refs,
                         &best_join_order[..=i],
                     );
@@ -358,14 +364,14 @@ fn optimize_table_access(
                     }
                     let ephemeral_index = ephemeral_index_build(
                         &joined_tables[table_idx],
-                        &table_constraints.constraints,
+                        &usable_constraints,
                         usable_constraint_refs,
                     );
                     let ephemeral_index = Arc::new(ephemeral_index);
                     joined_tables[table_idx].op = Operation::Search(Search::Seek {
                         index: Some(ephemeral_index),
                         seek_def: build_seek_def_from_constraints(
-                            &table_constraints.constraints,
+                            &usable_constraints,
                             usable_constraint_refs,
                             *iter_dir,
                             where_clause,

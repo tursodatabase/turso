@@ -151,13 +151,13 @@ pub fn insn_to_row(
                 start_reg_a,
                 start_reg_b,
                 count,
-                collation,
+                key_info,
             } => (
                 "Compare",
                 *start_reg_a as i32,
                 *start_reg_b as i32,
                 *count as i32,
-                Value::build_text(format!("k({count}, {})", collation.unwrap_or_default())),
+                Value::build_text(format!("k({count}, {})", key_info.iter().map(|k| k.collation.to_string()).collect::<Vec<_>>().join(", "))),
                 0,
                 format!(
                     "r[{}..{}]==r[{}..{}]",

@@ -4,6 +4,7 @@ use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, 
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
+    translate::collate::get_collseq_from_expr,
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -840,8 +841,8 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
-    ) -> Self {
-        let columns = plan
+    ) -> Result<Self> {
+        let mut columns = plan
             .result_columns
             .iter()
             .map(|rc| Column {
@@ -853,10 +854,15 @@ impl JoinedTable {
                 notnull: false,
                 default: None,
                 unique: false,
-                collation: None, // FIXME: infer collation from subquery
+                collation: None,
                 hidden: false,
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.collation =
+                get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
+        }
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {
             name: identifier.clone(),
@@ -864,7 +870,7 @@ impl JoinedTable {
             columns,
             result_columns_start_reg: None,
         });
-        Self {
+        Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
             identifier,
@@ -872,7 +878,7 @@ impl JoinedTable {
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             database_id: 0,
-        }
+        })
     }
 
     pub fn columns(&self) -> &[Column] {

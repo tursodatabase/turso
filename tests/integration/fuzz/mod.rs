@@ -498,6 +498,159 @@ mod tests {
     }
 
     #[test]
+    pub fn collation_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
+            (ChaCha8Rng::seed_from_u64(seed), seed)
+        } else {
+            rng_from_time()
+        };
+        println!("collation_fuzz seed: {seed}");
+
+        // Build six table variants that assign BINARY/NOCASE/RTRIM across (a,b,c)
+        // and include UNIQUE constraints so that auto-created indexes must honor column collations.
+        let variants: [(&str, &str, &str); 6] = [
+            ("BINARY", "NOCASE", "RTRIM"),
+            ("BINARY", "RTRIM", "NOCASE"),
+            ("NOCASE", "BINARY", "RTRIM"),
+            ("NOCASE", "RTRIM", "BINARY"),
+            ("RTRIM", "BINARY", "NOCASE"),
+            ("RTRIM", "NOCASE", "BINARY"),
+        ];
+
+        let table_defs: Vec<String> = variants
+            .iter()
+            .flat_map(|(ca, cb, cc)| {
+                // Create unique indexes so that index seek/scan behavior with unique constraints is exercised too.
+                vec![
+                    // No unique constraints
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc})"
+                    ),
+                    // Single column unique constraints
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(a))"
+                    ),
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(b))"
+                    ),
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(c))"
+                    ),
+                    // Two column unique constraints
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(a,b))"
+                    ),
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(a,c))"
+                    ),
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(b,c))"
+                    ),
+                    // Three column unique constraint
+                    format!(
+                        "CREATE TABLE t (a TEXT COLLATE {ca}, b TEXT COLLATE {cb}, c TEXT COLLATE {cc}, UNIQUE(a,b,c))"
+                    ),
+                ]
+            })
+            .collect();
+
+        // Create databases for each variant using rusqlite, then open limbo on the same file.
+        let dbs: Vec<TempDatabase> = table_defs
+            .iter()
+            .map(|ddl| TempDatabase::new_with_rusqlite(ddl, true))
+            .collect();
+
+        // Seed data focuses on case and trailing spaces to exercise NOCASE and RTRIM semantics.
+        const STR_POOL: [&str; 36] = [
+            "", " ", "  ", "a", "A", "a ", "A  ", "aa", "Aa", "AA", "aa ", "AA   ", "abc", "ABC",
+            "abc ", "ABC   ", "b", "B", "b ", "B  ", "ba", "BA", "ba ", "BA  ", "c", "C", "c  ",
+            " C", "c C", "C c", "foo", "Foo", "FOO", "bar", "Bar", "BAR",
+        ];
+
+        // Insert rows into the SQLite side (shared file) and ignore uniqueness errors to keep seeding going.
+        let row_target = 800usize;
+        for db in dbs.iter() {
+            let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+            for _ in 0..row_target {
+                let a = STR_POOL[rng.random_range(0..STR_POOL.len())];
+                let b = STR_POOL[rng.random_range(0..STR_POOL.len())];
+                let c = STR_POOL[rng.random_range(0..STR_POOL.len())];
+                let insert = format!(
+                    "INSERT INTO t(a,b,c) VALUES ('{}','{}','{}')",
+                    a.replace("'", "''"),
+                    b.replace("'", "''"),
+                    c.replace("'", "''"),
+                );
+                let _ = sqlite_conn.execute(&insert, params![]);
+            }
+            sqlite_conn.close().unwrap();
+        }
+
+        // Open connections for query phase
+        let sqlite_conns: Vec<rusqlite::Connection> = dbs
+            .iter()
+            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .collect();
+        let limbo_conns: Vec<_> = dbs.iter().map(|db| db.connect_limbo()).collect();
+
+        // Fuzz WHERE clauses with and without explicit COLLATE on a/b/c
+        let columns = ["a", "b", "c"];
+        let collates = [None, Some("BINARY"), Some("NOCASE"), Some("RTRIM")];
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap().parse::<u64>().unwrap();
+            (ChaCha8Rng::seed_from_u64(seed), seed)
+        } else {
+            rng_from_time()
+        };
+        println!("collation_fuzz seed: {seed}");
+
+        const ITERS: usize = 3000;
+        for iter in 0..ITERS {
+            if iter % (ITERS / 100).max(1) == 0 {
+                println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
+            }
+
+            // Choose predicate spec
+            let col = columns[rng.random_range(0..columns.len())];
+            let coll = collates[rng.random_range(0..collates.len())];
+            let val = STR_POOL[rng.random_range(0..STR_POOL.len())];
+            let collate_clause = coll.map(|c| format!(" COLLATE {c}")).unwrap_or_default();
+            let where_clause =
+                format!("WHERE {col}{collate_clause} = '{}'", val.replace("'", "''"));
+
+            let mut cols_clone = columns.to_vec();
+            cols_clone.shuffle(&mut rng);
+            let order_by = {
+                let mut order_by = String::new();
+                for col in cols_clone.iter() {
+                    let collate = collates
+                        .choose(&mut rng)
+                        .unwrap()
+                        .map(|c| format!(" COLLATE {c}"))
+                        .unwrap_or_default();
+                    let sort_order = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+                    order_by.push_str(&format!("{col}{collate} {sort_order}, "));
+                }
+                order_by.push_str("rowid ASC"); // sqlite and turso might return within-group rows in different orders which is semantically ok, so let's add rowid as a tiebreaker
+                order_by
+            };
+
+            let query = format!("SELECT a, b, c FROM t {where_clause} ORDER BY {order_by}");
+            for i in 0..sqlite_conns.len() {
+                let sqlite_rows = sqlite_exec_rows(&sqlite_conns[i], &query);
+                let limbo_rows = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query);
+                assert_eq!(
+                    sqlite_rows, limbo_rows,
+                    "Different results! limbo: {:?}, sqlite: {:?}, seed: {}, query: {}, table def: {}",
+                    limbo_rows, sqlite_rows, seed, query, table_defs[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz() {

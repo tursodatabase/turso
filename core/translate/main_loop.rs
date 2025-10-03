@@ -18,7 +18,7 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
-use crate::translate::window::emit_window_loop_source;
+use crate::translate::{collate::get_collseq_from_expr, window::emit_window_loop_source};
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
@@ -67,30 +67,33 @@ impl LoopLabels {
     }
 }
 
-pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> DistinctCtx {
+pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
     let index_name = format!("distinct_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
+    let mut columns = plan
+        .result_columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| IndexColumn {
+            name: col
+                .expr
+                .displayer(&PlanContext(&[&plan.table_references]))
+                .to_string(),
+            order: SortOrder::Asc,
+            pos_in_table: i,
+            collation: None,
+            default: None,
+        })
+        .collect::<Vec<_>>();
+    for (i, column) in columns.iter_mut().enumerate() {
+        column.collation =
+            get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
+    }
     let index = Arc::new(Index {
         name: index_name.clone(),
         table_name: String::new(),
         ephemeral: true,
         root_page: 0,
-        columns: plan
-            .result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                IndexColumn {
-                    name: col
-                        .expr
-                        .displayer(&PlanContext(&[&plan.table_references]))
-                        .to_string(),
-                    order: SortOrder::Asc,
-                    pos_in_table: i,
-                    collation: None, // FIXME: this should be determined based on the result column expression!
-                    default: None, // FIXME: this should be determined based on the result column expression!
-                }
-            })
-            .collect(),
+        columns,
         unique: false,
         has_rowid: false,
         where_clause: None,
@@ -107,7 +110,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Distinc
         is_table: false,
     });
 
-    ctx
+    Ok(ctx)
 }
 
 /// Initialize resources needed for the source operators (tables, joins, etc)
@@ -162,8 +165,8 @@ pub fn init_loop(
                 name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
                 order: SortOrder::Asc,
                 pos_in_table: 0,
-                collation: None, // FIXME: this should be inferred from the expression
-                default: None,   // FIXME: this should be inferred from the expression
+                collation: get_collseq_from_expr(&agg.original_expr, tables)?,
+                default: None, // FIXME: this should be inferred from the expression
             }],
             has_rowid: false,
             unique: false,

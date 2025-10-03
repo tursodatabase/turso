@@ -7,7 +7,6 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
-use crate::translate::plan::ResultSetColumn;
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     plan::Aggregate,
@@ -19,7 +18,7 @@ use crate::translate::{
 };
 use crate::{
     schema::PseudoCursorType,
-    translate::collate::CollationSeq,
+    translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -28,6 +27,7 @@ use crate::{
     },
     Result,
 };
+use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
 
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]
@@ -144,24 +144,7 @@ pub fn init_group_by<'a>(
         let collations = group_by
             .exprs
             .iter()
-            .map(|expr| match expr {
-                ast::Expr::Collate(_, collation_name) => {
-                    CollationSeq::new(collation_name.as_str()).map(Some)
-                }
-                ast::Expr::Column { table, column, .. } => {
-                    let table_reference = plan
-                        .table_references
-                        .find_joined_table_by_internal_id(*table)
-                        .unwrap();
-
-                    let Some(table_column) = table_reference.table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
-                    };
-
-                    Ok(table_column.collation)
-                }
-                _ => Ok(Some(CollationSeq::default())),
-            })
+            .map(|expr| get_collseq_from_expr(expr, &plan.table_references))
             .collect::<Result<Vec<_>>>()?;
 
         program.emit_insn(Insn::SorterOpen {
@@ -507,12 +490,29 @@ pub fn group_by_process_single_group(
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
     };
 
+    let mut compare_key_info = group_by
+        .exprs
+        .iter()
+        .map(|_| KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: CollationSeq::default(),
+        })
+        .collect::<Vec<_>>();
+    for (i, c) in compare_key_info
+        .iter_mut()
+        .enumerate()
+        .take(group_by.exprs.len())
+    {
+        let maybe_collation = get_collseq_from_expr(&group_by.exprs[i], &plan.table_references)?;
+        c.collation = maybe_collation.unwrap_or_default();
+    }
+
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not
     program.emit_insn(Insn::Compare {
         start_reg_a: registers.reg_group_exprs_cmp,
         start_reg_b: groups_start_reg,
         count: group_by.exprs.len(),
-        collation: program.curr_collation(),
+        key_info: compare_key_info,
     });
 
     program.add_comment(

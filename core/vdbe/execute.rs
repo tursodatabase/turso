@@ -73,7 +73,7 @@ use super::{
 };
 use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
-use turso_parser::ast::{self, Name};
+use turso_parser::ast::{self, Name, SortOrder};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -523,14 +523,13 @@ pub fn op_compare(
             start_reg_a,
             start_reg_b,
             count,
-            collation,
+            key_info,
         },
         insn
     );
     let start_reg_a = *start_reg_a;
     let start_reg_b = *start_reg_b;
     let count = *count;
-    let collation = collation.unwrap_or_default();
 
     if start_reg_a + count > start_reg_b {
         return Err(LimboError::InternalError(
@@ -538,21 +537,30 @@ pub fn op_compare(
         ));
     }
 
-    let mut cmp = None;
-    for i in 0..count {
+    let mut cmp = std::cmp::Ordering::Equal;
+    for (i, key_col) in key_info.iter().enumerate().take(count) {
+        // TODO (https://github.com/tursodatabase/turso/issues/2304): this logic is almost the same as compare_immutable()
+        // but that one works on RefValue and this works on Value. There are tons of cases like this where we could reuse
+        // functionality if we had a trait that both RefValue and Value implement.
         let a = state.registers[start_reg_a + i].get_value();
         let b = state.registers[start_reg_b + i].get_value();
+        let column_order = key_col.sort_order;
+        let collation = key_col.collation;
         cmp = match (a, b) {
             (Value::Text(left), Value::Text(right)) => {
-                Some(collation.compare_strings(left.as_str(), right.as_str()))
+                collation.compare_strings(left.as_str(), right.as_str())
             }
-            _ => Some(a.cmp(b)),
+            _ => a.partial_cmp(b).unwrap(),
         };
-        if cmp != Some(std::cmp::Ordering::Equal) {
+        if !cmp.is_eq() {
+            cmp = match column_order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            };
             break;
         }
     }
-    state.last_compare = cmp;
+    state.last_compare = Some(cmp);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
