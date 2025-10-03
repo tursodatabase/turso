@@ -26,6 +26,7 @@ use crate::Value;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -309,14 +310,29 @@ impl AtomicTransactionState {
     }
 }
 
-#[derive(Debug)]
-pub enum CommitState {
+#[allow(clippy::large_enum_variant)]
+pub enum CommitState<Clock: LogicalClock> {
     Initial,
-    Commit { end_ts: u64 },
-    BeginCommitLogicalLog { end_ts: u64, log_record: LogRecord },
-    EndCommitLogicalLog { end_ts: u64 },
-    SyncLogicalLog { end_ts: u64 },
-    CommitEnd { end_ts: u64 },
+    Commit {
+        end_ts: u64,
+    },
+    BeginCommitLogicalLog {
+        end_ts: u64,
+        log_record: LogRecord,
+    },
+    EndCommitLogicalLog {
+        end_ts: u64,
+    },
+    SyncLogicalLog {
+        end_ts: u64,
+    },
+    Checkpoint {
+        end_ts: u64,
+        state_machine: RefCell<StateMachine<CheckpointStateMachine<Clock>>>,
+    },
+    CommitEnd {
+        end_ts: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -334,7 +350,7 @@ struct CommitCoordinator {
 }
 
 pub struct CommitStateMachine<Clock: LogicalClock> {
-    state: CommitState,
+    state: CommitState<Clock>,
     is_finalized: bool,
     did_commit_schema_change: bool,
     tx_id: TxID,
@@ -343,6 +359,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     write_set: Vec<RowID>,
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
+    pager: Arc<Pager>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -380,12 +397,13 @@ pub struct DeleteRowStateMachine {
 
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn new(
-        state: CommitState,
+        state: CommitState<Clock>,
         tx_id: TxID,
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
     ) -> Self {
+        let pager = connection.pager.read().clone();
         Self {
             state,
             is_finalized: false,
@@ -394,6 +412,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             connection,
             write_set: Vec::new(),
             commit_coordinator,
+            pager,
             header,
             _phantom: PhantomData,
         }
@@ -414,7 +433,7 @@ impl WriteRowStateMachine {
 }
 
 impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
-    type Context = MvStore<Clock>;
+    type Context = Arc<MvStore<Clock>>;
     type SMResult = ();
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
@@ -620,6 +639,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
                 }
             }
+
+            CommitState::Checkpoint {
+                end_ts,
+                state_machine,
+            } => {
+                match state_machine.borrow_mut().step(&())? {
+                    IOResult::Done(_) => {}
+                    IOResult::IO(iocompletions) => {
+                        return Ok(TransitionResult::Io(iocompletions));
+                    }
+                }
+                self.finalize(mvcc_store)?;
+                return Ok(TransitionResult::Done(()));
+            }
             CommitState::SyncLogicalLog { end_ts } => {
                 let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
@@ -677,6 +710,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
+                }
+                if mvcc_store.storage.should_checkpoint() {
+                    let state_machine = StateMachine::new(CheckpointStateMachine::new(
+                        self.pager.clone(),
+                        mvcc_store.clone(),
+                        self.connection.clone(),
+                        false,
+                    ));
+                    let state_machine = RefCell::new(state_machine);
+                    self.state = CommitState::Checkpoint {
+                        end_ts: *end_ts,
+                        state_machine,
+                    };
+                    return Ok(TransitionResult::Continue);
                 }
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
@@ -1979,6 +2026,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.commit_load_tx(tx_id);
         Ok(true)
     }
+
+    pub fn set_checkpoint_threshold(&self, threshold: u64) {
+        self.storage.set_checkpoint_threshold(threshold)
+    }
 }
 
 /// A write-write conflict happens when transaction T_current attempts to update a
@@ -2107,4 +2158,36 @@ fn stmt_get_all_rows(stmt: &mut Statement) -> Result<Vec<Vec<Value>>> {
         }
     }
     Ok(rows)
+}
+
+impl<Clock: LogicalClock> Debug for CommitState<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initial => write!(f, "Initial"),
+            Self::Commit { end_ts } => f.debug_struct("Commit").field("end_ts", end_ts).finish(),
+            Self::BeginCommitLogicalLog { end_ts, log_record } => f
+                .debug_struct("BeginCommitLogicalLog")
+                .field("end_ts", end_ts)
+                .field("log_record", log_record)
+                .finish(),
+            Self::EndCommitLogicalLog { end_ts } => f
+                .debug_struct("EndCommitLogicalLog")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::SyncLogicalLog { end_ts } => f
+                .debug_struct("SyncLogicalLog")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::Checkpoint {
+                end_ts,
+                state_machine: _,
+            } => f
+                .debug_struct("Checkpoint")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::CommitEnd { end_ts } => {
+                f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
+            }
+        }
+    }
 }
