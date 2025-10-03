@@ -448,8 +448,8 @@ Modifiers:
 | Eq             | Yes    |         |
 | Expire         | No     |         |
 | Explain        | No     |         |
-| FkCounter      | No     |         |
-| FkIfZero       | No     |         |
+| FkCounter      | Yes    |         |
+| FkIfZero       | Yes    |         |
 | Found          | Yes    |         |
 | Function       | Yes    |         |
 | Ge             | Yes    |         |

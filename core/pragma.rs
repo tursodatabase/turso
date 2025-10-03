@@ -127,6 +127,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::Result0 | PragmaFlags::SchemaReq | PragmaFlags::NoColumns1,
             &["cipher"],
         ),
+        ForeignKeys => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["foreign_keys"],
+        ),
     }
 }
 

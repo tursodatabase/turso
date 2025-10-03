@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -2148,6 +2148,9 @@ pub fn halt(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            return Err(LimboError::Constraint(format!("{description} (19)")));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -2251,6 +2254,12 @@ pub fn op_transaction_inner(
                 let write = matches!(tx_mode, TransactionMode::Write);
                 if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
+                }
+                if write {
+                    program // reset deferred fk violations on BEGIN write tx
+                        .connection
+                        .fk_deferred_violations
+                        .store(0, Ordering::Release);
                 }
 
                 // 1. We try to upgrade current version
@@ -2444,6 +2453,11 @@ pub fn op_auto_commit(
 
     if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
         if *rollback {
+            program // reset deferred fk violations on ROLLBACK
+                .connection
+                .fk_deferred_violations
+                .store(0, Ordering::Release);
+
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -8170,6 +8184,68 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
             }
         }
     }
+}
+
+pub fn op_fk_counter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkCounter {
+            increment_value,
+            is_scope,
+        },
+        insn
+    );
+    if *is_scope {
+        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+    } else {
+        // Transaction-level counter: add/subtract for deferred FKs.
+        program
+            .connection
+            .fk_deferred_violations
+            .fetch_add(*increment_value, Ordering::AcqRel);
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_fk_if_zero(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(FkIfZero { target_pc, if_zero }, insn);
+    let fk_enabled = program.connection.foreign_keys_enabled();
+
+    // Jump if any:
+    // Foreign keys are disabled globally
+    // p1 is true AND deferred constraint counter is zero
+    // p1 is false AND deferred constraint counter is non-zero
+    let txn = program
+        .connection
+        .fk_deferred_violations
+        .load(Ordering::Acquire);
+    let jump = if !fk_enabled {
+        true
+    } else if *if_zero {
+        txn == 0
+    } else {
+        txn != 0
+    };
+    state.pc = if jump {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+
+    Ok(InsnFunctionStepResult::Step)
 }
 
 mod cmath {
