@@ -1619,6 +1619,7 @@ pub fn build_shared_wal(
         min_frame: AtomicU64::new(0),
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
+        transaction_count: AtomicU64::new(0),
         frame_cache: Arc::new(SpinLock::new(HashMap::new())),
         last_checksum: (0, 0),
         file: Some(file.clone()),
