@@ -12,9 +12,17 @@ use std::sync::{Arc, RwLock};
 
 use crate::File;
 
+pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: u64 = 1024 * 1024 * 8; // 8 MiB as default to mimic
+                                                                   // 2000 pages in sqlite which is
+                                                                   //      pretty much equal to
+                                                                   //      8MiB if page_size ==
+                                                                   //      4096 bytes
+
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     pub offset: u64,
+    /// Size at which we start performing a checkpoint on the logical log.
+    checkpoint_threshold: u64,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
@@ -140,7 +148,11 @@ impl LogRecordType {
 
 impl LogicalLog {
     pub fn new(file: Arc<dyn File>) -> Self {
-        Self { file, offset: 0 }
+        Self {
+            file,
+            offset: 0,
+            checkpoint_threshold: DEFAULT_LOG_CHECKPOINT_THRESHOLD,
+        }
     }
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
@@ -214,6 +226,14 @@ impl LogicalLog {
         let c = self.file.truncate(0, completion)?;
         self.offset = 0;
         Ok(c)
+    }
+
+    pub fn should_checkpoint(&self) -> bool {
+        self.offset >= self.checkpoint_threshold
+    }
+
+    pub fn set_checkpoint_threshold(&mut self, threshold: u64) {
+        self.checkpoint_threshold = threshold;
     }
 }
 

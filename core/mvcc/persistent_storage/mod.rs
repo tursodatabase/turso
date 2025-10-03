@@ -38,6 +38,17 @@ impl Storage {
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.write().unwrap().file.clone()
     }
+
+    pub fn should_checkpoint(&self) -> bool {
+        self.logical_log.read().unwrap().should_checkpoint()
+    }
+
+    pub fn set_checkpoint_threshold(&self, threshold: u64) {
+        self.logical_log
+            .write()
+            .unwrap()
+            .set_checkpoint_threshold(threshold)
+    }
 }
 
 impl Debug for Storage {
