@@ -8178,7 +8178,12 @@ mod tests {
         let pager = conn.pager.read().clone();
 
         // FIXME: handle page cache is full
-        let _ = run_until_done(|| pager.allocate_page1(), &pager);
+
+        // force allocate page1 with a transaction
+        pager.begin_read_tx().unwrap();
+        run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
+        run_until_done(|| pager.end_tx(false, &conn), &pager).unwrap();
+
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
         (pager, page2.get().id as i64, db, conn)
