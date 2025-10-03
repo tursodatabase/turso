@@ -735,7 +735,7 @@ pub fn insn_to_row(
                 0,
                 *dest as i32,
                 0,
-                Value::Blob(value.clone()),
+                Value::build_blob(value.clone()),
                 0,
                 format!(
                     "r[{}]={} (len={})",

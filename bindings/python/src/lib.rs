@@ -334,7 +334,16 @@ fn row_to_py(py: Python, row: &turso_core::Row) -> Result<PyObject> {
             turso_core::Value::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
             turso_core::Value::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
             turso_core::Value::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
-            turso_core::Value::Blob(b) => py_values.push(PyBytes::new(py, b.as_slice()).into()),
+            turso_core::Value::Blob(b) => {
+                let bytes = if b.unalloc_bytes > 0 {
+                    let mut blob = b.clone();
+                    blob.expand();
+                    blob.value
+                } else {
+                    b.value.clone()
+                };
+                py_values.push(PyBytes::new(py, &bytes).into())
+            }
         }
     }
     Ok(PyTuple::new(py, &py_values)
@@ -354,7 +363,7 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
-        Ok(Value::Blob(bytes.as_bytes().to_vec()))
+        Ok(Value::build_blob(bytes.as_bytes()))
     } else {
         return Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",

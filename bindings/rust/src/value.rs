@@ -117,7 +117,15 @@ impl From<turso_core::Value> for Value {
             turso_core::Value::Integer(n) => Value::Integer(n),
             turso_core::Value::Float(n) => Value::Real(n),
             turso_core::Value::Text(t) => Value::Text(t.into()),
-            turso_core::Value::Blob(items) => Value::Blob(items),
+            turso_core::Value::Blob(items) => {
+                if items.unalloc_bytes > 0 {
+                    panic!(
+                        "Value from conversion called on unexpanded zeroblob with {} unallocated bytes",
+                        items.unalloc_bytes
+                    );
+                }
+                Value::Blob(items.value)
+            }
         }
     }
 }
@@ -129,7 +137,7 @@ impl From<Value> for turso_core::Value {
             Value::Integer(n) => turso_core::Value::Integer(n),
             Value::Real(n) => turso_core::Value::Float(n),
             Value::Text(t) => turso_core::Value::from_text(&t),
-            Value::Blob(items) => turso_core::Value::from_blob(items),
+            Value::Blob(items) => turso_core::Value::build_blob(items),
         }
     }
 }

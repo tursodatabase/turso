@@ -972,7 +972,7 @@ impl ProgramBuilder {
                 },
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
-                ast::Literal::Blob(s) => Value::Blob(
+                ast::Literal::Blob(s) => Value::build_blob(
                     // Taken from `translate_expr`
                     s.as_bytes()
                         .chunks_exact(2)
@@ -982,7 +982,7 @@ impl ProgramBuilder {
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .collect::<Vec<u8>>(),
                 ),
                 _ => break 'value None,
             })

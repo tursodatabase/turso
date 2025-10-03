@@ -1156,7 +1156,7 @@ impl IncrementalOperator for AggregateOperator {
 
                         // Serialize the aggregate state with group key (even for deletion, we need a row)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
-                        let blob_value = Value::Blob(state_blob);
+                        let blob_value = Value::Blob(state_blob.as_slice().into());
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::Integer(operator_storage_id);
@@ -1556,7 +1556,7 @@ impl ScanState {
 
         // Compare zset_hash as blob
         if let RefValue::Blob(rec_zset_blob) = rec_zset_hash {
-            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob.to_slice()) {
+            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob.value.to_slice()) {
                 if rec_hash != zset_hash {
                     return Ok(IOResult::Done(None));
                 }
