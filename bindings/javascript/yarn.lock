@@ -1593,7 +1593,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm@workspace:packages/wasm":
+"@tursodatabase/database-wasm@npm:^0.2.0, @tursodatabase/database-wasm@workspace:packages/wasm":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
@@ -1608,7 +1608,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database@workspace:packages/native":
+"@tursodatabase/database@npm:^0.2.0, @tursodatabase/database@workspace:packages/native":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
@@ -2099,6 +2099,23 @@ __metadata:
   checksum: 10c0/053ea8b2135caff68a9e81470e845613e374e7309a47731e81639de3eaeb90c3d01af0e0b44d2ab9d50b43467223b88567dfeb3262db942dc063b9976718ffc1
   languageName: node
   linkType: hard
+
+"database-node@workspace:examples/database-node":
+  version: 0.0.0-use.local
+  resolution: "database-node@workspace:examples/database-node"
+  dependencies:
+    "@tursodatabase/database": "npm:^0.2.0"
+  languageName: unknown
+  linkType: soft
+
+"database-wasm-vite@workspace:examples/database-wasm-vite":
+  version: 0.0.0-use.local
+  resolution: "database-wasm-vite@workspace:examples/database-wasm-vite"
+  dependencies:
+    "@tursodatabase/database-wasm": "npm:^0.2.0"
+    vite: "npm:^7.1.9"
+  languageName: unknown
+  linkType: soft
 
 "debug@npm:4":
   version: 4.4.3
@@ -3865,9 +3882,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.1.5":
-  version: 7.1.5
-  resolution: "vite@npm:7.1.5"
+"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.1.5, vite@npm:^7.1.9":
+  version: 7.1.9
+  resolution: "vite@npm:7.1.9"
   dependencies:
     esbuild: "npm:^0.25.0"
     fdir: "npm:^6.5.0"
@@ -3916,7 +3933,7 @@ __metadata:
       optional: true
   bin:
     vite: bin/vite.js
-  checksum: 10c0/782d2f20c25541b26d1fb39bef5f194149caff39dc25b7836e25f049ca919f2e2ce186bddb21f3f20f6195354b3579ec637a8ca08d65b117f8b6f81e3e730a9c
+  checksum: 10c0/f628f903a137c1410232558bde99c223ea00a090bda6af77752c61f912955f0050aac12d3cfe024d08a0f150ff6fab61b3d0be75d634a59b94d49f525392e1f7
   languageName: node
   linkType: hard
 

@@ -1,0 +1,19 @@
+{
+  "name": "database-wasm-vite",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "node server.mjs"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "vite": "^7.1.9"
+  },
+  "dependencies": {
+    "@tursodatabase/database-wasm": "^0.2.0"
+  }
+}
