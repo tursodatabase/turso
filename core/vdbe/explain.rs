@@ -1042,6 +1042,20 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::SorterCompare {
+                cursor_id,
+                pc_when_nonequal,
+                sorted_record_reg,
+                num_regs,
+            } => (
+                "SorterCompare",
+                *cursor_id as i32,
+                pc_when_nonequal.as_debug_int(),
+                *sorted_record_reg as i32,
+                Value::build_text(num_regs.to_string()),
+                0,
+                "".to_string(),
+            ),
             Insn::Function {
                 constant_mask,
                 start_reg,
