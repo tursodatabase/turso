@@ -2346,6 +2346,7 @@ name = "limbo_sim"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "bitflags 2.9.4",
  "bitmaps",
  "chrono",
  "clap",

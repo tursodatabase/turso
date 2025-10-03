@@ -76,18 +76,12 @@ fn random_create_index<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationCont
 /// Possible queries that can be generated given the table state
 ///
 /// Does not take into account transactional statements
-pub fn possible_queries(tables: &[Table]) -> Vec<QueryDiscriminants> {
-    let mut queries = vec![QueryDiscriminants::Select, QueryDiscriminants::Create];
-    if !tables.is_empty() {
-        queries.extend([
-            QueryDiscriminants::Insert,
-            QueryDiscriminants::Update,
-            QueryDiscriminants::Delete,
-            QueryDiscriminants::Drop,
-            QueryDiscriminants::CreateIndex,
-        ]);
+pub const fn possible_queries(tables: &[Table]) -> &'static [QueryDiscriminants] {
+    if tables.is_empty() {
+        &[QueryDiscriminants::Select, QueryDiscriminants::Create]
+    } else {
+        QueryDiscriminants::ALL_NO_TRANSACTION
     }
-    queries
 }
 
 type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;

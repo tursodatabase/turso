@@ -1,6 +1,7 @@
+use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use sql_generation::{
-    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency, pick, pick_index},
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, Opts, pick, pick_index},
     model::{
         query::{
             Create, Delete, Drop, Insert, Select,
@@ -9,16 +10,17 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::Update,
         },
-        table::SimValue,
+        table::{SimValue, Table},
     },
 };
+use strum::IntoEnumIterator;
 use turso_core::{LimboError, types};
 use turso_parser::ast::{self, Distinctness};
 
 use crate::{
     common::print_diff,
-    generation::{Shadow as _, plan::InteractionType},
-    model::Query,
+    generation::{Shadow as _, plan::InteractionType, query::possible_queries},
+    model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
     runner::env::SimulatorEnv,
 };
@@ -27,7 +29,8 @@ use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(strum::EnumIter))]
 pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
@@ -1308,7 +1311,9 @@ fn property_insert_values_select<R: rand::Rng>(
 
 fn property_read_your_updates_back<R: rand::Rng>(
     rng: &mut R,
+    _remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // e.g. UPDATE t SET a=1, b=2 WHERE c=1;
     let update = Update::arbitrary(rng, ctx);
@@ -1330,7 +1335,9 @@ fn property_read_your_updates_back<R: rand::Rng>(
 
 fn property_table_has_expected_content<R: rand::Rng>(
     rng: &mut R,
+    _remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1339,7 +1346,12 @@ fn property_table_has_expected_content<R: rand::Rng>(
     }
 }
 
-fn property_select_limit<R: rand::Rng>(rng: &mut R, ctx: &impl GenerationContext) -> Property {
+fn property_select_limit<R: rand::Rng>(
+    rng: &mut R,
+    _remaining: &Remaining,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Select the table
@@ -1357,6 +1369,7 @@ fn property_double_create_failure<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Create the table
     let create_query = Create::arbitrary(rng, ctx);
@@ -1389,6 +1402,7 @@ fn property_delete_select<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1447,6 +1461,7 @@ fn property_drop_select<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1480,7 +1495,9 @@ fn property_drop_select<R: rand::Rng>(
 
 fn property_select_select_optimizer<R: rand::Rng>(
     rng: &mut R,
+    _remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1501,7 +1518,9 @@ fn property_select_select_optimizer<R: rand::Rng>(
 
 fn property_where_true_false_null<R: rand::Rng>(
     rng: &mut R,
+    _remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1520,7 +1539,9 @@ fn property_where_true_false_null<R: rand::Rng>(
 
 fn property_union_all_preserves_cardinality<R: rand::Rng>(
     rng: &mut R,
+    _remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     // Get a random table
     let table = pick(ctx.tables(), rng);
@@ -1547,6 +1568,7 @@ fn property_fsync_no_wait<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     Property::FsyncNoWait {
         query: Query::arbitrary_from(rng, ctx, remaining),
@@ -1558,11 +1580,167 @@ fn property_faulty_query<R: rand::Rng>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
+    _mvcc: bool,
 ) -> Property {
     Property::FaultyQuery {
         query: Query::arbitrary_from(rng, ctx, remaining),
         tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
+}
+
+type PropertyGenFunc<R, G> = fn(&mut R, &Remaining, &G, bool) -> Property;
+
+impl PropertyDiscriminants {
+    pub fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
+    where
+        R: rand::Rng,
+        G: GenerationContext,
+    {
+        match self {
+            PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
+            PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
+            PropertyDiscriminants::DoubleCreateFailure => property_double_create_failure,
+            PropertyDiscriminants::SelectLimit => property_select_limit,
+            PropertyDiscriminants::DeleteSelect => property_delete_select,
+            PropertyDiscriminants::DropSelect => property_drop_select,
+            PropertyDiscriminants::SelectSelectOptimizer => property_select_select_optimizer,
+            PropertyDiscriminants::WhereTrueFalseNull => property_where_true_false_null,
+            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+                property_union_all_preserves_cardinality
+            }
+            PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
+            PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::Queries => {
+                unreachable!("should not try to generate queries property")
+            }
+        }
+    }
+
+    pub fn weight(&self, env: &SimulatorEnv, remaining: &Remaining, opts: &Opts) -> u32 {
+        match self {
+            PropertyDiscriminants::InsertValuesSelect => {
+                if !env.opts.disable_insert_values_select {
+                    u32::min(remaining.select, remaining.insert).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::ReadYourUpdatesBack => {
+                u32::min(remaining.select, remaining.insert).max(1)
+            }
+            PropertyDiscriminants::TableHasExpectedContent => remaining.select.max(1),
+            PropertyDiscriminants::DoubleCreateFailure => {
+                if !env.opts.disable_double_create_failure {
+                    remaining.create / 2
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::SelectLimit => {
+                if !env.opts.disable_select_limit {
+                    remaining.select
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::DeleteSelect => {
+                if !env.opts.disable_delete_select {
+                    u32::min(remaining.select, remaining.insert).min(remaining.delete)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::DropSelect => {
+                if !env.opts.disable_drop_select {
+                    // remaining.drop
+                    0
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::SelectSelectOptimizer => {
+                if !env.opts.disable_select_optimizer {
+                    remaining.select / 2
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::WhereTrueFalseNull => {
+                if opts.indexes && !env.opts.disable_where_true_false_null {
+                    remaining.select / 2
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+                if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
+                    remaining.select / 3
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::FsyncNoWait => {
+                if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
+                    50 // Freestyle number
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::FaultyQuery => {
+                if env.profile.io.enable
+                    && env.profile.io.fault.enable
+                    && !env.opts.disable_faulty_query
+                {
+                    20
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::Queries => {
+                unreachable!("queries property should not be generated")
+            }
+        }
+    }
+
+    fn can_generate(queries: &[QueryDiscriminants]) -> Vec<PropertyDiscriminants> {
+        let queries_capabilities = QueryCapabilities::from_list_queries(queries);
+
+        PropertyDiscriminants::iter()
+            .filter(|property| queries_capabilities.contains(property.requirements()))
+            .collect()
+    }
+
+    pub const fn requirements(&self) -> QueryCapabilities {
+        match self {
+            PropertyDiscriminants::InsertValuesSelect => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::INSERT)
+            }
+            PropertyDiscriminants::ReadYourUpdatesBack => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
+            }
+            PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
+            PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
+            PropertyDiscriminants::SelectLimit => QueryCapabilities::SELECT,
+            PropertyDiscriminants::DeleteSelect => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::DELETE)
+            }
+            PropertyDiscriminants::DropSelect => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::DROP)
+            }
+            PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
+            PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
+            PropertyDiscriminants::UNIONAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
+            PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
+        }
+    }
+}
+
+pub fn possiple_properties(tables: &[Table]) -> Vec<PropertyDiscriminants> {
+    let queries = possible_queries(tables);
+    PropertyDiscriminants::can_generate(queries)
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
@@ -1579,110 +1757,19 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
             env.profile.experimental_mvcc,
         );
 
-        #[allow(clippy::type_complexity)]
-        let choices: Vec<(_, Box<dyn Fn(&mut R) -> Property>)> = vec![
-            (
-                if !env.opts.disable_insert_values_select {
-                    u32::min(remaining_.select, remaining_.insert).max(1)
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| {
-                    property_insert_values_select(
-                        rng,
-                        &remaining_,
-                        conn_ctx,
-                        env.profile.experimental_mvcc,
-                    )
-                }),
-            ),
-            (
-                remaining_.select.max(1),
-                Box::new(|rng: &mut R| property_table_has_expected_content(rng, conn_ctx)),
-            ),
-            (
-                u32::min(remaining_.select, remaining_.insert).max(1),
-                Box::new(|rng: &mut R| property_read_your_updates_back(rng, conn_ctx)),
-            ),
-            (
-                if !env.opts.disable_double_create_failure {
-                    remaining_.create / 2
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_double_create_failure(rng, &remaining_, conn_ctx)),
-            ),
-            (
-                if !env.opts.disable_select_limit {
-                    remaining_.select
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_select_limit(rng, conn_ctx)),
-            ),
-            (
-                if !env.opts.disable_delete_select {
-                    u32::min(remaining_.select, remaining_.insert).min(remaining_.delete)
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_delete_select(rng, &remaining_, conn_ctx)),
-            ),
-            (
-                if !env.opts.disable_drop_select {
-                    // remaining_.drop
-                    0
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_drop_select(rng, &remaining_, conn_ctx)),
-            ),
-            (
-                if !env.opts.disable_select_optimizer {
-                    remaining_.select / 2
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_select_select_optimizer(rng, conn_ctx)),
-            ),
-            (
-                if opts.indexes && !env.opts.disable_where_true_false_null {
-                    remaining_.select / 2
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_where_true_false_null(rng, conn_ctx)),
-            ),
-            (
-                if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
-                    remaining_.select / 3
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_union_all_preserves_cardinality(rng, conn_ctx)),
-            ),
-            (
-                if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
-                    50 // Freestyle number
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_fsync_no_wait(rng, &remaining_, conn_ctx)),
-            ),
-            (
-                if env.profile.io.enable
-                    && env.profile.io.fault.enable
-                    && !env.opts.disable_faulty_query
-                {
-                    20
-                } else {
-                    0
-                },
-                Box::new(|rng: &mut R| property_faulty_query(rng, &remaining_, conn_ctx)),
-            ),
-        ];
+        let properties = possiple_properties(conn_ctx.tables());
+        let weights = WeightedIndex::new(
+            properties
+                .iter()
+                .map(|property| property.weight(env, &remaining_, opts)),
+        )
+        .unwrap();
 
-        frequency(choices, rng)
+        let idx = weights.sample(rng);
+        let property_fn = properties[idx].gen_function();
+        let property = (property_fn)(rng, &remaining_, conn_ctx, env.profile.experimental_mvcc);
+
+        property
     }
 }
 

@@ -8,6 +8,7 @@ use std::{
 };
 
 use indexmap::IndexSet;
+use rand::distr::weighted::WeightedIndex;
 use serde::{Deserialize, Serialize};
 
 use sql_generation::{
@@ -26,7 +27,7 @@ use turso_core::{Connection, Result, StepResult};
 
 use crate::{
     SimulatorEnv,
-    generation::Shadow,
+    generation::{Shadow, property::possiple_properties, query::possible_queries},
     model::Query,
     runner::env::{ShadowTablesMut, SimConnection, SimulationType},
 };
@@ -1077,26 +1078,27 @@ fn random_create<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usiz
     Interactions::new(conn_index, InteractionsType::Query(Query::Create(create)))
 }
 
-fn random_read<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Select(Select::arbitrary(
-            rng,
-            &env.connection_context(conn_index),
-        ))),
-    )
+fn random_select<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
+    if rng.random_bool(0.7) {
+        Interactions::new(
+            conn_index,
+            InteractionsType::Query(Query::Select(Select::arbitrary(
+                rng,
+                &env.connection_context(conn_index),
+            ))),
+        )
+    } else {
+        // Random expression
+        Interactions::new(
+            conn_index,
+            InteractionsType::Query(Query::Select(
+                SelectFree::arbitrary(rng, &env.connection_context(conn_index)).0,
+            )),
+        )
+    }
 }
 
-fn random_expr<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Select(
-            SelectFree::arbitrary(rng, &env.connection_context(conn_index)).0,
-        )),
-    )
-}
-
-fn random_write<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
+fn random_insert<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
     Interactions::new(
         conn_index,
         InteractionsType::Query(Query::Insert(Insert::arbitrary(
@@ -1164,14 +1166,14 @@ fn random_create_index<R: rand::Rng>(
     ))
 }
 
-fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv) -> Interactions {
+fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
     let faults = if env.opts.disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
         vec![Fault::Disconnect, Fault::ReopenDatabase]
     };
     let fault = faults[rng.random_range(0..faults.len())];
-    Interactions::new(env.choose_conn(rng), InteractionsType::Fault(fault))
+    Interactions::new(conn_index, InteractionsType::Fault(fault))
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
@@ -1186,10 +1188,24 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
             &stats,
             env.profile.experimental_mvcc,
         );
+
+        // TODO: find a way to be more efficient and pass the weights and properties down to the ArbitraryFrom functions
+        let queries = possible_queries(conn_ctx.tables());
+        let query_weights =
+            WeightedIndex::new(queries.iter().map(|query| query.weight(&remaining_))).unwrap();
+
+        let properties = possiple_properties(conn_ctx.tables());
+        let property_weights = WeightedIndex::new(
+            properties
+                .iter()
+                .map(|property| property.weight(env, &remaining_, conn_ctx.opts())),
+        )
+        .unwrap();
+
         frequency(
             vec![
                 (
-                    u32::min(remaining_.select, remaining_.insert) + remaining_.create,
+                    property_weights.total_weight(),
                     Box::new(|rng: &mut R| {
                         Interactions::new(
                             conn_index,
@@ -1202,44 +1218,17 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
                     }),
                 ),
                 (
-                    remaining_.select,
-                    Box::new(|rng: &mut R| random_read(rng, env, conn_index)),
-                ),
-                (
-                    remaining_.select / 3,
-                    Box::new(|rng: &mut R| random_expr(rng, env, conn_index)),
-                ),
-                (
-                    remaining_.insert,
-                    Box::new(|rng: &mut R| random_write(rng, env, conn_index)),
-                ),
-                (
-                    remaining_.create,
-                    Box::new(|rng: &mut R| random_create(rng, env, conn_index)),
-                ),
-                (
-                    remaining_.create_index,
+                    query_weights.total_weight(),
                     Box::new(|rng: &mut R| {
-                        if let Some(interaction) = random_create_index(rng, env, conn_index) {
-                            interaction
-                        } else {
-                            // if no tables exist, we can't create an index, so fallback to creating a table
-                            random_create(rng, env, conn_index)
-                        }
+                        Interactions::new(
+                            conn_index,
+                            InteractionsType::Query(Query::arbitrary_from(
+                                rng,
+                                conn_ctx,
+                                &remaining_,
+                            )),
+                        )
                     }),
-                ),
-                (
-                    remaining_.delete,
-                    Box::new(|rng: &mut R| random_delete(rng, env, conn_index)),
-                ),
-                (
-                    remaining_.update,
-                    Box::new(|rng: &mut R| random_update(rng, env, conn_index)),
-                ),
-                (
-                    // remaining_.drop,
-                    0,
-                    Box::new(|rng: &mut R| random_drop(rng, env, conn_index)),
                 ),
                 (
                     remaining_
@@ -1247,7 +1236,7 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
                         .min(remaining_.insert)
                         .min(remaining_.create)
                         .max(1),
-                    Box::new(|rng: &mut R| random_fault(rng, env)),
+                    Box::new(|rng: &mut R| random_fault(rng, env, conn_index)),
                 ),
             ],
             rng,
