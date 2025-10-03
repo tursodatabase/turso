@@ -658,3 +658,24 @@ do_execsql_test_on_specific_db {:memory:} insert-select-nested-subquery {
     SELECT * FROM t;
 } {1
 1}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3567 (used to panic, now returns unique constraint error)
+do_execsql_test_in_memory_any_error insert-rowid-select-rowid {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t(rowid) SELECT rowid FROM t;
+}
+
+do_execsql_test_in_memory_any_error insert-rowidalias-select-rowid {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t(a) SELECT rowid FROM t;
+}
+
+do_execsql_test_on_specific_db {:memory:} insert-rowid-select-rowid-success {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (2);
+    INSERT INTO t(a) SELECT rowid FROM t;
+    SELECT * FROM t;
+} {2
+1}
