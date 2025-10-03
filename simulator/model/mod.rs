@@ -18,7 +18,7 @@ use turso_parser::ast::Distinctness;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 // This type represents the potential queries on the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
 pub enum Query {
     Create(Create),
     Select(Select),
