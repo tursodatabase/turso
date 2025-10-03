@@ -49,10 +49,10 @@ Example output:
 
 ### Method 1: Using PRAGMAs
 
-Start Turso and set encryption parameters before creating tables:
+Start Turso and set encryption parameters before creating tables. Do note that encryption is an experimental feature that must be explicitly enabled:
 
 ```bash
-tursodb database.db
+tursodb --experimental-encryption database.db
 ```
 
 Then in the SQL shell:
@@ -70,7 +70,7 @@ INSERT INTO users VALUES (1, 'Alice');
 Specify encryption parameters directly in the database URI:
 
 ```bash
-tursodb "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 
 ## Opening an Encrypted Database
@@ -78,7 +78,7 @@ tursodb "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54
 **Important:** To open an existing encrypted database, you MUST provide the cipher and key as URI parameters:
 
 ```bash
-tursodb "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
+tursodb --experimental-encryption "file:database.db?cipher=aegis256&hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 
 Attempting to open an encrypted database without the correct cipher and key will fail.
