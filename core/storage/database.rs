@@ -48,8 +48,12 @@ impl IOContext {
 
 impl Default for IOContext {
     fn default() -> Self {
+        #[cfg(feature = "checksum")]
+        let encryption_or_checksum = EncryptionOrChecksum::Checksum(ChecksumContext::default());
+        #[cfg(not(feature = "checksum"))]
+        let encryption_or_checksum = EncryptionOrChecksum::None;
         Self {
-            encryption_or_checksum: EncryptionOrChecksum::Checksum(ChecksumContext::default()),
+            encryption_or_checksum,
         }
     }
 }
@@ -97,6 +101,9 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
+        // casting to i64 to check some weird casting that could've happened before. This should be
+        // okay since page numbers should be u32
+        assert!(page_idx as i64 >= 0, "page should be positive");
         let r = c.as_read();
         let size = r.buf().len();
         assert!(page_idx > 0);

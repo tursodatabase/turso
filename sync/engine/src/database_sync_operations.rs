@@ -153,7 +153,7 @@ pub async fn wal_apply_from_file<Ctx>(
             coro.yield_(ProtocolCommand::IO).await?;
         }
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
-        tracing::debug!("got frame: {:?}", info);
+        tracing::info!("got frame: {:?}", info);
         db_size = info.db_size;
         session.append_page(info.page_no, &buffer.as_slice()[WAL_FRAME_HEADER..])?;
     }
@@ -165,7 +165,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
     coro: &Coro<Ctx>,
     client: &C,
     frames_file: &Arc<dyn turso_core::File>,
-    revision: &DatabasePullRevision,
+    revision: &Option<DatabasePullRevision>,
     wal_pull_batch_size: u64,
     long_poll_timeout: Option<std::time::Duration>,
 ) -> Result<DatabasePullRevision> {
@@ -181,10 +181,10 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
         coro.yield_(ProtocolCommand::IO).await?;
     }
     match revision {
-        DatabasePullRevision::Legacy {
+        Some(DatabasePullRevision::Legacy {
             generation,
             synced_frame_no,
-        } => {
+        }) => {
             let start_frame = synced_frame_no.unwrap_or(0) + 1;
             wal_pull_to_file_legacy(
                 coro,
@@ -196,9 +196,10 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
             )
             .await
         }
-        DatabasePullRevision::V1 { revision } => {
+        Some(DatabasePullRevision::V1 { revision }) => {
             wal_pull_to_file_v1(coro, client, frames_file, revision, long_poll_timeout).await
         }
+        None => wal_pull_to_file_v1(coro, client, frames_file, "", long_poll_timeout).await,
     }
 }
 

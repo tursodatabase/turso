@@ -36,8 +36,10 @@ pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
-    pub plan: Vec<Interactions>,
+    plan: Vec<Interactions>,
     pub mvcc: bool,
+    // Len should not count transactions statements, just so we can generate more meaningful interactions per run
+    len: usize,
 }
 
 impl InteractionPlan {
@@ -45,11 +47,16 @@ impl InteractionPlan {
         Self {
             plan: Vec::new(),
             mvcc,
+            len: 0,
         }
     }
 
     pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
-        Self { plan, mvcc }
+        let len = plan
+            .iter()
+            .filter(|interaction| !interaction.is_transaction())
+            .count();
+        Self { plan, mvcc, len }
     }
 
     #[inline]
@@ -57,23 +64,17 @@ impl InteractionPlan {
         &self.plan
     }
 
-    // TODO: this is just simplified logic so we can get something rolling with begin concurrent
-    // transactions in the simulator. Ideally when we generate the plan we will have begin and commits statements across interactions
+    /// Length of interactions that are not transaction statements
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn push(&mut self, interactions: Interactions) {
-        if self.mvcc {
-            let conn_index = interactions.connection_index;
-            let begin = Interactions::new(
-                conn_index,
-                InteractionsType::Query(Query::Begin(Begin::Concurrent)),
-            );
-            let commit =
-                Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)));
-            self.plan.push(begin);
-            self.plan.push(interactions);
-            self.plan.push(commit);
-        } else {
-            self.plan.push(interactions);
+        if !interactions.is_transaction() {
+            self.len += 1;
         }
+        self.plan.push(interactions);
     }
 
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
@@ -218,7 +219,7 @@ impl InteractionPlan {
         let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
 
         // initial query starts at 0th connection
-        plan.plan.push(Interactions::new(
+        plan.push(Interactions::new(
             0,
             InteractionsType::Query(Query::Create(create_query)),
         ));
@@ -234,19 +235,69 @@ impl InteractionPlan {
     ) -> Option<Vec<Interaction>> {
         let num_interactions = env.opts.max_interactions as usize;
         if self.len() < num_interactions {
-            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
-            let interactions = {
-                let conn_index = env.choose_conn(rng);
+            let conn_index = env.choose_conn(rng);
+            let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
+                let query = Query::Begin(Begin::Concurrent);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else if self.mvcc
+                && env.conn_in_transaction(conn_index)
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(0.4)
+            {
+                let query = Query::Commit(Commit);
+                Interactions::new(conn_index, InteractionsType::Query(query))
+            } else {
                 let conn_ctx = &env.connection_context(conn_index);
                 Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
 
-            let out_interactions = interactions.interactions();
+            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
+
+            let mut out_interactions = interactions.interactions();
+
             assert!(!out_interactions.is_empty());
+
+            let out_interactions = if self.mvcc
+                && out_interactions
+                    .iter()
+                    .any(|interaction| interaction.is_ddl())
+            {
+                // DDL statements must be serial, so commit all connections and then execute the DDL
+                let mut commit_interactions = (0..env.connections.len())
+                    .filter(|&idx| env.conn_in_transaction(idx))
+                    .map(|idx| {
+                        let query = Query::Commit(Commit);
+                        let interaction = Interactions::new(idx, InteractionsType::Query(query));
+                        let out_interactions = interaction.interactions();
+                        self.push(interaction);
+                        out_interactions
+                    })
+                    .fold(
+                        Vec::with_capacity(env.connections.len()),
+                        |mut accum, mut curr| {
+                            accum.append(&mut curr);
+                            accum
+                        },
+                    );
+                commit_interactions.append(&mut out_interactions);
+                commit_interactions
+            } else {
+                out_interactions
+            };
+
             self.push(interactions);
             Some(out_interactions)
         } else {
-            None
+            // after we generated all interactions if some connection is still in a transaction, commit
+            (0..env.connections.len())
+                .find(|idx| env.conn_in_transaction(*idx))
+                .map(|conn_index| {
+                    let query = Query::Commit(Commit);
+                    let interaction = Interactions::new(conn_index, InteractionsType::Query(query));
+                    let out_interactions = interaction.interactions();
+                    self.push(interaction);
+                    out_interactions
+                })
         }
     }
 
@@ -271,7 +322,7 @@ impl InteractionPlan {
 }
 
 impl Deref for InteractionPlan {
-    type Target = [Interactions];
+    type Target = Vec<Interactions>;
 
     fn deref(&self) -> &Self::Target {
         &self.plan
@@ -294,11 +345,32 @@ impl IntoIterator for InteractionPlan {
     }
 }
 
+impl<'a> IntoIterator for &'a InteractionPlan {
+    type Item = &'a Interactions;
+
+    type IntoIter = <&'a Vec<Interactions> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.plan.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut InteractionPlan {
+    type Item = &'a mut Interactions;
+
+    type IntoIter = <&'a mut Vec<Interactions> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.plan.iter_mut()
+    }
+}
+
 pub trait InteractionPlanIterator {
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction>;
 }
 
 impl<T: InteractionPlanIterator> InteractionPlanIterator for &mut T {
+    #[inline]
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         T::next(self, env)
     }
@@ -339,6 +411,7 @@ impl<I> InteractionPlanIterator for PlanIterator<I>
 where
     I: Iterator<Item = Interaction>,
 {
+    #[inline]
     fn next(&mut self, _env: &mut SimulatorEnv) -> Option<Interaction> {
         self.iter.next()
     }
@@ -367,6 +440,13 @@ impl Interactions {
             interactions,
         }
     }
+
+    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
+        match &mut self.interactions {
+            InteractionsType::Property(property) => property.get_extensional_queries(),
+            InteractionsType::Query(..) | InteractionsType::Fault(..) => None,
+        }
+    }
 }
 
 impl Deref for Interactions {
@@ -390,26 +470,11 @@ pub enum InteractionsType {
     Fault(Fault),
 }
 
-impl Shadow for Interactions {
-    type Result = ();
-
-    fn shadow(&self, tables: &mut ShadowTablesMut) {
-        match &self.interactions {
-            InteractionsType::Property(property) => {
-                let initial_tables = tables.clone();
-                for interaction in property.interactions(self.connection_index) {
-                    let res = interaction.shadow(tables);
-                    if res.is_err() {
-                        // If any interaction fails, we reset the tables to the initial state
-                        **tables = initial_tables.clone();
-                        break;
-                    }
-                }
-            }
-            InteractionsType::Query(query) => {
-                let _ = query.shadow(tables);
-            }
-            InteractionsType::Fault(_) => {}
+impl InteractionsType {
+    pub fn is_transaction(&self) -> bool {
+        match self {
+            InteractionsType::Query(query) => query.is_transaction(),
+            _ => false,
         }
     }
 }
@@ -489,7 +554,7 @@ impl Display for InteractionPlan {
                     writeln!(f, "-- FAULT '{fault}'")?;
                 }
                 InteractionsType::Query(query) => {
-                    writeln!(f, "{query};")?;
+                    writeln!(f, "{query}; -- {}", interactions.connection_index)?;
                 }
             }
         }
@@ -575,7 +640,7 @@ impl Assertion {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum Fault {
+pub enum Fault {
     Disconnect,
     ReopenDatabase,
 }
@@ -593,6 +658,7 @@ impl Display for Fault {
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
+    pub ignore_error: bool,
 }
 
 impl Deref for Interaction {
@@ -614,6 +680,15 @@ impl Interaction {
         Self {
             connection_index,
             interaction,
+            ignore_error: false,
+        }
+    }
+
+    pub fn new_ignore_error(connection_index: usize, interaction: InteractionType) -> Self {
+        Self {
+            connection_index,
+            interaction,
+            ignore_error: true,
         }
     }
 }
@@ -633,7 +708,7 @@ pub enum InteractionType {
 // FIXME: add the connection index here later
 impl Display for Interaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.interaction)
+        write!(f, "{}; -- {}", self.interaction, self.connection_index)
     }
 }
 
@@ -641,13 +716,13 @@ impl Display for InteractionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(query) => write!(f, "{query}"),
-            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {}", assumption.name),
             Self::Assertion(assertion) => {
                 write!(f, "-- ASSERT {};", assertion.name)
             }
-            Self::Fault(fault) => write!(f, "-- FAULT '{fault}';"),
+            Self::Fault(fault) => write!(f, "-- FAULT '{fault}'"),
             Self::FsyncQuery(query) => {
-                writeln!(f, "-- FSYNC QUERY;")?;
+                writeln!(f, "-- FSYNC QUERY")?;
                 writeln!(f, "{query};")?;
                 write!(f, "{query};")
             }
@@ -660,19 +735,31 @@ impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Self::Query(query) => query.shadow(env),
-            Self::FsyncQuery(query) => {
-                let mut first = query.shadow(env)?;
-                first.extend(query.shadow(env)?);
-                Ok(first)
+            Self::Query(query) => {
+                if !query.is_transaction() {
+                    env.add_query(query);
+                }
+                query.shadow(env)
             }
-            Self::Assumption(_) | Self::Assertion(_) | Self::Fault(_) | Self::FaultyQuery(_) => {
-                Ok(vec![])
-            }
+            Self::Assumption(_)
+            | Self::Assertion(_)
+            | Self::Fault(_)
+            | Self::FaultyQuery(_)
+            | Self::FsyncQuery(_) => Ok(vec![]),
         }
     }
 }
+
 impl InteractionType {
+    pub fn is_ddl(&self) -> bool {
+        match self {
+            InteractionType::Query(query)
+            | InteractionType::FsyncQuery(query)
+            | InteractionType::FaultyQuery(query) => query.is_ddl(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
             let query_str = query.to_string();
@@ -779,13 +866,15 @@ impl InteractionType {
                 match fault {
                     Fault::Disconnect => {
                         if env.connections[conn_index].is_connected() {
+                            if env.conn_in_transaction(conn_index) {
+                                env.rollback_conn(conn_index);
+                            }
                             env.connections[conn_index].disconnect();
                         } else {
                             return Err(turso_core::LimboError::InternalError(
                                 "connection already disconnected".into(),
                             ));
                         }
-                        env.connections[conn_index] = SimConnection::Disconnected;
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
@@ -925,6 +1014,8 @@ impl InteractionType {
 fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
+    let mvcc = env.profile.experimental_mvcc;
+    let indexes = env.profile.query.gen_opts.indexes;
     let num_conns = env.connections.len();
     env.connections.clear();
 
@@ -947,8 +1038,8 @@ fn reopen_database(env: &mut SimulatorEnv) {
             let db = match turso_core::Database::open_file(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
-                false,
-                true,
+                mvcc,
+                indexes,
             ) {
                 Ok(db) => db,
                 Err(e) => {

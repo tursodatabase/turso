@@ -201,6 +201,22 @@ do_execsql_test_in_memory_any_error upsert-composite-target-too-few {
       ON CONFLICT(a) DO UPDATE SET val = excluded.val;   -- only "a" given → no match → error
 }
 
+# Composite index requires exact coverage, targeting too few columns must not match.
+do_execsql_test_on_specific_db {:memory:} upsert-multilple-conflict-targets {
+    CREATE TABLE ct (id INTEGER PRIMARY KEY, x UNIQUE, y UNIQUE, z DEFAULT NULL);
+    INSERT INTO ct(id, x, y) VALUES (1, 'x', 'y');
+    INSERT INTO ct(id, x, y) VALUES (2, 'a', 'b');
+    INSERT INTO ct(id, x, y) VALUES (3, '!', '@');
+    INSERT INTO ct(id, x, y) VALUES (4, 'x', 'y1'), (5, 'a1', 'b'), (3, '_', '_')
+      ON CONFLICT(x) DO UPDATE SET x = excluded.x || '-' || x, y = excluded.y || '@' || y, z = 'x' 
+      ON CONFLICT(y) DO UPDATE SET x = excluded.x || '+' || x, y = excluded.y || '!' || y, z = 'y' 
+      ON CONFLICT DO UPDATE SET x = excluded.x || '#' || x, y = excluded.y || '%' || y, z = 'fallback';
+    SELECT * FROM ct;
+} {1|x-x|y1@y|x
+2|a1+a|b!b|y
+3|_#!|_%@|fallback
+}
+
 # Qualified target (t.a) should match unique index on a.
 do_execsql_test_on_specific_db {:memory:} upsert-qualified-target {
     CREATE TABLE qt (a UNIQUE, b);
@@ -336,6 +352,33 @@ do_execsql_test_on_specific_db {:memory:} upsert-doubly-qualified-target {
       ON CONFLICT(main.dq.a) DO UPDATE SET b = excluded.b;
     SELECT * FROM dq;
 } {1|new}
+
+do_execsql_test_on_specific_db {:memory:} upsert-targets-chain {
+    CREATE TABLE dq (a UNIQUE, b UNIQUE, c UNIQUE, value TEXT);
+    CREATE UNIQUE INDEX dq_ab ON dq(a, b);
+    INSERT INTO dq VALUES ('a1', 'a2', 'a3', 'aaa');
+    INSERT INTO dq VALUES ('b1', 'b2', 'b3', 'bbb');
+    INSERT INTO dq VALUES ('c1', 'c2', 'c3', 'ccc');
+    INSERT INTO dq VALUES ('d1', 'd2', 'd3', 'ddd');
+    INSERT INTO dq VALUES
+      ('a1', 'a2', 'a3', 'upd1'), ('b1', 'b1', 'b1', 'upd2'), ('c2', 'c2', 'c2', 'upd3'), ('d3', 'd3', 'd3', 'upd4')
+    ON CONFLICT (a, b) DO UPDATE SET value = excluded.value || '-a'
+    ON CONFLICT (a) DO UPDATE SET value = excluded.value || '-b'
+    ON CONFLICT (b) DO UPDATE SET value = excluded.value || '-c'
+    ON CONFLICT DO UPDATE SET value = excluded.value || '-d';
+    SELECT * FROM dq;
+} {a1|a2|a3|upd1-a
+b1|b2|b3|upd2-b
+c1|c2|c3|upd3-c
+d1|d2|d3|upd4-d}
+
+# https://github.com/tursodatabase/turso/issues/3384
+do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
+	create table phonebook(name text primary key, phonenumber text, validDate date);
+	insert into phonebook values ('Alice','704-545-3333','2018-10-10');
+	insert into phonebook values ('Alice','704-111-1111','2018-10-20') on conflict (name) do update set phonenumber=excluded.phonenumber, validDate=excluded.validDate;
+    SELECT phonenumber, validDate FROM phonebook;
+} {704-111-1111|2018-10-20}
 
 
 # TODO: uncomment these when we support collations in indexes 

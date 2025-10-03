@@ -56,9 +56,10 @@ pub fn translate_create_table(
     };
     program.extend(&opts);
 
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| normalized_tbl_name.starts_with(prefix))
+    if !connection.is_mvcc_bootstrap_connection()
+        && RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized_tbl_name.starts_with(prefix))
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
@@ -114,7 +115,7 @@ pub fn translate_create_table(
         program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
@@ -202,7 +203,7 @@ pub fn translate_create_table(
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 
@@ -416,7 +417,7 @@ fn collect_autoindexes(
 
 fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
     let mut sql = String::new();
-    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_str(), body).as_str());
+    sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
     match body {
         ast::CreateTableBody::ColumnsAndConstraints {
             columns: _,
@@ -457,15 +458,15 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     };
     format!(
         "CREATE VIRTUAL TABLE {} {} USING {}{}\n /*{}{}*/",
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         if_not_exists,
-        vtab.module_name.as_str(),
+        vtab.module_name.as_ident(),
         if args.is_empty() {
             String::new()
         } else {
             format!("({args})")
         },
-        vtab.tbl_name.name.as_str(),
+        vtab.tbl_name.name.as_ident(),
         vtab_args
     )
 }
@@ -537,7 +538,7 @@ pub fn translate_create_virtual_table(
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 
@@ -642,7 +643,7 @@ pub fn translate_drop_table(
     );
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id_0,
-        root_page: 1usize.into(),
+        root_page: 1i64.into(),
         db: 0,
     });
 
@@ -826,7 +827,7 @@ pub fn translate_drop_table(
         });
         program.emit_insn(Insn::OpenRead {
             cursor_id: sqlite_schema_cursor_id_1,
-            root_page: 1usize,
+            root_page: 1i64,
             db: 0,
         });
 
@@ -883,7 +884,7 @@ pub fn translate_drop_table(
         // 5. Open a write cursor to the schema table and re-insert the records placed in the ephemeral table but insert the correct root page now
         program.emit_insn(Insn::OpenWrite {
             cursor_id: sqlite_schema_cursor_id_1,
-            root_page: 1usize.into(),
+            root_page: 1i64.into(),
             db: 0,
         });
 
@@ -910,10 +911,7 @@ pub fn translate_drop_table(
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 0, schema_column_0_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 1, schema_column_1_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 2, schema_column_2_register);
-        let root_page = table
-            .get_root_page()
-            .try_into()
-            .expect("Failed to cast the root page to an i64");
+        let root_page = table.get_root_page();
         program.emit_insn(Insn::Integer {
             value: root_page,
             dest: moved_to_root_page_register,

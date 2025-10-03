@@ -4,6 +4,7 @@ pub mod grammar_generator;
 mod tests {
     use rand::seq::{IndexedRandom, SliceRandom};
     use std::collections::HashSet;
+    use turso_core::DatabaseOpts;
 
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -11,7 +12,8 @@ mod tests {
 
     use crate::{
         common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, rng_from_time, sqlite_exec_rows,
+            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, sqlite_exec_rows,
             TempDatabase,
         },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
@@ -168,21 +170,6 @@ mod tests {
         // values.push("(SELECT 1)".to_string()); subqueries ain't implemented yet homes.
 
         values
-    }
-
-    fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
-        let seed = std::env::var("SEED").map_or(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            |v| {
-                v.parse()
-                    .expect("Failed to parse SEED environment variable as u64")
-            },
-        );
-        let rng = ChaCha8Rng::seed_from_u64(seed);
-        (rng, seed)
     }
 
     #[test]
@@ -672,6 +659,15 @@ mod tests {
 
     #[test]
     pub fn partial_index_mutation_and_upsert_fuzz() {
+        index_mutation_upsert_fuzz(1.0, 4);
+    }
+
+    #[test]
+    pub fn simple_index_mutation_and_upsert_fuzz() {
+        index_mutation_upsert_fuzz(0.0, 4);
+    }
+
+    fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
         const INNER_ITERS: usize = 500;
@@ -723,6 +719,7 @@ mod tests {
             let functions = ["lower", "upper", "length"];
 
             let num_pidx = rng.random_range(0..=3);
+            let mut conflict_match_targets = vec!["".to_string(), "(id)".to_string()];
             let mut idx_ddls: Vec<String> = Vec::new();
             for i in 0..num_pidx {
                 // Pick 1 or 2 key columns; always include "k" sometimes to get frequent conflicts.
@@ -790,13 +787,24 @@ mod tests {
                     parts.join(" AND ")
                 };
 
-                let ddl = format!(
-                    "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
-                    outer,
-                    i,
-                    key_cols.join(","),
-                    pred
-                );
+                let ddl = if rng.random_bool(partial_index_prob) {
+                    format!(
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
+                        outer,
+                        i,
+                        key_cols.join(","),
+                        pred
+                    )
+                } else {
+                    // ON CONFLICT (...) can use only column set with non-partial UNIQUE constraint
+                    conflict_match_targets.push(format!("({})", key_cols.join(",")));
+                    format!(
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({})",
+                        outer,
+                        i,
+                        key_cols.join(","),
+                    )
+                };
                 idx_ddls.push(ddl.clone());
                 // Create in both engines
                 println!("{ddl};");
@@ -817,9 +825,11 @@ mod tests {
                     vals.push(v);
                 }
                 let ins = format!("INSERT INTO t VALUES ({})", vals.join(", "));
+                println!("{ins}; -- seed");
                 // Execute on both; ignore errors due to partial unique conflicts (keep seeding going)
-                let _ = sqlite.execute(&ins, rusqlite::params![]);
-                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &ins);
+                let sqlite_res = sqlite.execute(&ins, rusqlite::params![]);
+                let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, &ins);
+                assert!(sqlite_res.is_ok() == limbo_res.is_ok());
             }
 
             for _ in 0..INNER_ITERS {
@@ -909,37 +919,43 @@ mod tests {
                                 });
                             }
                         }
-                        if rng.random_bool(0.3) {
-                            // 30% chance ON CONFLICT DO UPDATE SET ...
-                            let mut set_list = Vec::new();
-                            let num_set = rng.random_range(1..=cols_list.len());
-                            let set_cols = cols_list
-                                .choose_multiple(&mut rng, num_set)
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            for c in set_cols.iter() {
-                                let v = if c == "k" {
-                                    format!("'{}'", K_POOL.choose(&mut rng).unwrap())
-                                } else if rng.random_bool(0.2) {
-                                    "NULL".into()
-                                } else {
-                                    rng.random_range(-5..=15).to_string()
-                                };
-                                set_list.push(format!("{c} = {v}"));
+                        let chain_length = rng.random_range(0..=conflict_chain_max_len);
+                        let mut on_conflict = String::new();
+                        for _ in 0..chain_length {
+                            let idx = rng.random_range(0..conflict_match_targets.len());
+                            let target = &conflict_match_targets[idx];
+                            if rng.random_bool(0.8) {
+                                let mut set_list = Vec::new();
+                                let num_set = rng.random_range(1..=cols_list.len());
+                                let set_cols = cols_list
+                                    .choose_multiple(&mut rng, num_set)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                for c in set_cols.iter() {
+                                    let v = if c == "k" {
+                                        format!("'{}'", K_POOL.choose(&mut rng).unwrap())
+                                    } else if rng.random_bool(0.2) {
+                                        "NULL".into()
+                                    } else {
+                                        rng.random_range(-5..=15).to_string()
+                                    };
+                                    set_list.push(format!("{c} = {v}"));
+                                }
+                                on_conflict.push_str(&format!(
+                                    " ON CONFLICT{} DO UPDATE SET {}",
+                                    target,
+                                    set_list.join(", ")
+                                ));
+                            } else {
+                                on_conflict.push_str(&format!(" ON CONFLICT{target} DO NOTHING"));
                             }
-                            format!(
-                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO UPDATE SET {}",
-                                cols_list.join(","),
-                                vals_list.join(","),
-                                set_list.join(", ")
-                            )
-                        } else {
-                            format!(
-                                "INSERT INTO t({}) VALUES({}) ON CONFLICT DO NOTHING",
-                                cols_list.join(","),
-                                vals_list.join(",")
-                            )
                         }
+                        format!(
+                            "INSERT INTO t({}) VALUES({}) {}",
+                            cols_list.join(","),
+                            vals_list.join(","),
+                            on_conflict
+                        )
                     }
                     _ => unreachable!(),
                 };
@@ -2494,13 +2510,24 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     pub fn fuzz_long_create_table_drop_table_alter_table() {
-        let db = TempDatabase::new_empty(true);
+        _fuzz_long_create_table_drop_table_alter_table(false);
+    }
+
+    #[test]
+    pub fn fuzz_long_create_table_drop_table_alter_table_mvcc() {
+        _fuzz_long_create_table_drop_table_alter_table(true);
+    }
+
+    fn _fuzz_long_create_table_drop_table_alter_table(mvcc: bool) {
+        let db = TempDatabase::new_with_opts(
+            "fuzz_long_create_table_drop_table_alter_table",
+            DatabaseOpts::new().with_mvcc(mvcc).with_indexes(!mvcc),
+        );
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        tracing::info!("create_table_drop_table_fuzz seed: {}", seed);
+        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
@@ -2515,7 +2542,7 @@ mod tests {
 
         let mut undroppable_cols = HashSet::new();
 
-        for iteration in 0..50000 {
+        for iteration in 0..2000 {
             println!("iteration: {iteration} (seed: {seed})");
             let operation = rng.random_range(0..100); // 0: create, 1: drop, 2: alter, 3: alter rename
 
@@ -2543,9 +2570,17 @@ mod tests {
 
                             let col_type = COLUMN_TYPES[rng.random_range(0..COLUMN_TYPES.len())];
                             let constraint = if i == 0 && rng.random_bool(0.2) {
-                                " PRIMARY KEY"
+                                if !mvcc || col_type == "INTEGER" {
+                                    " PRIMARY KEY"
+                                } else {
+                                    ""
+                                }
                             } else if rng.random_bool(0.1) {
-                                " UNIQUE"
+                                if !mvcc {
+                                    " UNIQUE"
+                                } else {
+                                    ""
+                                }
                             } else {
                                 ""
                             };
@@ -2558,19 +2593,29 @@ mod tests {
                         }
 
                         let create_sql =
-                            format!("CREATE TABLE {} ({})", table_name, columns.join(", "));
+                            format!("CREATE TABLE {table_name} ({})", columns.join(", "));
 
                         // Execute the create table statement
                         limbo_exec_rows(&db, &limbo_conn, &create_sql);
 
-                        // Successfully created table, update our tracking
-                        current_tables.insert(
-                            table_name.clone(),
-                            columns
-                                .iter()
-                                .map(|c| c.split_whitespace().next().unwrap().to_string())
-                                .collect(),
+                        let column_names = columns
+                            .iter()
+                            .map(|c| c.split_whitespace().next().unwrap().to_string())
+                            .collect::<Vec<_>>();
+
+                        // Insert a single row into the table
+                        let insert_sql = format!(
+                            "INSERT INTO {table_name} ({}) VALUES ({})",
+                            column_names.join(", "),
+                            (0..columns.len())
+                                .map(|i| i.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
+                        limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+
+                        // Successfully created table, update our tracking
+                        current_tables.insert(table_name.clone(), column_names);
                     }
                 }
 
@@ -2643,12 +2688,95 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+
+            // Do SELECT * FROM <table> for all current tables and just verify there is 1 row and the column count and names match the expected columns in the table
+            for (table_name, columns) in current_tables.iter() {
+                let select_sql = format!("SELECT * FROM {table_name}");
+                let col_names_actual = limbo_stmt_get_column_names(&db, &limbo_conn, &select_sql);
+                let col_names_expected = columns
+                    .iter()
+                    .map(|c| c.split_whitespace().next().unwrap().to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    col_names_actual, col_names_expected,
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+                let limbo = limbo_exec_rows(&db, &limbo_conn, &select_sql);
+                assert_eq!(
+                    limbo.len(),
+                    1,
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+                assert_eq!(
+                    limbo[0].len(),
+                    columns.len(),
+                    "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
+                );
+            }
         }
 
         // Final verification - the test passes if we didn't crash
         println!(
-            "create_table_drop_table_fuzz completed successfully with {} tables remaining",
+            "create_table_drop_table_fuzz completed successfully with {} tables remaining. (mvcc: {mvcc}, seed: {seed})",
             current_tables.len()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "test_helper")]
+    pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
+        use crate::common::rusqlite_integrity_check;
+
+        maybe_setup_tracing();
+        let (mut rng, seed) = rng_from_time_or_env();
+        tracing::debug!(seed);
+
+        // TODO: currently assume that page size is 4096 bytes (4 Kib)
+        const PAGE_SIZE: u32 = 4 * 2u32.pow(10);
+
+        /// 100 Mib
+        const MAX_DB_SIZE_BYTES: u32 = 100 * 2u32.pow(20);
+
+        const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
+
+        for _ in 0..10 {
+            // generate a random pending page that is smaller than the 100 MB mark
+
+            let pending_byte_pgno = rng.random_range(2..MAX_PAGENO);
+            let pending_byte = pending_byte_pgno * PAGE_SIZE;
+
+            tracing::debug!(pending_byte_pgno, pending_byte);
+
+            let db_path = tempfile::NamedTempFile::new()?;
+
+            {
+                let db = TempDatabase::new_with_existent(db_path.path(), true);
+
+                let prev_pending_byte = TempDatabase::get_pending_byte();
+                tracing::debug!(prev_pending_byte);
+
+                TempDatabase::set_pending_byte(pending_byte);
+
+                let new_pending_byte = TempDatabase::get_pending_byte();
+                tracing::debug!(new_pending_byte);
+
+                // Insert more than enough to pass the PENDING_BYTE
+                let query = format!("insert into t select replace(zeroblob({PAGE_SIZE}), x'00', 'A') from generate_series(1, {});", MAX_PAGENO * 2);
+
+                let conn = db.connect_limbo();
+
+                conn.execute("create table t(x);")?;
+
+                conn.execute(&query)?;
+
+                conn.close()?;
+            }
+
+            rusqlite_integrity_check(db_path.path())?;
+
+            TempDatabase::reset_pending_byte();
+        }
+
+        Ok(())
     }
 }

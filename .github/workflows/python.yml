@@ -1,6 +1,7 @@
 name: Python
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -115,7 +116,7 @@ jobs:
           path: bindings/python/dist
 
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 30
     defaults:
       run:

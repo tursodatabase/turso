@@ -10,7 +10,6 @@ use super::plan::TableReferences;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::parameters::PARAM_PREFIX;
 use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::ResultSetColumn;
@@ -1826,7 +1825,7 @@ pub fn translate_expr(
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
-                value: sanitize_double_quoted_string(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: target_register,
             });
             Ok(target_register)
@@ -3008,12 +3007,6 @@ pub fn sanitize_string(input: &str) -> String {
     inner.replace("''", "'")
 }
 
-/// Sanitizes a double-quoted string literal by removing double quotes at front and back
-/// and unescaping double quotes
-pub fn sanitize_double_quoted_string(input: &str) -> String {
-    input[1..input.len() - 1].replace("\"\"", "\"").to_string()
-}
-
 /// Returns the components of a binary expression
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
@@ -3250,26 +3243,25 @@ where
     Ok(WalkControl::Continue)
 }
 
-/// Context needed to walk all expressions in a INSERT|UPDATE|SELECT|DELETE body,
-/// in the order they are encountered, to ensure that the parameters are rewritten from
-/// anonymous ("?") to our internal named scheme so when the columns are re-ordered we are able
-/// to bind the proper parameter values.
 pub struct ParamState {
-    /// ALWAYS starts at 1
-    pub next_param_idx: usize,
+    // flag which allow or forbid usage of parameters during translation of AST to the program
+    //
+    // for example, parameters are not allowed in the partial index definition
+    // so tursodb set allowed to false when it parsed WHERE clause of partial index definition
+    pub allowed: bool,
 }
 
 impl Default for ParamState {
     fn default() -> Self {
-        Self { next_param_idx: 1 }
+        Self { allowed: true }
     }
 }
 impl ParamState {
     pub fn is_valid(&self) -> bool {
-        self.next_param_idx > 0
+        self.allowed
     }
     pub fn disallow() -> Self {
-        Self { next_param_idx: 0 }
+        Self { allowed: false }
     }
 }
 
@@ -3289,7 +3281,7 @@ pub enum BindingBehavior {
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones, as well as normalizing any DoublyQualified/Qualified quoted identifiers.
+/// ones
 pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
@@ -3302,23 +3294,10 @@ pub fn bind_and_rewrite_expr<'a>(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                // Rewrite anonymous variables in encounter order.
-                ast::Expr::Variable(var) if var.is_empty() => {
+                ast::Expr::Variable(_) => {
                     if !param_state.is_valid() {
                         crate::bail_parse_error!("Parameters are not allowed in this context");
                     }
-                    *expr = ast::Expr::Variable(format!(
-                        "{}{}",
-                        PARAM_PREFIX, param_state.next_param_idx
-                    ));
-                    param_state.next_param_idx += 1;
-                }
-                ast::Expr::Qualified(ast::Name::Quoted(ns), ast::Name::Quoted(c))
-                | ast::Expr::DoublyQualified(_, ast::Name::Quoted(ns), ast::Name::Quoted(c)) => {
-                    *expr = ast::Expr::Qualified(
-                        ast::Name::Ident(normalize_ident(ns.as_str())),
-                        ast::Name::Ident(normalize_ident(c.as_str())),
-                    );
                 }
                 ast::Expr::Between {
                     lhs,
@@ -3391,14 +3370,15 @@ pub fn bind_and_rewrite_expr<'a>(
                                             id.as_str()
                                         );
                                     }
+                                } else {
+                                    let col =
+                                        joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                                    match_result = Some((
+                                        joined_table.internal_id,
+                                        col_idx.unwrap(),
+                                        col.is_rowid_alias,
+                                    ));
                                 }
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias,
-                                ));
                             // only if we haven't found a match, check for explicit rowid reference
                             } else if let Some(row_id_expr) = parse_row_id(
                                 &normalized_id,
@@ -3470,9 +3450,9 @@ pub fn bind_and_rewrite_expr<'a>(
 
                         // SQLite behavior: Only double-quoted identifiers get fallback to string literals
                         // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                        if id.is_double_quoted() {
+                        if id.quoted_with('"') {
                             // Convert failed double-quoted identifier to string literal
-                            *expr = Expr::Literal(ast::Literal::String(id.as_str().to_string()));
+                            *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                             return Ok(WalkControl::Continue);
                         } else {
                             // Unquoted identifiers must resolve to columns - no fallback
@@ -3480,6 +3460,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
                     Expr::Qualified(tbl, id) => {
+                        tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                         let normalized_table_name = normalize_ident(tbl.as_str());
                         let matching_tbl = referenced_tables
                             .find_table_and_internal_id_by_identifier(&normalized_table_name);
@@ -3508,6 +3489,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             column: col_idx,
                             is_rowid_alias: col.is_rowid_alias,
                         };
+                        tracing::debug!("rewritten to column");
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                         return Ok(WalkControl::Continue);
                     }
@@ -3779,6 +3761,7 @@ pub fn get_expr_affinity(
             }
             Affinity::Blob
         }
+        ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
                 crate::schema::affinity(&type_name.name)
@@ -4150,7 +4133,7 @@ fn determine_column_alias(
 ) -> Option<String> {
     // First check for explicit alias
     if let Some(As::As(name)) = explicit_alias {
-        return Some(name.to_string());
+        return Some(name.as_str().to_string());
     }
 
     // For ROWID expressions, use "rowid" as the alias
@@ -4158,21 +4141,24 @@ fn determine_column_alias(
         return Some("rowid".to_string());
     }
 
-    // For column references, use special handling
+    // For column references, always use the column name from the table
     if let Expr::Column {
         column,
         is_rowid_alias,
         ..
     } = expr
     {
-        if *is_rowid_alias {
+        if let Some(name) = table
+            .columns()
+            .get(*column)
+            .and_then(|col| col.name.clone())
+        {
+            return Some(name);
+        } else if *is_rowid_alias {
+            // If it's a rowid alias, return "rowid"
             return Some("rowid".to_string());
         } else {
-            // Get the column name from the table
-            return table
-                .columns()
-                .get(*column)
-                .and_then(|col| col.name.clone());
+            return None;
         }
     }
 

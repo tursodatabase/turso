@@ -1,6 +1,6 @@
 import { DatabasePromise } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards } from "@tursodatabase/sync-common";
-import { SyncEngine, SyncEngineProtocolVersion } from "#index";
+import { SyncEngine, SyncEngineProtocolVersion, Database as NativeDatabase } from "#index";
 import { promises } from "node:fs";
 
 let NodeIO: ProtocolIo = {
@@ -45,6 +45,12 @@ class Database extends DatabasePromise {
     #io: ProtocolIo;
     #guards: SyncEngineGuards
     constructor(opts: DatabaseOpts) {
+        if (opts.url == null) {
+            super(new NativeDatabase(opts.path, { tracing: opts.tracing }) as any);
+            this.#engine = null;
+            return;
+        }
+
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -52,23 +58,31 @@ class Database extends DatabasePromise {
             protocolVersion: SyncEngineProtocolVersion.V1,
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
+            bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            remoteEncryption: opts.remoteEncryption?.cipher,
         });
         super(engine.db() as unknown as any);
 
-
-        let headers = typeof opts.authToken === "function" ? () => ({
-            ...(opts.authToken != null && { "Authorization": `Bearer ${(opts.authToken as any)()}` }),
-            ...(opts.encryption != null && {
-                "x-turso-encryption-key": opts.encryption.key,
-                "x-turso-encryption-cipher": opts.encryption.cipher,
-            })
-        }) : {
-            ...(opts.authToken != null && { "Authorization": `Bearer ${opts.authToken}` }),
-            ...(opts.encryption != null && {
-                "x-turso-encryption-key": opts.encryption.key,
-                "x-turso-encryption-cipher": opts.encryption.cipher,
-            })
-        };
+        let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
+        if (typeof opts.authToken == "function") {
+            const authToken = opts.authToken;
+            headers = async () => ({
+                ...(opts.authToken != null && { "Authorization": `Bearer ${await authToken()}` }),
+                ...(opts.remoteEncryption != null && {
+                    "x-turso-encryption-key": opts.remoteEncryption.key,
+                    "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
+                })
+            });
+        } else {
+            const authToken = opts.authToken;
+            headers = {
+                ...(opts.authToken != null && { "Authorization": `Bearer ${authToken}` }),
+                ...(opts.remoteEncryption != null && {
+                    "x-turso-encryption-key": opts.remoteEncryption.key,
+                    "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
+                })
+            };
+        }
         this.#runOpts = {
             url: opts.url,
             headers: headers,
@@ -83,7 +97,14 @@ class Database extends DatabasePromise {
      * connect database and initialize it in case of clean start
      */
     override async connect() {
-        await run(this.#runOpts, this.#io, this.#engine, this.#engine.connect());
+        if (this.connected) {
+            return;
+        } else if (this.#engine == null) {
+            await super.connect();
+        } else {
+            await run(this.#runOpts, this.#io, this.#engine, this.#engine.connect());
+        }
+        this.connected = true;
     }
     /**
      * pull new changes from the remote database
@@ -91,6 +112,9 @@ class Database extends DatabasePromise {
      * @returns true if new changes were pulled from the remote
      */
     async pull() {
+        if (this.#engine == null) {
+            throw new Error("sync is disabled as database was opened without sync support")
+        }
         const changes = await this.#guards.wait(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.wait()));
         if (changes.empty()) {
             return false;
@@ -103,25 +127,37 @@ class Database extends DatabasePromise {
      * if {@link DatabaseOpts.transform} is set - then provided callback will be called for every mutation before sending it to the remote
      */
     async push() {
+        if (this.#engine == null) {
+            throw new Error("sync is disabled as database was opened without sync support")
+        }
         await this.#guards.push(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.push()));
     }
     /**
      * checkpoint WAL for local database
      */
     async checkpoint() {
+        if (this.#engine == null) {
+            throw new Error("sync is disabled as database was opened without sync support")
+        }
         await this.#guards.checkpoint(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.checkpoint()));
     }
     /**
      * @returns statistic of current local database
      */
     async stats(): Promise<DatabaseStats> {
+        if (this.#engine == null) {
+            throw new Error("sync is disabled as database was opened without sync support")
+        }
         return (await run(this.#runOpts, this.#io, this.#engine, this.#engine.stats()));
     }
     /**
      * close the database
      */
     override async close(): Promise<void> {
-        this.#engine.close();
+        await super.close();
+        if (this.#engine != null) {
+            this.#engine.close();
+        }
     }
 }
 

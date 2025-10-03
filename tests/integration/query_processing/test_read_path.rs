@@ -792,11 +792,64 @@ fn test_offset_limit_bind() -> anyhow::Result<()> {
 
     conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
 
-    let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-    stmt.bind_at(1.try_into()?, Value::Integer(2));
-    stmt.bind_at(2.try_into()?, Value::Integer(1));
+    for (limit, offset, expected) in [
+        (
+            2,
+            1,
+            vec![
+                vec![turso_core::Value::Integer(4)],
+                vec![turso_core::Value::Integer(3)],
+            ],
+        ),
+        (0, 0, vec![]),
+        (1, 0, vec![vec![turso_core::Value::Integer(5)]]),
+        (0, 1, vec![]),
+        (1, 1, vec![vec![turso_core::Value::Integer(4)]]),
+    ] {
+        let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
+        stmt.bind_at(1.try_into()?, Value::Integer(limit));
+        stmt.bind_at(2.try_into()?, Value::Integer(offset));
+
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                StepResult::IO => stmt.run_once()?,
+                _ => break,
+            }
+        }
+
+        assert_eq!(rows, expected);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_upsert_parameters_order() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);",
+        false,
+    );
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
+    let mut stmt =
+        conn.prepare("INSERT INTO test VALUES (?, ?), (?, ?) ON CONFLICT DO UPDATE SET v = ?")?;
+    stmt.bind_at(1.try_into()?, Value::Integer(1));
+    stmt.bind_at(2.try_into()?, Value::Integer(20));
+    stmt.bind_at(3.try_into()?, Value::Integer(3));
+    stmt.bind_at(4.try_into()?, Value::Integer(40));
+    stmt.bind_at(5.try_into()?, Value::Integer(66));
+    while let StepResult::Row | StepResult::IO = stmt.step()? {
+        stmt.run_once()?;
+    }
 
     let mut rows = Vec::new();
+    let mut stmt = conn.prepare("SELECT * FROM test")?;
     loop {
         match stmt.step()? {
             StepResult::Row => {
@@ -811,10 +864,15 @@ fn test_offset_limit_bind() -> anyhow::Result<()> {
     assert_eq!(
         rows,
         vec![
-            vec![turso_core::Value::Integer(4)],
-            vec![turso_core::Value::Integer(3)]
+            vec![
+                turso_core::Value::Integer(1),
+                turso_core::Value::Integer(66)
+            ],
+            vec![
+                turso_core::Value::Integer(3),
+                turso_core::Value::Integer(66)
+            ]
         ]
     );
-
     Ok(())
 }

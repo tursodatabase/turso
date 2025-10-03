@@ -317,6 +317,7 @@ mod tests {
                 enable_views: true,
                 enable_strict: false,
                 enable_load_extension: false,
+                enable_encryption: false,
             },
             None,
         )?;

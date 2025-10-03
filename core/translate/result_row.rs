@@ -1,4 +1,4 @@
-use turso_parser::ast::{Expr, Literal, Name, Operator, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
 
 use crate::{
     vdbe::{
@@ -178,8 +178,8 @@ pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
     match expr.as_ref() {
         Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
         Expr::Literal(Literal::Null) => Some(0),
-        Expr::Id(Name::Ident(s)) => {
-            let lowered = s.to_ascii_lowercase();
+        Expr::Id(name) if !name.quoted() => {
+            let lowered = name.as_str();
             if lowered == "true" {
                 Some(1)
             } else if lowered == "false" {

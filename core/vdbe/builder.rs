@@ -1,4 +1,7 @@
-use std::{cell::Cell, cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::{atomic::AtomicI64, Arc},
+};
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
@@ -120,6 +123,7 @@ pub struct ProgramBuilder {
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
     pub param_ctx: ParamState,
+    pub(crate) reg_result_cols_start: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +210,7 @@ impl ProgramBuilder {
             query_mode,
             current_parent_explain_idx: None,
             param_ctx: ParamState::default(),
+            reg_result_cols_start: None,
         }
     }
 
@@ -321,7 +326,7 @@ impl ProgramBuilder {
     pub fn add_pragma_result_column(&mut self, col_name: String) {
         // TODO figure out a better type definition for ResultSetColumn
         // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::Ident("".to_string()));
+        let expr = ast::Expr::Id(ast::Name::exact("".to_string()));
         self.result_columns.push(ResultSetColumn {
             expr,
             alias: Some(col_name),
@@ -1002,7 +1007,7 @@ impl ProgramBuilder {
             comments: self.comments,
             connection,
             parameters: self.parameters,
-            n_change: Cell::new(0),
+            n_change: AtomicI64::new(0),
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,

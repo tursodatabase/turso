@@ -35,11 +35,11 @@ struct Args {
     mode: TransactionMode,
 
     #[arg(
-        long = "think",
+        long = "compute",
         default_value = "0",
-        help = "Per transaction think time (ms)"
+        help = "Per transaction compute time (us)"
     )]
-    think: u64,
+    compute: u64,
 
     #[arg(
         long = "timeout",
@@ -52,8 +52,7 @@ struct Args {
     io: Option<IoOption>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_ansi(false)
@@ -61,11 +60,15 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    println!(
-        "Running write throughput benchmark with {} threads, {} batch size, {} iterations, mode: {:?}",
-        args.threads, args.batch_size, args.iterations, args.mode
-    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.threads)
+        .build()
+        .unwrap();
 
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
     let db_path = "write_throughput_test.db";
     if std::path::Path::new(db_path).exists() {
         std::fs::remove_file(db_path).expect("Failed to remove existing database");
@@ -95,7 +98,7 @@ async fn main() -> Result<()> {
             args.iterations,
             barrier,
             args.mode,
-            args.think,
+            args.compute,
             timeout,
         ));
 
@@ -120,21 +123,10 @@ async fn main() -> Result<()> {
     let overall_elapsed = overall_start.elapsed();
     let overall_throughput = (total_inserts as f64) / overall_elapsed.as_secs_f64();
 
-    println!("\n=== BENCHMARK RESULTS ===");
-    println!("Total inserts: {total_inserts}");
-    println!("Total time: {:.2}s", overall_elapsed.as_secs_f64());
-    println!("Overall throughput: {overall_throughput:.2} inserts/sec");
-    println!("Threads: {}", args.threads);
-    println!("Batch size: {}", args.batch_size);
-    println!("Iterations per thread: {}", args.iterations);
-
     println!(
-        "Database file exists: {}",
-        std::path::Path::new(db_path).exists()
+        "Turso,{},{},{},{:.2}",
+        args.threads, args.batch_size, args.compute, overall_throughput
     );
-    if let Ok(metadata) = std::fs::metadata(db_path) {
-        println!("Database file size: {} bytes", metadata.len());
-    }
 
     Ok(())
 }
@@ -171,7 +163,6 @@ async fn setup_database(
     )
     .await?;
 
-    println!("Database created at: {db_path}");
     Ok(db)
 }
 
@@ -183,12 +174,11 @@ async fn worker_thread(
     iterations: usize,
     start_barrier: Arc<Barrier>,
     mode: TransactionMode,
-    think_ms: u64,
+    compute_usec: u64,
     timeout: Duration,
 ) -> Result<u64> {
     start_barrier.wait();
 
-    let start_time = Instant::now();
     let total_inserts = Arc::new(AtomicU64::new(0));
 
     let mut tx_futs = vec![];
@@ -208,6 +198,9 @@ async fn worker_thread(
             };
             conn.execute(begin_stmt, ()).await?;
 
+            let result = perform_compute(thread_id, compute_usec);
+            std::hint::black_box(result);
+
             for i in 0..batch_size {
                 let id = thread_id * iterations * batch_size + iteration * batch_size + i;
                 stmt.execute(turso::params::Params::Positional(vec![
@@ -216,10 +209,6 @@ async fn worker_thread(
                 ]))
                 .await?;
                 total_inserts.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if think_ms > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(think_ms)).await;
             }
 
             conn.execute("COMMIT", ()).await?;
@@ -236,17 +225,21 @@ async fn worker_thread(
         result?;
     }
 
-    let elapsed = start_time.elapsed();
     let final_inserts = total_inserts.load(Ordering::Relaxed);
-    let throughput = (final_inserts as f64) / elapsed.as_secs_f64();
-
-    println!(
-        "Thread {}: {} inserts in {:.2}s ({:.2} inserts/sec)",
-        thread_id,
-        final_inserts,
-        elapsed.as_secs_f64(),
-        throughput
-    );
 
     Ok(final_inserts)
+}
+
+// Busy loop to simulate CPU or GPU bound computation (for example, parsing,
+// data aggregation or ML inference).
+fn perform_compute(thread_id: usize, usec: u64) -> u64 {
+    if usec == 0 {
+        return 0;
+    }
+    let start = Instant::now();
+    let mut sum: u64 = 0;
+    while start.elapsed().as_micros() < usec as u128 {
+        sum = sum.wrapping_add(thread_id as u64);
+    }
+    sum
 }

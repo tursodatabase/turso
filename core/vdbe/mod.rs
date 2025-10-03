@@ -63,10 +63,12 @@ use execute::{
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
-    cell::Cell,
     collections::HashMap,
     num::NonZero,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
 };
 use tracing::{instrument, Level};
 
@@ -162,7 +164,7 @@ impl BranchOffset {
 
 pub type CursorID = usize;
 
-pub type PageIdx = usize;
+pub type PageIdx = i64;
 
 // Index of insn in list of insns
 type InsnReference = u32;
@@ -393,7 +395,6 @@ impl ProgramState {
             self.registers
                 .resize_with(max_resgisters, || Register::Value(Value::Null));
         }
-        self.cursors.iter_mut().for_each(|c| *c = None);
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
@@ -402,7 +403,6 @@ impl ProgramState {
         self.ended_coroutine.0 = [0; 4];
         self.regex_cache.like.clear();
         self.interrupted = false;
-        self.parameters.clear();
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -492,7 +492,7 @@ pub struct Program {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
-    pub n_change: Cell<i64>,
+    pub n_change: AtomicI64,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -511,7 +511,7 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<Arc<MvStore>>,
+        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
     ) -> Result<StepResult> {
@@ -525,7 +525,7 @@ impl Program {
     fn explain_step(
         &self,
         state: &mut ProgramState,
-        _mv_store: Option<Arc<MvStore>>,
+        _mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
@@ -579,7 +579,7 @@ impl Program {
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
-        _mv_store: Option<Arc<MvStore>>,
+        _mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
@@ -627,7 +627,7 @@ impl Program {
     fn normal_step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<Arc<MvStore>>,
+        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
@@ -649,7 +649,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -664,7 +664,7 @@ impl Program {
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, &pager, mv_store.as_ref()) {
+            match insn_function(self, state, insn, &pager, mv_store) {
                 Ok(InsnFunctionStepResult::Step) => {
                     // Instruction completed, moving to next
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -693,7 +693,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err, mv_store.as_ref())?;
+                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
                     return Err(err);
                 }
             }
@@ -898,7 +898,8 @@ impl Program {
                 }
             } else {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
                 Ok(IOResult::Done(()))
             }
@@ -917,7 +918,8 @@ impl Program {
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
-                    self.connection.set_changes(self.n_change.get());
+                    self.connection
+                        .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
                 connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;

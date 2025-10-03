@@ -7,12 +7,12 @@
   },
   "workspaces": [
     "packages/common",
+    "packages/wasm-common",
     "packages/native",
-    "packages/browser-common",
-    "packages/browser",
+    "packages/wasm",
     "sync/packages/common",
     "sync/packages/native",
-    "sync/packages/browser"
+    "sync/packages/wasm"
   ],
-  "version": "0.2.0-pre.10"
+  "version": "0.2.0-pre.14"
 }

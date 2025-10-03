@@ -31,13 +31,6 @@ pub fn emit_program_for_compound_select(
     };
 
     let right_plan = right_most.clone();
-    // Trivial exit on LIMIT 0
-    if matches!(limit.as_ref().and_then(try_fold_expr_to_i64), Some(v) if v == 0) {
-        program.result_columns = right_plan.result_columns;
-        program.table_references.extend(right_plan.table_references);
-        return Ok(());
-    }
-
     let right_most_ctx = TranslateCtx::new(
         program,
         resolver.schema,
@@ -140,6 +133,14 @@ fn emit_compound_select(
         unreachable!()
     };
 
+    let compound_select_end = program.allocate_label();
+    if let Some(limit_ctx) = &limit_ctx {
+        program.emit_insn(Insn::IfNot {
+            reg: limit_ctx.reg_limit,
+            target_pc: compound_select_end,
+            jump_if_null: false,
+        });
+    }
     let mut right_most_ctx = TranslateCtx::new(
         program,
         schema,
@@ -365,6 +366,8 @@ fn emit_compound_select(
             program.pop_current_parent_explain();
         }
     }
+
+    program.preassign_label_to_next_insn(compound_select_end);
 
     Ok(())
 }

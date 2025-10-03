@@ -22,7 +22,6 @@ COPY parser ./parser/
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
-COPY vendored ./vendored/
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
 COPY stress ./stress/
@@ -42,7 +41,6 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin limbo_sim --release --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
-COPY --from=planner /app/vendored ./vendored/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
 COPY --from=planner /app/parser ./parser/

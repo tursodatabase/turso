@@ -73,11 +73,25 @@ pub struct GroupBy {
 pub struct WhereTerm {
     /// The original condition expression.
     pub expr: ast::Expr,
-    /// Is this condition originally from an OUTER JOIN, and if so, what is the internal ID of the [TableReference] that it came from?
-    /// The ID is always the right-hand-side table of the OUTER JOIN.
-    /// If `from_outer_join` is Some, we need to evaluate this term at the loop of the the corresponding table,
-    /// regardless of which tables it references.
-    /// We also cannot e.g. short circuit the entire query in the optimizer if the condition is statically false.
+    /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
+    /// and let the optimizer determine when each should be evaluated based on the tables they reference.
+    /// See e.g. [EvalAt].
+    /// For example, in "SELECT * FROM x JOIN y WHERE x.a = 2", we want to evaluate x.a = 2 right after opening x
+    /// since it only depends on x.
+    ///
+    /// However, OUTER JOIN conditions require special handling. Consider:
+    ///   SELECT * FROM t LEFT JOIN s ON t.a = 2
+    ///
+    /// Even though t.a = 2 only references t, we cannot evaluate it during t's loop and skip rows where t.a != 2.
+    /// Instead, we must:
+    /// 1. Process ALL rows from t
+    /// 2. For each t row where t.a != 2, emit NULL values for s's columns
+    /// 3. For each t row where t.a = 2, emit the actual s values
+    ///
+    /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
+    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
+    /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
+    /// is set, we force evaluation to happen during that table's loop.
     pub from_outer_join: Option<TableInternalId>,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
@@ -367,7 +381,7 @@ impl SelectPlan {
         }
 
         let count = ast::Expr::FunctionCall {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             distinctness: None,
             args: vec![],
             order_by: vec![],
@@ -377,7 +391,7 @@ impl SelectPlan {
             },
         };
         let count_star = ast::Expr::FunctionCallStar {
-            name: ast::Name::Ident("count".to_string()),
+            name: ast::Name::exact("count".to_string()),
             filter_over: ast::FunctionTail {
                 filter_clause: None,
                 over_clause: None,
@@ -719,8 +733,16 @@ impl TableReferences {
     }
 
     pub fn contains_table(&self, table: &Table) -> bool {
-        self.joined_tables.iter().any(|t| t.table == *table)
-            || self.outer_query_refs.iter().any(|t| t.table == *table)
+        self.joined_tables
+            .iter()
+            .map(|t| &t.table)
+            .chain(self.outer_query_refs.iter().map(|t| &t.table))
+            .any(|t| match t {
+                Table::FromClauseSubquery(subquery_table) => {
+                    subquery_table.plan.table_references.contains_table(table)
+                }
+                _ => t == table,
+            })
     }
 
     pub fn extend(&mut self, other: TableReferences) {
@@ -760,6 +782,7 @@ impl ColumnUsedMask {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     // Scan operation
     // This operation is used to scan a table.
@@ -792,19 +815,6 @@ impl Operation {
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
-        }
-    }
-
-    pub fn returns_max_1_row(&self) -> bool {
-        match self {
-            Operation::Scan(_) => false,
-            Operation::Search(Search::RowidEq { .. }) => true,
-            Operation::Search(Search::Seek { index, seek_def }) => {
-                let Some(index) = index else {
-                    return false;
-                };
-                index.unique && seek_def.seek.as_ref().is_some_and(|seek| seek.op.eq_only())
-            }
         }
     }
 }
@@ -1065,7 +1075,7 @@ pub enum Scan {
 
 /// An enum that represents a search operation that can be used to search for a row in a table using an index
 /// (i.e. a primary key or a secondary index)
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Search {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.

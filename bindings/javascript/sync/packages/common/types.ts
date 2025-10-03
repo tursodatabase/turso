@@ -61,7 +61,7 @@ export interface EncryptionOpts {
     // base64 encoded encryption key (must be either 16 or 32 bytes depending on the cipher)
     key: string,
     // encryption cipher algorithm
-    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305'
+    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis256'
 }
 export interface DatabaseOpts {
     /**
@@ -73,22 +73,26 @@ export interface DatabaseOpts {
     /**
      * optional url of the remote database (e.g. libsql://db-org.turso.io)
      * (if omitted - local-only database will be created)
+     * 
+     * you can also promide function which will return URL or null
+     * in this case local database will be created and sync will be "switched-on" whenever the url will return non-empty value
+     * note, that all other parameters (like encryption) must be set in advance in order for the "deferred" sync to work properly
      */
-    url?: string;
+    url?: string | (() => string | null);
     /**
      * auth token for the remote database
      * (can be either static string or function which will provide short-lived credentials for every new request)
      */
-    authToken?: string | (() => string);
+    authToken?: string | (() => Promise<string>);
     /**
      * arbitrary client name which can be used to distinguish clients internally
      * the library will gurantee uniquiness of the clientId by appending unique suffix to the clientName
      */
     clientName?: string;
     /**
-     * optional encryption parameters if cloud database were encrypted by default
+     * optional remote encryption parameters if cloud database were encrypted by default
      */
-    encryption?: EncryptionOpts;
+    remoteEncryption?: EncryptionOpts;
     /**
      * optional callback which will be called for every mutation before sending it to the remote
      * this callback can transform the update in order to support complex conflict resolution strategy
@@ -136,8 +140,8 @@ export interface DatabaseStats {
 
 export interface RunOpts {
     preemptionMs: number,
-    url: string,
-    headers: { [K: string]: string } | (() => { [K: string]: string })
+    url: string | (() => string | null),
+    headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>)
     transform?: Transform,
 }
 

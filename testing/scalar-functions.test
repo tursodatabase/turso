@@ -622,6 +622,51 @@ do_execsql_test substring-2-args-exceed-length {
   SELECT substring('limbo', 10);
 } {}
 
+do_execsql_test substring-with-blob {
+    select substr(x'446F6E7450616E696321', 0);
+} {DontPanic!}
+
+do_execsql_test substring-with-blob-size {
+    select substr(x'446F6E7450616E696321', 5, 6);
+} {Panic!}
+
+# https://github.com/tursodatabase/turso/issues/3306
+do_execsql_test substring-with-blob-sanity {
+    with t as (select hex(substr(x'414243',2,1)) as slice) select slice, typeof(slice), length(slice) from t;
+} {42|text|2}
+
+do_execsql_test substring-with-numbers {
+    select substr(12345678987654, 5, 6);
+} {567898}
+
+do_execsql_test substring-with-numbers {
+    select substr(12345678987654, 0);
+} {12345678987654}
+
+do_execsql_test substring-emoji-1 {
+    SELECT substr('😁😅', 1, 1);
+} {😁}
+
+do_execsql_test substring-emoji-2 {
+    SELECT substr('😁😅', 1, 2);
+} {😁😅}
+
+do_execsql_test substring-emoji-3 {
+    SELECT substr('😁😅', 1);
+} {😁😅}
+
+do_execsql_test substring-utf8-emoji-1 {
+    SELECT substr('a😁ã😅', 2, 1);
+} {😁}
+
+do_execsql_test substring-utf8-emoji-2 {
+    SELECT substr('a😁ã😅', 2, 2);
+} {😁ã}
+
+do_execsql_test substring-utf8-emoji-3 {
+    SELECT substr('a😁ã😅', 2, 3);
+} {😁ã😅}
+
 do_execsql_test typeof-null {
   SELECT typeof(null);
 } {null}
@@ -943,6 +988,40 @@ do_execsql_test parse-large-integral-numeric-string-as-number {
 do_execsql_test length-999123 {
   select length('a' || char(0) || 'b');
 } {1}
+
+# refer https://github.com/tursodatabase/turso/issues/3285
+do_execsql_test sum-1 {
+  select sum('1'+'2');
+} {3}
+
+do_execsql_test sum-2 {
+  select sum('a1'+'a2');
+} {0}
+
+do_execsql_test sum-3 {
+  select sum('11a'+'21a2');
+} {32}
+
+do_execsql_test sum-4 {
+  select sum('?.a'+'a2');
+} {0}
+
+do_execsql_test sum-5 {
+  select sum('1*2a'+'a2');
+} {1}
+
+do_execsql_test sum-6 {
+  select sum('1+2a'+'a2');
+} {1}
+
+do_execsql_test sum-7 {
+  select sum('1-2a'+'a2');
+} {1}
+
+do_execsql_test sum-8 {
+  select sum('1.2a'+'a2');
+} {1.2}
+
 
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {

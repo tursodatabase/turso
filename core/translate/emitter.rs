@@ -234,14 +234,6 @@ fn emit_program_for_select(
         plan.table_references.joined_tables().len(),
     );
 
-    // Trivial exit on LIMIT 0
-    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit == 0 {
-            program.result_columns = plan.result_columns;
-            program.table_references.extend(plan.table_references);
-            return Ok(());
-        }
-    }
     // Emit main parts of query
     emit_query(program, &mut plan, &mut t_ctx)?;
 
@@ -256,21 +248,23 @@ pub fn emit_query<'a>(
     plan: &'a mut SelectPlan,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
+    let after_main_loop_label = program.allocate_label();
+    t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    init_limit(program, t_ctx, &plan.limit, &plan.offset);
+
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+        program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
     }
 
     // Emit subqueries first so the results can be read in the main query loop.
     emit_subqueries(program, t_ctx, &mut plan.table_references)?;
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset);
-
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
     // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set
-    let after_main_loop_label = program.allocate_label();
-    t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -292,6 +286,7 @@ pub fn emit_query<'a>(
     // Allocate registers for result columns
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
+        program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
     // Initialize cursors and other resources needed for query execution
@@ -424,20 +419,12 @@ fn emit_program_for_delete(
         plan.table_references.joined_tables().len(),
     );
 
-    // exit early if LIMIT 0
-    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit == 0 {
-            program.result_columns = plan.result_columns;
-            program.table_references.extend(plan.table_references);
-            return Ok(());
-        }
-    }
+    let after_main_loop_label = program.allocate_label();
+    t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
     init_limit(program, &mut t_ctx, &plan.limit, &None);
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
-    let after_main_loop_label = program.allocate_label();
-    t_ctx.label_main_loop_end = Some(after_main_loop_label);
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -720,18 +707,12 @@ fn emit_program_for_update(
         plan.table_references.joined_tables().len(),
     );
 
-    // Exit on LIMIT 0
-    if let Some(limit) = plan.limit.as_ref().and_then(try_fold_expr_to_i64) {
-        if limit == 0 {
-            program.result_columns = plan.returning.unwrap_or_default();
-            program.table_references.extend(plan.table_references);
-            return Ok(());
-        }
-    }
-
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset);
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
+
+    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset);
+
+    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
         program.emit_insn(Insn::Goto {
             target_pc: after_main_loop_label,
@@ -1758,6 +1739,7 @@ fn init_limit(
     let Some(limit_ctx) = &t_ctx.limit_ctx else {
         return;
     };
+
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
             if let Some(value) = try_fold_expr_to_i64(expr) {
@@ -1808,6 +1790,16 @@ fn init_limit(
             }
         }
     }
+
+    // exit early if LIMIT 0
+    let main_loop_end = t_ctx
+        .label_main_loop_end
+        .expect("label_main_loop_end must be set before init_limit");
+    program.emit_insn(Insn::IfNot {
+        reg: limit_ctx.reg_limit,
+        target_pc: main_loop_end,
+        jump_if_null: false,
+    });
 }
 
 /// We have `Expr`s which have *not* had column references bound to them,
@@ -1836,7 +1828,7 @@ fn rewrite_where_for_update_registers(
                     }
                 }
             }
-            Expr::Id(ast::Name::Ident(name)) | Expr::Id(ast::Name::Quoted(name)) => {
+            Expr::Id(name) => {
                 let normalized = normalize_ident(name.as_str());
                 if ROWID_STRS
                     .iter()

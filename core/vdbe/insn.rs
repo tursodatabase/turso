@@ -859,7 +859,7 @@ pub enum Insn {
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The root page of the table/index to destroy
-        root: usize,
+        root: i64,
         /// Register to store the former value of any moved root page (for AUTOVACUUM)
         former_root_reg: usize,
         /// Whether this is a temporary table (1) or main database table (0)
@@ -1093,7 +1093,7 @@ pub enum Insn {
     /// stored in P4_INTARRAY argument. If P5 is not zero, the check is done on the auxiliary database file, not the main database file. This opcode is used to implement the integrity_check pragma.
     IntegrityCk {
         max_errors: usize,
-        roots: Vec<usize>,
+        roots: Vec<i64>,
         message_register: usize,
     },
     RenameTable {

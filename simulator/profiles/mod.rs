@@ -28,7 +28,7 @@ pub struct Profile {
     #[garde(skip)]
     /// Experimental MVCC feature
     pub experimental_mvcc: bool,
-    #[garde(range(min = 1))]
+    #[garde(range(min = 1, max = 64))]
     pub max_connections: usize,
     #[garde(dive)]
     pub io: IOProfile,
@@ -106,11 +106,34 @@ impl Profile {
         profile
     }
 
+    /// Simple profile for testing MVCC: 2 connections, 1 table, no faults, no indexes
+    pub fn simple_mvcc() -> Self {
+        let profile = Profile {
+            io: IOProfile {
+                fault: FaultProfile {
+                    enable: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            query: QueryProfile {
+                create_table_weight: 0,
+                create_index_weight: 0,
+                ..Default::default()
+            },
+            experimental_mvcc: true,
+            max_connections: 2,
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn parse_from_type(profile_type: ProfileType) -> anyhow::Result<Self> {
         let profile = match profile_type {
             ProfileType::Default => Self::default(),
             ProfileType::WriteHeavy => Self::write_heavy(),
             ProfileType::Faultless => Self::faultless(),
+            ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -149,6 +172,7 @@ pub enum ProfileType {
     Default,
     WriteHeavy,
     Faultless,
+    SimpleMvcc,
     #[strum(disabled)]
     Custom(PathBuf),
 }

@@ -247,7 +247,7 @@ pub enum AggregateEvalState {
 #[derive(Debug)]
 pub struct AggregateOperator {
     // Unique operator ID for indexing in persistent storage
-    pub operator_id: usize,
+    pub operator_id: i64,
     // GROUP BY column indices
     group_by: Vec<usize>,
     // Aggregate functions to compute (including MIN/MAX)
@@ -796,7 +796,7 @@ impl AggregateState {
 
 impl AggregateOperator {
     pub fn new(
-        operator_id: usize,
+        operator_id: i64,
         group_by: Vec<usize>,
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
@@ -1765,7 +1765,7 @@ impl MinMaxPersistState {
 
     pub fn persist_min_max(
         &mut self,
-        operator_id: usize,
+        operator_id: i64,
         column_min_max: &HashMap<usize, AggColumnInfo>,
         cursors: &mut DbspStateCursors,
         generate_group_hash: impl Fn(&str) -> Hash128,

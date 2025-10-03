@@ -65,11 +65,31 @@ test('file-must-exist', async () => {
     await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open file/);
 })
 
-test('explicit connect', async () => {
+test('implicit connect', async () => {
     const db = new Database(':memory:');
-    expect(() => db.prepare("SELECT 1")).toThrowError(/database must be connected/g);
-    await db.connect();
+    const defer = db.prepare("SELECT * FROM t");
+    await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
+    expect(() => db.prepare("SELECT * FROM t")).toThrowError(/no such table: t/);
     expect(await db.prepare("SELECT 1 as x").all()).toEqual([{ x: 1 }]);
+})
+
+test('zero-limit-bug', async () => {
+    const db = await connect(':memory:');
+    const create = db.prepare(`CREATE TABLE users (name TEXT NOT NULL);`);
+    await create.run();
+
+    const insert = db.prepare(
+        `insert into "users" values (?), (?), (?);`,
+    );
+    await insert.run('John', 'Jane', 'Jack');
+
+    const stmt1 = db.prepare(`select * from "users" limit ?;`);
+    expect(await stmt1.all(0)).toEqual([]);
+    let rows = [{ name: 'John' }, { name: 'Jane' }, { name: 'Jack' }, { name: 'John' }, { name: 'Jane' }, { name: 'Jack' }];
+    for (const limit of [0, 1, 2, 3, 4, 5, 6, 7]) {
+        const stmt2 = db.prepare(`select * from "users" union all select * from "users" limit ?;`);
+        expect(await stmt2.all(limit)).toEqual(rows.slice(0, Math.min(limit, 6)));
+    }
 })
 
 test('avg-bug', async () => {
@@ -115,6 +135,37 @@ test('offset-bug', async () => {
 
     const stmt = db.prepare(`SELECT * FROM users LIMIT ? OFFSET ?;`);
     expect(await stmt.all(1, 1)).toEqual([{ id: 2, name: 'John1', verified: 0 }])
+})
+
+test('conflict-bug', async () => {
+    const db = await connect(':memory:');
+
+    const create = db.prepare(`create table "conflict_chain_example" (
+        id integer not null unique,
+        name text not null,
+        email text not null,
+        primary key (id, name)
+    )`);
+    await create.run();
+
+    await db.prepare(`insert into "conflict_chain_example" ("id", "name", "email") values (?, ?, ?), (?, ?, ?)`).run(
+        1,
+        'John',
+        'john@example.com',
+        2,
+        'John Second',
+        '2john@example.com',
+    );
+
+    const insert = db.prepare(
+        `insert into "conflict_chain_example" ("id", "name", "email") values (?, ?, ?), (?, ?, ?) on conflict ("conflict_chain_example"."id", "conflict_chain_example"."name") do update set "email" = ? on conflict ("conflict_chain_example"."id") do nothing`,
+    );
+    await insert.run(1, 'John', 'john@example.com', 2, 'Anthony', 'idthief@example.com', 'john1@example.com');
+
+    expect(await db.prepare("SELECT * FROM conflict_chain_example").all()).toEqual([
+        { id: 1, name: 'John', email: 'john1@example.com' },
+        { id: 2, name: 'John Second', email: '2john@example.com' }
+    ]);
 })
 
 test('on-disk db', async () => {

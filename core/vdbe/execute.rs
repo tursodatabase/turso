@@ -73,7 +73,7 @@ use super::{
 };
 use parking_lot::RwLock;
 use rand::{thread_rng, Rng};
-use turso_parser::ast;
+use turso_parser::ast::{self, Name};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -1037,13 +1037,13 @@ pub fn op_open_read(
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = *root_page as u64;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
+        assert!(*root_page >= 0, "");
         None
     };
     let cursors = &mut state.cursors;
@@ -1712,7 +1712,9 @@ pub fn op_column(
 
                             match serial_type {
                                 // NULL
-                                0 => break 'ifnull,
+                                0 => {
+                                    state.registers[*dest] = Register::Value(Value::Null);
+                                }
                                 // I8
                                 1 => {
                                     state.registers[*dest] =
@@ -2412,6 +2414,7 @@ pub fn op_transaction_inner(
                 }
 
                 state.pc += 1;
+                state.op_transaction_state = OpTransactionState::Start;
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -2472,9 +2475,11 @@ pub fn op_auto_commit(
             }
         } else {
             let is_begin = !*auto_commit && !*rollback;
-            return Err(LimboError::TxError(
-                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-            ));
+            if is_begin {
+                return Err(LimboError::TxError(
+                    "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+                ));
+            }
         }
     }
 
@@ -3679,13 +3684,17 @@ pub fn op_agg_step(
                                 match acc_i.checked_add(i) {
                                     Some(sum) => *acc = Value::Integer(sum),
                                     None => {
-                                        // Overflow -> switch to float with KBN summation
-                                        let acc_f = *acc_i as f64;
-                                        *acc = Value::Float(acc_f);
-                                        sum_state.approx = true;
-                                        sum_state.ovrfl = true;
+                                        if matches!(func, AggFunc::Total) {
+                                            // Total() never throw an integer overflow -> switch to float with KBN summation
+                                            let acc_f = *acc_i as f64;
+                                            *acc = Value::Float(acc_f);
+                                            sum_state.approx = true;
+                                            sum_state.ovrfl = true;
 
-                                        apply_kbn_step_int(acc, i, sum_state);
+                                            apply_kbn_step_int(acc, i, sum_state);
+                                        } else {
+                                            return Err(LimboError::IntegerOverflow);
+                                        }
                                     }
                                 }
                             }
@@ -3698,6 +3707,7 @@ pub fn op_agg_step(
                         Value::Float(f) => match acc {
                             Value::Null => {
                                 *acc = Value::Float(f);
+                                sum_state.approx = true;
                             }
                             Value::Integer(i) => {
                                 let i_f = *i as f64;
@@ -3711,11 +3721,18 @@ pub fn op_agg_step(
                             }
                             _ => unreachable!(),
                         },
-
-                        _ => {
-                            //  If any input to sum() is neither an integer nor a NULL, then sum() returns a float
-                            // https://sqlite.org/lang_aggfunc.html
-                            sum_state.approx = true;
+                        Value::Text(t) => {
+                            let s = t.as_str();
+                            let (_, parsed_number) = try_for_float(s);
+                            handle_text_sum(acc, sum_state, parsed_number);
+                        }
+                        Value::Blob(b) => {
+                            if let Ok(s) = std::str::from_utf8(&b) {
+                                let (_, parsed_number) = try_for_float(s);
+                                handle_text_sum(acc, sum_state, parsed_number);
+                            } else {
+                                handle_text_sum(acc, sum_state, ParsedNumber::None);
+                            }
                         }
                     }
                 }
@@ -5230,7 +5247,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::new(original_rename_to),
+                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -5256,7 +5273,7 @@ pub fn op_function(
                                     ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::new(original_rename_to),
+                                            name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
                                         temporary,
@@ -5328,11 +5345,12 @@ pub fn op_function(
 
                                 for column in &mut columns {
                                     match column.expr.as_mut() {
-                                        ast::Expr::Id(ast::Name::Ident(id))
-                                        | ast::Expr::Id(ast::Name::Quoted(id))
-                                            if normalize_ident(id) == rename_from =>
+                                        ast::Expr::Id(id)
+                                            if normalize_ident(id.as_str()) == rename_from =>
                                         {
-                                            *id = column_def.col_name.as_str().to_owned();
+                                            *id = Name::exact(
+                                                column_def.col_name.as_str().to_owned(),
+                                            );
                                         }
                                         _ => {}
                                     }
@@ -5372,7 +5390,7 @@ pub fn op_function(
                                 let column = columns
                                     .iter_mut()
                                     .find(|column| {
-                                        column.col_name == ast::Name::new(original_rename_from)
+                                        column.col_name.as_str() == original_rename_from.as_str()
                                     })
                                     .expect("column being renamed should be present");
 
@@ -5727,8 +5745,9 @@ pub fn op_insert(
                 if let Some(rowid) = maybe_rowid {
                     program.connection.update_last_rowid(rowid);
 
-                    let prev_changes = program.n_change.get();
-                    program.n_change.set(prev_changes + 1);
+                    program
+                        .n_change
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -5944,8 +5963,9 @@ pub fn op_delete(
     }
 
     state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
-    let prev_changes = program.n_change.get();
-    program.n_change.set(prev_changes + 1);
+    program
+        .n_change
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6594,9 +6614,9 @@ pub fn op_open_write(
     let pager = program.get_pager_from_database_index(db);
 
     let root_page = match root_page {
-        RegisterOrLiteral::Literal(lit) => *lit as u64,
+        RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
-            Value::Integer(val) => *val as u64,
+            Value::Integer(val) => *val,
             _ => {
                 return Err(LimboError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
@@ -6605,7 +6625,7 @@ pub fn op_open_write(
         },
     };
 
-    const SQLITE_SCHEMA_ROOT_PAGE: u64 = 1;
+    const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 
     if root_page == SQLITE_SCHEMA_ROOT_PAGE {
         if let Some(mv_store) = mv_store {
@@ -6628,10 +6648,9 @@ pub fn op_open_write(
         _ => None,
     };
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = root_page;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
+            MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
         ));
         Some(mv_cursor)
     } else {
@@ -6648,7 +6667,7 @@ pub fn op_open_write(
         let cursor = BTreeCursor::new_index(
             mv_cursor,
             pager.clone(),
-            root_page as usize,
+            root_page,
             index.as_ref(),
             num_columns,
         );
@@ -6665,8 +6684,7 @@ pub fn op_open_write(
             ),
         };
 
-        let cursor =
-            BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns);
+        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns);
         cursors
             .get_mut(*cursor_id)
             .unwrap()
@@ -6719,7 +6737,7 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store {
         let root_page = mv_store.get_next_table_id();
-        state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+        state.registers[*root] = Register::Value(Value::Integer(root_page));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -6747,6 +6765,11 @@ pub fn op_destroy(
     );
     if *is_temp == 1 {
         todo!("temp databases not implemented yet.");
+    }
+    if mv_store.is_some() {
+        // MVCC only does pager operations in checkpoint
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
     let mut cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
@@ -6939,7 +6962,6 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
-                mv_store,
             )
         })
     } else {
@@ -6955,7 +6977,6 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
-                mv_store,
             )
         })
     };
@@ -7399,19 +7420,9 @@ pub fn op_open_ephemeral(
             } else {
                 &CreateBTreeFlags::new_index()
             };
-            let root_page = return_if_io!(pager.btree_create(flag));
+            let root_page = return_if_io!(pager.btree_create(flag)) as i64;
 
             let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
-            let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let table_id = root_page as u64;
-                let mv_store = mv_store.unwrap().clone();
-                let mv_cursor = Arc::new(RwLock::new(
-                    MvCursor::new(mv_store.clone(), tx_id, table_id, pager.clone()).unwrap(),
-                ));
-                Some(mv_cursor)
-            } else {
-                None
-            };
 
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -7420,15 +7431,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(
-                    mv_cursor,
-                    pager.clone(),
-                    root_page as usize,
-                    index,
-                    num_columns,
-                )
+                BTreeCursor::new_index(None, pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page as usize, num_columns)
+                BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
@@ -7508,12 +7513,11 @@ pub fn op_open_dup(
     let pager = &original_cursor.pager;
 
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let table_id = root_page as u64;
         let mv_store = mv_store.unwrap().clone();
         let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
             mv_store,
             tx_id,
-            table_id,
+            root_page,
             pager.clone(),
         )?));
         Some(mv_cursor)
@@ -7744,7 +7748,7 @@ pub fn op_integrity_check(
                         .get()));
                 integrity_check_state.set_expected_freelist_count(expected_freelist_count as usize);
                 integrity_check_state.start(
-                    freelist_trunk_page as usize,
+                    freelist_trunk_page as i64,
                     PageCategory::FreeListTrunk,
                     &mut errors,
                 );
@@ -7906,7 +7910,7 @@ pub fn op_drop_column(
             .get_mut(&normalized_table_name)
             .expect("table being renamed should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table = Arc::get_mut(table).expect("this should be the only strong reference");
 
         let Table::BTree(btree) = table else {
             panic!("only btree tables can be renamed");
@@ -7916,29 +7920,49 @@ pub fn op_drop_column(
         btree.columns.remove(*column_index)
     });
 
-    let schema = conn.schema.read();
-    if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
-        for index in indexes {
-            if index
-                .columns
-                .iter()
-                .any(|column| column.pos_in_table == *column_index)
-            {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": indexed"
-                )));
+    {
+        let schema = conn.schema.read();
+        if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
+            for index in indexes {
+                if index
+                    .columns
+                    .iter()
+                    .any(|column| column.pos_in_table == *column_index)
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot drop column \"{column_name}\": indexed"
+                    )));
+                }
             }
         }
     }
 
-    for (view_name, view) in schema.views.iter() {
-        let view_select_sql = format!("SELECT * FROM {view_name}");
-        conn.prepare(view_select_sql.as_str()).map_err(|e| {
-            LimboError::ParseError(format!(
-                "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
-                column_name, view.sql,
-            ))
-        })?;
+    // Update index.pos_in_table for all indexes.
+    // For example, if the dropped column had index 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    conn.with_schema_mut(|schema| {
+        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
+            for index in indexes {
+                let index = Arc::get_mut(index).expect("this should be the only strong reference");
+                for index_column in index.columns.iter_mut() {
+                    if index_column.pos_in_table > *column_index {
+                        index_column.pos_in_table -= 1;
+                    }
+                }
+            }
+        }
+    });
+
+    {
+        let schema = conn.schema.read();
+        for (view_name, view) in schema.views.iter() {
+            let view_select_sql = format!("SELECT * FROM {view_name}");
+            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                LimboError::ParseError(format!(
+                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                    column_name, view.sql,
+                ))
+            })?;
+        }
     }
 
     state.pc += 1;
@@ -8103,6 +8127,51 @@ pub fn op_if_neg(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: ParsedNumber) {
+    match parsed_number {
+        ParsedNumber::Integer(i) => match acc {
+            Value::Null => {
+                *acc = Value::Integer(i);
+            }
+            Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                Some(sum) => *acc = Value::Integer(sum),
+                None => {
+                    let acc_f = *acc_i as f64;
+                    *acc = Value::Float(acc_f);
+                    sum_state.approx = true;
+                    sum_state.ovrfl = true;
+                    apply_kbn_step_int(acc, i, sum_state);
+                }
+            },
+            Value::Float(_) => {
+                apply_kbn_step_int(acc, i, sum_state);
+            }
+            _ => unreachable!(),
+        },
+        ParsedNumber::Float(f) => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+            apply_kbn_step(acc, f, sum_state);
+        }
+        ParsedNumber::None => {
+            if !sum_state.approx {
+                if let Value::Integer(current_sum) = *acc {
+                    *acc = Value::Float(current_sum as f64);
+                } else if matches!(*acc, Value::Null) {
+                    *acc = Value::Float(0.0);
+                }
+                sum_state.approx = true;
+            }
+        }
+    }
+}
+
 mod cmath {
     extern "C" {
         pub fn exp(x: f64) -> f64;
@@ -8126,6 +8195,22 @@ mod cmath {
         pub fn atan(x: f64) -> f64;
         pub fn atanh(x: f64) -> f64;
         pub fn atan2(x: f64, y: f64) -> f64;
+    }
+}
+
+enum TrimType {
+    All,
+    Left,
+    Right,
+}
+
+impl TrimType {
+    fn trim<'a>(&self, text: &'a str, pattern: &[char]) -> &'a str {
+        match self {
+            TrimType::All => text.trim_matches(pattern),
+            TrimType::Right => text.trim_end_matches(pattern),
+            TrimType::Left => text.trim_start_matches(pattern),
+        }
     }
 }
 
@@ -8347,35 +8432,100 @@ impl Value {
     }
 
     pub fn exec_substring(
-        str_value: &Value,
+        value: &Value,
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
-        if let (Value::Text(str), Value::Integer(start)) = (str_value, start_value) {
-            let str_len = str.as_str().len() as i64;
+        /// Function is stabilized but not released for version 1.88 \
+        /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
+        const fn ceil_char_boundary(s: &str, index: usize) -> usize {
+            const fn is_utf8_char_boundary(c: u8) -> bool {
+                // This is bit magic equivalent to: b < 128 || b >= 192
+                (c as i8) >= -0x40
+            }
+
+            if index >= s.len() {
+                s.len()
+            } else {
+                let mut i = index;
+                while i < s.len() {
+                    if is_utf8_char_boundary(s.as_bytes()[i]) {
+                        break;
+                    }
+                    i += 1;
+                }
+
+                //  The character boundary will be within four bytes of the index
+                debug_assert!(i <= index + 3);
+
+                i
+            }
+        }
+
+        fn calculate_postions(
+            start: i64,
+            bytes_len: usize,
+            length_value: Option<&Value>,
+        ) -> (usize, usize) {
+            let bytes_len = bytes_len as i64;
 
             // The left-most character of X is number 1.
             // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
-            let first_position = if *start < 0 {
-                str_len.saturating_sub((*start).abs())
+            let first_position = if start < 0 {
+                bytes_len.saturating_sub((start).abs())
             } else {
-                *start - 1
+                start - 1
             };
             // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
             let last_position = match length_value {
                 Some(Value::Integer(length)) => first_position + *length,
-                _ => str_len,
+                _ => bytes_len,
             };
+
             let (start, end) = if first_position <= last_position {
                 (first_position, last_position)
             } else {
                 (last_position, first_position)
             };
-            Value::build_text(
-                &str.as_str()[start.clamp(-0, str_len) as usize..end.clamp(0, str_len) as usize],
+
+            (
+                start.clamp(-0, bytes_len) as usize,
+                end.clamp(0, bytes_len) as usize,
             )
-        } else {
-            Value::Null
+        }
+
+        let start_value = start_value.exec_cast("INT");
+        let length_value = length_value.map(|value| value.exec_cast("INT"));
+
+        match (value, start_value) {
+            (Value::Blob(b), Value::Integer(start)) => {
+                let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
+                Value::from_blob(b[start..end].to_vec())
+            }
+            (value, Value::Integer(start)) => {
+                if let Some(text) = value.cast_text() {
+                    let (mut start, mut end) =
+                        calculate_postions(start, text.len(), length_value.as_ref());
+
+                    // https://github.com/sqlite/sqlite/blob/a248d84f/src/func.c#L417
+                    let s = text.as_str();
+                    let mut start_byte_idx = 0;
+                    end -= start;
+                    while start > 0 {
+                        start_byte_idx = ceil_char_boundary(s, start_byte_idx + 1);
+                        start -= 1;
+                    }
+                    let mut end_byte_idx = start_byte_idx;
+                    while end > 0 {
+                        end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
+                        end -= 1;
+                    }
+                    Value::build_text(&s[start_byte_idx..end_byte_idx])
+                } else {
+                    Value::Null
+                }
+            }
+            _ => Value::Null,
         }
     }
 
@@ -8510,48 +8660,30 @@ impl Value {
         Value::Float(f)
     }
 
-    // Implements TRIM pattern matching.
-    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+    fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
         match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim()),
-            (reg, _) => reg.to_owned(),
-        }
-    }
-    // Implements RTRIM pattern matching.
-    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
-        match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_end_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim_end()),
+            (Value::Text(_) | Value::Integer(_) | Value::Float(_), Some(pattern)) => {
+                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
+                let text = self.to_string();
+                Value::build_text(trim_type.trim(&text, &pattern_chars))
+            }
+            (Value::Text(t), None) => Value::build_text(trim_type.trim(t.as_str(), &[' '])),
             (reg, _) => reg.to_owned(),
         }
     }
 
+    // Implements TRIM pattern matching.
+    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+        self._exec_trim(pattern, TrimType::All)
+    }
+    // Implements RTRIM pattern matching.
+    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
+        self._exec_trim(pattern, TrimType::Right)
+    }
+
     // Implements LTRIM pattern matching.
     pub fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
-        match (self, pattern) {
-            (reg, Some(pattern)) => match reg {
-                Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                    let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                    Value::build_text(reg.to_string().trim_start_matches(&pattern_chars[..]))
-                }
-                _ => reg.to_owned(),
-            },
-            (Value::Text(t), None) => Value::build_text(t.as_str().trim_start()),
-            (reg, _) => reg.to_owned(),
-        }
+        self._exec_trim(pattern, TrimType::Left)
     }
 
     pub fn exec_zeroblob(&self) -> Value {
@@ -10145,6 +10277,14 @@ mod tests {
         let pattern_str = Value::build_text("Bob and");
         let expected_str = Value::build_text("Alice");
         assert_eq!(input_str.exec_trim(Some(&pattern_str)), expected_str);
+
+        let input_str = Value::build_text("\ta");
+        let expected_str = Value::build_text("\ta");
+        assert_eq!(input_str.exec_trim(None), expected_str);
+
+        let input_str = Value::build_text("\na");
+        let expected_str = Value::build_text("\na");
+        assert_eq!(input_str.exec_trim(None), expected_str);
     }
 
     #[test]

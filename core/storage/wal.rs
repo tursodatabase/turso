@@ -8,7 +8,7 @@ use tracing::{instrument, Level};
 
 use parking_lot::RwLock;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::{cell::Cell, fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
@@ -569,11 +569,11 @@ pub struct WalFile {
     // min and max frames for this connection
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
-    max_frame_read_lock_index: Cell<usize>,
+    max_frame_read_lock_index: AtomicUsize,
     /// Max frame allowed to lookup range=(minframe..max_frame)
-    max_frame: u64,
+    max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
-    min_frame: u64,
+    min_frame: AtomicU64,
     /// Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     last_checksum: (u32, u32),
     checkpoint_seq: AtomicU32,
@@ -812,9 +812,11 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_read_tx(&mut self) -> Result<bool> {
         turso_assert!(
-            self.max_frame_read_lock_index.get().eq(&NO_LOCK_HELD),
+            self.max_frame_read_lock_index
+                .load(Ordering::Acquire)
+                .eq(&NO_LOCK_HELD),
             "cannot start a new read tx without ending an existing one, lock_value={}, expected={}",
-            self.max_frame_read_lock_index.get(),
+            self.max_frame_read_lock_index.load(Ordering::Acquire),
             NO_LOCK_HELD
         );
         let (shared_max, nbackfills, last_checksum, checkpoint_seq) = {
@@ -825,7 +827,7 @@ impl Wal for WalFile {
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
             (mx, nb, ck, checkpoint_seq)
         };
-        let db_changed = shared_max != self.max_frame
+        let db_changed = shared_max != self.max_frame.load(Ordering::Acquire)
             || last_checksum != self.last_checksum
             || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire);
 
@@ -842,9 +844,10 @@ impl Wal for WalFile {
             }
             // we need to keep self.max_frame set to the appropriate
             // max frame in the wal at the time this transaction starts.
-            self.max_frame = shared_max;
-            self.max_frame_read_lock_index.set(lock_0_idx);
-            self.min_frame = nbackfills + 1;
+            self.max_frame.store(shared_max, Ordering::Release);
+            self.max_frame_read_lock_index
+                .store(lock_0_idx, Ordering::Release);
+            self.min_frame.store(nbackfills + 1, Ordering::Release);
             self.last_checksum = last_checksum;
             return Ok(db_changed);
         }
@@ -935,13 +938,14 @@ impl Wal for WalFile {
         {
             return Err(LimboError::Busy);
         }
-        self.min_frame = nb2 + 1;
-        self.max_frame = best_mark as u64;
-        self.max_frame_read_lock_index.set(best_idx as usize);
+        self.min_frame.store(nb2 + 1, Ordering::Release);
+        self.max_frame.store(best_mark as u64, Ordering::Release);
+        self.max_frame_read_lock_index
+            .store(best_idx as usize, Ordering::Release);
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
-            self.min_frame,
-            self.max_frame,
+            self.min_frame.load(Ordering::Acquire),
+            self.max_frame.load(Ordering::Acquire),
             best_idx,
             shared_max
         );
@@ -952,10 +956,11 @@ impl Wal for WalFile {
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_read_tx(&self) {
-        let slot = self.max_frame_read_lock_index.get();
+        let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
             self.get_shared_mut().read_locks[slot].unlock();
-            self.max_frame_read_lock_index.set(NO_LOCK_HELD);
+            self.max_frame_read_lock_index
+                .store(NO_LOCK_HELD, Ordering::Release);
             tracing::debug!("end_read_tx(slot={slot})");
         } else {
             tracing::debug!("end_read_tx(slot=no_lock)");
@@ -972,7 +977,7 @@ impl Wal for WalFile {
         // assert(pWal->readLock >= 0);
         // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
         turso_assert!(
-            self.max_frame_read_lock_index.get() != NO_LOCK_HELD,
+            self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
             "must have a read transaction to begin a write transaction"
         );
         if !shared.write_lock.write() {
@@ -983,16 +988,16 @@ impl Wal for WalFile {
             shared.nbackfills.load(Ordering::Acquire),
             shared.last_checksum,
         );
-        if self.max_frame == shared_max {
+        if self.max_frame.load(Ordering::Acquire) == shared_max {
             // Snapshot still valid; adopt counters
             drop(shared);
             self.last_checksum = last_checksum;
-            self.min_frame = nbackfills + 1;
+            self.min_frame.store(nbackfills + 1, Ordering::Release);
             return Ok(());
         }
 
         // Snapshot is stale, give up and let caller retry from scratch
-        tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame, shared_max);
+        tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared_max);
         shared.write_lock.unlock();
         Err(LimboError::Busy)
     }
@@ -1014,7 +1019,7 @@ impl Wal for WalFile {
         );
 
         turso_assert!(
-            frame_watermark.unwrap_or(0) <= self.max_frame,
+            frame_watermark.unwrap_or(0) <= self.max_frame.load(Ordering::Acquire),
             "frame_watermark must be <= than current WAL max_frame value"
         );
 
@@ -1033,7 +1038,9 @@ impl Wal for WalFile {
         // min_frame is set to nbackfill + 1 and max_frame is set to shared_max_frame
         //
         // by default, SQLite tries to restart log file in this case - but for now let's keep it simple in the turso-db
-        if self.max_frame_read_lock_index.get() == 0 && self.max_frame < self.min_frame {
+        if self.max_frame_read_lock_index.load(Ordering::Acquire) == 0
+            && self.max_frame.load(Ordering::Acquire) < self.min_frame.load(Ordering::Acquire)
+        {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): max_frame is 0 - read from DB file",
                 page_id,
@@ -1043,15 +1050,15 @@ impl Wal for WalFile {
         }
         let shared = self.get_shared();
         let frames = shared.frame_cache.lock();
-        let range = frame_watermark
-            .map(|x| 0..=x)
-            .unwrap_or(self.min_frame..=self.max_frame);
+        let range = frame_watermark.map(|x| 0..=x).unwrap_or(
+            self.min_frame.load(Ordering::Acquire)..=self.max_frame.load(Ordering::Acquire),
+        );
         tracing::debug!(
             "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
             page_id,
             frame_watermark,
-            self.min_frame,
-            self.max_frame
+            self.min_frame.load(Ordering::Acquire),
+            self.max_frame.load(Ordering::Acquire)
         );
         if let Some(list) = frames.get(&page_id) {
             if let Some(f) = list.iter().rfind(|&&f| range.contains(&f)) {
@@ -1204,14 +1211,15 @@ impl Wal for WalFile {
                 self.page_size(),
             )));
         }
-        if frame_id > self.max_frame + 1 {
+        if frame_id > self.max_frame.load(Ordering::Acquire) + 1 {
             // attempt to write frame out of sequential order - error out
             return Err(LimboError::InvalidArgument(format!(
                 "frame_id is beyond next frame in the WAL: frame_id={}, max_frame={}",
-                frame_id, self.max_frame
+                frame_id,
+                self.max_frame.load(Ordering::Acquire)
             )));
         }
-        if frame_id <= self.max_frame {
+        if frame_id <= self.max_frame.load(Ordering::Acquire) {
             // just validate if page content from the frame matches frame in the WAL
             let offset = self.frame_offset(frame_id);
             let conflict = Arc::new(Cell::new(false));
@@ -1334,11 +1342,11 @@ impl Wal for WalFile {
     }
 
     fn get_max_frame(&self) -> u64 {
-        self.max_frame
+        self.max_frame.load(Ordering::Acquire)
     }
 
     fn get_min_frame(&self) -> u64 {
-        self.min_frame
+        self.min_frame.load(Ordering::Acquire)
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -1357,7 +1365,7 @@ impl Wal for WalFile {
             (max_frame, shared.last_checksum)
         };
         self.last_checksum = last_checksum;
-        self.max_frame = max_frame;
+        self.max_frame.store(max_frame, Ordering::Release);
         self.reset_internal_states();
         Ok(())
     }
@@ -1365,8 +1373,10 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn finish_append_frames_commit(&mut self) -> Result<()> {
         let mut shared = self.get_shared_mut();
-        shared.max_frame.store(self.max_frame, Ordering::Release);
-        tracing::trace!(self.max_frame, ?self.last_checksum);
+        shared
+            .max_frame
+            .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
+        tracing::trace!(max_frame = self.max_frame.load(Ordering::Acquire), ?self.last_checksum);
         shared.last_checksum = self.last_checksum;
         Ok(())
     }
@@ -1428,7 +1438,7 @@ impl Wal for WalFile {
             checksum
         };
 
-        self.max_frame = 0;
+        self.max_frame.store(0, Ordering::Release);
         let shared = self.get_shared();
         assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
         let file = shared.file.as_ref().unwrap();
@@ -1485,7 +1495,7 @@ impl Wal for WalFile {
         // Rolling checksum input to each frame build
         let mut rolling_checksum: (u32, u32) = self.last_checksum;
 
-        let mut next_frame_id = self.max_frame + 1;
+        let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         // Build every frame in order, updating the rolling checksum
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
@@ -1531,7 +1541,7 @@ impl Wal for WalFile {
             next_frame_id += 1;
         }
 
-        let first_frame_id = self.max_frame + 1;
+        let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let start_off = self.frame_offset(first_frame_id);
 
         // pre-advance in-memory WAL state
@@ -1577,7 +1587,7 @@ impl Wal for WalFile {
 
     fn update_max_frame(&mut self) {
         let new_max_frame = self.get_shared().max_frame.load(Ordering::Acquire);
-        self.max_frame = new_max_frame;
+        self.max_frame.store(new_max_frame, Ordering::Release);
     }
 }
 
@@ -1600,7 +1610,7 @@ impl WalFile {
         Self {
             io,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
-            max_frame,
+            max_frame: AtomicU64::new(max_frame),
             shared,
             ongoing_checkpoint: OngoingCheckpoint {
                 time: now,
@@ -1617,8 +1627,8 @@ impl WalFile {
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
-            min_frame: 0,
-            max_frame_read_lock_index: NO_LOCK_HELD.into(),
+            min_frame: AtomicU64::new(0),
+            max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             last_checksum,
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
@@ -1677,7 +1687,7 @@ impl WalFile {
 
     fn complete_append_frame(&mut self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         self.last_checksum = checksums;
-        self.max_frame = frame_id;
+        self.max_frame.store(frame_id, Ordering::Release);
         let shared = self.get_shared();
         {
             let mut frame_cache = shared.frame_cache.lock();
@@ -1693,7 +1703,8 @@ impl WalFile {
     }
 
     fn reset_internal_states(&mut self) {
-        self.max_frame_read_lock_index.set(NO_LOCK_HELD);
+        self.max_frame_read_lock_index
+            .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.reset();
         self.syncing.store(false, Ordering::SeqCst);
     }
@@ -2104,8 +2115,8 @@ impl WalFile {
         self.get_shared_mut().restart_wal_header(&self.io, mode);
         let cksm = self.get_shared().last_checksum;
         self.last_checksum = cksm;
-        self.max_frame = 0;
-        self.min_frame = 0;
+        self.max_frame.store(0, Ordering::Release);
+        self.min_frame.store(0, Ordering::Release);
         self.checkpoint_seq.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -3037,7 +3048,7 @@ pub mod test {
         {
             let wal_any = wal.as_any();
             if let Some(wal_file) = wal_any.downcast_ref::<WalFile>() {
-                return wal_file.max_frame_read_lock_index.get() == expected_slot;
+                return wal_file.max_frame_read_lock_index.load(Ordering::Acquire) == expected_slot;
             }
         }
 

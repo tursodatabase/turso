@@ -1,5 +1,6 @@
 name: Dart/Flutter
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -20,7 +21,6 @@ jobs:
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
-          - macos-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:

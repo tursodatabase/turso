@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use crate::{
     io::ReadComplete,
-    mvcc::database::{LogRecord, Row, RowID, RowVersion},
+    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowVersion},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
     types::{IOCompletions, ImmutableRecord},
@@ -14,8 +14,7 @@ use crate::{types::IOResult, File};
 
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
-    offset: u64,
-    needs_recovery: bool,
+    pub offset: u64,
 }
 
 /// Log's Header, this will be the 64 bytes in any logical log file.
@@ -107,7 +106,12 @@ impl LogRecordType {
     /// * Data size -> varint
     /// * Data -> [u8] (data size length)
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
-        buffer.extend_from_slice(&row_version.row.id.table_id.to_be_bytes());
+        let table_id_i64: i64 = row_version.row.id.table_id.into();
+        assert!(
+            table_id_i64 < 0,
+            "table_id_i64 should be negative, but got {table_id_i64}"
+        );
+        buffer.extend_from_slice(&table_id_i64.to_be_bytes());
         buffer.extend_from_slice(&self.as_u8().to_be_bytes());
         let size_before_payload = buffer.len();
         match self {
@@ -136,12 +140,7 @@ impl LogRecordType {
 
 impl LogicalLog {
     pub fn new(file: Arc<dyn File>) -> Self {
-        let recover = file.size().unwrap() > 0;
-        Self {
-            file,
-            offset: 0,
-            needs_recovery: recover,
-        }
+        Self { file, offset: 0 }
     }
 
     pub fn log_tx(&mut self, tx: &LogRecord) -> Result<IOResult<()>> {
@@ -216,14 +215,6 @@ impl LogicalLog {
         self.offset = 0;
         Ok(IOResult::IO(IOCompletions::Single(c)))
     }
-
-    pub fn needs_recover(&self) -> bool {
-        self.needs_recovery
-    }
-
-    pub fn mark_recovered(&mut self) {
-        self.needs_recovery = false;
-    }
 }
 
 pub enum StreamingResult {
@@ -244,7 +235,7 @@ enum StreamingState {
 pub struct StreamingLogicalLogReader {
     file: Arc<dyn File>,
     /// Offset to read from file
-    offset: usize,
+    pub offset: usize,
     /// Log Header
     header: Option<Arc<LogHeader>>,
     /// Cached buffer after io read
@@ -329,11 +320,13 @@ impl StreamingLogicalLogReader {
                         self.state = StreamingState::NeedTransactionStart;
                         continue;
                     }
-                    let table_id = self.consume_u64(io)?;
+                    let table_id = MVTableId::from(self.consume_i64(io)?);
                     let record_type = self.consume_u8(io)?;
                     let _payload_size = self.consume_u64(io)?;
                     let mut bytes_read_on_row = 17; // table_id, record_type and payload_size
-                    match LogRecordType::from_u8(record_type).unwrap() {
+                    match LogRecordType::from_u8(record_type)
+                        .unwrap_or_else(|| panic!("invalid record type: {record_type}"))
+                    {
                         LogRecordType::DeleteRow => {
                             let (rowid, n) = self.consume_varint(io)?;
                             bytes_read_on_row += n;
@@ -382,6 +375,17 @@ impl StreamingLogicalLogReader {
         Ok(r)
     }
 
+    fn consume_i64(&mut self, io: &Arc<dyn crate::IO>) -> Result<i64> {
+        self.read_more_data(io, 8)?;
+        let r = i64::from_be_bytes(
+            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        self.buffer_offset += 8;
+        Ok(r)
+    }
+
     fn consume_u64(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
         self.read_more_data(io, 8)?;
         let r = u64::from_be_bytes(
@@ -419,17 +423,21 @@ impl StreamingLogicalLogReader {
         if bytes_can_read >= need {
             return Ok(());
         }
-        let to_read = 4096;
+        let to_read = 4096.max(need);
         let to_read = to_read.min(self.file_size - self.offset);
         let header_buf = Arc::new(Buffer::new_temporary(to_read));
         let buffer = self.buffer.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let buffer = buffer.clone();
             let mut buffer = buffer.write().unwrap();
-            let Ok((buf, _bytes_read)) = res else {
+            let Ok((buf, bytes_read)) = res else {
                 tracing::trace!("couldn't ready log err={:?}", res,);
                 return;
             };
+            turso_assert!(
+                bytes_read as usize >= need,
+                "couldn't read enough data. Requested={need} got={bytes_read}"
+            );
             let buf = buf.as_slice();
             buffer.extend_from_slice(buf);
         });
@@ -463,13 +471,13 @@ mod tests {
         mvcc::{
             database::{
                 tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-                RowID,
+                Row, RowID,
             },
             persistent_storage::Storage,
             LocalClock, MvStore,
         },
-        types::ImmutableRecord,
-        OpenFlags, RefValue,
+        types::{ImmutableRecord, Text},
+        OpenFlags, RefValue, Value,
     };
 
     use super::LogRecordType;
@@ -484,8 +492,34 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-
-            let row = generate_simple_string_row(1, 1, "foo");
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            // now insert a row into table -2
+            let row = generate_simple_string_row((-2).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             conn.close().unwrap();
@@ -498,9 +532,12 @@ mod tests {
 
         let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.recover_logical_log(&io, &pager).unwrap();
+        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-        let row = mvcc_store.read(tx, RowID::new(1, 1)).unwrap().unwrap();
+        let row = mvcc_store
+            .read(tx, RowID::new((-2).into(), 1))
+            .unwrap()
+            .unwrap();
         let record = ImmutableRecord::from_bin_record(row.data.clone());
         let values = record.get_values();
         let foo = values.first().unwrap();
@@ -513,7 +550,7 @@ mod tests {
     #[test]
     fn test_logical_log_read_multiple_transactions() {
         let values = (0..100)
-            .map(|i| (RowID::new(1, i), format!("foo_{i}")))
+            .map(|i| (RowID::new((-2).into(), i), format!("foo_{i}")))
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
@@ -522,6 +559,35 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
 
+            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            // now insert a row into table -2
             // generate insert per transaction
             for (rowid, value) in &values {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
@@ -540,7 +606,7 @@ mod tests {
 
         let file = io.open_file(log_file, OpenFlags::ReadOnly, false).unwrap();
         let mvcc_store = Arc::new(MvStore::new(LocalClock::new(), Storage::new(file.clone())));
-        mvcc_store.recover_logical_log(&io, &pager).unwrap();
+        mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, *rowid).unwrap().unwrap();
@@ -570,7 +636,7 @@ mod tests {
                 match op_type {
                     0 => {
                         let row_id = rng.next_u64();
-                        let rowid = RowID::new(1, row_id as i64);
+                        let rowid = RowID::new((-2).into(), row_id as i64);
                         let row = generate_simple_string_row(
                             rowid.table_id,
                             rowid.row_id,
@@ -604,6 +670,36 @@ mod tests {
             let pager = conn.pager.read().clone();
             let mvcc_store = db.get_mvcc_store();
 
+            // insert table id -2 into sqlite_schema table (table_id -1)
+            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            let data = ImmutableRecord::from_values(
+                &[
+                    Value::Text(Text::new("table")), // type
+                    Value::Text(Text::new("test")),  // name
+                    Value::Text(Text::new("test")),  // tbl_name
+                    Value::Integer(-2),              // rootpage
+                    Value::Text(Text::new(
+                        "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
+                    )), // sql
+                ],
+                5,
+            );
+            mvcc_store
+                .insert(
+                    tx_id,
+                    Row {
+                        id: RowID {
+                            table_id: (-1).into(),
+                            row_id: 1,
+                        },
+                        data: data.as_blob().to_vec(),
+                        column_count: 5,
+                    },
+                )
+                .unwrap();
+            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+
+            // insert rows
             for ops in &txns {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
                 for (op_type, maybe_row, rowid) in ops {

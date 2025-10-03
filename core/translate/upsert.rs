@@ -21,7 +21,7 @@ use crate::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
             NoConstantOptReason, ReturningValueRegisters,
         },
-        insert::{Insertion, ROWID_COLUMN},
+        insert::Insertion,
         plan::ResultSetColumn,
     },
     util::normalize_ident,
@@ -77,27 +77,22 @@ pub struct ConflictTarget {
 // Extract `(column, optional_collate)` from an ON CONFLICT target Expr.
 // Accepts: Id, Qualified, DoublyQualified, Parenthesized, Collate
 fn extract_target_key(e: &ast::Expr) -> Option<ConflictTarget> {
-    use ast::Name::{Ident, Quoted};
     match e {
         ast::Expr::Collate(inner, c) => {
             let mut tk = extract_target_key(inner.as_ref())?;
-            let cstr = match c {
-                Ident(s) | Quoted(s) => s.as_str(),
-            };
+            let cstr = c.as_str();
             tk.collate = Some(cstr.to_ascii_lowercase());
             Some(tk)
         }
         ast::Expr::Parenthesized(v) if v.len() == 1 => extract_target_key(&v[0]),
 
-        ast::Expr::Id(Ident(name)) | ast::Expr::Id(Quoted(name)) => Some(ConflictTarget {
-            col_name: normalize_ident(name),
+        ast::Expr::Id(name) => Some(ConflictTarget {
+            col_name: normalize_ident(name.as_str()),
             collate: None,
         }),
         // t.a or db.t.a: accept ident or quoted in the column position
         ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-            let cname = match col {
-                Ident(s) | Quoted(s) => s.as_str(),
-            };
+            let cname = col.as_str();
             Some(ConflictTarget {
                 col_name: normalize_ident(cname),
                 collate: None,
@@ -124,25 +119,25 @@ fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> St
         .unwrap_or_else(|| "binary".to_string())
 }
 
-/// Match ON CONFLICT target to the PRIMARY KEY, if any.
-/// If no target is specified, it is an automatic match for PRIMARY KEY
-pub fn upsert_matches_pk(upsert: &Upsert, table: &Table) -> bool {
+/// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
+pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     let Some(t) = upsert.index.as_ref() else {
-        // Omitted target is automatic
-        return true;
+        // omitted target matches everything, CatchAll handled elsewhere
+        return false;
     };
-    if !t.targets.len().eq(&1) {
+    if t.targets.len() != 1 {
         return false;
     }
-    let pk = table
-        .columns()
-        .iter()
-        .find(|c| c.is_rowid_alias || c.primary_key)
-        .unwrap_or(ROWID_COLUMN);
-    extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
-        tk.col_name
-            .eq_ignore_ascii_case(pk.name.as_ref().unwrap_or(&String::new()))
-    })
+    // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
+    let pk = table.columns().iter().find(|c| c.is_rowid_alias);
+    if let Some(pkcol) = pk {
+        extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
+            tk.col_name
+                .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
+        })
+    } else {
+        false
+    }
 }
 
 /// Returns array of chaned column indicies and whether rowid was changed.
@@ -192,20 +187,19 @@ fn index_keys(idx: &Index) -> Vec<usize> {
 
 /// Columns referenced by the partial WHERE (empty if none).
 fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    use ast::{Expr, Name};
+    use ast::Expr;
     let Some(expr) = &idx.where_clause else {
         return HashSet::new();
     };
     let mut out = HashSet::new();
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
-            Expr::Id(Name::Ident(n) | Name::Quoted(n)) => {
+            Expr::Id(n) => {
                 if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
                     out.insert(i);
                 }
             }
-            Expr::Qualified(ns, Name::Ident(c) | Name::Quoted(c))
-            | Expr::DoublyQualified(_, ns, Name::Ident(c) | Name::Quoted(c)) => {
+            Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                 // Only count columns that belong to this table
                 let nsn = normalize_ident(ns.as_str());
                 let tname = normalize_ident(table.get_name());
@@ -280,7 +274,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
     idx_cols.is_empty()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ResolvedUpsertTarget {
     // ON CONFLICT DO
     CatchAll,
@@ -300,17 +294,17 @@ pub fn resolve_upsert_target(
         return Ok(ResolvedUpsertTarget::CatchAll);
     }
 
-    // Targeted: must match PK or a non-partial UNIQUE index.
-    if upsert_matches_pk(upsert, table) {
+    // Targeted: must match PK, only if PK is a rowid alias
+    if upsert_matches_rowid_alias(upsert, table) {
         return Ok(ResolvedUpsertTarget::PrimaryKey);
     }
 
+    // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
     for idx in schema.get_indices(table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
     }
-    // Match SQLite’s error text:
     crate::bail_parse_error!(
         "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
     );
@@ -348,7 +342,7 @@ pub fn emit_upsert(
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &Resolver,
-    idx_cursors: &[(&String, usize, usize)],
+    idx_cursors: &[(&String, i64, usize)],
     returning: &mut [ResultSetColumn],
     cdc_cursor_id: Option<usize>,
     row_done_label: BranchOffset,
@@ -891,7 +885,7 @@ fn rewrite_expr_to_registers(
     insertion: Option<&Insertion>,
     allow_excluded: bool,
 ) -> crate::Result<WalkControl> {
-    use ast::{Expr, Name};
+    use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
 
     // Map a column name to a register within the row image at `base_start`.
@@ -911,8 +905,7 @@ fn rewrite_expr_to_registers(
         e,
         &mut |expr: &mut ast::Expr| -> crate::Result<WalkControl> {
             match expr {
-                Expr::Qualified(ns, Name::Ident(c) | Name::Quoted(c))
-                | Expr::DoublyQualified(_, ns, Name::Ident(c) | Name::Quoted(c)) => {
+                Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
                     let ns = normalize_ident(ns.as_str());
                     let c = normalize_ident(c.as_str());
                     // Handle EXCLUDED.* if enabled
@@ -940,7 +933,7 @@ fn rewrite_expr_to_registers(
                     }
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
-                Expr::Id(Name::Ident(name)) | Expr::Id(Name::Quoted(name)) => {
+                Expr::Id(name) => {
                     if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
                         *expr = Expr::Register(r);
                     }

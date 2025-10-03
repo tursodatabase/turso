@@ -142,10 +142,6 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
     if !plan.indexes_to_update.iter().any(|i| Arc::ptr_eq(index, i)) {
         return Ok(());
     }
-    // Fine to use index if we aren't going to be iterating over it, since it returns at most 1 row.
-    if table_ref.op.returns_max_1_row() {
-        return Ok(());
-    }
     // Otherwise, fall back to a table scan.
     table_ref.op = Operation::Scan(Scan::BTreeTable {
         iter_dir: IterationDirection::Forwards,
@@ -216,6 +212,13 @@ fn optimize_table_access(
             .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
         {
             t.join_info.as_mut().unwrap().outer = false;
+            for term in where_clause.iter_mut() {
+                if let Some(from_outer_join) = term.from_outer_join {
+                    if from_outer_join == t.internal_id {
+                        term.from_outer_join = None;
+                    }
+                }
+            }
             continue;
         }
     }
@@ -707,11 +710,7 @@ impl Optimizable for ast::Expr {
                 func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
-            Expr::Id(id) => {
-                // If we got here with an id, this has to be double-quotes identifier
-                assert!(id.is_double_quoted());
-                true
-            }
+            Expr::Id(_) => true,
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {

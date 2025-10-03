@@ -220,7 +220,7 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime: number, lastPushUnixTime?: number, revision?: string }
+  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsProtocolRequest =
@@ -238,6 +238,8 @@ export interface SyncEngineOpts {
   tablesIgnore?: Array<string>
   useTransform: boolean
   protocolVersion?: SyncEngineProtocolVersion
+  bootstrapIfEmpty: boolean
+  remoteEncryption?: string
 }
 
 export declare const enum SyncEngineProtocolVersion {

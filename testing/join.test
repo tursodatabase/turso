@@ -351,3 +351,36 @@ do_execsql_test_on_specific_db {:memory:} using-deduplicates-columns {
     select a from t join tt using(a);
 } {4
 5}
+
+# regression test for https://github.com/tursodatabase/turso/issues/3470
+do_execsql_test_on_specific_db {:memory:} left-join-where-clause-regression {
+    create table t(a);
+    create table s(a);
+    insert into t values (1), (2);
+    insert into s values (2);
+    select t.a, s.a from t left join s on t.a=s.a where t.a = 2;
+    select t.a, s.a from t left join s on t.a=s.a where s.a = 2;
+} {2|2
+2|2}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3468
+do_execsql_test_on_specific_db {:memory:} left-join-using-star-vs-explicit {
+    create table t(a, tb);
+    create table s(a, sb);
+    insert into t values (1, 't1'), (2, 't2');
+    insert into s values (1, 's1'), (3, 's3');
+    select * from t left join s using(a);
+    select a, tb, sb from t left join s using(a);
+} {1|t1|s1
+2|t2|
+1|t1|s1
+2|t2|}
+
+do_execsql_test_on_specific_db {:memory:} left-join-using-null {
+    create table t(a, b);
+    create table s(a, b);
+    insert into t values (1, null), (2, null); 
+    insert into s values (1, null), (2, null); 
+    select a, b from t left join s using (a, b);
+} {1|
+2|}

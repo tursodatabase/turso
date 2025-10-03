@@ -19,7 +19,6 @@ tracing.workspace = true
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 
 [features]
-encryption = ["turso_core/encryption"]
 browser = []
 tracing_release = ["turso_core/tracing_release"]
 [build-dependencies]

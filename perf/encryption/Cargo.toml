@@ -8,7 +8,7 @@ name = "encryption-throughput"
 path = "src/main.rs"
 
 [dependencies]
-turso = { workspace = true, features = ["encryption"] }
+turso = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 futures = { workspace = true }

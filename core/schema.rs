@@ -6,17 +6,71 @@ use crate::translate::expr::{
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
-/// Simple view structure for non-materialized views
 #[derive(Debug, Clone)]
+pub enum ViewState {
+    Ready,
+    InProgress,
+}
+
+/// Simple view structure for non-materialized views
+#[derive(Debug)]
 pub struct View {
     pub name: String,
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
+    pub state: Mutex<ViewState>,
+}
+
+impl View {
+    fn new(name: String, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
+        Self {
+            name,
+            sql,
+            select_stmt,
+            columns,
+            state: Mutex::new(ViewState::Ready),
+        }
+    }
+
+    pub fn process(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            ViewState::InProgress => {
+                bail_parse_error!("view {} is circularly defined", self.name)
+            }
+            ViewState::Ready => {
+                *state = ViewState::InProgress;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn done(&self) {
+        let mut state = self.state.lock().unwrap();
+        match *state {
+            ViewState::InProgress => {
+                *state = ViewState::Ready;
+            }
+            ViewState::Ready => {}
+        }
+    }
+}
+
+impl Clone for View {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            sql: self.sql.clone(),
+            select_stmt: self.select_stmt.clone(),
+            columns: self.columns.clone(),
+            state: Mutex::new(ViewState::Ready),
+        }
+    }
 }
 
 /// Type alias for regular views collection
-pub type ViewsMap = HashMap<String, View>;
+pub type ViewsMap = HashMap<String, Arc<View>>;
 
 use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
@@ -25,8 +79,8 @@ use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
 use crate::{
-    contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case, Connection,
-    LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
+    Connection, LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -37,7 +91,7 @@ use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
 use turso_parser::{
-    ast::{Cmd, CreateTableBody, Name, ResultColumn, Stmt},
+    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
 };
 
@@ -235,13 +289,13 @@ impl Schema {
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) {
         let name = normalize_ident(&view.name);
-        self.views.insert(name, view);
+        self.views.insert(name, Arc::new(view));
     }
 
     /// Get a regular view by name
-    pub fn get_view(&self, name: &str) -> Option<&View> {
+    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         let name = normalize_ident(name);
-        self.views.get(&name)
+        self.views.get(&name).cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
@@ -353,15 +407,14 @@ impl Schema {
         let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, usize)>> =
-            HashMap::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
 
         // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, usize> = HashMap::new();
+        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::new();
         // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, usize> = HashMap::new();
+        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::new();
         // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, usize)> = HashMap::new();
+        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::new();
 
         pager.begin_read_tx()?;
 
@@ -438,7 +491,7 @@ impl Schema {
     pub fn populate_indices(
         &mut self,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-        automatic_indices: std::collections::HashMap<String, Vec<(String, usize)>>,
+        automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             if !self.indexes_enabled() {
@@ -550,9 +603,9 @@ impl Schema {
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: std::collections::HashMap<String, (String, usize)>,
-        dbsp_state_roots: std::collections::HashMap<String, usize>,
-        dbsp_state_index_roots: std::collections::HashMap<String, usize>,
+        materialized_view_info: std::collections::HashMap<String, (String, i64)>,
+        dbsp_state_roots: std::collections::HashMap<String, i64>,
+        dbsp_state_index_roots: std::collections::HashMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -620,10 +673,10 @@ impl Schema {
         maybe_sql: Option<&str>,
         syms: &SymbolTable,
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
-        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, usize)>>,
-        dbsp_state_roots: &mut std::collections::HashMap<String, usize>,
-        dbsp_state_index_roots: &mut std::collections::HashMap<String, usize>,
-        materialized_view_info: &mut std::collections::HashMap<String, (String, usize)>,
+        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, i64)>>,
+        dbsp_state_roots: &mut std::collections::HashMap<String, i64>,
+        dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
+        materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
         mv_store: Option<&Arc<MvStore>>,
     ) -> Result<()> {
         match ty {
@@ -646,11 +699,8 @@ impl Schema {
                         )?
                     };
                     self.add_virtual_table(vtab);
-                    if let Some(mv_store) = mv_store {
-                        mv_store.mark_table_as_loaded(root_page as u64);
-                    }
                 } else {
-                    let table = BTreeTable::from_sql(sql, root_page as usize)?;
+                    let table = BTreeTable::from_sql(sql, root_page)?;
 
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
@@ -667,8 +717,7 @@ impl Schema {
                                 use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
                                 if stored_version == DBSP_CIRCUIT_VERSION {
                                     // Version matches, store the root page
-                                    dbsp_state_roots
-                                        .insert(view_name.to_string(), root_page as usize);
+                                    dbsp_state_roots.insert(view_name.to_string(), root_page);
                                 } else {
                                     // Version mismatch - DO NOT insert into dbsp_state_roots
                                     // This will cause populate_materialized_views to skip this view
@@ -683,9 +732,6 @@ impl Schema {
                         }
                     }
 
-                    if let Some(mv_store) = mv_store {
-                        mv_store.mark_table_as_loaded(root_page as u64);
-                    }
                     self.add_btree_table(Arc::new(table));
                 }
             }
@@ -695,7 +741,7 @@ impl Schema {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
                             table_name: table_name.to_string(),
-                            root_page: root_page as usize,
+                            root_page,
                             sql: sql.to_string(),
                         });
                     }
@@ -721,17 +767,17 @@ impl Schema {
                                     use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
                                     if stored_version == DBSP_CIRCUIT_VERSION {
                                         dbsp_state_index_roots
-                                            .insert(view_name.to_string(), root_page as usize);
+                                            .insert(view_name.to_string(), root_page);
                                     }
                                 }
                             }
                         } else {
                             match automatic_indices.entry(table_name) {
                                 std::collections::hash_map::Entry::Vacant(e) => {
-                                    e.insert(vec![(index_name, root_page as usize)]);
+                                    e.insert(vec![(index_name, root_page)]);
                                 }
                                 std::collections::hash_map::Entry::Occupied(mut e) => {
-                                    e.get_mut().push((index_name, root_page as usize));
+                                    e.get_mut().push((index_name, root_page));
                                 }
                             }
                         }
@@ -756,7 +802,7 @@ impl Schema {
                             // We'll handle reuse logic and create the actual IncrementalView
                             // in a later pass when we have both the main root page and DBSP state root
                             materialized_view_info
-                                .insert(view_name.clone(), (sql.to_string(), root_page as usize));
+                                .insert(view_name.clone(), (sql.to_string(), root_page));
 
                             // Mark the existing view for potential reuse
                             if self.incremental_views.contains_key(&view_name) {
@@ -783,12 +829,8 @@ impl Schema {
                             }
 
                             // Create regular view
-                            let view = View {
-                                name: name.to_string(),
-                                sql: sql.to_string(),
-                                select_stmt: select,
-                                columns: final_columns,
-                            };
+                            let view =
+                                View::new(name.to_string(), sql.to_string(), select, final_columns);
                             self.add_view(view);
                         }
                         _ => {}
@@ -850,7 +892,11 @@ impl Clone for Schema {
             .iter()
             .map(|(name, view)| (name.clone(), view.clone()))
             .collect();
-        let views = self.views.clone();
+        let views = self
+            .views
+            .iter()
+            .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
+            .collect();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -876,7 +922,7 @@ pub enum Table {
 }
 
 impl Table {
-    pub fn get_root_page(&self) -> usize {
+    pub fn get_root_page(&self) -> i64 {
         match self {
             Table::BTree(table) => table.root_page,
             Table::Virtual(_) => unimplemented!(),
@@ -962,7 +1008,7 @@ pub struct UniqueSet {
 
 #[derive(Clone, Debug)]
 pub struct BTreeTable {
-    pub root_page: usize,
+    pub root_page: i64,
     pub name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub columns: Vec<Column>,
@@ -996,7 +1042,7 @@ impl BTreeTable {
             .find(|(_, column)| column.name.as_ref() == Some(&name))
     }
 
-    pub fn from_sql(sql: &str, root_page: usize) -> Result<BTreeTable> {
+    pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
@@ -1094,11 +1140,7 @@ pub struct FromClauseSubquery {
     pub result_columns_start_reg: Option<usize>,
 }
 
-pub fn create_table(
-    tbl_name: &str,
-    body: &CreateTableBody,
-    root_page: usize,
-) -> Result<BTreeTable> {
+pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
@@ -1137,8 +1179,8 @@ pub fn create_table(
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
-                            _ => {
-                                todo!("Unsupported primary key expression");
+                            expr => {
+                                bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
                         primary_key_columns
@@ -1156,16 +1198,24 @@ pub fn create_table(
                     if conflict_clause.is_some() {
                         unimplemented!("ON CONFLICT not implemented");
                     }
+                    let mut unique_columns = Vec::with_capacity(columns.len());
+                    for column in columns {
+                        match column.expr.as_ref() {
+                            Expr::Id(id) => unique_columns.push((
+                                id.as_str().to_string(),
+                                column.order.unwrap_or(SortOrder::Asc),
+                            )),
+                            Expr::Literal(Literal::String(value)) => unique_columns.push((
+                                value.trim_matches('\'').to_owned(),
+                                column.order.unwrap_or(SortOrder::Asc),
+                            )),
+                            expr => {
+                                bail_parse_error!("unsupported unique key expression: {}", expr)
+                            }
+                        }
+                    }
                     let unique_set = UniqueSet {
-                        columns: columns
-                            .iter()
-                            .map(|column| {
-                                (
-                                    column.expr.as_ref().to_string(),
-                                    column.order.unwrap_or(SortOrder::Asc),
-                                )
-                            })
-                            .collect(),
+                        columns: unique_columns,
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
@@ -1368,13 +1418,7 @@ pub fn create_table(
 
 pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
     match expr {
-        // SQLite treats a bare identifier as a string literal in DEFAULT clause
-        Expr::Name(Name::Ident(str)) | Expr::Id(Name::Ident(str)) => {
-            Some(Box::new(Expr::Literal(Literal::String(format!("'{str}'")))))
-        }
-        Expr::Name(Name::Quoted(str)) | Expr::Id(Name::Quoted(str)) => Some(Box::new(
-            Expr::Literal(Literal::String(format!("'{}'", normalize_ident(str)))),
-        )),
+        Expr::Name(name) => Some(Box::new(Expr::Literal(Literal::String(name.as_literal())))),
         _ => None,
     }
 }
@@ -1747,7 +1791,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
 pub struct Index {
     pub name: String,
     pub table_name: String,
-    pub root_page: usize,
+    pub root_page: i64,
     pub columns: Vec<IndexColumn>,
     pub unique: bool,
     pub ephemeral: bool,
@@ -1776,7 +1820,7 @@ pub struct IndexColumn {
 }
 
 impl Index {
-    pub fn from_sql(sql: &str, root_page: usize, table: &BTreeTable) -> Result<Index> {
+    pub fn from_sql(sql: &str, root_page: i64, table: &BTreeTable) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
@@ -1791,7 +1835,10 @@ impl Index {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let mut index_columns = Vec::with_capacity(columns.len());
                 for col in columns.into_iter() {
-                    let name = normalize_ident(&col.expr.to_string());
+                    let name = normalize_ident(match col.expr.as_ref() {
+                        Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
+                        _ => crate::bail_parse_error!("cannot use expressions in CREATE INDEX"),
+                    });
                     let Some((pos_in_table, _)) = table.get_column(&name) else {
                         return Err(crate::LimboError::InternalError(format!(
                             "Column {} is in index {} but not found in table {}",
@@ -1824,7 +1871,7 @@ impl Index {
 
     pub fn automatic_from_primary_key(
         table: &BTreeTable,
-        auto_index: (String, usize), // name, root_page
+        auto_index: (String, i64), // name, root_page
         column_count: usize,
     ) -> Result<Index> {
         let has_primary_key_index =
@@ -1866,7 +1913,7 @@ impl Index {
 
     pub fn automatic_from_unique(
         table: &BTreeTable,
-        auto_index: (String, usize), // name, root_page
+        auto_index: (String, i64), // name, root_page
         column_indices_and_sort_orders: Vec<(usize, SortOrder)>,
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
@@ -1944,7 +1991,7 @@ impl Index {
             match e {
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
-                Expr::Id(Name::Ident(n)) | Expr::Id(Name::Quoted(n)) => {
+                Expr::Id(n) => {
                     let n = n.as_str();
                     if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
                         ok = false;

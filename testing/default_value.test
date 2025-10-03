@@ -39,5 +39,8 @@ do_execsql_test_on_specific_db {:memory:} default-value-function {
     SELECT y FROM t7 WHERE x = 1;
 } {5}
 
-
-
+do_execsql_test_on_specific_db {:memory:} default-value-identifier {
+    CREATE TABLE t7 (x INTEGER PRIMARY KEY, y DEFAULT asdf);
+    INSERT INTO t7 (x) VALUES (1);
+    SELECT y FROM t7 WHERE x = 1;
+} {asdf}

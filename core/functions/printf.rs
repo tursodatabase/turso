@@ -66,8 +66,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Integer(_) => result.push_str(&format!("{value}")),
-                    Value::Float(_) => result.push_str(&format!("{value}")),
+                    Value::Integer(i) => result.push_str(&i.to_string()),
+                    Value::Float(f) => {
+                        let truncated_val = *f as i64;
+                        result.push_str(&truncated_val.to_string());
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -92,7 +95,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 match &values[args_index].get_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
-                    Value::Null => result.push_str("(null)"),
+                    Value::Null => (),
                     v => result.push_str(&format!("{v}")),
                 }
                 args_index += 1;
@@ -105,7 +108,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{f:.6}")),
                     Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
-                    _ => result.push_str("0.0"),
+                    _ => result.push_str("0.000000"),
                 }
                 args_index += 1;
             }
@@ -194,6 +197,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:x}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:x}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:x}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -206,6 +213,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:X}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:X}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:X}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -218,6 +229,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Float(f) => result.push_str(&format!("{:o}", *f as i64)),
                     Value::Integer(i) => result.push_str(&format!("{i:o}")),
+                    Value::Text(s) => {
+                        let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
+                        result.push_str(&format!("{i:o}"))
+                    }
                     _ => result.push('0'),
                 }
                 args_index += 1;
@@ -282,7 +297,7 @@ mod tests {
             // String with null value
             (
                 vec![text("Hello, %s!"), Register::Value(Value::Null)],
-                text("Hello, (null)!"),
+                text("Hello, !"),
             ),
             // String with number conversion
             (vec![text("Value: %s"), integer(42)], text("Value: 42")),
@@ -310,6 +325,10 @@ mod tests {
             (
                 vec![text("Number: %d"), text("not a number")],
                 text("Number: 0"),
+            ),
+            (
+                vec![text("Truncated float: %d"), float(3.9)],
+                text("Truncated float: 3"),
             ),
             (vec![text("Number: %i"), integer(42)], text("Number: 42")),
         ];
@@ -367,7 +386,7 @@ mod tests {
             // Non-numeric value defaults to 0.0
             (
                 vec![text("Number: %f"), text("not a number")],
-                text("Number: 0.0"),
+                text("Number: 0.000000"),
             ),
         ];
 
@@ -505,7 +524,7 @@ mod tests {
                 text("hex: ffffffffffffffd6"),
             ),
             // Text
-            (vec![text("hex: %x"), text("42")], text("hex: 0")),
+            (vec![text("hex: %x"), text("42")], text("hex: 2a")),
             // Empty Text
             (vec![text("hex: %x"), text("")], text("hex: 0")),
         ];
@@ -538,7 +557,7 @@ mod tests {
                 text("octal: 1777777777777777777726"),
             ),
             // Text
-            (vec![text("octal: %o"), text("42")], text("octal: 0")),
+            (vec![text("octal: %o"), text("42")], text("octal: 52")),
             // Empty Text
             (vec![text("octal: %o"), text("")], text("octal: 0")),
         ];

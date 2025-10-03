@@ -76,8 +76,8 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
-    #[clap(long, help = "Enable experimental logical log feature")]
-    pub experimental_logical_log: bool,
+    #[clap(long, help = "Enable experimental encryption feature")]
+    pub experimental_encryption: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -170,6 +170,7 @@ impl Limbo {
                 opts.experimental_mvcc,
                 opts.experimental_views,
                 opts.experimental_strict,
+                opts.experimental_encryption,
             )?
         } else {
             let flags = if opts.readonly {
@@ -186,6 +187,7 @@ impl Limbo {
                     .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
+                    .with_encryption(opts.experimental_encryption)
                     .turso_cli(),
                 None,
             )?;
@@ -263,7 +265,7 @@ impl Limbo {
             }
 
             self.writeln(
-                "This software is ALPHA, only use for development, testing, and experimentation.",
+                "This software is in BETA, use caution with production data and ensure you have backups."
             )?;
             self.display_in_memory()?;
         }

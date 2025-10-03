@@ -108,6 +108,7 @@ pub struct DatabaseOpts {
     pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
+    pub enable_encryption: bool,
     enable_load_extension: bool,
 }
 
@@ -118,6 +119,7 @@ impl Default for DatabaseOpts {
             enable_indexes: true,
             enable_views: false,
             enable_strict: false,
+            enable_encryption: false,
             enable_load_extension: false,
         }
     }
@@ -151,6 +153,11 @@ impl DatabaseOpts {
 
     pub fn with_strict(mut self, enable: bool) -> Self {
         self.enable_strict = enable;
+        self
+    }
+
+    pub fn with_encryption(mut self, enable: bool) -> Self {
+        self.enable_encryption = enable;
         self
     }
 }
@@ -443,8 +450,6 @@ impl Database {
             buffer_pool: BufferPool::begin_init(&io, arena_size),
             n_connections: AtomicUsize::new(0),
         });
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
@@ -476,20 +481,47 @@ impl Database {
                     // a warning to the user to load the module
                     eprintln!("Warning: {e}");
                 }
+
+                if db.mvcc_enabled() && !schema.indexes.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "Database contains indexes which are not supported when MVCC is enabled."
+                            .to_string(),
+                    ));
+                }
+
                 Ok(())
             })?;
         }
+
+        if opts.enable_mvcc {
+            let mv_store = db.mv_store.as_ref().unwrap();
+            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            mv_store.bootstrap(mvcc_bootstrap_conn)?;
+        }
+
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+
         Ok(db)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        let pager = self.init_pager(None)?;
-        let pager = Arc::new(pager);
+        self._connect(false)
+    }
 
-        if self.mv_store.is_some() {
-            self.maybe_recover_logical_log(pager.clone())?;
-        }
+    pub(crate) fn connect_mvcc_bootstrap(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        self._connect(true)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn _connect(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+    ) -> Result<Arc<Connection>> {
+        let pager = self.init_pager(None)?;
+        pager.enable_encryption(self.opts.enable_encryption);
+        let pager = Arc::new(pager);
 
         let page_size = pager.get_page_size_unchecked();
 
@@ -531,6 +563,7 @@ impl Database {
             sync_mode: RwLock::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
+            is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -538,17 +571,6 @@ impl Database {
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
         Ok(conn)
-    }
-
-    pub fn maybe_recover_logical_log(self: &Arc<Database>, pager: Arc<Pager>) -> Result<()> {
-        let Some(mv_store) = self.mv_store.clone() else {
-            panic!("tryign to recover logical log without mvcc");
-        };
-        if !mv_store.needs_recover() {
-            return Ok(());
-        }
-
-        mv_store.recover_logical_log(&self.io, &pager)
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -827,6 +849,24 @@ impl Database {
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
     }
+
+    pub fn mvcc_enabled(&self) -> bool {
+        self.opts.enable_mvcc
+    }
+
+    pub fn indexes_enabled(&self) -> bool {
+        self.opts.enable_indexes
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn set_pending_byte(val: u32) {
+        Pager::set_pending_byte(val);
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn get_pending_byte() -> u32 {
+        Pager::get_pending_byte()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1040,6 +1080,8 @@ pub struct Connection {
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
     busy_timeout: RwLock<std::time::Duration>,
+    /// Whether this is an internal connection used for MVCC bootstrap
+    is_mvcc_bootstrap_connection: AtomicBool,
 }
 
 impl Drop for Connection {
@@ -1054,8 +1096,20 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    #[instrument(skip_all, level = Level::INFO)]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        if self.is_mvcc_bootstrap_connection() {
+            // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
+            return self._prepare(sql, None);
+        }
+        self._prepare(sql, self.db.mv_store.clone())
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn _prepare(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        mv_store: Option<Arc<MvStore>>,
+    ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1088,12 +1142,19 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(
-            program,
-            self.db.mv_store.clone(),
-            pager,
-            mode,
-        ))
+        Ok(Statement::new(program, mv_store, pager, mode))
+    }
+
+    /// Whether this is an internal connection used for MVCC bootstrap
+    pub fn is_mvcc_bootstrap_connection(&self) -> bool {
+        self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst)
+    }
+
+    /// Promote MVCC bootstrap connection to a regular connection so it reads from the MV store again.
+    pub fn promote_to_regular_connection(&self) {
+        assert!(self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst));
+        self.is_mvcc_bootstrap_connection
+            .store(false, Ordering::SeqCst);
     }
 
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
@@ -1194,14 +1255,7 @@ impl Connection {
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(
-            stmt,
-            &mut fresh,
-            &self.syms.read(),
-            None,
-            existing_views,
-            self.db.mv_store.as_ref(),
-        )?;
+        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), None, existing_views)?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -1370,6 +1424,8 @@ impl Connection {
         mvcc: bool,
         views: bool,
         strict: bool,
+        // flag to opt-in encryption support
+        encryption: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1384,7 +1440,8 @@ impl Connection {
                     .with_mvcc(mvcc)
                     .with_indexes(use_indexes)
                     .with_views(views)
-                    .with_strict(strict),
+                    .with_strict(strict)
+                    .with_encryption(encryption),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1412,7 +1469,8 @@ impl Connection {
                 .with_mvcc(mvcc)
                 .with_indexes(use_indexes)
                 .with_views(views)
-                .with_strict(strict),
+                .with_strict(strict)
+                .with_encryption(encryption),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -1522,8 +1580,7 @@ impl Connection {
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
         let pager = self.pager.read();
-        let (page_ref, c) = match pager.read_page_no_cache(page_idx as usize, frame_watermark, true)
-        {
+        let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
             #[cfg(target_os = "windows")]
@@ -1679,13 +1736,15 @@ impl Connection {
                 // No active transaction
             }
             _ => {
-                let pager = self.pager.read();
-                pager.io.block(|| {
-                    pager.end_tx(
-                        true, // rollback = true for close
-                        self,
-                    )
-                })?;
+                if !self.mvcc_enabled() {
+                    let pager = self.pager.read();
+                    pager.io.block(|| {
+                        pager.end_tx(
+                            true, // rollback = true for close
+                            self,
+                        )
+                    })?;
+                }
                 self.set_tx_state(TransactionState::None);
             }
         }
@@ -1709,7 +1768,7 @@ impl Connection {
     }
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst)
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.mv_store.is_some()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -1808,6 +1867,7 @@ impl Connection {
         }
         self.pager.write().clear_page_cache();
         let pager = self.db.init_pager(Some(size.get() as usize))?;
+        pager.enable_encryption(self.db.opts.enable_encryption);
         *self.pager.write() = Arc::new(pager);
         self.pager.read().set_initial_page_size(size);
 
@@ -1851,14 +1911,9 @@ impl Connection {
         let syms = self.syms.read();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) = parse_schema_rows(
-                rows,
-                schema,
-                &syms,
-                None,
-                existing_views,
-                self.db.mv_store.as_ref(),
-            ) {
+            if let Err(LimboError::ExtensionError(e)) =
+                parse_schema_rows(rows, schema, &syms, None, existing_views)
+            {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
                 eprintln!("Warning: {e}");
@@ -1901,6 +1956,10 @@ impl Connection {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.db.experimental_strict_enabled()
+    }
+
+    pub fn mvcc_enabled(&self) -> bool {
+        self.db.mvcc_enabled()
     }
 
     /// Query the current value(s) of `pragma_name` associated to
@@ -2207,6 +2266,12 @@ impl Connection {
         self.set_encryption_context()
     }
 
+    pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
+        let pager = self.pager.read();
+        pager.set_reserved_space_bytes(reserved_bytes);
+        Ok(())
+    }
+
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
         *self.encryption_cipher_mode.read()
     }
@@ -2389,7 +2454,9 @@ impl Statement {
     }
 
     pub fn n_change(&self) -> i64 {
-        self.program.n_change.get()
+        self.program
+            .n_change
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
@@ -2411,7 +2478,7 @@ impl Statement {
         let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
-                self.mv_store.clone(),
+                self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
             )
@@ -2419,7 +2486,7 @@ impl Statement {
             const MAX_SCHEMA_RETRY: usize = 50;
             let mut res = self.program.step(
                 &mut self.state,
-                self.mv_store.clone(),
+                self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
             );
@@ -2432,7 +2499,7 @@ impl Statement {
                 self.reprepare()?;
                 res = self.program.step(
                     &mut self.state,
-                    self.mv_store.clone(),
+                    self.mv_store.as_ref(),
                     self.pager.clone(),
                     self.query_mode,
                 );

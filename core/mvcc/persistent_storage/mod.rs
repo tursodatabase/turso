@@ -36,14 +36,6 @@ impl Storage {
         self.logical_log.write().unwrap().truncate()
     }
 
-    pub fn needs_recover(&self) -> bool {
-        self.logical_log.read().unwrap().needs_recover()
-    }
-
-    pub fn mark_recovered(&self) {
-        self.logical_log.write().unwrap().mark_recovered();
-    }
-
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
         self.logical_log.write().unwrap().file.clone()
     }

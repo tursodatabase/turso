@@ -208,7 +208,7 @@ pub enum ExecuteState {
     /// Processing multiple inputs (for recursive node processing)
     ProcessingInputs {
         /// Collection of (node_id, state) pairs to process
-        input_states: Vec<(usize, ExecuteState)>,
+        input_states: Vec<(i64, ExecuteState)>,
         /// Current index being processed
         current_index: usize,
         /// Collected deltas from processed inputs
@@ -320,11 +320,11 @@ pub enum DbspExpr {
 /// A node in the DBSP circuit DAG
 pub struct DbspNode {
     /// Unique identifier for this node
-    pub id: usize,
+    pub id: i64,
     /// The operator metadata
     pub operator: DbspOperator,
     /// Input nodes (edges in the DAG)
-    pub inputs: Vec<usize>,
+    pub inputs: Vec<i64>,
     /// The actual executable operator
     pub executable: Box<dyn IncrementalOperator>,
 }
@@ -376,11 +376,11 @@ pub const DBSP_CIRCUIT_VERSION: u32 = 1;
 #[derive(Debug)]
 pub struct DbspCircuit {
     /// All nodes in the circuit, indexed by their ID
-    pub(super) nodes: HashMap<usize, DbspNode>,
+    pub(super) nodes: HashMap<i64, DbspNode>,
     /// Counter for generating unique node IDs
-    next_id: usize,
+    next_id: i64,
     /// Root node ID (the final output)
-    pub(super) root: Option<usize>,
+    pub(super) root: Option<i64>,
     /// Output schema of the circuit (schema of the root node)
     pub(super) output_schema: SchemaRef,
 
@@ -388,20 +388,20 @@ pub struct DbspCircuit {
     commit_state: CommitState,
 
     /// Root page for the main materialized view data
-    pub(super) main_data_root: usize,
+    pub(super) main_data_root: i64,
     /// Root page for internal DBSP state table
-    pub(super) internal_state_root: usize,
+    pub(super) internal_state_root: i64,
     /// Root page for the DBSP state table's primary key index
-    pub(super) internal_state_index_root: usize,
+    pub(super) internal_state_index_root: i64,
 }
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
     /// The actual output schema will be set when the root node is established
     pub fn new(
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Self {
         // Start with an empty schema - will be updated when root is set
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
@@ -418,7 +418,7 @@ impl DbspCircuit {
     }
 
     /// Set the root node and update the output schema
-    fn set_root(&mut self, root_id: usize, schema: SchemaRef) {
+    fn set_root(&mut self, root_id: i64, schema: SchemaRef) {
         self.root = Some(root_id);
         self.output_schema = schema;
     }
@@ -428,9 +428,9 @@ impl DbspCircuit {
     fn add_node(
         &mut self,
         operator: DbspOperator,
-        inputs: Vec<usize>,
+        inputs: Vec<i64>,
         executable: Box<dyn IncrementalOperator>,
-    ) -> usize {
+    ) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -655,7 +655,7 @@ impl DbspCircuit {
     /// Execute a specific node in the circuit
     fn execute_node(
         &mut self,
-        node_id: usize,
+        node_id: i64,
         pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
         commit_operators: bool,
@@ -688,7 +688,7 @@ impl DbspCircuit {
                             let input_data = std::mem::take(input_data);
                             let input_node_ids = node.inputs.clone();
 
-                            let input_states: Vec<(usize, ExecuteState)> = input_node_ids
+                            let input_states: Vec<(i64, ExecuteState)> = input_node_ids
                                 .iter()
                                 .map(|&input_id| {
                                     (
@@ -783,7 +783,7 @@ impl Display for DbspCircuit {
 }
 
 impl DbspCircuit {
-    fn fmt_node(&self, f: &mut Formatter, node_id: usize, depth: usize) -> fmt::Result {
+    fn fmt_node(&self, f: &mut Formatter, node_id: i64, depth: usize) -> fmt::Result {
         let indent = "  ".repeat(depth);
         if let Some(node) = self.nodes.get(&node_id) {
             match &node.operator {
@@ -838,9 +838,9 @@ pub struct DbspCompiler {
 impl DbspCompiler {
     /// Create a new DBSP compiler
     pub fn new(
-        main_data_root: usize,
-        internal_state_root: usize,
-        internal_state_index_root: usize,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
     ) -> Self {
         Self {
             circuit: DbspCircuit::new(
@@ -848,6 +848,62 @@ impl DbspCompiler {
                 internal_state_root,
                 internal_state_index_root,
             ),
+        }
+    }
+
+    /// Resolve join condition columns to determine which side each column belongs to.
+    ///
+    /// Returns (left_column, left_index, right_column, right_index) where:
+    /// - left_column/right_column are the Column references
+    /// - left_index/right_index are the column indices in their respective schemas
+    ///
+    /// Handles cases where:
+    /// - Columns are in normal order (left table column = right table column)
+    /// - Columns are swapped (right table column = left table column)
+    /// - One or both columns have table qualifiers
+    /// - Column names exist in both tables but are disambiguated by qualifiers
+    fn resolve_join_columns(
+        first_col: &Column,
+        second_col: &Column,
+        left_schema: &LogicalSchema,
+        right_schema: &LogicalSchema,
+    ) -> Result<(Column, usize, Column, usize)> {
+        // Check all four possibilities to handle ambiguous column names
+        let first_in_left = left_schema.find_column(&first_col.name, first_col.table.as_deref());
+        let first_in_right = right_schema.find_column(&first_col.name, first_col.table.as_deref());
+        let second_in_left = left_schema.find_column(&second_col.name, second_col.table.as_deref());
+        let second_in_right =
+            right_schema.find_column(&second_col.name, second_col.table.as_deref());
+
+        // Determine the correct pairing: one column must be from left, one from right
+        if first_in_left.is_some() && second_in_right.is_some() {
+            // first is from left, second is from right
+            let (left_idx, _) = first_in_left.unwrap();
+            let (right_idx, _) = second_in_right.unwrap();
+            Ok((first_col.clone(), left_idx, second_col.clone(), right_idx))
+        } else if first_in_right.is_some() && second_in_left.is_some() {
+            // first is from right, second is from left
+            let (left_idx, _) = second_in_left.unwrap();
+            let (right_idx, _) = first_in_right.unwrap();
+            Ok((second_col.clone(), left_idx, first_col.clone(), right_idx))
+        } else {
+            // Provide specific error messages for different failure cases
+            if first_in_left.is_none() && first_in_right.is_none() {
+                Err(LimboError::ParseError(format!(
+                    "Join condition column '{}' not found in either input",
+                    first_col.name
+                )))
+            } else if second_in_left.is_none() && second_in_right.is_none() {
+                Err(LimboError::ParseError(format!(
+                    "Join condition column '{}' not found in either input",
+                    second_col.name
+                )))
+            } else {
+                Err(LimboError::ParseError(format!(
+                    "Join condition columns '{}' and '{}' must come from different input tables",
+                    first_col.name, second_col.name
+                )))
+            }
         }
     }
 
@@ -860,7 +916,7 @@ impl DbspCompiler {
     }
 
     /// Recursively compile a logical plan node
-    fn compile_plan(&mut self, plan: &LogicalPlan) -> Result<usize> {
+    fn compile_plan(&mut self, plan: &LogicalPlan) -> Result<i64> {
         match plan {
             LogicalPlan::Projection(proj) => {
                 // Compile the input first
@@ -1240,24 +1296,17 @@ impl DbspCompiler {
                 for (left_expr, right_expr) in &join.on {
                     // Extract column indices from join expressions
                     // We expect simple column references in join conditions
-                    if let (LogicalExpr::Column(left_col), LogicalExpr::Column(right_col)) = (left_expr, right_expr) {
-                        // Find indices in respective schemas using qualified lookup
-                        let (left_idx, _) = left_schema.find_column(&left_col.name, left_col.table.as_deref())
-                            .ok_or_else(|| LimboError::ParseError(
-                                format!("Join column '{}' not found in left input", left_col.name)
-                            ))?;
-                        let (right_idx, _) = right_schema.find_column(&right_col.name, right_col.table.as_deref())
-                            .ok_or_else(|| LimboError::ParseError(
-                                format!("Join column '{}' not found in right input", right_col.name)
-                            ))?;
+                    if let (LogicalExpr::Column(first_col), LogicalExpr::Column(second_col)) = (left_expr, right_expr) {
+                        let (actual_left_col, actual_left_idx, actual_right_col, actual_right_idx) =
+                            Self::resolve_join_columns(first_col, second_col, left_schema, right_schema)?;
 
-                        left_key_indices.push(left_idx);
-                        right_key_indices.push(right_idx);
+                        left_key_indices.push(actual_left_idx);
+                        right_key_indices.push(actual_right_idx);
 
                         // Convert to DBSP expressions
                         dbsp_on_exprs.push((
-                            DbspExpr::Column(left_col.name.clone()),
-                            DbspExpr::Column(right_col.name.clone())
+                            DbspExpr::Column(actual_left_col.name.clone()),
+                            DbspExpr::Column(actual_right_col.name.clone())
                         ));
                     } else {
                         return Err(LimboError::ParseError(
@@ -1403,7 +1452,7 @@ impl DbspCompiler {
     }
 
     /// Compile a UNION operator
-    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<usize> {
+    fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<i64> {
         if union.inputs.len() != 2 {
             return Err(LimboError::ParseError(format!(
                 "UNION requires exactly 2 inputs, got {}",
@@ -1583,7 +1632,7 @@ impl DbspCompiler {
                     .collect();
                 let ast_args: Vec<Box<ast::Expr>> = ast_args?.into_iter().map(Box::new).collect();
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::Ident(fun.clone()),
+                    name: ast::Name::exact(fun.clone()),
                     distinctness: None,
                     args: ast_args,
                     order_by: Vec::new(),
@@ -1624,7 +1673,7 @@ impl DbspCompiler {
                 };
 
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::Ident(func_name.to_string()),
+                    name: ast::Name::exact(func_name.to_string()),
                     distinctness: if *distinct {
                         Some(ast::Distinctness::Distinct)
                     } else {
@@ -2483,7 +2532,7 @@ mod tests {
         }};
     }
 
-    fn setup_btree_for_circuit() -> (Arc<Pager>, usize, usize, usize) {
+    fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
@@ -2494,17 +2543,17 @@ mod tests {
         let main_root_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         let dbsp_state_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         let dbsp_state_index_page = pager
             .io
             .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
-            .unwrap() as usize;
+            .unwrap() as i64;
 
         (
             pager,
@@ -5699,5 +5748,341 @@ mod tests {
             .iter()
             .find(|(row, _)| row.values[0] == Value::Integer(2));
         assert!(bob.is_none(), "Bob should be filtered out");
+    }
+
+    fn make_column_info(name: &str, ty: Type, table: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            ty,
+            database: None,
+            table: Some(table.to_string()),
+            table_alias: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_join_columns_normal_order() {
+        // Normal case: left.id = right.id
+        let left_schema = LogicalSchema::new(vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: Some("left".to_string()),
+                table_alias: None,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                ty: Type::Text,
+                database: None,
+                table: Some("left".to_string()),
+                table_alias: None,
+            },
+        ]);
+        let right_schema = LogicalSchema::new(vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: Some("right".to_string()),
+                table_alias: None,
+            },
+            ColumnInfo {
+                name: "value".to_string(),
+                ty: Type::Integer,
+                database: None,
+                table: Some("right".to_string()),
+                table_alias: None,
+            },
+        ]);
+
+        let left_col = Column {
+            name: "id".to_string(),
+            table: Some("left".to_string()),
+        };
+        let right_col = Column {
+            name: "id".to_string(),
+            table: Some("right".to_string()),
+        };
+
+        let result =
+            DbspCompiler::resolve_join_columns(&left_col, &right_col, &left_schema, &right_schema);
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "id");
+        assert_eq!(actual_left.table, Some("left".to_string()));
+        assert_eq!(left_idx, 0);
+        assert_eq!(actual_right.name, "id");
+        assert_eq!(actual_right.table, Some("right".to_string()));
+        assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_resolve_join_columns_swapped_order() {
+        // Swapped case: right.id = left.id
+        let left_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "left"),
+            make_column_info("name", Type::Text, "left"),
+        ]);
+        let right_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "right"),
+            make_column_info("value", Type::Integer, "right"),
+        ]);
+
+        let right_col = Column {
+            name: "id".to_string(),
+            table: Some("right".to_string()),
+        };
+        let left_col = Column {
+            name: "id".to_string(),
+            table: Some("left".to_string()),
+        };
+
+        let result =
+            DbspCompiler::resolve_join_columns(&right_col, &left_col, &left_schema, &right_schema);
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "id");
+        assert_eq!(actual_left.table, Some("left".to_string()));
+        assert_eq!(left_idx, 0);
+        assert_eq!(actual_right.name, "id");
+        assert_eq!(actual_right.table, Some("right".to_string()));
+        assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_resolve_join_columns_one_ambiguous_one_not() {
+        // Both tables have 'id', but only left has 'other_id'
+        let left_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "left"),
+            make_column_info("other_id", Type::Integer, "left"),
+        ]);
+        let right_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "right"),
+            make_column_info("value", Type::Integer, "right"),
+        ]);
+
+        // Unqualified 'id' with qualified 'left.other_id'
+        let id_col = Column {
+            name: "id".to_string(),
+            table: None,
+        };
+        let other_id_col = Column {
+            name: "other_id".to_string(),
+            table: Some("left".to_string()),
+        };
+
+        // id from right, other_id from left
+        let result =
+            DbspCompiler::resolve_join_columns(&id_col, &other_id_col, &left_schema, &right_schema);
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "other_id");
+        assert_eq!(left_idx, 1);
+        assert_eq!(actual_right.name, "id");
+        assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_resolve_join_columns_mixed_qualified() {
+        // One qualified, one unqualified, column exists on both sides
+        let left_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "left"),
+            make_column_info("name", Type::Text, "left"),
+        ]);
+        let right_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "right"),
+            make_column_info("name", Type::Text, "right"),
+        ]);
+
+        // Qualified left.id with unqualified name
+        let left_id = Column {
+            name: "id".to_string(),
+            table: Some("left".to_string()),
+        };
+        let name_unqualified = Column {
+            name: "name".to_string(),
+            table: None,
+        };
+
+        let result = DbspCompiler::resolve_join_columns(
+            &left_id,
+            &name_unqualified,
+            &left_schema,
+            &right_schema,
+        );
+        // left.id is explicitly from left, so unqualified 'name' must be resolved from right
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "id");
+        assert_eq!(left_idx, 0);
+        assert_eq!(actual_right.name, "name");
+        assert_eq!(right_idx, 1);
+    }
+
+    #[test]
+    fn test_resolve_join_columns_both_from_same_side() {
+        // Both columns from left table - should fail
+        let left_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "left"),
+            make_column_info("other_id", Type::Integer, "left"),
+        ]);
+        let right_schema =
+            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
+
+        let left_id = Column {
+            name: "id".to_string(),
+            table: Some("left".to_string()),
+        };
+        let left_other_id = Column {
+            name: "other_id".to_string(),
+            table: Some("left".to_string()),
+        };
+
+        let result = DbspCompiler::resolve_join_columns(
+            &left_id,
+            &left_other_id,
+            &left_schema,
+            &right_schema,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must come from different input tables"));
+    }
+
+    #[test]
+    fn test_resolve_join_columns_nonexistent_column() {
+        // Column doesn't exist in either table
+        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
+        let right_schema =
+            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
+
+        let id_col = Column {
+            name: "id".to_string(),
+            table: None,
+        };
+        let nonexistent_col = Column {
+            name: "does_not_exist".to_string(),
+            table: None,
+        };
+
+        let result = DbspCompiler::resolve_join_columns(
+            &id_col,
+            &nonexistent_col,
+            &left_schema,
+            &right_schema,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_join_columns_both_qualified() {
+        // Both columns qualified - should work normally
+        let left_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "left"),
+            make_column_info("name", Type::Text, "left"),
+        ]);
+        let right_schema = LogicalSchema::new(vec![
+            make_column_info("id", Type::Integer, "right"),
+            make_column_info("value", Type::Integer, "right"),
+        ]);
+
+        let left_id = Column {
+            name: "id".to_string(),
+            table: Some("left".to_string()),
+        };
+        let right_id = Column {
+            name: "id".to_string(),
+            table: Some("right".to_string()),
+        };
+
+        let result =
+            DbspCompiler::resolve_join_columns(&left_id, &right_id, &left_schema, &right_schema);
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "id");
+        assert_eq!(left_idx, 0);
+        assert_eq!(actual_right.name, "id");
+        assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_resolve_join_columns_both_unqualified_same_name() {
+        // Both columns unqualified with same name existing in both tables - should succeed
+        // (first match wins based on order of checking)
+        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
+        let right_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "right")]);
+
+        let id_col1 = Column {
+            name: "id".to_string(),
+            table: None,
+        };
+        let id_col2 = Column {
+            name: "id".to_string(),
+            table: None,
+        };
+
+        let result =
+            DbspCompiler::resolve_join_columns(&id_col1, &id_col2, &left_schema, &right_schema);
+        // Should succeed - unqualified 'id' matches in both schemas
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_join_columns_first_not_found() {
+        // First column doesn't exist anywhere
+        let left_schema = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "left")]);
+        let right_schema =
+            LogicalSchema::new(vec![make_column_info("value", Type::Integer, "right")]);
+
+        let missing_col = Column {
+            name: "missing".to_string(),
+            table: None,
+        };
+        let value_col = Column {
+            name: "value".to_string(),
+            table: None,
+        };
+
+        let result = DbspCompiler::resolve_join_columns(
+            &missing_col,
+            &value_col,
+            &left_schema,
+            &right_schema,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not found in either input"));
+    }
+
+    #[test]
+    fn test_resolve_join_columns_both_unqualified_different_names() {
+        // Both unqualified, each exists in only one table
+        let left_schema =
+            LogicalSchema::new(vec![make_column_info("left_id", Type::Integer, "left")]);
+        let right_schema =
+            LogicalSchema::new(vec![make_column_info("right_id", Type::Integer, "right")]);
+
+        let left_col = Column {
+            name: "left_id".to_string(),
+            table: None,
+        };
+        let right_col = Column {
+            name: "right_id".to_string(),
+            table: None,
+        };
+
+        let result =
+            DbspCompiler::resolve_join_columns(&left_col, &right_col, &left_schema, &right_schema);
+        assert!(result.is_ok());
+        let (actual_left, left_idx, actual_right, right_idx) = result.unwrap();
+        assert_eq!(actual_left.name, "left_id");
+        assert_eq!(left_idx, 0);
+        assert_eq!(actual_right.name, "right_id");
+        assert_eq!(right_idx, 0);
     }
 }

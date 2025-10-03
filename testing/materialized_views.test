@@ -1595,3 +1595,99 @@ do_execsql_test_on_specific_db {:memory:} matview-in-incremental {
 1|INFO|start
 3|ERROR|fail
 3|ERROR|fail}
+
+# Test join with swapped column order in ON clause
+do_execsql_test_on_specific_db {:memory:} matview-join-swapped-columns {
+    CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE departments(emp_id INTEGER PRIMARY KEY, dept_name TEXT);
+
+    INSERT INTO employees VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+    CREATE MATERIALIZED VIEW emp_dept AS
+        SELECT e.name, d.dept_name
+        FROM employees e
+        JOIN departments d ON d.emp_id = e.id;
+
+    SELECT * FROM emp_dept ORDER BY name;
+} {Alice|Engineering
+Bob|Sales}
+
+do_execsql_test_on_specific_db {:memory:} matview-groupby-scalar-function {
+    CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER);
+    INSERT INTO orders VALUES (1, '2020-01-15', 100);
+    INSERT INTO orders VALUES (2, '2020-06-10', 150);
+    INSERT INTO orders VALUES (3, '2021-03-20', 200);
+
+    CREATE MATERIALIZED VIEW yearly_totals AS
+        SELECT substr(orderdate, 1, 4), sum(amount)
+        FROM orders
+        GROUP BY substr(orderdate, 1, 4);
+
+    SELECT * FROM yearly_totals ORDER BY 1;
+} {2020|250
+2021|200}
+
+do_execsql_test_on_specific_db {:memory:} matview-groupby-alias {
+    CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER);
+    INSERT INTO orders VALUES (1, '2020-01-15', 100);
+    INSERT INTO orders VALUES (2, '2020-06-10', 150);
+    INSERT INTO orders VALUES (3, '2021-03-20', 200);
+
+    CREATE MATERIALIZED VIEW yearly_totals AS
+        SELECT substr(orderdate, 1, 4) as year, sum(amount) as total
+        FROM orders
+        GROUP BY year;
+
+    SELECT * FROM yearly_totals ORDER BY year;
+} {2020|250
+2021|200}
+
+do_execsql_test_on_specific_db {:memory:} matview-groupby-position {
+    CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER, nation TEXT);
+    INSERT INTO orders VALUES (1, '2020-01-15', 100, 'USA');
+    INSERT INTO orders VALUES (2, '2020-06-10', 150, 'USA');
+    INSERT INTO orders VALUES (3, '2021-03-20', 200, 'UK');
+
+    CREATE MATERIALIZED VIEW national_yearly AS
+        SELECT nation, substr(orderdate, 1, 4) as year, sum(amount) as total
+        FROM orders
+        GROUP BY 1, 2;
+
+    SELECT * FROM national_yearly ORDER BY nation, year;
+} {UK|2021|200
+USA|2020|250}
+
+do_execsql_test_on_specific_db {:memory:} matview-groupby-scalar-incremental {
+    CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER);
+    INSERT INTO orders VALUES (1, '2020-01-15', 100);
+
+    CREATE MATERIALIZED VIEW yearly_totals AS
+        SELECT substr(orderdate, 1, 4) as year, sum(amount) as total
+        FROM orders
+        GROUP BY year;
+
+    SELECT * FROM yearly_totals;
+    INSERT INTO orders VALUES (2, '2020-06-10', 150);
+    SELECT * FROM yearly_totals;
+    INSERT INTO orders VALUES (3, '2021-03-20', 200);
+    SELECT * FROM yearly_totals ORDER BY year;
+} {2020|100
+2020|250
+2020|250
+2021|200}
+
+do_execsql_test_on_specific_db {:memory:} matview-groupby-join-position {
+    CREATE TABLE t(a INTEGER);
+    CREATE TABLE u(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    INSERT INTO u VALUES (1), (1), (2);
+
+    CREATE MATERIALIZED VIEW tujoingroup AS
+        SELECT t.a, count(u.a) as cnt
+        FROM t JOIN u ON t.a = u.a
+        GROUP BY 1;
+
+    SELECT * FROM tujoingroup ORDER BY a;
+} {1|2
+2|1}

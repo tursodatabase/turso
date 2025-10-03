@@ -1,6 +1,7 @@
 name: Build & publish @tursodatabase/database
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -77,8 +78,8 @@ jobs:
               export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
               yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-browser-common build
-              yarn workspace @tursodatabase/database-browser build
+              yarn workspace @tursodatabase/database-wasm-common build
+              yarn workspace @tursodatabase/database-wasm build
           - host: ubuntu-latest
             target: wasm32-wasip1-threads
             artifact: sync-bindings-wasm32-wasip1-threads
@@ -92,9 +93,9 @@ jobs:
               export TARGET_CXXFLAGS="--target=wasm32-wasi-threads --sysroot=$(pwd)/wasi-sdk-25.0-x86_64-linux/share/wasi-sysroot -pthread -mllvm -wasm-enable-sjlj -lsetjmp"
               export TARGET_CFLAGS="$TARGET_CXXFLAGS"
               yarn workspace @tursodatabase/database-common build
-              yarn workspace @tursodatabase/database-browser-common build
+              yarn workspace @tursodatabase/database-wasm-common build
               yarn workspace @tursodatabase/sync-common build
-              yarn workspace @tursodatabase/sync-browser build
+              yarn workspace @tursodatabase/sync-wasm build
     name: ${{ matrix.settings.artifact }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -155,9 +156,9 @@ jobs:
           name: ${{ matrix.settings.artifact }}
           path: |
             bindings/javascript/packages/native/turso.*.node
-            bindings/javascript/packages/browser/turso.*.wasm
+            bindings/javascript/packages/wasm/turso.*.wasm
             bindings/javascript/sync/packages/native/sync.*.node
-            bindings/javascript/sync/packages/browser/sync.*.wasm
+            bindings/javascript/sync/packages/wasm/sync.*.wasm
           if-no-files-found: error
   test-db-linux-x64-gnu-binding:
     name: Test DB bindings on Linux-x64-gnu - node@${{ matrix.node }}
@@ -191,7 +192,7 @@ jobs:
         shell: bash
       - name: Test bindings
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
-  test-db-browser-binding:
+  test-db-wasm-binding:
     name: Test DB bindings on browser@${{ matrix.node }}
     timeout-minutes: 30
     needs:
@@ -212,10 +213,10 @@ jobs:
         run: yarn install
       - name: Build common
         run: yarn workspace @tursodatabase/database-common build
-      - name: Build browser-common
-        run: yarn workspace @tursodatabase/database-browser-common build
+      - name: Build wasm-common
+        run: yarn workspace @tursodatabase/database-wasm-common build
       - name: Install playwright with deps
-        run: yarn workspace @tursodatabase/database-browser playwright install --with-deps
+        run: yarn workspace @tursodatabase/database-wasm playwright install --with-deps
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
@@ -226,7 +227,7 @@ jobs:
         run: ls -R .
         shell: bash
       - name: Test bindings
-        run: yarn workspace @tursodatabase/database-browser test
+        run: yarn workspace @tursodatabase/database-wasm test
   publish:
     name: Publish
     runs-on: ubuntu-latest
@@ -236,7 +237,7 @@ jobs:
       id-token: write
     needs:
       - test-db-linux-x64-gnu-binding
-      - test-db-browser-binding
+      - test-db-wasm-binding
     steps:
       - uses: actions/checkout@v4
       - name: Setup node

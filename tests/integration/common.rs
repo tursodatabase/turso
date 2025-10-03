@@ -24,16 +24,8 @@ impl TempDatabase {
     pub fn new(db_name: &str, enable_indexes: bool) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
-        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
-            None,
-        )
-        .unwrap();
-        Self { path, io, db }
+
+        Self::new_with_existent(&path, enable_indexes)
     }
 
     pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
@@ -63,6 +55,23 @@ impl TempDatabase {
         )
     }
 
+    pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
+        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+        )
+        .unwrap();
+        Self {
+            path: db_path.to_path_buf(),
+            io,
+            db,
+        }
+    }
+
     pub fn new_with_existent_with_flags(
         db_path: &Path,
         flags: turso_core::OpenFlags,
@@ -73,7 +82,9 @@ impl TempDatabase {
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            turso_core::DatabaseOpts::new()
+                .with_indexes(enable_indexes)
+                .with_encryption(true),
             None,
         )
         .unwrap();
@@ -124,6 +135,31 @@ impl TempDatabase {
             enable_indexes,
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn get_pending_byte() -> u32 {
+        let pending_byte_sqlite = unsafe {
+            rusqlite::ffi::sqlite3_test_control(rusqlite::ffi::SQLITE_TESTCTRL_PENDING_BYTE, 0)
+        } as u32;
+        let pending_byte_turso = { Database::get_pending_byte() };
+        assert_eq!(pending_byte_turso, pending_byte_sqlite);
+        pending_byte_turso
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn set_pending_byte(offset: u32) {
+        unsafe {
+            rusqlite::ffi::sqlite3_test_control(rusqlite::ffi::SQLITE_TESTCTRL_PENDING_BYTE, offset)
+        };
+        Database::set_pending_byte(offset);
+    }
+
+    #[cfg(feature = "test_helper")]
+    pub fn reset_pending_byte() {
+        // 1 Gib
+        const PENDING_BYTE: u32 = 2u32.pow(30);
+        Self::set_pending_byte(PENDING_BYTE);
     }
 }
 
@@ -230,6 +266,20 @@ pub(crate) fn limbo_exec_rows(
     rows
 }
 
+pub(crate) fn limbo_stmt_get_column_names(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Vec<String> {
+    let stmt = conn.prepare(query).unwrap();
+
+    let mut names = vec![];
+    for i in 0..stmt.num_columns() {
+        names.push(stmt.get_column_name(i).to_string());
+    }
+    names
+}
+
 pub(crate) fn limbo_exec_rows_fallible(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
@@ -297,6 +347,21 @@ pub(crate) fn rng_from_time() -> (ChaCha8Rng, u64) {
     (rng, seed)
 }
 
+pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
+    let seed = std::env::var("SEED").map_or(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        |v| {
+            v.parse()
+                .expect("Failed to parse SEED environment variable as u64")
+        },
+    );
+    let rng = ChaCha8Rng::seed_from_u64(seed as u64);
+    (rng, seed as u64)
+}
+
 pub fn run_query(tmp_db: &TempDatabase, conn: &Arc<Connection>, query: &str) -> anyhow::Result<()> {
     run_query_core(tmp_db, conn, query, None::<fn(&Row)>)
 }
@@ -333,6 +398,26 @@ pub fn run_query_core(
             }
         }
     };
+    Ok(())
+}
+
+pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
+    let mut rows = stmt.query(())?;
+    let mut result: Vec<String> = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        result.push(row.get(0)?);
+    }
+    if result.is_empty() {
+        anyhow::bail!("integrity_check should return `ok` or a list of problems")
+    }
+    if !result[0].eq_ignore_ascii_case("ok") {
+        // Build a list of problems
+        result.iter_mut().for_each(|row| *row = format!("- {row}"));
+        anyhow::bail!("integrity check returned: {}", result.join("\n"))
+    }
     Ok(())
 }
 

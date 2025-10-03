@@ -112,16 +112,9 @@ const QUOTE_PAIRS: &[(char, char)] = &[
 ];
 
 pub fn normalize_ident(identifier: &str) -> String {
-    let quote_pair = QUOTE_PAIRS
-        .iter()
-        .find(|&(start, end)| identifier.starts_with(*start) && identifier.ends_with(*end));
-
-    if let Some(&(_, _)) = quote_pair {
-        &identifier[1..identifier.len() - 1]
-    } else {
-        identifier
-    }
-    .to_lowercase()
+    // quotes normalization already happened in the parser layer (see Name ast node implementation)
+    // so, we only need to convert identifier string to lowercase
+    identifier.to_lowercase()
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
@@ -131,7 +124,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// CREATE INDEX idx ON table_name(sql)
 pub struct UnparsedFromSqlIndex {
     pub table_name: String,
-    pub root_page: usize,
+    pub root_page: i64,
     pub sql: String,
 }
 
@@ -142,22 +135,22 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
-    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
+    let mv_store = rows.mv_store.clone();
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
     let mut automatic_indices = std::collections::HashMap::with_capacity(10);
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: std::collections::HashMap<String, usize> =
+    let mut dbsp_state_roots: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: std::collections::HashMap<String, usize> =
+    let mut dbsp_state_index_roots: std::collections::HashMap<String, i64> =
         std::collections::HashMap::new();
     // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: std::collections::HashMap<String, (String, usize)> =
+    let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
         std::collections::HashMap::new();
     loop {
         match rows.step()? {
@@ -180,7 +173,7 @@ pub fn parse_schema_rows(
                     &mut dbsp_state_roots,
                     &mut dbsp_state_index_roots,
                     &mut materialized_view_info,
-                    mv_store,
+                    mv_store.as_ref(),
                 )?
             }
             StepResult::IO => {
@@ -1019,11 +1012,7 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
 
 pub fn parse_string(expr: &Expr) -> Result<String> {
     match expr {
-        Expr::Name(ast::Name::Ident(s)) | Expr::Name(ast::Name::Quoted(s))
-            if s.len() >= 2 && s.starts_with("'") && s.ends_with("'") =>
-        {
-            Ok(s[1..s.len() - 1].to_string())
-        }
+        Expr::Name(name) if name.quoted_with('\'') => Ok(name.as_str().to_string()),
         _ => Err(LimboError::InvalidArgument(format!(
             "string parameter expected, got {expr:?} instead"
         ))),
@@ -1357,9 +1346,8 @@ pub mod tests {
     #[test]
     fn test_normalize_ident() {
         assert_eq!(normalize_ident("foo"), "foo");
-        assert_eq!(normalize_ident("`foo`"), "foo");
-        assert_eq!(normalize_ident("[foo]"), "foo");
-        assert_eq!(normalize_ident("\"foo\""), "foo");
+        assert_eq!(normalize_ident("FOO"), "foo");
+        assert_eq!(normalize_ident("ὈΔΥΣΣΕΎΣ"), "ὀδυσσεύς");
     }
 
     #[test]
@@ -1443,9 +1431,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_case_insensitive_functioncalls() {
         let func1 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1453,9 +1441,9 @@ pub mod tests {
             },
         };
         let func2 = Expr::FunctionCall {
-            name: Name::Ident("sum".to_string()),
+            name: Name::exact("sum".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1465,9 +1453,9 @@ pub mod tests {
         assert!(exprs_are_equivalent(&func1, &func2));
 
         let func3 = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1480,9 +1468,9 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_identical_fn_with_distinct() {
         let sum = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: None,
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1490,9 +1478,9 @@ pub mod tests {
             },
         };
         let sum_distinct = Expr::FunctionCall {
-            name: Name::Ident("SUM".to_string()),
+            name: Name::exact("SUM".to_string()),
             distinctness: Some(ast::Distinctness::Distinct),
-            args: vec![Expr::Id(Name::Ident("x".to_string())).into()],
+            args: vec![Expr::Id(Name::exact("x".to_string())).into()],
             order_by: vec![],
             filter_over: FunctionTail {
                 filter_clause: None,
@@ -1551,14 +1539,14 @@ pub mod tests {
     #[test]
     fn test_like_expressions_equivalent() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1570,14 +1558,14 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_like_escaped() {
         let expr1 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
             escape: Some(Box::new(Expr::Literal(Literal::String("\\".to_string())))),
         };
         let expr2 = Expr::Like {
-            lhs: Box::new(Expr::Id(Name::Ident("name".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("name".to_string()))),
             not: false,
             op: ast::LikeOperator::Like,
             rhs: Box::new(Expr::Literal(Literal::String("%john%".to_string()))),
@@ -1588,13 +1576,13 @@ pub mod tests {
     #[test]
     fn test_expressions_equivalent_between() {
         let expr1 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
         };
         let expr2 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("18".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -1603,7 +1591,7 @@ pub mod tests {
 
         // differing BETWEEN bounds
         let expr3 = Expr::Between {
-            lhs: Box::new(Expr::Id(Name::Ident("age".to_string()))),
+            lhs: Box::new(Expr::Id(Name::exact("age".to_string()))),
             not: false,
             start: Box::new(Expr::Literal(Literal::Numeric("20".to_string()))),
             end: Box::new(Expr::Literal(Literal::Numeric("65".to_string()))),
@@ -2328,18 +2316,18 @@ pub mod tests {
     #[test]
     fn test_parse_pragma_bool() {
         assert!(parse_pragma_bool(&Expr::Literal(Literal::Numeric("1".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("true".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("on".into()))).unwrap(),);
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("yes".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("true".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("on".into()))).unwrap(),);
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("yes".into()))).unwrap(),);
 
         assert!(!parse_pragma_bool(&Expr::Literal(Literal::Numeric("0".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("false".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("off".into()))).unwrap(),);
-        assert!(!parse_pragma_bool(&Expr::Name(Name::Ident("no".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("false".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("off".into()))).unwrap(),);
+        assert!(!parse_pragma_bool(&Expr::Name(Name::exact("no".into()))).unwrap(),);
 
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("nono".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("10".into()))).is_err());
-        assert!(parse_pragma_bool(&Expr::Name(Name::Ident("-1".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("nono".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("10".into()))).is_err());
+        assert!(parse_pragma_bool(&Expr::Name(Name::exact("-1".into()))).is_err());
     }
 
     #[test]

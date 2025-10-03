@@ -4,13 +4,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-use turso::{Builder, Database, Result};
-
-#[derive(Debug, Clone)]
-struct EncryptionOpts {
-    cipher: String,
-    hexkey: String,
-}
+use turso::{Builder, Database, EncryptionOpts, Result};
 
 #[derive(Parser)]
 #[command(name = "encryption-throughput")]
@@ -86,6 +80,8 @@ struct WorkerStats {
     reads_found: u64,
     reads_not_found: u64,
     total_transaction_time: Duration,
+    total_read_time: Duration,
+    total_write_time: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +198,8 @@ async fn main() -> Result<()> {
     let mut total_writes = 0;
     let mut total_reads_found = 0;
     let mut total_reads_not_found = 0;
+    let mut total_read_time = Duration::ZERO;
+    let mut total_write_time = Duration::ZERO;
 
     for (idx, handle) in handles.into_iter().enumerate() {
         match handle.await {
@@ -211,6 +209,8 @@ async fn main() -> Result<()> {
                 total_writes += stats.writes_completed;
                 total_reads_found += stats.reads_found;
                 total_reads_not_found += stats.reads_not_found;
+                total_read_time += stats.total_read_time;
+                total_write_time += stats.total_write_time;
             }
             Ok(Err(e)) => {
                 eprintln!("Thread error {idx}: {e}");
@@ -240,6 +240,19 @@ async fn main() -> Result<()> {
     };
     let avg_ops_per_txn = (total_operations as f64) / (total_transactions as f64);
 
+    // Turso DB is too damn fast, so lets measure latencies in microseconds
+    let avg_read_latency_us = if total_reads > 0 {
+        total_read_time.as_micros() as f64 / total_reads as f64
+    } else {
+        0.0
+    };
+
+    let avg_write_latency_us = if total_writes > 0 {
+        total_write_time.as_micros() as f64 / total_writes as f64
+    } else {
+        0.0
+    };
+
     println!("\n=== BENCHMARK RESULTS ===");
     println!("Total transactions: {total_transactions}");
     println!("Total operations: {total_operations}");
@@ -256,10 +269,17 @@ async fn main() -> Result<()> {
             "  - Read operations: {total_reads} ({total_reads_found} found, {total_reads_not_found} not found)"
         );
         println!("  - Read throughput: {read_throughput:.2} reads/sec");
+        println!("  - Read total time: {:.2}s", total_read_time.as_secs_f64());
+        println!("  - Read avg latency: {avg_read_latency_us:.2}μs");
     }
     if total_writes > 0 {
         println!("  - Write operations: {total_writes}");
         println!("  - Write throughput: {write_throughput:.2} writes/sec");
+        println!(
+            "  - Write total time: {:.2}s",
+            total_write_time.as_secs_f64()
+        );
+        println!("  - Write avg latency: {avg_write_latency_us:.2}μs");
     }
 
     println!("\nConfiguration:");
@@ -289,6 +309,14 @@ async fn setup_database(
     encryption_opts: &Option<EncryptionOpts>,
 ) -> Result<Database> {
     let builder = Builder::new_local(db_path);
+    let builder = if let Some(opts) = encryption_opts {
+        builder
+            .experimental_encryption(true)
+            .with_encryption(opts.clone())
+    } else {
+        builder
+    };
+
     let db = builder.build().await?;
     let conn = db.connect()?;
 
@@ -337,6 +365,8 @@ async fn worker_thread(
         reads_found: 0,
         reads_not_found: 0,
         total_transaction_time: Duration::ZERO,
+        total_read_time: Duration::ZERO,
+        total_write_time: Duration::ZERO,
     };
 
     let thread_seed = base_seed.wrapping_add(thread_id as u64);
@@ -369,6 +399,8 @@ async fn worker_thread(
                 let max_id = shared_state.max_inserted_id.load(Ordering::Relaxed);
                 if max_id > 0 {
                     let read_id = rng.random_range(1..=max_id);
+
+                    let read_start = Instant::now();
                     let row = conn
                         .query(
                             "SELECT data FROM test_table WHERE id = ?",
@@ -377,6 +409,8 @@ async fn worker_thread(
                             )]),
                         )
                         .await;
+                    let read_elapsed = read_start.elapsed();
+                    stats.total_read_time += read_elapsed;
 
                     match row {
                         Ok(_) => stats.reads_found += 1,
@@ -387,12 +421,16 @@ async fn worker_thread(
                 } else {
                     // if no data inserted yet, convert to a write
                     let id = thread_id * iterations * batch_size + iteration * batch_size + i + 1;
+
+                    let write_start = Instant::now();
                     insert_stmt
                         .execute(turso::params::Params::Positional(vec![
                             turso::Value::Integer(id as i64),
                             turso::Value::Text(format!("data_{id}")),
                         ]))
                         .await?;
+                    let write_elapsed = write_start.elapsed();
+                    stats.total_write_time += write_elapsed;
 
                     shared_state
                         .max_inserted_id
@@ -401,12 +439,19 @@ async fn worker_thread(
                 }
             } else {
                 let id = thread_id * iterations * batch_size + iteration * batch_size + i + 1;
+
+                // lets measure the "write" time. do note that, this write might not hit disk and do
+                // i/o, since fsync is called only on commit at the end. but thats okay since
+                // we want to compare overhead of encryption.
+                let write_start = Instant::now();
                 insert_stmt
                     .execute(turso::params::Params::Positional(vec![
                         turso::Value::Integer(id as i64),
                         turso::Value::Text(format!("data_{id}")),
                     ]))
                     .await?;
+                let write_elapsed = write_start.elapsed();
+                stats.total_write_time += write_elapsed;
 
                 shared_state
                     .max_inserted_id
@@ -433,8 +478,20 @@ async fn worker_thread(
     let avg_txn_latency =
         stats.total_transaction_time.as_secs_f64() * 1000.0 / stats.transactions_completed as f64;
 
+    let avg_read_latency = if stats.reads_completed > 0 {
+        (stats.total_read_time.as_secs_f64() * 1_000_000.0) / (stats.reads_completed as f64)
+    } else {
+        0.0
+    };
+
+    let avg_write_latency = if stats.writes_completed > 0 {
+        (stats.total_write_time.as_secs_f64() * 1_000_000.0) / (stats.writes_completed as f64)
+    } else {
+        0.0
+    };
+
     println!(
-        "Thread {}: {} txns ({} ops: {} reads, {} writes) in {:.2}s ({:.2} txns/sec, {:.2} ops/sec, {:.2}ms avg latency)",
+        "Thread {}: {} txns ({} ops: {} reads, {} writes) in {:.2}s ({:.2} txns/sec, {:.2} ops/sec, {:.2}ms avg txn latency)",
         thread_id,
         stats.transactions_completed,
         total_ops,
@@ -448,8 +505,15 @@ async fn worker_thread(
 
     if stats.reads_completed > 0 {
         println!(
-            "  Thread {} reads: {} found, {} not found",
-            thread_id, stats.reads_found, stats.reads_not_found
+            "  Thread {} reads: {} found, {} not found (avg latency: {:.2}μs)",
+            thread_id, stats.reads_found, stats.reads_not_found, avg_read_latency
+        );
+    }
+
+    if stats.writes_completed > 0 {
+        println!(
+            "  Thread {} writes: {} (avg latency: {:.2}μs)",
+            thread_id, stats.writes_completed, avg_write_latency
         );
     }
 

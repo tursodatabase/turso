@@ -48,7 +48,8 @@ pub use params::IntoParams;
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
-
+pub use turso_core::EncryptionOpts;
+use turso_core::OpenFlags;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -82,7 +83,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Builder {
     path: String,
     enable_mvcc: bool,
+    enable_encryption: bool,
     vfs: Option<String>,
+    encryption_opts: Option<EncryptionOpts>,
 }
 
 impl Builder {
@@ -91,12 +94,24 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_mvcc: false,
+            enable_encryption: false,
             vfs: None,
+            encryption_opts: None,
         }
     }
 
     pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
         self.enable_mvcc = mvcc_enabled;
+        self
+    }
+
+    pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
+        self.enable_encryption = encryption_enabled;
+        self
+    }
+
+    pub fn with_encryption(mut self, opts: EncryptionOpts) -> Self {
+        self.encryption_opts = Some(opts);
         self
     }
 
@@ -109,7 +124,16 @@ impl Builder {
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         let io = self.get_io()?;
-        let db = turso_core::Database::open_file(io, self.path.as_str(), self.enable_mvcc, true)?;
+        let opts = turso_core::DatabaseOpts::default()
+            .with_mvcc(self.enable_mvcc)
+            .with_encryption(self.enable_encryption);
+        let db = turso_core::Database::open_file_with_flags(
+            io,
+            self.path.as_str(),
+            OpenFlags::default(),
+            opts,
+            self.encryption_opts.clone(),
+        )?;
         Ok(Database { inner: db })
     }
 
@@ -482,7 +506,10 @@ impl Statement {
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
                     let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
+                    let i = stmt.parameters().index(&name).ok_or(
+                        turso_core::LimboError::InvalidArgument(
+                            format!("Unknown parameter '{name}' for query '{}'. Make sure you're using the correct parameter syntax - named: (:foo), positional: (?, ?)", stmt.get_sql())
+                        ))?;
                     stmt.bind_at(i, value.into());
                 }
             }

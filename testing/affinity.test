@@ -12,3 +12,11 @@ do_execsql_test_on_specific_db {:memory:} affinity {
   {1|integer} 
   {1a|text} 
 }
+
+do_execsql_test_on_specific_db {:memory:} affinity-rowid {
+	create table t(a integer);
+	insert into t(rowid, a) values (1, 1);
+	select * from t where rowid = '1';
+	select * from t where a = '1';
+} {1
+1}
