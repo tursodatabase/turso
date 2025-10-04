@@ -435,7 +435,7 @@ fn write_at<F: File + ?Sized>(io: &impl IO, file: &F, offset: usize, data: &[u8]
         let _buf = _buf.clone();
     });
     let result = file.pwrite(offset as u64, buffer, completion).unwrap();
-    while !result.is_completed() {
+    while !result.succeeded() {
         io.step().unwrap();
     }
 }

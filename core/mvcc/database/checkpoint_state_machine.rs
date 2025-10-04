@@ -586,7 +586,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -598,7 +598,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::CheckpointWal;
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))

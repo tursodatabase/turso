@@ -632,7 +632,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let c = mvcc_store.storage.log_tx(log_record)?;
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -643,7 +643,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
