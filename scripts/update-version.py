@@ -24,12 +24,20 @@ NPM_PACKAGES = [
     "bindings/javascript/sync/packages/common",
     "bindings/javascript/sync/packages/native",
     "bindings/javascript/sync/packages/wasm",
+    "bindings/javascript/examples/database-node",
+    "bindings/javascript/examples/database-wasm-vite",
+    "bindings/javascript/examples/sync-node",
+    "bindings/javascript/examples/sync-wasm-vite",
 ]
 
 NPM_WORKSPACE_PACKAGES = [
     "@tursodatabase/database-common",
     "@tursodatabase/database-wasm-common",
     "@tursodatabase/sync-common",
+    "@tursodatabase/database",
+    "@tursodatabase/database-wasm",
+    "@tursodatabase/sync",
+    "@tursodatabase/sync-wasm",
 ]
 
 NPM_WORKSPACES = [
