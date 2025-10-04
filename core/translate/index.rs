@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use crate::bail_parse_error;
+use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
 use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
+use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
@@ -91,6 +93,7 @@ pub fn translate_create_index(
     };
     let original_columns = columns;
     let columns = resolve_sorted_columns(&tbl, columns)?;
+    let unique = unique_if_not_exists.0;
 
     let idx = Arc::new(Index {
         name: idx_name.clone(),
@@ -106,7 +109,7 @@ pub fn translate_create_index(
                 default: col.default.clone(),
             })
             .collect(),
-        unique: unique_if_not_exists.0,
+        unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
         // store the *original* where clause, because we need to rewrite it
@@ -295,8 +298,34 @@ pub fn translate_create_index(
         cursor_id: sorter_cursor_id,
         pc_if_empty: sorted_loop_end,
     });
-    program.preassign_label_to_next_insn(sorted_loop_start);
+
     let sorted_record_reg = program.alloc_register();
+
+    if unique {
+        // Since the records to be inserted are sorted, we can compare prev with current and if they are equal,
+        // we fall through to Halt with a unique constraint violation error.
+        let goto_label = program.allocate_label();
+        let label_after_sorter_compare = program.allocate_label();
+        program.resolve_label(goto_label, program.offset());
+        program.emit_insn(Insn::Goto {
+            target_pc: label_after_sorter_compare,
+        });
+        program.preassign_label_to_next_insn(sorted_loop_start);
+        program.emit_insn(Insn::SorterCompare {
+            cursor_id: sorter_cursor_id,
+            sorted_record_reg,
+            num_regs: columns.len(),
+            pc_when_nonequal: goto_label,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            description: format_unique_violation_desc(tbl_name.as_str(), &idx),
+        });
+        program.preassign_label_to_next_insn(label_after_sorter_compare);
+    } else {
+        program.preassign_label_to_next_insn(sorted_loop_start);
+    }
+
     program.emit_insn(Insn::SorterData {
         pseudo_cursor: pseudo_cursor_id,
         cursor_id: sorter_cursor_id,

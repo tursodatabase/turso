@@ -687,6 +687,12 @@ impl ProgramBuilder {
                 Insn::SorterSort { pc_if_empty, .. } => {
                     resolve(pc_if_empty, "SorterSort");
                 }
+                Insn::SorterCompare {
+                    pc_when_nonequal: target_pc,
+                    ..
+                } => {
+                    resolve(target_pc, "SorterCompare");
+                }
                 Insn::NotNull {
                     reg: _reg,
                     target_pc,

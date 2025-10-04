@@ -62,7 +62,7 @@ pub struct Sorter {
     /// The number of values in the key.
     key_len: usize,
     /// The key info.
-    index_key_info: Rc<Vec<KeyInfo>>,
+    pub index_key_info: Rc<Vec<KeyInfo>>,
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
