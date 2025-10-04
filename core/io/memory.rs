@@ -1,5 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::Result;
+use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
 use std::{
@@ -35,11 +35,7 @@ impl Default for MemoryIO {
 
 impl Clock for MemoryIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 

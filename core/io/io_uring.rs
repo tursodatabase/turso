@@ -1,7 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
-use crate::io::clock::{Clock, Instant};
+use crate::io::clock::{Clock, DefaultClock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, CompletionError, LimboError, Result};
 use parking_lot::Mutex;
@@ -697,11 +697,7 @@ impl IO for UringIO {
 
 impl Clock for UringIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 

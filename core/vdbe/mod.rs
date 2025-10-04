@@ -69,6 +69,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
+    task::Waker,
 };
 use tracing::{instrument, Level};
 
@@ -514,9 +515,10 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         match query_mode {
-            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
         }
@@ -629,6 +631,7 @@ impl Program {
         state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
@@ -645,6 +648,7 @@ impl Program {
             }
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
+                    io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
@@ -676,6 +680,7 @@ impl Program {
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
+                    io.set_waker(waker);
                     state.io_completions = Some(io);
                     return Ok(StepResult::IO);
                 }
