@@ -160,16 +160,65 @@ A transaction is a sequence of one or more SQL statements that execute as a sing
 A transaction ensures **atomicity** and **isolation**, meaning that either all SQL statements are executed or none of them are, and that concurrent transactions don't interfere with other transactions.
 Transactions maintain database integrity in the presence of errors, crashes, and concurrent access.
 
-Turso supports two types of transactions: **deferred** and **immediate** transactions:
+Turso supports three types of transactions: **deferred**, **immediate**, and **concurrent** transactions:
 
 * **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.
 * **Immediate**: The transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists. The `EXCLUSIVE` mode is always an alias for `IMMEDIATE` in Turso, just like it is in SQLite in WAL mode.
+* **Concurrent (MVCC only)**: The transaction begins immediately and allows multiple concurrent read and write transactions. When a concurrent transaction commits, the database performs row-level conflict detection and returns a `SQLITE_BUSY` (write-write conflict) error if the transaction attempted to modify a row that was concurrently modified by another transaction. This mode provides the highest level of concurrency at the cost of potential transaction conflicts that must be retried by the application. The transaction isolation level provided by concurrent transactions is snapshot isolation.
 
 ### Deferred transaction lifecycle
 
 When the `BEGIN DEFERRED TRANSACTION` statement executes, the database acquires no snapshot or locks. Instead, the transaction is in a suspended state until the first read or write SQL statement executes. When the first read statement executes, a read transaction begins. The database allows multiple read transactions to exist concurrently. When the first write statement executes, a read transaction is either upgraded to a write transaction or a write transaction begins. The database allows a single write transaction at a time. Concurrent write transactions fail with `SQLITE_BUSY` error.
 
 If a deferred transaction remains unused (no reads or writes), it is automatically restarted by the database if another write transaction commits before the transaction is used. However, if the deferred transaction has already performed reads and another concurrent write transaction commits, it cannot automatically restart due to potential snapshot inconsistency. In this case, the deferred transaction must be manually rolled back and restarted by the application.
+
+### Concurrent transaction lifecycle
+
+Concurrent transactions are only available when MVCC (Multi-Version Concurrency Control) is enabled in the database. They use optimistic concurrency control to allow multiple transactions to modify the database simultaneously.
+
+When the `BEGIN CONCURRENT TRANSACTION` statement executes, the database:
+
+1. Assigns a unique transaction ID to the transaction
+2. Records a begin timestamp from the logical clock
+3. Creates an empty read set and write set to track accessed rows
+4. Does **not** acquire any locks
+
+Unlike deferred transactions which delay locking, concurrent transactions never acquire locks. Instead, they rely on MVCC's snapshot isolation and conflict detection at commit time.
+
+#### Read snapshot isolation
+
+Each concurrent transaction reads from a consistent snapshot of the database as of its begin timestamp. This means:
+
+- Reads see all data committed before the transaction's begin timestamp
+- Reads do **not** see writes from other transactions that commit after this transaction starts
+- Reads from the same transaction are consistent (repeatable reads within the transaction)
+- Multiple concurrent transactions can read and write simultaneously without blocking each other
+
+All rows read by the transaction are tracked in the transaction's read set, and all rows written are tracked in the write set.
+
+#### Commit and conflict detection
+
+When a concurrent transaction commits, the database performs these steps:
+
+1. **Exclusive transaction check**: If there is an active exclusive transaction (started with `BEGIN IMMEDIATE` or a `BEGIN DEFERRED` that upgraded to a write transaction), the concurrent transaction **cannot commit** and receives a `SQLITE_BUSY` error. Concurrent transactions can read and write concurrently with exclusive transactions, but cannot commit until the exclusive transaction completes.
+
+2. **Write-write conflict detection**: For each row in the transaction's write set, the database checks if the row was modified by another transaction. A write-write conflict occurs when:
+   - The row is currently being modified by another active transaction, or
+   - The row was modified by a transaction that committed after this transaction's begin timestamp
+
+3. **Commit or abort**: If no conflicts are detected, the transaction commits successfully. All row versions in the write set have their begin timestamps updated to the transaction's commit timestamp, making them visible to future transactions. If a conflict is detected, the transaction fails with a `SQLITE_BUSY` error and must be rolled back and retried by the application.
+
+#### Interaction with exclusive transactions
+
+Concurrent transactions can coexist with exclusive transactions (deferred and immediate), but with important restrictions:
+
+- **Concurrent transactions can read and write** while an exclusive transaction is active
+- **Concurrent transactions cannot commit** while an exclusive transaction holds the exclusive lock
+- **Exclusive transactions block concurrent transaction commits**, not their reads or writes
+
+This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access when needed (for example, schema changes).
+
+**Best practice**: For maximum concurrency in MVCC mode, use `BEGIN CONCURRENT` for all write transactions. Only use `BEGIN IMMEDIATE` or `BEGIN DEFERRED` when you need exclusive write access that prevents any concurrent commits.
 
 ## The SQL language
 
@@ -212,6 +261,7 @@ where `transaction_mode` is one of the following:
 * A `DEFERRED` transaction in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes.
 * An `IMMEDIATE` transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists.
 * An `EXCLUSIVE` transaction is always an alias for `IMMEDIATE`.
+* A `CONCURRENT` transaction begins immediately, but allows other concurrent transactions.
 
 **See also:**
 
