@@ -418,15 +418,15 @@ impl BTreeGenerator<'_> {
         assert_eq!(file.size().unwrap(), 4096 * 2);
         for (i, page) in pages.iter().enumerate() {
             let page = self.create_page(page, &page_numbers);
-            write_at(&io, file.clone(), 4096 * (i + 1), &page);
+            write_at(&io, file.as_ref(), 4096 * (i + 1), &page);
         }
         let size = 1 + pages.len();
         let size_bytes = U32::new(size as u32).to_bytes();
-        write_at(&io, file, 28, &size_bytes);
+        write_at(&io, file.as_ref(), 28, &size_bytes);
     }
 }
 
-fn write_at(io: &impl IO, file: Arc<dyn File>, offset: usize, data: &[u8]) {
+fn write_at<F: File + ?Sized>(io: &impl IO, file: &F, offset: usize, data: &[u8]) {
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new(data.to_vec()));
     let _buf = buffer.clone();

@@ -58,7 +58,7 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
@@ -899,7 +899,7 @@ impl PageContent {
 /// if allow_empty_read is set, than empty read will be raise error for the page, but will not panic
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
-    db_file: Arc<dyn DatabaseStorage>,
+    db_file: DatabaseFile,
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
@@ -1076,10 +1076,7 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(
-    db_file: Arc<dyn DatabaseStorage>,
-    syncing: Arc<AtomicBool>,
-) -> Result<Completion> {
+pub fn begin_sync(db_file: DatabaseFile, syncing: Arc<AtomicBool>) -> Result<Completion> {
     assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
@@ -1932,9 +1929,9 @@ impl StreamingWalReader {
     }
 }
 
-pub fn begin_read_wal_frame_raw(
+pub fn begin_read_wal_frame_raw<F: File + ?Sized>(
     buffer_pool: &Arc<BufferPool>,
-    io: &Arc<dyn File>,
+    io: &F,
     offset: u64,
     complete: Box<ReadComplete>,
 ) -> Result<Completion> {
@@ -1945,8 +1942,8 @@ pub fn begin_read_wal_frame_raw(
     Ok(c)
 }
 
-pub fn begin_read_wal_frame(
-    io: &Arc<dyn File>,
+pub fn begin_read_wal_frame<F: File + ?Sized>(
+    io: &F,
     offset: u64,
     buffer_pool: Arc<BufferPool>,
     complete: Box<ReadComplete>,
@@ -2086,7 +2083,7 @@ pub fn prepare_wal_frame(
     (final_checksum, Arc::new(buffer))
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<Completion> {
+pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> Result<Completion> {
     tracing::trace!("begin_write_wal_header");
     let buffer = {
         let buffer = Buffer::new_temporary(WAL_HEADER_SIZE);

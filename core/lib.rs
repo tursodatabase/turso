@@ -206,7 +206,7 @@ static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
 pub struct Database {
     mv_store: Option<Arc<MvStore>>,
     schema: Mutex<Arc<Schema>>,
-    db_file: Arc<dyn DatabaseStorage>,
+    db_file: DatabaseFile,
     path: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
@@ -305,7 +305,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
-        let db_file = Arc::new(DatabaseFile::new(file));
+        let db_file = DatabaseFile::new(file);
         Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
     }
 
@@ -313,7 +313,7 @@ impl Database {
     pub fn open(
         io: Arc<dyn IO>,
         path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
+        db_file: DatabaseFile,
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
@@ -333,7 +333,7 @@ impl Database {
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
+        db_file: DatabaseFile,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
@@ -381,7 +381,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         wal_path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
+        db_file: DatabaseFile,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
@@ -402,7 +402,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         wal_path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
+        db_file: DatabaseFile,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,

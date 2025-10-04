@@ -1,3 +1,4 @@
+use crate::storage::database::DatabaseFile;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -505,7 +506,7 @@ enum BtreeCreateVacuumFullState {
 /// transaction management.
 pub struct Pager {
     /// Source of the database pages.
-    pub db_file: Arc<dyn DatabaseStorage>,
+    pub db_file: DatabaseFile,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
@@ -607,7 +608,7 @@ enum FreePageState {
 
 impl Pager {
     pub fn new(
-        db_file: Arc<dyn DatabaseStorage>,
+        db_file: DatabaseFile,
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
@@ -2785,9 +2786,8 @@ mod ptrmap_tests {
     // Helper to create a Pager for testing
     fn test_pager_setup(page_size: u32, initial_db_pages: u32) -> Pager {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
-            io.open_file("test.db", OpenFlags::Create, true).unwrap(),
-        ));
+        let db_file: DatabaseFile =
+            DatabaseFile::new(io.open_file("test.db", OpenFlags::Create, true).unwrap());
 
         //  Construct interfaces for the pager
         let pages = initial_db_pages + 10;

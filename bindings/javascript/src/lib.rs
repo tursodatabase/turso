@@ -180,7 +180,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         .open_file(&db.path, flags, false)
         .map_err(|e| to_generic_error("failed to open file", e))?;
 
-    let db_file = Arc::new(DatabaseFile::new(file));
+    let db_file = DatabaseFile::new(file);
     let db_core = turso_core::Database::open_with_flags(
         io.clone(),
         &db.path,
