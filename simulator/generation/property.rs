@@ -16,6 +16,7 @@ use turso_core::{LimboError, types};
 use turso_parser::ast::{self, Distinctness};
 
 use crate::{
+    common::print_diff,
     generation::{Shadow as _, plan::InteractionType},
     model::Query,
     profiles::query::QueryProfile,
@@ -276,6 +277,7 @@ impl Property {
                             .find(|t| t.name == table)
                             .expect("table should be in enviroment");
                         if rows.len() != sim_table.rows.len() {
+                            print_diff(&sim_table.rows, rows, "simulator", "database");
                             return Ok(Err(format!(
                                 "expected {} rows but got {} for table {}",
                                 sim_table.rows.len(),
@@ -285,6 +287,7 @@ impl Property {
                         }
                         for expected_row in sim_table.rows.iter() {
                             if !rows.contains(expected_row) {
+                                print_diff(&sim_table.rows, rows, "simulator", "database");
                                 return Ok(Err(format!(
                                     "expected row {:?} not found in table {}",
                                     expected_row,
@@ -335,6 +338,17 @@ impl Property {
                                 for row in rows {
                                     for (i, (col, val)) in update.set_values.iter().enumerate() {
                                         if &row[i] != val {
+                                            let update_rows = update
+                                                .set_values
+                                                .iter()
+                                                .map(|(_, val)| val.clone())
+                                                .collect::<Vec<_>>();
+                                            print_diff(
+                                                &[row.to_vec()],
+                                                &[update_rows],
+                                                "database",
+                                                "update-clause",
+                                            );
                                             return Ok(Err(format!(
                                                 "updated row {} has incorrect value for column {col}: expected {val}, got {}",
                                                 i, row[i]
@@ -1085,13 +1099,12 @@ fn assert_all_table_values(
                             // Check if all values in the table are present in the result set
                             // Find a value in the table that is not in the result set
                             let model_contains_db = table.rows.iter().find(|v| {
-                                !vals.iter().any(|r| {
-                                    &r == v
-                                })
+                                !vals.contains(v)
                             });
                             let db_contains_model = vals.iter().find(|v| {
-                                !table.rows.iter().any(|r| &r == v)
+                                !table.rows.contains(v)
                             });
+
 
                             if let Some(model_contains_db) = model_contains_db {
                                 tracing::debug!(
@@ -1099,6 +1112,8 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(model_contains_db)
                                 );
+                                print_diff(&table.rows, vals, "simulator", "database");
+
                                 Ok(Err(format!("table {} does not contain the expected values, the simulator model has more rows than the database: {:?}", table.name, print_row(model_contains_db))))
                             } else if let Some(db_contains_model) = db_contains_model {
                                 tracing::debug!(
@@ -1106,6 +1121,8 @@ fn assert_all_table_values(
                                     table.name,
                                     print_row(db_contains_model)
                                 );
+                                print_diff(&table.rows, vals, "simulator", "database");
+
                                 Ok(Err(format!("table {} does not contain the expected values, the database has more rows than the simulator model: {:?}", table.name, print_row(db_contains_model))))
                             } else {
                                 Ok(Ok(()))
