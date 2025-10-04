@@ -6,45 +6,101 @@ use crate::token::TokenType;
 #[diagnostic()]
 pub enum Error {
     /// Lexer error
-    #[error("unrecognized token at {0:?}")]
-    UnrecognizedToken(#[label("here")] miette::SourceSpan),
+    #[error("unrecognized token '{token_text}' at offset {offset}")]
+    UnrecognizedToken {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Missing quote or double-quote or backtick
-    #[error("non-terminated literal at {0:?}")]
-    UnterminatedLiteral(#[label("here")] miette::SourceSpan),
+    #[error("non-terminated literal '{token_text}' at offset {offset}")]
+    UnterminatedLiteral {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Missing `]`
-    #[error("non-terminated bracket at {0:?}")]
-    UnterminatedBracket(#[label("here")] miette::SourceSpan),
+    #[error("non-terminated bracket '{token_text}' at offset {offset}")]
+    UnterminatedBracket {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
+    /// Missing `*/`
+    #[error("non-terminated block comment '{token_text}' at offset {offset}")]
+    UnterminatedBlockComment {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Invalid parameter name
-    #[error("bad variable name at {0:?}")]
-    BadVariableName(#[label("here")] miette::SourceSpan),
+    #[error("bad variable name '{token_text}' at offset {offset}")]
+    BadVariableName {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Invalid number format
-    #[error("bad number at {0:?}")]
-    BadNumber(#[label("here")] miette::SourceSpan),
+    #[error("bad number '{token_text}' at offset {offset}")]
+    BadNumber {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     // Bad fractional part of a number
-    #[error("bad fractional part at {0:?}")]
-    BadFractionalPart(#[label("here")] miette::SourceSpan),
+    #[error("bad fractional part '{token_text}' at offset {offset}")]
+    BadFractionalPart {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     // Bad exponent part of a number
-    #[error("bad exponent part at {0:?}")]
-    BadExponentPart(#[label("here")] miette::SourceSpan),
+    #[error("bad exponent part '{token_text}' at offset {offset}")]
+    BadExponentPart {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Invalid or missing sign after `!`
-    #[error("expected = sign at {0:?}")]
-    ExpectedEqualsSign(#[label("here")] miette::SourceSpan),
+    #[error("expected = sign '{token_text}' at offset {offset}")]
+    ExpectedEqualsSign {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     /// Hexadecimal integer literals follow the C-language notation of "0x" or "0X" followed by hexadecimal digits.
-    #[error("malformed hex integer at {0:?}")]
-    MalformedHexInteger(#[label("here")] miette::SourceSpan),
+    #[error("malformed hex integer '{token_text}' at offset {offset}")]
+    MalformedHexInteger {
+        #[label("here")]
+        span: miette::SourceSpan,
+        token_text: String,
+        offset: usize,
+    },
     // parse errors
     // Unexpected end of file
     #[error("unexpected end of file")]
     ParseUnexpectedEOF,
     // Unexpected token
-    #[error("unexpected token at {parsed_offset:?}")]
-    #[diagnostic(help("expected {expected:?} but found {got:?}"))]
+    #[error("unexpected token '{token_text}' at offset {offset}")]
+    #[diagnostic(help("expected {expected_display} but found '{token_text}'"))]
     ParseUnexpectedToken {
         #[label("here")]
         parsed_offset: miette::SourceSpan,
 
         got: TokenType,
         expected: &'static [TokenType],
+        token_text: String,
+        offset: usize,
+        expected_display: String,
     },
     // Custom error message
     #[error("{0}")]

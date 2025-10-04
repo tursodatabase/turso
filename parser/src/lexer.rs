@@ -297,14 +297,27 @@ impl<'a> Lexer<'a> {
 
                     if start == self.offset {
                         // before the underscore, there was no digit
-                        return Err(Error::BadNumber((start, self.offset - start).into()));
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        return Err(Error::BadNumber {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        });
                     }
 
                     match self.peek() {
                         Some(b) if b.is_ascii_digit() => continue, // Continue if next is a digit
                         _ => {
                             // after the underscore, there is no digit
-                            return Err(Error::BadNumber((start, self.offset - start).into()));
+                            let token_text =
+                                String::from_utf8_lossy(&self.input[start..self.offset])
+                                    .to_string();
+                            return Err(Error::BadNumber {
+                                span: (start, self.offset - start).into(),
+                                token_text,
+                                offset: start,
+                            });
                         }
                     }
                 }
@@ -321,7 +334,13 @@ impl<'a> Lexer<'a> {
                 Some(b'_') => {
                     if start == self.offset {
                         // before the underscore, there was no digit
-                        return Err(Error::BadNumber((start, self.offset - start).into()));
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        return Err(Error::BadNumber {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        });
                     }
 
                     self.eat_and_assert(|b| b == b'_');
@@ -329,7 +348,14 @@ impl<'a> Lexer<'a> {
                         Some(b) if b.is_ascii_hexdigit() => continue, // Continue if next is a digit
                         _ => {
                             // after the underscore, there is no digit
-                            return Err(Error::BadNumber((start, self.offset - start).into()));
+                            let token_text =
+                                String::from_utf8_lossy(&self.input[start..self.offset])
+                                    .to_string();
+                            return Err(Error::BadNumber {
+                                span: (start, self.offset - start).into(),
+                                token_text,
+                                offset: start,
+                            });
                         }
                     }
                 }
@@ -514,9 +540,13 @@ impl<'a> Lexer<'a> {
                 self.eat_and_assert(|b| b == b'=');
             }
             _ => {
-                return Err(Error::ExpectedEqualsSign(
-                    (start, self.offset - start).into(),
-                ))
+                let token_text =
+                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                return Err(Error::ExpectedEqualsSign {
+                    span: (start, self.offset - start).into(),
+                    token_text,
+                    offset: start,
+                });
             }
         }
 
@@ -567,9 +597,13 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 None => {
-                    return Err(Error::UnterminatedLiteral(
-                        (start, self.offset - start).into(),
-                    ))
+                    let token_text =
+                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                    return Err(Error::UnterminatedLiteral {
+                        span: (start, self.offset - start).into(),
+                        token_text,
+                        offset: start,
+                    });
                 }
                 _ => unreachable!(),
             };
@@ -598,9 +632,15 @@ impl<'a> Lexer<'a> {
                             token_type: Some(TokenType::TK_FLOAT),
                         })
                     }
-                    Some(b) if is_identifier_start(b) => Err(Error::BadFractionalPart(
-                        (start, self.offset - start).into(),
-                    )),
+                    Some(b) if is_identifier_start(b) => {
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        Err(Error::BadFractionalPart {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        })
+                    }
                     _ => Ok(Token {
                         value: &self.input[start..self.offset],
                         token_type: Some(TokenType::TK_FLOAT),
@@ -627,11 +667,21 @@ impl<'a> Lexer<'a> {
         let start_num = self.offset;
         self.eat_while_number_digit()?;
         if start_num == self.offset {
-            return Err(Error::BadExponentPart((start, self.offset - start).into()));
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            return Err(Error::BadExponentPart {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            });
         }
 
         if self.peek().is_some() && is_identifier_start(self.peek().unwrap()) {
-            return Err(Error::BadExponentPart((start, self.offset - start).into()));
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            return Err(Error::BadExponentPart {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            });
         }
 
         Ok(Token {
@@ -654,13 +704,23 @@ impl<'a> Lexer<'a> {
                     self.eat_while_number_hexdigit()?;
 
                     if start_hex == self.offset {
-                        return Err(Error::MalformedHexInteger(
-                            (start, self.offset - start).into(),
-                        ));
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        return Err(Error::MalformedHexInteger {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        });
                     }
 
                     if self.peek().is_some() && is_identifier_start(self.peek().unwrap()) {
-                        return Err(Error::BadNumber((start, self.offset - start).into()));
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        return Err(Error::BadNumber {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        });
                     }
 
                     return Ok(Token {
@@ -689,7 +749,13 @@ impl<'a> Lexer<'a> {
                 })
             }
             Some(b) if is_identifier_start(b) => {
-                Err(Error::BadNumber((start, self.offset - start).into()))
+                let token_text =
+                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                Err(Error::BadNumber {
+                    span: (start, self.offset - start).into(),
+                    token_text,
+                    offset: start,
+                })
             }
             _ => Ok(Token {
                 value: &self.input[start..self.offset],
@@ -710,9 +776,15 @@ impl<'a> Lexer<'a> {
                     token_type: Some(TokenType::TK_ID),
                 })
             }
-            None => Err(Error::UnterminatedBracket(
-                (start, self.offset - start).into(),
-            )),
+            None => {
+                let token_text =
+                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                Err(Error::UnterminatedBracket {
+                    span: (start, self.offset - start).into(),
+                    token_text,
+                    offset: start,
+                })
+            }
             _ => unreachable!(), // We should not reach here
         }
     }
@@ -737,7 +809,13 @@ impl<'a> Lexer<'a> {
 
                 // empty variable name
                 if start_id == self.offset {
-                    return Err(Error::BadVariableName((start, self.offset - start).into()));
+                    let token_text =
+                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                    return Err(Error::BadVariableName {
+                        span: (start, self.offset - start).into(),
+                        token_text,
+                        offset: start,
+                    });
                 }
 
                 Ok(Token {
@@ -767,9 +845,14 @@ impl<'a> Lexer<'a> {
                         self.eat_and_assert(|b| b == b'\'');
 
                         if (end_hex - start_hex) % 2 != 0 {
-                            return Err(Error::UnrecognizedToken(
-                                (start, self.offset - start).into(),
-                            ));
+                            let token_text =
+                                String::from_utf8_lossy(&self.input[start..self.offset])
+                                    .to_string();
+                            return Err(Error::UnrecognizedToken {
+                                span: (start, self.offset - start).into(),
+                                token_text,
+                                offset: start,
+                            });
                         }
 
                         Ok(Token {
@@ -777,9 +860,15 @@ impl<'a> Lexer<'a> {
                             token_type: Some(TokenType::TK_BLOB),
                         })
                     }
-                    _ => Err(Error::UnterminatedLiteral(
-                        (start, self.offset - start).into(),
-                    )),
+                    _ => {
+                        let token_text =
+                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                        Err(Error::UnterminatedLiteral {
+                            span: (start, self.offset - start).into(),
+                            token_text,
+                            offset: start,
+                        })
+                    }
                 }
             }
             _ => {
@@ -796,9 +885,12 @@ impl<'a> Lexer<'a> {
     fn eat_unrecognized(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_while(|b| b.is_some() && !b.unwrap().is_ascii_whitespace());
-        Err(Error::UnrecognizedToken(
-            (start, self.offset - start).into(),
-        ))
+        let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+        Err(Error::UnrecognizedToken {
+            span: (start, self.offset - start).into(),
+            token_text,
+            offset: start,
+        })
     }
 }
 
