@@ -658,3 +658,10 @@ do_execsql_test_on_specific_db {:memory:} insert-select-nested-subquery {
     SELECT * FROM t;
 } {1
 1}
+
+# https://github.com/tursodatabase/turso/issues/3481
+do_execsql_test_on_specific_db {:memory:} integer-affinity-scientific-notation {
+    create table s(a integer);
+    insert into s values ('2e0');
+    select typeof(a), a from s;
+} {integer|2}
