@@ -8,7 +8,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, Index, Table};
+use crate::schema::{self, Affinity, Index, Table};
 use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
@@ -322,6 +322,12 @@ pub fn translate_insert(
                             .iter()
                             .map(|col_name| {
                                 let column_name = normalize_ident(col_name.as_str());
+                                if ROWID_STRS
+                                    .iter()
+                                    .any(|s| s.eq_ignore_ascii_case(&column_name))
+                                {
+                                    return Affinity::Integer.aff_mask();
+                                }
                                 table
                                     .get_column_by_name(&column_name)
                                     .unwrap()
