@@ -58,22 +58,30 @@ impl Default for LatencyProfile {
 pub struct FaultProfile {
     #[garde(skip)]
     pub enable: bool,
-    // TODO: modify SimIo impls to have a FaultProfile inside so they can skip faults depending on the profile
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub prob: f64,
     #[garde(skip)]
     pub read: bool,
     #[garde(skip)]
     pub write: bool,
     #[garde(skip)]
+    pub writev: bool,
+    #[garde(skip)]
     pub sync: bool,
+    #[garde(skip)]
+    pub truncate: bool,
 }
 
 impl Default for FaultProfile {
     fn default() -> Self {
         Self {
             enable: true,
+            prob: 0.2,
             read: true,
             write: true,
+            writev: true,
             sync: true,
+            truncate: true,
         }
     }
 }
