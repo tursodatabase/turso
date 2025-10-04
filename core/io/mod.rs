@@ -244,11 +244,11 @@ impl Completion {
         c
     }
 
-    pub fn is_completed(&self) -> bool {
+    pub fn succeeded(&self) -> bool {
         self.inner.result.get().is_some_and(|val| val.is_none())
     }
 
-    pub fn has_error(&self) -> bool {
+    pub fn failed(&self) -> bool {
         self.inner.result.get().is_some_and(|val| val.is_some())
     }
 
