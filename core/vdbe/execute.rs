@@ -2138,7 +2138,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
         // invalidate page cache in case of error
-        pager.clear_page_cache();
+        pager.clear_page_cache(false);
     }
     match err_code {
         0 => {}
