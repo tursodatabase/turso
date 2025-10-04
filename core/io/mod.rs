@@ -3,7 +3,6 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use parking_lot::Once;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
@@ -143,8 +142,6 @@ struct CompletionInner {
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
     needs_link: bool,
-    /// before calling callback we check if done is true
-    done: Once,
 }
 
 impl Debug for CompletionType {
@@ -172,7 +169,6 @@ impl Completion {
                 completion_type,
                 result: OnceLock::new(),
                 needs_link: false,
-                done: Once::new(),
             }),
         }
     }
@@ -183,7 +179,6 @@ impl Completion {
                 completion_type,
                 result: OnceLock::new(),
                 needs_link: true,
-                done: Once::new(),
             }),
         }
     }
@@ -276,17 +271,14 @@ impl Completion {
     }
 
     fn callback(&self, result: Result<i32, CompletionError>) {
-        self.inner.done.call_once(|| {
+        self.inner.result.get_or_init(|| {
             match &self.inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
                 CompletionType::Sync(s) => s.callback(result), // fix
                 CompletionType::Truncate(t) => t.callback(result),
             };
-            self.inner
-                .result
-                .set(result.err())
-                .expect("result must be set only once");
+            result.err()
         });
     }
 
@@ -295,15 +287,6 @@ impl Completion {
     pub fn as_read(&self) -> &ReadCompletion {
         match self.inner.completion_type {
             CompletionType::Read(ref r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    /// only call this method if you are sure that the completion is
-    /// a WriteCompletion, panics otherwise
-    pub fn as_write(&self) -> &WriteCompletion {
-        match self.inner.completion_type {
-            CompletionType::Write(ref w) => w,
             _ => unreachable!(),
         }
     }
