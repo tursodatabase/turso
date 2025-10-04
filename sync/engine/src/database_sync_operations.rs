@@ -103,7 +103,7 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
                 assert!(size as usize == content_len);
             });
             let c = db.pwrite(pos, buffer.clone(), c)?;
-            while !c.is_completed() {
+            while !c.succeeded() {
                 coro.yield_(ProtocolCommand::IO).await?;
             }
             pos += content_len as u64;
@@ -119,7 +119,7 @@ pub async fn db_bootstrap<C: ProtocolIO, Ctx>(
         // todo(sivukhin): we need to error out in case of failed sync
     });
     let c = db.sync(c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -149,7 +149,7 @@ pub async fn wal_apply_from_file<Ctx>(
             assert!(size as usize == WAL_FRAME_SIZE);
         });
         let c = frames_file.pread(offset, c)?;
-        while !c.is_completed() {
+        while !c.succeeded() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
         let info = WalFrameInfo::from_frame_header(buffer.as_slice());
@@ -177,7 +177,7 @@ pub async fn wal_pull_to_file<C: ProtocolIO, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = frames_file.truncate(0, c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
     match revision {
@@ -279,7 +279,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         });
 
         let c = frames_file.pwrite(offset, buffer.clone(), c)?;
-        while !c.is_completed() {
+        while !c.succeeded() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
         offset += WAL_FRAME_SIZE as u64;
@@ -289,7 +289,7 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         // todo(sivukhin): we need to error out in case of failed sync
     });
     let c = frames_file.sync(c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -358,7 +358,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
                         assert!(size as usize == WAL_FRAME_SIZE);
                     });
                     let c = frames_file.pwrite(last_offset, buffer.clone(), c)?;
-                    while !c.is_completed() {
+                    while !c.succeeded() {
                         coro.yield_(ProtocolCommand::IO).await?;
                     }
 
@@ -401,7 +401,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = frames_file.truncate(committed_len, c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -409,7 +409,7 @@ pub async fn wal_pull_to_file_legacy<C: ProtocolIO, Ctx>(
         // todo(sivukhin): we need to error out in case of failed sync
     });
     let c = frames_file.sync(c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -949,7 +949,7 @@ pub async fn read_wal_salt<Ctx>(
         }
     });
     let c = wal.pread(0, c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
     if buffer.as_mut_slice() == [0u8; WAL_HEADER] {
@@ -1033,7 +1033,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         assert!(rc as usize == 0);
     });
     let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
 
@@ -1060,7 +1060,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
             assert!(size as usize == PAGE_SIZE);
         });
         let c = file.pwrite(offset, buffer.clone(), c)?;
-        while !c.is_completed() {
+        while !c.succeeded() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
     }
@@ -1142,7 +1142,7 @@ pub async fn reset_wal_file<Ctx>(
         assert!(rc as usize == 0);
     });
     let c = wal.truncate(wal_size, c)?;
-    while !c.is_completed() {
+    while !c.succeeded() {
         coro.yield_(ProtocolCommand::IO).await?;
     }
     Ok(())

@@ -1500,14 +1500,14 @@ impl Pager {
                         continue;
                     };
                     self.commit_info.write().state = CommitState::PrepareWalSync;
-                    if !c.is_completed() {
+                    if !c.succeeded() {
                         io_yield_one!(c);
                     }
                 }
                 CommitState::PrepareWalSync => {
                     let c = wal.borrow_mut().prepare_wal_finish()?;
                     self.commit_info.write().state = CommitState::GetDbSize;
-                    if !c.is_completed() {
+                    if !c.succeeded() {
                         io_yield_one!(c);
                     }
                 }
@@ -1673,7 +1673,7 @@ impl Pager {
                     );
                     let (should_finish, result, completions) = {
                         let mut commit_info = self.commit_info.write();
-                        if commit_info.completions.iter().all(|c| c.is_completed()) {
+                        if commit_info.completions.iter().all(|c| c.succeeded()) {
                             commit_info.completions.clear();
                             commit_info.state = CommitState::PrepareWal;
                             (true, commit_info.result.take(), Vec::new())
@@ -1992,7 +1992,7 @@ impl Pager {
                     let trunk_page_id = header.freelist_trunk_page.get();
                     let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
                     if let Some(c) = c {
-                        if !c.is_completed() {
+                        if !c.succeeded() {
                             io_yield_one!(c);
                         }
                     }

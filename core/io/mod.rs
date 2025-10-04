@@ -176,7 +176,7 @@ impl CompletionGroup {
     }
 
     pub fn add(&mut self, completion: &Completion) {
-        if !completion.finished() || completion.has_error() {
+        if !completion.finished() || completion.failed() {
             self.completions.push(completion.clone());
         }
         // Skip successfully finished completions
@@ -372,7 +372,7 @@ impl Completion {
         c
     }
 
-    pub fn is_completed(&self) -> bool {
+    pub fn succeeded(&self) -> bool {
         match &self.inner.completion_type {
             CompletionType::Group(g) => {
                 g.inner.outstanding.load(Ordering::SeqCst) == 0
@@ -382,7 +382,7 @@ impl Completion {
         }
     }
 
-    pub fn has_error(&self) -> bool {
+    pub fn failed(&self) -> bool {
         self.inner.result.get().is_some_and(|val| val.is_some())
     }
 
@@ -746,7 +746,7 @@ mod tests {
         let group = CompletionGroup::new(|_| {});
         let group = group.build();
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(group.get_error().is_none());
     }
 
@@ -758,12 +758,12 @@ mod tests {
         let group = group.build();
 
         assert!(!group.finished());
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
 
         c.complete(0);
 
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(group.get_error().is_none());
     }
 
@@ -778,19 +778,19 @@ mod tests {
         group.add(&c3);
         let group = group.build();
 
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
         assert!(!group.finished());
 
         c1.complete(0);
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
         assert!(!group.finished());
 
         c2.complete(0);
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
         assert!(!group.finished());
 
         c3.complete(0);
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(group.finished());
     }
 
@@ -807,7 +807,7 @@ mod tests {
         c2.error(CompletionError::Aborted);
 
         assert!(group.finished());
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
         assert_eq!(group.get_error(), Some(CompletionError::Aborted));
     }
 
@@ -835,7 +835,7 @@ mod tests {
         c2.complete(0);
         assert!(called.load(Ordering::SeqCst));
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
     }
 
     #[test]
@@ -860,14 +860,14 @@ mod tests {
         // c1 and c2 finished before build(), so outstanding should account for them
         // Only c3 should be pending
         assert!(!group.finished());
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
 
         // Complete c3
         c3.complete(0);
 
         // Now the group should be finished
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(group.get_error().is_none());
     }
 
@@ -889,7 +889,7 @@ mod tests {
 
         // All completions were already complete, so group should be finished immediately
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(group.get_error().is_none());
     }
 
@@ -929,7 +929,7 @@ mod tests {
 
         c4.complete(0);
         assert!(group.finished());
-        assert!(group.is_completed());
+        assert!(group.succeeded());
         assert!(called.load(Ordering::SeqCst));
     }
 
@@ -950,7 +950,7 @@ mod tests {
 
         // Group should immediately fail with the error
         assert!(group.finished());
-        assert!(!group.is_completed());
+        assert!(!group.succeeded());
         assert_eq!(group.get_error(), Some(CompletionError::Aborted));
     }
 }
