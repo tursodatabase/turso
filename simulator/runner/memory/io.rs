@@ -124,7 +124,7 @@ pub struct MemorySimIO {
     pub nr_run_once_faults: Cell<usize>,
     pub page_size: usize,
     seed: u64,
-    latency_probability: usize,
+    latency_probability: u8,
     clock: Arc<SimulatorClock>,
 }
 
@@ -135,7 +135,7 @@ impl MemorySimIO {
     pub fn new(
         seed: u64,
         page_size: usize,
-        latency_probability: usize,
+        latency_probability: u8,
         min_tick: u64,
         max_tick: u64,
     ) -> Self {

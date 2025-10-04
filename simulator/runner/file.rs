@@ -37,7 +37,7 @@ pub(crate) struct SimulatorFile {
 
     pub(crate) rng: RefCell<ChaCha8Rng>,
 
-    pub latency_probability: usize,
+    pub latency_probability: u8,
 
     pub sync_completion: RefCell<Option<turso_core::Completion>>,
     pub queued_io: RefCell<Vec<DelayedIo>>,

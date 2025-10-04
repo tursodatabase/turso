@@ -34,7 +34,7 @@ mod runner;
 mod shrink;
 
 fn main() -> anyhow::Result<()> {
-    init_logger();
+    init_logger()?;
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
 
@@ -622,17 +622,16 @@ fn run_simulation_default(
     result
 }
 
-fn init_logger() {
+fn init_logger() -> anyhow::Result<()> {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("simulator.log")
-        .unwrap();
+        .open("simulator.log")?;
 
     let requires_ansi = std::io::stdout().is_terminal();
 
-    let _ = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(requires_ansi)
@@ -642,17 +641,17 @@ fn init_logger() {
         )
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
-            #[allow(deprecated)]
             tracing_subscriber::fmt::layer()
                 .with_writer(file)
                 .with_ansi(false)
-                .fmt_fields(format::PrettyFields::new().with_ansi(false)) // with_ansi is deprecated, but I cannot find another way to remove ansi codes
+                .fmt_fields(format::PrettyFields::new())
                 .with_line_number(true)
                 .without_time()
                 .with_thread_ids(false)
                 .map_fmt_fields(|f| f.debug_alt()),
         )
-        .try_init();
+        .try_init()?;
+    Ok(())
 }
 
 fn banner() {

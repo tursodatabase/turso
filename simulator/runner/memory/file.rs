@@ -52,7 +52,7 @@ pub struct MemorySimFile {
     pub closed: Cell<bool>,
     io_tracker: RefCell<IOTracker>,
     pub rng: RefCell<ChaCha8Rng>,
-    pub latency_probability: usize,
+    pub latency_probability: u8,
     clock: Arc<SimulatorClock>,
     fault: Cell<bool>,
 }
@@ -65,7 +65,7 @@ impl MemorySimFile {
         callbacks: CallbackQueue,
         fd: Fd,
         seed: u64,
-        latency_probability: usize,
+        latency_probability: u8,
         clock: Arc<SimulatorClock>,
     ) -> Self {
         Self {
