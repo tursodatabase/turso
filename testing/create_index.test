@@ -13,3 +13,49 @@ do_execsql_test_on_specific_db {:memory:} create-index-quoted-identifiers {
     "CREATE INDEX \"idx idx\" ON \"t t\" (\"a a\")"
     "CREATE UNIQUE INDEX \"unique idx idx\" ON \"t t\" (\"a a\")"
 }
+
+
+# single-column index key: creating unique index fails with duplicates
+do_execsql_test_in_memory_any_error create-unique-index-with-duplicates-1 {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 1);
+    INSERT INTO t1 VALUES(1, 2);
+    CREATE UNIQUE INDEX idx1 ON t1(a);
+}
+
+# multi-column index key: creating unique index fails with duplicates
+do_execsql_test_in_memory_any_error create-unique-index-with-duplicates-2 {
+    CREATE TABLE t2(a, b, c);
+    INSERT INTO t2 VALUES(1, 2, 3);
+    INSERT INTO t2 VALUES(1, 2, 4);
+    CREATE UNIQUE INDEX idx2 ON t2(a, b);
+}
+
+
+# single-column index key: creating unique index succeeds because NULLs are never equal
+do_execsql_test_on_specific_db {:memory:} create-unique-index-with-duplicates-3 {
+    CREATE TABLE t3(a);
+    INSERT INTO t3 VALUES(NULL);
+    INSERT INTO t3 VALUES(NULL);
+    CREATE UNIQUE INDEX idx3 ON t3(a);
+    SELECT count(*) FROM t3;
+} {2}
+
+# multi-column index key: creating unique index succeeds because NULLs are never equal
+do_execsql_test_on_specific_db {:memory:} create-unique-index-with-duplicates-4 {
+    CREATE TABLE t4(a, b);
+    INSERT INTO t4 VALUES(1, NULL);
+    INSERT INTO t4 VALUES(1, NULL);
+    CREATE UNIQUE INDEX idx4 ON t4(a, b);
+    SELECT count(*) FROM t4;
+} {2}
+
+# multi-column index key: creating unique index succeeds when all NULLs
+do_execsql_test_on_specific_db {:memory:} create-unique-index-with-duplicates-5 {
+    CREATE TABLE t5(a, b);
+    INSERT INTO t5 VALUES(NULL, NULL);
+    INSERT INTO t5 VALUES(NULL, NULL);
+    CREATE UNIQUE INDEX idx5 ON t5(a, b);
+    SELECT count(*) FROM t5;
+} {2}
+

@@ -713,6 +713,18 @@ pub enum Insn {
         record_reg: usize,
     },
 
+    /// `cursor_id` is a sorter cursor. This instruction compares a prefix of the record blob in register `sorted_record_reg`
+    /// against a prefix of the entry that the sorter cursor currently points to.
+    /// Only the first `num_regs` fields of `sorted_record_reg` and the sorter record are compared.
+    /// Fall through to next instruction if the two records compare equal to each other.
+    /// Jump to `pc_when_nonequal` if they are different.
+    SorterCompare {
+        cursor_id: CursorID,
+        pc_when_nonequal: BranchOffset,
+        sorted_record_reg: usize,
+        num_regs: usize,
+    },
+
     /// Sort the rows in the sorter.
     SorterSort {
         cursor_id: CursorID,
@@ -1263,6 +1275,7 @@ impl InsnVariants {
             InsnVariants::SorterSort => execute::op_sorter_sort,
             InsnVariants::SorterData => execute::op_sorter_data,
             InsnVariants::SorterNext => execute::op_sorter_next,
+            InsnVariants::SorterCompare => execute::op_sorter_compare,
             InsnVariants::Function => execute::op_function,
             InsnVariants::Cast => execute::op_cast,
             InsnVariants::InitCoroutine => execute::op_init_coroutine,

@@ -4247,6 +4247,59 @@ pub fn op_sorter_next(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_sorter_compare(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        SorterCompare {
+            cursor_id,
+            sorted_record_reg,
+            num_regs,
+            pc_when_nonequal,
+        },
+        insn
+    );
+
+    let previous_sorter_values = {
+        let Register::Record(record) = &state.registers[*sorted_record_reg] else {
+            return Err(LimboError::InternalError(
+                "Sorted record must be a record".to_string(),
+            ));
+        };
+        &record.get_values()[..*num_regs]
+    };
+
+    let cursor = state.get_cursor(*cursor_id);
+    let cursor = cursor.as_sorter_mut();
+    let Some(current_sorter_record) = cursor.record() else {
+        return Err(LimboError::InternalError(
+            "Sorter must have a record".to_string(),
+        ));
+    };
+
+    let current_sorter_values = &current_sorter_record.get_values()[..*num_regs];
+    // If the current sorter record has a NULL in any of the significant fields, the comparison is not equal.
+    let is_equal = current_sorter_values
+        .iter()
+        .all(|v| !matches!(v, RefValue::Null))
+        && compare_immutable(
+            previous_sorter_values,
+            current_sorter_values,
+            &cursor.index_key_info,
+        )
+        .is_eq();
+    if is_equal {
+        state.pc += 1;
+    } else {
+        state.pc = pc_when_nonequal.as_offset_int();
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
