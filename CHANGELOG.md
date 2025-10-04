@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 -- 2025-10-04
+
+### Added
+
+### Updated
+
+* Actually enforce uniqueness in create unique index (Jussi Saurio)
+* Disallow unexpected interop between WAL mode and MVCC mode (Jussi Saurio)
+
+### Fixed
+
+* core/io/unix: Fix short writes in try_pwritev_raw() (FamHaggs)
+
 ## 0.2.0 -- 2025-10-03
 
 ### Added
