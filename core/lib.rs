@@ -57,8 +57,8 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionType, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
-    WriteCompletion, IO,
+    Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
+    SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
 use schema::Schema;

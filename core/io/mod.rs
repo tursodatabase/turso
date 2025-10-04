@@ -7,6 +7,7 @@ use parking_lot::Once;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
@@ -136,7 +137,6 @@ pub struct Completion {
     inner: Arc<CompletionInner>,
 }
 
-#[derive(Debug)]
 struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
@@ -145,6 +145,121 @@ struct CompletionInner {
     needs_link: bool,
     /// before calling callback we check if done is true
     done: Once,
+    /// Optional parent group this completion belongs to
+    parent: OnceLock<Arc<GroupCompletionInner>>,
+}
+
+impl fmt::Debug for CompletionInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionInner")
+            .field("completion_type", &self.completion_type)
+            .field("needs_link", &self.needs_link)
+            .field("parent", &self.parent.get().is_some())
+            .finish()
+    }
+}
+
+pub struct CompletionGroup {
+    completions: Vec<Completion>,
+    callback: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+}
+
+impl CompletionGroup {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self {
+            completions: Vec::new(),
+            callback: Box::new(callback),
+        }
+    }
+
+    pub fn add(&mut self, completion: &Completion) {
+        if !completion.finished() || completion.has_error() {
+            self.completions.push(completion.clone());
+        }
+        // Skip successfully finished completions
+    }
+
+    pub fn build(self) -> Completion {
+        let total = self.completions.len();
+        if total == 0 {
+            let group_completion = GroupCompletion::new(self.callback, 0);
+            return Completion::new(CompletionType::Group(group_completion));
+        }
+        let group_completion = GroupCompletion::new(self.callback, total);
+        let group = Completion::new(CompletionType::Group(group_completion));
+
+        for mut c in self.completions {
+            if !c.finished() {
+                c.link_internal(&group);
+                continue;
+            }
+            if let Some(err) = c.get_error() {
+                let group_inner = match &group.inner.completion_type {
+                    CompletionType::Group(g) => &g.inner,
+                    _ => unreachable!(),
+                };
+                let _ = group_inner.result.set(Some(err));
+                group_inner.outstanding.store(0, Ordering::SeqCst);
+                (group_inner.complete)(Err(err));
+                return group;
+            }
+        }
+
+        let group_inner = match &group.inner.completion_type {
+            CompletionType::Group(g) => &g.inner,
+            _ => unreachable!(),
+        };
+        if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
+            (group_inner.complete)(Ok(0));
+        }
+        group
+    }
+}
+
+pub struct GroupCompletion {
+    inner: Arc<GroupCompletionInner>,
+}
+
+impl fmt::Debug for GroupCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupCompletion")
+            .field(
+                "outstanding",
+                &self.inner.outstanding.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+struct GroupCompletionInner {
+    /// Number of completions that need to finish
+    outstanding: AtomicUsize,
+    /// Callback to invoke when all completions finish
+    complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+    /// Cached result after all completions finish
+    result: OnceLock<Option<CompletionError>>,
+}
+
+impl GroupCompletion {
+    pub fn new<F>(complete: F, outstanding: usize) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(GroupCompletionInner {
+                outstanding: AtomicUsize::new(outstanding),
+                complete: Box::new(complete),
+                result: OnceLock::new(),
+            }),
+        }
+    }
+
+    pub fn callback(&self, result: Result<i32, CompletionError>) {
+        (self.inner.complete)(result);
+    }
 }
 
 impl Debug for CompletionType {
@@ -154,6 +269,7 @@ impl Debug for CompletionType {
             Self::Write(..) => f.debug_tuple("Write").finish(),
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+            Self::Group(..) => f.debug_tuple("Group").finish(),
         }
     }
 }
@@ -163,6 +279,7 @@ pub enum CompletionType {
     Write(WriteCompletion),
     Sync(SyncCompletion),
     Truncate(TruncateCompletion),
+    Group(GroupCompletion),
 }
 
 impl Completion {
@@ -173,6 +290,7 @@ impl Completion {
                 result: OnceLock::new(),
                 needs_link: false,
                 done: Once::new(),
+                parent: OnceLock::new(),
             }),
         }
     }
@@ -184,6 +302,7 @@ impl Completion {
                 result: OnceLock::new(),
                 needs_link: true,
                 done: Once::new(),
+                parent: OnceLock::new(),
             }),
         }
     }
@@ -245,7 +364,13 @@ impl Completion {
     }
 
     pub fn is_completed(&self) -> bool {
-        self.inner.result.get().is_some_and(|val| val.is_none())
+        match &self.inner.completion_type {
+            CompletionType::Group(g) => {
+                g.inner.outstanding.load(Ordering::SeqCst) == 0
+                    && g.inner.result.get().is_none_or(|e| e.is_none())
+            }
+            _ => self.inner.result.get().is_some(),
+        }
     }
 
     pub fn has_error(&self) -> bool {
@@ -253,12 +378,22 @@ impl Completion {
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        self.inner.result.get().and_then(|res| *res)
+        match &self.inner.completion_type {
+            CompletionType::Group(g) => {
+                // For groups, check the group's cached result field
+                // (set when the last completion finishes)
+                g.inner.result.get().and_then(|res| *res)
+            }
+            _ => self.inner.result.get().and_then(|res| *res),
+        }
     }
 
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
-        self.inner.result.get().is_some()
+        match &self.inner.completion_type {
+            CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
+            _ => self.inner.result.get().is_some(),
+        }
     }
 
     pub fn complete(&self, result: i32) {
@@ -282,11 +417,27 @@ impl Completion {
                 CompletionType::Write(w) => w.callback(result),
                 CompletionType::Sync(s) => s.callback(result), // fix
                 CompletionType::Truncate(t) => t.callback(result),
+                CompletionType::Group(g) => g.callback(result),
             };
             self.inner
                 .result
                 .set(result.err())
                 .expect("result must be set only once");
+
+            if let Some(group) = self.inner.parent.get() {
+                // Capture first error in group
+                if let Err(err) = result {
+                    let _ = group.result.set(Some(err));
+                }
+                let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
+
+                // If this was the last completion, call the group callback
+                if prev == 1 {
+                    let group_result = group.result.get().and_then(|e| *e);
+                    (group.complete)(group_result.map_or(Ok(0), Err));
+                }
+                // TODO: remove self from parent group
+            }
         });
     }
 
@@ -305,6 +456,19 @@ impl Completion {
         match self.inner.completion_type {
             CompletionType::Write(ref w) => w,
             _ => unreachable!(),
+        }
+    }
+
+    /// Link this completion to a group completion (internal use only)
+    fn link_internal(&mut self, group: &Completion) {
+        let group_inner = match &group.inner.completion_type {
+            CompletionType::Group(g) => &g.inner,
+            _ => panic!("link_internal() requires a group completion"),
+        };
+
+        // Set the parent (can only be set once)
+        if self.inner.parent.set(group_inner.clone()).is_err() {
+            panic!("completion can only be linked once");
         }
     }
 }
@@ -563,3 +727,126 @@ pub use memory::MemoryIO;
 pub mod clock;
 mod common;
 pub use clock::Clock;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_group_empty() {
+        let group = CompletionGroup::new(|_| {});
+        let group = group.build();
+        assert!(group.finished());
+        assert!(group.is_completed());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_single_completion() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c = Completion::new_write(|_| {});
+        group.add(&c);
+        let group = group.build();
+
+        assert!(!group.finished());
+        assert!(!group.is_completed());
+
+        c.complete(0);
+
+        assert!(group.finished());
+        assert!(group.is_completed());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_multiple_completions() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        let group = group.build();
+
+        assert!(!group.is_completed());
+        assert!(!group.finished());
+
+        c1.complete(0);
+        assert!(!group.is_completed());
+        assert!(!group.finished());
+
+        c2.complete(0);
+        assert!(!group.is_completed());
+        assert!(!group.finished());
+
+        c3.complete(0);
+        assert!(group.is_completed());
+        assert!(group.finished());
+    }
+
+    #[test]
+    fn test_completion_group_with_error() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        c1.complete(0);
+        c2.error(CompletionError::Aborted);
+
+        assert!(group.finished());
+        assert!(!group.is_completed());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_group_mixed_types() {
+        let mut group = CompletionGroup::new(|_| {});
+        let buf = Arc::new(Buffer::new(vec![0u8; 4096]));
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_read(buf, |_| {});
+        let c3 = Completion::new_sync(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        let group = group.build();
+
+        c1.complete(100);
+        c2.complete(4096);
+        c3.complete(0);
+
+        assert!(group.finished());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let mut group = CompletionGroup::new(move |_| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        assert!(!called.load(Ordering::SeqCst));
+
+        c1.complete(0);
+        assert!(!called.load(Ordering::SeqCst));
+
+        c2.complete(0);
+        assert!(called.load(Ordering::SeqCst));
+        assert!(group.finished());
+        assert!(group.is_completed());
+    }
+}
