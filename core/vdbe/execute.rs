@@ -385,6 +385,7 @@ pub fn op_checkpoint_inner(
             pager.clone(),
             mv_store.clone(),
             program.connection.clone(),
+            true,
         ));
         loop {
             let result = ckpt_sm.step(&())?;
