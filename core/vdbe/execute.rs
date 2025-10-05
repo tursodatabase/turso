@@ -36,6 +36,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
+use rand::Rng;
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -72,7 +73,6 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
 use turso_parser::ast::{self, Name, SortOrder};
 use turso_parser::parser::Parser;
 
@@ -6489,8 +6489,9 @@ pub fn op_new_rowid(
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
                 // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
                 // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-                let mut rng = thread_rng();
-                let mut random_rowid: i64 = rng.gen();
+
+                let mut rng = rand::rng();
+                let mut random_rowid: i64 = rng.random();
                 random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
                 random_rowid += 1; // Ensure positive
 
