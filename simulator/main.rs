@@ -27,6 +27,7 @@ use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
 
+mod common;
 mod generation;
 mod model;
 mod profiles;
