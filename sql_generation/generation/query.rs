@@ -18,7 +18,7 @@ use turso_parser::ast::{Expr, SortOrder};
 use super::{backtrack, pick};
 
 impl Arbitrary for Create {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         Create {
             table: Table::arbitrary(rng, context),
         }
@@ -26,7 +26,7 @@ impl Arbitrary for Create {
 }
 
 impl Arbitrary for FromClause {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let opts = &context.opts().query.from_clause;
         let weights = opts.as_weighted_index();
         let num_joins = opts.joins[rng.sample(weights)].num_joins;
@@ -85,7 +85,7 @@ impl Arbitrary for FromClause {
 }
 
 impl Arbitrary for SelectInner {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let from = FromClause::arbitrary(rng, env);
         let tables = env.tables().clone();
         let join_table = from.into_join_table(&tables);
@@ -144,7 +144,7 @@ impl Arbitrary for SelectInner {
 }
 
 impl ArbitrarySized for SelectInner {
-    fn arbitrary_sized<R: Rng, C: GenerationContext>(
+    fn arbitrary_sized<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         env: &C,
         num_result_columns: usize,
@@ -179,7 +179,7 @@ impl ArbitrarySized for SelectInner {
 }
 
 impl Arbitrary for Distinctness {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         match rng.random_range(0..=5) {
             0..4 => Distinctness::All,
             _ => Distinctness::Distinct,
@@ -188,7 +188,7 @@ impl Arbitrary for Distinctness {
 }
 
 impl Arbitrary for CompoundOperator {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         match rng.random_range(0..=1) {
             0 => CompoundOperator::Union,
             1 => CompoundOperator::UnionAll,
@@ -203,7 +203,7 @@ impl Arbitrary for CompoundOperator {
 pub struct SelectFree(pub Select);
 
 impl Arbitrary for SelectFree {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let expr = Predicate(Expr::arbitrary_sized(rng, env, 8));
         let select = Select::expr(expr);
         Self(select)
@@ -211,7 +211,7 @@ impl Arbitrary for SelectFree {
 }
 
 impl Arbitrary for Select {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         // Generate a number of selects based on the query size
         // If experimental indexes are enabled, we can have selects with compounds
         // Otherwise, we just have a single select with no compounds
@@ -259,7 +259,7 @@ impl Arbitrary for Select {
 }
 
 impl Arbitrary for Insert {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let opts = &env.opts().query.insert;
         let gen_values = |rng: &mut R| {
             let table = pick(env.tables(), rng);
@@ -300,7 +300,7 @@ impl Arbitrary for Insert {
 }
 
 impl Arbitrary for Delete {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
         Self {
             table: table.name.clone(),
@@ -310,7 +310,7 @@ impl Arbitrary for Delete {
 }
 
 impl Arbitrary for Drop {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
         Self {
             table: table.name.clone(),
@@ -319,7 +319,7 @@ impl Arbitrary for Drop {
 }
 
 impl Arbitrary for CreateIndex {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         assert!(
             !env.tables().is_empty(),
             "Cannot create an index when no tables exist in the environment."
@@ -366,7 +366,7 @@ impl Arbitrary for CreateIndex {
 }
 
 impl Arbitrary for Update {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
         let num_cols = rng.random_range(1..=table.columns.len());
         let columns = pick_unique(&table.columns, num_cols, rng);
