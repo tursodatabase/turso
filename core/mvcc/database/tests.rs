@@ -1487,8 +1487,14 @@ fn transaction_display() {
     let begin_ts = 20250914;
 
     let write_set = SkipSet::new();
-    write_set.insert(RowID::new((-2).into(), 11));
-    write_set.insert(RowID::new((-2).into(), 13));
+    write_set.insert(WriteSetEntry {
+        row_id: RowID::new((-2).into(), 11),
+        version_index: 0,
+    });
+    write_set.insert(WriteSetEntry {
+        row_id: RowID::new((-2).into(), 13),
+        version_index: 1,
+    });
 
     let read_set = SkipSet::new();
     read_set.insert(RowID::new((-2).into(), 17));

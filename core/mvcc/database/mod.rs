@@ -154,6 +154,15 @@ pub enum TxTimestampOrID {
     TxID(TxID),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct WriteSetEntry {
+    row_id: RowID,
+    // TODO: This should be a pointer pointing to a RowVersion in the MvStore,
+    // however, we are currently using a RwLock<Vec<RowVersion>> for the versions,
+    // so we have to store the index to the vector instead for now.
+    version_index: usize,
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction {
@@ -164,7 +173,7 @@ pub struct Transaction {
     /// The transaction begin timestamp.
     begin_ts: u64,
     /// The transaction write set.
-    write_set: SkipSet<RowID>,
+    write_set: SkipSet<WriteSetEntry>,
     /// The transaction read set.
     read_set: SkipSet<RowID>,
     /// The transaction header.
@@ -187,8 +196,8 @@ impl Transaction {
         self.read_set.insert(id);
     }
 
-    fn insert_to_write_set(&self, id: RowID) {
-        self.write_set.insert(id);
+    fn insert_to_write_set(&self, entry: WriteSetEntry) {
+        self.write_set.insert(entry);
     }
 }
 
@@ -206,7 +215,7 @@ impl std::fmt::Display for Transaction {
             if i > 0 {
                 write!(f, ", ")?
             }
-            write!(f, "{:?}", *v.value())?;
+            write!(f, "{:?}", v.value().row_id)?;
         }
 
         write!(f, "], read_set: [")?;
@@ -355,7 +364,7 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     tx_id: TxID,
     connection: Arc<Connection>,
     /// Write set sorted by table id and row id
-    write_set: Vec<RowID>,
+    write_set: Vec<WriteSetEntry>,
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
@@ -547,7 +556,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .extend(tx.write_set.iter().map(|v| *v.value()));
                 self.write_set.sort_by(|a, b| {
                     // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
-                    b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
+                    b.row_id
+                        .table_id
+                        .cmp(&a.row_id.table_id)
+                        .then(a.row_id.row_id.cmp(&b.row_id.row_id))
                 });
                 if self.write_set.is_empty() {
                     tx.state.store(TransactionState::Committed(end_ts));
@@ -568,16 +580,16 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
                     return Err(LimboError::WriteWriteConflict);
                 }
-                for id in &self.write_set {
-                    if let Some(row_versions) = mvcc_store.rows.get(id) {
+                for entry in &self.write_set {
+                    if let Some(row_versions) = mvcc_store.rows.get(&entry.row_id) {
                         let mut row_versions = row_versions.value().write();
-                        for row_version in row_versions.iter_mut() {
+                        if let Some(row_version) = row_versions.get_mut(entry.version_index) {
                             if let TxTimestampOrID::TxID(id) = row_version.begin {
                                 if id == self.tx_id {
                                     // New version is valid STARTING FROM committing transaction's end timestamp
                                     // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                     row_version.begin = TxTimestampOrID::Timestamp(*end_ts);
-                                    mvcc_store.insert_version_raw(
+                                    let _ = mvcc_store.insert_version_raw(
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
@@ -592,7 +604,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     // Old version is valid UNTIL committing transaction's end timestamp
                                     // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                     row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
-                                    mvcc_store.insert_version_raw(
+                                    let _ = mvcc_store.insert_version_raw(
                                         &mut log_record.row_versions,
                                         row_version.clone(),
                                     ); // FIXME: optimize cloning out
@@ -1095,8 +1107,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             end: None,
             row,
         };
-        tx.insert_to_write_set(id);
-        self.insert_version(id, row_version);
+        let version_index = self.insert_version(id, row_version);
+        tx.insert_to_write_set(WriteSetEntry {
+            row_id: id,
+            version_index,
+        });
         Ok(())
     }
 
@@ -1154,7 +1169,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let row_versions_opt = self.rows.get(&id);
         if let Some(ref row_versions) = row_versions_opt {
             let mut row_versions = row_versions.value().write();
-            for rv in row_versions.iter_mut().rev() {
+            for i in (0..row_versions.len()).rev() {
+                let rv = &mut row_versions[i];
                 let tx = self
                     .txs
                     .get(&tx_id)
@@ -1180,7 +1196,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .get(&tx_id)
                     .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                 let tx = tx.value();
-                tx.insert_to_write_set(id);
+                tx.insert_to_write_set(WriteSetEntry {
+                    row_id: id,
+                    version_index: i,
+                });
                 return Ok(true);
             }
         }
@@ -1527,14 +1546,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let end_ts = self.get_timestamp();
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        for rowid in &tx.write_set {
-            let rowid = rowid.value();
-            if let Some(row_versions) = self.rows.get(rowid) {
+        for entry in &tx.write_set {
+            let entry = entry.value();
+            if let Some(row_versions) = self.rows.get(&entry.row_id) {
                 let mut row_versions = row_versions.value().write();
-                // Find rows that were written by this transaction.
-                // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
-                // this transaction changed.
-                for row_version in row_versions.iter_mut().rev() {
+                if let Some(row_version) = row_versions.get_mut(entry.version_index) {
                     if let TxTimestampOrID::TxID(id) = row_version.begin {
                         turso_assert!(
                             id == tx_id,
@@ -1578,26 +1594,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
-        let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
 
         if self.is_exclusive_tx(&tx_id) {
             self.commit_coordinator.pager_commit_lock.unlock();
             self.release_exclusive_tx(&tx_id);
         }
 
-        for ref id in write_set {
-            if let Some(row_versions) = self.rows.get(id) {
+        for entry in &tx.write_set {
+            if let Some(row_versions) = self.rows.get(&entry.row_id) {
                 let mut row_versions = row_versions.value().write();
-                for rv in row_versions.iter_mut() {
-                    if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
-                        // undo deletions by this transaction
-                        rv.end = None;
+                if let Some(row_version) = row_versions.get_mut(entry.version_index) {
+                    if let TxTimestampOrID::TxID(id) = row_version.begin {
+                        assert_eq!(id, tx_id);
+                        // If the transaction has aborted,
+                        // it marks all its new versions as garbage and sets their Begin
+                        // and End timestamps to infinity to make them invisible
+                        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        // TODO: Should we have TxTimestampOrID::Infinity or something similar
+                        // instead of using u64::MAX?
+                        row_version.begin = TxTimestampOrID::Timestamp(u64::MAX);
+                        row_version.end = Some(TxTimestampOrID::Timestamp(u64::MAX));
                     }
-                }
-                // remove insertions by this transaction
-                row_versions.retain(|rv| rv.begin != TxTimestampOrID::TxID(tx_id));
-                if row_versions.is_empty() {
-                    self.rows.remove(id);
+                    // Revert the old version that this transaction updated or deleted.
+                    else if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                        assert_eq!(id, tx_id);
+                        row_version.end = None;
+                    }
                 }
             }
         }
@@ -1756,7 +1778,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Inserts a new row version into the database, while making sure that
     /// the row version is inserted in the correct order.
-    fn insert_version(&self, id: RowID, row_version: RowVersion) {
+    fn insert_version(&self, id: RowID, row_version: RowVersion) -> usize {
         let versions = self.rows.get_or_insert_with(id, || RwLock::new(Vec::new()));
         let mut versions = versions.value().write();
         self.insert_version_raw(&mut versions, row_version)
@@ -1764,7 +1786,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     /// Inserts a new row version into the internal data structure for versions,
     /// while making sure that the row version is inserted in the correct order.
-    pub fn insert_version_raw(&self, versions: &mut Vec<RowVersion>, row_version: RowVersion) {
+    pub fn insert_version_raw(
+        &self,
+        versions: &mut Vec<RowVersion>,
+        row_version: RowVersion,
+    ) -> usize {
         // NOTICE: this is an insert a'la insertion sort, with pessimistic linear complexity.
         // However, we expect the number of versions to be nearly sorted, so we deem it worthy
         // to search linearly for the insertion point instead of paying the price of using
@@ -1785,6 +1811,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             );
         }
         versions.insert(position, row_version);
+        position
     }
 
     pub fn write_row_to_pager(
