@@ -1,4 +1,7 @@
-use crate::model::{Query, QueryDiscriminants};
+use crate::{
+    generation::WeightedDistribution,
+    model::{Query, QueryDiscriminants},
+};
 use rand::{
     Rng,
     distr::{Distribution, weighted::WeightedIndex},
@@ -13,7 +16,7 @@ use sql_generation::{
 
 use super::property::Remaining;
 
-fn random_create<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     let mut create = Create::arbitrary(rng, conn_ctx);
     while conn_ctx
         .tables()
@@ -25,7 +28,7 @@ fn random_create<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -
     Query::Create(create)
 }
 
-fn random_select<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_select<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     if rng.random_bool(0.7) {
         Query::Select(Select::arbitrary(rng, conn_ctx))
     } else {
@@ -34,27 +37,30 @@ fn random_select<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -
     }
 }
 
-fn random_insert<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_insert<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Insert(Insert::arbitrary(rng, conn_ctx))
 }
 
-fn random_delete<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_delete<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Delete(Delete::arbitrary(rng, conn_ctx))
 }
 
-fn random_update<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_update<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Update(Update::arbitrary(rng, conn_ctx))
 }
 
-fn random_drop<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_drop<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Drop(sql_generation::model::query::Drop::arbitrary(rng, conn_ctx))
 }
 
-fn random_create_index<R: rand::Rng>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_create_index<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     assert!(!conn_ctx.tables().is_empty());
 
     let mut create_index = CreateIndex::arbitrary(rng, conn_ctx);
@@ -89,7 +95,7 @@ type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;
 impl QueryDiscriminants {
     pub fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
     where
-        R: rand::Rng,
+        R: rand::Rng + ?Sized,
         G: GenerationContext,
     {
         match self {
@@ -126,20 +132,53 @@ impl QueryDiscriminants {
     }
 }
 
-impl ArbitraryFrom<&Remaining> for Query {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        remaining: &Remaining,
-    ) -> Self {
-        let queries = possible_queries(context.tables());
-        let weights =
+pub(super) struct QueryDistribution {
+    queries: &'static [QueryDiscriminants],
+    weights: WeightedIndex<u32>,
+}
+
+impl QueryDistribution {
+    pub fn new(queries: &'static [QueryDiscriminants], remaining: &Remaining) -> Self {
+        let query_weights =
             WeightedIndex::new(queries.iter().map(|query| query.weight(remaining))).unwrap();
+        Self {
+            queries,
+            weights: query_weights,
+        }
+    }
+}
+
+impl WeightedDistribution for QueryDistribution {
+    type Item = QueryDiscriminants;
+    type GenItem = Query;
+
+    fn items(&self) -> &[Self::Item] {
+        self.queries
+    }
+
+    fn weights(&self) -> &WeightedIndex<u32> {
+        &self.weights
+    }
+
+    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+        &self,
+        rng: &mut R,
+        ctx: &C,
+    ) -> Self::GenItem {
+        let weights = &self.weights;
 
         let idx = weights.sample(rng);
-        let query_fn = queries[idx].gen_function();
-        let query = (query_fn)(rng, context);
+        let query_fn = self.queries[idx].gen_function();
+        (query_fn)(rng, ctx)
+    }
+}
 
-        query
+impl ArbitraryFrom<&QueryDistribution> for Query {
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        query_distr: &QueryDistribution,
+    ) -> Self {
+        query_distr.sample(rng, context)
     }
 }

@@ -1064,7 +1064,11 @@ fn reopen_database(env: &mut SimulatorEnv) {
     };
 }
 
-fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
+fn random_fault<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    env: &SimulatorEnv,
+    conn_index: usize,
+) -> Interactions {
     let faults = if env.opts.disable_reopen_database {
         vec![Fault::Disconnect]
     } else {
@@ -1075,7 +1079,7 @@ fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
-    fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         conn_ctx: &C,
         (env, stats, conn_index): (&SimulatorEnv, InteractionStats, usize),
@@ -1110,7 +1114,7 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
                             InteractionsType::Property(Property::arbitrary_from(
                                 rng,
                                 conn_ctx,
-                                (env, &stats),
+                                (env, &remaining_),
                             )),
                         )
                     }),

@@ -1208,7 +1208,7 @@ pub(crate) fn remaining(
     }
 }
 
-fn property_insert_values_select<R: rand::Rng>(
+fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1309,7 +1309,7 @@ fn property_insert_values_select<R: rand::Rng>(
     }
 }
 
-fn property_read_your_updates_back<R: rand::Rng>(
+fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1333,7 +1333,7 @@ fn property_read_your_updates_back<R: rand::Rng>(
     Property::ReadYourUpdatesBack { update, select }
 }
 
-fn property_table_has_expected_content<R: rand::Rng>(
+fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1346,7 +1346,7 @@ fn property_table_has_expected_content<R: rand::Rng>(
     }
 }
 
-fn property_select_limit<R: rand::Rng>(
+fn property_select_limit<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1365,7 +1365,7 @@ fn property_select_limit<R: rand::Rng>(
     Property::SelectLimit { select }
 }
 
-fn property_double_create_failure<R: rand::Rng>(
+fn property_double_create_failure<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1398,7 +1398,7 @@ fn property_double_create_failure<R: rand::Rng>(
     }
 }
 
-fn property_delete_select<R: rand::Rng>(
+fn property_delete_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1457,7 +1457,7 @@ fn property_delete_select<R: rand::Rng>(
     }
 }
 
-fn property_drop_select<R: rand::Rng>(
+fn property_drop_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1493,7 +1493,7 @@ fn property_drop_select<R: rand::Rng>(
     }
 }
 
-fn property_select_select_optimizer<R: rand::Rng>(
+fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1516,7 +1516,7 @@ fn property_select_select_optimizer<R: rand::Rng>(
     }
 }
 
-fn property_where_true_false_null<R: rand::Rng>(
+fn property_where_true_false_null<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1537,7 +1537,7 @@ fn property_where_true_false_null<R: rand::Rng>(
     }
 }
 
-fn property_union_all_preserves_cardinality<R: rand::Rng>(
+fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1564,7 +1564,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng>(
     }
 }
 
-fn property_fsync_no_wait<R: rand::Rng>(
+fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1576,7 +1576,7 @@ fn property_fsync_no_wait<R: rand::Rng>(
     }
 }
 
-fn property_faulty_query<R: rand::Rng>(
+fn property_faulty_query<R: rand::Rng + ?Sized>(
     rng: &mut R,
     remaining: &Remaining,
     ctx: &impl GenerationContext,
@@ -1593,7 +1593,7 @@ type PropertyGenFunc<R, G> = fn(&mut R, &Remaining, &G, bool) -> Property;
 impl PropertyDiscriminants {
     pub fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
     where
-        R: rand::Rng,
+        R: rand::Rng + ?Sized,
         G: GenerationContext,
     {
         match self {
@@ -1743,19 +1743,13 @@ pub fn possiple_properties(tables: &[Table]) -> Vec<PropertyDiscriminants> {
     PropertyDiscriminants::can_generate(queries)
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats)> for Property {
-    fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
+impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Property {
+    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         conn_ctx: &C,
-        (env, stats): (&SimulatorEnv, &InteractionStats),
+        (env, remaining_): (&SimulatorEnv, &Remaining),
     ) -> Self {
         let opts = conn_ctx.opts();
-        let remaining_ = remaining(
-            env.opts.max_interactions,
-            &env.profile.query,
-            stats,
-            env.profile.experimental_mvcc,
-        );
 
         let properties = possiple_properties(conn_ctx.tables());
         let weights = WeightedIndex::new(
