@@ -481,7 +481,7 @@ impl StreamingLogicalLogReader {
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
-    use rand::{thread_rng, Rng};
+    use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_logical_log_read_fuzz() {
-        let seed = thread_rng().gen();
+        let seed = rng().random();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
