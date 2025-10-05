@@ -59,7 +59,7 @@ regex-syntax = { workspace = true, default-features = false, features = [
 ] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 julian_day_converter = "0.4.5"
-rand = "0.8.5"
+rand = { workspace = true }
 libm = "0.2"
 turso_macros = { workspace = true }
 miette = { workspace = true }
@@ -103,7 +103,6 @@ rstest = "0.18.2"
 rusqlite = { workspace = true, features = ["series"] }
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = { version = "1.0", default-features = false }
-rand = "0.8.5" # Required for quickcheck
 rand_chacha = { workspace = true }
 env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }

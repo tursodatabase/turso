@@ -7875,7 +7875,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use rand::{thread_rng, Rng};
+    use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -9719,7 +9719,7 @@ mod tests {
         let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 100000;
-        let seed = thread_rng().gen();
+        let seed = rng().random();
         tracing::info!("seed {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         while i > 0 {
