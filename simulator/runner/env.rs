@@ -12,6 +12,7 @@ use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::Table;
+use tracing::trace;
 use turso_core::Database;
 
 use crate::generation::Shadow;
@@ -297,7 +298,8 @@ impl SimulatorEnv {
 
         let mut opts = SimulatorOpts {
             seed,
-            ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
+            ticks: rng
+                .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
             max_tables: rng.random_range(0..128),
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
@@ -311,8 +313,7 @@ impl SimulatorEnv {
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests)
-                as u32,
+            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
         };
@@ -418,9 +419,7 @@ impl SimulatorEnv {
         }
 
         if self.connections[connection_index].is_connected() {
-            log::trace!(
-                "Connection {connection_index} is already connected, skipping reconnection"
-            );
+            trace!("Connection {connection_index} is already connected, skipping reconnection");
             return;
         }
 

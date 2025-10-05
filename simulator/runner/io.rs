@@ -16,7 +16,7 @@ pub(crate) struct SimulatorIO {
     pub(crate) rng: RefCell<ChaCha8Rng>,
     pub(crate) page_size: usize,
     seed: u64,
-    latency_probability: usize,
+    latency_probability: u8,
     clock: Arc<SimulatorClock>,
 }
 
@@ -27,7 +27,7 @@ impl SimulatorIO {
     pub(crate) fn new(
         seed: u64,
         page_size: usize,
-        latency_probability: usize,
+        latency_probability: u8,
         min_tick: u64,
         max_tick: u64,
     ) -> Result<Self> {

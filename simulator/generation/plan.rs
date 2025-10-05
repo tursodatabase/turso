@@ -21,6 +21,7 @@ use sql_generation::{
         table::SimValue,
     },
 };
+use tracing::error;
 use turso_core::{Connection, Result, StepResult};
 
 use crate::{
@@ -121,7 +122,7 @@ impl InteractionPlan {
                     let _ = plan[j].split_off(k);
                     break;
                 }
-                log::error!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
+                error!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
                 if interactions[i].contains(plan[j][k].to_string().as_str()) {
                     i += 1;
                     k += 1;
