@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -9,6 +10,7 @@ use bitmaps::Bitmap;
 use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use regex::Regex;
 use sql_generation::generation::GenerationContext;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::Table;
@@ -62,6 +64,7 @@ pub struct ShadowTables<'a> {
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
     transaction_tables: &'a mut Option<TransactionTables>,
+    regex_cache: &'a mut HashMap<String, Regex>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -108,6 +111,7 @@ where
             let mut shadow_table = ShadowTablesMut {
                 commited_tables: self.commited_tables,
                 transaction_tables: &mut None,
+                regex_cache: self.regex_cache,
             };
 
             for query in transation_tables.pending_changes {
@@ -127,6 +131,10 @@ where
         if let Some(transaction_tables) = self.transaction_tables {
             transaction_tables.pending_changes.push(query.clone());
         }
+    }
+
+    pub fn regex_cache(&mut self) -> &mut HashMap<String, Regex> {
+        self.regex_cache
     }
 }
 
@@ -168,6 +176,7 @@ pub(crate) struct SimulatorEnv {
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
+    pub regex_cache: HashMap<String, Regex>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -192,6 +201,7 @@ impl SimulatorEnv {
             connection_tables: self.connection_tables.clone(),
             connection_last_query: self.connection_last_query,
             committed_tables: self.committed_tables.clone(),
+            regex_cache: HashMap::new(),
         }
     }
 
@@ -413,6 +423,7 @@ impl SimulatorEnv {
             committed_tables: Vec::new(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
+            regex_cache: HashMap::new(),
         }
     }
 
@@ -515,6 +526,7 @@ impl SimulatorEnv {
         ShadowTablesMut {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
+            regex_cache: &mut self.regex_cache,
         }
     }
 }

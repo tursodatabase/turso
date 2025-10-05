@@ -1,8 +1,13 @@
-use std::{fmt::Display, hash::Hash, ops::Deref};
+use std::{collections::HashMap, fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{
+    likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape},
+    numeric::Numeric,
+    types,
+};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -249,21 +254,32 @@ impl SimValue {
         }
     }
 
-    // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+        escape: Option<Option<SimValue>>,
+        regex_cache: Option<&mut HashMap<String, Regex>>,
+    ) -> bool {
+        let lhs = self.0.to_string();
+        let rhs = other.0.to_string();
+
         match operator {
-            ast::LikeOperator::Glob => todo!(),
+            ast::LikeOperator::Glob => exec_glob(regex_cache, lhs.as_str(), rhs.as_str()),
             ast::LikeOperator::Like => {
-                // TODO: support ESCAPE `expr` option in AST
-                // TODO: regex cache
-                types::Value::exec_like(
-                    None,
-                    other.0.to_string().as_str(),
-                    self.0.to_string().as_str(),
-                )
+                let should_use_escape = escape
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .and_then(|e| construct_like_escape_arg(&e.0).ok());
+
+                if let Some(escape_char) = should_use_escape {
+                    exec_like_with_escape(rhs.as_str(), lhs.as_str(), escape_char)
+                } else {
+                    types::Value::exec_like(regex_cache, rhs.as_str(), lhs.as_str())
+                }
             }
-            ast::LikeOperator::Match => todo!(),
-            ast::LikeOperator::Regexp => todo!(),
+
+            ast::LikeOperator::Match | ast::LikeOperator::Regexp => todo!(),
         }
     }
 

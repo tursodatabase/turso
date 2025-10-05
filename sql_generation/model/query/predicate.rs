@@ -1,6 +1,6 @@
-use std::fmt::Display;
-
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt::Display};
 use turso_parser::ast::{
     self,
     fmt::{BlankContext, ToTokens},
@@ -78,12 +78,17 @@ impl Predicate {
         Self(expr)
     }
 
-    pub fn eval(&self, row: &[SimValue], table: &Table) -> Option<SimValue> {
-        expr_to_value(&self.0, row, table)
+    pub fn eval(
+        &self,
+        row: &[SimValue],
+        table: &Table,
+        regex_cache: &mut Option<&mut HashMap<String, Regex>>,
+    ) -> Option<SimValue> {
+        expr_to_value(&self.0, row, table, regex_cache)
     }
 
     pub fn test<T: TableContext>(&self, row: &[SimValue], table: &T) -> bool {
-        let value = expr_to_value(&self.0, row, table);
+        let value = expr_to_value(&self.0, row, table, &mut None);
         value.is_some_and(|value| value.as_bool())
     }
 }
@@ -96,6 +101,7 @@ pub fn expr_to_value<T: TableContext>(
     expr: &ast::Expr,
     row: &[SimValue],
     table: &T,
+    regex_cache: &mut Option<&mut HashMap<String, Regex>>,
 ) -> Option<SimValue> {
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
@@ -113,8 +119,8 @@ pub fn expr_to_value<T: TableContext>(
         }
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {
-            let lhs = expr_to_value(lhs, row, table)?;
-            let rhs = expr_to_value(rhs, row, table)?;
+            let lhs = expr_to_value(lhs, row, table, regex_cache)?;
+            let rhs = expr_to_value(rhs, row, table, regex_cache)?;
             Some(lhs.binary_compare(&rhs, *op))
         }
         ast::Expr::Like {
@@ -122,21 +128,31 @@ pub fn expr_to_value<T: TableContext>(
             not,
             op,
             rhs,
-            escape: _, // TODO: support escape
+            escape,
         } => {
-            let lhs = expr_to_value(lhs, row, table)?;
-            let rhs = expr_to_value(rhs, row, table)?;
-            let res = lhs.like_compare(&rhs, *op);
-            let value: SimValue = if *not { !res } else { res }.into();
+            let lhs = expr_to_value(lhs, row, table, regex_cache)?;
+            let rhs = expr_to_value(rhs, row, table, regex_cache)?;
+            let escape = escape
+                .as_ref()
+                .map(|e| expr_to_value(e, row, table, regex_cache));
+            let value: SimValue = {
+                let result = if let Some(regex_cache) = regex_cache {
+                    lhs.like_compare(&rhs, *op, escape, Some(&mut *regex_cache))
+                } else {
+                    lhs.like_compare(&rhs, *op, escape, None)
+                };
+
+                if *not { !result } else { result }.into()
+            };
             Some(value)
         }
         ast::Expr::Unary(op, expr) => {
-            let value = expr_to_value(expr, row, table)?;
+            let value = expr_to_value(expr, row, table, regex_cache)?;
             Some(value.unary_exec(*op))
         }
         ast::Expr::Parenthesized(exprs) => {
             assert_eq!(exprs.len(), 1);
-            expr_to_value(&exprs[0], row, table)
+            expr_to_value(&exprs[0], row, table, regex_cache)
         }
         _ => unreachable!("{:?}", expr),
     }
