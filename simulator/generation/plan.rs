@@ -12,12 +12,11 @@ use rand::distr::weighted::WeightedIndex;
 use serde::{Deserialize, Serialize};
 
 use sql_generation::{
-    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency, query::SelectFree},
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
     model::{
         query::{
-            Create, CreateIndex, Delete, Drop, Insert, Select,
+            Create,
             transaction::{Begin, Commit},
-            update::Update,
         },
         table::SimValue,
     },
@@ -1063,107 +1062,6 @@ fn reopen_database(env: &mut SimulatorEnv) {
             }
         }
     };
-}
-
-fn random_create<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    let conn_ctx = env.connection_context(conn_index);
-    let mut create = Create::arbitrary(rng, &conn_ctx);
-    while conn_ctx
-        .tables()
-        .iter()
-        .any(|t| t.name == create.table.name)
-    {
-        create = Create::arbitrary(rng, &conn_ctx);
-    }
-    Interactions::new(conn_index, InteractionsType::Query(Query::Create(create)))
-}
-
-fn random_select<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    if rng.random_bool(0.7) {
-        Interactions::new(
-            conn_index,
-            InteractionsType::Query(Query::Select(Select::arbitrary(
-                rng,
-                &env.connection_context(conn_index),
-            ))),
-        )
-    } else {
-        // Random expression
-        Interactions::new(
-            conn_index,
-            InteractionsType::Query(Query::Select(
-                SelectFree::arbitrary(rng, &env.connection_context(conn_index)).0,
-            )),
-        )
-    }
-}
-
-fn random_insert<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Insert(Insert::arbitrary(
-            rng,
-            &env.connection_context(conn_index),
-        ))),
-    )
-}
-
-fn random_delete<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Delete(Delete::arbitrary(
-            rng,
-            &env.connection_context(conn_index),
-        ))),
-    )
-}
-
-fn random_update<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Update(Update::arbitrary(
-            rng,
-            &env.connection_context(conn_index),
-        ))),
-    )
-}
-
-fn random_drop<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
-    Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::Drop(Drop::arbitrary(
-            rng,
-            &env.connection_context(conn_index),
-        ))),
-    )
-}
-
-fn random_create_index<R: rand::Rng>(
-    rng: &mut R,
-    env: &SimulatorEnv,
-    conn_index: usize,
-) -> Option<Interactions> {
-    let conn_ctx = env.connection_context(conn_index);
-    if conn_ctx.tables().is_empty() {
-        return None;
-    }
-    let mut create_index = CreateIndex::arbitrary(rng, &conn_ctx);
-    while conn_ctx
-        .tables()
-        .iter()
-        .find(|t| t.name == create_index.table_name)
-        .expect("table should exist")
-        .indexes
-        .iter()
-        .any(|i| i == &create_index.index_name)
-    {
-        create_index = CreateIndex::arbitrary(rng, &conn_ctx);
-    }
-
-    Some(Interactions::new(
-        conn_index,
-        InteractionsType::Query(Query::CreateIndex(create_index)),
-    ))
 }
 
 fn random_fault<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
