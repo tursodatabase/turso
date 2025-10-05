@@ -168,7 +168,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let mut exists_in_db_file = false;
             for (i, version) in row_versions.iter().enumerate() {
                 let is_last = i == row_versions.len() - 1;
-                if let TxTimestampOrID::Timestamp(ts) = &version.begin {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = &version.begin {
                     if *ts <= self.checkpointed_txid_max_old {
                         exists_in_db_file = true;
                     }
