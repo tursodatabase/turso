@@ -1711,7 +1711,10 @@ impl PropertyDiscriminants {
         let queries_capabilities = QueryCapabilities::from_list_queries(queries);
 
         PropertyDiscriminants::iter()
-            .filter(|property| queries_capabilities.contains(property.requirements()))
+            .filter(|property| {
+                !matches!(property, PropertyDiscriminants::Queries)
+                    && queries_capabilities.contains(property.requirements())
+            })
             .collect()
     }
 
