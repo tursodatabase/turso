@@ -6,12 +6,12 @@ use std::{
 
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 use turso_core::{File, Result};
 
 use crate::{
     profiles::io::IOProfile,
-    runner::{clock::SimulatorClock, FAULT_ERROR_MSG},
+    runner::{FAULT_ERROR_MSG, clock::SimulatorClock},
 };
 pub(crate) struct SimulatorFile {
     pub path: String,

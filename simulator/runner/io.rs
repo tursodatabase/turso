@@ -5,11 +5,11 @@ use std::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Instant, OpenFlags, PlatformIO, Result, IO};
+use turso_core::{Clock, IO, Instant, OpenFlags, PlatformIO, Result};
 
 use crate::{
     profiles::io::IOProfile,
-    runner::{clock::SimulatorClock, file::SimulatorFile, SimIO},
+    runner::{SimIO, clock::SimulatorClock, file::SimulatorFile},
 };
 
 pub(crate) struct SimulatorIO {
