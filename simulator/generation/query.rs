@@ -121,7 +121,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Insert => remaining.insert,
             QueryDiscriminants::Delete => remaining.delete,
             QueryDiscriminants::Update => remaining.update,
-            QueryDiscriminants::Drop => 0,
+            QueryDiscriminants::Drop => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit

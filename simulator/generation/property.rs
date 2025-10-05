@@ -1657,8 +1657,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::DropSelect => {
                 if !env.opts.disable_drop_select {
-                    // remaining.drop
-                    0
+                    remaining.drop
                 } else {
                     0
                 }
