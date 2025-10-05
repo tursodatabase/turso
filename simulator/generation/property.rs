@@ -19,7 +19,11 @@ use turso_parser::ast::{self, Distinctness};
 
 use crate::{
     common::print_diff,
-    generation::{Shadow as _, plan::InteractionType, query::possible_queries},
+    generation::{
+        Shadow as _, WeightedDistribution,
+        plan::InteractionType,
+        query::{QueryDistribution, possible_queries},
+    },
     model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
     runner::env::SimulatorEnv,
@@ -1210,7 +1214,7 @@ pub(crate) fn remaining(
 
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     mvcc: bool,
 ) -> Property {
@@ -1254,7 +1258,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         }));
     }
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, remaining);
+        let query = Query::arbitrary_from(rng, ctx, query_distr);
         match &query {
             Query::Delete(Delete {
                 table: t,
@@ -1311,7 +1315,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
 
 fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1335,7 +1339,7 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
 
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1348,7 +1352,7 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
 
 fn property_select_limit<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1367,7 +1371,7 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
 
 fn property_double_create_failure<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1381,7 +1385,7 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
     // - [x] There will be no errors in the middle interactions.(best effort)
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, remaining);
+        let query = Query::arbitrary_from(rng, ctx, query_distr);
         if let Query::Create(Create { table: t }) = &query {
             // There will be no errors in the middle interactions.
             // - Creating the same table is an error
@@ -1400,7 +1404,7 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
 
 fn property_delete_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1415,7 +1419,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
     // - [x] A row that holds for the predicate will not be inserted.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, remaining);
+        let query = Query::arbitrary_from(rng, ctx, query_distr);
         match &query {
             Query::Insert(Insert::Values { table: t, values }) => {
                 // A row that holds for the predicate will not be inserted.
@@ -1459,7 +1463,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
 
 fn property_drop_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1471,7 +1475,7 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
     // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
     for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, remaining);
+        let query = Query::arbitrary_from(rng, ctx, query_distr);
         if let Query::Create(Create { table: t }) = &query {
             // - The table `t` will not be created
             if t.name == table.name {
@@ -1495,7 +1499,7 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
 
 fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1518,7 +1522,7 @@ fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
 
 fn property_where_true_false_null<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1539,7 +1543,7 @@ fn property_where_true_false_null<R: rand::Rng + ?Sized>(
 
 fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    _remaining: &Remaining,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1566,32 +1570,32 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
 
 fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
     Property::FsyncNoWait {
-        query: Query::arbitrary_from(rng, ctx, remaining),
+        query: Query::arbitrary_from(rng, ctx, query_distr),
         tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
 fn property_faulty_query<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    remaining: &Remaining,
+    query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
     Property::FaultyQuery {
-        query: Query::arbitrary_from(rng, ctx, remaining),
+        query: Query::arbitrary_from(rng, ctx, query_distr),
         tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
-type PropertyGenFunc<R, G> = fn(&mut R, &Remaining, &G, bool) -> Property;
+type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
-    pub fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
+    pub(super) fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -1743,27 +1747,69 @@ pub fn possiple_properties(tables: &[Table]) -> Vec<PropertyDiscriminants> {
     PropertyDiscriminants::can_generate(queries)
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, &Remaining)> for Property {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
-        rng: &mut R,
-        conn_ctx: &C,
-        (env, remaining_): (&SimulatorEnv, &Remaining),
-    ) -> Self {
-        let opts = conn_ctx.opts();
+pub(super) struct PropertyDistribution<'a> {
+    properties: Vec<PropertyDiscriminants>,
+    weights: WeightedIndex<u32>,
+    query_distr: &'a QueryDistribution,
+    mvcc: bool,
+}
 
-        let properties = possiple_properties(conn_ctx.tables());
+impl<'a> PropertyDistribution<'a> {
+    pub fn new(
+        env: &SimulatorEnv,
+        remaining: &Remaining,
+        query_distr: &'a QueryDistribution,
+        opts: &Opts,
+    ) -> Self {
+        let properties = PropertyDiscriminants::can_generate(query_distr.items());
         let weights = WeightedIndex::new(
             properties
                 .iter()
-                .map(|property| property.weight(env, &remaining_, opts)),
+                .map(|property| property.weight(env, remaining, opts)),
         )
         .unwrap();
 
-        let idx = weights.sample(rng);
-        let property_fn = properties[idx].gen_function();
-        let property = (property_fn)(rng, &remaining_, conn_ctx, env.profile.experimental_mvcc);
+        Self {
+            properties,
+            weights,
+            query_distr,
+            mvcc: env.profile.experimental_mvcc,
+        }
+    }
+}
 
-        property
+impl<'a> WeightedDistribution for PropertyDistribution<'a> {
+    type Item = PropertyDiscriminants;
+
+    type GenItem = Property;
+
+    fn items(&self) -> &[Self::Item] {
+        &self.properties
+    }
+
+    fn weights(&self) -> &WeightedIndex<u32> {
+        &self.weights
+    }
+
+    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+        &self,
+        rng: &mut R,
+        conn_ctx: &C,
+    ) -> Self::GenItem {
+        let properties = &self.properties;
+        let idx = self.weights.sample(rng);
+        let property_fn = properties[idx].gen_function();
+        (property_fn)(rng, self.query_distr, conn_ctx, self.mvcc)
+    }
+}
+
+impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
+    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        conn_ctx: &C,
+        property_distr: &PropertyDistribution<'a>,
+    ) -> Self {
+        property_distr.sample(rng, conn_ctx)
     }
 }
 

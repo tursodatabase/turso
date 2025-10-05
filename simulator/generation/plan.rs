@@ -8,7 +8,6 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use rand::distr::weighted::WeightedIndex;
 use serde::{Deserialize, Serialize};
 
 use sql_generation::{
@@ -26,7 +25,11 @@ use turso_core::{Connection, Result, StepResult};
 
 use crate::{
     SimulatorEnv,
-    generation::{Shadow, property::possiple_properties, query::possible_queries},
+    generation::{
+        Shadow, WeightedDistribution,
+        property::PropertyDistribution,
+        query::{QueryDistribution, possible_queries},
+    },
     model::Query,
     runner::env::{ShadowTablesMut, SimConnection, SimulationType},
 };
@@ -1091,43 +1094,36 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
             env.profile.experimental_mvcc,
         );
 
-        // TODO: find a way to be more efficient and pass the weights and properties down to the ArbitraryFrom functions
         let queries = possible_queries(conn_ctx.tables());
-        let query_weights =
-            WeightedIndex::new(queries.iter().map(|query| query.weight(&remaining_))).unwrap();
+        let query_distr = QueryDistribution::new(queries, &remaining_);
 
-        let properties = possiple_properties(conn_ctx.tables());
-        let property_weights = WeightedIndex::new(
-            properties
-                .iter()
-                .map(|property| property.weight(env, &remaining_, conn_ctx.opts())),
-        )
-        .unwrap();
+        let property_distr =
+            PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx.opts());
 
         frequency(
             vec![
                 (
-                    property_weights.total_weight(),
+                    property_distr.weights().total_weight(),
                     Box::new(|rng: &mut R| {
                         Interactions::new(
                             conn_index,
                             InteractionsType::Property(Property::arbitrary_from(
                                 rng,
                                 conn_ctx,
-                                (env, &remaining_),
+                                &property_distr,
                             )),
                         )
                     }),
                 ),
                 (
-                    query_weights.total_weight(),
+                    query_distr.weights().total_weight(),
                     Box::new(|rng: &mut R| {
                         Interactions::new(
                             conn_index,
                             InteractionsType::Query(Query::arbitrary_from(
                                 rng,
                                 conn_ctx,
-                                &remaining_,
+                                &query_distr,
                             )),
                         )
                     }),
