@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use indexmap::IndexSet;
 use rand::Rng;
 use turso_core::Value;
@@ -40,6 +43,7 @@ impl Arbitrary for Table {
             name,
             columns: Vec::from_iter(column_set),
             indexes: vec![],
+            regex_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

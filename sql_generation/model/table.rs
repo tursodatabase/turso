@@ -1,7 +1,18 @@
-use std::{fmt::Display, hash::Hash, ops::Deref};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    hash::Hash,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{
+    likeop::{exec_glob, exec_like_with_escape},
+    numeric::Numeric,
+    types, Value,
+};
 use turso_parser::ast;
 
 use crate::model::query::predicate::Predicate;
@@ -25,6 +36,9 @@ pub struct ContextColumn<'a> {
 pub trait TableContext {
     fn columns<'a>(&'a self) -> impl Iterator<Item = ContextColumn<'a>>;
     fn rows(&self) -> &Vec<Vec<SimValue>>;
+    fn regex_cache(&self) -> Option<Arc<Mutex<HashMap<String, Regex>>>> {
+        None
+    }
 }
 
 impl TableContext for Table {
@@ -38,6 +52,10 @@ impl TableContext for Table {
     fn rows(&self) -> &Vec<Vec<SimValue>> {
         &self.rows
     }
+
+    fn regex_cache(&self) -> Option<Arc<Mutex<HashMap<String, Regex>>>> {
+        Some(self.regex_cache.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +64,8 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
     pub indexes: Vec<String>,
+    #[serde(skip)]
+    pub regex_cache: Arc<Mutex<HashMap<String, Regex>>>,
 }
 
 impl Table {
@@ -55,6 +75,7 @@ impl Table {
             name: "".to_string(),
             columns: vec![],
             indexes: vec![],
+            regex_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -211,21 +232,31 @@ impl SimValue {
         }
     }
 
-    // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+        escape: Option<Option<SimValue>>,
+        regex_cache: Option<&mut HashMap<String, Regex>>,
+    ) -> bool {
+        let lhs = self.0.to_string();
+        let rhs = other.0.to_string();
+
         match operator {
-            ast::LikeOperator::Glob => todo!(),
+            ast::LikeOperator::Glob => exec_glob(regex_cache, lhs.as_str(), rhs.as_str()),
             ast::LikeOperator::Like => {
-                // TODO: support ESCAPE `expr` option in AST
-                // TODO: regex cache
-                types::Value::exec_like(
-                    None,
-                    other.0.to_string().as_str(),
-                    self.0.to_string().as_str(),
-                )
+                let escape_char = escape.and_then(|opt| opt).and_then(|val| match val.0 {
+                    Value::Text(ref s) if s.as_str().len() == 1 => s.as_str().chars().next(),
+                    _ => None,
+                });
+
+                match escape_char {
+                    Some(ch) => exec_like_with_escape(rhs.as_str(), lhs.as_str(), ch),
+                    None => types::Value::exec_like(regex_cache, rhs.as_str(), lhs.as_str()),
+                }
             }
-            ast::LikeOperator::Match => todo!(),
-            ast::LikeOperator::Regexp => todo!(),
+
+            ast::LikeOperator::Match | ast::LikeOperator::Regexp => todo!(),
         }
     }
 
