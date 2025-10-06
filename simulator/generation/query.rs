@@ -111,6 +111,9 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback => {
                 unreachable!("transactional queries should not be generated")
             }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("Query Placeholders should not be generated")
+            }
         }
     }
 
@@ -127,6 +130,9 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
                 unreachable!("transactional queries should not be generated")
+            }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("Query Placeholders should not be generated")
             }
         }
     }

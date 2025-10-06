@@ -195,6 +195,7 @@ impl InteractionPlan {
                 Query::Begin(_) => stats.begin_count += 1,
                 Query::Commit(_) => stats.commit_count += 1,
                 Query::Rollback(_) => stats.rollback_count += 1,
+                Query::Placeholder => {}
             }
         }
         for interactions in &self.plan {
@@ -766,6 +767,11 @@ impl InteractionType {
 
     pub(crate) fn execute_query(&self, conn: &mut Arc<Connection>) -> ResultSet {
         if let Self::Query(query) = self {
+            assert!(
+                !matches!(query, Query::Placeholder),
+                "simulation cannot have a placeholder Query for execution"
+            );
+
             let query_str = query.to_string();
             let rows = conn.query(&query_str);
             if rows.is_err() {

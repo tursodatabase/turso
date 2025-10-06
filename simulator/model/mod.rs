@@ -32,6 +32,8 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    /// Placeholder query that still needs to be generated
+    Placeholder,
 }
 
 impl Query {
@@ -70,6 +72,7 @@ impl Query {
                 IndexSet::from_iter([table_name.clone()])
             }
             Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
+            Query::Placeholder => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -83,6 +86,7 @@ impl Query {
             | Query::Drop(Drop { table, .. }) => vec![table.clone()],
             Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
+            Query::Placeholder => vec![],
         }
     }
 
@@ -116,6 +120,7 @@ impl Display for Query {
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
+            Self::Placeholder => Ok(()),
         }
     }
 }
@@ -124,7 +129,6 @@ impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
-        tracing::info!("SHADOW {:?}", self);
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -136,6 +140,7 @@ impl Shadow for Query {
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
+            Query::Placeholder => Ok(vec![]),
         }
     }
 }
@@ -181,6 +186,9 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
                 unreachable!("QueryCapabilities do not apply to transaction queries")
+            }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
         }
     }
