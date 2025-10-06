@@ -19,7 +19,7 @@ use crate::types::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::registers_to_ref_values;
+use crate::vdbe::{registers_to_ref_values, TxnCleanup};
 use crate::vector::{vector_concat, vector_slice};
 use crate::{
     error::{
@@ -157,7 +157,6 @@ pub enum InsnFunctionStepResult {
     Done,
     IO(IOCompletions),
     Row,
-    Interrupt,
     Step,
 }
 
@@ -2328,7 +2327,7 @@ pub fn op_transaction_inner(
                             | TransactionMode::Read
                             | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
                             TransactionMode::Write => {
-                                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
+                                mv_store.begin_exclusive_tx(pager.clone(), None)?
                             }
                         };
                         *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
@@ -2343,7 +2342,7 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                            mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))?;
                         }
                     }
                 } else {
@@ -2359,6 +2358,7 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
                     if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
@@ -2374,6 +2374,7 @@ pub fn op_transaction_inner(
                             if matches!(current_state, TransactionState::None) {
                                 pager.end_read_tx();
                                 conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
                             return Err(LimboError::Busy);
@@ -8018,15 +8019,12 @@ pub fn op_drop_column(
         let schema = conn.schema.read();
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
-            let stmt = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
                     column_name, view.sql,
                 ))
             })?;
-            // this is internal statement running during active Program execution
-            // so, we must not interact with transaction state and explicitly mark this statement as done avoiding cleanup on reset
-            stmt.mark_as_done();
         }
     }
 
@@ -8152,15 +8150,12 @@ pub fn op_alter_column(
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             // FIXME: this should rewrite the view to reference the new column name
-            let stmt = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
                     old_column_name, view.sql,
                 ))
             })?;
-            // this is internal statement running during active Program execution
-            // so, we must not interact with transaction state and explicitly mark this statement as done avoiding cleanup on reset
-            stmt.mark_as_done();
         }
     }
 

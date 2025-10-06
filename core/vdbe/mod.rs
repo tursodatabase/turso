@@ -66,7 +66,7 @@ use std::{
     collections::HashMap,
     num::NonZero,
     sync::{
-        atomic::{AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicI64, Ordering},
         Arc,
     },
 };
@@ -265,6 +265,12 @@ pub struct Row {
     count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TxnCleanup {
+    None,
+    RollbackTxn,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -302,6 +308,10 @@ pub struct ProgramState {
     op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
+    /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
+    /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
+    pub(crate) auto_txn_cleanup: TxnCleanup,
 }
 
 impl ProgramState {
@@ -346,6 +356,7 @@ impl ProgramState {
             op_transaction_state: OpTransactionState::Start,
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            auto_txn_cleanup: TxnCleanup::None,
         }
     }
 
@@ -428,6 +439,7 @@ impl ProgramState {
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.auto_txn_cleanup = TxnCleanup::None;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -483,10 +495,6 @@ macro_rules! get_cursor {
     };
 }
 
-pub(crate) const PROGRAM_STATE_ACTIVE: u32 = 1;
-pub(crate) const PROGRAM_STATE_ABORTED: u32 = 2;
-pub(crate) const PROGRAM_STATE_DONE: u32 = 3;
-
 pub struct Program {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
@@ -505,9 +513,6 @@ pub struct Program {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     pub accesses_db: bool,
-    /// Current state of the program
-    /// Used to execute abort only once
-    pub program_state: AtomicU32,
 }
 
 impl Program {
@@ -648,7 +653,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
-                self.abort(mv_store, &pager, None);
+                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -657,7 +662,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    self.abort(mv_store, &pager, Some(&err));
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -680,8 +685,7 @@ impl Program {
                 Ok(InsnFunctionStepResult::Done) => {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
-                    self.program_state
-                        .store(PROGRAM_STATE_DONE, Ordering::SeqCst);
+                    state.auto_txn_cleanup = TxnCleanup::None;
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
@@ -694,16 +698,12 @@ impl Program {
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     return Ok(StepResult::Row);
                 }
-                Ok(InsnFunctionStepResult::Interrupt) => {
-                    // Instruction interrupted - may resume at same PC
-                    return Ok(StepResult::Interrupt);
-                }
                 Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(mv_store, &pager, Some(&err));
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
             }
@@ -964,43 +964,33 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
+        cleanup: &mut TxnCleanup,
     ) {
-        let Ok(..) = self.program_state.compare_exchange(
-            PROGRAM_STATE_ACTIVE,
-            PROGRAM_STATE_ABORTED,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) else {
-            // no need to abort: program was either already aborted or executed to completion successfully
-            return;
-        };
-
-        if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
-            // Errors from nested statements are handled by the parent statement.
-            return;
-        }
-        if self.connection.get_tx_state() == TransactionState::None {
-            return;
-        }
-        match err {
-            // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
-            Some(LimboError::TxError(_)) => {}
-            // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-            Some(LimboError::TableLocked) => {}
-            // Busy errors do not cause a rollback.
-            Some(LimboError::Busy) => {}
-            _ => {
-                if let Some(mv_store) = mv_store {
-                    if let Some(tx_id) = self.connection.get_mv_tx_id() {
-                        self.connection.auto_commit.store(true, Ordering::SeqCst);
-                        mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+        // Errors from nested statements are handled by the parent statement.
+        if !self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+            match err {
+                // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
+                Some(LimboError::TxError(_)) => {}
+                // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
+                Some(LimboError::TableLocked) => {}
+                // Busy errors do not cause a rollback.
+                Some(LimboError::Busy) => {}
+                _ => {
+                    if *cleanup != TxnCleanup::None || err.is_some() {
+                        if let Some(mv_store) = mv_store {
+                            if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                                self.connection.auto_commit.store(true, Ordering::SeqCst);
+                                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+                            }
+                        } else {
+                            pager.rollback_tx(&self.connection);
+                        }
+                        self.connection.set_tx_state(TransactionState::None);
                     }
-                } else {
-                    pager.rollback_tx(&self.connection);
                 }
-                self.connection.set_tx_state(TransactionState::None);
             }
         }
+        *cleanup = TxnCleanup::None;
     }
 }
 

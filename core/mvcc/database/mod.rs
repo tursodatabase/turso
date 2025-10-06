@@ -1342,7 +1342,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
-    ) -> Result<IOResult<TxID>> {
+    ) -> Result<TxID> {
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -1378,7 +1378,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
-        Ok(IOResult::Done(tx_id))
+        Ok(tx_id)
     }
 
     /// Begins a new transaction in the database.

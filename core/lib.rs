@@ -47,7 +47,6 @@ use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
-use crate::vdbe::PROGRAM_STATE_DONE;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use core::str;
@@ -2424,6 +2423,12 @@ pub struct Statement {
     busy_timeout: Option<BusyTimeout>,
 }
 
+impl Drop for Statement {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
 impl Statement {
     pub fn new(
         program: vdbe::Program,
@@ -2719,16 +2724,15 @@ impl Statement {
         self.reset_internal(None, None);
     }
 
-    pub(crate) fn mark_as_done(&self) {
-        self.program
-            .program_state
-            .store(PROGRAM_STATE_DONE, Ordering::SeqCst);
-    }
-
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
+        self.program.abort(
+            self.mv_store.as_ref(),
+            &self.pager,
+            None,
+            &mut self.state.auto_txn_cleanup,
+        );
         self.state.reset(max_registers, max_cursors);
-        self.program
-            .abort(self.mv_store.as_ref(), &self.pager, None);
         self.busy = false;
         self.busy_timeout = None;
     }
@@ -2743,12 +2747,6 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
-    }
-}
-
-impl Drop for Statement {
-    fn drop(&mut self) {
-        self.reset();
     }
 }
 
