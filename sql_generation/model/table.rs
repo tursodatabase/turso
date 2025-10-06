@@ -9,9 +9,9 @@ use std::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use turso_core::{
-    likeop::{exec_glob, exec_like_with_escape},
+    likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape},
     numeric::Numeric,
-    types, Value,
+    types,
 };
 use turso_parser::ast;
 
@@ -52,10 +52,6 @@ impl TableContext for Table {
     fn rows(&self) -> &Vec<Vec<SimValue>> {
         &self.rows
     }
-
-    fn regex_cache(&self) -> Option<Arc<Mutex<HashMap<String, Regex>>>> {
-        Some(self.regex_cache.clone())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +60,6 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
     pub indexes: Vec<String>,
-    #[serde(skip)]
-    pub regex_cache: Arc<Mutex<HashMap<String, Regex>>>,
 }
 
 impl Table {
@@ -75,7 +69,6 @@ impl Table {
             name: "".to_string(),
             columns: vec![],
             indexes: vec![],
-            regex_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -245,14 +238,15 @@ impl SimValue {
         match operator {
             ast::LikeOperator::Glob => exec_glob(regex_cache, lhs.as_str(), rhs.as_str()),
             ast::LikeOperator::Like => {
-                let escape_char = escape.and_then(|opt| opt).and_then(|val| match val.0 {
-                    Value::Text(ref s) if s.as_str().len() == 1 => s.as_str().chars().next(),
-                    _ => None,
-                });
+                let should_use_escape = escape
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .and_then(|e| construct_like_escape_arg(&e.0).ok());
 
-                match escape_char {
-                    Some(ch) => exec_like_with_escape(rhs.as_str(), lhs.as_str(), ch),
-                    None => types::Value::exec_like(regex_cache, rhs.as_str(), lhs.as_str()),
+                if let Some(escape_char) = should_use_escape {
+                    exec_like_with_escape(rhs.as_str(), lhs.as_str(), escape_char)
+                } else {
+                    types::Value::exec_like(regex_cache, rhs.as_str(), lhs.as_str())
                 }
             }
 

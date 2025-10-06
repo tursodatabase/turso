@@ -10,9 +10,9 @@ use sql_generation::{
     },
     model::table::{Column, ColumnType, Table},
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::{cell::RefCell, sync::Mutex};
 use tracing::trace;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use turso_core::{
@@ -361,7 +361,6 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
             columns,
             rows: vec![],
             indexes: vec![],
-            regex_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         schema.push(Create { table });
