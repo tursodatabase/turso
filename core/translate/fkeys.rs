@@ -7,32 +7,22 @@ use crate::{
     vdbe::{
         builder::CursorType,
         insn::{CmpInsFlags, Insn},
+        BranchOffset,
     },
     Result,
 };
 use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 #[inline]
-/// Increment/decrement the FK scope counter if `table_name` has either outgoing or incoming FKs.
-///
-/// Returns `true` if a scope change was emitted. Scope open (+1) occurs before a statement
-/// touching the table; scope close (−1) occurs after. On scope close, remaining deferred
-/// violations are raised by the runtime.
-pub fn emit_fk_scope_if_needed(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_name: &str,
-    open: bool,
-) -> Result<bool> {
-    let has_fks = resolver.schema.has_child_fks(table_name)
-        || resolver.schema.any_resolved_fks_referencing(table_name);
-    if has_fks {
-        program.emit_insn(Insn::FkCounter {
-            increment_value: if open { 1 } else { -1 },
-            is_scope: true,
-        });
-    }
-    Ok(has_fks)
+pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset) {
+    program.emit_insn(Insn::FkIfZero {
+        is_scope: false,
+        target_pc: label,
+    });
+    program.emit_insn(Insn::FkCounter {
+        increment_value: -1,
+        is_scope: false,
+    });
 }
 
 /// Open a read cursor on an index and return its cursor id.
@@ -543,8 +533,7 @@ enum ParentProbePass {
     New,
 }
 
-/// Probe the child side for a given parent key. If `increment_value` is +1, increment counter on match.
-/// If −1, we guard with `FkIfZero` then decrement to avoid counter underflow in edge cases.
+/// Probe the child side for a given parent key
 fn emit_fk_parent_key_probe(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -576,14 +565,7 @@ fn emit_fk_parent_key_probe(
             (true, ParentProbePass::New) => {
                 // Guard to avoid underflow if OLD pass didn't increment.
                 let skip = p.allocate_label();
-                p.emit_insn(Insn::FkIfZero {
-                    is_scope: false,
-                    target_pc: skip,
-                });
-                p.emit_insn(Insn::FkCounter {
-                    increment_value: -1,
-                    is_scope: false,
-                });
+                emit_guarded_fk_decrement(p, skip);
                 p.preassign_label_to_next_insn(skip);
             }
             // Immediate FK on NEW pass: nothing to cancel; do nothing.
@@ -663,8 +645,8 @@ fn build_parent_key(
 
 /// Child-side FK maintenance for UPDATE/UPSERT:
 /// If any FK columns of this child row changed:
-///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing → decrement deferred counter (guarded).
-///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing → immediate error or deferred(+1).
+///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement deferred counter (guarded).
+///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing: immediate error or deferred(+1).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
     program: &mut ProgramBuilder,
@@ -687,7 +669,6 @@ pub fn emit_fk_child_update_counters(
                 let (pos, _col) = match child_tbl.get_column(cname) {
                     Some(v) => v,
                     None => {
-                        // schema inconsistency; treat as no-old tuple
                         return None;
                     }
                 };
@@ -701,7 +682,7 @@ pub fn emit_fk_child_update_counters(
             // No NULLs, proceed
             let cont = program.allocate_label();
             program.emit_insn(Insn::Goto { target_pc: cont });
-            // NULL encountered -> invalidate tuple by jumping here
+            // NULL encountered: invalidate tuple by jumping here
             program.preassign_label_to_next_insn(null_jmp);
 
             program.preassign_label_to_next_insn(cont);
@@ -736,30 +717,23 @@ pub fn emit_fk_child_update_counters(
                     });
                     program.emit_insn(Insn::MustBeInt { reg: rid });
 
-                    // If NOT exists => decrement (guarded)
+                    // If NOT exists => decrement
                     let miss = program.allocate_label();
                     program.emit_insn(Insn::NotExists {
                         cursor: pcur,
                         rowid_reg: rid,
                         target_pc: miss,
                     });
-                    // found → close & continue
+                    // found: close & continue
                     let join = program.allocate_label();
                     program.emit_insn(Insn::Close { cursor_id: pcur });
                     program.emit_insn(Insn::Goto { target_pc: join });
 
-                    // missing → guarded decrement
+                    // missing: guarded decrement
                     program.preassign_label_to_next_insn(miss);
                     program.emit_insn(Insn::Close { cursor_id: pcur });
                     let skip = program.allocate_label();
-                    program.emit_insn(Insn::FkIfZero {
-                        is_scope: false,
-                        target_pc: skip,
-                    });
-                    program.emit_insn(Insn::FkCounter {
-                        is_scope: false,
-                        increment_value: -1,
-                    });
+                    emit_guarded_fk_decrement(program, skip);
                     program.preassign_label_to_next_insn(skip);
 
                     program.preassign_label_to_next_insn(join);
@@ -786,14 +760,7 @@ pub fn emit_fk_child_update_counters(
                         |_p| Ok(()),
                         |p| {
                             let skip = p.allocate_label();
-                            p.emit_insn(Insn::FkIfZero {
-                                is_scope: false,
-                                target_pc: skip,
-                            });
-                            p.emit_insn(Insn::FkCounter {
-                                is_scope: false,
-                                increment_value: -1,
-                            });
+                            emit_guarded_fk_decrement(p, skip);
                             p.preassign_label_to_next_insn(skip);
                             Ok(())
                         },
@@ -803,7 +770,6 @@ pub fn emit_fk_child_update_counters(
         }
 
         // Pass 2: NEW tuple handling
-        // If any NEW component is NULL → FK is satisfied vacuously.
         let fk_ok = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
@@ -825,7 +791,7 @@ pub fn emit_fk_child_update_counters(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl);
 
-            // Take the first child column value (rowid) from NEW image
+            // Take the first child column value from NEW image
             let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias {
                 new_rowid_reg
@@ -847,11 +813,11 @@ pub fn emit_fk_child_update_counters(
                 rowid_reg: tmp,
                 target_pc: violation,
             });
-            // found → close and continue
+            // found: close and continue
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
-            // missing → violation (immediate HALT or deferred +1)
+            // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
             emit_fk_violation(program, &fk_ref.fk)?;
@@ -866,7 +832,7 @@ pub fn emit_fk_child_update_counters(
                 .expect("parent unique index required");
             let icur = open_read_index(program, idx);
 
-            // Build NEW probe (in FK child column order → aligns with parent index columns)
+            // Build NEW probe (in FK child column order, aligns with parent index columns)
             let probe = {
                 let start = program.alloc_registers(ncols);
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {

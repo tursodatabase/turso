@@ -1539,6 +1539,7 @@ impl Connection {
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
         self.fk_pragma.store(enable, Ordering::Release);
     }
+
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
     }

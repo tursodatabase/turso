@@ -17,7 +17,7 @@ use crate::translate::expr::{
     BindingBehavior, ReturningValueRegisters, WalkControl,
 };
 use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_scope_if_needed, emit_fk_violation, index_probe,
+    build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
     open_read_index, open_read_table,
 };
 use crate::translate::plan::TableReferences;
@@ -241,11 +241,11 @@ pub fn translate_insert(
         connection,
     )?;
 
-    let has_fks = if fk_enabled {
-        emit_fk_scope_if_needed(&mut program, resolver, table_name.as_str(), true)?
-    } else {
-        false
-    };
+    let has_fks = fk_enabled
+        && (resolver.schema.has_child_fks(table_name.as_str())
+            || resolver
+                .schema
+                .any_resolved_fks_referencing(table_name.as_str()));
     let mut yield_reg_opt = None;
     let mut temp_table_ctx = None;
     let (num_values, cursor_id) = match body {
@@ -1200,10 +1200,6 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(stmt_epilogue);
-    if has_fks {
-        emit_fk_scope_if_needed(&mut program, resolver, table_name.as_str(), false)?;
-    }
-
     program.resolve_label(halt_label, program.offset());
 
     Ok(program)
@@ -1908,7 +1904,6 @@ pub fn emit_fk_child_insert_checks(
     new_rowid_reg: usize,
 ) -> crate::Result<()> {
     for fk_ref in resolver.schema.resolved_fks_for_child(&child_tbl.name)? {
-        let ncols = fk_ref.child_cols.len();
         let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
         // Short-circuit if any NEW component is NULL
@@ -1925,12 +1920,11 @@ pub fn emit_fk_child_insert_checks(
                 target_pc: fk_ok,
             });
         }
-
+        let parent_tbl = resolver
+            .schema
+            .get_btree_table(&fk_ref.fk.parent_table)
+            .expect("parent btree");
         if fk_ref.parent_uses_rowid {
-            let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
-                .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl);
 
             // first child col carries rowid
@@ -1941,6 +1935,7 @@ pub fn emit_fk_child_insert_checks(
                 new_start_reg + i_child
             };
 
+            // Normalize rowid to integer for both the probe and the same-row fast path.
             let tmp = program.alloc_register();
             program.emit_insn(Insn::Copy {
                 src_reg: val_reg,
@@ -1948,6 +1943,18 @@ pub fn emit_fk_child_insert_checks(
                 extra_amount: 0,
             });
             program.emit_insn(Insn::MustBeInt { reg: tmp });
+
+            // If this is a self-reference *and* the child FK equals NEW rowid,
+            // the constraint will be satisfied once this row is inserted
+            if is_self_ref {
+                program.emit_insn(Insn::Eq {
+                    lhs: tmp,
+                    rhs: new_rowid_reg,
+                    target_pc: fk_ok,
+                    flags: CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
 
             let violation = program.allocate_label();
             program.emit_insn(Insn::NotExists {
@@ -1958,31 +1965,20 @@ pub fn emit_fk_child_insert_checks(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
+            // Missing parent: immediate vs deferred as usual
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-
-            // Self-ref: count (don’t halt). Non-self: standard behavior.
-            if is_self_ref {
-                program.emit_insn(Insn::FkCounter {
-                    increment_value: 1,
-                    is_scope: false,
-                });
-            } else {
-                emit_fk_violation(program, &fk_ref.fk)?;
-            }
+            emit_fk_violation(program, &fk_ref.fk)?;
+            program.preassign_label_to_next_insn(fk_ok);
         } else {
-            // Parent by unique index
-            let parent_tbl = resolver
-                .schema
-                .get_btree_table(&fk_ref.fk.parent_table)
-                .expect("parent btree");
             let idx = fk_ref
                 .parent_unique_index
                 .as_ref()
                 .expect("parent unique index required");
             let icur = open_read_index(program, idx);
+            let ncols = fk_ref.child_cols.len();
 
-            // Build NEW probe from child NEW values; apply parent index affinities
+            // Build NEW child probe from child NEW values, apply parent-index affinities.
             let probe = {
                 let start = program.alloc_registers(ncols);
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {
@@ -2006,28 +2002,69 @@ pub fn emit_fk_child_insert_checks(
                 }
                 start
             };
+            if is_self_ref {
+                // Determine the parent column order to compare against:
+                let parent_cols: Vec<&str> =
+                    idx.columns.iter().map(|ic| ic.name.as_str()).collect();
+
+                // Build new parent-key image from this same row’s new values, in the index order.
+                let parent_new = program.alloc_registers(ncols);
+                for (i, pname) in parent_cols.iter().enumerate() {
+                    let (pos, col) = child_tbl.get_column(pname).unwrap();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: if col.is_rowid_alias {
+                            new_rowid_reg
+                        } else {
+                            new_start_reg + pos
+                        },
+                        dst_reg: parent_new + i,
+                        extra_amount: 0,
+                    });
+                }
+                if let Some(cnt) = NonZeroUsize::new(ncols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: parent_new,
+                        count: cnt,
+                        affinities: build_index_affinity_string(idx, &parent_tbl),
+                    });
+                }
+
+                // Compare child probe to NEW parent image column-by-column.
+                let mismatch = program.allocate_label();
+                for i in 0..ncols {
+                    let cont = program.allocate_label();
+                    program.emit_insn(Insn::Eq {
+                        lhs: probe + i,
+                        rhs: parent_new + i,
+                        target_pc: cont,
+                        flags: CmpInsFlags::default().jump_if_null(),
+                        collation: Some(super::collate::CollationSeq::Binary),
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: mismatch,
+                    });
+                    program.preassign_label_to_next_insn(cont);
+                }
+                // All equal: same-row OK
+                program.emit_insn(Insn::Goto { target_pc: fk_ok });
+                program.preassign_label_to_next_insn(mismatch);
+            }
             index_probe(
                 program,
                 icur,
                 probe,
                 ncols,
+                // on_found: parent exists, FK satisfied
                 |_p| Ok(()),
+                // on_not_found: behave like a normal FK
                 |p| {
-                    if is_self_ref {
-                        p.emit_insn(Insn::FkCounter {
-                            increment_value: 1,
-                            is_scope: false,
-                        });
-                    } else {
-                        emit_fk_violation(p, &fk_ref.fk)?;
-                    }
+                    emit_fk_violation(p, &fk_ref.fk)?;
                     Ok(())
                 },
             )?;
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
+            program.preassign_label_to_next_insn(fk_ok);
         }
-
-        program.preassign_label_to_next_insn(fk_ok);
     }
     Ok(())
 }
@@ -2127,7 +2164,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             .child_table
             .name
             .eq_ignore_ascii_case(&parent_table.name);
-        // Skip only when it cannot repair anything: non-deferred and not self-ref.
+        // Skip only when it cannot repair anything: non-deferred and not self-referencing
         if !pref.fk.deferred && !is_self_ref {
             continue;
         }
@@ -2172,22 +2209,15 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 num_regs: n_cols,
             });
 
-            // Not found => nothing to decrement
+            // Not found, nothing to decrement
             program.emit_insn(Insn::Close { cursor_id: icur });
             let skip = program.allocate_label();
             program.emit_insn(Insn::Goto { target_pc: skip });
 
-            // Found => guarded decrement
+            // Found: guarded counter decrement
             program.resolve_label(found, program.offset());
             program.emit_insn(Insn::Close { cursor_id: icur });
-            program.emit_insn(Insn::FkIfZero {
-                is_scope: false,
-                target_pc: skip,
-            });
-            program.emit_insn(Insn::FkCounter {
-                increment_value: -1,
-                is_scope: false,
-            });
+            emit_guarded_fk_decrement(program, skip);
             program.resolve_label(skip, program.offset());
         } else {
             // fallback scan :(
@@ -2231,23 +2261,13 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 });
                 program.resolve_label(cont, program.offset());
             }
-
-            // Matched one child row -> guarded decrement
-            program.emit_insn(Insn::FkIfZero {
-                is_scope: false,
-                target_pc: next_row,
-            });
-            program.emit_insn(Insn::FkCounter {
-                is_scope: false,
-                increment_value: -1,
-            });
-
+            // Matched one child row: guarded decrement of counter
+            emit_guarded_fk_decrement(program, next_row);
             program.resolve_label(next_row, program.offset());
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
                 pc_if_next: loop_top,
             });
-
             program.resolve_label(done, program.offset());
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }

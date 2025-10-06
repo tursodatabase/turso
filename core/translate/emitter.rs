@@ -32,8 +32,8 @@ use crate::translate::expr::{
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters,
-    emit_fk_delete_parent_existence_checks, emit_fk_scope_if_needed, emit_parent_pk_change_checks,
-    stabilize_new_row_for_fk,
+    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
+    emit_parent_pk_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
@@ -437,18 +437,6 @@ fn emit_program_for_delete(
         });
     }
 
-    let fk_enabled = connection.foreign_keys_enabled();
-    let table_name = plan
-        .table_references
-        .joined_tables()
-        .first()
-        .unwrap()
-        .table
-        .get_name()
-        .to_string();
-    if fk_enabled {
-        emit_fk_scope_if_needed(program, resolver, &table_name, true)?;
-    }
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
@@ -487,9 +475,6 @@ fn emit_program_for_delete(
         None,
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if fk_enabled {
-        emit_fk_scope_if_needed(program, resolver, &table_name, false)?;
-    }
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
@@ -536,12 +521,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 .schema
                 .get_btree_table(&fk_ref.fk.parent_table)
                 .expect("parent btree");
-            let pcur = program.alloc_cursor_id(CursorType::BTreeTable(parent_tbl.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id: pcur,
-                root_page: parent_tbl.root_page,
-                db: 0,
-            });
+            let pcur = open_read_table(program, &parent_tbl);
 
             let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
             let val = if col.is_rowid_alias {
@@ -581,15 +561,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            program.emit_insn(Insn::FkIfZero {
-                is_scope: false,
-                target_pc: done,
-            });
-            program.emit_insn(Insn::FkCounter {
-                is_scope: false,
-                increment_value: -1,
-            });
-
+            emit_guarded_fk_decrement(program, done);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -598,12 +570,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 .get_btree_table(&fk_ref.fk.parent_table)
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
-            let icur = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id: icur,
-                root_page: idx.root_page,
-                db: 0,
-            });
+            let icur = open_read_index(program, idx);
 
             // Build probe from current child row
             let n = fk_ref.child_cols.len();
@@ -642,18 +609,10 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            program.emit_insn(Insn::FkIfZero {
-                is_scope: false,
-                target_pc: ok,
-            });
-            program.emit_insn(Insn::FkCounter {
-                increment_value: -1,
-                is_scope: false,
-            });
+            emit_guarded_fk_decrement(program, ok);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
-
         program.preassign_label_to_next_insn(null_skip);
     }
     Ok(())
@@ -947,22 +906,6 @@ fn emit_program_for_update(
         program.decr_nesting();
     }
 
-    let fk_enabled = connection.foreign_keys_enabled();
-    let table_name = plan
-        .table_references
-        .joined_tables()
-        .first()
-        .unwrap()
-        .table
-        .get_name()
-        .to_string();
-
-    // statement-level FK scope open
-    if fk_enabled {
-        let open = true;
-        emit_fk_scope_if_needed(program, resolver, &table_name, open)?;
-    }
-
     // Initialize the main loop
     init_loop(
         program,
@@ -1029,10 +972,6 @@ fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if fk_enabled {
-        let open = false;
-        emit_fk_scope_if_needed(program, resolver, &table_name, open)?;
-    }
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();

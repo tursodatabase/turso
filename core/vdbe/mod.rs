@@ -914,9 +914,6 @@ impl Program {
                     self.connection
                         .set_changes(self.n_change.load(Ordering::SeqCst));
                 }
-                if connection.foreign_keys_enabled() {
-                    connection.clear_deferred_foreign_key_violations();
-                }
                 Ok(IOResult::Done(()))
             }
         }
