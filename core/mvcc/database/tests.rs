@@ -1536,3 +1536,16 @@ fn test_insert_with_checkpoint() {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn test_select_empty_table() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    // force checkpoint on every transaction
+    mv_store.set_checkpoint_threshold(0);
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x integer primary key)")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t where x > 100");
+    assert!(rows.is_empty());
+}
