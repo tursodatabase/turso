@@ -11,6 +11,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use rand::{thread_rng, Rng};
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -1335,6 +1336,20 @@ pub fn extract_view_columns(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+pub const MAX_ROWID: i64 = i64::MAX;
+pub const MAX_ATTEMPTS_GENERATE_ROWID: u32 = 100;
+pub fn generate_random_rowid() -> i64 {
+    const MAX_ROWID: i64 = i64::MAX;
+    // Generate a random i64 and constrain it to the lower half of the rowid range.
+    // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
+    // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
+    let mut rng = thread_rng();
+    let mut random_rowid: i64 = rng.gen();
+    random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
+    random_rowid += 1; // Ensure positive
+    random_rowid
 }
 
 #[cfg(test)]

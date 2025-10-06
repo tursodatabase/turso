@@ -1,8 +1,7 @@
-use rand::{thread_rng, Rng};
-
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
 use crate::types::{IOResult, SeekKey, SeekOp, SeekResult};
+use crate::util::{generate_random_rowid, MAX_ATTEMPTS_GENERATE_ROWID, MAX_ROWID};
 use crate::{LimboError, Result};
 use crate::{Pager, Value};
 use std::fmt::Debug;
@@ -170,19 +169,11 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         self.last();
         match self.current_pos {
             CursorPosition::Loaded(id) => {
-                const MAX_ATTEMPTS: u32 = 100;
-                const MAX_ROWID: i64 = i64::MAX;
                 if id.row_id < MAX_ROWID {
                     Ok(id.row_id + 1)
                 } else {
-                    for _ in 0..MAX_ATTEMPTS {
-                        // Generate a random i64 and constrain it to the lower half of the rowid range.
-                        // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
-                        // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-                        let mut rng = thread_rng();
-                        let mut random_rowid: i64 = rng.gen();
-                        random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
-                        random_rowid += 1; // Ensure positive
+                    for _ in 0..MAX_ATTEMPTS_GENERATE_ROWID {
+                        let random_rowid = generate_random_rowid();
                         let IOResult::Done(exists) = self.exists(&Value::Integer(random_rowid))?
                         else {
                             todo!("io on mvcc exists not implemented yet");

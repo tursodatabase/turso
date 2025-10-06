@@ -17,7 +17,7 @@ use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::normalize_ident;
+use crate::util::{generate_random_rowid, normalize_ident, MAX_ATTEMPTS_GENERATE_ROWID, MAX_ROWID};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::registers_to_ref_values;
 use crate::vector::{vector_concat, vector_slice};
@@ -72,7 +72,6 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
 use turso_parser::ast::{self, Name, SortOrder};
 use turso_parser::parser::Parser;
 
@@ -6324,9 +6323,6 @@ pub fn op_new_rowid(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    const MAX_ROWID: i64 = i64::MAX;
-    const MAX_ATTEMPTS: u32 = 100;
-
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
@@ -6371,17 +6367,11 @@ pub fn op_new_rowid(
             }
 
             OpNewRowidState::GeneratingRandom { attempts } => {
-                if attempts >= MAX_ATTEMPTS {
+                if attempts >= MAX_ATTEMPTS_GENERATE_ROWID {
                     return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
                 }
 
-                // Generate a random i64 and constrain it to the lower half of the rowid range.
-                // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
-                // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-                let mut rng = thread_rng();
-                let mut random_rowid: i64 = rng.gen();
-                random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
-                random_rowid += 1; // Ensure positive
+                let random_rowid = generate_random_rowid();
 
                 state.op_new_rowid_state = OpNewRowidState::VerifyingCandidate {
                     attempts,
