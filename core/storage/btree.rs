@@ -8690,7 +8690,11 @@ mod tests {
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
                 let record = run_until_done(|| cursor.record(), &pager).unwrap();
                 let record = record.as_ref().unwrap();
-                let cur = record.get_values().clone();
+                let cur = record
+                    .get_values()
+                    .iter()
+                    .map(ValueRef::to_owned)
+                    .collect::<Vec<_>>();
                 if let Some(prev) = prev {
                     if prev >= cur {
                         println!("Seed: {seed}");
@@ -8933,11 +8937,7 @@ mod tests {
             let ValueRef::Blob(ref cur) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
-            assert_eq!(
-                cur.to_slice(),
-                key,
-                "key {key:?} is not found, seed: {seed}"
-            );
+            assert_eq!(cur, key, "key {key:?} is not found, seed: {seed}");
         }
         pager.end_read_tx();
     }
@@ -9469,8 +9469,8 @@ mod tests {
             let exists = run_until_done(|| cursor.next(), &pager)?;
             assert!(exists, "Record {i} not found");
 
-            let record = run_until_done(|| cursor.record(), &pager)?;
-            let value = record.unwrap().get_value(0)?;
+            let record = run_until_done(|| cursor.record(), &pager)?.unwrap();
+            let value = record.get_value(0)?;
             assert_eq!(
                 value,
                 ValueRef::Integer(i),

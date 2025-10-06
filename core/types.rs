@@ -68,12 +68,6 @@ impl Display for Text {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct TextRef {
-    pub value: RawSlice,
-    pub subtype: TextSubtype,
-}
-
 impl Text {
     pub fn new(value: &str) -> Self {
         Self {
@@ -119,19 +113,7 @@ pub trait AnyText: AsRef<str> {
     fn subtype(&self) -> TextSubtype;
 }
 
-impl AsRef<str> for TextRef {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl AnyText for Text {
-    fn subtype(&self) -> TextSubtype {
-        self.subtype
-    }
-}
-
-impl AnyText for TextRef {
     fn subtype(&self) -> TextSubtype {
         self.subtype
     }
@@ -145,12 +127,6 @@ impl AnyText for &str {
 
 pub trait AnyBlob {
     fn as_slice(&self) -> &[u8];
-}
-
-impl AnyBlob for RawSlice {
-    fn as_slice(&self) -> &[u8] {
-        self.to_slice()
-    }
 }
 
 impl AnyBlob for Vec<u8> {
@@ -195,22 +171,6 @@ impl From<Text> for String {
     }
 }
 
-impl Display for TextRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl TextRef {
-    pub fn create_from(value: &[u8], subtype: TextSubtype) -> Self {
-        let value = RawSlice::create_from(value);
-        Self { value, subtype }
-    }
-    pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.value.to_slice()) }
-    }
-}
-
 #[cfg(feature = "serde")]
 fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -247,12 +207,6 @@ pub enum Value {
     Float(f64),
     Text(Text),
     Blob(Vec<u8>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RawSlice {
-    data: *const u8,
-    len: usize,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -2559,27 +2513,6 @@ pub enum SeekKey<'a> {
     IndexKey(&'a ImmutableRecord),
 }
 
-impl RawSlice {
-    pub fn create_from(value: &[u8]) -> Self {
-        if value.is_empty() {
-            RawSlice::new(std::ptr::null(), 0)
-        } else {
-            let ptr = &value[0] as *const u8;
-            RawSlice::new(ptr, value.len())
-        }
-    }
-    pub fn new(data: *const u8, len: usize) -> Self {
-        Self { data, len }
-    }
-    pub fn to_slice(&self) -> &[u8] {
-        if self.data.is_null() {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.data, self.len) }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum DatabaseChangeType {
     Delete,
@@ -2641,9 +2574,10 @@ mod tests {
             let collation = index_key_info[i].collation;
 
             let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => {
-                    collation.compare_strings(left.as_str(), right.as_str())
-                }
+                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
+                    &String::from_utf8_lossy(left),
+                    &String::from_utf8_lossy(right),
+                ),
                 _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
             };
 
@@ -2682,37 +2616,6 @@ mod tests {
         }
     }
 
-    fn value_to_ref_value(value: &Value) -> ValueRef {
-        match value {
-            Value::Null => ValueRef::Null,
-            Value::Integer(i) => ValueRef::Integer(*i),
-            Value::Float(f) => ValueRef::Float(*f),
-            Value::Text(text) => ValueRef::Text(TextRef {
-                value: RawSlice::from_slice(&text.value),
-                subtype: text.subtype,
-            }),
-            Value::Blob(blob) => ValueRef::Blob(RawSlice::from_slice(blob)),
-        }
-    }
-
-    impl TextRef {
-        fn from_str(s: &str) -> Self {
-            TextRef {
-                value: RawSlice::from_slice(s.as_bytes()),
-                subtype: crate::types::TextSubtype::Text,
-            }
-        }
-    }
-
-    impl RawSlice {
-        fn from_slice(data: &[u8]) -> Self {
-            Self {
-                data: data.as_ptr(),
-                len: data.len(),
-            }
-        }
-    }
-
     fn assert_compare_matches_full_comparison(
         serialized_values: Vec<Value>,
         unpacked_values: Vec<ValueRef>,
@@ -2722,7 +2625,7 @@ mod tests {
         let serialized = create_record(serialized_values.clone());
 
         let serialized_ref_values: Vec<ValueRef> =
-            serialized_values.iter().map(value_to_ref_value).collect();
+            serialized_values.iter().map(Value::as_ref).collect();
 
         let tie_breaker = std::cmp::Ordering::Equal;
 
@@ -2858,7 +2761,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::from_str("hello")),
+                    ValueRef::Text(b"hello", TextSubtype::Text),
                 ],
                 "integer_text_equal",
             ),
@@ -2866,7 +2769,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::from_str("world")),
+                    ValueRef::Text(b"world", TextSubtype::Text),
                 ],
                 "integer_equal_text_different",
             ),
@@ -2893,34 +2796,34 @@ mod tests {
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Text(TextRef::from_str("hello"))],
+                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
                 "equal_strings",
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::from_str("def"))],
+                vec![ValueRef::Text(b"def", TextSubtype::Text)],
                 "less_than_strings",
             ),
             (
                 vec![Value::Text(Text::new("xyz"))],
-                vec![ValueRef::Text(TextRef::from_str("abc"))],
+                vec![ValueRef::Text(b"abc", TextSubtype::Text)],
                 "greater_than_strings",
             ),
             (
                 vec![Value::Text(Text::new(""))],
-                vec![ValueRef::Text(TextRef::from_str(""))],
+                vec![ValueRef::Text(b"", TextSubtype::Text)],
                 "empty_strings",
             ),
             (
                 vec![Value::Text(Text::new("a"))],
-                vec![ValueRef::Text(TextRef::from_str("aa"))],
+                vec![ValueRef::Text(b"aa", TextSubtype::Text)],
                 "prefix_strings",
             ),
             // Multi-field with string first
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::from_str("hello")),
+                    ValueRef::Text(b"hello", TextSubtype::Text),
                     ValueRef::Integer(42),
                 ],
                 "string_integer_equal",
@@ -2928,7 +2831,7 @@ mod tests {
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::from_str("hello")),
+                    ValueRef::Text(b"hello", TextSubtype::Text),
                     ValueRef::Integer(99),
                 ],
                 "string_equal_integer_different",
@@ -2964,39 +2867,39 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Text(TextRef::from_str("hello"))],
+                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
                 "null_vs_text",
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Blob(RawSlice::from_slice(b"blob"))],
+                vec![ValueRef::Blob(b"blob")],
                 "null_vs_blob",
             ),
             // Numbers vs Text/Blob
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Text(TextRef::from_str("hello"))],
+                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
                 "integer_vs_text",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Text(TextRef::from_str("hello"))],
+                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
                 "float_vs_text",
             ),
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Blob(RawSlice::from_slice(b"blob"))],
+                vec![ValueRef::Blob(b"blob")],
                 "integer_vs_blob",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Blob(RawSlice::from_slice(b"blob"))],
+                vec![ValueRef::Blob(b"blob")],
                 "float_vs_blob",
             ),
             // Text vs Blob
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Blob(RawSlice::from_slice(b"blob"))],
+                vec![ValueRef::Blob(b"blob")],
                 "text_vs_blob",
             ),
             // Integer vs Float (affinity conversion)
@@ -3044,7 +2947,7 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::from_str("def"))],
+                vec![ValueRef::Text(b"def", TextSubtype::Text)],
                 "desc_string_reversed",
             ),
             // Mixed sort orders
@@ -3052,7 +2955,7 @@ mod tests {
                 vec![Value::Integer(10), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(20),
-                    ValueRef::Text(TextRef::from_str("hello")),
+                    ValueRef::Text(b"hello", TextSubtype::Text),
                 ],
                 "desc_first_asc_second",
             ),
@@ -3078,7 +2981,7 @@ mod tests {
                 vec![Value::Integer(42)],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::from_str("extra")),
+                    ValueRef::Text(b"extra", TextSubtype::Text),
                 ],
                 "fewer_serialized_fields",
             ),
@@ -3096,18 +2999,18 @@ mod tests {
             ),
             (
                 vec![Value::Blob(vec![1, 2, 3])],
-                vec![ValueRef::Blob(RawSlice::from_slice(&[1, 2, 3]))],
+                vec![ValueRef::Blob(&[1, 2, 3])],
                 "blob_first_field",
             ),
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(5)],
-                vec![ValueRef::Text(TextRef::from_str("hello"))],
+                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
                 vec![Value::Text(Text::new("same")), Value::Integer(5)],
                 vec![
-                    ValueRef::Text(TextRef::from_str("same")),
+                    ValueRef::Text(b"same", TextSubtype::Text),
                     ValueRef::Integer(5),
                 ],
                 "equal_text_then_equal_int",
@@ -3167,7 +3070,7 @@ mod tests {
 
         let int_values = vec![
             ValueRef::Integer(42),
-            ValueRef::Text(TextRef::from_str("hello")),
+            ValueRef::Text(b"hello", TextSubtype::Text),
         ];
         assert!(matches!(
             find_compare(&int_values, &index_info_small),
@@ -3175,7 +3078,7 @@ mod tests {
         ));
 
         let string_values = vec![
-            ValueRef::Text(TextRef::from_str("hello")),
+            ValueRef::Text(b"hello", TextSubtype::Text),
             ValueRef::Integer(42),
         ];
         assert!(matches!(
@@ -3189,7 +3092,7 @@ mod tests {
             RecordCompare::Generic
         ));
 
-        let blob_values = vec![ValueRef::Blob(RawSlice::from_slice(&[1, 2, 3]))];
+        let blob_values = vec![ValueRef::Blob(&[1, 2, 3])];
         assert!(matches!(
             find_compare(&blob_values, &index_info_small),
             RecordCompare::Generic

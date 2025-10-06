@@ -978,8 +978,8 @@ fn test_cursor_modification_during_scan() {
     record.start_serialization(&row.data);
     let value = record.get_value(0).unwrap();
     match value {
-        ValueRef::Text(text) => {
-            assert_eq!(text.as_str(), "new_row");
+        ValueRef::Text(text, _) => {
+            assert_eq!(text, b"new_row");
         }
         _ => panic!("Expected Text value"),
     }
@@ -1210,8 +1210,8 @@ fn test_restart() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            ValueRef::Text(text) => {
-                assert_eq!(text.as_str(), "bar");
+            ValueRef::Text(text, _) => {
+                assert_eq!(text, b"bar");
             }
             _ => panic!("Expected Text value"),
         }
