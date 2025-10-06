@@ -16,6 +16,7 @@ use crate::{
         expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
+    vdbe::PROGRAM_STATE_ACTIVE,
     CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
@@ -1019,6 +1020,7 @@ impl ProgramBuilder {
             table_references: self.table_references,
             sql: sql.to_string(),
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
+            program_state: PROGRAM_STATE_ACTIVE.into(),
         }
     }
 }

@@ -2722,6 +2722,8 @@ impl Statement {
 
     pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.state.reset(max_registers, max_cursors);
+        self.program
+            .abort(self.mv_store.as_ref(), &self.pager, None);
         self.busy = false;
         self.busy_timeout = None;
     }

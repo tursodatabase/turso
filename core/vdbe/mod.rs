@@ -66,7 +66,7 @@ use std::{
     collections::HashMap,
     num::NonZero,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU32, Ordering},
         Arc,
     },
 };
@@ -483,6 +483,10 @@ macro_rules! get_cursor {
     };
 }
 
+const PROGRAM_STATE_ACTIVE: u32 = 0;
+const PROGRAM_STATE_ABORTED: u32 = 1;
+const PROGRAM_STATE_DONE: u32 = 2;
+
 pub struct Program {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
@@ -501,6 +505,9 @@ pub struct Program {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     pub accesses_db: bool,
+    /// Current state of the program
+    /// Used to execute abort only once
+    pub program_state: AtomicU32,
 }
 
 impl Program {
@@ -641,6 +648,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
+                self.abort(mv_store, &pager, None);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -649,7 +657,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err));
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -672,6 +680,8 @@ impl Program {
                 Ok(InsnFunctionStepResult::Done) => {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    self.program_state
+                        .store(PROGRAM_STATE_DONE, Ordering::SeqCst);
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
@@ -693,7 +703,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err));
                     return Err(err);
                 }
             }
@@ -946,6 +956,52 @@ impl Program {
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
     }
+
+    /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
+    /// This method is no-op if program was already finished (either aborted or executed to completion)
+    pub fn abort(
+        &self,
+        mv_store: Option<&Arc<MvStore>>,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+    ) {
+        let Ok(..) = self.program_state.compare_exchange(
+            PROGRAM_STATE_ACTIVE,
+            PROGRAM_STATE_ABORTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) else {
+            // no need to abort: program was either already aborted or executed to completion successfully
+            return;
+        };
+
+        if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+            // Errors from nested statements are handled by the parent statement.
+            return;
+        }
+        if self.connection.get_tx_state() == TransactionState::None {
+            return;
+        }
+        match err {
+            // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
+            Some(LimboError::TxError(_)) => {}
+            // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
+            Some(LimboError::TableLocked) => {}
+            // Busy errors do not cause a rollback.
+            Some(LimboError::Busy) => {}
+            _ => {
+                if let Some(mv_store) = mv_store {
+                    if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                        self.connection.auto_commit.store(true, Ordering::SeqCst);
+                        mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+                    }
+                } else {
+                    pager.rollback_tx(&self.connection);
+                }
+                self.connection.set_tx_state(TransactionState::None);
+            }
+        }
+    }
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
@@ -1067,43 +1123,4 @@ impl Row {
     pub fn len(&self) -> usize {
         self.count
     }
-}
-
-/// Handle a program error by rolling back the transaction
-pub fn handle_program_error(
-    pager: &Arc<Pager>,
-    connection: &Connection,
-    err: &LimboError,
-    mv_store: Option<&Arc<MvStore>>,
-) -> Result<()> {
-    if connection.is_nested_stmt.load(Ordering::SeqCst) {
-        // Errors from nested statements are handled by the parent statement.
-        return Ok(());
-    }
-    match err {
-        // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
-        LimboError::TxError(_) => {}
-        // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-        LimboError::TableLocked => {}
-        // Busy errors do not cause a rollback.
-        LimboError::Busy => {}
-        _ => {
-            if let Some(mv_store) = mv_store {
-                if let Some(tx_id) = connection.get_mv_tx_id() {
-                    connection.set_tx_state(TransactionState::None);
-                    connection.auto_commit.store(true, Ordering::SeqCst);
-                    mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
-                }
-            } else {
-                pager
-                    .io
-                    .block(|| pager.end_tx(true, connection))
-                    .inspect_err(|e| {
-                        tracing::error!("end_tx failed: {e}");
-                    })?;
-            }
-            connection.set_tx_state(TransactionState::None);
-        }
-    }
-    Ok(())
 }
