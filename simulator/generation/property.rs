@@ -240,6 +240,9 @@ pub struct InteractiveQueryInfo {
     end_with_commit: bool,
 }
 
+type PropertyQueryGenFunc<'a, R, G> =
+    fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
+
 impl Property {
     pub(crate) fn name(&self) -> &str {
         match self {
@@ -273,6 +276,186 @@ impl Property {
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. } => None,
+        }
+    }
+
+    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
+    where
+        R: rand::Rng + ?Sized,
+        G: GenerationContext,
+    {
+        match self {
+            Property::InsertValuesSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [x] The inserted row will not be deleted.
+                // - [x] The inserted row will not be updated.
+                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
+                    let Property::InsertValuesSelect {
+                        insert, row_index, ..
+                    } = property
+                    else {
+                        unreachable!();
+                    };
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    let table_name = insert.table();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+
+                    let rows = insert.rows();
+                    let row = &rows[*row_index];
+
+                    match &query {
+                        Query::Delete(Delete {
+                            table: t,
+                            predicate,
+                        }) if t == &table.name && predicate.test(row, table) => {
+                            // The inserted row will not be deleted.
+                            None
+                        }
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Update(Update {
+                            table: t,
+                            set_values: _,
+                            predicate,
+                        }) if t == &table.name && predicate.test(row, table) => {
+                            // The inserted row will not be updated.
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot drop the table we are inserting
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DoubleCreateFailure { .. } => {
+                // The interactions in the middle has the following constraints;
+                // - [x] There will be no errors in the middle interactions.(best effort)
+                // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
+                    let Property::DoubleCreateFailure { create, .. } = property else {
+                        unreachable!()
+                    };
+
+                    let table_name = create.table.name.clone();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    match &query {
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot Drop the created table
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DeleteSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [x] A row that holds for the predicate will not be inserted.
+                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+
+                |rng, ctx, query_distr, property| {
+                    let Property::DeleteSelect {
+                        table: table_name,
+                        predicate,
+                        ..
+                    } = property
+                    else {
+                        unreachable!()
+                    };
+
+                    let table_name = table_name.clone();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    match &query {
+                        Query::Insert(Insert::Values { table: t, values })
+                            if *t == table_name
+                                && values.iter().any(|v| predicate.test(v, table)) =>
+                        {
+                            // A row that holds for the predicate will not be inserted.
+                            None
+                        }
+                        Query::Insert(Insert::Select {
+                            table: t,
+                            select: _,
+                        }) if t == &table.name => {
+                            // A row that holds for the predicate will not be inserted.
+                            None
+                        }
+                        Query::Update(Update { table: t, .. }) if t == &table.name => {
+                            // A row that holds for the predicate will not be updated.
+                            None
+                        }
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot Drop the same table
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DropSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+                |rng, ctx, query_distr, property: &Property| {
+                    let Property::DropSelect {
+                        table: table_name, ..
+                    } = property
+                    else {
+                        unreachable!()
+                    };
+
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    if let Query::Create(Create { table: t }) = &query
+                        && t.name == *table_name
+                    {
+                        // - The table `t` will not be created
+                        None
+                    } else {
+                        Some(query)
+                    }
+                }
+            }
+            Property::Queries { .. } => {
+                unreachable!("No extensional querie generation for `Property::Queries`")
+            }
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+                unreachable!("No extensional queries")
+            }
+            Property::SelectLimit { .. }
+            | Property::SelectSelectOptimizer { .. }
+            | Property::WhereTrueFalseNull { .. }
+            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::ReadYourUpdatesBack { .. }
+            | Property::TableHasExpectedContent { .. } => unreachable!("No extensional queries"),
         }
     }
 
@@ -1244,7 +1427,7 @@ pub(crate) fn remaining(
 
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     mvcc: bool,
 ) -> Property {
@@ -1278,50 +1461,19 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
 
     let amount = rng.random_range(0..3);
 
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [x] The inserted row will not be deleted.
-    // - [x] The inserted row will not be updated.
-    // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
-    let mut queries = generate_queries(rng, ctx, amount, &[&insert_query], |rng, ctx| {
-        let query = Query::arbitrary_from(rng, &ctx, query_distr);
-        match &query {
-            Query::Delete(Delete {
-                table: t,
-                predicate,
-            }) if t == &table.name && predicate.test(&row, table) => {
-                // The inserted row will not be deleted.
-                None
-            }
-            Query::Create(Create { table: t }) if t.name == table.name => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                None
-            }
-            Query::Update(Update {
-                table: t,
-                set_values: _,
-                predicate,
-            }) if t == &table.name && predicate.test(&row, table) => {
-                // The inserted row will not be updated.
-                None
-            }
-            Query::Drop(Drop { table: t }) if *t == table.name => {
-                // Cannot drop the table we are inserting
-                None
-            }
-            _ => Some(query),
-        }
-    });
+    let mut queries = Vec::with_capacity(amount + 2);
 
     if let Some(ref interactive) = interactive {
-        queries.insert(
-            0,
-            Query::Begin(if interactive.start_with_immediate {
-                Begin::Immediate
-            } else {
-                Begin::Deferred
-            }),
-        );
+        queries.push(Query::Begin(if interactive.start_with_immediate {
+            Begin::Immediate
+        } else {
+            Begin::Deferred
+        }));
+    }
+
+    queries.extend(std::iter::repeat_n(Query::Placeholder, amount));
+
+    if let Some(ref interactive) = interactive {
         queries.push(if interactive.end_with_commit {
             Query::Commit(Commit)
         } else {
@@ -1404,44 +1556,26 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
 
 fn property_double_create_failure<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
     // Create the table
-    let create_query = Query::Create(Create::arbitrary(rng, ctx));
-    let table = &create_query.as_create().table;
+    let create_query = Create::arbitrary(rng, ctx);
 
     let amount = rng.random_range(0..3);
 
-    // The interactions in the middle has the following constraints;
-    // - [x] There will be no errors in the middle interactions.(best effort)
-    // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
-    let queries = generate_queries(rng, ctx, amount, &[&create_query], |rng, ctx| {
-        let query = Query::arbitrary_from(rng, &ctx, query_distr);
-        match &query {
-            Query::Create(Create { table: t }) if t.name == table.name => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                None
-            }
-            Query::Drop(Drop { table: t }) if *t == table.name => {
-                // Cannot Drop the created table
-                None
-            }
-            _ => Some(query),
-        }
-    });
+    let queries = vec![Query::Placeholder; amount];
 
     Property::DoubleCreateFailure {
-        create: create_query.unwrap_create(),
+        create: create_query,
         queries,
     }
 }
 
 fn property_delete_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1453,46 +1587,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
 
     let amount = rng.random_range(0..3);
 
-    let delete = Query::Delete(Delete {
-        predicate: predicate.clone(),
-        table: table.name.clone(),
-    });
-
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [x] A row that holds for the predicate will not be inserted.
-    // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
-    let queries = generate_queries(rng, ctx, amount, &[&delete], |rng, tmp_ctx| {
-        let query = Query::arbitrary_from(rng, &tmp_ctx, query_distr);
-        match &query {
-            Query::Insert(Insert::Values { table: t, values })
-                if t == &table.name && values.iter().any(|v| predicate.test(v, table)) =>
-            {
-                // A row that holds for the predicate will not be inserted.
-                None
-            }
-            Query::Insert(Insert::Select {
-                table: t,
-                select: _,
-            }) if t == &table.name => {
-                // A row that holds for the predicate will not be inserted.
-                None
-            }
-            Query::Update(Update { table: t, .. }) if t == &table.name => {
-                // A row that holds for the predicate will not be updated.
-                None
-            }
-            Query::Create(Create { table: t }) if t.name == table.name => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                None
-            }
-            Query::Drop(Drop { table: t }) if *t == table.name => {
-                // Cannot Drop the same table
-                None
-            }
-            _ => Some(query),
-        }
-    });
+    let queries = vec![Query::Placeholder; amount];
 
     Property::DeleteSelect {
         table: table.name.clone(),
@@ -1503,7 +1598,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
 
 fn property_drop_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
@@ -1511,26 +1606,9 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
     // Get a random table
     let table = pick(ctx.tables(), rng);
 
-    let drop = Query::Drop(Drop {
-        table: table.name.clone(),
-    });
-
     let amount = rng.random_range(0..3);
-    // Create random queries respecting the constraints
-    let queries = generate_queries(rng, ctx, amount, &[&drop], |rng, tmp_ctx| {
-        // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-        // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
 
-        let query = Query::arbitrary_from(rng, &tmp_ctx, query_distr);
-        if let Query::Create(Create { table: t }) = &query
-            && t.name == table.name
-        {
-            // - The table `t` will not be created
-            None
-        } else {
-            Some(query)
-        }
-    });
+    let queries = vec![Query::Placeholder; amount];
 
     let select = Select::simple(
         table.name.clone(),

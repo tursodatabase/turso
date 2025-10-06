@@ -293,16 +293,7 @@ impl InteractionPlan {
             self.push(interactions);
             Some(out_interactions)
         } else {
-            // after we generated all interactions if some connection is still in a transaction, commit
-            (0..env.connections.len())
-                .find(|idx| env.conn_in_transaction(*idx))
-                .map(|conn_index| {
-                    let query = Query::Commit(Commit);
-                    let interaction = Interactions::new(conn_index, InteractionsType::Query(query));
-                    let out_interactions = interaction.interactions();
-                    self.push(interaction);
-                    out_interactions
-                })
+            None
         }
     }
 
@@ -314,6 +305,7 @@ impl InteractionPlan {
         let iter = interactions.into_iter();
         PlanGenerator {
             plan: self,
+            peek: None,
             iter,
             rng,
         }
@@ -383,28 +375,145 @@ impl<T: InteractionPlanIterator> InteractionPlanIterator for &mut T {
 
 pub struct PlanGenerator<'a, R: rand::Rng> {
     plan: &'a mut InteractionPlan,
+    peek: Option<Interaction>,
     iter: <Vec<Interaction> as IntoIterator>::IntoIter,
     rng: &'a mut R,
+}
+
+impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
+    fn next_interaction(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
+        self.iter
+            .next()
+            .or_else(|| {
+                // Iterator ended, try to create a new iterator
+                // This will not be an infinte sequence because generate_next_interaction will eventually
+                // stop generating
+                let mut iter = self
+                    .plan
+                    .generate_next_interaction(self.rng, env)
+                    .map_or(Vec::new().into_iter(), |interactions| {
+                        interactions.into_iter()
+                    });
+                let next = iter.next();
+                self.iter = iter;
+
+                next
+            })
+            .map(|interaction| {
+                // Certain properties can generate intermediate queries
+                // we need to generate them here and substitute
+                if let InteractionType::Query(Query::Placeholder) = &interaction.interaction {
+                    let stats = self.plan.stats();
+
+                    let remaining_ = remaining(
+                        env.opts.max_interactions,
+                        &env.profile.query,
+                        &stats,
+                        env.profile.experimental_mvcc,
+                    );
+
+                    let InteractionsType::Property(property) =
+                        &mut self.plan.last_mut().unwrap().interactions
+                    else {
+                        unreachable!("only properties have extensional queries");
+                    };
+
+                    let conn_ctx = env.connection_context(interaction.connection_index);
+
+                    let queries = possible_queries(conn_ctx.tables());
+                    let query_distr = QueryDistribution::new(queries, &remaining_);
+
+                    let query_gen = property.get_extensional_query_gen_function();
+
+                    let mut count = 0;
+                    let new_query = loop {
+                        if count > 1_000_000 {
+                            panic!("possible infinite loop in query generation");
+                        }
+                        if let Some(new_query) =
+                            (query_gen)(self.rng, &conn_ctx, &query_distr, property)
+                        {
+                            let queries = property.get_extensional_queries().unwrap();
+                            let query = queries
+                                .iter_mut()
+                                .find(|query| matches!(query, Query::Placeholder))
+                                .expect("Placeholder should be present in extensional queries");
+                            *query = new_query.clone();
+                            break new_query;
+                        }
+                        count += 1;
+                    };
+                    Interaction::new(
+                        interaction.connection_index,
+                        InteractionType::Query(new_query),
+                    )
+                } else {
+                    interaction
+                }
+            })
+    }
+
+    fn peek(&mut self, env: &mut SimulatorEnv) -> Option<&Interaction> {
+        if self.peek.is_none() {
+            self.peek = self.next_interaction(env);
+        }
+        self.peek.as_ref()
+    }
 }
 
 impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
-        self.iter.next().or_else(|| {
-            // Iterator ended, try to create a new iterator
-            // This will not be an infinte sequence because generate_next_interaction will eventually
-            // stop generating
-            let mut iter = self
-                .plan
-                .generate_next_interaction(self.rng, env)
-                .map_or(Vec::new().into_iter(), |interactions| {
-                    interactions.into_iter()
-                });
-            let next = iter.next();
-            self.iter = iter;
+        let mvcc = self.plan.mvcc;
+        match self.peek(env) {
+            Some(peek_interaction) => {
+                if mvcc && peek_interaction.is_ddl() {
+                    // try to commit a transaction as we cannot execute DDL statements in concurrent mode
 
-            next
-        })
+                    let commit_connection = (0..env.connections.len())
+                        .find(|idx| env.conn_in_transaction(*idx))
+                        .map(|conn_index| {
+                            let query = Query::Commit(Commit);
+                            let interaction = Interactions::new(
+                                conn_index,
+                                InteractionsType::Query(query.clone()),
+                            );
+
+                            // Connections are queued for commit on `generate_next_interaction` if Interactions::Query or Interactions::Property produce a DDL statement.
+                            // This means that the only way we will reach here, is if the DDL statement was created later in the extensional query of a Property
+                            let queries = self
+                                .plan
+                                .last_mut()
+                                .unwrap()
+                                .get_extensional_queries()
+                                .unwrap();
+                            queries.insert(0, query.clone());
+
+                            self.plan.push(interaction);
+
+                            Interaction::new(conn_index, InteractionType::Query(query))
+                        });
+                    if commit_connection.is_some() {
+                        return commit_connection;
+                    }
+                }
+
+                self.peek.take()
+            }
+            None => {
+                // after we generated all interactions if some connection is still in a transaction, commit
+                (0..env.connections.len())
+                    .find(|idx| env.conn_in_transaction(*idx))
+                    .map(|conn_index| {
+                        let query = Query::Commit(Commit);
+                        let interaction =
+                            Interactions::new(conn_index, InteractionsType::Query(query));
+                        self.plan.push(interaction);
+
+                        Interaction::new(conn_index, InteractionType::Query(Query::Commit(Commit)))
+                    })
+            }
+        }
     }
 }
 
