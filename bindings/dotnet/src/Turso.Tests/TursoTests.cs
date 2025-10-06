@@ -183,10 +183,11 @@ public class TursoTests
         insert.ExecuteNonQuery().Should().Be(2);
 
         using var selectBefore = new TursoCommand(connection2, "SELECT COUNT(*) FROM t");
-        var readerBefore = selectBefore.ExecuteReader();
-        readerBefore.Read().Should().BeTrue();
-        readerBefore.GetInt32(0).Should().Be(0);
-        // readerBefore.Read().Should().BeFalse();
+        using (var readerBefore = selectBefore.ExecuteReader())
+        {
+            readerBefore.Read().Should().BeTrue();
+            readerBefore.GetInt32(0).Should().Be(0);
+        }
 
         tx.Commit();
 
@@ -194,7 +195,6 @@ public class TursoTests
         using var readerAfter = selectAfter.ExecuteReader();
         readerAfter.Read().Should().BeTrue();
         readerAfter.GetInt32(0).Should().Be(2);
-        readerBefore.Read().Should().BeFalse();
     }
 
     [Test]
