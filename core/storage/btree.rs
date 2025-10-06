@@ -1254,11 +1254,21 @@ impl BTreeCursor {
             let mut mv_cursor = mv_cursor.write();
             mv_cursor.forward();
             let rowid = mv_cursor.current_row_id();
+            drop(mv_cursor); // Release lock before seeking
+
             match rowid {
-                Some(_rowid) => {
+                Some(rowid) => {
+                    // Position the b-tree cursor at this row so record() can read from b-tree if needed
+                    return_if_io!(self.seek(
+                        SeekKey::TableRowId(rowid.row_id),
+                        SeekOp::GE { eq_only: true }
+                    ));
                     return Ok(IOResult::Done(true));
                 }
-                None => return Ok(IOResult::Done(false)),
+                None => {
+                    // MVCC cursor has no more rows - fall back to b-tree iteration
+                    // Continue with normal b-tree next logic below
+                }
             }
         } else if self.stack.current_page == -1 {
             // This can happen in nested left joins. See:
@@ -4488,11 +4498,13 @@ impl BTreeCursor {
                     if let Some(mv_cursor) = &self.mv_cursor {
                         let mut mv_cursor = mv_cursor.write();
                         mv_cursor.rewind();
-                    } else {
-                        let c = self.move_to_root()?;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
+                        // Also rewind the b-tree cursor so it's positioned for fallback reads
+                        drop(mv_cursor);
+                    }
+                    // Always position the b-tree cursor at the root
+                    let c = self.move_to_root()?;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 RewindState::NextRecord => {
@@ -4652,7 +4664,10 @@ impl BTreeCursor {
         if let Some(mv_cursor) = &self.mv_cursor {
             let mut mv_cursor = mv_cursor.write();
             let Some(row) = mv_cursor.current_row()? else {
-                return Ok(IOResult::Done(None));
+                // No MVCC version exists - fall back to reading from b-tree
+                // The b-tree cursor should already be positioned correctly by get_next_record() or rewind()
+                drop(mv_cursor); // Release lock before reading from b-tree
+                return self.record_from_btree();
             };
             self.get_immutable_record_or_create()
                 .as_mut()
@@ -4669,6 +4684,10 @@ impl BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
 
+        self.record_from_btree()
+    }
+
+    fn record_from_btree(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>> {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
