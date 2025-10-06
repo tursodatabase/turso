@@ -497,10 +497,7 @@ impl Database {
                 schema.schema_version = header_schema_cookie;
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
-                    .or_else(|e| {
-                        pager.end_read_tx();
-                        Err(e)
-                    });
+                    .inspect_err(|_| pager.end_read_tx());
                 if let Err(LimboError::ExtensionError(e)) = result {
                     // this means that a vtab exists and we no longer have the module loaded. we print
                     // a warning to the user to load the module
