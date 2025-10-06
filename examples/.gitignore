@@ -1,0 +1,6 @@
+*.db
+*.db-info
+*.db-wal
+*.db-wal-revert
+*.db-changes
+*.db-remote
