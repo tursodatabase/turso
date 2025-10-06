@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{limbo_exec_rows, TempDatabase};
 use turso_core::{StepResult, Value};
 
 #[test]
@@ -874,5 +874,26 @@ fn test_upsert_parameters_order() -> anyhow::Result<()> {
             ]
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn test_multiple_connections_visibility() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);",
+        false,
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN")?;
+    conn1.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
+    let mut stmt = conn2.prepare("SELECT COUNT(*) FROM test").unwrap();
+    let _ = stmt.step().unwrap();
+    // intentionally drop not-fully-consumed statement in order to check that on Drop statement will execute reset with proper cleanup
+    drop(stmt);
+    conn1.execute("COMMIT")?;
+
+    let rows = limbo_exec_rows(&tmp_db, &conn2, "SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     Ok(())
 }
