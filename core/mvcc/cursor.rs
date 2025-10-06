@@ -1,7 +1,9 @@
+use rand::{thread_rng, Rng};
+
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
 use crate::types::{IOResult, SeekKey, SeekOp, SeekResult};
-use crate::Result;
+use crate::{LimboError, Result};
 use crate::{Pager, Value};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -164,12 +166,39 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         }
     }
 
-    pub fn get_next_rowid(&mut self) -> i64 {
+    pub fn get_next_rowid(&mut self) -> Result<i64> {
         self.last();
         match self.current_pos {
-            CursorPosition::Loaded(id) => id.row_id + 1,
-            CursorPosition::BeforeFirst => 1,
-            CursorPosition::End => i64::MAX,
+            CursorPosition::Loaded(id) => {
+                const MAX_ATTEMPTS: u32 = 100;
+                const MAX_ROWID: i64 = i64::MAX;
+                if id.row_id < MAX_ROWID {
+                    Ok(id.row_id + 1)
+                } else {
+                    for _ in 0..MAX_ATTEMPTS {
+                        // Generate a random i64 and constrain it to the lower half of the rowid range.
+                        // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
+                        // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
+                        let mut rng = thread_rng();
+                        let mut random_rowid: i64 = rng.gen();
+                        random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
+                        random_rowid += 1; // Ensure positive
+                        let IOResult::Done(exists) = self.exists(&Value::Integer(random_rowid))?
+                        else {
+                            todo!("io on mvcc exists not implemented yet");
+                        };
+                        if !exists {
+                            return Ok(random_rowid);
+                        }
+                    }
+                    Err(LimboError::DatabaseFull(
+                    "Unable to find an unused rowid after 100 attempts - database is probably full"
+                        .to_string(),
+                ))
+                }
+            }
+            CursorPosition::BeforeFirst => Ok(1),
+            CursorPosition::End => Ok(i64::MAX),
         }
     }
 
