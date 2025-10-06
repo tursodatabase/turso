@@ -83,7 +83,7 @@ impl std::fmt::Display for MVTableId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
     pub table_id: MVTableId,
@@ -2187,6 +2187,24 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
             }
+        }
+    }
+}
+
+impl PartialOrd for RowID {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowID {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Make sure table id is first comparison so that we sort first by table_id and then by
+        // rowid. Due to order of the struct, table_id is first which is fine but if we were to
+        // change it we would bring chaos.
+        match self.table_id.cmp(&other.table_id) {
+            std::cmp::Ordering::Equal => self.row_id.cmp(&other.row_id),
+            ord => ord,
         }
     }
 }
