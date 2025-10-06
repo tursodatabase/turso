@@ -483,9 +483,9 @@ macro_rules! get_cursor {
     };
 }
 
-const PROGRAM_STATE_ACTIVE: u32 = 0;
-const PROGRAM_STATE_ABORTED: u32 = 1;
-const PROGRAM_STATE_DONE: u32 = 2;
+pub(crate) const PROGRAM_STATE_ACTIVE: u32 = 1;
+pub(crate) const PROGRAM_STATE_ABORTED: u32 = 2;
+pub(crate) const PROGRAM_STATE_DONE: u32 = 3;
 
 pub struct Program {
     pub max_registers: usize,

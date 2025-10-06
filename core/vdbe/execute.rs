@@ -8018,12 +8018,15 @@ pub fn op_drop_column(
         let schema = conn.schema.read();
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
-            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let stmt = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
                     column_name, view.sql,
                 ))
             })?;
+            // this is internal statement running during active Program execution
+            // so, we must not interact with transaction state and explicitly mark this statement as done avoiding cleanup on reset
+            stmt.mark_as_done();
         }
     }
 
@@ -8149,12 +8152,15 @@ pub fn op_alter_column(
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             // FIXME: this should rewrite the view to reference the new column name
-            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let stmt = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
                     old_column_name, view.sql,
                 ))
             })?;
+            // this is internal statement running during active Program execution
+            // so, we must not interact with transaction state and explicitly mark this statement as done avoiding cleanup on reset
+            stmt.mark_as_done();
         }
     }
 

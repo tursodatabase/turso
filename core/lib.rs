@@ -47,6 +47,7 @@ use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::metrics::ConnectionMetrics;
+use crate::vdbe::PROGRAM_STATE_DONE;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
 use core::str;
@@ -2572,6 +2573,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
+
         *conn.schema.write() = conn.db.clone_schema();
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
@@ -2600,7 +2602,7 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self._reset(Some(max_registers), Some(cursor_count));
+        self.reset_internal(Some(max_registers), Some(cursor_count));
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -2714,10 +2716,16 @@ impl Statement {
     }
 
     pub fn reset(&mut self) {
-        self._reset(None, None);
+        self.reset_internal(None, None);
     }
 
-    pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+    pub(crate) fn mark_as_done(&self) {
+        self.program
+            .program_state
+            .store(PROGRAM_STATE_DONE, Ordering::SeqCst);
+    }
+
+    fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.state.reset(max_registers, max_cursors);
         self.program
             .abort(self.mv_store.as_ref(), &self.pager, None);
