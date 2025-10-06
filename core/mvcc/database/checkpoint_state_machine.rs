@@ -164,92 +164,67 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
                 continue;
             }
+
             let row_versions = entry.value().read();
+
+            let mut version_to_checkpoint = None;
             let mut exists_in_db_file = false;
-            for (i, version) in row_versions.iter().enumerate() {
-                let is_last = i == row_versions.len() - 1;
-                if let Some(TxTimestampOrID::Timestamp(ts)) = &version.begin {
-                    if *ts <= self.checkpointed_txid_max_old {
+            for version in row_versions.iter() {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                    //TODO: garbage collect row versions after checkpointing.
+                    if ts > self.checkpointed_txid_max_old {
+                        version_to_checkpoint = Some(version);
+                    } else {
                         exists_in_db_file = true;
                     }
+                }
+            }
 
-                    let current_version_ts =
-                        if let Some(TxTimestampOrID::Timestamp(ts_end)) = version.end {
-                            ts_end.max(*ts)
-                        } else {
-                            *ts
-                        };
-                    if current_version_ts <= self.checkpointed_txid_max_old {
-                        // already checkpointed. TODO: garbage collect row versions after checkpointing.
-                        continue;
-                    }
+            if let Some(version) = version_to_checkpoint {
+                let is_delete = version.end.is_some();
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                    max_timestamp = max_timestamp.max(ts);
+                }
 
-                    // Row versions in sqlite_schema are temporarily assigned a negative root page that is equal to the table id,
-                    // because the root page is not known until it's actually allocated during the checkpoint.
-                    // However, existing tables have a real root page.
-                    let get_table_id_or_root_page_from_sqlite_schema = |row_data: &Vec<u8>| {
-                        let row_data = ImmutableRecord::from_bin_record(row_data.clone());
+                // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
+                // the database file.
+                if !is_delete || exists_in_db_file {
+                    let mut special_write = None;
+
+                    if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                        let row_data = ImmutableRecord::from_bin_record(version.row.data.clone());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor.parse_full_header(&row_data).unwrap();
-                        let RefValue::Integer(root_page) =
+
+                        if let RefValue::Integer(root_page) =
                             record_cursor.get_value(&row_data, 3).unwrap()
-                        else {
-                            panic!(
-                                "Expected integer value for root page, got {:?}",
-                                record_cursor.get_value(&row_data, 3)
-                            );
-                        };
-                        root_page
-                    };
+                        {
+                            if is_delete {
+                                let table_id = self
+                                    .mvstore
+                                    .table_id_to_rootpage
+                                    .iter()
+                                    .find(|entry| {
+                                        entry.value().is_some_and(|r| r == root_page as u64)
+                                    })
+                                    .map(|entry| *entry.key())
+                                    .unwrap(); // This assumes a valid mapping exists.
+                                self.destroyed_tables.insert(table_id);
 
-                    max_timestamp = max_timestamp.max(current_version_ts);
-                    if is_last {
-                        let is_delete = version.end.is_some();
-                        let is_delete_of_table =
-                            is_delete && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
-                        let is_create_of_table = !exists_in_db_file
-                            && !is_delete
-                            && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
-
-                        // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
-                        let special_write = if is_delete_of_table {
-                            let root_page =
-                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
-                            assert!(root_page > 0, "rootpage is positive integer");
-                            let root_page = root_page as u64;
-                            let table_id = *self
-                                .mvstore
-                                .table_id_to_rootpage
-                                .iter()
-                                .find(|entry| entry.value().is_some_and(|r| r == root_page))
-                                .unwrap()
-                                .key();
-                            self.destroyed_tables.insert(table_id);
-
-                            if exists_in_db_file {
-                                Some(SpecialWrite::BTreeDestroy {
+                                // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
+                                special_write = Some(SpecialWrite::BTreeDestroy {
                                     table_id,
-                                    root_page,
+                                    root_page: root_page as u64,
                                     num_columns: version.row.column_count,
-                                })
-                            } else {
-                                None
+                                });
+                            } else if !exists_in_db_file {
+                                let table_id = MVTableId::from(root_page);
+                                special_write = Some(SpecialWrite::BTreeCreate { table_id });
                             }
-                        } else if is_create_of_table {
-                            let table_id =
-                                get_table_id_or_root_page_from_sqlite_schema(&version.row.data);
-                            let table_id = MVTableId::from(table_id);
-                            Some(SpecialWrite::BTreeCreate { table_id })
-                        } else {
-                            None
-                        };
-
-                        // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in the database file.
-                        let should_be_deleted_from_db_file = is_delete && exists_in_db_file;
-                        if !is_delete || should_be_deleted_from_db_file {
-                            self.write_set.push((version.clone(), special_write));
                         }
                     }
+
+                    self.write_set.push((version.clone(), special_write));
                 }
             }
         }
