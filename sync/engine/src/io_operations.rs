@@ -60,7 +60,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
             tracing::debug!("file truncated: rc={}", rc);
         });
         let c = file.truncate(len as u64, c)?;
-        while !c.is_completed() {
+        while !c.succeeded() {
             coro.yield_(ProtocolCommand::IO).await?;
         }
         Ok(())

@@ -523,7 +523,7 @@ impl OngoingCheckpoint {
         let mut moved = false;
         // retain only those still pending
         self.inflight_reads.retain(|slot| {
-            if slot.completion.is_completed() {
+            if slot.completion.succeeded() {
                 if let Some(buf) = slot.buf.lock().take() {
                     // read is done, take the buffer and add it to the batch to write
                     self.pending_writes.insert(slot.page_id, buf);
