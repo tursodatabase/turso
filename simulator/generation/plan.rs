@@ -1097,8 +1097,7 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
         let queries = possible_queries(conn_ctx.tables());
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
-        let property_distr =
-            PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx.opts());
+        let property_distr = PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx);
 
         frequency(
             vec![

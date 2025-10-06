@@ -29,7 +29,7 @@ fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
 }
 
 fn random_select<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
-    if rng.random_bool(0.7) {
+    if !conn_ctx.tables().is_empty() && rng.random_bool(0.7) {
         Query::Select(Select::arbitrary(rng, conn_ctx))
     } else {
         // Random expression

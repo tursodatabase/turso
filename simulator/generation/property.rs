@@ -1248,6 +1248,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate rows to insert
@@ -1373,6 +1374,7 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     Property::TableHasExpectedContent {
@@ -1386,6 +1388,7 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Select the table
@@ -1442,6 +1445,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1503,6 +1507,7 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
 
@@ -1545,6 +1550,7 @@ fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1568,6 +1574,7 @@ fn property_where_true_false_null<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1589,6 +1596,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1663,10 +1671,16 @@ impl PropertyDiscriminants {
         }
     }
 
-    pub fn weight(&self, env: &SimulatorEnv, remaining: &Remaining, opts: &Opts) -> u32 {
+    pub fn weight(
+        &self,
+        env: &SimulatorEnv,
+        remaining: &Remaining,
+        ctx: &impl GenerationContext,
+    ) -> u32 {
+        let opts = ctx.opts();
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
-                if !env.opts.disable_insert_values_select {
+                if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
                     u32::min(remaining.select, remaining.insert).max(1)
                 } else {
                     0
@@ -1675,7 +1689,13 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 u32::min(remaining.select, remaining.insert).max(1)
             }
-            PropertyDiscriminants::TableHasExpectedContent => remaining.select.max(1),
+            PropertyDiscriminants::TableHasExpectedContent => {
+                if !ctx.tables().is_empty() {
+                    remaining.select.max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::DoubleCreateFailure => {
                 if !env.opts.disable_double_create_failure {
                     remaining.create / 2
@@ -1684,42 +1704,48 @@ impl PropertyDiscriminants {
                 }
             }
             PropertyDiscriminants::SelectLimit => {
-                if !env.opts.disable_select_limit {
+                if !env.opts.disable_select_limit && !ctx.tables().is_empty() {
                     remaining.select
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::DeleteSelect => {
-                if !env.opts.disable_delete_select {
+                if !env.opts.disable_delete_select && !ctx.tables().is_empty() {
                     u32::min(remaining.select, remaining.insert).min(remaining.delete)
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::DropSelect => {
-                if !env.opts.disable_drop_select {
+                if !env.opts.disable_drop_select && !ctx.tables().is_empty() {
                     remaining.drop
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::SelectSelectOptimizer => {
-                if !env.opts.disable_select_optimizer {
+                if !env.opts.disable_select_optimizer && !ctx.tables().is_empty() {
                     remaining.select / 2
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::WhereTrueFalseNull => {
-                if opts.indexes && !env.opts.disable_where_true_false_null {
+                if opts.indexes
+                    && !env.opts.disable_where_true_false_null
+                    && !ctx.tables().is_empty()
+                {
                     remaining.select / 2
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::UNIONAllPreservesCardinality => {
-                if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
+                if opts.indexes
+                    && !env.opts.disable_union_all_preserves_cardinality
+                    && !ctx.tables().is_empty()
+                {
                     remaining.select / 3
                 } else {
                     0
@@ -1803,13 +1829,13 @@ impl<'a> PropertyDistribution<'a> {
         env: &SimulatorEnv,
         remaining: &Remaining,
         query_distr: &'a QueryDistribution,
-        opts: &Opts,
+        ctx: &impl GenerationContext,
     ) -> Self {
         let properties = PropertyDiscriminants::can_generate(query_distr.items());
         let weights = WeightedIndex::new(
             properties
                 .iter()
-                .map(|property| property.weight(env, remaining, opts)),
+                .map(|property| property.weight(env, remaining, ctx)),
         )
         .unwrap();
 
