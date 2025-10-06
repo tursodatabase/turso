@@ -1282,7 +1282,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        if lower_bound {
+        let res = if lower_bound {
             self.rows
                 .lower_bound(bound)
                 .and_then(|entry| self.find_last_visible_version(tx, entry))
@@ -1290,7 +1290,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.rows
                 .upper_bound(bound)
                 .and_then(|entry| self.find_last_visible_version(tx, entry))
-        }
+        };
+        tracing::trace!(
+            "seek_rowid(bound={:?}, lower_bound={}, found={:?})",
+            bound,
+            lower_bound,
+            res
+        );
+        let table_id_expect = match bound {
+            Bound::Included(rowid) => rowid.table_id,
+            Bound::Excluded(rowid) => rowid.table_id,
+            Bound::Unbounded => unreachable!(),
+        };
+        res.filter(|&rowid| rowid.table_id == table_id_expect)
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
