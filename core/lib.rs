@@ -2741,6 +2741,12 @@ impl Statement {
     }
 }
 
+impl Drop for Statement {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
 pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
