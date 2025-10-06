@@ -212,8 +212,7 @@ pub extern "C" fn db_statement_get_value(statement_ptr: *mut Statement, col_idx:
             Value::Integer(int_val) => TursoValue{value_type: ValueType::Integer, value: TursoValueUnion{int_val: *int_val}},
             Value::Float(float_value) => TursoValue{value_type: ValueType::Float, value: TursoValueUnion{real_val: *float_value}},
             Value::Text(text) => {
-                let string_bytes = text.as_str().as_bytes();
-                let array = Array{ptr: string_bytes.as_ptr(), len: string_bytes.len()};
+                let array = Array{ptr: text.value.as_ptr(), len: text.value.len()};
                 TursoValue{
                     value_type: ValueType::Text, 
                     value: TursoValueUnion {
