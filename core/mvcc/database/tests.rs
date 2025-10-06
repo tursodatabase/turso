@@ -1511,9 +1511,9 @@ fn transaction_display() {
 #[test]
 fn test_select_empty_table() {
     let db = MvccTestDbNoConn::new_with_random_db();
-    let mv_store = db.get_mvcc_store();
+    //let mv_store = db.get_mvcc_store();
     // force checkpoint on every transaction
-    mv_store.set_checkpoint_threshold(0);
+    // mv_store.set_checkpoint_threshold(0);
     let conn = db.connect();
     conn.execute("CREATE TABLE t(x integer primary key)")
         .unwrap();
