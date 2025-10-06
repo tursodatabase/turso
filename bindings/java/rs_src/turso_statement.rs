@@ -115,7 +115,15 @@ fn row_to_obj_array<'local>(
                 env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
             }
             turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
-            turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
+            turso_core::Value::Blob(b) => {
+                if b.unalloc_bytes > 0 {
+                    panic!(
+                        "row_to_obj_array called on unexpanded zeroblob with {} unallocated bytes",
+                        b.unalloc_bytes
+                    );
+                }
+                env.byte_array_from_slice(&b.value)?.into()
+            }
         };
         if let Err(e) = env.set_object_array_element(&obj_array, i as i32, obj) {
             eprintln!("Error on parsing row: {e:?}");
@@ -262,8 +270,10 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindBlob<'local>(
         Err(_) => return SQLITE_ERROR,
     };
 
-    stmt.stmt
-        .bind_at(NonZero::new(position as usize).unwrap(), Value::Blob(blob));
+    stmt.stmt.bind_at(
+        NonZero::new(position as usize).unwrap(),
+        Value::build_blob(blob),
+    );
     SQLITE_OK
 }
 

@@ -58,12 +58,12 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         }
     };
 
-    if blob.is_empty() {
+    if blob.value.is_empty() {
         return Ok(Value::build_text("[]"));
     }
 
-    let vector_type = vector_type(blob)?;
-    let vector = vector_deserialize(vector_type, blob)?;
+    let vector_type = vector_type(&blob.value)?;
+    let vector = vector_deserialize(vector_type, &blob.value)?;
     Ok(Value::build_text(vector_to_text(&vector)))
 }
 

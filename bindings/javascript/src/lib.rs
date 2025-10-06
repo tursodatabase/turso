@@ -565,7 +565,7 @@ impl Statement {
                         let byte = obj.get_element::<u32>(i)?;
                         bytes.push(byte as u8);
                     }
-                    turso_core::Value::Blob(bytes)
+                    turso_core::Value::build_blob(bytes)
                 } else {
                     let s = value.coerce_to_string()?.into_utf8()?;
                     turso_core::Value::Text(s.as_str()?.to_owned().into())
@@ -752,15 +752,23 @@ fn to_js_value<'a>(
         turso_core::Value::Float(f) => ToNapiValue::into_unknown(*f, env),
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {
+            let bytes = if b.unalloc_bytes > 0 {
+                let mut blob = b.clone();
+                blob.expand();
+                blob.value
+            } else {
+                b.value.clone()
+            };
+
             #[cfg(not(feature = "browser"))]
             {
-                let buffer = Buffer::from(b.as_slice());
+                let buffer = Buffer::from(bytes.as_slice());
                 ToNapiValue::into_unknown(buffer, env)
             }
             // emnapi do not support Buffer
             #[cfg(feature = "browser")]
             {
-                let buffer = Uint8Array::from(b.as_slice());
+                let buffer = Uint8Array::from(bytes.as_slice());
                 ToNapiValue::into_unknown(buffer, env)
             }
         }

@@ -847,7 +847,7 @@ mod tests {
                 ValueType::Blob => {
                     let mut blob = Vec::with_capacity((rng.next_u64() % 2047 + 1) as usize);
                     rng.fill_bytes(&mut blob);
-                    Value::Blob(blob)
+                    Value::build_blob(blob)
                 }
                 ValueType::Null => Value::Null,
                 _ => unreachable!(),

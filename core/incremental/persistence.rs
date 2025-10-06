@@ -40,7 +40,7 @@ impl ReadRecord {
                         let blob = values[3].to_owned();
 
                         let (state, _group_key) = match blob {
-                            Value::Blob(blob) => AggregateState::from_blob(&blob),
+                            Value::Blob(blob) => AggregateState::from_blob(&blob.value),
                             _ => Err(LimboError::ParseError(
                                 "Value in aggregator not blob".to_string(),
                             )),

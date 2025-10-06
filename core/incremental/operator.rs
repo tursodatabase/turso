@@ -332,7 +332,7 @@ mod tests {
                 // Get the blob data from column 3 (value column)
                 if let Some(Value::Blob(blob)) = values.get(3) {
                     // Deserialize the state
-                    match AggregateState::from_blob(blob) {
+                    match AggregateState::from_blob(&blob.value) {
                         Ok((state, group_key)) => {
                             // Should not have made it this far.
                             assert!(state.count != 0);
