@@ -253,6 +253,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
         }
+        // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
+        // in case of an insert-heavy checkpoint.
+        self.write_set.sort_by_key(|version| {
+            (
+                // Sort by table_id descending (schema changes first)
+                std::cmp::Reverse(version.0.row.id.table_id),
+                // Then by row_id ascending
+                version.0.row.id.row_id,
+            )
+        });
         self.checkpointed_txid_max_new = max_timestamp;
     }
 
