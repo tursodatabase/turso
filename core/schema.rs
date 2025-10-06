@@ -80,7 +80,7 @@ use crate::util::{
 };
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -428,36 +428,36 @@ impl Schema {
             let mut record_cursor = cursor.record_cursor.borrow_mut();
             // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
             let ty_value = record_cursor.get_value(&row, 0)?;
-            let RefValue::Text(ty) = ty_value else {
+            let ValueRef::Text(ty, _) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let ty = ty.as_str();
-            let RefValue::Text(name) = record_cursor.get_value(&row, 1)? else {
+            let ty = String::from_utf8_lossy(ty);
+            let ValueRef::Text(name, _) = record_cursor.get_value(&row, 1)? else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let name = name.as_str();
+            let name = String::from_utf8_lossy(name);
             let table_name_value = record_cursor.get_value(&row, 2)?;
-            let RefValue::Text(table_name) = table_name_value else {
+            let ValueRef::Text(table_name, _) = table_name_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let table_name = table_name.as_str();
+            let table_name = String::from_utf8_lossy(table_name);
             let root_page_value = record_cursor.get_value(&row, 3)?;
-            let RefValue::Integer(root_page) = root_page_value else {
+            let ValueRef::Integer(root_page) = root_page_value else {
                 return Err(LimboError::ConversionError("Expected integer value".into()));
             };
             let sql_value = record_cursor.get_value(&row, 4)?;
             let sql_textref = match sql_value {
-                RefValue::Text(sql) => Some(sql),
+                ValueRef::Text(sql, _) => Some(sql),
                 _ => None,
             };
-            let sql = sql_textref.as_ref().map(|s| s.as_str());
+            let sql = sql_textref.map(|s| String::from_utf8_lossy(s));
 
             self.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                &ty,
+                &name,
+                &table_name,
                 root_page,
-                sql,
+                sql.as_deref(),
                 syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,

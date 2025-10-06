@@ -28,7 +28,7 @@ use crate::{
 
 use crate::{
     return_corrupt, return_if_io,
-    types::{compare_immutable, IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, Value},
+    types::{compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
     LimboError, Result,
 };
 
@@ -705,7 +705,7 @@ impl BTreeCursor {
             .unwrap()
             .last_value(record_cursor)
         {
-            Some(Ok(RefValue::Integer(rowid))) => rowid,
+            Some(Ok(ValueRef::Integer(rowid))) => rowid,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
             ),
@@ -2164,7 +2164,7 @@ impl BTreeCursor {
 
     fn compare_with_current_record(
         &self,
-        key_values: &[RefValue],
+        key_values: &[ValueRef],
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
@@ -8930,7 +8930,7 @@ mod tests {
             let record = record.as_ref().unwrap();
             let cur = record.get_values().clone();
             let cur = cur.first().unwrap();
-            let RefValue::Blob(ref cur) = cur else {
+            let ValueRef::Blob(ref cur) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
             assert_eq!(
@@ -9473,7 +9473,7 @@ mod tests {
             let value = record.unwrap().get_value(0)?;
             assert_eq!(
                 value,
-                RefValue::Integer(i),
+                ValueRef::Integer(i),
                 "Unexpected value for record {i}",
             );
         }

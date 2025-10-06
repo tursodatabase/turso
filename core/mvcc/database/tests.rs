@@ -714,7 +714,7 @@ use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{RefValue, DATABASE_MANAGER};
+use crate::{ValueRef, DATABASE_MANAGER};
 
 // Simple atomic clock implementation for testing
 
@@ -978,7 +978,7 @@ fn test_cursor_modification_during_scan() {
     record.start_serialization(&row.data);
     let value = record.get_value(0).unwrap();
     match value {
-        RefValue::Text(text) => {
+        ValueRef::Text(text) => {
             assert_eq!(text.as_str(), "new_row");
         }
         _ => panic!("Expected Text value"),
@@ -1210,7 +1210,7 @@ fn test_restart() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            RefValue::Text(text) => {
+            ValueRef::Text(text) => {
                 assert_eq!(text.as_str(), "bar");
             }
             _ => panic!("Expected Text value"),

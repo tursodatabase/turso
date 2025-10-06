@@ -501,7 +501,7 @@ mod tests {
             LocalClock, MvStore,
         },
         types::{ImmutableRecord, Text},
-        OpenFlags, RefValue, Value,
+        OpenFlags, Value, ValueRef,
     };
 
     use super::LogRecordType;
@@ -565,7 +565,7 @@ mod tests {
         let record = ImmutableRecord::from_bin_record(row.data.clone());
         let values = record.get_values();
         let foo = values.first().unwrap();
-        let RefValue::Text(foo) = foo else {
+        let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
         assert_eq!(foo.as_str(), "foo");
@@ -637,7 +637,7 @@ mod tests {
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let RefValue::Text(foo) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
             assert_eq!(foo.as_str(), value.as_str());
@@ -758,7 +758,7 @@ mod tests {
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let RefValue::Text(foo) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
 

@@ -117,15 +117,12 @@ impl MaterializedViewCursor {
             Some(rowid) => rowid,
         };
 
-        let btree_record = return_if_io!(self.btree_cursor.record());
-        let btree_ref_values = btree_record
-            .ok_or_else(|| {
-                crate::LimboError::InternalError(
-                    "Invalid data in materialized view: found a rowid, but not the row!"
-                        .to_string(),
-                )
-            })?
-            .get_values();
+        let btree_record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
+            )
+        })?;
+        let btree_ref_values = btree_record.get_values();
 
         // Convert RefValues to Values (copying for now - can optimize later)
         let mut btree_values: Vec<Value> =

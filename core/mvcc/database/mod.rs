@@ -18,11 +18,11 @@ use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
-use crate::RefValue;
 use crate::Result;
 use crate::Statement;
 use crate::StepResult;
 use crate::Value;
+use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
@@ -1978,7 +1978,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let record_values = record_cursor.get_values(&record).unwrap();
-                        let RefValue::Integer(root_page) = record_values[3] else {
+                        let ValueRef::Integer(root_page) = record_values[3] else {
                             panic!(
                                 "Expected integer value for root page, got {:?}",
                                 record_values[3]
