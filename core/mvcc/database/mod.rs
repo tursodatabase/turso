@@ -27,7 +27,6 @@ use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -555,7 +554,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.pager_commit_lock.unlock();
                     }
-                    mvcc_store.remove_tx(self.tx_id);
+                    let pager = self.connection.pager.read().clone();
+                    mvcc_store.remove_tx(self.tx_id, pager);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
                 }
@@ -692,7 +692,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // But that's a problem for another day.
                 // FIXME: it actually just become a problem for today!!!
                 // TODO: test that reproduces this failure, and then a fix
-                mvcc_store.remove_tx(self.tx_id);
+                let pager = self.connection.pager.read().clone();
+                mvcc_store.remove_tx(self.tx_id, pager);
 
                 if mvcc_store.is_exclusive_tx(&self.tx_id) {
                     mvcc_store.release_exclusive_tx(&self.tx_id);
@@ -927,7 +928,6 @@ pub struct MvStore<Clock: LogicalClock> {
     next_table_id: AtomicI64,
     clock: Clock,
     storage: Storage,
-    loaded_tables: RwLock<HashSet<MVTableId>>,
 
     /// The transaction ID of a transaction that has acquired an exclusive write lock, if any.
     ///
@@ -971,7 +971,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             next_table_id: AtomicI64::new(-2), // table id -1 / root page 1 is always sqlite_schema.
             clock,
             storage,
-            loaded_tables: RwLock::new(HashSet::new()),
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
             commit_coordinator: Arc::new(CommitCoordinator {
                 pager_commit_lock: Arc::new(TursoRwLock::new()),
@@ -1348,6 +1347,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             return Err(LimboError::Busy);
         }
         let unlock = || self.blocking_checkpoint_lock.unlock();
+
+        // If this is a new transaction (not promoting an existing one), start a pager read tx
+        let is_new_tx = maybe_existing_tx_id.is_none();
+        if is_new_tx {
+            pager.begin_read_tx()?;
+        }
+
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
             self.txs.get(&tx_id).unwrap().value().begin_ts
@@ -1391,6 +1397,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
         }
+
+        // Start a pager read transaction to get a stable snapshot of the b-tree.
+        // This ensures that reads from the b-tree (when no MVCC version exists)
+        // see a consistent snapshot, even if a checkpoint happens concurrently.
+        pager.begin_read_tx()?;
+
         let tx_id = self.get_tx_id();
         let begin_ts = self.get_timestamp();
 
@@ -1403,8 +1415,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(tx_id)
     }
 
-    pub fn remove_tx(&self, tx_id: TxID) {
+    pub fn remove_tx(&self, tx_id: TxID, pager: Arc<Pager>) {
         self.txs.remove(&tx_id);
+        // End the pager read transaction started in begin_tx()
+        pager.end_read_tx().unwrap();
         self.blocking_checkpoint_lock.unlock();
     }
 
@@ -1569,7 +1583,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn rollback_tx(
         &self,
         tx_id: TxID,
-        _pager: Arc<Pager>,
+        pager: Arc<Pager>,
         connection: &Connection,
     ) -> Result<()> {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
@@ -1614,7 +1628,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("terminate(tx_id={})", tx_id);
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
-        self.remove_tx(tx_id);
+        self.remove_tx(tx_id, pager);
 
         Ok(())
     }
@@ -1812,126 +1826,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(rowid, cursor));
 
         Ok(state_machine)
-    }
-
-    /// Try to scan for row ids in the table.
-    ///
-    /// This function loads all row ids of a table if the rowids of table were not populated yet.
-    /// TODO: This is quite expensive so we should try and load rowids in a lazy way.
-    ///
-    /// # Arguments
-    ///
-    pub fn maybe_initialize_table(&self, table_id: MVTableId, pager: Arc<Pager>) -> Result<()> {
-        tracing::trace!("scan_row_ids_for_table(table_id={})", table_id);
-
-        // First, check if the table is already loaded.
-        if self.loaded_tables.read().contains(&table_id) {
-            return Ok(());
-        }
-
-        if !self
-            .table_id_to_rootpage
-            .get(&table_id)
-            .is_some_and(|entry| entry.value().is_some())
-        {
-            // Not a checkpointed table; doesn't need to be initialized
-            self.mark_table_as_loaded(table_id);
-            return Ok(());
-        }
-
-        // Then, scan the disk B-tree to find existing rows
-        self.scan_load_table(table_id, pager)?;
-
-        self.mark_table_as_loaded(table_id);
-
-        Ok(())
-    }
-
-    // Mark table as loaded
-    pub fn mark_table_as_loaded(&self, table_id: MVTableId) {
-        self.loaded_tables.write().insert(table_id);
-    }
-
-    /// Scans the table and inserts the rows into the database.
-    ///
-    /// This is initialization step for a table, where we still don't have any rows so we need to insert them if there are.
-    fn scan_load_table(&self, table_id: MVTableId, pager: Arc<Pager>) -> Result<()> {
-        let entry = self
-            .table_id_to_rootpage
-            .get(&table_id)
-            .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
-        let root_page = entry
-            .value()
-            .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
-        let mut cursor = BTreeCursor::new_table(
-            None, // No MVCC cursor for scanning
-            pager.clone(),
-            root_page as i64,
-            1, // We'll adjust this as needed
-        );
-        loop {
-            match cursor
-                .rewind()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
-            {
-                IOResult::Done(()) => break,
-                IOResult::IO(io) => {
-                    io.wait(pager.io.as_ref())?;
-                    continue;
-                }
-            }
-        }
-        loop {
-            let rowid_result = cursor
-                .rowid()
-                .map_err(|e| LimboError::InternalError(e.to_string()))?;
-            let row_id = match rowid_result {
-                IOResult::Done(Some(row_id)) => row_id,
-                IOResult::Done(None) => break,
-                IOResult::IO(io) => {
-                    io.wait(pager.io.as_ref())?;
-                    continue;
-                }
-            };
-            'record: loop {
-                match cursor.record()? {
-                    IOResult::Done(Some(record)) => {
-                        let id = RowID { table_id, row_id };
-                        let column_count = record.column_count();
-                        // We insert row with 0 timestamp, because it's the only version we have on initialization.
-                        self.insert_version(
-                            id,
-                            RowVersion {
-                                begin: TxTimestampOrID::Timestamp(0),
-                                end: None,
-                                row: Row::new(id, record.get_payload().to_vec(), column_count),
-                            },
-                        );
-                        break 'record;
-                    }
-                    IOResult::Done(None) => break,
-                    IOResult::IO(io) => {
-                        io.wait(pager.io.as_ref())?;
-                    } // FIXME: lazy me not wanting to do state machine right now
-                }
-            }
-
-            // Move to next record
-            'next: loop {
-                match cursor.next()? {
-                    IOResult::Done(has_next) => {
-                        if !has_next {
-                            break;
-                        }
-                        break 'next;
-                    }
-                    IOResult::IO(io) => {
-                        io.wait(pager.io.as_ref())?;
-                    } // FIXME: lazy me not wanting to do state machine right now
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn get_last_rowid(&self, table_id: MVTableId) -> Option<i64> {
