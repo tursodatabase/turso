@@ -1287,32 +1287,29 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
             Query::Delete(Delete {
                 table: t,
                 predicate,
-            }) => {
+            }) if t == &table.name && predicate.test(&row, table) => {
                 // The inserted row will not be deleted.
-                if t == &table.name && predicate.test(&row, table) {
-                    return None;
-                }
+                None
             }
-            Query::Create(Create { table: t }) => {
+            Query::Create(Create { table: t }) if t.name == table.name => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
-                if t.name == table.name {
-                    return None;
-                }
+                None
             }
             Query::Update(Update {
                 table: t,
                 set_values: _,
                 predicate,
-            }) => {
+            }) if t == &table.name && predicate.test(&row, table) => {
                 // The inserted row will not be updated.
-                if t == &table.name && predicate.test(&row, table) {
-                    return None;
-                }
+                None
             }
-            _ => (),
+            Query::Drop(Drop { table: t }) if *t == table.name => {
+                // Cannot drop the table we are inserting
+                None
+            }
+            _ => Some(query),
         }
-        Some(query)
     });
 
     if let Some(ref interactive) = interactive {
@@ -1419,14 +1416,18 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
     let queries = generate_queries(rng, ctx, amount, &[&create_query], |rng, ctx| {
         let query = Query::arbitrary_from(rng, &ctx, query_distr);
-        if let Query::Create(Create { table: t }) = &query {
-            // There will be no errors in the middle interactions.
-            // - Creating the same table is an error
-            if t.name == table.name {
-                return None;
+        match &query {
+            Query::Create(Create { table: t }) if t.name == table.name => {
+                // There will be no errors in the middle interactions.
+                // - Creating the same table is an error
+                None
             }
+            Query::Drop(Drop { table: t }) if *t == table.name => {
+                // Cannot Drop the created table
+                None
+            }
+            _ => Some(query),
         }
-        Some(query)
     });
 
     Property::DoubleCreateFailure {
@@ -1459,37 +1460,34 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
     let queries = generate_queries(rng, ctx, amount, &[&delete], |rng, tmp_ctx| {
         let query = Query::arbitrary_from(rng, &tmp_ctx, query_distr);
         match &query {
-            Query::Insert(Insert::Values { table: t, values }) => {
+            Query::Insert(Insert::Values { table: t, values })
+                if t == &table.name && values.iter().any(|v| predicate.test(v, table)) =>
+            {
                 // A row that holds for the predicate will not be inserted.
-                if t == &table.name && values.iter().any(|v| predicate.test(v, table)) {
-                    return None;
-                }
+                None
             }
             Query::Insert(Insert::Select {
                 table: t,
                 select: _,
-            }) => {
+            }) if t == &table.name => {
                 // A row that holds for the predicate will not be inserted.
-                if t == &table.name {
-                    return None;
-                }
+                None
             }
-            Query::Update(Update { table: t, .. }) => {
+            Query::Update(Update { table: t, .. }) if t == &table.name => {
                 // A row that holds for the predicate will not be updated.
-                if t == &table.name {
-                    return None;
-                }
+                None
             }
-            Query::Create(Create { table: t }) => {
+            Query::Create(Create { table: t }) if t.name == table.name => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
-                if t.name == table.name {
-                    return None;
-                }
+                None
             }
-            _ => (),
+            Query::Drop(Drop { table: t }) if *t == table.name => {
+                // Cannot Drop the same table
+                None
+            }
+            _ => Some(query),
         }
-        Some(query)
     });
 
     Property::DeleteSelect {
