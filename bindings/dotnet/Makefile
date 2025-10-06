@@ -1,5 +1,5 @@
 all:
-	echo "make [build|test|build-production]"
+	echo "make [build|test|benchmark|build-production]"
 
 build:
 	cargo build --target-dir ./rs_compiled/
@@ -11,3 +11,6 @@ build-production:
 
 test: build
 	dotnet test ./src/Turso.Tests/Turso.Tests.csproj
+
+benchmark: build-production
+	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj
