@@ -176,6 +176,12 @@ public class TursoDataReader : DbDataReader
         return true;
     }
 
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        _command.Dispose();
+    }
+
     public override bool Read()
     {
         return _statement.Read();

@@ -1,7 +1,9 @@
 use std::ffi::{CStr, CString};
 use std::num::NonZero;
+use std::ops::Deref;
 use std::os::raw::c_char;
 use std::ptr::null;
+use std::slice;
 use std::sync::Arc;
 use turso_core::types::Text;
 use turso_core::{self, Connection, Statement, StepResult, Value, IO};
@@ -74,7 +76,10 @@ pub fn allocate_error(err: String) -> *const Error {
 }
 
 pub fn to_vec(array: Array) ->  Vec<u8> {
-    unsafe { Vec::from_raw_parts(array.ptr as *mut u8, array.len, array.len) }
+    unsafe { 
+        let slice = slice::from_raw_parts(array.ptr, array.len);
+        slice.to_vec()
+    }
 }
 
 pub fn to_value(value: TursoValue) -> Value {
@@ -200,7 +205,8 @@ pub extern "C" fn db_statement_execute_step(statement_ptr: *mut Statement, error
 
 #[no_mangle]
 pub extern "C" fn free_statement(statement_ptr: *mut Statement) {
-    let _ = unsafe { Box::from_raw(statement_ptr) };
+    let mut statement = unsafe { Box::from_raw(statement_ptr) };
+    statement.reset();
 }
 
 #[no_mangle]
