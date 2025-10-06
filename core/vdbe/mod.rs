@@ -30,7 +30,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
     state_machine::StateMachine,
-    storage::sqlite3_ondisk::SmallVec,
+    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult, RawSlice, TextRef},
     vdbe::{
@@ -41,7 +41,7 @@ use crate::{
         },
         metrics::StatementMetrics,
     },
-    IOExt, RefValue,
+    RefValue,
 };
 
 use crate::{
@@ -533,7 +533,7 @@ impl Program {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                pager.rollback_tx(&self.connection);
             }
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -588,7 +588,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -636,7 +636,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -888,7 +888,7 @@ impl Program {
                     ),
                     TransactionState::Read => {
                         connection.set_tx_state(TransactionState::None);
-                        pager.end_read_tx()?;
+                        pager.end_read_tx();
                         Ok(IOResult::Done(()))
                     }
                     TransactionState::None => Ok(IOResult::Done(())),
@@ -914,7 +914,12 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let cacheflush_status = pager.end_tx(rollback, connection)?;
+        let cacheflush_status = if !rollback {
+            pager.commit_tx(connection)?
+        } else {
+            pager.rollback_tx(connection);
+            IOResult::Done(PagerCommitResult::Rollback)
+        };
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {

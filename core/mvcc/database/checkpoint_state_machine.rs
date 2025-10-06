@@ -548,7 +548,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::CommitPagerTxn => {
                 tracing::debug!("Committing pager transaction");
-                let result = self.pager.end_tx(false, &self.connection)?;
+                let result = self.pager.commit_tx(&self.connection)?;
                 match result {
                     IOResult::Done(_) => {
                         self.state = CheckpointState::TruncateLogicalLog;
@@ -642,16 +642,12 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
             Err(err) => {
                 tracing::info!("Error in checkpoint state machine: {err}");
                 if self.lock_states.pager_write_tx {
-                    let rollback = true;
-                    self.pager
-                        .io
-                        .block(|| self.pager.end_tx(rollback, self.connection.as_ref()))
-                        .expect("failed to end pager write tx");
+                    self.pager.rollback_tx(self.connection.as_ref());
                     if self.update_transaction_state {
                         *self.connection.transaction_state.write() = TransactionState::None;
                     }
                 } else if self.lock_states.pager_read_tx {
-                    self.pager.end_read_tx().unwrap();
+                    self.pager.end_read_tx();
                     if self.update_transaction_state {
                         *self.connection.transaction_state.write() = TransactionState::None;
                     }

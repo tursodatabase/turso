@@ -8183,7 +8183,7 @@ mod tests {
         // force allocate page1 with a transaction
         pager.begin_read_tx().unwrap();
         run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
-        run_until_done(|| pager.end_tx(false, &conn), &pager).unwrap();
+        run_until_done(|| pager.commit_tx(&conn), &pager).unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
@@ -8495,7 +8495,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager.io.block(|| pager.end_tx(false, &conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -8524,7 +8524,7 @@ mod tests {
                     println!("btree after:\n{btree_after}");
                     panic!("invalid btree");
                 }
-                pager.end_read_tx().unwrap();
+                pager.end_read_tx();
             }
             pager.begin_read_tx().unwrap();
             tracing::info!(
@@ -8546,7 +8546,7 @@ mod tests {
                     "key {key} is not found, got {cursor_rowid}"
                 );
             }
-            pager.end_read_tx().unwrap();
+            pager.end_read_tx();
         }
     }
 
@@ -8641,7 +8641,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.end_tx(false, &conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
             }
 
             // Check that all keys can be found by seeking
@@ -8702,7 +8702,7 @@ mod tests {
                 }
                 prev = Some(cur);
             }
-            pager.end_read_tx().unwrap();
+            pager.end_read_tx();
         }
     }
 
@@ -8848,7 +8848,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.end_tx(false, &conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
             }
 
             // Final validation
@@ -8856,7 +8856,7 @@ mod tests {
             sorted_keys.sort();
             validate_expected_keys(&pager, &mut cursor, &sorted_keys, seed);
 
-            pager.end_read_tx().unwrap();
+            pager.end_read_tx();
         }
     }
 
@@ -8939,7 +8939,7 @@ mod tests {
                 "key {key:?} is not found, seed: {seed}"
             );
         }
-        pager.end_read_tx().unwrap();
+        pager.end_read_tx();
     }
 
     #[test]

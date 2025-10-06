@@ -1566,12 +1566,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(
-        &self,
-        tx_id: TxID,
-        _pager: Arc<Pager>,
-        connection: &Connection,
-    ) -> Result<()> {
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
         *connection.mv_tx.write() = None;
@@ -1615,8 +1610,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
-
-        Ok(())
     }
 
     /// Returns true if the given transaction is the exclusive transaction.

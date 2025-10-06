@@ -2372,7 +2372,7 @@ pub fn op_transaction_inner(
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
                             if matches!(current_state, TransactionState::None) {
-                                pager.end_read_tx()?;
+                                pager.end_read_tx();
                                 conn.set_tx_state(TransactionState::None);
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
@@ -2456,10 +2456,10 @@ pub fn op_auto_commit(
             // TODO(pere): add rollback I/O logic once we implement rollback journal
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn);
                 }
             } else {
-                return_if_io!(pager.end_tx(true, &conn));
+                pager.rollback_tx(&conn);
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);

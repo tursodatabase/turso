@@ -1161,33 +1161,20 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn end_tx(
-        &self,
-        rollback: bool,
-        connection: &Connection,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
         if connection.is_nested_stmt.load(Ordering::SeqCst) {
             // Parent statement will handle the transaction rollback.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
-        tracing::trace!("end_tx(rollback={})", rollback);
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         };
-        let (is_write, schema_did_change) = match connection.get_tx_state() {
+        let (_, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
-        tracing::trace!("end_tx(schema_did_change={})", schema_did_change);
-        if rollback {
-            if is_write {
-                wal.borrow().end_write_tx();
-            }
-            wal.borrow().end_read_tx();
-            self.rollback(schema_did_change, connection, is_write)?;
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
-        }
+        tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
         let commit_status = return_if_io!(self.commit_dirty_pages(
             connection.is_wal_auto_checkpoint_disabled(),
             connection.get_sync_mode(),
@@ -1204,12 +1191,33 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn end_read_tx(&self) -> Result<()> {
+    pub fn rollback_tx(&self, connection: &Connection) {
+        if connection.is_nested_stmt.load(Ordering::SeqCst) {
+            // Parent statement will handle the transaction rollback.
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
-            return Ok(());
+            // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            return;
+        };
+        let (is_write, schema_did_change) = match connection.get_tx_state() {
+            TransactionState::Write { schema_did_change } => (true, schema_did_change),
+            _ => (false, false),
+        };
+        tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
+        if is_write {
+            wal.borrow().end_write_tx();
+        }
+        wal.borrow().end_read_tx();
+        self.rollback(schema_did_change, connection, is_write);
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn end_read_tx(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
         };
         wal.borrow().end_read_tx();
-        Ok(())
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
@@ -2393,12 +2401,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn rollback(
-        &self,
-        schema_did_change: bool,
-        connection: &Connection,
-        is_write: bool,
-    ) -> Result<(), LimboError> {
+    pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
         self.clear_page_cache();
         if is_write {
@@ -2415,11 +2418,9 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.borrow_mut().rollback()?;
+                wal.borrow_mut().rollback();
             }
         }
-
-        Ok(())
     }
 
     fn reset_internal_states(&self) {
@@ -2764,7 +2765,7 @@ mod ptrmap_tests {
     use super::*;
     use crate::io::{MemoryIO, OpenFlags, IO};
     use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::database::{DatabaseFile, DatabaseStorage};
+    use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::PageCache;
     use crate::storage::pager::Pager;
     use crate::storage::sqlite3_ondisk::PageSize;

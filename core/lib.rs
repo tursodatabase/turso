@@ -498,7 +498,7 @@ impl Database {
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .or_else(|e| {
-                        pager.end_read_tx()?;
+                        pager.end_read_tx();
                         Err(e)
                     });
                 if let Err(LimboError::ExtensionError(e)) = result {
@@ -1195,11 +1195,11 @@ impl Connection {
                 0
             }
             Err(err) => {
-                pager.end_read_tx().expect("read txn must be finished");
+                pager.end_read_tx();
                 return Err(err);
             }
         };
-        pager.end_read_tx().expect("read txn must be finished");
+        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().unwrap().schema_version;
         tracing::debug!(
@@ -1236,7 +1236,7 @@ impl Connection {
         // close opened transaction if it was kept open
         // (in most cases, it will be automatically closed if stmt was executed properly)
         if previous == TransactionState::Read {
-            pager.end_read_tx().expect("read txn must be finished");
+            pager.end_read_tx();
         }
 
         reparse_result?;
@@ -1654,7 +1654,7 @@ impl Connection {
         let pager = self.pager.read();
         pager.begin_read_tx()?;
         pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx().expect("read txn must be closed");
+            pager.end_read_tx();
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
@@ -1702,13 +1702,11 @@ impl Connection {
                 wal.end_read_tx();
             }
 
-            let rollback_err = if !force_commit {
+            if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
-                pager.rollback(false, self, true).err()
-            } else {
-                None
-            };
-            if let Some(err) = commit_err.or(rollback_err) {
+                pager.rollback(false, self, true);
+            }
+            if let Some(err) = commit_err {
                 return Err(err);
             }
         }
@@ -1752,12 +1750,7 @@ impl Connection {
             _ => {
                 if !self.mvcc_enabled() {
                     let pager = self.pager.read();
-                    pager.io.block(|| {
-                        pager.end_tx(
-                            true, // rollback = true for close
-                            self,
-                        )
-                    })?;
+                    pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
             }
@@ -2632,12 +2625,8 @@ impl Statement {
             }
             let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
+                self.pager.rollback_tx(&self.program.connection);
                 self.program.connection.set_tx_state(TransactionState::None);
-                assert!(
-                    matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
-                );
             }
         }
         res
