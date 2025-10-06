@@ -1091,7 +1091,18 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@napi-rs/wasm-runtime@npm:^1.0.1, @napi-rs/wasm-runtime@npm:^1.0.5":
+"@napi-rs/wasm-runtime@npm:^1.0.1":
+  version: 1.0.6
+  resolution: "@napi-rs/wasm-runtime@npm:1.0.6"
+  dependencies:
+    "@emnapi/core": "npm:^1.5.0"
+    "@emnapi/runtime": "npm:^1.5.0"
+    "@tybys/wasm-util": "npm:^0.10.1"
+  checksum: 10c0/af48168c6e13c970498fda3ce7238234a906bc69dd474dc9abd560cdf8a7dea6410147afec8f0191a1d19767c8347d8ec0125a8a93225312f7ac37e06e8c15ad
+  languageName: node
+  linkType: hard
+
+"@napi-rs/wasm-runtime@npm:^1.0.5":
   version: 1.0.5
   resolution: "@napi-rs/wasm-runtime@npm:1.0.5"
   dependencies:
@@ -1593,7 +1604,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm@npm:^0.2.0, @tursodatabase/database-wasm@workspace:packages/wasm":
+"@tursodatabase/database-wasm@workspace:packages/wasm":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
@@ -1608,7 +1619,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database@npm:^0.2.0, @tursodatabase/database@workspace:packages/native":
+"@tursodatabase/database@workspace:packages/native":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
@@ -1632,7 +1643,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync-wasm@npm:^0.2.0, @tursodatabase/sync-wasm@workspace:sync/packages/wasm":
+"@tursodatabase/sync-wasm@workspace:sync/packages/wasm":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
@@ -1648,7 +1659,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync@npm:^0.2.0, @tursodatabase/sync@workspace:sync/packages/native":
+"@tursodatabase/sync@workspace:sync/packages/native":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
@@ -2099,23 +2110,6 @@ __metadata:
   checksum: 10c0/053ea8b2135caff68a9e81470e845613e374e7309a47731e81639de3eaeb90c3d01af0e0b44d2ab9d50b43467223b88567dfeb3262db942dc063b9976718ffc1
   languageName: node
   linkType: hard
-
-"database-node@workspace:examples/database-node":
-  version: 0.0.0-use.local
-  resolution: "database-node@workspace:examples/database-node"
-  dependencies:
-    "@tursodatabase/database": "npm:^0.2.0"
-  languageName: unknown
-  linkType: soft
-
-"database-wasm-vite@workspace:examples/database-wasm-vite":
-  version: 0.0.0-use.local
-  resolution: "database-wasm-vite@workspace:examples/database-wasm-vite"
-  dependencies:
-    "@tursodatabase/database-wasm": "npm:^0.2.0"
-    vite: "npm:^7.1.9"
-  languageName: unknown
-  linkType: soft
 
 "debug@npm:4":
   version: 4.4.3
@@ -3672,23 +3666,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"sync-node@workspace:examples/sync-node":
-  version: 0.0.0-use.local
-  resolution: "sync-node@workspace:examples/sync-node"
-  dependencies:
-    "@tursodatabase/sync": "npm:^0.2.0"
-  languageName: unknown
-  linkType: soft
-
-"sync-wasm-vite@workspace:examples/sync-wasm-vite":
-  version: 0.0.0-use.local
-  resolution: "sync-wasm-vite@workspace:examples/sync-wasm-vite"
-  dependencies:
-    "@tursodatabase/sync-wasm": "npm:^0.2.0"
-    vite: "npm:^7.1.9"
-  languageName: unknown
-  linkType: soft
-
 "tar-fs@npm:^2.0.0":
   version: 2.1.4
   resolution: "tar-fs@npm:2.1.4"
@@ -3899,7 +3876,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.1.5, vite@npm:^7.1.9":
+"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.1.5":
   version: 7.1.9
   resolution: "vite@npm:7.1.9"
   dependencies:
