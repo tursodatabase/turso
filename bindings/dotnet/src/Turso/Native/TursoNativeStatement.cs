@@ -107,13 +107,13 @@ public class TursoNativeStatement : IDisposable
         {
             var bytes = Encoding.UTF8.GetBytes(value.StringValue);
             handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-            union.StringValue = new TursoNativeArray { Data = (IntPtr)handle, Length = (ulong)bytes.Length };
+            union.StringValue = new TursoNativeArray { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)bytes.Length };
         }
 
         if (value.ValueType == TursoValueType.Blob)
         {
             handle = GCHandle.Alloc(value.BlobValue, GCHandleType.Pinned);
-            union.BlobValue = new TursoNativeArray { Data = (IntPtr)handle, Length = (ulong)value.BlobValue.Length };
+            union.BlobValue = new TursoNativeArray { Data = handle.Value.AddrOfPinnedObject(), Length = (ulong)value.BlobValue.Length };
         }
 
         return new TursoNativeValue

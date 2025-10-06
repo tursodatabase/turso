@@ -46,6 +46,53 @@ public class TursoTests
         reader.Read().Should().BeFalse();
     }
 
+    [TestCase("stringValue", TestName = "TestStringValue")]
+    [TestCase(new byte[] { 1, 2, 3, 4, 5 }, TestName = "TestBlobValue")]
+    [TestCase(1, TestName = "TestIntValue")]
+    [TestCase(2.5, TestName = "TestRealValue")]
+    public void TestDifferentTypes(object typedValue)
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+
+        using (var create = new TursoCommand(connection, "CREATE TABLE t(v)"))
+        {
+            create.ExecuteNonQuery().Should().Be(0);
+        }
+
+        using (var insert = new TursoCommand(connection, "INSERT INTO t VALUES (?)"))
+        {
+            insert.Parameters.Add(typedValue);
+            insert.ExecuteNonQuery().Should().Be(1);
+        }
+
+        using var select = new TursoCommand(connection, "SELECT v FROM t");
+        using var reader = select.ExecuteReader();
+
+        reader.Read().Should().BeTrue();
+
+        switch (typedValue)
+        {
+            case string s:
+                reader.GetString(0).Should().Be(s);
+                break;
+            case byte[] bytes:
+                ((byte[])reader.GetValue(0)).SequenceEqual(bytes).Should().BeTrue();
+                break;
+            case int i:
+                reader.GetInt32(0).Should().Be(i);
+                break;
+            case double d:
+                reader.GetDouble(0).Should().Be(d);
+                break;
+            default:
+                throw new AssertionException($"Unsupported test type: {typedValue.GetType()}");
+        }
+
+        reader.Read().Should().BeFalse();
+    }
+
+
     [Test]
     public void TestBindNamedParameter()
     {
@@ -119,7 +166,6 @@ public class TursoTests
     }
 
     [Test]
-    [Ignore("Need to fix read data after commit")]
     public void TestCommitTransaction()
     {
         using var connection = new TursoConnection("Data Source=./turso.db");
@@ -130,9 +176,9 @@ public class TursoTests
 
         connection.ExecuteNonQuery("CREATE TABLE IF NOT EXISTS t(id INTEGER)");
         connection.ExecuteNonQuery("DELETE FROM t");
-        
+
         using var tx = connection.BeginTransaction();
-        
+
         using var insert = new TursoCommand(connection, "INSERT INTO t VALUES (1),(2)");
         insert.ExecuteNonQuery().Should().Be(2);
 
@@ -140,13 +186,15 @@ public class TursoTests
         var readerBefore = selectBefore.ExecuteReader();
         readerBefore.Read().Should().BeTrue();
         readerBefore.GetInt32(0).Should().Be(0);
+        // readerBefore.Read().Should().BeFalse();
 
         tx.Commit();
-        
+
         using var selectAfter = new TursoCommand(connection2, "SELECT COUNT(*) FROM t");
         using var readerAfter = selectAfter.ExecuteReader();
         readerAfter.Read().Should().BeTrue();
         readerAfter.GetInt32(0).Should().Be(2);
+        readerBefore.Read().Should().BeFalse();
     }
 
     [Test]
