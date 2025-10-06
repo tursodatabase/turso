@@ -1,3 +1,10 @@
+//! FIXME: With the current API and generation logic in plan.rs,
+//! for Properties that have intermediary queries we need to CLONE the current Context tables
+//! to properly generate queries, as we need to shadow after each query generated to make sure we are generating
+//! queries that are valid. This is specially valid with DROP and ALTER TABLE in the mix, because with outdated context
+//! we can generate queries that reference tables that do not exist. This is not a correctness issue, but more of
+//! an optimization issue that is good to point out for the future
+
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use sql_generation::{
@@ -26,10 +33,33 @@ use crate::{
     },
     model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
-    runner::env::SimulatorEnv,
+    runner::env::{ShadowTablesMut, SimulatorEnv},
 };
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
+
+#[derive(Debug, Clone, Copy)]
+struct PropertyGenContext<'a> {
+    tables: &'a Vec<sql_generation::model::table::Table>,
+    opts: &'a sql_generation::generation::Opts,
+}
+
+impl<'a> PropertyGenContext<'a> {
+    #[inline]
+    fn new(tables: &'a Vec<Table>, opts: &'a Opts) -> Self {
+        Self { tables, opts }
+    }
+}
+
+impl<'a> GenerationContext for PropertyGenContext<'a> {
+    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
+        self.tables
+    }
+
+    fn opts(&self) -> &sql_generation::generation::Opts {
+        self.opts
+    }
+}
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -1230,10 +1260,10 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let row = rows[row_index].clone();
 
     // Insert the rows
-    let insert_query = Insert::Values {
+    let insert_query = Query::Insert(Insert::Values {
         table: table.name.clone(),
         values: rows,
-    };
+    });
 
     // Choose if we want queries to be executed in an interactive transaction
     let interactive = if !mvcc && rng.random_bool(0.5) {
@@ -1244,21 +1274,15 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     } else {
         None
     };
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
+
+    let amount = rng.random_range(0..3);
+
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
     // - [x] The inserted row will not be deleted.
     // - [x] The inserted row will not be updated.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
-    if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(if interactive.start_with_immediate {
-            Begin::Immediate
-        } else {
-            Begin::Deferred
-        }));
-    }
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
+    let mut queries = generate_queries(rng, ctx, amount, &[&insert_query], |rng, ctx| {
+        let query = Query::arbitrary_from(rng, &ctx, query_distr);
         match &query {
             Query::Delete(Delete {
                 table: t,
@@ -1266,14 +1290,14 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
             }) => {
                 // The inserted row will not be deleted.
                 if t == &table.name && predicate.test(&row, table) {
-                    continue;
+                    return None;
                 }
             }
             Query::Create(Create { table: t }) => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
                 if t.name == table.name {
-                    continue;
+                    return None;
                 }
             }
             Query::Update(Update {
@@ -1283,14 +1307,23 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
             }) => {
                 // The inserted row will not be updated.
                 if t == &table.name && predicate.test(&row, table) {
-                    continue;
+                    return None;
                 }
             }
             _ => (),
         }
-        queries.push(query);
-    }
+        Some(query)
+    });
+
     if let Some(ref interactive) = interactive {
+        queries.insert(
+            0,
+            Query::Begin(if interactive.start_with_immediate {
+                Begin::Immediate
+            } else {
+                Begin::Deferred
+            }),
+        );
         queries.push(if interactive.end_with_commit {
             Query::Commit(Commit)
         } else {
@@ -1305,7 +1338,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     );
 
     Property::InsertValuesSelect {
-        insert: insert_query,
+        insert: insert_query.unwrap_insert(),
         row_index,
         queries,
         select: select_query,
@@ -1376,28 +1409,28 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
     _mvcc: bool,
 ) -> Property {
     // Create the table
-    let create_query = Create::arbitrary(rng, ctx);
-    let table = &create_query.table;
+    let create_query = Query::Create(Create::arbitrary(rng, ctx));
+    let table = &create_query.as_create().table;
 
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
+    let amount = rng.random_range(0..3);
+
     // The interactions in the middle has the following constraints;
     // - [x] There will be no errors in the middle interactions.(best effort)
     // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
+    let queries = generate_queries(rng, ctx, amount, &[&create_query], |rng, ctx| {
+        let query = Query::arbitrary_from(rng, &ctx, query_distr);
         if let Query::Create(Create { table: t }) = &query {
             // There will be no errors in the middle interactions.
             // - Creating the same table is an error
             if t.name == table.name {
-                continue;
+                return None;
             }
         }
-        queries.push(query);
-    }
+        Some(query)
+    });
 
     Property::DoubleCreateFailure {
-        create: create_query,
+        create: create_query.unwrap_create(),
         queries,
     }
 }
@@ -1413,18 +1446,23 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, ctx, table);
 
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
+    let amount = rng.random_range(0..3);
+
+    let delete = Query::Delete(Delete {
+        predicate: predicate.clone(),
+        table: table.name.clone(),
+    });
+
     // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
     // - [x] A row that holds for the predicate will not be inserted.
     // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
+    let queries = generate_queries(rng, ctx, amount, &[&delete], |rng, tmp_ctx| {
+        let query = Query::arbitrary_from(rng, &tmp_ctx, query_distr);
         match &query {
             Query::Insert(Insert::Values { table: t, values }) => {
                 // A row that holds for the predicate will not be inserted.
                 if t == &table.name && values.iter().any(|v| predicate.test(v, table)) {
-                    continue;
+                    return None;
                 }
             }
             Query::Insert(Insert::Select {
@@ -1433,26 +1471,26 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
             }) => {
                 // A row that holds for the predicate will not be inserted.
                 if t == &table.name {
-                    continue;
+                    return None;
                 }
             }
             Query::Update(Update { table: t, .. }) => {
                 // A row that holds for the predicate will not be updated.
                 if t == &table.name {
-                    continue;
+                    return None;
                 }
             }
             Query::Create(Create { table: t }) => {
                 // There will be no errors in the middle interactions.
                 // - Creating the same table is an error
                 if t.name == table.name {
-                    continue;
+                    return None;
                 }
             }
             _ => (),
         }
-        queries.push(query);
-    }
+        Some(query)
+    });
 
     Property::DeleteSelect {
         table: table.name.clone(),
@@ -1470,20 +1508,26 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
     // Get a random table
     let table = pick(ctx.tables(), rng);
 
+    let drop = Query::Drop(Drop {
+        table: table.name.clone(),
+    });
+
+    let amount = rng.random_range(0..3);
     // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
-        if let Query::Create(Create { table: t }) = &query {
+    let queries = generate_queries(rng, ctx, amount, &[&drop], |rng, tmp_ctx| {
+        // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+        // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+
+        let query = Query::arbitrary_from(rng, &tmp_ctx, query_distr);
+        if let Query::Create(Create { table: t }) = &query
+            && t.name == table.name
+        {
             // - The table `t` will not be created
-            if t.name == table.name {
-                continue;
-            }
+            None
+        } else {
+            Some(query)
         }
-        queries.push(query);
-    }
+    });
 
     let select = Select::simple(
         table.name.clone(),
@@ -1813,6 +1857,49 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
     }
+}
+
+fn generate_queries<R: rand::Rng + ?Sized, F>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    amount: usize,
+    init_queries: &[&Query],
+    func: F,
+) -> Vec<Query>
+where
+    F: Fn(&mut R, PropertyGenContext) -> Option<Query>,
+{
+    // Create random queries respecting the constraints
+    let mut queries = Vec::new();
+
+    let range = 0..amount;
+    if !range.is_empty() {
+        let mut tmp_tables = ctx.tables().clone();
+
+        for query in init_queries {
+            tmp_shadow(&mut tmp_tables, query);
+        }
+
+        for _ in range {
+            let tmp_ctx = PropertyGenContext::new(&tmp_tables, ctx.opts());
+
+            let Some(query) = func(rng, tmp_ctx) else {
+                continue;
+            };
+
+            tmp_shadow(&mut tmp_tables, &query);
+
+            queries.push(query);
+        }
+    }
+    queries
+}
+
+fn tmp_shadow(tmp_tables: &mut Vec<Table>, query: &Query) {
+    let mut tx_tables = None;
+    let mut tmp_shadow_tables = ShadowTablesMut::new(tmp_tables, &mut tx_tables);
+
+    let _ = query.shadow(&mut tmp_shadow_tables);
 }
 
 fn print_row(row: &[SimValue]) -> String {

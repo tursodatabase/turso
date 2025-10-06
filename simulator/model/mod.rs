@@ -35,6 +35,28 @@ pub enum Query {
 }
 
 impl Query {
+    pub fn as_create(&self) -> &Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn unwrap_create(self) -> Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn unwrap_insert(self) -> Insert {
+        match self {
+            Self::Insert(insert) => insert,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
@@ -102,6 +124,7 @@ impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
+        tracing::info!("SHADOW {:?}", self);
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -239,6 +262,7 @@ impl Shadow for Drop {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tracing::info!("dropping {:?}", self);
         if !tables.iter().any(|t| t.name == self.table) {
             // If the table does not exist, we return an error
             return Err(anyhow::anyhow!(
