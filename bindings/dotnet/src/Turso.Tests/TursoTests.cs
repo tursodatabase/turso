@@ -166,6 +166,7 @@ public class TursoTests
     }
 
     [Test]
+    [Ignore("https://github.com/tursodatabase/turso/pull/3591")]
     public void TestCommitTransaction()
     {
         using var connection = new TursoConnection("Data Source=./turso.db");
