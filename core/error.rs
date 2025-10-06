@@ -49,8 +49,6 @@ pub enum LimboError {
     ExtensionError(String),
     #[error("Runtime error: integer overflow")]
     IntegerOverflow,
-    #[error("Schema is locked for write")]
-    SchemaLocked,
     #[error("Runtime error: database table is locked")]
     TableLocked,
     #[error("Error: Resource is read-only")]

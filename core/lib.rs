@@ -558,12 +558,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: RwLock::new(pager),
-            schema: RwLock::new(
-                self.schema
-                    .lock()
-                    .map_err(|_| LimboError::SchemaLocked)?
-                    .clone(),
-            ),
+            schema: RwLock::new(self.schema.lock().unwrap().clone()),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
             transaction_state: RwLock::new(TransactionState::None),
@@ -835,17 +830,17 @@ impl Database {
 
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
-        let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let mut schema_ref = self.schema.lock().unwrap();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-    pub(crate) fn clone_schema(&self) -> Result<Arc<Schema>> {
-        let schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
-        Ok(schema.clone())
+    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+        let schema = self.schema.lock().unwrap();
+        schema.clone()
     }
 
-    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) -> Result<()> {
-        let mut schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
+        let mut schema = self.schema.lock().unwrap();
         if schema.schema_version < another.schema_version {
             tracing::debug!(
                 "DB schema is outdated: {} < {}",
@@ -860,7 +855,6 @@ impl Database {
                 another.schema_version
             );
         }
-        Ok(())
     }
 
     pub fn get_mv_store(&self) -> Option<&Arc<MvStore>> {
@@ -1154,7 +1148,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let pager = self.pager.read().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -1248,7 +1242,8 @@ impl Connection {
         reparse_result?;
 
         let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema)
+        self.db.update_schema_if_newer(schema);
+        Ok(())
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
@@ -1303,7 +1298,7 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -1337,7 +1332,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -1389,7 +1384,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
@@ -1540,20 +1535,14 @@ impl Connection {
         Ok(db)
     }
 
-    pub fn maybe_update_schema(&self) -> Result<()> {
+    pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
-        let schema = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?;
+        let schema = self.db.schema.lock().unwrap();
         if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
         }
-
-        Ok(())
     }
 
     /// Read schema version at current transaction
@@ -2075,12 +2064,7 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?
-            .indexes_enabled();
+        let use_indexes = self.db.schema.lock().unwrap().indexes_enabled();
         let use_mvcc = self.db.mv_store.is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
@@ -2598,7 +2582,7 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.write() = conn.db.clone_schema()?;
+        *conn.schema.write() = conn.db.clone_schema();
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

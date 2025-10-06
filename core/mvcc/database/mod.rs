@@ -654,7 +654,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema)?;
+                    connection.db.update_schema_if_newer(schema);
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
@@ -1606,7 +1606,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema()?;
+            *connection.schema.write() = connection.db.clone_schema();
         }
 
         let tx = tx_unlocked.value();
