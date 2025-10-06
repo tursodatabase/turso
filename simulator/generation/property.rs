@@ -691,21 +691,21 @@ impl Property {
                     format!("select query should result in an error for table '{table}'"),
                     move |stack: &Vec<ResultSet>, _| {
                         let last = stack.last().unwrap();
+                        dbg!(last);
                         match last {
                             Ok(success) => Ok(Err(format!(
                                 "expected table creation to fail but it succeeded: {success:?}"
                             ))),
-                            Err(e) => {
-                                if e.to_string()
-                                    .contains(&format!("Table {table_name} does not exist"))
+                            Err(e) => match e {
+                                LimboError::ParseError(e)
+                                    if e.contains(&format!("no such table: {table_name}")) =>
                                 {
                                     Ok(Ok(()))
-                                } else {
-                                    Ok(Err(format!(
-                                        "expected table does not exist error, got: {e}"
-                                    )))
                                 }
-                            }
+                                _ => Ok(Err(format!(
+                                    "expected table does not exist error, got: {e}"
+                                ))),
+                            },
                         }
                     },
                 ));
@@ -726,7 +726,7 @@ impl Property {
                         .into_iter()
                         .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
                 );
-                interactions.push(Interaction::new(connection_index, select));
+                interactions.push(Interaction::new_ignore_error(connection_index, select));
                 interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
