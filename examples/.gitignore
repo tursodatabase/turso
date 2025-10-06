@@ -4,3 +4,4 @@
 *.db-wal-revert
 *.db-changes
 *.db-remote
+node_modules
