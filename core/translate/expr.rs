@@ -30,6 +30,7 @@ pub struct ConditionMetadata {
     pub jump_if_condition_is_true: bool,
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
+    pub jump_target_when_null: BranchOffset,
 }
 
 /// Container for register locations of values that can be referenced in RETURNING expressions
@@ -174,21 +175,20 @@ fn expr_can_be_null(expr: &ast::Expr) -> bool {
     }
 }
 
-// todo(rn): Check right affinities, fix other call to translate
-
 /// Core implementation of IN expression logic that can be used in both conditional and expression contexts.
 /// This follows SQLite's approach where a single core function handles all InList cases.
 ///
 /// This is extracted from the original conditional implementation to be reusable.
 /// The logic exactly matches the original conditional InList implementation.
+// todo: Check right affinities
 #[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
 fn translate_in_list(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
     lhs: &ast::Expr,
     rhs: &[Box<ast::Expr>],
-    dest_if_false: BranchOffset,
-    dest_if_null: BranchOffset,
+    condition_metadata: ConditionMetadata,
+    // dest if null should be in ConditionMetadata
     resolver: &Resolver,
 ) -> Result<()> {
     let lhs_reg = expr_code_vector(program, lhs);
@@ -196,7 +196,7 @@ fn translate_in_list(
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
 
-    if dest_if_false != dest_if_null {
+    if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
         check_null_reg = program.alloc_register();
         program.emit_insn(Insn::BitAnd {
             lhs: lhs_reg,
@@ -218,7 +218,9 @@ fn translate_in_list(
             });
         }
 
-        if !last_condition || dest_if_false != dest_if_null {
+        if !last_condition
+            || condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null
+        {
             if lhs_reg != rhs_reg {
                 program.emit_insn(Insn::Eq {
                     lhs: lhs_reg,
@@ -240,14 +242,14 @@ fn translate_in_list(
                 program.emit_insn(Insn::Ne {
                     lhs: lhs_reg,
                     rhs: rhs_reg,
-                    target_pc: dest_if_false,
+                    target_pc: condition_metadata.jump_target_when_false,
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
                     reg: lhs_reg,
-                    target_pc: dest_if_false,
+                    target_pc: condition_metadata.jump_target_when_false,
                 });
             }
         }
@@ -256,10 +258,17 @@ fn translate_in_list(
     if check_null_reg != 0 {
         program.emit_insn(Insn::IsNull {
             reg: check_null_reg,
-            target_pc: dest_if_null,
+            target_pc: condition_metadata.jump_target_when_null,
         });
         program.emit_insn(Insn::Goto {
-            target_pc: dest_if_false,
+            target_pc: condition_metadata.jump_target_when_false,
+        });
+    }
+
+    // by default if IN expression is true we just continue to the next instruction
+    if condition_metadata.jump_if_condition_is_true {
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_true,
         });
     }
     program.resolve_label(label_ok, program.offset());
@@ -392,20 +401,12 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::InList { lhs, not, rhs } => {
-            let ConditionMetadata {
-                jump_target_when_true,
-                jump_target_when_false,
-                ..
-            } = condition_metadata;
-            // fix me
             translate_in_list(
                 program,
                 Some(referenced_tables),
                 lhs,
                 rhs,
-                jump_target_when_false,
-                // should be null!!!
-                jump_target_when_true,
+                condition_metadata,
                 resolver,
             )?;
         }
@@ -2032,6 +2033,8 @@ pub fn translate_expr(
 
             let dest_if_false = program.allocate_label();
             let dest_if_null = program.allocate_label();
+            // won't use this label :/
+            let dest_if_true = program.allocate_label();
 
             // Call the core InList logic with expression-appropriate condition metadata
             translate_in_list(
@@ -2039,8 +2042,12 @@ pub fn translate_expr(
                 referenced_tables,
                 lhs,
                 rhs,
-                dest_if_false,
-                dest_if_null,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: dest_if_true,
+                    jump_target_when_false: dest_if_false,
+                    jump_target_when_null: dest_if_null,
+                },
                 resolver,
             )?;
 
