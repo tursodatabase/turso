@@ -389,7 +389,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   }
 
   @Override
-  @SkipNullableCheck
+  @Nullable
   public Reader getCharacterStream(String columnLabel) throws SQLException {
     return getCharacterStream(findColumn(columnLabel));
   }
@@ -834,7 +834,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   }
 
   @Override
-  @SkipNullableCheck
+  @Nullable
   public Time getTime(int columnIndex, Calendar cal) throws SQLException {
     final Time time = getTime(columnIndex);
     if (time == null || cal == null) {
