@@ -1,0 +1,143 @@
+name: Publish Java Bindings to Maven Central
+
+on:
+  # Manually trigger the workflow
+  workflow_dispatch:
+
+env:
+  working-directory: bindings/java
+
+jobs:
+  # Build native libraries for each platform
+  build-natives:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            make-target: linux_x86
+            artifact-name: linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            make-target: macos_x86
+            artifact-name: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            make-target: macos_arm64
+            artifact-name: macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            make-target: windows
+            artifact-name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Verify and install Rust target
+        run: |
+          echo "Installing target: ${{ matrix.target }}"
+          rustup target add ${{ matrix.target }}
+          echo "Installed targets:"
+          rustup target list --installed
+          echo "Rust version:"
+          rustc --version
+
+      - name: Install cross-compilation tools (Windows on Linux)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Build native library
+        run: make ${{ matrix.make-target }}
+
+      - name: Verify build output
+        run: |
+          echo "Build completed for ${{ matrix.target }}"
+          ls -lah libs/
+          find libs/ -type f
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact-name }}
+          path: ${{ env.working-directory }}/libs/
+          retention-days: 1
+
+  # Publish to Maven Central with all native libraries
+  publish:
+    needs: build-natives
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Install Rust (for test builds)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: ${{ env.working-directory }}/libs-temp
+          merge-multiple: true
+
+      - name: Organize native libraries
+        run: |
+          # Move downloaded artifacts to libs directory
+          rm -rf libs
+          mv libs-temp libs
+          echo "Native libraries collected:"
+          ls -R libs/
+
+      - name: Build test natives
+        run: make build_test
+
+      - name: Run tests
+        run: ./gradlew test
+
+      - name: Publish to Maven Central
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "Building, signing, and publishing to Maven Central..."
+          ./gradlew clean publishToMavenCentral --no-daemon --stacktrace
+
+      - name: Upload bundle artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-central-bundle
+          path: ${{ env.working-directory }}/build/maven-central/*.zip
+          retention-days: 7
