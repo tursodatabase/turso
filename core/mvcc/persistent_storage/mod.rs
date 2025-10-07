@@ -49,6 +49,10 @@ impl Storage {
             .unwrap()
             .set_checkpoint_threshold(threshold)
     }
+
+    pub fn checkpoint_threshold(&self) -> u64 {
+        self.logical_log.read().unwrap().checkpoint_threshold()
+    }
 }
 
 impl Debug for Storage {

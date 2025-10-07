@@ -235,6 +235,10 @@ impl LogicalLog {
     pub fn set_checkpoint_threshold(&mut self, threshold: u64) {
         self.checkpoint_threshold = threshold;
     }
+
+    pub fn checkpoint_threshold(&self) -> u64 {
+        self.checkpoint_threshold
+    }
 }
 
 pub enum StreamingResult {
