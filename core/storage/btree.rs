@@ -5811,6 +5811,8 @@ pub enum IntegrityCheckError {
         actual_count: usize,
         expected_count: usize,
     },
+    #[error("Page {page_id}: never used")]
+    PageNeverUsed { page_id: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5836,16 +5838,18 @@ struct IntegrityCheckPageEntry {
 }
 pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
+    pub db_size: usize,
     first_leaf_level: Option<usize>,
-    page_reference: HashMap<i64, i64>,
+    pub page_reference: HashMap<i64, i64>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
 
 impl IntegrityCheckState {
-    pub fn new() -> Self {
+    pub fn new(db_size: usize) -> Self {
         Self {
             page_stack: Vec::new(),
+            db_size,
             page_reference: HashMap::new(),
             first_leaf_level: None,
             page: None,
