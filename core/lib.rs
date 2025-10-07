@@ -46,6 +46,7 @@ use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
@@ -2667,6 +2668,17 @@ impl Statement {
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
+        if self.query_mode == QueryMode::Explain {
+            return Cow::Owned(EXPLAIN_COLUMNS.get(idx).expect("No column").to_string());
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Cow::Owned(
+                EXPLAIN_QUERY_PLAN_COLUMNS
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2685,6 +2697,9 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self
@@ -2697,6 +2712,22 @@ impl Statement {
     }
 
     pub fn get_column_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain {
+            return Some(
+                EXPLAIN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Some(
+                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column {
