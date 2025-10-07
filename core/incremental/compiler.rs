@@ -2149,6 +2149,31 @@ impl DbspCompiler {
                     ))
                 }
             }
+            LogicalExpr::IsNull { expr, negated } => {
+                // Extract column index from the inner expression
+                if let LogicalExpr::Column(col) = expr.as_ref() {
+                    let column_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col.name)
+                        .ok_or_else(|| {
+                            LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for IS NULL filter",
+                                col.name
+                            ))
+                        })?;
+
+                    if *negated {
+                        Ok(FilterPredicate::IsNotNull { column_idx })
+                    } else {
+                        Ok(FilterPredicate::IsNull { column_idx })
+                    }
+                } else {
+                    Err(LimboError::ParseError(
+                        "IS NULL/IS NOT NULL expects a column reference".to_string(),
+                    ))
+                }
+            }
             _ => Err(LimboError::ParseError(format!(
                 "Unsupported filter expression: {expr:?}"
             ))),
