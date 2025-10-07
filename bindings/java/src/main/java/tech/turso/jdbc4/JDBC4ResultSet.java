@@ -368,7 +368,13 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int findColumn(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final String[] columnNames = resultSet.getColumnNames();
+    for (int i = 0; i < columnNames.length; i++) {
+      if (columnNames[i].equals(columnLabel)) {
+        return i + 1;
+      }
+    }
+    throw new SQLException("column name " + columnLabel + " not found");
   }
 
   @Override

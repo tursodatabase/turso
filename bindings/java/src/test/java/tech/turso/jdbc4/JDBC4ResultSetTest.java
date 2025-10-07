@@ -512,4 +512,81 @@ class JDBC4ResultSetTest {
     // Test negative column index
     assertThrows(SQLException.class, () -> resultSet.getInt(-1));
   }
+
+  @Test
+  void test_findColumn_with_exact_name() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER, username TEXT, age INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1, 'minseok', 30);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM users");
+    assertTrue(resultSet.next());
+
+    assertEquals(1, resultSet.findColumn("id"));
+    assertEquals(2, resultSet.findColumn("username"));
+    assertEquals(3, resultSet.findColumn("age"));
+  }
+
+  @Test
+  void test_findColumn_with_duplicate_names() throws Exception {
+    // SQLite allows duplicate column names in SELECT
+    stmt.executeUpdate("CREATE TABLE test (a INTEGER, b INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES (1, 2);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT a, a FROM test");
+    assertTrue(resultSet.next());
+
+    // Should return the FIRST occurrence
+    assertEquals(1, resultSet.findColumn("a"));
+  }
+
+  @Test
+  void test_findColumn_with_nonexistent_column() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM users");
+    assertTrue(resultSet.next());
+
+    SQLException exception =
+        assertThrows(SQLException.class, () -> resultSet.findColumn("nonexistent"));
+    assertTrue(exception.getMessage().contains("column name"));
+    assertTrue(exception.getMessage().contains("not found"));
+  }
+
+  @Test
+  void test_findColumn_with_alias() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT id AS user_id FROM users");
+    assertTrue(resultSet.next());
+
+    // Should find by alias, not original column name
+    assertEquals(1, resultSet.findColumn("user_id"));
+    assertThrows(SQLException.class, () -> resultSet.findColumn("id"));
+  }
+
+  @Test
+  void test_findColumn_with_empty_string() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test (col INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test");
+    assertTrue(resultSet.next());
+
+    assertThrows(SQLException.class, () -> resultSet.findColumn(""));
+  }
+
+  @Test
+  void test_findColumn_with_special_characters() throws Exception {
+    // SQLite allows spaces and special chars in column names if quoted
+    stmt.executeUpdate("CREATE TABLE test ([user name] TEXT, [user-id] INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES ('minseok', 1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test");
+    assertTrue(resultSet.next());
+
+    assertEquals(1, resultSet.findColumn("user name"));
+    assertEquals(2, resultSet.findColumn("user-id"));
+  }
 }
