@@ -5,6 +5,7 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
+use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
@@ -300,6 +301,8 @@ pub enum DbspOperator {
     Input { name: String, schema: SchemaRef },
     /// Merge operator for combining streams (used in recursive CTEs and UNION)
     Merge { schema: SchemaRef },
+    /// Distinct operator - removes duplicates
+    Distinct { schema: SchemaRef },
 }
 
 /// Represents an expression in DBSP
@@ -818,6 +821,13 @@ impl DbspCircuit {
                         schema.columns.len()
                     )?;
                 }
+                DbspOperator::Distinct { schema } => {
+                    writeln!(
+                        f,
+                        "{indent}Distinct[{node_id}]: (schema: {} columns)",
+                        schema.columns.len()
+                    )?;
+                }
             }
 
             for input_id in &node.inputs {
@@ -1143,16 +1153,34 @@ impl DbspCompiler {
                     }
                 }
 
-                // Compile aggregate expressions
+                // Compile aggregate expressions (both DISTINCT and regular)
                 let mut aggregate_functions = Vec::new();
                 for expr in &agg.aggr_expr {
-                    if let LogicalExpr::AggregateFunction { fun, args, .. } = expr {
+                    if let LogicalExpr::AggregateFunction { fun, args, distinct } = expr {
                         use crate::function::AggFunc;
                         use crate::incremental::aggregate_operator::AggregateFunction;
 
                         match fun {
                             AggFunc::Count | AggFunc::Count0 => {
-                                aggregate_functions.push(AggregateFunction::Count);
+                                if *distinct {
+                                    // COUNT(DISTINCT col)
+                                    if args.is_empty() {
+                                        return Err(LimboError::ParseError("COUNT(DISTINCT) requires an argument".to_string()));
+                                    }
+                                    if let LogicalExpr::Column(col) = &args[0] {
+                                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                            .ok_or_else(|| LimboError::ParseError(
+                                                format!("COUNT(DISTINCT) column '{}' not found in input", col.name)
+                                            ))?;
+                                        aggregate_functions.push(AggregateFunction::CountDistinct(col_idx));
+                                    } else {
+                                        return Err(LimboError::ParseError(
+                                            "Only column references are supported in aggregate functions for incremental views".to_string()
+                                        ));
+                                    }
+                                } else {
+                                    aggregate_functions.push(AggregateFunction::Count);
+                                }
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
@@ -1164,7 +1192,11 @@ impl DbspCompiler {
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("SUM column '{}' not found in input", col.name)
                                         ))?;
-                                    aggregate_functions.push(AggregateFunction::Sum(col_idx));
+                                    if *distinct {
+                                        aggregate_functions.push(AggregateFunction::SumDistinct(col_idx));
+                                    } else {
+                                        aggregate_functions.push(AggregateFunction::Sum(col_idx));
+                                    }
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1180,7 +1212,11 @@ impl DbspCompiler {
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("AVG column '{}' not found in input", col.name)
                                         ))?;
-                                    aggregate_functions.push(AggregateFunction::Avg(col_idx));
+                                    if *distinct {
+                                        aggregate_functions.push(AggregateFunction::AvgDistinct(col_idx));
+                                    } else {
+                                        aggregate_functions.push(AggregateFunction::Avg(col_idx));
+                                    }
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1364,14 +1400,48 @@ impl DbspCompiler {
                 // Handle UNION and UNION ALL
                 self.compile_union(union)
             }
+            LogicalPlan::Distinct(distinct) => {
+                // DISTINCT is implemented as GROUP BY all columns with a special aggregate
+                let input_id = self.compile_plan(&distinct.input)?;
+                let input_schema = distinct.input.schema();
+
+                // Create GROUP BY indices for all columns
+                let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
+
+                // Column names for the operator
+                let input_column_names: Vec<String> = input_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+
+                // Create the aggregate operator with DISTINCT mode
+                let operator_id = self.circuit.next_id;
+                let executable: Box<dyn IncrementalOperator> = Box::new(
+                    AggregateOperator::new(
+                        operator_id,
+                        group_by,
+                        vec![], // Empty aggregates indicates plain DISTINCT
+                        input_column_names,
+                    ),
+                );
+
+                // Add the node to the circuit
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Distinct {
+                        schema: input_schema.clone(),
+                    },
+                    vec![input_id],
+                    executable,
+                );
+
+                Ok(node_id)
+            }
             _ => Err(LimboError::ParseError(
                 format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
                         LogicalPlan::Union(_) => "Union",
-                        LogicalPlan::Distinct(_) => "Distinct",
-                        LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
                         LogicalPlan::Values(_) => "Values",
                         LogicalPlan::WithCTE(_) => "WithCTE",
                         LogicalPlan::CTERef(_) => "CTERef",
