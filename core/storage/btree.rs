@@ -28,7 +28,7 @@ use crate::{
 
 use crate::{
     return_corrupt, return_if_io,
-    types::{compare_immutable, IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, Value},
+    types::{compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
     LimboError, Result,
 };
 
@@ -705,7 +705,7 @@ impl BTreeCursor {
             .unwrap()
             .last_value(record_cursor)
         {
-            Some(Ok(RefValue::Integer(rowid))) => rowid,
+            Some(Ok(ValueRef::Integer(rowid))) => rowid,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
             ),
@@ -2164,7 +2164,7 @@ impl BTreeCursor {
 
     fn compare_with_current_record(
         &self,
-        key_values: &[RefValue],
+        key_values: &[ValueRef],
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
@@ -8690,7 +8690,11 @@ mod tests {
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
                 let record = run_until_done(|| cursor.record(), &pager).unwrap();
                 let record = record.as_ref().unwrap();
-                let cur = record.get_values().clone();
+                let cur = record
+                    .get_values()
+                    .iter()
+                    .map(ValueRef::to_owned)
+                    .collect::<Vec<_>>();
                 if let Some(prev) = prev {
                     if prev >= cur {
                         println!("Seed: {seed}");
@@ -8930,14 +8934,10 @@ mod tests {
             let record = record.as_ref().unwrap();
             let cur = record.get_values().clone();
             let cur = cur.first().unwrap();
-            let RefValue::Blob(ref cur) = cur else {
+            let ValueRef::Blob(ref cur) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
-            assert_eq!(
-                cur.to_slice(),
-                key,
-                "key {key:?} is not found, seed: {seed}"
-            );
+            assert_eq!(cur, key, "key {key:?} is not found, seed: {seed}");
         }
         pager.end_read_tx();
     }
@@ -9469,11 +9469,11 @@ mod tests {
             let exists = run_until_done(|| cursor.next(), &pager)?;
             assert!(exists, "Record {i} not found");
 
-            let record = run_until_done(|| cursor.record(), &pager)?;
-            let value = record.unwrap().get_value(0)?;
+            let record = run_until_done(|| cursor.record(), &pager)?.unwrap();
+            let value = record.get_value(0)?;
             assert_eq!(
                 value,
-                RefValue::Integer(i),
+                ValueRef::Integer(i),
                 "Unexpected value for record {i}",
             );
         }

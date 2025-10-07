@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
@@ -1320,22 +1320,22 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
-pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usize)> {
+pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRef<'a>, usize)> {
     match serial_type.kind() {
-        SerialTypeKind::Null => Ok((RefValue::Null, 0)),
+        SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
             if buf.is_empty() {
                 crate::bail_corrupt_error!("Invalid UInt8 value");
             }
             let val = buf[0] as i8;
-            Ok((RefValue::Integer(val as i64), 1))
+            Ok((ValueRef::Integer(val as i64), 1))
         }
         SerialTypeKind::I16 => {
             if buf.len() < 2 {
                 crate::bail_corrupt_error!("Invalid BEInt16 value");
             }
             Ok((
-                RefValue::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                 2,
             ))
         }
@@ -1345,7 +1345,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(
+                ValueRef::Integer(
                     i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
                 ),
                 3,
@@ -1356,7 +1356,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt32 value");
             }
             Ok((
-                RefValue::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+                ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
                 4,
             ))
         }
@@ -1366,7 +1366,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     buf[0],
@@ -1384,7 +1384,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt64 value");
             }
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
@@ -1395,26 +1395,20 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEFloat64 value");
             }
             Ok((
-                RefValue::Float(f64::from_be_bytes([
+                ValueRef::Float(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
             ))
         }
-        SerialTypeKind::ConstInt0 => Ok((RefValue::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((RefValue::Integer(1), 0)),
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
             if buf.len() < content_size {
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
-            if content_size == 0 {
-                Ok((RefValue::Blob(RawSlice::new(std::ptr::null(), 0)), 0))
-            } else {
-                let ptr = &buf[0] as *const u8;
-                let slice = RawSlice::new(ptr, content_size);
-                Ok((RefValue::Blob(slice), content_size))
-            }
+            Ok((ValueRef::Blob(&buf[..content_size]), content_size))
         }
         SerialTypeKind::Text => {
             let content_size = serial_type.size();
@@ -1427,10 +1421,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
 
             Ok((
-                RefValue::Text(TextRef::create_from(
-                    &buf[..content_size],
-                    TextSubtype::Text,
-                )),
+                ValueRef::Text(&buf[..content_size], TextSubtype::Text),
                 content_size,
             ))
         }
