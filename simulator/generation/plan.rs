@@ -239,6 +239,28 @@ impl InteractionPlan {
         env: &mut SimulatorEnv,
     ) -> Option<Vec<Interaction>> {
         let num_interactions = env.opts.max_interactions as usize;
+        // If last interaction needs to check all db tables, generate the Property to do so
+        if let Some(i) = self.plan.last()
+            && i.check_tables()
+        {
+            let check_all_tables = Interactions::new(
+                i.connection_index,
+                InteractionsType::Property(Property::AllTableHaveExpectedContent {
+                    tables: env
+                        .connection_context(i.connection_index)
+                        .tables()
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect(),
+                }),
+            );
+
+            let out_interactions = check_all_tables.interactions();
+
+            self.push(check_all_tables);
+            return Some(out_interactions);
+        }
+
         if self.len() < num_interactions {
             let conn_index = env.choose_conn(rng);
             let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
@@ -559,6 +581,14 @@ impl Interactions {
         match &mut self.interactions {
             InteractionsType::Property(property) => property.get_extensional_queries(),
             InteractionsType::Query(..) | InteractionsType::Fault(..) => None,
+        }
+    }
+
+    /// Whether the interaction needs to check the database tables
+    pub fn check_tables(&self) -> bool {
+        match &self.interactions {
+            InteractionsType::Property(property) => property.check_tables(),
+            InteractionsType::Query(..) | InteractionsType::Fault(..) => false,
         }
     }
 }

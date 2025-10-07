@@ -116,6 +116,17 @@ pub enum Property {
     TableHasExpectedContent {
         table: String,
     },
+    /// AllTablesHaveExpectedContent is a property in which the table
+    /// must have the expected content, i.e. all the insertions and
+    /// updates and deletions should have been persisted in the way
+    /// we think they were.
+    /// The execution of the property is as follows
+    ///     SELECT * FROM <t>
+    ///     ASSERT <expected_content>
+    /// for each table in the simulator model
+    AllTableHaveExpectedContent {
+        tables: Vec<String>,
+    },
     /// Double Create Failure is a property in which creating
     /// the same table twice leads to an error.
     /// The execution of the property is as follows
@@ -222,11 +233,9 @@ pub enum Property {
     ///
     FsyncNoWait {
         query: Query,
-        tables: Vec<String>,
     },
     FaultyQuery {
         query: Query,
-        tables: Vec<String>,
     },
     /// Property used to subsititute a property with its queries only
     Queries {
@@ -249,6 +258,7 @@ impl Property {
             Property::InsertValuesSelect { .. } => "Insert-Values-Select",
             Property::ReadYourUpdatesBack { .. } => "Read-Your-Updates-Back",
             Property::TableHasExpectedContent { .. } => "Table-Has-Expected-Content",
+            Property::AllTableHaveExpectedContent { .. } => "All-Tables-Have-Expected-Content",
             Property::DoubleCreateFailure { .. } => "Double-Create-Failure",
             Property::SelectLimit { .. } => "Select-Limit",
             Property::DeleteSelect { .. } => "Delete-Select",
@@ -260,6 +270,11 @@ impl Property {
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
             Property::Queries { .. } => "Queries",
         }
+    }
+
+    /// Property Does some sort of fault injection
+    pub fn check_tables(&self) -> bool {
+        matches!(self, Property::FsyncNoWait { .. } | Property::FaultyQuery { .. })
     }
 
     pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
@@ -275,7 +290,8 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
-            | Property::TableHasExpectedContent { .. } => None,
+            | Property::TableHasExpectedContent { .. }
+            | Property::AllTableHaveExpectedContent { .. } => None,
         }
     }
 
@@ -455,7 +471,10 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
-            | Property::TableHasExpectedContent { .. } => unreachable!("No extensional queries"),
+            | Property::TableHasExpectedContent { .. }
+            | Property::AllTableHaveExpectedContent { .. } => {
+                unreachable!("No extensional queries")
+            }
         }
     }
 
@@ -464,6 +483,9 @@ impl Property {
     /// and `interaction` cannot be serialized directly.
     pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
         match self {
+            Property::AllTableHaveExpectedContent { tables } => {
+                assert_all_table_values(tables, connection_index).collect()
+            }
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
                 let table_name = table.clone();
@@ -1033,18 +1055,13 @@ impl Property {
                     Interaction::new(connection_index, assertion),
                 ]
             }
-            Property::FsyncNoWait { query, tables } => {
-                let checks = assert_all_table_values(tables, connection_index);
-                Vec::from_iter(
-                    std::iter::once(Interaction::new(
-                        connection_index,
-                        InteractionType::FsyncQuery(query.clone()),
-                    ))
-                    .chain(checks),
-                )
+            Property::FsyncNoWait { query } => {
+                vec![Interaction::new(
+                    connection_index,
+                    InteractionType::FsyncQuery(query.clone()),
+                )]
             }
-            Property::FaultyQuery { query, tables } => {
-                let checks = assert_all_table_values(tables, connection_index);
+            Property::FaultyQuery { query } => {
                 let query_clone = query.clone();
                 // A fault may not occur as we first signal we want a fault injected,
                 // then when IO is called the fault triggers. It may happen that a fault is injected
@@ -1071,13 +1088,13 @@ impl Property {
                         }
                     },
                 );
-                let first = [
+                [
                     InteractionType::FaultyQuery(query.clone()),
                     InteractionType::Assertion(assert),
                 ]
                 .into_iter()
-                .map(|i| Interaction::new(connection_index, i));
-                Vec::from_iter(first.chain(checks))
+                .map(|i| Interaction::new(connection_index, i))
+                .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let assumption = InteractionType::Assumption(Assertion::new(
@@ -1534,6 +1551,17 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::AllTableHaveExpectedContent {
+        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
+    }
+}
+
 fn property_select_limit<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1704,7 +1732,6 @@ fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
 ) -> Property {
     Property::FsyncNoWait {
         query: Query::arbitrary_from(rng, ctx, query_distr),
-        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
@@ -1716,7 +1743,6 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
 ) -> Property {
     Property::FaultyQuery {
         query: Query::arbitrary_from(rng, ctx, query_distr),
-        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
@@ -1732,6 +1758,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
+            PropertyDiscriminants::AllTableHaveExpectedContent => {
+                property_all_tables_have_expected_content
+            }
             PropertyDiscriminants::DoubleCreateFailure => property_double_create_failure,
             PropertyDiscriminants::SelectLimit => property_select_limit,
             PropertyDiscriminants::DeleteSelect => property_delete_select,
@@ -1774,6 +1803,8 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            // AllTableHaveExpectedContent should only be generated by Properties that inject faults
+            PropertyDiscriminants::AllTableHaveExpectedContent => 0,
             PropertyDiscriminants::DoubleCreateFailure => {
                 if !env.opts.disable_double_create_failure {
                     remaining.create / 2
@@ -1872,6 +1903,7 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
+            PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
             PropertyDiscriminants::SelectLimit => QueryCapabilities::SELECT,
             PropertyDiscriminants::DeleteSelect => {
