@@ -1239,26 +1239,33 @@ impl Limbo {
     }
 
     fn display_indexes(&mut self, maybe_table: Option<String>) -> anyhow::Result<()> {
-        let sql = match maybe_table {
-            Some(ref tbl_name) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
-            ),
-            None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
-        };
-
         let mut indexes = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
-                indexes.push_str(idx.as_str());
-                indexes.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(err) = self.handle_row(&sql, handler) {
-            if err.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", err));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match maybe_table {
+                Some(ref tbl_name) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
+                ),
+                None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        indexes.push_str(prefix);
+                        indexes.push('.');
+                    }
+                    indexes.push_str(idx.as_str());
+                    indexes.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(err) = self.handle_row(&sql, handler) {
+                if err.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", err));
+                }
             }
         }
         if !indexes.is_empty() {
@@ -1268,28 +1275,35 @@ impl Limbo {
     }
 
     fn display_tables(&mut self, pattern: Option<&str>) -> anyhow::Result<()> {
-        let sql = match pattern {
-            Some(pattern) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
-            ),
-            None => String::from(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
-            ),
-        };
-
         let mut tables = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
-                tables.push_str(table.as_str());
-                tables.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(e) = self.handle_row(&sql, handler) {
-            if e.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", e));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match pattern {
+                Some(pattern) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
+                ),
+                None => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                ),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        tables.push_str(prefix);
+                        tables.push('.');
+                    }
+                    tables.push_str(table.as_str());
+                    tables.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(e) = self.handle_row(&sql, handler) {
+                if e.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", e));
+                }
             }
         }
         if !tables.is_empty() {
@@ -1302,6 +1316,21 @@ impl Limbo {
             let _ = self.writeln(b"No tables found in the database.");
         }
         Ok(())
+    }
+
+    fn database_names(&mut self) -> anyhow::Result<Vec<String>> {
+        let sql = "PRAGMA database_list";
+        let mut db_names: Vec<String> = Vec::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            if let Ok(Value::Text(name)) = row.get::<&Value>(1) {
+                db_names.push(name.to_string());
+            }
+            Ok(())
+        };
+        match self.handle_row(&sql, handler) {
+            Ok(_) => Ok(db_names),
+            Err(e) => Err(anyhow::anyhow!("Error in database list: {}", e)),
+        }
     }
 
     fn handle_row<F>(&mut self, sql: &str, mut handler: F) -> anyhow::Result<()>
