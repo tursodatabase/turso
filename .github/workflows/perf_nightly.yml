@@ -1,7 +1,8 @@
 name: Nightly Benchmarks on Nyrkiö Runners (stability)
 
 on:
-  workflow_dispatch: ["main", "notmain", "master"]
+  workflow_dispatch:
+    branches: ["main", "notmain", "master"]
   schedule:
     - cron: '24 6,11,14,20 * * *'
   push:
