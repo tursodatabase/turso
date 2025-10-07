@@ -1666,9 +1666,7 @@ impl Pager {
                         "total time flushing cache: {} ms",
                         self.io
                             .now()
-                            .to_system_time()
-                            .duration_since(self.commit_info.read().time.to_system_time())
-                            .unwrap()
+                            .duration_since(self.commit_info.read().time)
                             .as_millis()
                     );
                     let (should_finish, result, completions) = {

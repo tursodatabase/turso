@@ -2020,9 +2020,7 @@ impl WalFile {
                         "total time spent checkpointing: {:?}",
                         self.io
                             .now()
-                            .to_system_time()
-                            .duration_since(self.ongoing_checkpoint.time.to_system_time())
-                            .expect("time")
+                            .duration_since(self.ongoing_checkpoint.time)
                             .as_millis()
                     );
                     self.ongoing_checkpoint.state = CheckpointState::Start;

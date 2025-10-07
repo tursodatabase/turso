@@ -44,11 +44,7 @@ impl IO for GenericIO {
 
 impl Clock for GenericIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        std::time::Instant::now()
     }
 }
 
