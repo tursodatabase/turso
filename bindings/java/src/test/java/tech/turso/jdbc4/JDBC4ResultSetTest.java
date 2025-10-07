@@ -686,4 +686,33 @@ class JDBC4ResultSetTest {
     assertFalse(resultSet.isBeforeFirst());
     assertTrue(resultSet.isAfterLast());
   }
+
+  @Test
+  void test_getRow() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_row (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (1);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (2);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (3);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_row");
+
+    // Before first row
+    assertEquals(0, resultSet.getRow());
+
+    // First row
+    resultSet.next();
+    assertEquals(1, resultSet.getRow());
+
+    // Second row
+    resultSet.next();
+    assertEquals(2, resultSet.getRow());
+
+    // Third row
+    resultSet.next();
+    assertEquals(3, resultSet.getRow());
+
+    // After last row
+    resultSet.next();
+    assertEquals(3, resultSet.getRow());
+  }
 }

@@ -453,7 +453,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int getRow() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return resultSet.getRow();
   }
 
   @Override
