@@ -703,7 +703,7 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
-        },
+        }
     }
 }
 
