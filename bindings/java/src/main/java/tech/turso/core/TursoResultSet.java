@@ -104,6 +104,11 @@ public final class TursoResultSet {
     return pastLastRow;
   }
 
+  /** Checks whether the result set is empty (has no rows). */
+  public boolean isEmpty() {
+    return isEmptyResultSet;
+  }
+
   /** Gets the current row number (0-based, 0 means before first row). */
   public int getRow() {
     return row;

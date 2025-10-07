@@ -413,6 +413,10 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public boolean isBeforeFirst() throws SQLException {
+    // Empty ResultSet should return false per JDBC spec
+    if (resultSet.isEmpty()) {
+      return false;
+    }
     return resultSet.isOpen() && resultSet.getRow() == 0 && !resultSet.isPastLastRow();
   }
 

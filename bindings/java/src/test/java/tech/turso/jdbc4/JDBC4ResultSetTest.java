@@ -675,7 +675,8 @@ class JDBC4ResultSetTest {
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_empty");
 
     // Before calling next()
-    assertTrue(resultSet.isBeforeFirst());
+    // Empty ResultSet should return false for isBeforeFirst()
+    assertFalse(resultSet.isBeforeFirst());
     assertFalse(resultSet.isAfterLast());
 
     // After calling next() on empty ResultSet
