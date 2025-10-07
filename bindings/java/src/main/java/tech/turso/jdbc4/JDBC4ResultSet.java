@@ -408,7 +408,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public BigDecimal getBigDecimal(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBigDecimal(findColumn(columnLabel));
   }
 
   @Override

@@ -631,4 +631,15 @@ class JDBC4ResultSetTest {
     assertTrue(resultSet.next());
     assertNull(resultSet.getCharacterStream(1));
   }
+
+  @Test
+  void test_getBigDecimal_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_bigdecimal (amount REAL);");
+    stmt.executeUpdate("INSERT INTO test_bigdecimal (amount) VALUES (12345.67);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_bigdecimal");
+    assertTrue(resultSet.next());
+
+    assertEquals(BigDecimal.valueOf(12345.67), resultSet.getBigDecimal("amount"));
+  }
 }
