@@ -1723,11 +1723,23 @@ impl<'a> Parser<'a> {
                                 _ => {
                                     let exprs = self.parse_expr_list()?;
                                     eat_expect!(self, TK_RP);
-                                    Box::new(Expr::InList {
-                                        lhs: result,
-                                        not,
-                                        rhs: exprs,
-                                    })
+                                    // Expressions in the form:
+                                    // lhs IN ()
+                                    // lhs NOT IN ()
+                                    // can be simplified to constants 0 (false) and 1 (true), respectively.
+                                    //
+                                    // todo: should check if lhs has a function. If so, this optimization cannot
+                                    // be done.
+                                    if exprs.is_empty() {
+                                        let name = if not { "1" } else { "0" };
+                                        Box::new(Expr::Literal(Literal::Numeric(name.into())))
+                                    } else {
+                                        Box::new(Expr::InList {
+                                            lhs: result,
+                                            not,
+                                            rhs: exprs,
+                                        })
+                                    }
                                 }
                             }
                         }

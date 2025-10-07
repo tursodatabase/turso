@@ -191,15 +191,6 @@ fn translate_in_list(
     dest_if_null: BranchOffset,
     resolver: &Resolver,
 ) -> Result<()> {
-    // Disclamer: SQLite does this opt during parsing (https://github.com/sqlite/sqlite/blob/833fb1ef59b1c62fb2b00c7a121a5b5171f8a85e/src/parse.y#L1425)
-    // But we're the cool kids so we gotta do during translation :)
-    if rhs.is_empty() {
-        program.emit_insn(Insn::Goto {
-            target_pc: dest_if_false,
-        });
-        return Ok(());
-    }
-
     let lhs_reg = expr_code_vector(program, lhs);
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
