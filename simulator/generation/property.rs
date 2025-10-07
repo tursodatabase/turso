@@ -929,14 +929,14 @@ impl Property {
                     format!("select query should result in an error for table '{table}'"),
                     move |stack: &Vec<ResultSet>, _| {
                         let last = stack.last().unwrap();
-                        dbg!(last);
                         match last {
                             Ok(success) => Ok(Err(format!(
                                 "expected table creation to fail but it succeeded: {success:?}"
                             ))),
                             Err(e) => match e {
-                                LimboError::ParseError(e)
-                                    if e.contains(&format!("no such table: {table_name}")) =>
+                                e if e
+                                    .to_string()
+                                    .contains(&format!("no such table: {table_name}")) =>
                                 {
                                     Ok(Ok(()))
                                 }
