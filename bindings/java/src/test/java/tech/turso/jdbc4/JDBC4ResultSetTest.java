@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Time;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.Properties;
@@ -765,5 +766,58 @@ class JDBC4ResultSetTest {
     Date date = resultSet.getDate("created_at", utcCal);
 
     assertNotNull(date);
+  }
+
+  @Test
+  void test_getTime_with_calendar() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_time_cal (time_col BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_time_cal (time_col) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_time_cal");
+    assertTrue(resultSet.next());
+
+    // Get time with UTC calendar
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Time utcTime2 = resultSet.getTime(1, utcCal);
+
+    // Get time with Seoul calendar (UTC+9)
+    Calendar seoulCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    Time seoulTime = resultSet.getTime(1, seoulCal);
+
+    // Seoul time should be 9 hours ahead
+    long timeDiff = seoulTime.getTime() - utcTime2.getTime();
+    assertEquals(9 * 60 * 60 * 1000, timeDiff);
+  }
+
+  @Test
+  void test_getTime_with_calendar_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_time_cal (created_at BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_time_cal (created_at) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_time_cal");
+    assertTrue(resultSet.next());
+
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Time time = resultSet.getTime("created_at", utcCal);
+
+    assertNotNull(time);
   }
 }
