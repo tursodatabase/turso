@@ -62,6 +62,7 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
+use std::cell::Cell;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -217,7 +218,7 @@ pub struct Database {
     shared_wal: Arc<RwLock<WalFileShared>>,
     db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
-    open_flags: OpenFlags,
+    open_flags: Cell<OpenFlags>,
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
@@ -231,7 +232,7 @@ impl fmt::Debug for Database {
         let mut debug_struct = f.debug_struct("Database");
         debug_struct
             .field("path", &self.path)
-            .field("open_flags", &self.open_flags);
+            .field("open_flags", &self.open_flags.get());
 
         // Database state information
         let db_state_value = match self.db_state.get() {
@@ -468,7 +469,7 @@ impl Database {
             db_file,
             builtin_syms: syms.into(),
             io: io.clone(),
-            open_flags: flags,
+            open_flags: flags.into(),
             db_state: Arc::new(AtomicDbState::new(db_state)),
             init_lock: Arc::new(Mutex::new(())),
             opts,
@@ -599,7 +600,7 @@ impl Database {
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.open_flags.contains(OpenFlags::ReadOnly)
+        self.open_flags.get().contains(OpenFlags::ReadOnly)
     }
 
     /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
@@ -1527,9 +1528,7 @@ impl Connection {
         db_opts: DatabaseOpts,
         io: Arc<dyn IO>,
     ) -> Result<Arc<Database>> {
-        let mut opts = OpenOptions::parse(uri)?;
-        // FIXME: for now, only support read only attach
-        opts.mode = OpenMode::ReadOnly;
+        let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
@@ -2090,9 +2089,15 @@ impl Connection {
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
+        let io: Arc<dyn IO> = if path.contains(":memory:") {
+            Arc::new(MemoryIO::new())
+        } else {
+            Arc::new(PlatformIO::new()?)
+        };
+        let db = Self::from_uri_attached(path, db_opts, io)?;
         let pager = Arc::new(db.init_pager(None)?);
-
+        // FIXME: for now, only support read only attach
+        db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
