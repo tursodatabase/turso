@@ -1755,6 +1755,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
             Some(TxTimestampOrID::TxID(tx_id)) => self.txs.get(tx_id).unwrap().value().begin_ts,
+            // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
+            //
+            // The row version chain should be append-only (aside from garbage collection),
+            // so the specific ordering handled by this function may not be critical. We might
+            // be able to append directly to the row version chain in the future.
+            //
+            // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
+            // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
+            // while actual timestamps will start from 1.
             None => 0,
         }
     }
