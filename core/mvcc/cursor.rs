@@ -2,7 +2,7 @@ use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
 use crate::types::{IOResult, SeekKey, SeekOp, SeekResult};
 use crate::util::{generate_random_rowid, MAX_ATTEMPTS_GENERATE_ROWID, MAX_ROWID};
-use crate::{LimboError, Result};
+use crate::{LimboError, Result, IO};
 use crate::{Pager, Value};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -165,7 +165,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         }
     }
 
-    pub fn get_next_rowid(&mut self) -> Result<i64> {
+    pub fn get_next_rowid(&mut self, io: &Arc<dyn IO>) -> Result<i64> {
         self.last();
         match self.current_pos {
             CursorPosition::Loaded(id) => {
@@ -173,7 +173,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
                     Ok(id.row_id + 1)
                 } else {
                     for _ in 0..MAX_ATTEMPTS_GENERATE_ROWID {
-                        let random_rowid = generate_random_rowid();
+                        let random_rowid = generate_random_rowid(io);
                         let IOResult::Done(exists) = self.exists(&Value::Integer(random_rowid))?
                         else {
                             todo!("io on mvcc exists not implemented yet");

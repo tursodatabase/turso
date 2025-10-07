@@ -6316,7 +6316,7 @@ pub fn op_new_rowid(
             let cursor = cursor.as_btree_mut();
             let mvcc_cursor = cursor.get_mvcc_cursor();
             let mut mvcc_cursor = mvcc_cursor.write();
-            mvcc_cursor.get_next_rowid()?
+            mvcc_cursor.get_next_rowid(&pager.io)?
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
         state.pc += 1;
@@ -6371,7 +6371,7 @@ pub fn op_new_rowid(
                     return Err(LimboError::DatabaseFull("Unable to find an unused rowid after 100 attempts - database is probably full".to_string()));
                 }
 
-                let random_rowid = generate_random_rowid();
+                let random_rowid = generate_random_rowid(&pager.io);
 
                 state.op_new_rowid_state = OpNewRowidState::VerifyingCandidate {
                     attempts,
