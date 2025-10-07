@@ -302,7 +302,7 @@ pub trait Wal: Debug {
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
-    fn rollback(&mut self) -> Result<()>;
+    fn rollback(&mut self);
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
@@ -1351,8 +1351,8 @@ impl Wal for WalFile {
         self.min_frame.load(Ordering::Acquire)
     }
 
-    #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn rollback(&mut self) -> Result<()> {
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn rollback(&mut self) {
         let (max_frame, last_checksum) = {
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::Acquire);
@@ -1369,7 +1369,6 @@ impl Wal for WalFile {
         self.last_checksum = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
         self.reset_internal_states();
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2825,7 +2824,7 @@ pub mod test {
             }
         }
         drop(w);
-        conn2.pager.write().end_read_tx().unwrap();
+        conn2.pager.write().end_read_tx();
 
         conn1
             .execute("create table test(id integer primary key, value text)")

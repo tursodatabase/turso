@@ -472,7 +472,7 @@ impl Schema {
             pager.io.block(|| cursor.next())?;
         }
 
-        pager.end_read_tx()?;
+        pager.end_read_tx();
 
         self.populate_indices(from_sql_indexes, automatic_indices)?;
 

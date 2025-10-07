@@ -498,10 +498,7 @@ impl Database {
                 schema.schema_version = header_schema_cookie;
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
-                    .or_else(|e| {
-                        pager.end_read_tx()?;
-                        Err(e)
-                    });
+                    .inspect_err(|_| pager.end_read_tx());
                 if let Err(LimboError::ExtensionError(e)) = result {
                     // this means that a vtab exists and we no longer have the module loaded. we print
                     // a warning to the user to load the module
@@ -559,12 +556,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: RwLock::new(pager),
-            schema: RwLock::new(
-                self.schema
-                    .lock()
-                    .map_err(|_| LimboError::SchemaLocked)?
-                    .clone(),
-            ),
+            schema: RwLock::new(self.schema.lock().unwrap().clone()),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
             transaction_state: RwLock::new(TransactionState::None),
@@ -836,17 +828,17 @@ impl Database {
 
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
-        let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let mut schema_ref = self.schema.lock().unwrap();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-    pub(crate) fn clone_schema(&self) -> Result<Arc<Schema>> {
-        let schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
-        Ok(schema.clone())
+    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+        let schema = self.schema.lock().unwrap();
+        schema.clone()
     }
 
-    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) -> Result<()> {
-        let mut schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
+        let mut schema = self.schema.lock().unwrap();
         if schema.schema_version < another.schema_version {
             tracing::debug!(
                 "DB schema is outdated: {} < {}",
@@ -861,7 +853,6 @@ impl Database {
                 another.schema_version
             );
         }
-        Ok(())
     }
 
     pub fn get_mv_store(&self) -> Option<&Arc<MvStore>> {
@@ -1155,7 +1146,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let pager = self.pager.read().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -1202,11 +1193,11 @@ impl Connection {
                 0
             }
             Err(err) => {
-                pager.end_read_tx().expect("read txn must be finished");
+                pager.end_read_tx();
                 return Err(err);
             }
         };
-        pager.end_read_tx().expect("read txn must be finished");
+        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().unwrap().schema_version;
         tracing::debug!(
@@ -1243,13 +1234,14 @@ impl Connection {
         // close opened transaction if it was kept open
         // (in most cases, it will be automatically closed if stmt was executed properly)
         if previous == TransactionState::Read {
-            pager.end_read_tx().expect("read txn must be finished");
+            pager.end_read_tx();
         }
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema)
+        self.db.update_schema_if_newer(schema);
+        Ok(())
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
@@ -1304,7 +1296,7 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -1338,7 +1330,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -1390,7 +1382,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
@@ -1539,20 +1531,14 @@ impl Connection {
         Ok(db)
     }
 
-    pub fn maybe_update_schema(&self) -> Result<()> {
+    pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
-        let schema = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?;
+        let schema = self.db.schema.lock().unwrap();
         if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
         }
-
-        Ok(())
     }
 
     /// Read schema version at current transaction
@@ -1664,7 +1650,7 @@ impl Connection {
         let pager = self.pager.read();
         pager.begin_read_tx()?;
         pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx().expect("read txn must be closed");
+            pager.end_read_tx();
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
@@ -1712,13 +1698,11 @@ impl Connection {
                 wal.end_read_tx();
             }
 
-            let rollback_err = if !force_commit {
+            if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
-                pager.rollback(false, self, true).err()
-            } else {
-                None
-            };
-            if let Some(err) = commit_err.or(rollback_err) {
+                pager.rollback(false, self, true);
+            }
+            if let Some(err) = commit_err {
                 return Err(err);
             }
         }
@@ -1762,12 +1746,7 @@ impl Connection {
             _ => {
                 if !self.mvcc_enabled() {
                     let pager = self.pager.read();
-                    pager.io.block(|| {
-                        pager.end_tx(
-                            true, // rollback = true for close
-                            self,
-                        )
-                    })?;
+                    pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
             }
@@ -2074,12 +2053,7 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?
-            .indexes_enabled();
+        let use_indexes = self.db.schema.lock().unwrap().indexes_enabled();
         let use_mvcc = self.db.mv_store.is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
@@ -2471,6 +2445,12 @@ pub struct Statement {
     busy_timeout: Option<BusyTimeout>,
 }
 
+impl Drop for Statement {
+    fn drop(&mut self) {
+        self.reset();
+    }
+}
+
 impl Statement {
     pub fn new(
         program: vdbe::Program,
@@ -2620,7 +2600,8 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.write() = conn.db.clone_schema()?;
+
+        *conn.schema.write() = conn.db.clone_schema();
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2648,7 +2629,7 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self._reset(Some(max_registers), Some(cursor_count));
+        self.reset_internal(Some(max_registers), Some(cursor_count));
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -2670,12 +2651,8 @@ impl Statement {
             }
             let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
+                self.pager.rollback_tx(&self.program.connection);
                 self.program.connection.set_tx_state(TransactionState::None);
-                assert!(
-                    matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
-                );
             }
         }
         res
@@ -2766,10 +2743,17 @@ impl Statement {
     }
 
     pub fn reset(&mut self) {
-        self._reset(None, None);
+        self.reset_internal(None, None);
     }
 
-    pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+    fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
+        self.program.abort(
+            self.mv_store.as_ref(),
+            &self.pager,
+            None,
+            &mut self.state.auto_txn_cleanup,
+        );
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_timeout = None;

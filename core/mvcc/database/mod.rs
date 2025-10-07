@@ -654,7 +654,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema)?;
+                    connection.db.update_schema_if_newer(schema);
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
@@ -1354,7 +1354,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
-    ) -> Result<IOResult<TxID>> {
+    ) -> Result<TxID> {
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -1390,7 +1390,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
-        Ok(IOResult::Done(tx_id))
+        Ok(tx_id)
     }
 
     /// Begins a new transaction in the database.
@@ -1578,12 +1578,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(
-        &self,
-        tx_id: TxID,
-        _pager: Arc<Pager>,
-        connection: &Connection,
-    ) -> Result<()> {
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
         *connection.mv_tx.write() = None;
@@ -1618,7 +1613,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema()?;
+            *connection.schema.write() = connection.db.clone_schema();
         }
 
         let tx = tx_unlocked.value();
@@ -1627,8 +1622,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
-
-        Ok(())
     }
 
     /// Returns true if the given transaction is the exclusive transaction.

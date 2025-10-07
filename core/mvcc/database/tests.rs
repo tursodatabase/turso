@@ -347,8 +347,7 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row3, row4);
     db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.read().clone(), &db.conn)
-        .unwrap();
+        .rollback_tx(tx1, db.conn.pager.read().clone(), &db.conn);
     let tx2 = db
         .mvcc_store
         .begin_tx(db.conn.pager.read().clone())
@@ -592,8 +591,7 @@ fn test_lost_update() {
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
     db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.read().clone(), &conn3)
-        .unwrap();
+        .rollback_tx(tx3, conn3.pager.read().clone(), &conn3);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
