@@ -1,6 +1,7 @@
 package tech.turso.jdbc4;
 
 import java.io.InputStream;
+import java.io.StringReader;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -380,13 +381,17 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public Reader getCharacterStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(() -> new StringReader((String) result));
   }
 
   @Override
   @SkipNullableCheck
   public Reader getCharacterStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getCharacterStream(findColumn(columnLabel));
   }
 
   @Override

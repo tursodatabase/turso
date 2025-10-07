@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.ResultSet;
@@ -588,5 +589,46 @@ class JDBC4ResultSetTest {
 
     assertEquals(1, resultSet.findColumn("user name"));
     assertEquals(2, resultSet.findColumn("user-id"));
+  }
+
+  @Test
+  void test_getCharacterStream() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_char_stream (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_char_stream (text_col) VALUES ('Hello World');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_char_stream");
+    assertTrue(resultSet.next());
+
+    Reader reader = resultSet.getCharacterStream(1);
+    char[] buffer = new char[11];
+    int charsRead = reader.read(buffer);
+
+    assertEquals(11, charsRead);
+    assertEquals("Hello World", new String(buffer));
+  }
+
+  @Test
+  void test_getCharacterStream_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_char_stream (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_char_stream (text_col) VALUES ('Test Data');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_char_stream");
+    assertTrue(resultSet.next());
+
+    Reader reader = resultSet.getCharacterStream("text_col");
+    char[] buffer = new char[9];
+    reader.read(buffer);
+
+    assertEquals("Test Data", new String(buffer));
+  }
+
+  @Test
+  void test_getCharacterStream_returns_null_on_null() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_null (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_null (text_col) VALUES (NULL);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_null");
+    assertTrue(resultSet.next());
+    assertNull(resultSet.getCharacterStream(1));
   }
 }
