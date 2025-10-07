@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use anyhow::Context;
+use bitflags::bitflags;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,8 @@ use turso_parser::ast::Distinctness;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 // This type represents the potential queries on the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
+#[strum_discriminants(derive(strum::VariantArray, strum::EnumIter))]
 pub enum Query {
     Create(Create),
     Select(Select),
@@ -112,6 +114,74 @@ impl Shadow for Query {
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
         }
+    }
+}
+
+bitflags! {
+    pub struct QueryCapabilities: u32 {
+        const CREATE = 1 << 0;
+        const SELECT = 1 << 1;
+        const INSERT = 1 << 2;
+        const DELETE = 1 << 3;
+        const UPDATE = 1 << 4;
+        const DROP = 1 << 5;
+        const CREATE_INDEX = 1 << 6;
+    }
+}
+
+impl QueryCapabilities {
+    // TODO: can be const fn in the future
+    pub fn from_list_queries(queries: &[QueryDiscriminants]) -> Self {
+        queries
+            .iter()
+            .fold(Self::empty(), |accum, q| accum.union(q.into()))
+    }
+}
+
+impl From<&QueryDiscriminants> for QueryCapabilities {
+    fn from(value: &QueryDiscriminants) -> Self {
+        (*value).into()
+    }
+}
+
+impl From<QueryDiscriminants> for QueryCapabilities {
+    fn from(value: QueryDiscriminants) -> Self {
+        match value {
+            QueryDiscriminants::Create => Self::CREATE,
+            QueryDiscriminants::Select => Self::SELECT,
+            QueryDiscriminants::Insert => Self::INSERT,
+            QueryDiscriminants::Delete => Self::DELETE,
+            QueryDiscriminants::Update => Self::UPDATE,
+            QueryDiscriminants::Drop => Self::DROP,
+            QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
+            QueryDiscriminants::Begin
+            | QueryDiscriminants::Commit
+            | QueryDiscriminants::Rollback => {
+                unreachable!("QueryCapabilities do not apply to transaction queries")
+            }
+        }
+    }
+}
+
+impl QueryDiscriminants {
+    pub const ALL_NO_TRANSACTION: &[QueryDiscriminants] = &[
+        QueryDiscriminants::Select,
+        QueryDiscriminants::Create,
+        QueryDiscriminants::Insert,
+        QueryDiscriminants::Update,
+        QueryDiscriminants::Delete,
+        QueryDiscriminants::Drop,
+        QueryDiscriminants::CreateIndex,
+    ];
+
+    #[inline]
+    pub fn is_transaction(&self) -> bool {
+        matches!(self, Self::Begin | Self::Commit | Self::Rollback)
+    }
+
+    #[inline]
+    pub fn is_ddl(&self) -> bool {
+        matches!(self, Self::Create | Self::CreateIndex | Self::Drop)
     }
 }
 

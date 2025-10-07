@@ -17,7 +17,7 @@ use crate::{
 
 impl Predicate {
     /// Generate an [ast::Expr::Binary] [Predicate] from a column and [SimValue]
-    pub fn from_column_binary<R: rand::Rng, C: GenerationContext>(
+    pub fn from_column_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         column_name: &str,
@@ -55,7 +55,7 @@ impl Predicate {
     }
 
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
-    pub fn true_binary<R: rand::Rng, C: GenerationContext>(
+    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -168,7 +168,7 @@ impl Predicate {
     }
 
     /// Produces an [ast::Expr::Binary] [Predicate] that is false for the provided row in the given table
-    pub fn false_binary<R: rand::Rng, C: GenerationContext>(
+    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -253,7 +253,7 @@ impl Predicate {
 
 impl SimplePredicate {
     /// Generates a true [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn true_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -311,7 +311,7 @@ impl SimplePredicate {
     }
 
     /// Generates a false [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn false_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -373,7 +373,7 @@ impl CompoundPredicate {
     /// Decide if you want to create an AND or an OR
     ///
     /// Creates a Compound Predicate that is TRUE or FALSE for at least a single row
-    pub fn from_table_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn from_table_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,

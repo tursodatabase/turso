@@ -1,3 +1,6 @@
+use rand::distr::weighted::WeightedIndex;
+use sql_generation::generation::GenerationContext;
+
 use crate::runner::env::ShadowTablesMut;
 
 pub mod plan;
@@ -16,4 +19,16 @@ pub mod query;
 pub(crate) trait Shadow {
     type Result;
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result;
+}
+
+pub(super) trait WeightedDistribution {
+    type Item;
+    type GenItem;
+    fn items(&self) -> &[Self::Item];
+    fn weights(&self) -> &WeightedIndex<u32>;
+    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+        &self,
+        rng: &mut R,
+        context: &C,
+    ) -> Self::GenItem;
 }
