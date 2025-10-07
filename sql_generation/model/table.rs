@@ -136,8 +136,43 @@ pub struct JoinTable {
     pub rows: Vec<Vec<SimValue>>,
 }
 
+impl From<JoinTable> for Table {
+    fn from(value: JoinTable) -> Self {
+        Table {
+            name: value
+                .tables
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<Vec<_>>()
+                .join("_"),
+            columns: value
+                .tables
+                .iter()
+                .flat_map(|table| table.columns.clone())
+                .collect(),
+            rows: value.rows,
+            indexes: vec![],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct SimValue(pub turso_core::Value);
+
+impl SimValue {
+    pub fn int(i: i64) -> Self {
+        Self(types::Value::Integer(i))
+    }
+    pub fn float(f: f64) -> Self {
+        Self(types::Value::Float(f))
+    }
+    pub fn text(s: String) -> Self {
+        Self(types::Value::build_text(s))
+    }
+    pub fn blob(b: Vec<u8>) -> Self {
+        Self(types::Value::Blob(b))
+    }
+}
 
 fn to_sqlite_blob(bytes: &[u8]) -> String {
     format!(
