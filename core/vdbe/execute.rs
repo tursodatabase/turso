@@ -6832,6 +6832,11 @@ pub fn op_create_btree(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub enum OpDestroyState {
+    CreateCursor,
+    DestroyBtree(Arc<RwLock<BTreeCursor>>),
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -6855,15 +6860,26 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
-    let former_root_page_result = cursor.btree_destroy()?;
-    if let IOResult::Done(former_root_page) = former_root_page_result {
-        state.registers[*former_root_reg] =
-            Register::Value(Value::Integer(former_root_page.unwrap_or(0) as i64));
+
+    loop {
+        match state.op_destroy_state {
+            OpDestroyState::CreateCursor => {
+                // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
+                // table btree cursor for both.
+                let cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
+                state.op_destroy_state =
+                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
+            }
+            OpDestroyState::DestroyBtree(ref mut cursor) => {
+                let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
+                state.registers[*former_root_reg] =
+                    Register::Value(Value::Integer(maybe_former_root_page.unwrap_or(0) as i64));
+                state.op_destroy_state = OpDestroyState::CreateCursor;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_reset_sorter(
