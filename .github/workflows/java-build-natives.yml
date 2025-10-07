@@ -1,0 +1,133 @@
+name: Build Java Native Libraries
+
+on:
+  # Manually trigger the workflow
+  workflow_dispatch:
+  # Trigger on PRs affecting Java bindings
+  pull_request:
+    paths:
+      - 'bindings/java/**'
+      - '.github/workflows/java-build-natives.yml'
+  # Trigger on push to main
+  push:
+    branches:
+      - main
+    paths:
+      - 'bindings/java/**'
+      - '.github/workflows/java-build-natives.yml'
+  # Allow this workflow to be called by other workflows
+  workflow_call:
+
+env:
+  working-directory: bindings/java
+
+jobs:
+  build-natives:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            make-target: linux_x86
+            artifact-name: linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            make-target: macos_x86
+            artifact-name: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            make-target: macos_arm64
+            artifact-name: macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-pc-windows-gnu
+            make-target: windows
+            artifact-name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Windows on Linux)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+
+      - name: Build native library
+        run: make ${{ matrix.make-target }}
+
+      - name: Verify build output
+        run: |
+          echo "Build completed for ${{ matrix.target }}"
+          ls -lah libs/
+          find libs/ -type f
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact-name }}
+          path: ${{ env.working-directory }}/libs/
+          retention-days: 7
+
+  # Test job to verify all natives were built
+  verify-natives:
+    needs: build-natives
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all native libraries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: ${{ env.working-directory }}/libs-collected
+          merge-multiple: true
+
+      - name: Verify all platforms built
+        run: |
+          echo "Collected native libraries:"
+          ls -R libs-collected/
+
+          # Check that all expected files exist
+          expected_files=(
+            "libs-collected/macos_x86/lib_turso_java.dylib"
+            "libs-collected/macos_arm64/lib_turso_java.dylib"
+            "libs-collected/windows/lib_turso_java.dll"
+            "libs-collected/linux_x86/lib_turso_java.so"
+          )
+
+          all_found=true
+          for file in "${expected_files[@]}"; do
+            if [ -f "$file" ]; then
+              echo "✓ Found: $file"
+            else
+              echo "✗ Missing: $file"
+              all_found=false
+            fi
+          done
+
+          if [ "$all_found" = false ]; then
+            echo "ERROR: Not all native libraries were built"
+            exit 1
+          fi
+
+          echo "✓ All native libraries built successfully!"

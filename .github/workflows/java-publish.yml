@@ -7,15 +7,12 @@ on:
       release-version:
         description: 'Release version (e.g., 0.0.1)'
         required: false
-  # Trigger on release tags
-  push:
-    tags:
-      - 'java-v*'
 
 env:
   working-directory: bindings/java
 
 jobs:
+  # Publish to Maven Central (assumes native libraries already exist in libs/)
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -28,9 +25,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
@@ -40,11 +34,53 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build native libraries
-        run: make build
+      - name: Install Rust (for test builds)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native libraries exist
+        run: |
+          echo "Checking for native libraries in libs/ directory..."
+          if [ ! -d "libs" ]; then
+            echo "ERROR: libs/ directory not found"
+            echo "Please ensure native libraries are committed or built before publishing"
+            exit 1
+          fi
+          echo "Native libraries found:"
+          ls -R libs/
+
+      - name: Build test natives
+        run: make build_test
 
       - name: Run tests
         run: ./gradlew test
+
+      - name: Build and sign artifacts
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          ./gradlew clean build --no-daemon --stacktrace
+
+      - name: Verify build artifacts
+        run: |
+          echo "Build artifacts:"
+          ls -lah build/libs/
+          echo ""
+          echo "Checking for required files..."
+          required_files=(
+            "build/libs/turso-*.jar"
+            "build/libs/turso-*-sources.jar"
+            "build/libs/turso-*-javadoc.jar"
+            "build/libs/turso-*.jar.asc"
+          )
+          for pattern in "${required_files[@]}"; do
+            if ls $pattern 1> /dev/null 2>&1; then
+              echo "✓ Found: $pattern"
+            else
+              echo "✗ Missing: $pattern"
+              exit 1
+            fi
+          done
 
       - name: Publish to Maven Central
         env:
@@ -53,4 +89,13 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
+          echo "Publishing to Maven Central..."
           ./gradlew publishToMavenCentral --no-daemon --stacktrace
+
+      - name: Upload bundle artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-central-bundle
+          path: ${{ env.working-directory }}/build/maven-central/*.zip
+          retention-days: 7
