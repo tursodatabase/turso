@@ -1,5 +1,7 @@
 package tech.turso.jdbc4;
 
+import static org.junit.jupiter.api.Assertions.*;
+
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -14,8 +16,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import tech.turso.TestUtils;
-
-import static org.junit.jupiter.api.Assertions.*;
 
 class JDBC4ResultSetTest {
 

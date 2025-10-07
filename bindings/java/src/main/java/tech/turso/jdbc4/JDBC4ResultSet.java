@@ -1,8 +1,8 @@
 package tech.turso.jdbc4;
 
 import java.io.InputStream;
-import java.io.StringReader;
 import java.io.Reader;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.net.URL;
@@ -820,8 +820,9 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     final Calendar localCal = Calendar.getInstance();
     localCal.setTime(date);
 
-    final long offset = cal.getTimeZone().getOffset(date.getTime()) -
-        localCal.getTimeZone().getOffset(date.getTime());
+    final long offset =
+        cal.getTimeZone().getOffset(date.getTime())
+            - localCal.getTimeZone().getOffset(date.getTime());
 
     return new Date(date.getTime() + offset);
   }
@@ -843,8 +844,9 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     final Calendar localCal = Calendar.getInstance();
     localCal.setTime(time);
 
-    final long offset = cal.getTimeZone().getOffset(time.getTime()) -
-        localCal.getTimeZone().getOffset(time.getTime());
+    final long offset =
+        cal.getTimeZone().getOffset(time.getTime())
+            - localCal.getTimeZone().getOffset(time.getTime());
 
     return new Time(time.getTime() + offset);
   }
@@ -866,8 +868,9 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     final Calendar localCal = Calendar.getInstance();
     localCal.setTime(timestamp);
 
-    final long offset = cal.getTimeZone().getOffset(timestamp.getTime()) -
-        localCal.getTimeZone().getOffset(timestamp.getTime());
+    final long offset =
+        cal.getTimeZone().getOffset(timestamp.getTime())
+            - localCal.getTimeZone().getOffset(timestamp.getTime());
 
     return new Timestamp(timestamp.getTime() + offset);
   }
