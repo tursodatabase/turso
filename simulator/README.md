@@ -27,9 +27,6 @@ SELECT * FROM marvelous_ideal WHERE (devoted_ahmed = -9142609771.541502 AND lovi
 The simulator starts from an initially empty database, adding random interactions based on the workload distribution. It can
 add random queries unrelated to the properties without breaking the property invariants to reach more diverse states and respect the configured workload distribution.
 
-The simulator executes the interaction plans in a loop, and checks the assertions. It can add random queries unrelated to the properties without
-breaking the property invariants to reach more diverse states and respect the configured workload distribution.
-
 The simulator code is broken into 4 main parts:
 
 - **Simulator(main.rs)**: The main entry point of the simulator. It generates random configurations and interaction plans, and executes them.

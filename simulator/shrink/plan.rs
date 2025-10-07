@@ -131,6 +131,7 @@ impl InteractionPlan {
                             | Property::WhereTrueFalseNull { .. }
                             | Property::UNIONAllPreservesCardinality { .. }
                             | Property::ReadYourUpdatesBack { .. }
+                            | Property::InsertSelectNested { .. }
                             | Property::TableHasExpectedContent { .. } => {}
                         }
                     }
@@ -341,6 +342,7 @@ impl InteractionPlan {
                     | Property::FsyncNoWait { .. }
                     | Property::ReadYourUpdatesBack { .. }
                     | Property::TableHasExpectedContent { .. }
+                    | Property::InsertSelectNested { .. }
                     | Property::AllTableHaveExpectedContent { .. } => {}
                 }
             }

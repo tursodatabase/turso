@@ -82,7 +82,7 @@ impl Select {
                     distinctness: distinct,
                     columns: result_columns,
                     from: Some(FromClause {
-                        table,
+                        table: SelectTable::Table(table),
                         joins: Vec::new(),
                     }),
                     where_clause,
@@ -112,7 +112,7 @@ impl Select {
         }
         let from = self.body.select.from.as_ref().unwrap();
         let mut tables = IndexSet::new();
-        tables.insert(from.table.clone());
+        tables.extend(from.table.dependencies());
 
         tables.extend(from.dependencies());
 
@@ -178,19 +178,28 @@ pub struct CompoundSelect {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FromClause {
     /// table
-    pub table: String,
+    pub table: SelectTable,
     /// `JOIN`ed tables
     pub joins: Vec<JoinedTable>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SelectTable {
+    Table(String),
+    Select(Select),
 }
 
 impl FromClause {
     fn to_sql_ast(&self) -> ast::FromClause {
         ast::FromClause {
-            select: Box::new(ast::SelectTable::Table(
-                ast::QualifiedName::single(ast::Name::from_string(&self.table)),
-                None,
-                None,
-            )),
+            select: Box::new(match &self.table {
+                SelectTable::Table(table) => ast::SelectTable::Table(
+                    ast::QualifiedName::single(ast::Name::from_string(table)),
+                    None,
+                    None,
+                ),
+                SelectTable::Select(select) => ast::SelectTable::Select(select.to_sql_ast(), None),
+            }),
             joins: self
                 .joins
                 .iter()
@@ -214,7 +223,7 @@ impl FromClause {
     }
 
     pub fn dependencies(&self) -> Vec<String> {
-        let mut deps = vec![self.table.clone()];
+        let mut deps = self.table.dependencies();
         for join in &self.joins {
             deps.push(join.table.clone());
         }
@@ -222,9 +231,15 @@ impl FromClause {
     }
 
     pub fn into_join_table(&self, tables: &[Table]) -> JoinTable {
+        let self_table = if let SelectTable::Table(table) = &self.table {
+            table.clone()
+        } else {
+            unimplemented!("into_join_table is only implemented for Table");
+        };
+
         let first_table = tables
             .iter()
-            .find(|t| t.name == self.table)
+            .find(|t| t.name == self_table)
             .expect("Table not found");
 
         let mut join_table = JoinTable {
@@ -369,6 +384,27 @@ impl Select {
 impl Display for Select {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_sql_ast().displayer(&BlankContext).fmt(f)
+    }
+}
+
+impl SelectTable {
+    pub fn dependencies(&self) -> Vec<String> {
+        match self {
+            SelectTable::Table(table) => vec![table.to_owned()],
+            SelectTable::Select(select) => {
+                if let Some(from) = &select.body.select.from {
+                    let mut v = from.table.dependencies();
+                    v.extend(
+                        from.joins
+                            .iter()
+                            .map(|joined_table| joined_table.table.clone()),
+                    );
+                    v
+                } else {
+                    vec![]
+                }
+            }
+        }
     }
 }
 
