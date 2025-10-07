@@ -812,3 +812,7 @@ do_execsql_test_on_specific_db {:memory:} null-in-search {
 2|2
 2|2}
 
+do_execsql_test_in_memory_any_error limit-column-reference-error {
+  CREATE TABLE t(a);
+  SELECT * FROM t LIMIT (t.a);
+}
