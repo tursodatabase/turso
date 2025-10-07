@@ -2035,6 +2035,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn set_checkpoint_threshold(&self, threshold: u64) {
         self.storage.set_checkpoint_threshold(threshold)
     }
+
+    pub fn checkpoint_threshold(&self) -> u64 {
+        self.storage.checkpoint_threshold()
+    }
 }
 
 /// A write-write conflict happens when transaction T_current attempts to update a
