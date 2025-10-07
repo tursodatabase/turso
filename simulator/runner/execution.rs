@@ -368,6 +368,9 @@ fn execute_query_rusqlite(
             }
             Ok(result)
         }
+        Query::Placeholder => {
+            unreachable!("simulation cannot have a placeholder Query for execution")
+        }
         _ => {
             connection.execute(query.to_string().as_str(), ())?;
             Ok(vec![])

@@ -29,7 +29,7 @@ fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
 }
 
 fn random_select<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
-    if rng.random_bool(0.7) {
+    if !conn_ctx.tables().is_empty() && rng.random_bool(0.7) {
         Query::Select(Select::arbitrary(rng, conn_ctx))
     } else {
         // Random expression
@@ -111,27 +111,36 @@ impl QueryDiscriminants {
             | QueryDiscriminants::Rollback => {
                 unreachable!("transactional queries should not be generated")
             }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("Query Placeholders should not be generated")
+            }
         }
     }
 
     pub fn weight(&self, remaining: &Remaining) -> u32 {
         match self {
             QueryDiscriminants::Create => remaining.create,
-            QueryDiscriminants::Select => remaining.select + remaining.select / 3, // remaining.select / 3 is for the random_expr generation
+            // remaining.select / 3 is for the random_expr generation
+            // have a max of 1 so that we always generate at least a non zero weight for `QueryDistribution`
+            QueryDiscriminants::Select => (remaining.select + remaining.select / 3).max(1),
             QueryDiscriminants::Insert => remaining.insert,
             QueryDiscriminants::Delete => remaining.delete,
             QueryDiscriminants::Update => remaining.update,
-            QueryDiscriminants::Drop => 0,
+            QueryDiscriminants::Drop => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
                 unreachable!("transactional queries should not be generated")
             }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("Query Placeholders should not be generated")
+            }
         }
     }
 }
 
+#[derive(Debug)]
 pub(super) struct QueryDistribution {
     queries: &'static [QueryDiscriminants],
     weights: WeightedIndex<u32>,

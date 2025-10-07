@@ -24,6 +24,13 @@ impl Insert {
             Insert::Values { table, .. } | Insert::Select { table, .. } => table,
         }
     }
+
+    pub fn rows(&self) -> &[Vec<SimValue>] {
+        match self {
+            Insert::Values { values, .. } => values,
+            Insert::Select { .. } => unreachable!(),
+        }
+    }
 }
 
 impl Display for Insert {

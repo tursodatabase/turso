@@ -83,6 +83,18 @@ impl<'a, 'b> ShadowTablesMut<'a>
 where
     'a: 'b,
 {
+    /// Creation of [ShadowTablesMut] outside of [SimulatorEnv] should be done sparingly and carefully.
+    /// Should only need to call this function if we need to do shadowing in a temporary model table
+    pub fn new(
+        commited_tables: &'a mut Vec<Table>,
+        transaction_tables: &'a mut Option<TransactionTables>,
+    ) -> Self {
+        ShadowTablesMut {
+            commited_tables,
+            transaction_tables,
+        }
+    }
+
     fn tables(&'a self) -> &'a Vec<Table> {
         self.transaction_tables
             .as_ref()

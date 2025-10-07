@@ -1,3 +1,10 @@
+//! FIXME: With the current API and generation logic in plan.rs,
+//! for Properties that have intermediary queries we need to CLONE the current Context tables
+//! to properly generate queries, as we need to shadow after each query generated to make sure we are generating
+//! queries that are valid. This is specially valid with DROP and ALTER TABLE in the mix, because with outdated context
+//! we can generate queries that reference tables that do not exist. This is not a correctness issue, but more of
+//! an optimization issue that is good to point out for the future
+
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use sql_generation::{
@@ -26,10 +33,33 @@ use crate::{
     },
     model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
-    runner::env::SimulatorEnv,
+    runner::env::{ShadowTablesMut, SimulatorEnv},
 };
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
+
+#[derive(Debug, Clone, Copy)]
+struct PropertyGenContext<'a> {
+    tables: &'a Vec<sql_generation::model::table::Table>,
+    opts: &'a sql_generation::generation::Opts,
+}
+
+impl<'a> PropertyGenContext<'a> {
+    #[inline]
+    fn new(tables: &'a Vec<Table>, opts: &'a Opts) -> Self {
+        Self { tables, opts }
+    }
+}
+
+impl<'a> GenerationContext for PropertyGenContext<'a> {
+    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
+        self.tables
+    }
+
+    fn opts(&self) -> &sql_generation::generation::Opts {
+        self.opts
+    }
+}
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -85,6 +115,17 @@ pub enum Property {
     ///     ASSERT <expected_content>
     TableHasExpectedContent {
         table: String,
+    },
+    /// AllTablesHaveExpectedContent is a property in which the table
+    /// must have the expected content, i.e. all the insertions and
+    /// updates and deletions should have been persisted in the way
+    /// we think they were.
+    /// The execution of the property is as follows
+    ///     SELECT * FROM <t>
+    ///     ASSERT <expected_content>
+    /// for each table in the simulator model
+    AllTableHaveExpectedContent {
+        tables: Vec<String>,
     },
     /// Double Create Failure is a property in which creating
     /// the same table twice leads to an error.
@@ -192,11 +233,9 @@ pub enum Property {
     ///
     FsyncNoWait {
         query: Query,
-        tables: Vec<String>,
     },
     FaultyQuery {
         query: Query,
-        tables: Vec<String>,
     },
     /// Property used to subsititute a property with its queries only
     Queries {
@@ -210,12 +249,16 @@ pub struct InteractiveQueryInfo {
     end_with_commit: bool,
 }
 
+type PropertyQueryGenFunc<'a, R, G> =
+    fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
+
 impl Property {
     pub(crate) fn name(&self) -> &str {
         match self {
             Property::InsertValuesSelect { .. } => "Insert-Values-Select",
             Property::ReadYourUpdatesBack { .. } => "Read-Your-Updates-Back",
             Property::TableHasExpectedContent { .. } => "Table-Has-Expected-Content",
+            Property::AllTableHaveExpectedContent { .. } => "All-Tables-Have-Expected-Content",
             Property::DoubleCreateFailure { .. } => "Double-Create-Failure",
             Property::SelectLimit { .. } => "Select-Limit",
             Property::DeleteSelect { .. } => "Delete-Select",
@@ -227,6 +270,14 @@ impl Property {
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
             Property::Queries { .. } => "Queries",
         }
+    }
+
+    /// Property Does some sort of fault injection
+    pub fn check_tables(&self) -> bool {
+        matches!(
+            self,
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. }
+        )
     }
 
     pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
@@ -242,7 +293,191 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
-            | Property::TableHasExpectedContent { .. } => None,
+            | Property::TableHasExpectedContent { .. }
+            | Property::AllTableHaveExpectedContent { .. } => None,
+        }
+    }
+
+    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
+    where
+        R: rand::Rng + ?Sized,
+        G: GenerationContext,
+    {
+        match self {
+            Property::InsertValuesSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [x] The inserted row will not be deleted.
+                // - [x] The inserted row will not be updated.
+                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
+                    let Property::InsertValuesSelect {
+                        insert, row_index, ..
+                    } = property
+                    else {
+                        unreachable!();
+                    };
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    let table_name = insert.table();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+
+                    let rows = insert.rows();
+                    let row = &rows[*row_index];
+
+                    match &query {
+                        Query::Delete(Delete {
+                            table: t,
+                            predicate,
+                        }) if t == &table.name && predicate.test(row, table) => {
+                            // The inserted row will not be deleted.
+                            None
+                        }
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Update(Update {
+                            table: t,
+                            set_values: _,
+                            predicate,
+                        }) if t == &table.name && predicate.test(row, table) => {
+                            // The inserted row will not be updated.
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot drop the table we are inserting
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DoubleCreateFailure { .. } => {
+                // The interactions in the middle has the following constraints;
+                // - [x] There will be no errors in the middle interactions.(best effort)
+                // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
+                    let Property::DoubleCreateFailure { create, .. } = property else {
+                        unreachable!()
+                    };
+
+                    let table_name = create.table.name.clone();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    match &query {
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot Drop the created table
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DeleteSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [x] A row that holds for the predicate will not be inserted.
+                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+
+                |rng, ctx, query_distr, property| {
+                    let Property::DeleteSelect {
+                        table: table_name,
+                        predicate,
+                        ..
+                    } = property
+                    else {
+                        unreachable!()
+                    };
+
+                    let table_name = table_name.clone();
+                    let table = ctx
+                        .tables()
+                        .iter()
+                        .find(|table| table.name == table_name)
+                        .unwrap();
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    match &query {
+                        Query::Insert(Insert::Values { table: t, values })
+                            if *t == table_name
+                                && values.iter().any(|v| predicate.test(v, table)) =>
+                        {
+                            // A row that holds for the predicate will not be inserted.
+                            None
+                        }
+                        Query::Insert(Insert::Select {
+                            table: t,
+                            select: _,
+                        }) if t == &table.name => {
+                            // A row that holds for the predicate will not be inserted.
+                            None
+                        }
+                        Query::Update(Update { table: t, .. }) if t == &table.name => {
+                            // A row that holds for the predicate will not be updated.
+                            None
+                        }
+                        Query::Create(Create { table: t }) if t.name == table.name => {
+                            // There will be no errors in the middle interactions.
+                            // - Creating the same table is an error
+                            None
+                        }
+                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                            // Cannot Drop the same table
+                            None
+                        }
+                        _ => Some(query),
+                    }
+                }
+            }
+            Property::DropSelect { .. } => {
+                // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
+                // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+                |rng, ctx, query_distr, property: &Property| {
+                    let Property::DropSelect {
+                        table: table_name, ..
+                    } = property
+                    else {
+                        unreachable!()
+                    };
+
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+                    if let Query::Create(Create { table: t }) = &query
+                        && t.name == *table_name
+                    {
+                        // - The table `t` will not be created
+                        None
+                    } else {
+                        Some(query)
+                    }
+                }
+            }
+            Property::Queries { .. } => {
+                unreachable!("No extensional querie generation for `Property::Queries`")
+            }
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {
+                unreachable!("No extensional queries")
+            }
+            Property::SelectLimit { .. }
+            | Property::SelectSelectOptimizer { .. }
+            | Property::WhereTrueFalseNull { .. }
+            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::ReadYourUpdatesBack { .. }
+            | Property::TableHasExpectedContent { .. }
+            | Property::AllTableHaveExpectedContent { .. } => {
+                unreachable!("No extensional queries")
+            }
         }
     }
 
@@ -251,6 +486,9 @@ impl Property {
     /// and `interaction` cannot be serialized directly.
     pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
         match self {
+            Property::AllTableHaveExpectedContent { tables } => {
+                assert_all_table_values(tables, connection_index).collect()
+            }
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
                 let table_name = table.clone();
@@ -695,17 +933,17 @@ impl Property {
                             Ok(success) => Ok(Err(format!(
                                 "expected table creation to fail but it succeeded: {success:?}"
                             ))),
-                            Err(e) => {
-                                if e.to_string()
-                                    .contains(&format!("Table {table_name} does not exist"))
+                            Err(e) => match e {
+                                e if e
+                                    .to_string()
+                                    .contains(&format!("no such table: {table_name}")) =>
                                 {
                                     Ok(Ok(()))
-                                } else {
-                                    Ok(Err(format!(
-                                        "expected table does not exist error, got: {e}"
-                                    )))
                                 }
-                            }
+                                _ => Ok(Err(format!(
+                                    "expected table does not exist error, got: {e}"
+                                ))),
+                            },
                         }
                     },
                 ));
@@ -726,7 +964,7 @@ impl Property {
                         .into_iter()
                         .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
                 );
-                interactions.push(Interaction::new(connection_index, select));
+                interactions.push(Interaction::new_ignore_error(connection_index, select));
                 interactions.push(Interaction::new(connection_index, assertion));
 
                 interactions
@@ -820,18 +1058,13 @@ impl Property {
                     Interaction::new(connection_index, assertion),
                 ]
             }
-            Property::FsyncNoWait { query, tables } => {
-                let checks = assert_all_table_values(tables, connection_index);
-                Vec::from_iter(
-                    std::iter::once(Interaction::new(
-                        connection_index,
-                        InteractionType::FsyncQuery(query.clone()),
-                    ))
-                    .chain(checks),
-                )
+            Property::FsyncNoWait { query } => {
+                vec![Interaction::new(
+                    connection_index,
+                    InteractionType::FsyncQuery(query.clone()),
+                )]
             }
-            Property::FaultyQuery { query, tables } => {
-                let checks = assert_all_table_values(tables, connection_index);
+            Property::FaultyQuery { query } => {
                 let query_clone = query.clone();
                 // A fault may not occur as we first signal we want a fault injected,
                 // then when IO is called the fault triggers. It may happen that a fault is injected
@@ -858,13 +1091,13 @@ impl Property {
                         }
                     },
                 );
-                let first = [
+                [
                     InteractionType::FaultyQuery(query.clone()),
                     InteractionType::Assertion(assert),
                 ]
                 .into_iter()
-                .map(|i| Interaction::new(connection_index, i));
-                Vec::from_iter(first.chain(checks))
+                .map(|i| Interaction::new(connection_index, i))
+                .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
                 let assumption = InteractionType::Assumption(Assertion::new(
@@ -1214,10 +1447,11 @@ pub(crate) fn remaining(
 
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate rows to insert
@@ -1230,10 +1464,10 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let row = rows[row_index].clone();
 
     // Insert the rows
-    let insert_query = Insert::Values {
+    let insert_query = Query::Insert(Insert::Values {
         table: table.name.clone(),
         values: rows,
-    };
+    });
 
     // Choose if we want queries to be executed in an interactive transaction
     let interactive = if !mvcc && rng.random_bool(0.5) {
@@ -1244,12 +1478,11 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     } else {
         None
     };
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [x] The inserted row will not be deleted.
-    // - [x] The inserted row will not be updated.
-    // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+
+    let amount = rng.random_range(0..3);
+
+    let mut queries = Vec::with_capacity(amount + 2);
+
     if let Some(ref interactive) = interactive {
         queries.push(Query::Begin(if interactive.start_with_immediate {
             Begin::Immediate
@@ -1257,39 +1490,9 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
             Begin::Deferred
         }));
     }
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
-        match &query {
-            Query::Delete(Delete {
-                table: t,
-                predicate,
-            }) => {
-                // The inserted row will not be deleted.
-                if t == &table.name && predicate.test(&row, table) {
-                    continue;
-                }
-            }
-            Query::Create(Create { table: t }) => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                if t.name == table.name {
-                    continue;
-                }
-            }
-            Query::Update(Update {
-                table: t,
-                set_values: _,
-                predicate,
-            }) => {
-                // The inserted row will not be updated.
-                if t == &table.name && predicate.test(&row, table) {
-                    continue;
-                }
-            }
-            _ => (),
-        }
-        queries.push(query);
-    }
+
+    queries.extend(std::iter::repeat_n(Query::Placeholder, amount));
+
     if let Some(ref interactive) = interactive {
         queries.push(if interactive.end_with_commit {
             Query::Commit(Commit)
@@ -1305,7 +1508,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     );
 
     Property::InsertValuesSelect {
-        insert: insert_query,
+        insert: insert_query.unwrap_insert(),
         row_index,
         queries,
         select: select_query,
@@ -1343,10 +1546,22 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     Property::TableHasExpectedContent {
         table: table.name.clone(),
+    }
+}
+
+fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
+    _rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    Property::AllTableHaveExpectedContent {
+        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
@@ -1356,6 +1571,7 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Select the table
@@ -1371,30 +1587,16 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
 
 fn property_double_create_failure<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
     // Create the table
     let create_query = Create::arbitrary(rng, ctx);
-    let table = &create_query.table;
 
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-    // The interactions in the middle has the following constraints;
-    // - [x] There will be no errors in the middle interactions.(best effort)
-    // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
-        if let Query::Create(Create { table: t }) = &query {
-            // There will be no errors in the middle interactions.
-            // - Creating the same table is an error
-            if t.name == table.name {
-                continue;
-            }
-        }
-        queries.push(query);
-    }
+    let amount = rng.random_range(0..3);
+
+    let queries = vec![Query::Placeholder; amount];
 
     Property::DoubleCreateFailure {
         create: create_query,
@@ -1404,55 +1606,19 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
 
 fn property_delete_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
     let predicate = Predicate::arbitrary_from(rng, ctx, table);
 
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [x] A row that holds for the predicate will not be inserted.
-    // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
-        match &query {
-            Query::Insert(Insert::Values { table: t, values }) => {
-                // A row that holds for the predicate will not be inserted.
-                if t == &table.name && values.iter().any(|v| predicate.test(v, table)) {
-                    continue;
-                }
-            }
-            Query::Insert(Insert::Select {
-                table: t,
-                select: _,
-            }) => {
-                // A row that holds for the predicate will not be inserted.
-                if t == &table.name {
-                    continue;
-                }
-            }
-            Query::Update(Update { table: t, .. }) => {
-                // A row that holds for the predicate will not be updated.
-                if t == &table.name {
-                    continue;
-                }
-            }
-            Query::Create(Create { table: t }) => {
-                // There will be no errors in the middle interactions.
-                // - Creating the same table is an error
-                if t.name == table.name {
-                    continue;
-                }
-            }
-            _ => (),
-        }
-        queries.push(query);
-    }
+    let amount = rng.random_range(0..3);
+
+    let queries = vec![Query::Placeholder; amount];
 
     Property::DeleteSelect {
         table: table.name.clone(),
@@ -1463,27 +1629,17 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
 
 fn property_drop_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
-    query_distr: &QueryDistribution,
+    _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
 
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-    // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-    // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
-    for _ in 0..rng.random_range(0..3) {
-        let query = Query::arbitrary_from(rng, ctx, query_distr);
-        if let Query::Create(Create { table: t }) = &query {
-            // - The table `t` will not be created
-            if t.name == table.name {
-                continue;
-            }
-        }
-        queries.push(query);
-    }
+    let amount = rng.random_range(0..3);
+
+    let queries = vec![Query::Placeholder; amount];
 
     let select = Select::simple(
         table.name.clone(),
@@ -1503,6 +1659,7 @@ fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1526,6 +1683,7 @@ fn property_where_true_false_null<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1547,6 +1705,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    assert!(!ctx.tables().is_empty());
     // Get a random table
     let table = pick(ctx.tables(), rng);
     // Generate a random predicate
@@ -1576,7 +1735,6 @@ fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
 ) -> Property {
     Property::FsyncNoWait {
         query: Query::arbitrary_from(rng, ctx, query_distr),
-        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
@@ -1588,7 +1746,6 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
 ) -> Property {
     Property::FaultyQuery {
         query: Query::arbitrary_from(rng, ctx, query_distr),
-        tables: ctx.tables().iter().map(|t| t.name.clone()).collect(),
     }
 }
 
@@ -1604,6 +1761,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
+            PropertyDiscriminants::AllTableHaveExpectedContent => {
+                property_all_tables_have_expected_content
+            }
             PropertyDiscriminants::DoubleCreateFailure => property_double_create_failure,
             PropertyDiscriminants::SelectLimit => property_select_limit,
             PropertyDiscriminants::DeleteSelect => property_delete_select,
@@ -1621,10 +1781,16 @@ impl PropertyDiscriminants {
         }
     }
 
-    pub fn weight(&self, env: &SimulatorEnv, remaining: &Remaining, opts: &Opts) -> u32 {
+    pub fn weight(
+        &self,
+        env: &SimulatorEnv,
+        remaining: &Remaining,
+        ctx: &impl GenerationContext,
+    ) -> u32 {
+        let opts = ctx.opts();
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
-                if !env.opts.disable_insert_values_select {
+                if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
                     u32::min(remaining.select, remaining.insert).max(1)
                 } else {
                     0
@@ -1633,7 +1799,15 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 u32::min(remaining.select, remaining.insert).max(1)
             }
-            PropertyDiscriminants::TableHasExpectedContent => remaining.select.max(1),
+            PropertyDiscriminants::TableHasExpectedContent => {
+                if !ctx.tables().is_empty() {
+                    remaining.select.max(1)
+                } else {
+                    0
+                }
+            }
+            // AllTableHaveExpectedContent should only be generated by Properties that inject faults
+            PropertyDiscriminants::AllTableHaveExpectedContent => 0,
             PropertyDiscriminants::DoubleCreateFailure => {
                 if !env.opts.disable_double_create_failure {
                     remaining.create / 2
@@ -1642,43 +1816,48 @@ impl PropertyDiscriminants {
                 }
             }
             PropertyDiscriminants::SelectLimit => {
-                if !env.opts.disable_select_limit {
+                if !env.opts.disable_select_limit && !ctx.tables().is_empty() {
                     remaining.select
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::DeleteSelect => {
-                if !env.opts.disable_delete_select {
+                if !env.opts.disable_delete_select && !ctx.tables().is_empty() {
                     u32::min(remaining.select, remaining.insert).min(remaining.delete)
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::DropSelect => {
-                if !env.opts.disable_drop_select {
-                    // remaining.drop
-                    0
+                if !env.opts.disable_drop_select && !ctx.tables().is_empty() {
+                    remaining.drop
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::SelectSelectOptimizer => {
-                if !env.opts.disable_select_optimizer {
+                if !env.opts.disable_select_optimizer && !ctx.tables().is_empty() {
                     remaining.select / 2
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::WhereTrueFalseNull => {
-                if opts.indexes && !env.opts.disable_where_true_false_null {
+                if opts.indexes
+                    && !env.opts.disable_where_true_false_null
+                    && !ctx.tables().is_empty()
+                {
                     remaining.select / 2
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::UNIONAllPreservesCardinality => {
-                if opts.indexes && !env.opts.disable_union_all_preserves_cardinality {
+                if opts.indexes
+                    && !env.opts.disable_union_all_preserves_cardinality
+                    && !ctx.tables().is_empty()
+                {
                     remaining.select / 3
                 } else {
                     0
@@ -1727,6 +1906,7 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
+            PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::DoubleCreateFailure => QueryCapabilities::CREATE,
             PropertyDiscriminants::SelectLimit => QueryCapabilities::SELECT,
             PropertyDiscriminants::DeleteSelect => {
@@ -1762,22 +1942,21 @@ impl<'a> PropertyDistribution<'a> {
         env: &SimulatorEnv,
         remaining: &Remaining,
         query_distr: &'a QueryDistribution,
-        opts: &Opts,
-    ) -> Self {
+        ctx: &impl GenerationContext,
+    ) -> Result<Self, rand::distr::weighted::Error> {
         let properties = PropertyDiscriminants::can_generate(query_distr.items());
         let weights = WeightedIndex::new(
             properties
                 .iter()
-                .map(|property| property.weight(env, remaining, opts)),
-        )
-        .unwrap();
+                .map(|property| property.weight(env, remaining, ctx)),
+        )?;
 
-        Self {
+        Ok(Self {
             properties,
             weights,
             query_distr,
             mvcc: env.profile.experimental_mvcc,
-        }
+        })
     }
 }
 
@@ -1814,6 +1993,49 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
     }
+}
+
+fn generate_queries<R: rand::Rng + ?Sized, F>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+    amount: usize,
+    init_queries: &[&Query],
+    func: F,
+) -> Vec<Query>
+where
+    F: Fn(&mut R, PropertyGenContext) -> Option<Query>,
+{
+    // Create random queries respecting the constraints
+    let mut queries = Vec::new();
+
+    let range = 0..amount;
+    if !range.is_empty() {
+        let mut tmp_tables = ctx.tables().clone();
+
+        for query in init_queries {
+            tmp_shadow(&mut tmp_tables, query);
+        }
+
+        for _ in range {
+            let tmp_ctx = PropertyGenContext::new(&tmp_tables, ctx.opts());
+
+            let Some(query) = func(rng, tmp_ctx) else {
+                continue;
+            };
+
+            tmp_shadow(&mut tmp_tables, &query);
+
+            queries.push(query);
+        }
+    }
+    queries
+}
+
+fn tmp_shadow(tmp_tables: &mut Vec<Table>, query: &Query) {
+    let mut tx_tables = None;
+    let mut tmp_shadow_tables = ShadowTablesMut::new(tmp_tables, &mut tx_tables);
+
+    let _ = query.shadow(&mut tmp_shadow_tables);
 }
 
 fn print_row(row: &[SimValue]) -> String {
