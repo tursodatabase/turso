@@ -546,8 +546,7 @@ class JDBC4ResultSetTest {
 
     SQLException exception =
         assertThrows(SQLException.class, () -> resultSet.findColumn("nonexistent"));
-    assertTrue(exception.getMessage().contains("column name"));
-    assertTrue(exception.getMessage().contains("not found"));
+    assertEquals("column name nonexistent not found", exception.getMessage());
   }
 
   @Test
@@ -560,7 +559,8 @@ class JDBC4ResultSetTest {
 
     // Should find by alias, not original column name
     assertEquals(1, resultSet.findColumn("user_id"));
-    assertThrows(SQLException.class, () -> resultSet.findColumn("id"));
+    SQLException exception = assertThrows(SQLException.class, () -> resultSet.findColumn("id"));
+    assertEquals("column name id not found", exception.getMessage());
   }
 
   @Test
@@ -571,7 +571,8 @@ class JDBC4ResultSetTest {
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test");
     assertTrue(resultSet.next());
 
-    assertThrows(SQLException.class, () -> resultSet.findColumn(""));
+    SQLException exception = assertThrows(SQLException.class, () -> resultSet.findColumn(""));
+    assertEquals("column name not found", exception.getMessage());
   }
 
   @Test
