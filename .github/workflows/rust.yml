@@ -105,3 +105,47 @@ jobs:
         run: cargo build --package limbo_sqlite_test_ext
       - name: Test
         run: SQLITE_EXEC="sqlite3" make test-compat
+
+  build-alpine:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    container:
+      image: rust:alpine
+    steps:
+      - name: Install dependencies
+        run: |
+          apk add --no-cache \
+            git \
+            musl-dev \
+            gcc \
+            g++ \
+            make \
+            pkgconfig \
+            openssl-dev \
+            linux-headers
+      - uses: actions/checkout@v3
+      - name: Build core packages
+        run: |
+          cargo build --verbose --release --lib \
+            --package turso_cli \
+            --package turso_core \
+            --package turso_sqlite3 \
+            --package turso \
+            --package turso_macros \
+            --package turso_parser \
+            --package turso_ext \
+            --package turso_sync_engine
+      - name: Build CLI binary
+        run: cargo build --verbose --release --bin tursodb
+      - name: Run tests
+        run: |
+          cargo test --verbose --release --lib \
+            --package turso_core \
+            --package turso_sqlite3 \
+            --package turso \
+            --package turso_parser
+        timeout-minutes: 20
+      - name: Verify binary
+        run: |
+          ./target/release/tursodb --version
+          echo "Binary successfully built and runs on Alpine Linux"
