@@ -1242,46 +1242,45 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
         let queries = possible_queries(conn_ctx.tables());
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
-        let property_distr = PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx);
+        #[allow(clippy::type_complexity)]
+        let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![
+            (
+                query_distr.weights().total_weight(),
+                Box::new(|rng: &mut R| {
+                    Interactions::new(
+                        conn_index,
+                        InteractionsType::Query(Query::arbitrary_from(rng, conn_ctx, &query_distr)),
+                    )
+                }),
+            ),
+            (
+                remaining_
+                    .select
+                    .min(remaining_.insert)
+                    .min(remaining_.create)
+                    .max(1),
+                Box::new(|rng: &mut R| random_fault(rng, env, conn_index)),
+            ),
+        ];
 
-        frequency(
-            vec![
-                (
-                    property_distr.weights().total_weight(),
-                    Box::new(|rng: &mut R| {
-                        Interactions::new(
-                            conn_index,
-                            InteractionsType::Property(Property::arbitrary_from(
-                                rng,
-                                conn_ctx,
-                                &property_distr,
-                            )),
-                        )
-                    }),
-                ),
-                (
-                    query_distr.weights().total_weight(),
-                    Box::new(|rng: &mut R| {
-                        Interactions::new(
-                            conn_index,
-                            InteractionsType::Query(Query::arbitrary_from(
-                                rng,
-                                conn_ctx,
-                                &query_distr,
-                            )),
-                        )
-                    }),
-                ),
-                (
-                    remaining_
-                        .select
-                        .min(remaining_.insert)
-                        .min(remaining_.create)
-                        .max(1),
-                    Box::new(|rng: &mut R| random_fault(rng, env, conn_index)),
-                ),
-            ],
-            rng,
-        )
+        if let Ok(property_distr) =
+            PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx)
+        {
+            choices.push((
+                property_distr.weights().total_weight(),
+                Box::new(move |rng: &mut R| {
+                    Interactions::new(
+                        conn_index,
+                        InteractionsType::Property(Property::arbitrary_from(
+                            rng,
+                            conn_ctx,
+                            &property_distr,
+                        )),
+                    )
+                }),
+            ));
+        };
+
+        frequency(choices, rng)
     }
 }

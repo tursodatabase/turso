@@ -274,7 +274,10 @@ impl Property {
 
     /// Property Does some sort of fault injection
     pub fn check_tables(&self) -> bool {
-        matches!(self, Property::FsyncNoWait { .. } | Property::FaultyQuery { .. })
+        matches!(
+            self,
+            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. }
+        )
     }
 
     pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
@@ -1940,21 +1943,20 @@ impl<'a> PropertyDistribution<'a> {
         remaining: &Remaining,
         query_distr: &'a QueryDistribution,
         ctx: &impl GenerationContext,
-    ) -> Self {
+    ) -> Result<Self, rand::distr::weighted::Error> {
         let properties = PropertyDiscriminants::can_generate(query_distr.items());
         let weights = WeightedIndex::new(
             properties
                 .iter()
                 .map(|property| property.weight(env, remaining, ctx)),
-        )
-        .unwrap();
+        )?;
 
-        Self {
+        Ok(Self {
             properties,
             weights,
             query_distr,
             mvcc: env.profile.experimental_mvcc,
-        }
+        })
     }
 }
 

@@ -120,7 +120,9 @@ impl QueryDiscriminants {
     pub fn weight(&self, remaining: &Remaining) -> u32 {
         match self {
             QueryDiscriminants::Create => remaining.create,
-            QueryDiscriminants::Select => remaining.select + remaining.select / 3, // remaining.select / 3 is for the random_expr generation
+            // remaining.select / 3 is for the random_expr generation
+            // have a max of 1 so that we always generate at least a non zero weight for `QueryDistribution`
+            QueryDiscriminants::Select => (remaining.select + remaining.select / 3).max(1),
             QueryDiscriminants::Insert => remaining.insert,
             QueryDiscriminants::Delete => remaining.delete,
             QueryDiscriminants::Update => remaining.update,
@@ -138,6 +140,7 @@ impl QueryDiscriminants {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct QueryDistribution {
     queries: &'static [QueryDiscriminants],
     weights: WeightedIndex<u32>,
