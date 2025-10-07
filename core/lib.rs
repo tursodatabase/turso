@@ -1528,8 +1528,7 @@ impl Connection {
         db_opts: DatabaseOpts,
         io: Arc<dyn IO>,
     ) -> Result<Arc<Database>> {
-        let mut opts = OpenOptions::parse(uri)?;
-        // FIXME: for now, only support read only attach
+        let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
@@ -2090,18 +2089,15 @@ impl Connection {
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let is_memory = path.contains(":memory:");
-        let io: Arc<dyn IO> = if is_memory {
+        let io: Arc<dyn IO> = if path.contains(":memory:") {
             Arc::new(MemoryIO::new())
         } else {
             Arc::new(PlatformIO::new()?)
         };
-        let db = Self::from_uri_attached(path, db_opts, io).expect("FAILURE");
+        let db = Self::from_uri_attached(path, db_opts, io)?;
         let pager = Arc::new(db.init_pager(None)?);
-        // set back to read-only now that we have
-        if is_memory {
-            db.open_flags.set(OpenFlags::ReadOnly);
-        }
+        // FIXME: for now, only support read only attach
+        db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
