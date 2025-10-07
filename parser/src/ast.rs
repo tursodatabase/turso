@@ -1449,6 +1449,8 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
+    MvccCheckpointThreshold,
 }
 
 /// `CREATE TRIGGER` time
