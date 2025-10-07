@@ -44,11 +44,11 @@ impl Storage {
         self.logical_log.read().should_checkpoint()
     }
 
-    pub fn set_checkpoint_threshold(&self, threshold: u64) {
+    pub fn set_checkpoint_threshold(&self, threshold: i64) {
         self.logical_log.write().set_checkpoint_threshold(threshold)
     }
 
-    pub fn checkpoint_threshold(&self) -> u64 {
+    pub fn checkpoint_threshold(&self) -> i64 {
         self.logical_log.read().checkpoint_threshold()
     }
 }

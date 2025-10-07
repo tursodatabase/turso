@@ -2341,7 +2341,7 @@ impl Connection {
         *self.mv_tx.read()
     }
 
-    pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: u64) -> Result<()> {
+    pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
         match self.db.mv_store.as_ref() {
             Some(mv_store) => {
                 mv_store.set_checkpoint_threshold(threshold);
@@ -2351,7 +2351,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<u64> {
+    pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<i64> {
         match self.db.mv_store.as_ref() {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
