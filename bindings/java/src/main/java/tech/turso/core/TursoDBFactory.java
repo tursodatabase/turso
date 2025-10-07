@@ -23,7 +23,7 @@ public final class TursoDBFactory {
    * @param url the URL of the database
    * @param filePath the path to the database file
    * @param properties additional properties for the database connection
-   * @return an instance of {@link tursoDB}
+   * @return an instance of {@link TursoDB}
    * @throws SQLException if there is an error opening the connection
    * @throws IllegalArgumentException if the fileName is empty
    */

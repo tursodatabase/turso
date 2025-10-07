@@ -10,6 +10,7 @@ import tech.turso.jdbc4.JDBC4Connection;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
+/** Turso JDBC driver implementation. */
 public final class JDBC implements Driver {
 
   private static final Logger logger = LoggerFactory.getLogger(JDBC.class);
@@ -24,6 +25,14 @@ public final class JDBC implements Driver {
     }
   }
 
+  /**
+   * Creates a new Turso JDBC connection.
+   *
+   * @param url the database URL
+   * @param properties connection properties
+   * @return a new connection instance, or null if the URL is not valid
+   * @throws SQLException if a database access error occurs
+   */
   @Nullable
   public static JDBC4Connection createConnection(String url, Properties properties)
       throws SQLException {

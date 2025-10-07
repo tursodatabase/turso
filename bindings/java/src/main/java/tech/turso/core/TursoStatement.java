@@ -91,8 +91,8 @@ public final class TursoStatement {
   private native void _close(long statementPointer);
 
   /**
-   * Initializes the column metadata, such as the names of the columns. Since {@link tursoStatement}
-   * can only have a single {@link tursoResultSet}, it is appropriate to place the initialization of
+   * Initializes the column metadata, such as the names of the columns. Since {@link TursoStatement}
+   * can only have a single {@link TursoResultSet}, it is appropriate to place the initialization of
    * column metadata here.
    *
    * @throws SQLException if a database access error occurs while retrieving column names
