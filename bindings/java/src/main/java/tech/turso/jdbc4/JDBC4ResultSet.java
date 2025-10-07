@@ -27,10 +27,18 @@ import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
+/**
+ * JDBC 4 ResultSet implementation for Turso databases.
+ */
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;
 
+  /**
+   * Creates a new JDBC4ResultSet.
+   *
+   * @param resultSet the underlying Turso result set
+   */
   public JDBC4ResultSet(TursoResultSet resultSet) {
     this.resultSet = resultSet;
   }
@@ -1279,8 +1287,19 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     throw new UnsupportedOperationException("not implemented");
   }
 
+  /**
+   * Functional interface for result set value suppliers.
+   *
+   * @param <T> the type of value to supply
+   */
   @FunctionalInterface
   public interface ResultSetSupplier<T> {
+    /**
+     * Gets a result from the result set.
+     *
+     * @return the result value
+     * @throws Exception if an error occurs
+     */
     T get() throws Exception;
   }
 

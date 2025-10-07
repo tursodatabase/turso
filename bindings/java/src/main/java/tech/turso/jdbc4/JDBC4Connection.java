@@ -9,20 +9,45 @@ import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoConnection;
 import tech.turso.core.TursoStatement;
 
+/**
+ * JDBC 4 Connection implementation for Turso databases.
+ */
 public final class JDBC4Connection implements Connection {
 
   private final TursoConnection connection;
 
   private Map<String, Class<?>> typeMap = new HashMap<>();
 
+  /**
+   * Creates a new JDBC4 connection.
+   *
+   * @param url the database URL
+   * @param filePath the database file path
+   * @throws SQLException if a database access error occurs
+   */
   public JDBC4Connection(String url, String filePath) throws SQLException {
     this.connection = new TursoConnection(url, filePath);
   }
 
+  /**
+   * Creates a new JDBC4 connection with properties.
+   *
+   * @param url the database URL
+   * @param filePath the database file path
+   * @param properties connection properties
+   * @throws SQLException if a database access error occurs
+   */
   public JDBC4Connection(String url, String filePath, Properties properties) throws SQLException {
     this.connection = new TursoConnection(url, filePath, properties);
   }
 
+  /**
+   * Prepares a SQL statement for execution.
+   *
+   * @param sql the SQL statement to prepare
+   * @return the prepared statement
+   * @throws SQLException if a database access error occurs
+   */
   public TursoStatement prepare(String sql) throws SQLException {
     final TursoStatement statement = connection.prepare(sql);
     statement.initializeColumnMetadata();
@@ -357,6 +382,11 @@ public final class JDBC4Connection implements Connection {
     return false;
   }
 
+  /**
+   * Sets the busy timeout for the connection.
+   *
+   * @param busyTimeout the timeout in milliseconds
+   */
   public void setBusyTimeout(int busyTimeout) {
     // TODO: add support for busy timeout
   }
@@ -367,10 +397,20 @@ public final class JDBC4Connection implements Connection {
     return 0;
   }
 
+  /**
+   * Gets the database URL.
+   *
+   * @return the database URL
+   */
   public String getUrl() {
     return this.connection.getUrl();
   }
 
+  /**
+   * Checks if the connection is open.
+   *
+   * @throws SQLException if the connection is closed
+   */
   public void checkOpen() throws SQLException {
     connection.checkOpen();
   }

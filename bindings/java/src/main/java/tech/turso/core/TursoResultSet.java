@@ -57,7 +57,7 @@ public final class TursoResultSet {
   }
 
   /**
-   * Moves the cursor forward one row from its current position. A {@link tursoResultSet} cursor is
+   * Moves the cursor forward one row from its current position. A {@link TursoResultSet} cursor is
    * initially positioned before the first fow; the first call to the method <code>next</code> makes
    * the first row the current row; the second call makes the second row the current row, and so on.
    * When a call to the <code>next</code> method returns <code>false</code>, the cursor is
@@ -65,6 +65,9 @@ public final class TursoResultSet {
    *
    * <p>Note that turso only supports <code>ResultSet.TYPE_FORWARD_ONLY</code>, which means that the
    * cursor can only move forward.
+   *
+   * @return true if the new current row is valid; false if there are no more rows
+   * @throws SQLException if a database access error occurs
    */
   public boolean next() throws SQLException {
     if (!open) {

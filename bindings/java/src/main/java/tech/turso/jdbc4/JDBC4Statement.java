@@ -17,6 +17,9 @@ import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 import tech.turso.core.TursoStatement;
 
+/**
+ * JDBC 4 Statement implementation for Turso databases.
+ */
 public class JDBC4Statement implements Statement {
 
   private static final Pattern BATCH_COMPATIBLE_PATTERN =
@@ -35,7 +38,10 @@ public class JDBC4Statement implements Statement {
 
   private final JDBC4Connection connection;
 
+  /** The underlying Turso statement. */
   @Nullable protected TursoStatement statement = null;
+
+  /** The number of rows affected by the last update operation. */
   protected long updateCount;
 
   // Because JDBC4Statement has different life cycle in compared to tursoStatement, let's use this
@@ -475,8 +481,19 @@ public class JDBC4Statement implements Statement {
     }
   }
 
+  /**
+   * Functional interface for SQL callable operations.
+   *
+   * @param <T> the return type
+   */
   @FunctionalInterface
   protected interface SQLCallable<T> {
+    /**
+     * Executes the SQL operation.
+     *
+     * @return the result of the operation
+     * @throws SQLException if a database access error occurs
+     */
     T call() throws SQLException;
   }
 
