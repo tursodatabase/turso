@@ -165,12 +165,10 @@ fn expr_code_vector(program: &mut ProgramBuilder, expr: &ast::Expr) -> usize {
 fn expr_can_be_null(expr: &ast::Expr) -> bool {
     // todo: better handling columns. Check sqlite3ExprCanBeNull
     match expr {
-        Expr::Literal(literal) => match literal {
-            ast::Literal::Numeric(_) => false,
-            ast::Literal::String(_) => false,
-            ast::Literal::Blob(_) => false,
-            _ => true,
-        },
+        Expr::Literal(literal) => !matches!(
+            literal,
+            ast::Literal::Numeric(_) | ast::Literal::String(_) | ast::Literal::Blob(_)
+        ),
         _ => true,
     }
 }
@@ -180,6 +178,30 @@ fn expr_can_be_null(expr: &ast::Expr) -> bool {
 ///
 /// This is extracted from the original conditional implementation to be reusable.
 /// The logic exactly matches the original conditional InList implementation.
+///
+/// An IN expression has one of the following formats:
+///  ```sql
+///      x IN (y1, y2,...,yN)
+///      x IN (subquery) (Not yet implemented)
+///  ```
+/// The result of an IN operator is one of TRUE, FALSE, or NULL.  A NULL result
+/// means that it cannot be determined if the LHS is contained in the RHS due
+/// to the presence of NULL values.
+///
+/// Currently, we do a simple full-scan, yet it's not ideal when there are many rows
+/// on RHS. (Check sqlite's in-operator.md)
+///
+/// Algorithm:
+/// 1. Set the null-flag to false
+/// 2. For each row in the RHS:
+///     - Compare LHS and RHS
+///     - If LHS matches RHS, returns TRUE
+///     - If the comparison results in NULL, set the null-flag to true
+/// 3. If the null-flag is true, return NULL
+/// 4. Return FALSE
+///
+/// A "NOT IN" operator is computed by first computing the equivalent IN
+/// operator, then interchanging the TRUE and FALSE results.
 // todo: Check right affinities
 #[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
 fn translate_in_list(
@@ -237,21 +259,19 @@ fn translate_in_list(
                 });
             }
             // sqlite3VdbeChangeP5(v, zAff[0]);
+        } else if lhs_reg != rhs_reg {
+            program.emit_insn(Insn::Ne {
+                lhs: lhs_reg,
+                rhs: rhs_reg,
+                target_pc: condition_metadata.jump_target_when_false,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
         } else {
-            if lhs_reg != rhs_reg {
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                    flags: CmpInsFlags::default(),
-                    collation: program.curr_collation(),
-                });
-            } else {
-                program.emit_insn(Insn::IsNull {
-                    reg: lhs_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                });
-            }
+            program.emit_insn(Insn::IsNull {
+                reg: lhs_reg,
+                target_pc: condition_metadata.jump_target_when_false,
+            });
         }
     }
 
@@ -400,15 +420,42 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
         }
+
         ast::Expr::InList { lhs, not, rhs } => {
+            let ConditionMetadata {
+                jump_if_condition_is_true,
+                jump_target_when_true,
+                jump_target_when_false,
+                jump_target_when_null,
+            } = condition_metadata;
+
+            // Adjust targets if `NOT IN`
+            let adjusted_metadata = if *not {
+                ConditionMetadata {
+                    jump_if_condition_is_true,
+                    jump_target_when_true,
+                    jump_target_when_false: jump_target_when_true,
+                    jump_target_when_null,
+                }
+            } else {
+                condition_metadata
+            };
+
             translate_in_list(
                 program,
                 Some(referenced_tables),
                 lhs,
                 rhs,
-                condition_metadata,
+                adjusted_metadata,
                 resolver,
             )?;
+
+            if *not {
+                program.emit_insn(Insn::Goto {
+                    target_pc: jump_target_when_false,
+                });
+                program.resolve_label(adjusted_metadata.jump_target_when_false, program.offset());
+            }
         }
         ast::Expr::Like { not, .. } => {
             let cur_reg = program.alloc_register();

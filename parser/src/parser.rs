@@ -1736,8 +1736,8 @@ impl<'a> Parser<'a> {
                                     } else {
                                         Box::new(Expr::InList {
                                             lhs: result,
-                                            not,
                                             rhs: exprs,
+                                            not,
                                         })
                                     }
                                 }

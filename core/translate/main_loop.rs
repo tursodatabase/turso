@@ -384,12 +384,11 @@ pub fn init_loop(
         .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
     {
         let jump_target = program.allocate_label();
-        let null_jump_target = program.allocate_label();
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
-            jump_target_when_null: null_jump_target,
+            jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -711,12 +710,11 @@ fn emit_conditions(
         .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
     {
         let jump_target_when_true = program.allocate_label();
-        let jump_target_when_null = program.allocate_label();
         let condition_metadata = ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true,
             jump_target_when_false: next,
-            jump_target_when_null,
+            jump_target_when_null: next,
         };
         translate_condition_expr(
             program,

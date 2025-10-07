@@ -237,7 +237,6 @@ pub fn translate_create_index(
     let mut skip_row_label = None;
     if let Some(where_clause) = where_clause {
         let label = program.allocate_label();
-        let null_label = program.allocate_label();
         translate_condition_expr(
             &mut program,
             &table_references,
@@ -246,7 +245,7 @@ pub fn translate_create_index(
                 jump_if_condition_is_true: false,
                 jump_target_when_false: label,
                 jump_target_when_true: BranchOffset::Placeholder,
-                jump_target_when_null: null_label,
+                jump_target_when_null: label,
             },
             resolver,
         )?;
