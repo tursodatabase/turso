@@ -328,7 +328,7 @@ impl Shadow for FromClause {
                     .context("Table not found")?;
                 JoinTable {
                     tables: vec![first_table.clone()],
-                    rows: Vec::new(),
+                    rows: first_table.rows.clone(),
                 }
             }
             SelectTable::Select(select) => {
@@ -356,29 +356,24 @@ impl Shadow for FromClause {
 
             match join.join_type {
                 JoinType::Inner => {
-                    // Implement inner join logic
-                    let join_rows = joined_table
-                        .rows
-                        .iter()
-                        .filter(|row| join.on.test(row, joined_table))
-                        .cloned()
-                        .collect::<Vec<_>>();
                     // take a cartesian product of the rows
                     let all_row_pairs = join_table
                         .rows
                         .clone()
                         .into_iter()
-                        .cartesian_product(join_rows.iter());
+                        .cartesian_product(joined_table.rows.iter());
 
+                    let mut rows = Vec::new();
                     for (row1, row2) in all_row_pairs {
                         let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
 
                         let is_in = join.on.test(&row, &join_table);
 
                         if is_in {
-                            join_table.rows.push(row);
+                            rows.push(row);
                         }
                     }
+                    join_table.rows = rows;
                 }
                 _ => todo!(),
             }
@@ -413,6 +408,117 @@ impl Shadow for SelectTable {
                 })
             }
         }
+    }
+}
+#[cfg(test)]
+mod from_clause_tests {
+    use sql_generation::model::{
+        query::predicate::Predicate,
+        table::{Column, ColumnType, JoinedTable},
+    };
+    use turso_parser::ast::{Expr, Name};
+
+    use super::*;
+    use crate::runner::env::ShadowTablesMut;
+
+    #[test]
+    fn test_shadow_from_clause() {
+        let mut commited_tables = Vec::new();
+        let mut transaction_tables = Option::None;
+
+        let mut tables: ShadowTablesMut = ShadowTablesMut {
+            commited_tables: &mut commited_tables,
+            transaction_tables: &mut transaction_tables,
+        };
+
+        let table1 = Table {
+            name: "table1".to_string(),
+            columns: vec![
+                ("id".to_string(), ColumnType::Integer),
+                ("value".to_string(), ColumnType::Text),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name,
+                column_type,
+                primary: false,
+                unique: false,
+            })
+            .collect(),
+            rows: vec![
+                vec![SimValue::int(1), SimValue::text("A".to_string())],
+                vec![SimValue::int(2), SimValue::text("B".to_string())],
+                vec![SimValue::int(4), SimValue::text("D".to_string())],
+            ],
+            indexes: vec![],
+        };
+
+        let table2 = Table {
+            name: "table2".to_string(),
+            columns: vec![
+                ("id".to_string(), ColumnType::Integer),
+                ("description".to_string(), ColumnType::Text),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| Column {
+                name,
+                column_type,
+                primary: false,
+                unique: false,
+            })
+            .collect(),
+            rows: vec![
+                vec![SimValue::int(1), SimValue::text("Desc A".to_string())],
+                vec![SimValue::int(2), SimValue::text("Desc B".to_string())],
+                vec![SimValue::int(3), SimValue::text("Desc C".to_string())],
+            ],
+            indexes: vec![],
+        };
+
+        tables.push(table1);
+        tables.push(table2);
+
+        // SELECT * FROM table1 INNER JOIN table2 ON table1.id = table2.id;
+        let from_clause = FromClause {
+            table: "table1".to_string(),
+            joins: vec![JoinedTable {
+                table: "table2".to_string(),
+                join_type: JoinType::Inner,
+                on: Predicate(turso_parser::ast::Expr::Binary(
+                    Box::new(Expr::Qualified(
+                        Name::from_string(&"table1".to_string()),
+                        Name::from_string(&"id".to_string()),
+                    )),
+                    turso_parser::ast::Operator::Equals,
+                    Box::new(turso_parser::ast::Expr::Qualified(
+                        Name::from_string(&"table2".to_string()),
+                        Name::from_string(&"id".to_string()),
+                    )),
+                )),
+            }],
+        };
+
+        let result = from_clause.shadow(&mut tables).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0],
+            vec![
+                SimValue::int(1),
+                SimValue::text("A".to_string()),
+                SimValue::int(1),
+                SimValue::text("Desc A".to_string()),
+            ]
+        );
+        assert_eq!(
+            result.rows[1],
+            vec![
+                SimValue::int(2),
+                SimValue::text("B".to_string()),
+                SimValue::int(2),
+                SimValue::text("Desc B".to_string()),
+            ]
+        );
     }
 }
 
