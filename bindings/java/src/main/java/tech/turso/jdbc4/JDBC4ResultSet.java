@@ -27,9 +27,7 @@ import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
-/**
- * JDBC 4 ResultSet implementation for Turso databases.
- */
+/** JDBC 4 ResultSet implementation for Turso databases. */
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;

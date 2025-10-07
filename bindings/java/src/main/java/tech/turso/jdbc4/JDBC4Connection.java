@@ -9,9 +9,7 @@ import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoConnection;
 import tech.turso.core.TursoStatement;
 
-/**
- * JDBC 4 Connection implementation for Turso databases.
- */
+/** JDBC 4 Connection implementation for Turso databases. */
 public final class JDBC4Connection implements Connection {
 
   private final TursoConnection connection;

@@ -13,9 +13,7 @@ import tech.turso.core.TursoPropertiesHolder;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
-/**
- * JDBC 4 DatabaseMetaData implementation for Turso databases.
- */
+/** JDBC 4 DatabaseMetaData implementation for Turso databases. */
 public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   private static final Logger logger = LoggerFactory.getLogger(JDBC4DatabaseMetaData.class);

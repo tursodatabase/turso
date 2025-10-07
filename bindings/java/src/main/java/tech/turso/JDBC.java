@@ -10,9 +10,7 @@ import tech.turso.jdbc4.JDBC4Connection;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
-/**
- * Turso JDBC driver implementation.
- */
+/** Turso JDBC driver implementation. */
 public final class JDBC implements Driver {
 
   private static final Logger logger = LoggerFactory.getLogger(JDBC.class);

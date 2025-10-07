@@ -17,9 +17,7 @@ import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 import tech.turso.core.TursoStatement;
 
-/**
- * JDBC 4 Statement implementation for Turso databases.
- */
+/** JDBC 4 Statement implementation for Turso databases. */
 public class JDBC4Statement implements Statement {
 
   private static final Pattern BATCH_COMPATIBLE_PATTERN =

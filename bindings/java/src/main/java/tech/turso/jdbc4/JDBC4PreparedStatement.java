@@ -26,9 +26,7 @@ import java.util.Calendar;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
-/**
- * JDBC 4 PreparedStatement implementation for Turso databases.
- */
+/** JDBC 4 PreparedStatement implementation for Turso databases. */
 public final class JDBC4PreparedStatement extends JDBC4Statement implements PreparedStatement {
 
   private final String sql;
