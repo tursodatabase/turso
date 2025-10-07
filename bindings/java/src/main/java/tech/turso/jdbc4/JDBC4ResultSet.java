@@ -413,12 +413,12 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public boolean isBeforeFirst() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return resultSet.isOpen() && resultSet.getRow() == 0 && !resultSet.isPastLastRow();
   }
 
   @Override
   public boolean isAfterLast() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return resultSet.isOpen() && resultSet.isPastLastRow();
   }
 
   @Override

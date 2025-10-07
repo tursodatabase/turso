@@ -99,6 +99,16 @@ public final class TursoResultSet {
     return lastStepResult != null && lastStepResult.isRow();
   }
 
+  /** Checks whether the cursor is positioned after the last row. */
+  public boolean isPastLastRow() {
+    return pastLastRow;
+  }
+
+  /** Gets the current row number (0-based, 0 means before first row). */
+  public int getRow() {
+    return row;
+  }
+
   /**
    * Checks the status of the result set.
    *

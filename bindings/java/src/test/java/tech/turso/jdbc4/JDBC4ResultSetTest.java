@@ -642,4 +642,48 @@ class JDBC4ResultSetTest {
 
     assertEquals(BigDecimal.valueOf(12345.67), resultSet.getBigDecimal("amount"));
   }
+
+  @Test
+  void test_isBeforeFirst_and_isAfterLast() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_position (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO test_position VALUES (1);");
+    stmt.executeUpdate("INSERT INTO test_position VALUES (2);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_position");
+
+    // Before first row
+    assertTrue(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // First row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // Second row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // After last row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertTrue(resultSet.isAfterLast());
+  }
+
+  @Test
+  void test_isBeforeFirst_with_empty_resultSet() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_empty (id INTEGER);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_empty");
+
+    // Before calling next()
+    assertTrue(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // After calling next() on empty ResultSet
+    assertFalse(resultSet.next());
+    assertFalse(resultSet.isBeforeFirst());
+    assertTrue(resultSet.isAfterLast());
+  }
 }
