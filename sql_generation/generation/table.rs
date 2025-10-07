@@ -17,7 +17,7 @@ impl Arbitrary for Name {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
         let base = readable_name_custom("_", rng).replace("-", "_");
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        Name(format!("{}_{}", base, id))
+        Name(format!("{base}_{id}"))
     }
 }
 
