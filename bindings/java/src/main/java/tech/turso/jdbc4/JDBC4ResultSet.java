@@ -812,15 +812,24 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @Nullable
   public Date getDate(int columnIndex, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getDate(columnIndex);
+    final Date date = getDate(columnIndex);
+    if (date == null || cal == null) {
+      return date;
+    }
+
+    final Calendar localCal = Calendar.getInstance();
+    localCal.setTime(date);
+
+    final long offset = cal.getTimeZone().getOffset(date.getTime()) -
+        localCal.getTimeZone().getOffset(date.getTime());
+
+    return new Date(date.getTime() + offset);
   }
 
   @Override
   @Nullable
   public Date getDate(String columnLabel, Calendar cal) throws SQLException {
-    // TODO: Properly handle timezone conversion with Calendar
-    return getDate(columnLabel);
+    return getDate(findColumn(columnLabel), cal);
   }
 
   @Override

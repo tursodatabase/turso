@@ -1,18 +1,14 @@
 package tech.turso.jdbc4;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.ByteBuffer;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.Properties;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +16,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import tech.turso.TestUtils;
+
+import static org.junit.jupiter.api.Assertions.*;
 
 class JDBC4ResultSetTest {
 
@@ -714,5 +712,58 @@ class JDBC4ResultSetTest {
     // After last row
     resultSet.next();
     assertEquals(3, resultSet.getRow());
+  }
+
+  @Test
+  void test_getDate_with_calendar() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_date_cal (date_col BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_date_cal (date_col) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_date_cal");
+    assertTrue(resultSet.next());
+
+    // Get date with UTC calendar
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Date utcDate = resultSet.getDate(1, utcCal);
+
+    // Get date with Seoul calendar (UTC+9)
+    Calendar seoulCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    Date seoulDate = resultSet.getDate(1, seoulCal);
+
+    // Seoul time should be 9 hours ahead
+    long timeDiff = seoulDate.getTime() - utcDate.getTime();
+    assertEquals(9 * 60 * 60 * 1000, timeDiff);
+  }
+
+  @Test
+  void test_getDate_with_calendar_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_date_cal (created_at BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_date_cal (created_at) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_date_cal");
+    assertTrue(resultSet.next());
+
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Date date = resultSet.getDate("created_at", utcCal);
+
+    assertNotNull(date);
   }
 }
