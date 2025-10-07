@@ -625,7 +625,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_dummy(),
+                            Completion::new_yield(),
                         )));
                     }
                 }

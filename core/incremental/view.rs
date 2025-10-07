@@ -1282,7 +1282,7 @@ impl IncrementalView {
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
                                 // TODO: Get the actual I/O completion from the statement
-                                let completion = crate::io::Completion::new_dummy();
+                                let completion = crate::io::Completion::new_yield();
                                 return Ok(IOResult::IO(crate::types::IOCompletions::Single(
                                     completion,
                                 )));

@@ -86,14 +86,14 @@ impl VfsMod {
 /// that the into_raw/from_raw contract will hold
 unsafe extern "C" fn callback_fn(result: i32, ctx: SendPtr) {
     let completion = Completion {
-        inner: (Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionInner)),
+        inner: (Some(Arc::from_raw(ctx.inner().as_ptr() as *mut CompletionInner))),
     };
     completion.complete(result);
 }
 
 fn to_callback(c: Completion) -> IOCallback {
     IOCallback::new(callback_fn, unsafe {
-        NonNull::new_unchecked(Arc::into_raw(c.inner) as *mut c_void)
+        NonNull::new_unchecked(Arc::into_raw(c.get_inner().clone()) as *mut c_void)
     })
 }
 
