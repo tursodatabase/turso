@@ -53,14 +53,14 @@ impl TransactionTables {
 
 #[derive(Debug)]
 pub struct ShadowTables<'a> {
-    commited_tables: &'a Vec<Table>,
-    transaction_tables: Option<&'a TransactionTables>,
+    pub(crate) commited_tables: &'a Vec<Table>,
+    pub(crate) transaction_tables: Option<&'a TransactionTables>,
 }
 
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
-    commited_tables: &'a mut Vec<Table>,
-    transaction_tables: &'a mut Option<TransactionTables>,
+    pub(crate) commited_tables: &'a mut Vec<Table>,
+    pub(crate) transaction_tables: &'a mut Option<TransactionTables>,
 }
 
 impl<'a> ShadowTables<'a> {
