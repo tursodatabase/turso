@@ -858,15 +858,24 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public Timestamp getTimestamp(int columnIndex, Calendar cal) throws SQLException {
-    // TODO: Apply calendar timezone conversion
-    return getTimestamp(columnIndex);
+    final Timestamp timestamp = getTimestamp(columnIndex);
+    if (timestamp == null || cal == null) {
+      return timestamp;
+    }
+
+    final Calendar localCal = Calendar.getInstance();
+    localCal.setTime(timestamp);
+
+    final long offset = cal.getTimeZone().getOffset(timestamp.getTime()) -
+        localCal.getTimeZone().getOffset(timestamp.getTime());
+
+    return new Timestamp(timestamp.getTime() + offset);
   }
 
   @Override
   @SkipNullableCheck
   public Timestamp getTimestamp(String columnLabel, Calendar cal) throws SQLException {
-    // TODO: Apply calendar timezone conversion
-    return getTimestamp(findColumn(columnLabel));
+    return getTimestamp(findColumn(columnLabel), cal);
   }
 
   @Override
