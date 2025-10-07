@@ -13,8 +13,8 @@ mod tests {
     use crate::{
         common::{
             do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
-            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, sqlite_exec_rows,
-            TempDatabase,
+            maybe_setup_tracing, rng_from_time, rng_from_time_or_env, rusqlite_integrity_check,
+            sqlite_exec_rows, TempDatabase,
         },
         fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
     };
@@ -2663,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    pub fn fuzz_long_create_table_drop_table_alter_table() {
+    pub fn fuzz_long_create_table_drop_table_alter_table_normal() {
         _fuzz_long_create_table_drop_table_alter_table(false);
     }
 
@@ -2694,6 +2694,8 @@ mod tests {
         ];
 
         let mut undroppable_cols = HashSet::new();
+
+        let mut stmts = vec![];
 
         for iteration in 0..2000 {
             println!("iteration: {iteration} (seed: {seed})");
@@ -2749,8 +2751,8 @@ mod tests {
                             format!("CREATE TABLE {table_name} ({})", columns.join(", "));
 
                         // Execute the create table statement
+                        stmts.push(create_sql.clone());
                         limbo_exec_rows(&db, &limbo_conn, &create_sql);
-
                         let column_names = columns
                             .iter()
                             .map(|c| c.split_whitespace().next().unwrap().to_string())
@@ -2765,6 +2767,7 @@ mod tests {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
+                        stmts.push(insert_sql.clone());
                         limbo_exec_rows(&db, &limbo_conn, &insert_sql);
 
                         // Successfully created table, update our tracking
@@ -2779,6 +2782,7 @@ mod tests {
                         let table_to_drop = &table_names[rng.random_range(0..table_names.len())];
 
                         let drop_sql = format!("DROP TABLE {table_to_drop}");
+                        stmts.push(drop_sql.clone());
                         limbo_exec_rows(&db, &limbo_conn, &drop_sql);
 
                         // Successfully dropped table, update our tracking
@@ -2799,6 +2803,7 @@ mod tests {
                             table_to_alter, &new_col_name, col_type
                         );
 
+                        stmts.push(alter_sql.clone());
                         limbo_exec_rows(&db, &limbo_conn, &alter_sql);
 
                         // Successfully added column, update our tracking
@@ -2830,6 +2835,7 @@ mod tests {
                                 let alter_sql = format!(
                                     "ALTER TABLE {table_to_alter} DROP COLUMN {col_to_drop}"
                                 );
+                                stmts.push(alter_sql.clone());
                                 limbo_exec_rows(&db, &limbo_conn, &alter_sql);
 
                                 // Successfully dropped column, update our tracking
@@ -2865,6 +2871,14 @@ mod tests {
                     columns.len(),
                     "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
                 );
+            }
+            if !mvcc {
+                if let Err(e) = rusqlite_integrity_check(&db.path) {
+                    for stmt in stmts.iter() {
+                        println!("{stmt};");
+                    }
+                    panic!("seed: {seed}, mvcc: {mvcc}, error: {e}");
+                }
             }
         }
 
