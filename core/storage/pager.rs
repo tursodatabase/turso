@@ -1142,7 +1142,7 @@ impl Pager {
                 }
             } else {
                 // Give a chance for the allocation to happen elsewhere
-                io_yield_one!(Completion::new_dummy());
+                io_yield_one!(Completion::new_yield());
             }
         }
         Ok(IOResult::Done(()))

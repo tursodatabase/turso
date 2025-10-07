@@ -1746,7 +1746,7 @@ impl StreamingWalReader {
             .min((self.file_size - offset) as usize);
         if read_size == 0 {
             // end-of-file; let caller finalize
-            return Ok((0, Completion::new_dummy()));
+            return Ok((0, Completion::new_yield()));
         }
 
         let buf = Arc::new(Buffer::new_temporary(read_size));

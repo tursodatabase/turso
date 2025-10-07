@@ -5717,7 +5717,7 @@ impl BTreeCursor {
                     self.valid_state =
                         CursorValidState::RequireAdvance(ctx.seek_op.iteration_direction());
                     self.context = Some(ctx);
-                    io_yield_one!(Completion::new_dummy());
+                    io_yield_one!(Completion::new_yield());
                 }
                 self.valid_state = CursorValidState::Valid;
                 Ok(IOResult::Done(()))
