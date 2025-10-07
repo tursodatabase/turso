@@ -1,0 +1,56 @@
+name: Publish Java Bindings to Maven Central
+
+on:
+  # Manually trigger the workflow
+  workflow_dispatch:
+    inputs:
+      release-version:
+        description: 'Release version (e.g., 0.0.1)'
+        required: false
+  # Trigger on release tags
+  push:
+    tags:
+      - 'java-v*'
+
+env:
+  working-directory: bindings/java
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build native libraries
+        run: make build
+
+      - name: Run tests
+        run: ./gradlew test
+
+      - name: Publish to Maven Central
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          ./gradlew publishToMavenCentral --no-daemon --stacktrace
