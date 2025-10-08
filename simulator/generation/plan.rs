@@ -708,7 +708,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Write: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -719,6 +719,7 @@ impl Display for InteractionStats {
             self.begin_count,
             self.commit_count,
             self.rollback_count,
+            self.alter_table_count,
         )
     }
 }

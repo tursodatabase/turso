@@ -1369,13 +1369,7 @@ pub(super) fn remaining(
     stats: &InteractionStats,
     mvcc: bool,
 ) -> Remaining {
-    let total_weight = opts.select_weight
-        + opts.create_table_weight
-        + opts.create_index_weight
-        + opts.insert_weight
-        + opts.update_weight
-        + opts.delete_weight
-        + opts.drop_table_weight;
+    let total_weight = opts.total_weight();
 
     let total_select = (max_interactions * opts.select_weight) / total_weight;
     let total_insert = (max_interactions * opts.insert_weight) / total_weight;
@@ -1384,6 +1378,7 @@ pub(super) fn remaining(
     let total_delete = (max_interactions * opts.delete_weight) / total_weight;
     let total_update = (max_interactions * opts.update_weight) / total_weight;
     let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
+    let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
 
     let remaining_select = total_select
         .checked_sub(stats.select_count)
@@ -1405,6 +1400,10 @@ pub(super) fn remaining(
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
 
+    let remaining_alter_table = total_alter_table
+        .checked_sub(stats.alter_table_count)
+        .unwrap_or_default();
+
     if mvcc {
         // TODO: index not supported yet for mvcc
         remaining_create_index = 0;
@@ -1418,7 +1417,7 @@ pub(super) fn remaining(
         delete: remaining_delete,
         drop: remaining_drop,
         update: remaining_update,
-        alter_table: 0, // TODO: calculate remaining
+        alter_table: remaining_alter_table,
     }
 }
 

@@ -9,7 +9,9 @@ use rand::{
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
-        query::{Create, CreateIndex, Delete, Insert, Select, update::Update},
+        query::{
+            Create, CreateIndex, Delete, Insert, Select, alter_table::AlterTable, update::Update,
+        },
         table::Table,
     },
 };
@@ -83,7 +85,8 @@ fn random_alter_table<R: rand::Rng + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
 ) -> Query {
-    todo!()
+    assert!(!conn_ctx.tables().is_empty());
+    Query::AlterTable(AlterTable::arbitrary(rng, conn_ctx))
 }
 
 /// Possible queries that can be generated given the table state
