@@ -666,9 +666,7 @@ impl IncrementalView {
     ) -> crate::Result<Vec<String>> {
         if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
-                turso_parser::error::ParseError::Custom(
-                    "No tables to populate from".to_string(),
-                ),
+                turso_parser::error::ParseError::Custom("No tables to populate from".to_string()),
             ));
         }
 

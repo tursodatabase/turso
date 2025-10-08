@@ -329,7 +329,7 @@ pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 
 pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
     // Even-sized blobs are always float32.
-    if blob.len() % 2 == 0 {
+    if blob.len().is_multiple_of(2) {
         return Ok(VectorType::Float32);
     }
     // Odd-sized blobs have type byte at the end

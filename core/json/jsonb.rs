@@ -1209,9 +1209,7 @@ impl Jsonb {
             // Can be serialized as is. Do not need escaping
             ElementType::TEXT => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError(
-                        turso_parser::error::ParseError::FailedToSerializeString,
-                    )
+                    LimboError::ParseError(turso_parser::error::ParseError::FailedToSerializeString)
                 })?;
                 string.push_str(word);
             }
@@ -1219,9 +1217,7 @@ impl Jsonb {
             // Contain standard json escapes
             ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError(
-                        turso_parser::error::ParseError::FailedToSerializeString,
-                    )
+                    LimboError::ParseError(turso_parser::error::ParseError::FailedToSerializeString)
                 })?;
                 string.push_str(word);
             }
@@ -1338,9 +1334,7 @@ impl Jsonb {
 
             ElementType::TEXTRAW => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError(
-                        turso_parser::error::ParseError::FailedToSerializeString,
-                    )
+                    LimboError::ParseError(turso_parser::error::ParseError::FailedToSerializeString)
                 })?;
 
                 for ch in word.chars() {
@@ -2880,9 +2874,9 @@ impl Jsonb {
             }
         };
 
-        Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(
-            "Not found".to_string(),
-        )))
+        Err(LimboError::ParseError(
+            turso_parser::error::ParseError::Custom("Not found".to_string()),
+        ))
     }
 
     fn skip_element(&self, mut pos: usize) -> Result<usize> {
@@ -2927,9 +2921,7 @@ impl Jsonb {
                 let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
                 if !key_header.0.is_valid_key() {
                     return Err(LimboError::ParseError(
-                        turso_parser::error::ParseError::Custom(
-                            "Invalid key type".to_string(),
-                        ),
+                        turso_parser::error::ParseError::Custom("Invalid key type".to_string()),
                     ));
                 }
 

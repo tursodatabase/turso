@@ -128,9 +128,7 @@ impl VirtualTable {
     fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next_cmd()?.ok_or(
-            LimboError::ParseError(
-                turso_parser::error::ParseError::VirtualTableSchemaParseFailed,
-            ),
+            LimboError::ParseError(turso_parser::error::ParseError::VirtualTableSchemaParseFailed),
         )? {
             columns_from_create_table_body(&body)
         } else {

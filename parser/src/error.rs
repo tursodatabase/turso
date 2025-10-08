@@ -94,6 +94,12 @@ pub enum ParseError {
     /// Operation requires an argument
     #[error("{0} requires an argument")]
     OperationRequiresArgument(String),
+    /// Table not found in get_collseq_from_expr
+    #[error("table not found")]
+    TableNotFound,
+    /// Column not found in get_collseq_from_expr
+    #[error("column not found")]
+    ColumnNotFound,
     // Custom error message
     #[error("{0}")]
     Custom(String),

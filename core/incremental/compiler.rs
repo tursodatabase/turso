@@ -669,7 +669,7 @@ impl DbspCircuit {
                     panic!("Trying to execute an uninitialized ExecuteState state machine");
                 }
                 ExecuteState::Init { input_data } => {
-                    let node = self.nodes.get(&node_id).ok_or_else(|| {
+                    let node = self.nodes.get(&node_id).ok_or({
                         LimboError::ParseError(turso_parser::error::ParseError::NodeNotFound)
                     })?;
 
@@ -759,7 +759,7 @@ impl DbspCircuit {
                 }
                 ExecuteState::ProcessingNode { eval_state } => {
                     // Get mutable reference to node for eval
-                    let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
+                    let node = self.nodes.get_mut(&node_id).ok_or({
                         LimboError::ParseError(turso_parser::error::ParseError::NodeNotFound)
                     })?;
 

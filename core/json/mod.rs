@@ -83,7 +83,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
     match jsonbin {
         Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
         Err(_) => {
-            return Err(LimboError::ParseError(
+            Err(LimboError::ParseError(
                 turso_parser::error::ParseError::MalformedJson,
             ))
         }
@@ -609,7 +609,7 @@ pub fn json_error_position(json: &Value) -> crate::Result<Value> {
 /// The number of values must be even, and the first value of each pair (which represents the map key)
 /// must be a TEXT value. The second value of each pair can be any JSON value (which represents the map value)
 pub fn json_object(values: &[Register]) -> crate::Result<Value> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);
@@ -630,7 +630,7 @@ pub fn json_object(values: &[Register]) -> crate::Result<Value> {
 }
 
 pub fn jsonb_object(values: &[Register]) -> crate::Result<Value> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);

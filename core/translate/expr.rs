@@ -3555,11 +3555,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         let table = connection
                             .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                             .ok_or_else(|| {
-                                crate::LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
-                                    "no such table: {}.{}",
-                                    db_name.as_str(),
-                                    tbl_name.as_str()
-                                )))
+                                crate::LimboError::ParseError(
+                                    turso_parser::error::ParseError::Custom(format!(
+                                        "no such table: {}.{}",
+                                        db_name.as_str(),
+                                        tbl_name.as_str()
+                                    )),
+                                )
                             })?;
 
                         // Find the column in the table
@@ -3572,12 +3574,14 @@ pub fn bind_and_rewrite_expr<'a>(
                                 })
                             })
                             .ok_or_else(|| {
-                                crate::LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
-                                    "Column: {}.{}.{} not found",
-                                    db_name.as_str(),
-                                    tbl_name.as_str(),
-                                    col_name.as_str()
-                                )))
+                                crate::LimboError::ParseError(
+                                    turso_parser::error::ParseError::Custom(format!(
+                                        "Column: {}.{}.{} not found",
+                                        db_name.as_str(),
+                                        tbl_name.as_str(),
+                                        col_name.as_str()
+                                    )),
+                                )
                             })?;
 
                         let col = table.columns().get(col_idx).unwrap();

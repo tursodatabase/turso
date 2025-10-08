@@ -107,10 +107,10 @@ pub fn get_collseq_from_expr(
             Expr::Column { table, column, .. } => {
                 let table_ref = referenced_tables
                     .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError(ParseError::TableNotFound))?;
+                    .ok_or(crate::LimboError::ParseError(ParseError::TableNotFound))?;
                 let column = table_ref
                     .get_column_at(*column)
-                    .ok_or_else(|| crate::LimboError::ParseError(ParseError::ColumnNotFound))?;
+                    .ok_or(crate::LimboError::ParseError(ParseError::ColumnNotFound))?;
                 if maybe_column_collseq.is_none() {
                     maybe_column_collseq = column.collation;
                 }
@@ -119,7 +119,7 @@ pub fn get_collseq_from_expr(
             Expr::RowId { table, .. } => {
                 let table_ref = referenced_tables
                     .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError(ParseError::TableNotFound))?;
+                    .ok_or(crate::LimboError::ParseError(ParseError::TableNotFound))?;
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {

@@ -224,8 +224,8 @@ impl InteractionPlan {
 
             let iter = range_transactions.get_mut(&interactions.connection_index);
 
-            if let Some(iter) = iter {
-                if let Some(txn_interaction_idx) = iter.peek().copied() {
+            if let Some(iter) = iter
+                && let Some(txn_interaction_idx) = iter.peek().copied() {
                     if txn_interaction_idx == idx {
                         iter.next();
                     }
@@ -233,7 +233,6 @@ impl InteractionPlan {
                         retain = false;
                     }
                 }
-            }
 
             idx += 1;
             retain

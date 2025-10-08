@@ -475,9 +475,9 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(turso_parser::error::ParseError::Custom(
-                            format!("Unknown Checkpoint Mode: {e}")
-                        ))
+                        LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+                            "Unknown Checkpoint Mode: {e}"
+                        )))
                     })?
                 }
                 _ => CheckpointMode::Passive {
