@@ -5,6 +5,8 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
+use turso_parser::error::ParseError;
+
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
@@ -462,7 +464,7 @@ impl DbspCircuit {
             )
         } else {
             Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
+                turso_parser::error::ParseError::CircuitHasNoRootNode,
             ))
         }
     }
@@ -498,7 +500,7 @@ impl DbspCircuit {
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
             Err(LimboError::ParseError(
-                "Circuit has no root node".to_string(),
+                turso_parser::error::ParseError::CircuitHasNoRootNode,
             ))
         }
     }
@@ -667,10 +669,9 @@ impl DbspCircuit {
                     panic!("Trying to execute an uninitialized ExecuteState state machine");
                 }
                 ExecuteState::Init { input_data } => {
-                    let node = self
-                        .nodes
-                        .get(&node_id)
-                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+                    let node = self.nodes.get(&node_id).ok_or_else(|| {
+                        LimboError::ParseError(turso_parser::error::ParseError::NodeNotFound)
+                    })?;
 
                     // Check if this is an Input node
                     match &node.operator {
@@ -758,10 +759,9 @@ impl DbspCircuit {
                 }
                 ExecuteState::ProcessingNode { eval_state } => {
                     // Get mutable reference to node for eval
-                    let node = self
-                        .nodes
-                        .get_mut(&node_id)
-                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+                    let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
+                        LimboError::ParseError(turso_parser::error::ParseError::NodeNotFound)
+                    })?;
 
                     let output_delta =
                         return_if_io!(node.process_node(eval_state, commit_operators, cursors));
@@ -889,20 +889,24 @@ impl DbspCompiler {
         } else {
             // Provide specific error messages for different failure cases
             if first_in_left.is_none() && first_in_right.is_none() {
-                Err(LimboError::ParseError(format!(
-                    "Join condition column '{}' not found in either input",
-                    first_col.name
-                )))
+                Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::JoinConditionColumnNotFound(
+                        first_col.name.clone(),
+                    ),
+                ))
             } else if second_in_left.is_none() && second_in_right.is_none() {
-                Err(LimboError::ParseError(format!(
-                    "Join condition column '{}' not found in either input",
-                    second_col.name
-                )))
+                Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::JoinConditionColumnNotFound(
+                        second_col.name.clone(),
+                    ),
+                ))
             } else {
-                Err(LimboError::ParseError(format!(
+                Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
                     "Join condition columns '{}' and '{}' must come from different input tables",
                     first_col.name, second_col.name
-                )))
+                )),
+                ))
             }
         }
     }
@@ -1132,15 +1136,23 @@ impl DbspCompiler {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
                         // Find the column index in the input schema using qualified lookup
-                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                            .ok_or_else(|| LimboError::ParseError(
-                                format!("GROUP BY column '{}' not found in input", col.name)
-                            ))?;
+                        let (col_idx, _) = input_schema
+                            .find_column(&col.name, col.table.as_deref())
+                            .ok_or_else(|| {
+                                LimboError::ParseError(
+                                    turso_parser::error::ParseError::FeatureColumnNotFoundInInput(
+                                        "GROUP BY".to_string(),
+                                        col.name.clone(),
+                                    ),
+                                )
+                            })?;
                         group_by_indices.push(col_idx);
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
                         return Err(LimboError::ParseError(
-                            "Only column references are supported in GROUP BY for incremental views".to_string()
+                            turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                "GROUP BY".to_string(),
+                            ),
                         ));
                     }
                 }
@@ -1158,78 +1170,130 @@ impl DbspCompiler {
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("SUM requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        turso_parser::error::ParseError::OperationRequiresArgument(
+                                            "SUM".to_string(),
+                                        ),
+                                    ));
                                 }
                                 // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("SUM column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(
+                                                turso_parser::error::ParseError::FeatureColumnNotFoundInInput(
+                                                    "SUM".to_string(),
+                                                    col.name.clone(),
+                                                ),
+                                            )
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        "Only column references are supported in aggregate functions for incremental views".to_string()
+                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                            "aggregate functions".to_string(),
+                                        ),
                                     ));
                                 }
                             }
                             AggFunc::Avg => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("AVG requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        turso_parser::error::ParseError::OperationRequiresArgument(
+                                            "AVG".to_string(),
+                                        ),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("AVG column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(
+                                                turso_parser::error::ParseError::FeatureColumnNotFoundInInput(
+                                                    "AVG".to_string(),
+                                                    col.name.clone(),
+                                                ),
+                                            )
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        "Only column references are supported in aggregate functions for incremental views".to_string()
+                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                            "aggregate functions".to_string(),
+                                        ),
                                     ));
                                 }
                             }
                             AggFunc::Min => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MIN requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        turso_parser::error::ParseError::OperationRequiresArgument(
+                                            "MIN".to_string(),
+                                        ),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MIN column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(
+                                                turso_parser::error::ParseError::FeatureColumnNotFoundInInput(
+                                                    "MIN".to_string(),
+                                                    col.name.clone(),
+                                                ),
+                                            )
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        "Only column references are supported in MIN for incremental views".to_string()
+                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                            "MIN".to_string(),
+                                        ),
                                     ));
                                 }
                             }
                             AggFunc::Max => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MAX requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        turso_parser::error::ParseError::OperationRequiresArgument(
+                                            "MAX".to_string(),
+                                        ),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MAX column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(
+                                                turso_parser::error::ParseError::FeatureColumnNotFoundInInput(
+                                                    "MAX".to_string(),
+                                                    col.name.clone(),
+                                                ),
+                                            )
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        "Only column references are supported in MAX for incremental views".to_string()
+                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                            "MAX".to_string(),
+                                        ),
                                     ));
                                 }
                             }
                             _ => {
                                 return Err(LimboError::ParseError(
-                                    format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
+                                    turso_parser::error::ParseError::Custom(format!(
+                                        "Unsupported aggregate function in DBSP compiler: {fun:?}"
+                                    )),
                                 ));
                             }
                         }
                     } else {
                         return Err(LimboError::ParseError(
-                            "Expected aggregate function in aggregate expressions".to_string()
+                            turso_parser::error::ParseError::Custom(
+                                "Expected aggregate function in aggregate expressions".to_string(),
+                            ),
                         ));
                     }
                 }
@@ -1276,14 +1340,18 @@ impl DbspCompiler {
                 // Check if there are any non-equijoin conditions in the filter
                 if join.filter.is_some() {
                     return Err(LimboError::ParseError(
-                        "Non-equijoin conditions are not supported in materialized views. Only equality joins (=) are allowed.".to_string()
+                        turso_parser::error::ParseError::Custom(
+                            "Non-equijoin conditions are not supported in materialized views. Only equality joins (=) are allowed.".to_string(),
+                        ),
                     ));
                 }
 
                 // Check if we have at least one equijoin condition
                 if join.on.is_empty() {
                     return Err(LimboError::ParseError(
-                        "Joins in materialized views must have at least one equality condition.".to_string()
+                        turso_parser::error::ParseError::Custom(
+                            "Joins in materialized views must have at least one equality condition.".to_string(),
+                        ),
                     ));
                 }
 
@@ -1310,7 +1378,9 @@ impl DbspCompiler {
                         ));
                     } else {
                         return Err(LimboError::ParseError(
-                            "Only simple column references are supported in join conditions for incremental views".to_string()
+                            turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                "join conditions".to_string(),
+                            ),
                         ));
                     }
                 }
@@ -1367,7 +1437,8 @@ impl DbspCompiler {
                 self.compile_union(union)
             }
             _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
+                turso_parser::error::ParseError::Custom(format!(
+                    "Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
@@ -1379,7 +1450,7 @@ impl DbspCompiler {
                         LogicalPlan::CTERef(_) => "CTERef",
                         _ => "Unknown",
                     }
-                )
+                ))
             )),
         }
     }
@@ -1454,10 +1525,12 @@ impl DbspCompiler {
     /// Compile a UNION operator
     fn compile_union(&mut self, union: &crate::translate::logical::Union) -> Result<i64> {
         if union.inputs.len() != 2 {
-            return Err(LimboError::ParseError(format!(
-                "UNION requires exactly 2 inputs, got {}",
-                union.inputs.len()
-            )));
+            return Err(LimboError::ParseError(
+                turso_parser::error::ParseError::Custom(format!(
+                    "UNION requires exactly 2 inputs, got {}",
+                    union.inputs.len()
+                )),
+            ));
         }
 
         // Extract source identifiers from each input (for UNION ALL)
@@ -1593,10 +1666,10 @@ impl DbspCompiler {
                 let (idx, _) = schema
                     .find_column(&col.name, col.table.as_deref())
                     .ok_or_else(|| {
-                        LimboError::ParseError(format!(
+                        LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
                             "Column '{}' with table {:?} not found in schema",
                             col.name, col.table
-                        ))
+                        )))
                     })?;
                 // Return a Register expression with the correct index
                 Ok(ast::Expr::Register(idx))
@@ -1666,9 +1739,11 @@ impl DbspCompiler {
                     crate::function::AggFunc::Min => "MIN",
                     crate::function::AggFunc::Max => "MAX",
                     _ => {
-                        return Err(LimboError::ParseError(format!(
-                            "Unsupported aggregate function: {fun:?}"
-                        )))
+                        return Err(LimboError::ParseError(
+                            turso_parser::error::ParseError::Custom(format!(
+                                "Unsupported aggregate function: {fun:?}"
+                            )),
+                        ))
                     }
                 };
 
@@ -1787,9 +1862,11 @@ impl DbspCompiler {
                     type_name: type_name.clone(),
                 })
             }
-            _ => Err(LimboError::ParseError(format!(
-                "Cannot convert LogicalExpr to AST Expr: {expr:?}"
-            ))),
+            _ => Err(LimboError::ParseError(
+                turso_parser::error::ParseError::Custom(format!(
+                    "Cannot convert LogicalExpr to AST Expr: {expr:?}"
+                )),
+            )),
         }
     }
 
@@ -2002,9 +2079,11 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == left_col.name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                left_col.name
+                            crate::LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                                format!(
+                                    "Column '{}' not found in schema for filter",
+                                    left_col.name
+                                ),
                             ))
                         })?;
 
@@ -2013,9 +2092,11 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == right_col.name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                right_col.name
+                            crate::LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                                format!(
+                                    "Column '{}' not found in schema for filter",
+                                    right_col.name
+                                ),
                             ))
                         })?;
 
@@ -2062,9 +2143,11 @@ impl DbspCompiler {
                                 _ => unreachable!(),
                             }
                         }
-                        _ => Err(LimboError::ParseError(format!(
-                            "Unsupported operator in filter: {op:?}"
-                        ))),
+                        _ => Err(LimboError::ParseError(
+                            turso_parser::error::ParseError::Custom(format!(
+                                "Unsupported operator in filter: {op:?}"
+                            )),
+                        )),
                     }
                 } else if let (LogicalExpr::Column(col), LogicalExpr::Literal(val)) =
                     (left.as_ref(), right.as_ref())
@@ -2075,9 +2158,8 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == col.name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                col.name
+                            crate::LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                                format!("Column '{}' not found in schema for filter", col.name),
                             ))
                         })?;
 
@@ -2124,9 +2206,11 @@ impl DbspCompiler {
                                 Box::new(right_pred),
                             ))
                         }
-                        _ => Err(LimboError::ParseError(format!(
-                            "Unsupported operator in filter: {op:?}"
-                        ))),
+                        _ => Err(LimboError::ParseError(
+                            turso_parser::error::ParseError::Custom(format!(
+                                "Unsupported operator in filter: {op:?}"
+                            )),
+                        )),
                     }
                 } else if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
                     // Handle logical operators
@@ -2145,7 +2229,10 @@ impl DbspCompiler {
                     }
                 } else {
                     Err(LimboError::ParseError(
-                        "Filter predicate must be column op value or column op column".to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "Filter predicate must be column op value or column op column"
+                                .to_string(),
+                        ),
                     ))
                 }
             }
@@ -2157,10 +2244,10 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == col.name)
                         .ok_or_else(|| {
-                            LimboError::ParseError(format!(
+                            LimboError::ParseError(ParseError::Custom(format!(
                                 "Column '{}' not found in schema for IS NULL filter",
                                 col.name
-                            ))
+                            )))
                         })?;
 
                     if *negated {
@@ -2169,14 +2256,14 @@ impl DbspCompiler {
                         Ok(FilterPredicate::IsNull { column_idx })
                     }
                 } else {
-                    Err(LimboError::ParseError(
+                    Err(LimboError::ParseError(ParseError::Custom(
                         "IS NULL/IS NOT NULL expects a column reference".to_string(),
-                    ))
+                    )))
                 }
             }
-            _ => Err(LimboError::ParseError(format!(
+            _ => Err(LimboError::ParseError(ParseError::Custom(format!(
                 "Unsupported filter expression: {expr:?}"
-            ))),
+            )))),
         }
     }
 }
