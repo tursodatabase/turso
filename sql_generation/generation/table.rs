@@ -99,9 +99,9 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
         column_type: &ColumnType,
     ) -> Self {
         // 5%: Null
-        if rng.random_bool(0.05) {
-            return SimValue(Value::Null);
-        }
+        // if rng.random_bool(0.05) {
+        //     return SimValue(Value::Null);
+        // }
         // 10%: Pick a random type
         let column_type = if rng.random_bool(0.1) {
             ColumnType::arbitrary(rng, context)

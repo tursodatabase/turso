@@ -643,6 +643,18 @@ impl Assertion {
         }
     }
 
+    pub fn table_should_not_exist(table_name: &str, connection_index: usize) -> Self {
+        let name = format!("table_should_not_exist({})", table_name);
+        let table_name = table_name.to_string();
+        Self::new(name, move |_, env| {
+            let conn_tables = env.get_conn_tables(connection_index);
+            if !conn_tables.iter().any(|t| t.name == table_name) {
+                Ok(Ok(()))
+            } else {
+                Ok(Err(format!("table {table_name} already exists")))
+            }
+        })
+    }
     pub fn table_exists(table_name: &str) -> Self {
         let name = format!("table_exists({})", table_name);
         let table_name = table_name.to_string();
@@ -710,6 +722,63 @@ impl Assertion {
                 )))
             }
         })
+    }
+
+    pub fn shadow_equivalence(table: &str, conn_index: usize) -> Self {
+        let table = table.to_string();
+        Self::new(
+            format!("table {} should have the expected content", table.clone()),
+            move |stack: &Vec<ResultSet>, env| {
+                let rows = stack.last().unwrap();
+                let Ok(rows) = rows else {
+                    return Ok(Err(format!("expected rows but got error: {rows:?}")));
+                };
+                let conn_tables = env.get_conn_tables(conn_index);
+                let sim_table = conn_tables
+                    .iter()
+                    .find(|t| t.name == table)
+                    .expect("table should be in enviroment");
+                if rows.len() != sim_table.rows.len() {
+                    return Ok(Err(format!(
+                        "expected {} rows but got {} for table {}",
+                        sim_table.rows.len(),
+                        rows.len(),
+                        table.clone()
+                    )));
+                }
+                for expected_row in sim_table.rows.iter() {
+                    if !rows.contains(expected_row) {
+                        return Ok(Err(format!(
+                            "expected row {:?} not found in table {}",
+                            expected_row,
+                            table.clone()
+                        )));
+                    }
+                }
+                Ok(Ok(()))
+            },
+        )
+    }
+
+    pub fn expected_result(expected: Vec<Vec<SimValue>>) -> Self {
+        let expected_clone = expected.clone();
+        Self::new(
+            format!("expected result to be {:?}", expected_clone),
+            move |stack: &Vec<ResultSet>, _| {
+                let rows = stack.last().unwrap();
+                let Ok(rows) = rows else {
+                    return Ok(Err(format!("expected rows but got error: {rows:?}")));
+                };
+                if *rows == expected {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(format!(
+                        "expected result to be {:?}, but got {:?}",
+                        expected, rows
+                    )))
+                }
+            },
+        )
     }
 }
 

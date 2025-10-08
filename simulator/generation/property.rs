@@ -251,37 +251,9 @@ impl Property {
                     Predicate::true_(),
                 )));
                 let table = table.clone();
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("table {} should have the expected content", table.clone()),
-                    move |stack: &Vec<ResultSet>, env| {
-                        let rows = stack.last().unwrap();
-                        let Ok(rows) = rows else {
-                            return Ok(Err(format!("expected rows but got error: {rows:?}")));
-                        };
-                        let conn_tables = env.get_conn_tables(connection_index);
-                        let sim_table = conn_tables
-                            .iter()
-                            .find(|t| t.name == table)
-                            .expect("table should be in enviroment");
-                        if rows.len() != sim_table.rows.len() {
-                            return Ok(Err(format!(
-                                "expected {} rows but got {} for table {}",
-                                sim_table.rows.len(),
-                                rows.len(),
-                                table.clone()
-                            )));
-                        }
-                        for expected_row in sim_table.rows.iter() {
-                            if !rows.contains(expected_row) {
-                                return Ok(Err(format!(
-                                    "expected row {:?} not found in table {}",
-                                    expected_row,
-                                    table.clone()
-                                )));
-                            }
-                        }
-                        Ok(Ok(()))
-                    },
+                let assertion = InteractionType::Assertion(Assertion::shadow_equivalence(
+                    &table,
+                    connection_index,
                 ));
 
                 vec![
@@ -415,28 +387,17 @@ impl Property {
                 interactions
             }
             Property::DoubleCreateFailure { create, queries } => {
-                let table_name = create.table.name.clone();
-
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    "Double-Create-Failure should not be called on an existing table".to_string(),
-                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        let conn_tables = env.get_conn_tables(connection_index);
-                        if !conn_tables.iter().any(|t| t.name == table_name) {
-                            Ok(Ok(()))
-                        } else {
-                            Ok(Err(format!("table {table_name} already exists")))
-                        }
-                    },
+                let assumption = InteractionType::Assumption(Assertion::table_should_not_exist(
+                    &create.table.name,
+                    connection_index,
                 ));
 
                 let cq1 = InteractionType::Query(Query::Create(create.clone()));
                 let cq2 = InteractionType::Query(Query::Create(create.clone()));
 
-                let table_name = create.table.name.clone();
-
                 let assertion = InteractionType::Assertion(Assertion::expect_error(
-                    &format!("table {table_name} already exists"),
-                    "creating two tables with the name should result in a failure for the second query",
+                    &format!("table {} already exists", &create.table.name),
+                    "creating two tables with the same name should result in a failure for the second query",
                 ));
 
                 let mut interactions = Vec::new();
@@ -454,34 +415,11 @@ impl Property {
                 interactions
             }
             Property::SelectLimit { select } => {
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!(
-                        "table ({}) exists",
-                        select
-                            .dependencies()
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    {
-                        let table_name = select.dependencies();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if table_name
-                                .iter()
-                                .all(|table| conn_tables.iter().any(|t| t.name == *table))
-                            {
-                                Ok(Ok(()))
-                            } else {
-                                let missing_tables = table_name
-                                    .iter()
-                                    .filter(|t| !conn_tables.iter().any(|t2| t2.name == **t))
-                                    .collect::<Vec<&String>>();
-                                Ok(Err(format!("missing tables: {missing_tables:?}")))
-                            }
-                        }
-                    },
-                ));
+                let assumptions = select
+                    .dependencies()
+                    .iter()
+                    .map(|table| Assertion::table_exists(table))
+                    .collect::<Vec<Assertion>>();
 
                 let limit = select
                     .limit
@@ -493,40 +431,25 @@ impl Property {
                     "select query should respect the limit clause",
                 ));
 
-                vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(
-                        connection_index,
-                        InteractionType::Query(Query::Select(select.clone())),
-                    ),
-                    Interaction::new(connection_index, assertion),
-                ]
+                let mut interactions = Vec::new();
+                interactions.extend(
+                    assumptions.into_iter().map(|a| {
+                        Interaction::new(connection_index, InteractionType::Assumption(a))
+                    }),
+                );
+                interactions.push(Interaction::new(
+                    connection_index,
+                    InteractionType::Query(Query::Select(select.clone())),
+                ));
+                interactions.push(Interaction::new(connection_index, assertion));
+                interactions
             }
             Property::DeleteSelect {
                 table,
                 predicate,
                 queries,
             } => {
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {table} exists"),
-                    {
-                        let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table) {
-                                Ok(Ok(()))
-                            } else {
-                                {
-                                    let available_tables: Vec<String> =
-                                        conn_tables.iter().map(|t| t.name.clone()).collect();
-                                    Ok(Err(format!(
-                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
-                                    )))
-                                }
-                            }
-                        }
-                    },
-                ));
+                let assumption = InteractionType::Assumption(Assertion::table_exists(table));
 
                 let delete = InteractionType::Query(Query::Delete(Delete {
                     table: table.clone(),
@@ -538,29 +461,7 @@ impl Property {
                     predicate.clone(),
                 )));
 
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("`{select}` should return no values for table `{table}`",),
-                    move |stack: &Vec<ResultSet>, _| {
-                        let rows = stack.last().unwrap();
-                        match rows {
-                            Ok(rows) => {
-                                if rows.is_empty() {
-                                    Ok(Ok(()))
-                                } else {
-                                    Ok(Err(format!(
-                                        "expected no rows but got {} rows: {:?}",
-                                        rows.len(),
-                                        rows.iter()
-                                            .map(|r| print_row(r))
-                                            .collect::<Vec<String>>()
-                                            .join(", ")
-                                    )))
-                                }
-                            }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
-                        }
-                    },
-                ));
+                let assertion = InteractionType::Assertion(Assertion::expected_result(vec![]));
 
                 let mut interactions = Vec::new();
                 interactions.push(Interaction::new(connection_index, assumption));
@@ -585,27 +486,9 @@ impl Property {
 
                 let table_name = table.clone();
 
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("select query should result in an error for table '{table}'"),
-                    move |stack: &Vec<ResultSet>, _| {
-                        let last = stack.last().unwrap();
-                        match last {
-                            Ok(success) => Ok(Err(format!(
-                                "expected table creation to fail but it succeeded: {success:?}"
-                            ))),
-                            Err(e) => {
-                                if e.to_string()
-                                    .contains(&format!("Table {table_name} does not exist"))
-                                {
-                                    Ok(Ok(()))
-                                } else {
-                                    Ok(Err(format!(
-                                        "expected table does not exist error, got: {e}"
-                                    )))
-                                }
-                            }
-                        }
-                    },
+                let assertion = InteractionType::Assertion(Assertion::expect_error(
+                    &format!("Table {} does not exist", table_name),
+                    "selecting from a dropped table should result in an error",
                 ));
 
                 let drop = InteractionType::Query(Query::Drop(Drop {

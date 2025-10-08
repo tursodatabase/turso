@@ -191,16 +191,20 @@ pub fn pick_unique<'a, T: PartialEq>(
 mod tests {
     use crate::{
         generation::{GenerationContext, Opts},
-        model::table::Table,
+        model::table::{SimValue, Table},
     };
 
     #[derive(Debug, Default, Clone)]
     pub struct TestContext {
+        pub values: Vec<SimValue>,
         pub opts: Opts,
         pub tables: Vec<Table>,
     }
 
     impl GenerationContext for TestContext {
+        fn values(&self) -> &Vec<SimValue> {
+            &self.values
+        }
         fn tables(&self) -> &Vec<Table> {
             &self.tables
         }
