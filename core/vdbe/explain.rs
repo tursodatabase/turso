@@ -1804,7 +1804,25 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        }
+        Insn::FkCounter{increment_value, is_scope } => (
+        "FkCounter",
+            *increment_value as i32,
+            *is_scope as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::FkIfZero{target_pc, is_scope } => (
+        "FkIfZero",
+            target_pc.as_debug_int(),
+            *is_scope as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+    }
 }
 
 pub fn insn_to_row_with_comment(

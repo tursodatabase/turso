@@ -313,6 +313,7 @@ pub struct ProgramState {
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    fk_scope_counter: isize,
 }
 
 impl ProgramState {
@@ -359,6 +360,7 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
+            fk_scope_counter: 0,
         }
     }
 
@@ -830,7 +832,6 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-
         if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.

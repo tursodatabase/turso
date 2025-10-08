@@ -5,10 +5,13 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::ast::{self, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::schema::ROWID_SENTINEL;
 use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_pk_change_checks};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
+use crate::Connection;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -346,6 +349,7 @@ pub fn emit_upsert(
     returning: &mut [ResultSetColumn],
     cdc_cursor_id: Option<usize>,
     row_done_label: BranchOffset,
+    connection: &Arc<Connection>,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -464,10 +468,55 @@ pub fn emit_upsert(
         }
     }
 
+    let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias);
+    let has_direct_rowid_update = set_pairs
+        .iter()
+        .any(|(idx, _)| *idx == rowid_alias_idx.unwrap_or(ROWID_SENTINEL));
+    let has_user_provided_rowid = if let Some(i) = rowid_alias_idx {
+        set_pairs.iter().any(|(idx, _)| *idx == i) || has_direct_rowid_update
+    } else {
+        has_direct_rowid_update
+    };
+
+    let rowid_set_clause_reg = if has_user_provided_rowid {
+        Some(new_rowid_reg.unwrap_or(conflict_rowid_reg))
+    } else {
+        None
+    };
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled() {
+            let rowid_new_reg = new_rowid_reg.unwrap_or(conflict_rowid_reg);
+
+            // Child-side checks
+            if resolver.schema.has_child_fks(bt.name.as_str()) {
+                emit_fk_child_update_counters(
+                    program,
+                    resolver,
+                    &bt,
+                    table.get_name(),
+                    tbl_cursor_id,
+                    new_start,
+                    rowid_new_reg,
+                    &changed_cols,
+                )?;
+            }
+            emit_parent_pk_change_checks(
+                program,
+                resolver,
+                &bt,
+                tbl_cursor_id,
+                conflict_rowid_reg,
+                new_start,
+                new_rowid_reg.unwrap_or(conflict_rowid_reg),
+                rowid_set_clause_reg,
+                set_pairs,
+            )?;
+        }
+    }
+
     // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
     if let Some(before) = before_start {
-        let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-
         for (idx_name, _root, idx_cid) in idx_cursors {
             let idx_meta = resolver
                 .schema

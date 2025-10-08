@@ -1,6 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -28,6 +29,11 @@ use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
     ReturningValueRegisters, WalkControl,
+};
+use crate::translate::fkeys::{
+    build_index_affinity_string, emit_fk_child_update_counters,
+    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
+    emit_parent_pk_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
@@ -469,10 +475,146 @@ fn emit_program_for_delete(
         None,
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
-
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+pub fn emit_fk_child_decrement_on_delete(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_tbl: &BTreeTable,
+    child_table_name: &str,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+) -> crate::Result<()> {
+    for fk_ref in resolver.schema.resolved_fks_for_child(child_table_name)? {
+        if !fk_ref.fk.deferred {
+            continue;
+        }
+        // Fast path: if any FK column is NULL can't be a violation
+        let null_skip = program.allocate_label();
+        for cname in &fk_ref.child_cols {
+            let (pos, col) = child_tbl.get_column(cname).unwrap();
+            let src = if col.is_rowid_alias {
+                child_rowid_reg
+            } else {
+                let tmp = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: child_cursor_id,
+                    column: pos,
+                    dest: tmp,
+                    default: None,
+                });
+                tmp
+            };
+            program.emit_insn(Insn::IsNull {
+                reg: src,
+                target_pc: null_skip,
+            });
+        }
+
+        if fk_ref.parent_uses_rowid {
+            // Probe parent table by rowid
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let pcur = open_read_table(program, &parent_tbl);
+
+            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let val = if col.is_rowid_alias {
+                child_rowid_reg
+            } else {
+                let tmp = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: child_cursor_id,
+                    column: pos,
+                    dest: tmp,
+                    default: None,
+                });
+                tmp
+            };
+            let tmpi = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: val,
+                dst_reg: tmpi,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MustBeInt { reg: tmpi });
+
+            // NotExists jumps when the parent key is missing, so we decrement there
+            let missing = program.allocate_label();
+            let done = program.allocate_label();
+
+            program.emit_insn(Insn::NotExists {
+                cursor: pcur,
+                rowid_reg: tmpi,
+                target_pc: missing,
+            });
+
+            // Parent FOUND, no decrement
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+            program.emit_insn(Insn::Goto { target_pc: done });
+
+            // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
+            program.preassign_label_to_next_insn(missing);
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+            emit_guarded_fk_decrement(program, done);
+            program.preassign_label_to_next_insn(done);
+        } else {
+            // Probe parent unique index
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
+            let icur = open_read_index(program, idx);
+
+            // Build probe from current child row
+            let n = fk_ref.child_cols.len();
+            let probe = program.alloc_registers(n);
+            for (i, cname) in fk_ref.child_cols.iter().enumerate() {
+                let (pos, col) = child_tbl.get_column(cname).unwrap();
+                let src = if col.is_rowid_alias {
+                    child_rowid_reg
+                } else {
+                    let r = program.alloc_register();
+                    program.emit_insn(Insn::Column {
+                        cursor_id: child_cursor_id,
+                        column: pos,
+                        dest: r,
+                        default: None,
+                    });
+                    r
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: src,
+                    dst_reg: probe + i,
+                    extra_amount: 0,
+                });
+            }
+            program.emit_insn(Insn::Affinity {
+                start_reg: probe,
+                count: std::num::NonZeroUsize::new(n).unwrap(),
+                affinities: build_index_affinity_string(idx, &parent_tbl),
+            });
+
+            let ok = program.allocate_label();
+            program.emit_insn(Insn::Found {
+                cursor_id: icur,
+                target_pc: ok,
+                record_reg: probe,
+                num_regs: n,
+            });
+            program.emit_insn(Insn::Close { cursor_id: icur });
+            emit_guarded_fk_decrement(program, ok);
+            program.preassign_label_to_next_insn(ok);
+            program.emit_insn(Insn::Close { cursor_id: icur });
+        }
+        program.preassign_label_to_next_insn(null_skip);
+    }
     Ok(())
 }
 
@@ -513,6 +655,34 @@ fn emit_delete_insns(
         cursor_id: main_table_cursor_id,
         dest: key_reg,
     });
+
+    if connection.foreign_keys_enabled() {
+        if let Some(table) = unsafe { &*table_reference }.btree() {
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
+                emit_fk_delete_parent_existence_checks(
+                    program,
+                    &t_ctx.resolver,
+                    table_name,
+                    main_table_cursor_id,
+                    key_reg,
+                )?;
+            }
+            if t_ctx.resolver.schema.has_child_fks(table_name) {
+                emit_fk_child_decrement_on_delete(
+                    program,
+                    &t_ctx.resolver,
+                    &table,
+                    table_name,
+                    main_table_cursor_id,
+                    key_reg,
+                )?;
+            }
+        }
+    }
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
@@ -802,7 +972,6 @@ fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
@@ -1063,6 +1232,59 @@ fn emit_update_insns(
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
                 program.mark_last_insn_constant();
+            }
+        }
+    }
+
+    if connection.foreign_keys_enabled() {
+        let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
+        if let Some(table_btree) = unsafe { &*table_ref }.btree() {
+            stabilize_new_row_for_fk(
+                program,
+                &table_btree,
+                &plan.set_clauses,
+                cursor_id,
+                start,
+                rowid_new_reg,
+            )?;
+            if t_ctx.resolver.schema.has_child_fks(table_name) {
+                // Child-side checks:
+                // this ensures updated row still satisfies child FKs that point OUT from this table
+                emit_fk_child_update_counters(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    table_name,
+                    cursor_id,
+                    start,
+                    rowid_new_reg,
+                    &plan
+                        .set_clauses
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .collect::<HashSet<_>>(),
+                )?;
+            }
+            // Parent-side checks:
+            // We only need to do work if the referenced key (the parent key) might change.
+            // we detect that by comparing OLD vs NEW primary key representation
+            // then run parent FK checks only when it actually changes.
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
+                emit_parent_pk_change_checks(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    cursor_id,
+                    beg,
+                    start,
+                    rowid_new_reg,
+                    rowid_set_clause_reg,
+                    &plan.set_clauses,
+                )?;
             }
         }
     }

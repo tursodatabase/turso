@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -35,7 +35,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, MvCursor};
+use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -2156,6 +2156,9 @@ pub fn halt(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            return Err(LimboError::Constraint(format!("{description} (19)")));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -2166,9 +2169,21 @@ pub fn halt(
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
-        program
-            .commit_txn(pager.clone(), state, mv_store, false)
-            .map(Into::into)
+        let res = program.commit_txn(pager.clone(), state, mv_store, false);
+        if res.is_ok()
+            && program.connection.foreign_keys_enabled()
+            && program
+                .connection
+                .fk_deferred_violations
+                .swap(0, Ordering::AcqRel)
+                > 0
+        {
+            // In autocommit mode, a statement that leaves deferred violations must fail here.
+            return Err(LimboError::Constraint(
+                "foreign key constraint failed".to_string(),
+            ));
+        }
+        res.map(Into::into)
     } else {
         Ok(InsnFunctionStepResult::Done)
     }
@@ -2441,20 +2456,47 @@ pub fn op_auto_commit(
     load_insn!(
         AutoCommit {
             auto_commit,
-            rollback,
+            rollback
         },
         insn
     );
+
     let conn = program.connection.clone();
+    let fk_on = conn.foreign_keys_enabled();
+    let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
+
+    // Drive any multi-step commit/rollback that’s already in progress.
     if matches!(state.commit_state, CommitState::Committing) {
-        return program
+        let res = program
             .commit_txn(pager.clone(), state, mv_store, *rollback)
             .map(Into::into);
+        // Only clear after a final, successful non-rollback COMMIT.
+        if fk_on
+            && !*rollback
+            && matches!(
+                res,
+                Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+            )
+        {
+            conn.clear_deferred_foreign_key_violations();
+        }
+        return res;
     }
 
-    if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
-        if *rollback {
-            // TODO(pere): add rollback I/O logic once we implement rollback journal
+    // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
+    // very explicit about the currently existing and requested state.
+    let requested_autocommit = *auto_commit;
+    let requested_rollback = *rollback;
+    let changed = requested_autocommit != had_autocommit;
+
+    // what the requested operation is
+    let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
+    let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
+    let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
+
+    if changed {
+        if requested_rollback {
+            // ROLLBACK transition
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
                     mv_store.rollback_tx(tx_id, pager.clone(), &conn);
@@ -2465,16 +2507,23 @@ pub fn op_auto_commit(
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
-            conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
+            // BEGIN (true->false) or COMMIT (false->true)
+            if is_commit_req {
+                // Pre-check deferred FKs; leave tx open and do NOT clear violations
+                check_deferred_fk_on_commit(&conn)?;
+            }
+            conn.auto_commit
+                .store(requested_autocommit, Ordering::SeqCst);
         }
     } else {
-        let mvcc_tx_active = program.connection.get_mv_tx().is_some();
+        // No autocommit flip
+        let mvcc_tx_active = conn.get_mv_tx().is_some();
         if !mvcc_tx_active {
-            if !*auto_commit {
+            if !requested_autocommit {
                 return Err(LimboError::TxError(
                     "cannot start a transaction within a transaction".to_string(),
                 ));
-            } else if *rollback {
+            } else if requested_rollback {
                 return Err(LimboError::TxError(
                     "cannot rollback - no transaction is active".to_string(),
                 ));
@@ -2483,19 +2532,41 @@ pub fn op_auto_commit(
                     "cannot commit - no transaction is active".to_string(),
                 ));
             }
-        } else {
-            let is_begin = !*auto_commit && !*rollback;
-            if is_begin {
-                return Err(LimboError::TxError(
-                    "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-                ));
-            }
+        } else if is_begin_req {
+            return Err(LimboError::TxError(
+                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+            ));
         }
     }
 
-    program
-        .commit_txn(pager.clone(), state, mv_store, *rollback)
-        .map(Into::into)
+    let res = program
+        .commit_txn(pager.clone(), state, mv_store, requested_rollback)
+        .map(Into::into);
+
+    // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
+    if fk_on
+        && matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        )
+        && (is_rollback_req || is_commit_req)
+    {
+        conn.clear_deferred_foreign_key_violations();
+    }
+
+    res
+}
+
+fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
+    if !conn.foreign_keys_enabled() {
+        return Ok(());
+    }
+    if conn.get_deferred_foreign_key_violations() > 0 {
+        return Err(LimboError::Constraint(
+            "FOREIGN KEY constraint failed".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn op_goto(
@@ -8285,6 +8356,72 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
             }
         }
     }
+}
+
+pub fn op_fk_counter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkCounter {
+            increment_value,
+            is_scope,
+        },
+        insn
+    );
+    if *is_scope {
+        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+    } else {
+        // Transaction-level counter: add/subtract for deferred FKs.
+        program
+            .connection
+            .fk_deferred_violations
+            .fetch_add(*increment_value, Ordering::AcqRel);
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_fk_if_zero(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkIfZero {
+            is_scope,
+            target_pc,
+        },
+        insn
+    );
+    let fk_enabled = program.connection.foreign_keys_enabled();
+
+    // Jump if any:
+    // Foreign keys are disabled globally
+    // p1 is true AND deferred constraint counter is zero
+    // p1 is false AND deferred constraint counter is non-zero
+    if !fk_enabled {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let v = if !*is_scope {
+        program.connection.get_deferred_foreign_key_violations()
+    } else {
+        state.fk_scope_counter
+    };
+
+    state.pc = if v == 0 {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+    Ok(InsnFunctionStepResult::Step)
 }
 
 mod cmath {
