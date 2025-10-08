@@ -2,6 +2,7 @@ use crate::generation::{
     gen_random_text, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom, ArbitrarySized,
     GenerationContext,
 };
+use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
@@ -9,9 +10,12 @@ use crate::model::query::select::{
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
-use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext};
+use crate::model::table::{
+    Column, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+};
 use indexmap::IndexSet;
 use itertools::Itertools;
+use rand::seq::IndexedRandom;
 use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
 
@@ -382,6 +386,50 @@ impl Arbitrary for Update {
             table: table.name.clone(),
             set_values,
             predicate: Predicate::arbitrary_from(rng, env, table),
+        }
+    }
+}
+
+impl Arbitrary for AlterTable {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let table = pick(context.tables(), rng);
+        let choices: &'static [AlterTableTypeDiscriminants] = if table.columns.len() > 1 {
+            &[
+                AlterTableTypeDiscriminants::RenameTo,
+                AlterTableTypeDiscriminants::AddColumn,
+                // AlterTableTypeDiscriminants::AlterColumn,
+                AlterTableTypeDiscriminants::RenameColumn,
+                AlterTableTypeDiscriminants::DropColumn,
+            ]
+        } else {
+            &[
+                AlterTableTypeDiscriminants::RenameTo,
+                AlterTableTypeDiscriminants::AddColumn,
+                // AlterTableTypeDiscriminants::AlterColumn,
+                AlterTableTypeDiscriminants::RenameColumn,
+            ]
+        };
+        let alter_table_type = match choices.choose(rng).unwrap() {
+            AlterTableTypeDiscriminants::RenameTo => AlterTableType::RenameTo {
+                new_name: Name::arbitrary(rng, context).0,
+            },
+            AlterTableTypeDiscriminants::AddColumn => AlterTableType::AddColumn {
+                column: Column::arbitrary(rng, context),
+            },
+            AlterTableTypeDiscriminants::AlterColumn => {
+                todo!();
+            }
+            AlterTableTypeDiscriminants::RenameColumn => AlterTableType::RenameColumn {
+                old: pick(&table.columns, rng).name.clone(),
+                new: Name::arbitrary(rng, context).0,
+            },
+            AlterTableTypeDiscriminants::DropColumn => AlterTableType::DropColumn {
+                column_name: pick(&table.columns, rng).name.clone(),
+            },
+        };
+        Self {
+            table_name: table.name.clone(),
+            alter_table_type,
         }
     }
 }
