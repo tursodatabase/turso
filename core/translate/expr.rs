@@ -1819,8 +1819,55 @@ pub fn translate_expr(
                 Func::AlterTable(_) => unreachable!(),
             }
         }
-        ast::Expr::FunctionCallStar { .. } => {
-            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported")
+        ast::Expr::FunctionCallStar { name, filter_over } => {
+            // Handle func(*) syntax as a function call with 0 arguments
+            // This is equivalent to func() for functions that accept 0 arguments
+            let args_count = 0;
+            let func_type = resolver.resolve_function(name.as_str(), args_count);
+
+            if func_type.is_none() {
+                crate::bail_parse_error!("unknown function {}", name.as_str());
+            }
+
+            let func_ctx = FuncCtx {
+                func: func_type.unwrap(),
+                arg_count: args_count,
+            };
+
+            // Check if this function supports the (*) syntax by verifying it can be called with 0 args
+            match &func_ctx.func {
+                Func::Agg(_) => {
+                    crate::bail_parse_error!(
+                        "misuse of {} function {}(*)",
+                        if filter_over.over_clause.is_some() {
+                            "window"
+                        } else {
+                            "aggregate"
+                        },
+                        name.as_str()
+                    )
+                }
+                // For supported functions, delegate to the existing FunctionCall logic
+                // by creating a synthetic FunctionCall with empty args
+                _ => {
+                    let synthetic_call = ast::Expr::FunctionCall {
+                        name: name.clone(),
+                        distinctness: None,
+                        args: vec![], // Empty args for func(*)
+                        filter_over: filter_over.clone(),
+                        order_by: vec![], // Empty order_by for func(*)
+                    };
+
+                    // Recursively call translate_expr with the synthetic function call
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        &synthetic_call,
+                        target_register,
+                        resolver,
+                    )
+                }
+            }
         }
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)

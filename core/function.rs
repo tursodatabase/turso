@@ -642,6 +642,28 @@ impl Func {
             Self::AlterTable(_) => true,
         }
     }
+
+    pub fn supports_star_syntax(&self) -> bool {
+        match self {
+            Self::Scalar(scalar_func) => {
+                matches!(
+                    scalar_func,
+                    ScalarFunc::Changes
+                        | ScalarFunc::Random
+                        | ScalarFunc::TotalChanges
+                        | ScalarFunc::SqliteVersion
+                        | ScalarFunc::SqliteSourceId
+                        | ScalarFunc::LastInsertRowid
+                )
+            }
+            Self::Math(math_func) => {
+                matches!(math_func.arity(), MathFuncArity::Nullary)
+            }
+            // Aggregate functions with (*) syntax are handled separately in the planner
+            Self::Agg(_) => false,
+            _ => false,
+        }
+    }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);
         match normalized_name.as_str() {
