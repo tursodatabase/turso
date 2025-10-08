@@ -292,13 +292,14 @@ fn translate_in_list(
         });
     }
 
+    program.resolve_label(label_ok, program.offset());
+
     // by default if IN expression is true we just continue to the next instruction
     if condition_metadata.jump_if_condition_is_true {
         program.emit_insn(Insn::Goto {
             target_pc: condition_metadata.jump_target_when_true,
         });
     }
-    program.resolve_label(label_ok, program.offset());
     // todo: deallocate check_null_reg
 
     Ok(())
@@ -437,15 +438,21 @@ pub fn translate_condition_expr(
             } = condition_metadata;
 
             // Adjust targets if `NOT IN`
-            let adjusted_metadata = if *not {
-                ConditionMetadata {
-                    jump_if_condition_is_true,
-                    jump_target_when_true,
-                    jump_target_when_false: jump_target_when_true,
-                    jump_target_when_null,
-                }
+            let (adjusted_metadata, not_true_label, not_false_label) = if *not {
+                let not_true_label = program.allocate_label();
+                let not_false_label = program.allocate_label();
+                (
+                    ConditionMetadata {
+                        jump_if_condition_is_true,
+                        jump_target_when_true: not_true_label,
+                        jump_target_when_false: not_false_label,
+                        jump_target_when_null,
+                    },
+                    Some(not_true_label),
+                    Some(not_false_label),
+                )
             } else {
-                condition_metadata
+                (condition_metadata, None, None)
             };
 
             translate_in_list(
@@ -458,10 +465,17 @@ pub fn translate_condition_expr(
             )?;
 
             if *not {
+                // When IN is TRUE (match found), NOT IN should be FALSE
+                program.resolve_label(not_true_label.unwrap(), program.offset());
                 program.emit_insn(Insn::Goto {
                     target_pc: jump_target_when_false,
                 });
-                program.resolve_label(adjusted_metadata.jump_target_when_false, program.offset());
+
+                // When IN is FALSE (no match), NOT IN should be TRUE
+                program.resolve_label(not_false_label.unwrap(), program.offset());
+                program.emit_insn(Insn::Goto {
+                    target_pc: jump_target_when_true,
+                });
             }
         }
         ast::Expr::Like { not, .. } => {
