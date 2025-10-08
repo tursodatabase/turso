@@ -82,11 +82,9 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
     let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
     match jsonbin {
         Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
-        Err(_) => {
-            Err(LimboError::ParseError(
-                turso_parser::error::ParseError::MalformedJson,
-            ))
-        }
+        Err(_) => Err(LimboError::ParseError(
+            turso_parser::error::ParseError::MalformedJson,
+        )),
     }
 }
 
