@@ -95,6 +95,7 @@ fn test_deferred_transaction_no_restart() {
         .execute("INSERT INTO test (id, value) VALUES (2, 'second')")
         .unwrap();
     conn2.execute("COMMIT").unwrap();
+    drop(stmt);
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {

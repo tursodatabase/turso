@@ -1,6 +1,97 @@
 import { expect, test } from 'vitest'
 import { connect, Database } from './promise-default.js'
 
+test('explain', async () => {
+    const db = await connect(":memory:");
+    const stmt = db.prepare("EXPLAIN SELECT 1");
+    expect(stmt.columns()).toEqual([
+        {
+            "name": "addr",
+            "type": "INTEGER",
+        },
+        {
+            "name": "opcode",
+            "type": "TEXT",
+        },
+        {
+            "name": "p1",
+            "type": "INTEGER",
+        },
+        {
+            "name": "p2",
+            "type": "INTEGER",
+        },
+        {
+            "name": "p3",
+            "type": "INTEGER",
+        },
+        {
+            "name": "p4",
+            "type": "INTEGER",
+        },
+        {
+            "name": "p5",
+            "type": "INTEGER",
+        },
+        {
+            "name": "comment",
+            "type": "TEXT",
+        },
+    ].map(x => ({ ...x, column: null, database: null, table: null })));
+    expect(await stmt.all()).toEqual([
+        {
+            "addr": 0,
+            "comment": "Start at 3",
+            "opcode": "Init",
+            "p1": 0,
+            "p2": 3,
+            "p3": 0,
+            "p4": "",
+            "p5": 0,
+        },
+        {
+            "addr": 1,
+            "comment": "output=r[1]",
+            "opcode": "ResultRow",
+            "p1": 1,
+            "p2": 1,
+            "p3": 0,
+            "p4": "",
+            "p5": 0,
+        },
+        {
+            "addr": 2,
+            "comment": "",
+            "opcode": "Halt",
+            "p1": 0,
+            "p2": 0,
+            "p3": 0,
+            "p4": "",
+            "p5": 0,
+        },
+        {
+            "addr": 3,
+            "comment": "r[1]=1",
+            "opcode": "Integer",
+            "p1": 1,
+            "p2": 1,
+            "p3": 0,
+            "p4": "",
+            "p5": 0,
+        },
+        {
+            "addr": 4,
+            "comment": "",
+            "opcode": "Goto",
+            "p1": 0,
+            "p2": 1,
+            "p3": 0,
+            "p4": "",
+            "p5": 0,
+        },
+    ]);
+})
+
 test('in-memory db', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x)");
@@ -9,6 +100,7 @@ test('in-memory db', async () => {
     const rows = await stmt.all([1]);
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
+
 
 test('implicit connect', async () => {
     const db = new Database(':memory:');

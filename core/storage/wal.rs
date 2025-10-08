@@ -15,6 +15,7 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
+use crate::io::CompletionGroup;
 use crate::io::{clock, File, IO};
 use crate::storage::database::EncryptionOrChecksum;
 use crate::storage::sqlite3_ondisk::{
@@ -23,8 +24,8 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::{
-    bail_corrupt_error, io_yield_many, io_yield_one, return_if_io, turso_assert, Buffer,
-    Completion, CompletionError, IOContext, LimboError, Result,
+    bail_corrupt_error, io_yield_one, return_if_io, turso_assert, Buffer, Completion,
+    CompletionError, IOContext, LimboError, Result,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -301,7 +302,7 @@ pub trait Wal: Debug {
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
-    fn rollback(&mut self) -> Result<()>;
+    fn rollback(&mut self);
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
@@ -522,7 +523,7 @@ impl OngoingCheckpoint {
         let mut moved = false;
         // retain only those still pending
         self.inflight_reads.retain(|slot| {
-            if slot.completion.is_completed() {
+            if slot.completion.succeeded() {
                 if let Some(buf) = slot.buf.lock().take() {
                     // read is done, take the buffer and add it to the batch to write
                     self.pending_writes.insert(slot.page_id, buf);
@@ -1350,8 +1351,8 @@ impl Wal for WalFile {
         self.min_frame.load(Ordering::Acquire)
     }
 
-    #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn rollback(&mut self) -> Result<()> {
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn rollback(&mut self) {
         let (max_frame, last_checksum) = {
             let shared = self.get_shared();
             let max_frame = shared.max_frame.load(Ordering::Acquire);
@@ -1368,7 +1369,6 @@ impl Wal for WalFile {
         self.last_checksum = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
         self.reset_internal_states();
-        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1823,8 +1823,9 @@ impl WalFile {
                 // to prevent serialization, and we try to issue reads and flush batches concurrently
                 // if at all possible, at the cost of some batching potential.
                 CheckpointState::Processing => {
-                    // Gather I/O completions, estimate with MAX_INFLIGHT_WRITES to prevent realloc
-                    let mut completions = Vec::with_capacity(MAX_INFLIGHT_WRITES);
+                    // Gather I/O completions using a completion group
+                    let mut nr_completions = 0;
+                    let mut group = CompletionGroup::new(|_| {});
 
                     // Check and clean any completed writes from pending flush
                     if self.ongoing_checkpoint.process_inflight_writes() {
@@ -1891,7 +1892,8 @@ impl WalFile {
                         // the frame requirements
                         let inflight =
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
-                        completions.push(inflight.completion.clone());
+                        group.add(&inflight.completion);
+                        nr_completions += 1;
                         self.ongoing_checkpoint.inflight_reads.push(inflight);
                         self.ongoing_checkpoint.current_page += 1;
                     }
@@ -1903,12 +1905,15 @@ impl WalFile {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            completions.extend(write_pages_vectored(pager, batch_map, done_flag)?);
+                            for c in write_pages_vectored(pager, batch_map, done_flag)? {
+                                group.add(&c);
+                                nr_completions += 1;
+                            }
                         }
                     }
 
-                    if !completions.is_empty() {
-                        io_yield_many!(completions);
+                    if nr_completions > 0 {
+                        io_yield_one!(group.build());
                     } else if self.ongoing_checkpoint.complete() {
                         self.ongoing_checkpoint.state = CheckpointState::Finalize;
                     }
@@ -2819,7 +2824,7 @@ pub mod test {
             }
         }
         drop(w);
-        conn2.pager.write().end_read_tx().unwrap();
+        conn2.pager.write().end_read_tx();
 
         conn1
             .execute("create table test(id integer primary key, value text)")

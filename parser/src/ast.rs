@@ -1416,6 +1416,8 @@ pub enum PragmaName {
     Encoding,
     /// Current free page count.
     FreelistCount,
+    /// Enable or disable foreign key constraint enforcement
+    ForeignKeys,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma
@@ -1449,6 +1451,8 @@ pub enum PragmaName {
     UserVersion,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
+    /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
+    MvccCheckpointThreshold,
 }
 
 /// `CREATE TRIGGER` time

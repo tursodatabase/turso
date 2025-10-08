@@ -30,18 +30,18 @@ use crate::{
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
     state_machine::StateMachine,
-    storage::sqlite3_ondisk::SmallVec,
+    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState,
-            OpSeekState, OpTransactionState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
+            OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
-    IOExt, RefValue,
+    ValueRef,
 };
 
 use crate::{
@@ -265,6 +265,12 @@ pub struct Row {
     count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TxnCleanup {
+    None,
+    RollbackTxn,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -284,6 +290,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_delete_state: OpDeleteState,
+    op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
     /// Metrics collected during statement execution
@@ -302,6 +309,11 @@ pub struct ProgramState {
     op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
+    /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
+    /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
+    pub(crate) auto_txn_cleanup: TxnCleanup,
+    fk_scope_counter: isize,
 }
 
 impl ProgramState {
@@ -328,6 +340,7 @@ impl ProgramState {
                 sub_state: OpDeleteSubState::MaybeCaptureRecord,
                 deleted_record: None,
             },
+            op_destroy_state: OpDestroyState::CreateCursor,
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
@@ -346,6 +359,8 @@ impl ProgramState {
             op_transaction_state: OpTransactionState::Start,
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            auto_txn_cleanup: TxnCleanup::None,
+            fk_scope_counter: 0,
         }
     }
 
@@ -428,6 +443,7 @@ impl ProgramState {
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.auto_txn_cleanup = TxnCleanup::None;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -533,7 +549,7 @@ impl Program {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                pager.rollback_tx(&self.connection);
             }
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -588,7 +604,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -636,11 +652,12 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
+                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -649,7 +666,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -672,6 +689,7 @@ impl Program {
                 Ok(InsnFunctionStepResult::Done) => {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    state.auto_txn_cleanup = TxnCleanup::None;
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
@@ -684,16 +702,12 @@ impl Program {
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     return Ok(StepResult::Row);
                 }
-                Ok(InsnFunctionStepResult::Interrupt) => {
-                    // Instruction interrupted - may resume at same PC
-                    return Ok(StepResult::Interrupt);
-                }
                 Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
             }
@@ -818,7 +832,6 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-
         if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
@@ -888,7 +901,7 @@ impl Program {
                     ),
                     TransactionState::Read => {
                         connection.set_tx_state(TransactionState::None);
-                        pager.end_read_tx()?;
+                        pager.end_read_tx();
                         Ok(IOResult::Done(()))
                     }
                     TransactionState::None => Ok(IOResult::Done(())),
@@ -914,7 +927,12 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let cacheflush_status = pager.end_tx(rollback, connection)?;
+        let cacheflush_status = if !rollback {
+            pager.commit_tx(connection)?
+        } else {
+            pager.rollback_tx(connection);
+            IOResult::Done(PagerCommitResult::Rollback)
+        };
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
@@ -941,6 +959,42 @@ impl Program {
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
     }
+
+    /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
+    /// This method is no-op if program was already finished (either aborted or executed to completion)
+    pub fn abort(
+        &self,
+        mv_store: Option<&Arc<MvStore>>,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+        cleanup: &mut TxnCleanup,
+    ) {
+        // Errors from nested statements are handled by the parent statement.
+        if !self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+            match err {
+                // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
+                Some(LimboError::TxError(_)) => {}
+                // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
+                Some(LimboError::TableLocked) => {}
+                // Busy errors do not cause a rollback.
+                Some(LimboError::Busy) => {}
+                _ => {
+                    if *cleanup != TxnCleanup::None || err.is_some() {
+                        if let Some(mv_store) = mv_store {
+                            if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                                self.connection.auto_commit.store(true, Ordering::SeqCst);
+                                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+                            }
+                        } else {
+                            pager.rollback_tx(&self.connection);
+                        }
+                        self.connection.set_tx_state(TransactionState::None);
+                    }
+                }
+            }
+        }
+        *cleanup = TxnCleanup::None;
+    }
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
@@ -948,22 +1002,10 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
     registers
         .iter()
-        .map(|reg| {
-            let value = reg.get_value();
-            match value {
-                Value::Null => RefValue::Null,
-                Value::Integer(i) => RefValue::Integer(*i),
-                Value::Float(f) => RefValue::Float(*f),
-                Value::Text(t) => RefValue::Text(TextRef {
-                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
-                    subtype: t.subtype,
-                }),
-                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
-            }
-        })
+        .map(|reg| reg.get_value().as_ref())
         .collect()
 }
 
@@ -1062,43 +1104,4 @@ impl Row {
     pub fn len(&self) -> usize {
         self.count
     }
-}
-
-/// Handle a program error by rolling back the transaction
-pub fn handle_program_error(
-    pager: &Arc<Pager>,
-    connection: &Connection,
-    err: &LimboError,
-    mv_store: Option<&Arc<MvStore>>,
-) -> Result<()> {
-    if connection.is_nested_stmt.load(Ordering::SeqCst) {
-        // Errors from nested statements are handled by the parent statement.
-        return Ok(());
-    }
-    match err {
-        // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
-        LimboError::TxError(_) => {}
-        // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-        LimboError::TableLocked => {}
-        // Busy errors do not cause a rollback.
-        LimboError::Busy => {}
-        _ => {
-            if let Some(mv_store) = mv_store {
-                if let Some(tx_id) = connection.get_mv_tx_id() {
-                    connection.set_tx_state(TransactionState::None);
-                    connection.auto_commit.store(true, Ordering::SeqCst);
-                    mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
-                }
-            } else {
-                pager
-                    .io
-                    .block(|| pager.end_tx(true, connection))
-                    .inspect_err(|e| {
-                        tracing::error!("end_tx failed: {e}");
-                    })?;
-            }
-            connection.set_tx_state(TransactionState::None);
-        }
-    }
-    Ok(())
 }

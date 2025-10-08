@@ -17,7 +17,7 @@ use crate::{
 pub struct TrueValue(pub SimValue);
 
 impl ArbitraryFromMaybe<&SimValue> for TrueValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         _rng: &mut R,
         _context: &C,
         value: &SimValue,
@@ -31,7 +31,7 @@ impl ArbitraryFromMaybe<&SimValue> for TrueValue {
 }
 
 impl ArbitraryFromMaybe<&Vec<&SimValue>> for TrueValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         values: &Vec<&SimValue>,
@@ -51,7 +51,7 @@ impl ArbitraryFromMaybe<&Vec<&SimValue>> for TrueValue {
 pub struct FalseValue(pub SimValue);
 
 impl ArbitraryFromMaybe<&SimValue> for FalseValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         _rng: &mut R,
         _context: &C,
         value: &SimValue,
@@ -65,7 +65,7 @@ impl ArbitraryFromMaybe<&SimValue> for FalseValue {
 }
 
 impl ArbitraryFromMaybe<&Vec<&SimValue>> for FalseValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         values: &Vec<&SimValue>,
@@ -86,7 +86,7 @@ impl ArbitraryFromMaybe<&Vec<&SimValue>> for FalseValue {
 pub struct BitNotValue(pub SimValue);
 
 impl ArbitraryFromMaybe<(&SimValue, bool)> for BitNotValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         _rng: &mut R,
         _context: &C,
         (value, predicate): (&SimValue, bool),
@@ -101,7 +101,7 @@ impl ArbitraryFromMaybe<(&SimValue, bool)> for BitNotValue {
 }
 
 impl ArbitraryFromMaybe<(&Vec<&SimValue>, bool)> for BitNotValue {
-    fn arbitrary_from_maybe<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (values, predicate): (&Vec<&SimValue>, bool),
@@ -121,7 +121,7 @@ impl ArbitraryFromMaybe<(&Vec<&SimValue>, bool)> for BitNotValue {
 // TODO: have some more complex generation with columns names here as well
 impl SimplePredicate {
     /// Generates a true [ast::Expr::Unary] [SimplePredicate] from a [TableContext] for some values in the table
-    pub fn true_unary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn true_unary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         _table: &T,
@@ -187,7 +187,7 @@ impl SimplePredicate {
     }
 
     /// Generates a false [ast::Expr::Unary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn false_unary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn false_unary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         _table: &T,

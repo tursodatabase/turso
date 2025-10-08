@@ -458,11 +458,6 @@ impl CompiledExpression {
                                 "Expression evaluation produced unexpected row".to_string(),
                             ));
                         }
-                        crate::vdbe::execute::InsnFunctionStepResult::Interrupt => {
-                            return Err(crate::LimboError::InternalError(
-                                "Expression evaluation was interrupted".to_string(),
-                            ));
-                        }
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {
                             pc = state.pc as usize;
                         }

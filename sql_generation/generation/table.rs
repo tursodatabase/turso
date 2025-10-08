@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use indexmap::IndexSet;
 use rand::Rng;
 use turso_core::Value;
@@ -9,15 +11,18 @@ use crate::model::table::{Column, ColumnType, Name, SimValue, Table};
 
 use super::ArbitraryFromMaybe;
 
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl Arbitrary for Name {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
-        let name = readable_name_custom("_", rng);
-        Name(name.replace("-", "_"))
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
+        let base = readable_name_custom("_", rng).replace("-", "_");
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Name(format!("{base}_{id}"))
     }
 }
 
 impl Arbitrary for Table {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let opts = context.opts().table.clone();
         let name = Name::arbitrary(rng, context).0;
         let large_table =
@@ -45,7 +50,7 @@ impl Arbitrary for Table {
 }
 
 impl Arbitrary for Column {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
         let column_type = ColumnType::arbitrary(rng, context);
         Self {
@@ -58,13 +63,13 @@ impl Arbitrary for Column {
 }
 
 impl Arbitrary for ColumnType {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         pick(&[Self::Integer, Self::Float, Self::Text, Self::Blob], rng).to_owned()
     }
 }
 
 impl ArbitraryFrom<&Table> for Vec<SimValue> {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         table: &Table,
@@ -79,7 +84,7 @@ impl ArbitraryFrom<&Table> for Vec<SimValue> {
 }
 
 impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         values: &Vec<&Self>,
@@ -93,7 +98,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
 }
 
 impl ArbitraryFrom<&ColumnType> for SimValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         column_type: &ColumnType,
@@ -111,7 +116,7 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
 pub struct LTValue(pub SimValue);
 
 impl ArbitraryFrom<&Vec<&SimValue>> for LTValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         values: &Vec<&SimValue>,
@@ -127,7 +132,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for LTValue {
 }
 
 impl ArbitraryFrom<&SimValue> for LTValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         value: &SimValue,
@@ -181,7 +186,7 @@ impl ArbitraryFrom<&SimValue> for LTValue {
 pub struct GTValue(pub SimValue);
 
 impl ArbitraryFrom<&Vec<&SimValue>> for GTValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         values: &Vec<&SimValue>,
@@ -197,7 +202,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for GTValue {
 }
 
 impl ArbitraryFrom<&SimValue> for GTValue {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         value: &SimValue,
@@ -251,7 +256,7 @@ impl ArbitraryFrom<&SimValue> for GTValue {
 pub struct LikeValue(pub SimValue);
 
 impl ArbitraryFromMaybe<&SimValue> for LikeValue {
-    fn arbitrary_from_maybe<R: Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         value: &SimValue,

@@ -46,6 +46,7 @@ use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
@@ -57,21 +58,21 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionType, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO,
-    WriteCompletion, IO,
+    Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
+    SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
 use schema::Schema;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
     time::Duration,
@@ -95,8 +96,8 @@ use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
-pub use types::RefValue;
 pub use types::Value;
+pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -217,7 +218,7 @@ pub struct Database {
     shared_wal: Arc<RwLock<WalFileShared>>,
     db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
-    open_flags: OpenFlags,
+    open_flags: Cell<OpenFlags>,
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
@@ -231,7 +232,7 @@ impl fmt::Debug for Database {
         let mut debug_struct = f.debug_struct("Database");
         debug_struct
             .field("path", &self.path)
-            .field("open_flags", &self.open_flags);
+            .field("open_flags", &self.open_flags.get());
 
         // Database state information
         let db_state_value = match self.db_state.get() {
@@ -468,7 +469,7 @@ impl Database {
             db_file,
             builtin_syms: syms.into(),
             io: io.clone(),
-            open_flags: flags,
+            open_flags: flags.into(),
             db_state: Arc::new(AtomicDbState::new(db_state)),
             init_lock: Arc::new(Mutex::new(())),
             opts,
@@ -497,10 +498,7 @@ impl Database {
                 schema.schema_version = header_schema_cookie;
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
-                    .or_else(|e| {
-                        pager.end_read_tx()?;
-                        Err(e)
-                    });
+                    .inspect_err(|_| pager.end_read_tx());
                 if let Err(LimboError::ExtensionError(e)) = result {
                     // this means that a vtab exists and we no longer have the module loaded. we print
                     // a warning to the user to load the module
@@ -558,12 +556,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: RwLock::new(pager),
-            schema: RwLock::new(
-                self.schema
-                    .lock()
-                    .map_err(|_| LimboError::SchemaLocked)?
-                    .clone(),
-            ),
+            schema: RwLock::new(self.schema.lock().unwrap().clone()),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
             transaction_state: RwLock::new(TransactionState::None),
@@ -589,6 +582,8 @@ impl Database {
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            fk_pragma: AtomicBool::new(false),
+            fk_deferred_violations: AtomicIsize::new(0),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -599,7 +594,7 @@ impl Database {
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.open_flags.contains(OpenFlags::ReadOnly)
+        self.open_flags.get().contains(OpenFlags::ReadOnly)
     }
 
     /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
@@ -835,17 +830,17 @@ impl Database {
 
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
-        let mut schema_ref = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+        let mut schema_ref = self.schema.lock().unwrap();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-    pub(crate) fn clone_schema(&self) -> Result<Arc<Schema>> {
-        let schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
-        Ok(schema.clone())
+    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+        let schema = self.schema.lock().unwrap();
+        schema.clone()
     }
 
-    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) -> Result<()> {
-        let mut schema = self.schema.lock().map_err(|_| LimboError::SchemaLocked)?;
+    pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
+        let mut schema = self.schema.lock().unwrap();
         if schema.schema_version < another.schema_version {
             tracing::debug!(
                 "DB schema is outdated: {} < {}",
@@ -860,7 +855,6 @@ impl Database {
                 another.schema_version
             );
         }
-        Ok(())
     }
 
     pub fn get_mv_store(&self) -> Option<&Arc<MvStore>> {
@@ -1107,6 +1101,9 @@ pub struct Connection {
     busy_timeout: RwLock<std::time::Duration>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
+    /// Whether pragma foreign_keys=ON for this connection
+    fk_pragma: AtomicBool,
+    fk_deferred_violations: AtomicIsize,
 }
 
 impl Drop for Connection {
@@ -1154,7 +1151,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let pager = self.pager.read().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
@@ -1201,11 +1198,11 @@ impl Connection {
                 0
             }
             Err(err) => {
-                pager.end_read_tx().expect("read txn must be finished");
+                pager.end_read_tx();
                 return Err(err);
             }
         };
-        pager.end_read_tx().expect("read txn must be finished");
+        pager.end_read_tx();
 
         let db_schema_version = self.db.schema.lock().unwrap().schema_version;
         tracing::debug!(
@@ -1242,13 +1239,14 @@ impl Connection {
         // close opened transaction if it was kept open
         // (in most cases, it will be automatically closed if stmt was executed properly)
         if previous == TransactionState::Read {
-            pager.end_read_tx().expect("read txn must be finished");
+            pager.end_read_tx();
         }
 
         reparse_result?;
 
         let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema)
+        self.db.update_schema_if_newer(schema);
+        Ok(())
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
@@ -1303,7 +1301,7 @@ impl Connection {
                 "The supplied SQL string contains no statements".to_string(),
             ));
         }
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let sql = sql.as_ref();
         tracing::trace!("Preparing and executing batch: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
@@ -1337,7 +1335,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         tracing::trace!("Querying: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -1389,7 +1387,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let sql = sql.as_ref();
-        self.maybe_update_schema()?;
+        self.maybe_update_schema();
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
@@ -1527,9 +1525,7 @@ impl Connection {
         db_opts: DatabaseOpts,
         io: Arc<dyn IO>,
     ) -> Result<Arc<Database>> {
-        let mut opts = OpenOptions::parse(uri)?;
-        // FIXME: for now, only support read only attach
-        opts.mode = OpenMode::ReadOnly;
+        let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
@@ -1540,20 +1536,29 @@ impl Connection {
         Ok(db)
     }
 
-    pub fn maybe_update_schema(&self) -> Result<()> {
+    pub fn set_foreign_keys_enabled(&self, enable: bool) {
+        self.fk_pragma.store(enable, Ordering::Release);
+    }
+
+    pub fn foreign_keys_enabled(&self) -> bool {
+        self.fk_pragma.load(Ordering::Acquire)
+    }
+    pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.swap(0, Ordering::Release)
+    }
+
+    pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
+        self.fk_deferred_violations.load(Ordering::Acquire)
+    }
+
+    pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
-        let schema = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?;
+        let schema = self.db.schema.lock().unwrap();
         if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
             *self.schema.write() = schema.clone();
         }
-
-        Ok(())
     }
 
     /// Read schema version at current transaction
@@ -1665,7 +1670,7 @@ impl Connection {
         let pager = self.pager.read();
         pager.begin_read_tx()?;
         pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
-            pager.end_read_tx().expect("read txn must be closed");
+            pager.end_read_tx();
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
@@ -1713,13 +1718,11 @@ impl Connection {
                 wal.end_read_tx();
             }
 
-            let rollback_err = if !force_commit {
+            if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
-                pager.rollback(false, self, true).err()
-            } else {
-                None
-            };
-            if let Some(err) = commit_err.or(rollback_err) {
+                pager.rollback(false, self, true);
+            }
+            if let Some(err) = commit_err {
                 return Err(err);
             }
         }
@@ -1763,12 +1766,7 @@ impl Connection {
             _ => {
                 if !self.mvcc_enabled() {
                     let pager = self.pager.read();
-                    pager.io.block(|| {
-                        pager.end_tx(
-                            true, // rollback = true for close
-                            self,
-                        )
-                    })?;
+                    pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
             }
@@ -2075,12 +2073,7 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self
-            .db
-            .schema
-            .lock()
-            .map_err(|_| LimboError::SchemaLocked)?
-            .indexes_enabled();
+        let use_indexes = self.db.schema.lock().unwrap().indexes_enabled();
         let use_mvcc = self.db.mv_store.is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
@@ -2090,9 +2083,15 @@ impl Connection {
             .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
-        let db = Self::from_uri_attached(path, db_opts, self.db.io.clone())?;
+        let io: Arc<dyn IO> = if path.contains(":memory:") {
+            Arc::new(MemoryIO::new())
+        } else {
+            Arc::new(PlatformIO::new()?)
+        };
+        let db = Self::from_uri_attached(path, db_opts, io)?;
         let pager = Arc::new(db.init_pager(None)?);
-
+        // FIXME: for now, only support read only attach
+        db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
@@ -2360,6 +2359,23 @@ impl Connection {
     pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
     }
+
+    pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: u64) -> Result<()> {
+        match self.db.mv_store.as_ref() {
+            Some(mv_store) => {
+                mv_store.set_checkpoint_threshold(threshold);
+                Ok(())
+            }
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
+
+    pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<u64> {
+        match self.db.mv_store.as_ref() {
+            Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
+            None => Err(LimboError::InternalError("MVCC not enabled".into())),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2447,6 +2463,12 @@ pub struct Statement {
     /// Busy timeout instant
     /// We need Option here because `io.now()` is not a cheap call
     busy_timeout: Option<BusyTimeout>,
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        self.reset();
+    }
 }
 
 impl Statement {
@@ -2598,7 +2620,8 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        *conn.schema.write() = conn.db.clone_schema()?;
+
+        *conn.schema.write() = conn.db.clone_schema();
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
@@ -2626,7 +2649,7 @@ impl Statement {
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
-        self._reset(Some(max_registers), Some(cursor_count));
+        self.reset_internal(Some(max_registers), Some(cursor_count));
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
@@ -2648,12 +2671,8 @@ impl Statement {
             }
             let state = self.program.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                let end_tx_res = self.pager.end_tx(true, &self.program.connection)?;
+                self.pager.rollback_tx(&self.program.connection);
                 self.program.connection.set_tx_state(TransactionState::None);
-                assert!(
-                    matches!(end_tx_res, IOResult::Done(_)),
-                    "end_tx should not return IO as it should just end txn without flushing anything. Got {end_tx_res:?}"
-                );
             }
         }
         res
@@ -2668,6 +2687,17 @@ impl Statement {
     }
 
     pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
+        if self.query_mode == QueryMode::Explain {
+            return Cow::Owned(EXPLAIN_COLUMNS.get(idx).expect("No column").to_string());
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Cow::Owned(
+                EXPLAIN_QUERY_PLAN_COLUMNS
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         match self.query_mode {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
@@ -2686,6 +2716,9 @@ impl Statement {
     }
 
     pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
+        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
+            return None;
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column { table, .. } => self
@@ -2698,6 +2731,22 @@ impl Statement {
     }
 
     pub fn get_column_type(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain {
+            return Some(
+                EXPLAIN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Some(
+                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
         let column = &self.program.result_columns.get(idx).expect("No column");
         match &column.expr {
             turso_parser::ast::Expr::Column {
@@ -2744,10 +2793,17 @@ impl Statement {
     }
 
     pub fn reset(&mut self) {
-        self._reset(None, None);
+        self.reset_internal(None, None);
     }
 
-    pub fn _reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+    fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
+        self.program.abort(
+            self.mv_store.as_ref(),
+            &self.pager,
+            None,
+            &mut self.state.auto_txn_cleanup,
+        );
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_timeout = None;

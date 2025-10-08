@@ -80,7 +80,7 @@ use crate::util::{
 };
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, RefValue, SymbolTable, VirtualTable,
+    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
@@ -89,7 +89,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
+use turso_parser::ast::{
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+};
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
@@ -428,36 +430,36 @@ impl Schema {
             let mut record_cursor = cursor.record_cursor.borrow_mut();
             // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
             let ty_value = record_cursor.get_value(&row, 0)?;
-            let RefValue::Text(ty) = ty_value else {
+            let ValueRef::Text(ty, _) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let ty = ty.as_str();
-            let RefValue::Text(name) = record_cursor.get_value(&row, 1)? else {
+            let ty = String::from_utf8_lossy(ty);
+            let ValueRef::Text(name, _) = record_cursor.get_value(&row, 1)? else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let name = name.as_str();
+            let name = String::from_utf8_lossy(name);
             let table_name_value = record_cursor.get_value(&row, 2)?;
-            let RefValue::Text(table_name) = table_name_value else {
+            let ValueRef::Text(table_name, _) = table_name_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let table_name = table_name.as_str();
+            let table_name = String::from_utf8_lossy(table_name);
             let root_page_value = record_cursor.get_value(&row, 3)?;
-            let RefValue::Integer(root_page) = root_page_value else {
+            let ValueRef::Integer(root_page) = root_page_value else {
                 return Err(LimboError::ConversionError("Expected integer value".into()));
             };
             let sql_value = record_cursor.get_value(&row, 4)?;
             let sql_textref = match sql_value {
-                RefValue::Text(sql) => Some(sql),
+                ValueRef::Text(sql, _) => Some(sql),
                 _ => None,
             };
-            let sql = sql_textref.as_ref().map(|s| s.as_str());
+            let sql = sql_textref.map(|s| String::from_utf8_lossy(s));
 
             self.handle_schema_row(
-                ty,
-                name,
-                table_name,
+                &ty,
+                &name,
+                &table_name,
                 root_page,
-                sql,
+                sql.as_deref(),
                 syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,
@@ -472,7 +474,7 @@ impl Schema {
             pager.io.block(|| cursor.next())?;
         }
 
-        pager.end_read_tx()?;
+        pager.end_read_tx();
 
         self.populate_indices(from_sql_indexes, automatic_indices)?;
 
@@ -646,6 +648,7 @@ impl Schema {
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
+                foreign_keys: vec![],
 
                 unique_sets: vec![],
             })));
@@ -842,6 +845,266 @@ impl Schema {
 
         Ok(())
     }
+
+    /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
+    /// Each item contains the child table, normalized columns/positions, and the parent lookup
+    /// strategy (rowid vs. UNIQUE index or PK).
+    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+        let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
+            crate::LimboError::Constraint(format!(
+                "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+            ))
+        };
+        let target = normalize_ident(table_name);
+        let mut out = Vec::with_capacity(4); // arbitrary estimate
+        let parent_tbl = self
+            .get_btree_table(&target)
+            .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
+
+        // Precompute helper to find parent unique index, if it's not the rowid
+        let find_parent_unique = |cols: &Vec<String>| -> Option<Arc<Index>> {
+            self.get_indices(&parent_tbl.name)
+                .find(|idx| {
+                    idx.unique
+                        && idx.columns.len() == cols.len()
+                        && idx
+                            .columns
+                            .iter()
+                            .zip(cols.iter())
+                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                })
+                .cloned()
+        };
+
+        for t in self.tables.values() {
+            let Some(child) = t.btree() else {
+                continue;
+            };
+            for fk in &child.foreign_keys {
+                if !fk.parent_table.eq_ignore_ascii_case(&target) {
+                    continue;
+                }
+                if fk.child_columns.is_empty() {
+                    // SQLite requires an explicit child column list unless the table has a single-column PK that
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
+                let child_cols: Vec<String> = fk.child_columns.clone();
+                let mut child_pos = Vec::with_capacity(child_cols.len());
+
+                for cname in &child_cols {
+                    let (i, _) = child
+                        .get_column(cname)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                    child_pos.push(i);
+                }
+                let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                    if !parent_tbl.primary_key_columns.is_empty() {
+                        parent_tbl
+                            .primary_key_columns
+                            .iter()
+                            .map(|(col, _)| col)
+                            .cloned()
+                            .collect()
+                    } else {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    }
+                } else {
+                    fk.parent_columns.clone()
+                };
+
+                // Same length required
+                if parent_cols.len() != child_cols.len() {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
+
+                let mut parent_pos = Vec::with_capacity(parent_cols.len());
+                for pc in &parent_cols {
+                    let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
+                        ROWID_STRS
+                            .iter()
+                            .any(|s| pc.eq_ignore_ascii_case(s))
+                            .then_some(0)
+                    });
+                    let Some(p) = pos else {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    };
+                    parent_pos.push(p);
+                }
+
+                // Determine if parent key is ROWID/alias
+                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
+                    if parent_tbl.primary_key_columns.len() == 1 {
+                        let pk_name = &parent_tbl.primary_key_columns[0].0;
+                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
+                        parent_tbl.columns.iter().any(|c| {
+                            c.is_rowid_alias
+                                && c.name
+                                    .as_deref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
+                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
+                    } else {
+                        false
+                    }
+                };
+
+                // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
+                let parent_unique_index = if parent_uses_rowid {
+                    None
+                } else {
+                    find_parent_unique(&parent_cols)
+                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
+                        .into()
+                };
+                fk.validate()?;
+                out.push(ResolvedFkRef {
+                    child_table: Arc::clone(&child),
+                    fk: Arc::clone(fk),
+                    parent_cols,
+                    child_cols,
+                    child_pos,
+                    parent_pos,
+                    parent_uses_rowid,
+                    parent_unique_index,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute all resolved FKs *declared by* `child_table`
+    pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
+        let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
+            crate::LimboError::Constraint(format!(
+                "foreign key mismatch - \"{child}\" referencing \"{parent}\""
+            ))
+        };
+        let child_name = normalize_ident(child_table);
+        let child = self
+            .get_btree_table(&child_name)
+            .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
+
+        let mut out = Vec::with_capacity(child.foreign_keys.len());
+
+        for fk in &child.foreign_keys {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let parent_tbl = self
+                .get_btree_table(&parent_name)
+                .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
+
+            let child_cols: Vec<String> = fk.child_columns.clone();
+            if child_cols.is_empty() {
+                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            }
+
+            // Child positions exist
+            let mut child_pos = Vec::with_capacity(child_cols.len());
+            for cname in &child_cols {
+                let (i, _) = child
+                    .get_column(cname)
+                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?;
+                child_pos.push(i);
+            }
+
+            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                if !parent_tbl.primary_key_columns.is_empty() {
+                    parent_tbl
+                        .primary_key_columns
+                        .iter()
+                        .map(|(col, _)| col)
+                        .cloned()
+                        .collect()
+                } else {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                }
+            } else {
+                fk.parent_columns.clone()
+            };
+
+            if parent_cols.len() != child_cols.len() {
+                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            }
+
+            // Parent positions exist, or rowid sentinel
+            let mut parent_pos = Vec::with_capacity(parent_cols.len());
+            for pc in &parent_cols {
+                let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
+                    ROWID_STRS
+                        .iter()
+                        .any(|&r| r.eq_ignore_ascii_case(pc))
+                        .then_some(0)
+                });
+                let Some(p) = pos else {
+                    return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                };
+                parent_pos.push(p);
+            }
+
+            let parent_uses_rowid = parent_cols.len().eq(&1) && {
+                let c = parent_cols[0].as_str();
+                ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c))
+                    || parent_tbl.columns.iter().any(|col| {
+                        col.is_rowid_alias
+                            && col
+                                .name
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(c))
+                    })
+            };
+
+            // Must be PK or a non-partial UNIQUE on exactly those columns.
+            let parent_unique_index = if parent_uses_rowid {
+                None
+            } else {
+                self.get_indices(&parent_tbl.name)
+                    .find(|idx| {
+                        idx.unique
+                            && idx.where_clause.is_none()
+                            && idx.columns.len() == parent_cols.len()
+                            && idx
+                                .columns
+                                .iter()
+                                .zip(parent_cols.iter())
+                                .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                    })
+                    .cloned()
+                    .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
+                    .into()
+            };
+
+            fk.validate()?;
+            out.push(ResolvedFkRef {
+                child_table: Arc::clone(&child),
+                fk: Arc::clone(fk),
+                parent_cols,
+                child_cols,
+                child_pos,
+                parent_pos,
+                parent_uses_rowid,
+                parent_unique_index,
+            });
+        }
+
+        Ok(out)
+    }
+
+    /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
+    pub fn any_resolved_fks_referencing(&self, table_name: &str) -> bool {
+        self.tables.values().any(|t| {
+            let Some(bt) = t.btree() else {
+                return false;
+            };
+            bt.foreign_keys
+                .iter()
+                .any(|fk| fk.parent_table == table_name)
+        })
+    }
+
+    /// Returns true if `table_name` declares any FOREIGN KEYs
+    pub fn has_child_fks(&self, table_name: &str) -> bool {
+        self.get_table(table_name)
+            .and_then(|t| t.btree())
+            .is_some_and(|t| !t.foreign_keys.is_empty())
+    }
 }
 
 impl Clone for Schema {
@@ -1016,6 +1279,7 @@ pub struct BTreeTable {
     pub is_strict: bool,
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
+    pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
 impl BTreeTable {
@@ -1146,6 +1410,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_rowid = true;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
+    let mut foreign_keys = vec![];
     let mut cols = vec![];
     let is_strict: bool;
     let mut unique_sets: Vec<UniqueSet> = vec![];
@@ -1219,6 +1484,73 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
+                } else if let ast::TableConstraint::ForeignKey {
+                    columns,
+                    clause,
+                    defer_clause,
+                } = &c.constraint
+                {
+                    let child_columns: Vec<String> = columns
+                        .iter()
+                        .map(|ic| normalize_ident(ic.col_name.as_str()))
+                        .collect();
+                    // derive parent columns: explicit or default to parent PK
+                    let parent_table = normalize_ident(clause.tbl_name.as_str());
+                    let parent_columns: Vec<String> = clause
+                        .columns
+                        .iter()
+                        .map(|ic| normalize_ident(ic.col_name.as_str()))
+                        .collect();
+
+                    // Only check arity if parent columns were explicitly listed
+                    if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
+                        crate::bail_parse_error!(
+                            "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
+                            tbl_name,
+                            child_columns.len(),
+                            parent_columns.len()
+                        );
+                    }
+                    // deferrable semantics
+                    let deferred = match defer_clause {
+                        Some(d) => {
+                            d.deferrable
+                                && matches!(
+                                    d.init_deferred,
+                                    Some(InitDeferredPred::InitiallyDeferred)
+                                )
+                        }
+                        None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
+                    };
+                    let fk = ForeignKey {
+                        parent_table,
+                        parent_columns,
+                        child_columns,
+                        on_delete: clause
+                            .args
+                            .iter()
+                            .find_map(|a| {
+                                if let ast::RefArg::OnDelete(x) = a {
+                                    Some(*x)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(RefAct::NoAction),
+                        on_update: clause
+                            .args
+                            .iter()
+                            .find_map(|a| {
+                                if let ast::RefArg::OnUpdate(x) = a {
+                                    Some(*x)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(RefAct::NoAction),
+                        deferred,
+                    };
+                    foreign_keys.push(Arc::new(fk));
                 }
             }
             for ast::ColumnDefinition {
@@ -1259,7 +1591,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut unique = false;
                 let mut collation = None;
                 for c_def in constraints {
-                    match c_def.constraint {
+                    match &c_def.constraint {
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
@@ -1272,11 +1604,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
-                            if auto_increment {
+                            if *auto_increment {
                                 has_autoincrement = true;
                             }
                             if let Some(o) = o {
-                                order = o;
+                                order = *o;
                             }
                             unique_sets.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
@@ -1304,6 +1636,53 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
                             collation = Some(CollationSeq::new(collation_name.as_str())?);
+                        }
+                        ast::ColumnConstraint::ForeignKey {
+                            clause,
+                            defer_clause,
+                        } => {
+                            let fk = ForeignKey {
+                                parent_table: normalize_ident(clause.tbl_name.as_str()),
+                                parent_columns: clause
+                                    .columns
+                                    .iter()
+                                    .map(|c| normalize_ident(c.col_name.as_str()))
+                                    .collect(),
+                                on_delete: clause
+                                    .args
+                                    .iter()
+                                    .find_map(|arg| {
+                                        if let ast::RefArg::OnDelete(act) = arg {
+                                            Some(*act)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(RefAct::NoAction),
+                                on_update: clause
+                                    .args
+                                    .iter()
+                                    .find_map(|arg| {
+                                        if let ast::RefArg::OnUpdate(act) = arg {
+                                            Some(*act)
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(RefAct::NoAction),
+                                child_columns: vec![name.clone()],
+                                deferred: match defer_clause {
+                                    Some(d) => {
+                                        d.deferrable
+                                            && matches!(
+                                                d.init_deferred,
+                                                Some(InitDeferredPred::InitiallyDeferred)
+                                            )
+                                    }
+                                    None => false,
+                                },
+                            };
+                            foreign_keys.push(Arc::new(fk));
                         }
                         _ => {}
                     }
@@ -1384,6 +1763,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_autoincrement,
         columns: cols,
         is_strict,
+        foreign_keys,
         unique_sets: {
             // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
             // Examples:
@@ -1439,6 +1819,115 @@ pub fn _build_pseudo_table(columns: &[ResultColumn]) -> PseudoCursorType {
         }
     }
     table
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    /// Columns in this table (child side)
+    pub child_columns: Vec<String>,
+    /// Referenced (parent) table
+    pub parent_table: String,
+    /// Parent-side referenced columns
+    pub parent_columns: Vec<String>,
+    pub on_delete: RefAct,
+    pub on_update: RefAct,
+    /// DEFERRABLE INITIALLY DEFERRED
+    pub deferred: bool,
+}
+impl ForeignKey {
+    fn validate(&self) -> Result<()> {
+        // TODO: remove this when actions are implemented
+        if !(matches!(self.on_update, RefAct::NoAction)
+            && matches!(self.on_delete, RefAct::NoAction))
+        {
+            crate::bail_parse_error!(
+                "foreign key actions other than NO ACTION are not implemented"
+            );
+        }
+        if self
+            .parent_columns
+            .iter()
+            .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
+        {
+            return Err(crate::LimboError::Constraint(format!(
+                "foreign key mismatch referencing \"{}\"",
+                self.parent_table
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A single resolved foreign key where `parent_table == target`.
+#[derive(Clone, Debug)]
+pub struct ResolvedFkRef {
+    /// Child table that owns the FK.
+    pub child_table: Arc<BTreeTable>,
+    /// The FK as declared on the child table.
+    pub fk: Arc<ForeignKey>,
+
+    /// Resolved, normalized column names.
+    pub parent_cols: Vec<String>,
+    pub child_cols: Vec<String>,
+
+    /// Column positions in the child/parent tables (pos_in_table)
+    pub child_pos: Vec<usize>,
+    pub parent_pos: Vec<usize>,
+
+    /// If the parent key is rowid or a rowid-alias (single-column only)
+    pub parent_uses_rowid: bool,
+    /// For non-rowid parents: the UNIQUE index that enforces the parent key.
+    /// (None when `parent_uses_rowid == true`.)
+    pub parent_unique_index: Option<Arc<Index>>,
+}
+
+impl ResolvedFkRef {
+    /// Returns if any referenced parent column can change when these column positions are updated.
+    pub fn parent_key_may_change(
+        &self,
+        updated_parent_positions: &HashSet<usize>,
+        parent_tbl: &BTreeTable,
+    ) -> bool {
+        if self.parent_uses_rowid {
+            // parent rowid changes if the parent's rowid or alias is updated
+            if let Some((idx, _)) = parent_tbl
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.is_rowid_alias)
+            {
+                return updated_parent_positions.contains(&idx);
+            }
+            // Without a rowid alias, a direct rowid update is represented separately with ROWID_SENTINEL
+            return true;
+        }
+        self.parent_pos
+            .iter()
+            .any(|p| updated_parent_positions.contains(p))
+    }
+
+    /// Returns if any child column of this FK is in `updated_child_positions`
+    pub fn child_key_changed(
+        &self,
+        updated_child_positions: &HashSet<usize>,
+        child_tbl: &BTreeTable,
+    ) -> bool {
+        if self
+            .child_pos
+            .iter()
+            .any(|p| updated_child_positions.contains(p))
+        {
+            return true;
+        }
+        // special case: if FK uses a rowid alias on child, and rowid changed
+        if self.child_cols.len() == 1 {
+            let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
+            if col.is_rowid_alias && updated_child_positions.contains(&i) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1782,6 +2271,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 hidden: false,
             },
         ],
+        foreign_keys: vec![],
         unique_sets: vec![],
     }
 }
@@ -2392,6 +2882,7 @@ mod tests {
                 hidden: false,
             }],
             unique_sets: vec![],
+            foreign_keys: vec![],
         };
 
         let result =

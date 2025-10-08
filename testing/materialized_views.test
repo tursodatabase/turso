@@ -3,6 +3,35 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+# Test that INSERT with reused primary keys maintains correct aggregate counts
+# When a row is deleted and a new row is inserted with the same primary key
+# but different group value, all groups should maintain correct counts
+do_execsql_test_on_specific_db {:memory:} matview-insert-reused-key-maintains-all-groups {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'A'), (2, 'B');
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT val, COUNT(*) as cnt
+        FROM t
+        GROUP BY val;
+
+    -- Initial state: A=1, B=1
+    SELECT * FROM v ORDER BY val;
+
+    -- Delete id=1 (which has 'A')
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM v ORDER BY val;
+
+    -- Insert id=1 with different value 'C'
+    -- This should NOT affect group 'B'
+    INSERT INTO t VALUES (1, 'C');
+    SELECT * FROM v ORDER BY val;
+} {A|1
+B|1
+B|1
+B|1
+C|1}
+
 do_execsql_test_on_specific_db {:memory:} matview-basic-filter-population {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES

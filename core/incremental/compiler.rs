@@ -2149,6 +2149,31 @@ impl DbspCompiler {
                     ))
                 }
             }
+            LogicalExpr::IsNull { expr, negated } => {
+                // Extract column index from the inner expression
+                if let LogicalExpr::Column(col) = expr.as_ref() {
+                    let column_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col.name)
+                        .ok_or_else(|| {
+                            LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for IS NULL filter",
+                                col.name
+                            ))
+                        })?;
+
+                    if *negated {
+                        Ok(FilterPredicate::IsNotNull { column_idx })
+                    } else {
+                        Ok(FilterPredicate::IsNull { column_idx })
+                    }
+                } else {
+                    Err(LimboError::ParseError(
+                        "IS NULL/IS NOT NULL expects a column reference".to_string(),
+                    ))
+                }
+            }
             _ => Err(LimboError::ParseError(format!(
                 "Unsupported filter expression: {expr:?}"
             ))),
@@ -2220,6 +2245,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(users_table));
 
@@ -2273,6 +2299,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(products_table));
 
@@ -2338,6 +2365,7 @@ mod tests {
                 has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(orders_table));
 
@@ -2376,6 +2404,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(customers_table));
 
@@ -2438,6 +2467,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(purchases_table));
 
@@ -2488,6 +2518,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(vendors_table));
 
@@ -2525,6 +2556,7 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
             schema.add_btree_table(Arc::new(sales_table));
 

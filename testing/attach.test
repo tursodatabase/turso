@@ -73,3 +73,11 @@ do_execsql_test_error query-after-detach {
     DETACH DATABASE small;
     select * from small.sqlite_schema;
 } {(.*no such.*)}
+
+# regression test for https://github.com/tursodatabase/turso/issues/3540
+do_execsql_test_on_specifc_db {:memory:} attach-from-memory-db {
+	CREATE TABLE t(a);
+	INSERT INTO t SELECT value from generate_series(1,10);
+	ATTACH DATABASE 'testing/testing.db' as a;
+	SELECT * from a.products, t LIMIT 1;
+} {1|hat|79.0|1}

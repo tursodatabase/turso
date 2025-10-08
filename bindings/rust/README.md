@@ -4,7 +4,7 @@ The next evolution of SQLite: A high-performance, SQLite-compatible database lib
 
 ## Features
 
-- **SQLite Compatible**: Drop-in replacement for rusqlite with familiar API
+- **SQLite Compatible**: Similar interface to rusqlite with familiar API apart from using async Rust
 - **High Performance**: Built with Rust for maximum speed and efficiency  
 - **Async/Await Support**: Native async operations with tokio support
 - **In-Process**: No network overhead, runs directly in your application

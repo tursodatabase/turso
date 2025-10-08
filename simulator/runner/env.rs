@@ -12,6 +12,7 @@ use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::Table;
+use tracing::trace;
 use turso_core::Database;
 
 use crate::generation::Shadow;
@@ -82,6 +83,18 @@ impl<'a, 'b> ShadowTablesMut<'a>
 where
     'a: 'b,
 {
+    /// Creation of [ShadowTablesMut] outside of [SimulatorEnv] should be done sparingly and carefully.
+    /// Should only need to call this function if we need to do shadowing in a temporary model table
+    pub fn new(
+        commited_tables: &'a mut Vec<Table>,
+        transaction_tables: &'a mut Option<TransactionTables>,
+    ) -> Self {
+        ShadowTablesMut {
+            commited_tables,
+            transaction_tables,
+        }
+    }
+
     fn tables(&'a self) -> &'a Vec<Table> {
         self.transaction_tables
             .as_ref()
@@ -297,7 +310,8 @@ impl SimulatorEnv {
 
         let mut opts = SimulatorOpts {
             seed,
-            ticks: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
+            ticks: rng
+                .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
             max_tables: rng.random_range(0..128),
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
@@ -311,8 +325,7 @@ impl SimulatorEnv {
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
-            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests)
-                as u32,
+            max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
         };
@@ -418,9 +431,7 @@ impl SimulatorEnv {
         }
 
         if self.connections[connection_index].is_connected() {
-            log::trace!(
-                "Connection {connection_index} is already connected, skipping reconnection"
-            );
+            trace!("Connection {connection_index} is already connected, skipping reconnection");
             return;
         }
 

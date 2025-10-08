@@ -9,8 +9,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, Pager, RefValue, Result, TransactionState,
-    Value,
+    CheckpointResult, Completion, Connection, IOExt, Pager, Result, TransactionState, Value,
+    ValueRef,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -195,8 +195,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let row_data = ImmutableRecord::from_bin_record(version.row.data.clone());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor.parse_full_header(&row_data).unwrap();
-
-                        if let RefValue::Integer(root_page) =
+                        let ValueRef::Integer(root_page) =
                             record_cursor.get_value(&row_data, 3).unwrap()
                         {
                             if is_delete {
@@ -228,6 +227,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
         }
+        // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
+        // in case of an insert-heavy checkpoint.
+        self.write_set.sort_by_key(|version| {
+            (
+                // Sort by table_id descending (schema changes first)
+                std::cmp::Reverse(version.0.row.id.table_id),
+                // Then by row_id ascending
+                version.0.row.id.row_id,
+            )
+        });
         self.checkpointed_txid_max_new = max_timestamp;
     }
 
@@ -523,7 +532,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::CommitPagerTxn => {
                 tracing::debug!("Committing pager transaction");
-                let result = self.pager.end_tx(false, &self.connection)?;
+                let result = self.pager.commit_tx(&self.connection)?;
                 match result {
                     IOResult::Done(_) => {
                         self.state = CheckpointState::TruncateLogicalLog;
@@ -561,7 +570,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let c = self.truncate_logical_log()?;
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -573,7 +582,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::CheckpointWal;
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -617,16 +626,12 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
             Err(err) => {
                 tracing::info!("Error in checkpoint state machine: {err}");
                 if self.lock_states.pager_write_tx {
-                    let rollback = true;
-                    self.pager
-                        .io
-                        .block(|| self.pager.end_tx(rollback, self.connection.as_ref()))
-                        .expect("failed to end pager write tx");
+                    self.pager.rollback_tx(self.connection.as_ref());
                     if self.update_transaction_state {
                         *self.connection.transaction_state.write() = TransactionState::None;
                     }
                 } else if self.lock_states.pager_read_tx {
-                    self.pager.end_read_tx().unwrap();
+                    self.pager.end_read_tx();
                     if self.update_transaction_state {
                         *self.connection.transaction_state.write() = TransactionState::None;
                     }

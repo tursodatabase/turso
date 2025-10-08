@@ -3,10 +3,10 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, CompletionError, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use parking_lot::Once;
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{fmt::Debug, pin::Pin};
 
@@ -102,8 +102,10 @@ pub trait IO: Clock + Send + Sync {
         while !c.finished() {
             self.step()?
         }
-        if let Some(Some(err)) = c.inner.result.get().copied() {
-            return Err(err.into());
+        if let Some(inner) = &c.inner {
+            if let Some(Some(err)) = inner.result.get().copied() {
+                return Err(err.into());
+            }
         }
         Ok(())
     }
@@ -133,18 +135,140 @@ pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>);
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Completion {
-    inner: Arc<CompletionInner>,
+    /// Optional completion state. If None, it means we are Yield in order to not allocate anything
+    inner: Option<Arc<CompletionInner>>,
 }
 
-#[derive(Debug)]
 struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
     result: std::sync::OnceLock<Option<CompletionError>>,
     needs_link: bool,
-    /// before calling callback we check if done is true
-    done: Once,
+    /// Optional parent group this completion belongs to
+    parent: OnceLock<Arc<GroupCompletionInner>>,
+}
+
+impl fmt::Debug for CompletionInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionInner")
+            .field("completion_type", &self.completion_type)
+            .field("needs_link", &self.needs_link)
+            .field("parent", &self.parent.get().is_some())
+            .finish()
+    }
+}
+
+pub struct CompletionGroup {
+    completions: Vec<Completion>,
+    callback: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+}
+
+impl CompletionGroup {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self {
+            completions: Vec::new(),
+            callback: Box::new(callback),
+        }
+    }
+
+    pub fn add(&mut self, completion: &Completion) {
+        if !completion.finished() || completion.failed() {
+            self.completions.push(completion.clone());
+        }
+        // Skip successfully finished completions
+    }
+
+    pub fn build(self) -> Completion {
+        let total = self.completions.len();
+        if total == 0 {
+            let group_completion = GroupCompletion::new(self.callback, 0);
+            return Completion::new(CompletionType::Group(group_completion));
+        }
+        let group_completion = GroupCompletion::new(self.callback, total);
+        let group = Completion::new(CompletionType::Group(group_completion));
+
+        for mut c in self.completions {
+            // If the completion has not completed, link it to the group.
+            if !c.finished() {
+                c.link_internal(&group);
+                continue;
+            }
+            let group_inner = match &group.get_inner().completion_type {
+                CompletionType::Group(g) => &g.inner,
+                _ => unreachable!(),
+            };
+            // Return early if there was an error.
+            if let Some(err) = c.get_error() {
+                let _ = group_inner.result.set(Some(err));
+                group_inner.outstanding.store(0, Ordering::SeqCst);
+                (group_inner.complete)(Err(err));
+                return group;
+            }
+            // Mark the successful completion as done.
+            group_inner.outstanding.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let group_inner = match &group.get_inner().completion_type {
+            CompletionType::Group(g) => &g.inner,
+            _ => unreachable!(),
+        };
+        if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
+            (group_inner.complete)(Ok(0));
+        }
+        group
+    }
+}
+
+pub struct GroupCompletion {
+    inner: Arc<GroupCompletionInner>,
+}
+
+impl fmt::Debug for GroupCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupCompletion")
+            .field(
+                "outstanding",
+                &self.inner.outstanding.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+struct GroupCompletionInner {
+    /// Number of completions that need to finish
+    outstanding: AtomicUsize,
+    /// Callback to invoke when all completions finish
+    complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+    /// Cached result after all completions finish
+    result: OnceLock<Option<CompletionError>>,
+}
+
+impl GroupCompletion {
+    pub fn new<F>(complete: F, outstanding: usize) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self {
+            inner: Arc::new(GroupCompletionInner {
+                outstanding: AtomicUsize::new(outstanding),
+                complete: Box::new(complete),
+                result: OnceLock::new(),
+            }),
+        }
+    }
+
+    pub fn callback(&self, result: Result<i32, CompletionError>) {
+        assert_eq!(
+            self.inner.outstanding.load(Ordering::SeqCst),
+            0,
+            "callback called before all completions finished"
+        );
+        (self.inner.complete)(result);
+    }
 }
 
 impl Debug for CompletionType {
@@ -154,6 +278,8 @@ impl Debug for CompletionType {
             Self::Write(..) => f.debug_tuple("Write").finish(),
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
             Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+            Self::Group(..) => f.debug_tuple("Group").finish(),
+            Self::Yield => f.debug_tuple("Yield").finish(),
         }
     }
 }
@@ -163,33 +289,39 @@ pub enum CompletionType {
     Write(WriteCompletion),
     Sync(SyncCompletion),
     Truncate(TruncateCompletion),
+    Group(GroupCompletion),
+    Yield,
 }
 
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
-            inner: Arc::new(CompletionInner {
+            inner: Some(Arc::new(CompletionInner {
                 completion_type,
                 result: OnceLock::new(),
                 needs_link: false,
-                done: Once::new(),
-            }),
+                parent: OnceLock::new(),
+            })),
         }
     }
 
     pub fn new_linked(completion_type: CompletionType) -> Self {
         Self {
-            inner: Arc::new(CompletionInner {
+            inner: Some(Arc::new(CompletionInner {
                 completion_type,
                 result: OnceLock::new(),
                 needs_link: true,
-                done: Once::new(),
-            }),
+                parent: OnceLock::new(),
+            })),
         }
     }
 
+    pub(self) fn get_inner(&self) -> &Arc<CompletionInner> {
+        self.inner.as_ref().unwrap()
+    }
+
     pub fn needs_link(&self) -> bool {
-        self.inner.needs_link
+        self.get_inner().needs_link
     }
 
     pub fn new_write_linked<F>(complete: F) -> Self
@@ -237,28 +369,57 @@ impl Completion {
         ))))
     }
 
-    /// Create a dummy completed completion
-    pub fn new_dummy() -> Self {
-        let c = Self::new_write(|_| {});
-        c.complete(0);
-        c
+    /// Create a yield completion. These are completed by default allowing to yield control without
+    /// allocating memory.
+    pub fn new_yield() -> Self {
+        Self { inner: None }
     }
 
-    pub fn is_completed(&self) -> bool {
-        self.inner.result.get().is_some_and(|val| val.is_none())
+    pub fn succeeded(&self) -> bool {
+        match &self.inner {
+            Some(inner) => match &inner.completion_type {
+                CompletionType::Group(g) => {
+                    g.inner.outstanding.load(Ordering::SeqCst) == 0
+                        && g.inner.result.get().is_none_or(|e| e.is_none())
+                }
+                _ => inner.result.get().is_some(),
+            },
+            None => true,
+        }
     }
 
-    pub fn has_error(&self) -> bool {
-        self.inner.result.get().is_some_and(|val| val.is_some())
+    pub fn failed(&self) -> bool {
+        match &self.inner {
+            Some(inner) => inner.result.get().is_some_and(|val| val.is_some()),
+            None => false,
+        }
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
-        self.inner.result.get().and_then(|res| *res)
+        match &self.inner {
+            Some(inner) => {
+                match &inner.completion_type {
+                    CompletionType::Group(g) => {
+                        // For groups, check the group's cached result field
+                        // (set when the last completion finishes)
+                        g.inner.result.get().and_then(|res| *res)
+                    }
+                    _ => inner.result.get().and_then(|res| *res),
+                }
+            }
+            None => None,
+        }
     }
 
     /// Checks if the Completion completed or errored
     pub fn finished(&self) -> bool {
-        self.inner.result.get().is_some()
+        match &self.inner {
+            Some(inner) => match &inner.completion_type {
+                CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
+                _ => inner.result.get().is_some(),
+            },
+            None => true,
+        }
     }
 
     pub fn complete(&self, result: i32) {
@@ -276,35 +437,56 @@ impl Completion {
     }
 
     fn callback(&self, result: Result<i32, CompletionError>) {
-        self.inner.done.call_once(|| {
-            match &self.inner.completion_type {
+        let inner = self.get_inner();
+        inner.result.get_or_init(|| {
+            match &inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
                 CompletionType::Write(w) => w.callback(result),
                 CompletionType::Sync(s) => s.callback(result), // fix
                 CompletionType::Truncate(t) => t.callback(result),
+                CompletionType::Group(g) => g.callback(result),
+                CompletionType::Yield => {}
             };
-            self.inner
-                .result
-                .set(result.err())
-                .expect("result must be set only once");
+
+            if let Some(group) = inner.parent.get() {
+                // Capture first error in group
+                if let Err(err) = result {
+                    let _ = group.result.set(Some(err));
+                }
+                let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
+
+                // If this was the last completion, call the group callback
+                if prev == 1 {
+                    let group_result = group.result.get().and_then(|e| *e);
+                    (group.complete)(group_result.map_or(Ok(0), Err));
+                }
+                // TODO: remove self from parent group
+            }
+
+            result.err()
         });
     }
 
     /// only call this method if you are sure that the completion is
     /// a ReadCompletion, panics otherwise
     pub fn as_read(&self) -> &ReadCompletion {
-        match self.inner.completion_type {
+        let inner = self.get_inner();
+        match inner.completion_type {
             CompletionType::Read(ref r) => r,
             _ => unreachable!(),
         }
     }
 
-    /// only call this method if you are sure that the completion is
-    /// a WriteCompletion, panics otherwise
-    pub fn as_write(&self) -> &WriteCompletion {
-        match self.inner.completion_type {
-            CompletionType::Write(ref w) => w,
-            _ => unreachable!(),
+    /// Link this completion to a group completion (internal use only)
+    fn link_internal(&mut self, group: &Completion) {
+        let group_inner = match &group.get_inner().completion_type {
+            CompletionType::Group(g) => &g.inner,
+            _ => panic!("link_internal() requires a group completion"),
+        };
+
+        // Set the parent (can only be set once)
+        if self.get_inner().parent.set(group_inner.clone()).is_err() {
+            panic!("completion can only be linked once");
         }
     }
 }
@@ -563,3 +745,221 @@ pub use memory::MemoryIO;
 pub mod clock;
 mod common;
 pub use clock::Clock;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_group_empty() {
+        let group = CompletionGroup::new(|_| {});
+        let group = group.build();
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_single_completion() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c = Completion::new_write(|_| {});
+        group.add(&c);
+        let group = group.build();
+
+        assert!(!group.finished());
+        assert!(!group.succeeded());
+
+        c.complete(0);
+
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_multiple_completions() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        let group = group.build();
+
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c1.complete(0);
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c2.complete(0);
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c3.complete(0);
+        assert!(group.succeeded());
+        assert!(group.finished());
+    }
+
+    #[test]
+    fn test_completion_group_with_error() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        c1.complete(0);
+        c2.error(CompletionError::Aborted);
+
+        assert!(group.finished());
+        assert!(!group.succeeded());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_group_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let mut group = CompletionGroup::new(move |_| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        assert!(!called.load(Ordering::SeqCst));
+
+        c1.complete(0);
+        assert!(!called.load(Ordering::SeqCst));
+
+        c2.complete(0);
+        assert!(called.load(Ordering::SeqCst));
+        assert!(group.finished());
+        assert!(group.succeeded());
+    }
+
+    #[test]
+    fn test_completion_group_some_already_completed() {
+        // Test some completions added to group, then finish before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+
+        // Add all to group while pending
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+
+        // Complete c1 and c2 AFTER adding but BEFORE build()
+        c1.complete(0);
+        c2.complete(0);
+
+        let group = group.build();
+
+        // c1 and c2 finished before build(), so outstanding should account for them
+        // Only c3 should be pending
+        assert!(!group.finished());
+        assert!(!group.succeeded());
+
+        // Complete c3
+        c3.complete(0);
+
+        // Now the group should be finished
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_all_already_completed() {
+        // Test when all completions are already finished before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+
+        // Complete both before adding to group
+        c1.complete(0);
+        c2.complete(0);
+
+        group.add(&c1);
+        group.add(&c2);
+
+        let group = group.build();
+
+        // All completions were already complete, so group should be finished immediately
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_mixed_finished_and_pending() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let mut group = CompletionGroup::new(move |_| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+        let c4 = Completion::new_write(|_| {});
+
+        // Complete c1 and c3 before adding to group
+        c1.complete(0);
+        c3.complete(0);
+
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        group.add(&c4);
+
+        let group = group.build();
+
+        // Only c2 and c4 should be pending
+        assert!(!group.finished());
+        assert!(!called.load(Ordering::SeqCst));
+
+        c2.complete(0);
+        assert!(!group.finished());
+        assert!(!called.load(Ordering::SeqCst));
+
+        c4.complete(0);
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_completion_group_already_completed_with_error() {
+        // Test when a completion finishes with error before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+
+        // Complete c1 with error before adding to group
+        c1.error(CompletionError::Aborted);
+
+        group.add(&c1);
+        group.add(&c2);
+
+        let group = group.build();
+
+        // Group should immediately fail with the error
+        assert!(group.finished());
+        assert!(!group.succeeded());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+    }
+}

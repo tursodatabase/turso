@@ -16,6 +16,11 @@ pub fn translate_integrity_check(
     for table in schema.tables.values() {
         if let crate::schema::Table::BTree(table) = table.as_ref() {
             root_pages.push(table.root_page);
+            if let Some(indexes) = schema.indexes.get(table.name.as_str()) {
+                for index in indexes.iter() {
+                    root_pages.push(index.root_page);
+                }
+            }
         };
     }
     let message_register = program.alloc_register();

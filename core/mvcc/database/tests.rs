@@ -347,8 +347,7 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row3, row4);
     db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.read().clone(), &db.conn)
-        .unwrap();
+        .rollback_tx(tx1, db.conn.pager.read().clone(), &db.conn);
     let tx2 = db
         .mvcc_store
         .begin_tx(db.conn.pager.read().clone())
@@ -592,8 +591,7 @@ fn test_lost_update() {
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
     db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.read().clone(), &conn3)
-        .unwrap();
+        .rollback_tx(tx3, conn3.pager.read().clone(), &conn3);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -716,7 +714,7 @@ use crate::types::Text;
 use crate::Value;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{RefValue, DATABASE_MANAGER};
+use crate::{ValueRef, DATABASE_MANAGER};
 
 // Simple atomic clock implementation for testing
 
@@ -980,8 +978,8 @@ fn test_cursor_modification_during_scan() {
     record.start_serialization(&row.data);
     let value = record.get_value(0).unwrap();
     match value {
-        RefValue::Text(text) => {
-            assert_eq!(text.as_str(), "new_row");
+        ValueRef::Text(text, _) => {
+            assert_eq!(text, b"new_row");
         }
         _ => panic!("Expected Text value"),
     }
@@ -1214,8 +1212,8 @@ fn test_restart() {
             .unwrap();
         let record = get_record_value(&row);
         match record.get_value(0).unwrap() {
-            RefValue::Text(text) => {
-                assert_eq!(text.as_str(), "bar");
+            ValueRef::Text(text, _) => {
+                assert_eq!(text, b"bar");
             }
             _ => panic!("Expected Text value"),
         }
@@ -1537,4 +1535,17 @@ fn test_insert_with_checkpoint() {
         Value::Integer(i) => assert_eq!(*i, 1),
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn test_select_empty_table() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mv_store = db.get_mvcc_store();
+    // force checkpoint on every transaction
+    mv_store.set_checkpoint_threshold(0);
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(x integer primary key)")
+        .unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t where x > 100");
+    assert!(rows.is_empty());
 }

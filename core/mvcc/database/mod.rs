@@ -18,11 +18,11 @@ use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
-use crate::RefValue;
 use crate::Result;
 use crate::Statement;
 use crate::StepResult;
 use crate::Value;
+use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
@@ -83,7 +83,7 @@ impl std::fmt::Display for MVTableId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
     pub table_id: MVTableId,
@@ -626,14 +626,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_dummy(),
+                            Completion::new_yield(),
                         )));
                     }
                 }
                 let c = mvcc_store.storage.log_tx(log_record)?;
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -644,7 +644,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
-                if c.is_completed() {
+                if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions::Single(c)))
@@ -655,7 +655,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema)?;
+                    connection.db.update_schema_if_newer(schema);
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
@@ -1323,7 +1323,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        if lower_bound {
+        let res = if lower_bound {
             self.rows
                 .lower_bound(bound)
                 .and_then(|entry| self.find_last_visible_version(tx, entry))
@@ -1331,7 +1331,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.rows
                 .upper_bound(bound)
                 .and_then(|entry| self.find_last_visible_version(tx, entry))
-        }
+        };
+        tracing::trace!(
+            "seek_rowid(bound={:?}, lower_bound={}, found={:?})",
+            bound,
+            lower_bound,
+            res
+        );
+        let table_id_expect = match bound {
+            Bound::Included(rowid) => rowid.table_id,
+            Bound::Excluded(rowid) => rowid.table_id,
+            Bound::Unbounded => unreachable!(),
+        };
+        res.filter(|&rowid| rowid.table_id == table_id_expect)
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -1343,7 +1355,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
-    ) -> Result<IOResult<TxID>> {
+    ) -> Result<TxID> {
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -1379,7 +1391,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
-        Ok(IOResult::Done(tx_id))
+        Ok(tx_id)
     }
 
     /// Begins a new transaction in the database.
@@ -1567,12 +1579,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(
-        &self,
-        tx_id: TxID,
-        _pager: Arc<Pager>,
-        connection: &Connection,
-    ) -> Result<()> {
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
         *connection.mv_tx.write() = None;
@@ -1610,7 +1617,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema()?;
+            *connection.schema.write() = connection.db.clone_schema();
         }
 
         let tx = tx_unlocked.value();
@@ -1619,8 +1626,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
-
-        Ok(())
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
@@ -1987,7 +1992,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let record_values = record_cursor.get_values(&record).unwrap();
-                        let RefValue::Integer(root_page) = record_values[3] else {
+                        let ValueRef::Integer(root_page) = record_values[3] else {
                             panic!(
                                 "Expected integer value for root page, got {:?}",
                                 record_values[3]
@@ -2025,7 +2030,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
                 StreamingResult::Eof => {
                     // Set offset to the end so that next writes go to the end of the file
-                    self.storage.logical_log.write().unwrap().offset = reader.offset as u64;
+                    self.storage.logical_log.write().offset = reader.offset as u64;
                     break;
                 }
             }
@@ -2036,6 +2041,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub fn set_checkpoint_threshold(&self, threshold: u64) {
         self.storage.set_checkpoint_threshold(threshold)
+    }
+
+    pub fn checkpoint_threshold(&self) -> u64 {
+        self.storage.checkpoint_threshold()
     }
 }
 
@@ -2190,6 +2199,24 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
             Self::CommitEnd { end_ts } => {
                 f.debug_struct("CommitEnd").field("end_ts", end_ts).finish()
             }
+        }
+    }
+}
+
+impl PartialOrd for RowID {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowID {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Make sure table id is first comparison so that we sort first by table_id and then by
+        // rowid. Due to order of the struct, table_id is first which is fine but if we were to
+        // change it we would bring chaos.
+        match self.table_id.cmp(&other.table_id) {
+            std::cmp::Ordering::Equal => self.row_id.cmp(&other.row_id),
+            ord => ord,
         }
     }
 }

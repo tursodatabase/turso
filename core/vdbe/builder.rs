@@ -792,6 +792,9 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => {
                     resolve(target_pc, "NotFound");
                 }
+                Insn::FkIfZero { target_pc, .. } => {
+                    resolve(target_pc, "FkIfZero");
+                }
                 _ => {}
             }
         }

@@ -33,7 +33,7 @@ pub struct LatencyProfile {
     pub enable: bool,
     #[garde(range(min = 0, max = 100))]
     /// Added IO latency probability
-    pub latency_probability: usize,
+    pub latency_probability: u8,
     #[garde(custom(max_dependent(&self.max_tick)))]
     /// Minimum tick time in microseconds for simulated time
     pub min_tick: u64,

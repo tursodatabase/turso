@@ -138,7 +138,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Failed to decrypt page data for page_id={page_idx}: {e}"
                                 );
                                 assert!(
-                                    !original_c.has_error(),
+                                    !original_c.failed(),
                                     "Original completion already has an error"
                                 );
                                 original_c.error(CompletionError::DecryptionError { page_idx });
@@ -172,7 +172,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Failed to verify checksum for page_id={page_idx}: {e}"
                                 );
                                 assert!(
-                                    !original_c.has_error(),
+                                    !original_c.failed(),
                                     "Original completion already has an error"
                                 );
                                 original_c.error(e);

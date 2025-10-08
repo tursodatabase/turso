@@ -6,7 +6,11 @@ use super::{Insn, InsnReference, Program, Value};
 use crate::function::{Func, ScalarFunc};
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
+    "INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "TEXT",
+];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
 
 pub fn insn_to_row(
     program: &Program,
@@ -1800,7 +1804,25 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        }
+        Insn::FkCounter{increment_value, is_scope } => (
+        "FkCounter",
+            *increment_value as i32,
+            *is_scope as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::FkIfZero{target_pc, is_scope } => (
+        "FkIfZero",
+            target_pc.as_debug_int(),
+            *is_scope as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+    }
 }
 
 pub fn insn_to_row_with_comment(

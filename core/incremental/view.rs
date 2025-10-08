@@ -1282,7 +1282,7 @@ impl IncrementalView {
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
                                 // TODO: Get the actual I/O completion from the statement
-                                let completion = crate::io::Completion::new_dummy();
+                                let completion = crate::io::Completion::new_yield();
                                 return Ok(IOResult::IO(crate::types::IOCompletions::Single(
                                     completion,
                                 )));
@@ -1411,6 +1411,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
             has_autoincrement: false,
         };
 
@@ -1460,6 +1461,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1509,6 +1511,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1558,6 +1561,7 @@ mod tests {
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 

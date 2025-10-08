@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -19,7 +19,7 @@ use crate::types::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::registers_to_ref_values;
+use crate::vdbe::{registers_to_ref_values, TxnCleanup};
 use crate::vector::{vector_concat, vector_slice};
 use crate::{
     error::{
@@ -35,7 +35,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, MvCursor};
+use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -65,7 +65,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{info, turso_assert, OpenFlags, RefValue, Row, TransactionState};
+use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -157,7 +157,6 @@ pub enum InsnFunctionStepResult {
     Done,
     IO(IOCompletions),
     Row,
-    Interrupt,
     Step,
 }
 
@@ -2157,6 +2156,9 @@ pub fn halt(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
+        SQLITE_CONSTRAINT_FOREIGNKEY => {
+            return Err(LimboError::Constraint(format!("{description} (19)")));
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -2167,9 +2169,21 @@ pub fn halt(
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
-        program
-            .commit_txn(pager.clone(), state, mv_store, false)
-            .map(Into::into)
+        let res = program.commit_txn(pager.clone(), state, mv_store, false);
+        if res.is_ok()
+            && program.connection.foreign_keys_enabled()
+            && program
+                .connection
+                .fk_deferred_violations
+                .swap(0, Ordering::AcqRel)
+                > 0
+        {
+            // In autocommit mode, a statement that leaves deferred violations must fail here.
+            return Err(LimboError::Constraint(
+                "foreign key constraint failed".to_string(),
+            ));
+        }
+        res.map(Into::into)
     } else {
         Ok(InsnFunctionStepResult::Done)
     }
@@ -2258,7 +2272,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
-                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
+                if write && conn.db.open_flags.get().contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
                 }
 
@@ -2328,7 +2342,7 @@ pub fn op_transaction_inner(
                             | TransactionMode::Read
                             | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
                             TransactionMode::Write => {
-                                return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), None))
+                                mv_store.begin_exclusive_tx(pager.clone(), None)?
                             }
                         };
                         *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
@@ -2343,7 +2357,7 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            return_if_io!(mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id)));
+                            mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))?;
                         }
                     }
                 } else {
@@ -2359,6 +2373,7 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                     }
 
                     if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
@@ -2372,8 +2387,9 @@ pub fn op_transaction_inner(
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
                             if matches!(current_state, TransactionState::None) {
-                                pager.end_read_tx()?;
+                                pager.end_read_tx();
                                 conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
                             return Err(LimboError::Busy);
@@ -2440,40 +2456,74 @@ pub fn op_auto_commit(
     load_insn!(
         AutoCommit {
             auto_commit,
-            rollback,
+            rollback
         },
         insn
     );
+
     let conn = program.connection.clone();
+    let fk_on = conn.foreign_keys_enabled();
+    let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
+
+    // Drive any multi-step commit/rollback that’s already in progress.
     if matches!(state.commit_state, CommitState::Committing) {
-        return program
+        let res = program
             .commit_txn(pager.clone(), state, mv_store, *rollback)
             .map(Into::into);
+        // Only clear after a final, successful non-rollback COMMIT.
+        if fk_on
+            && !*rollback
+            && matches!(
+                res,
+                Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+            )
+        {
+            conn.clear_deferred_foreign_key_violations();
+        }
+        return res;
     }
 
-    if *auto_commit != conn.auto_commit.load(Ordering::SeqCst) {
-        if *rollback {
-            // TODO(pere): add rollback I/O logic once we implement rollback journal
+    // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
+    // very explicit about the currently existing and requested state.
+    let requested_autocommit = *auto_commit;
+    let requested_rollback = *rollback;
+    let changed = requested_autocommit != had_autocommit;
+
+    // what the requested operation is
+    let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
+    let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
+    let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
+
+    if changed {
+        if requested_rollback {
+            // ROLLBACK transition
             if let Some(mv_store) = mv_store {
                 if let Some(tx_id) = conn.get_mv_tx_id() {
-                    mv_store.rollback_tx(tx_id, pager.clone(), &conn)?;
+                    mv_store.rollback_tx(tx_id, pager.clone(), &conn);
                 }
             } else {
-                return_if_io!(pager.end_tx(true, &conn));
+                pager.rollback_tx(&conn);
             }
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
-            conn.auto_commit.store(*auto_commit, Ordering::SeqCst);
+            // BEGIN (true->false) or COMMIT (false->true)
+            if is_commit_req {
+                // Pre-check deferred FKs; leave tx open and do NOT clear violations
+                check_deferred_fk_on_commit(&conn)?;
+            }
+            conn.auto_commit
+                .store(requested_autocommit, Ordering::SeqCst);
         }
     } else {
-        let mvcc_tx_active = program.connection.get_mv_tx().is_some();
+        // No autocommit flip
+        let mvcc_tx_active = conn.get_mv_tx().is_some();
         if !mvcc_tx_active {
-            if !*auto_commit {
+            if !requested_autocommit {
                 return Err(LimboError::TxError(
                     "cannot start a transaction within a transaction".to_string(),
                 ));
-            } else if *rollback {
+            } else if requested_rollback {
                 return Err(LimboError::TxError(
                     "cannot rollback - no transaction is active".to_string(),
                 ));
@@ -2482,19 +2532,41 @@ pub fn op_auto_commit(
                     "cannot commit - no transaction is active".to_string(),
                 ));
             }
-        } else {
-            let is_begin = !*auto_commit && !*rollback;
-            if is_begin {
-                return Err(LimboError::TxError(
-                    "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
-                ));
-            }
+        } else if is_begin_req {
+            return Err(LimboError::TxError(
+                "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
+            ));
         }
     }
 
-    program
-        .commit_txn(pager.clone(), state, mv_store, *rollback)
-        .map(Into::into)
+    let res = program
+        .commit_txn(pager.clone(), state, mv_store, requested_rollback)
+        .map(Into::into);
+
+    // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
+    if fk_on
+        && matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        )
+        && (is_rollback_req || is_commit_req)
+    {
+        conn.clear_deferred_foreign_key_violations();
+    }
+
+    res
+}
+
+fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
+    if !conn.foreign_keys_enabled() {
+        return Ok(());
+    }
+    if conn.get_deferred_foreign_key_violations() > 0 {
+        return Err(LimboError::Constraint(
+            "FOREIGN KEY constraint failed".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn op_goto(
@@ -2704,7 +2776,7 @@ pub fn op_row_id(
                     let record_cursor = record_cursor_ref.deref_mut();
                     let rowid = record.last_value(record_cursor).unwrap();
                     match rowid {
-                        Ok(RefValue::Integer(rowid)) => rowid,
+                        Ok(ValueRef::Integer(rowid)) => rowid,
                         _ => unreachable!(),
                     }
                 };
@@ -4274,7 +4346,14 @@ pub fn op_sorter_compare(
         &record.get_values()[..*num_regs]
     };
 
-    let cursor = state.get_cursor(*cursor_id);
+    // Inlined `state.get_cursor` to prevent borrowing conflit with `state.registers`
+    let cursor = state
+        .cursors
+        .get_mut(*cursor_id)
+        .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
+        .as_mut()
+        .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"));
+
     let cursor = cursor.as_sorter_mut();
     let Some(current_sorter_record) = cursor.record() else {
         return Err(LimboError::InternalError(
@@ -4286,7 +4365,7 @@ pub fn op_sorter_compare(
     // If the current sorter record has a NULL in any of the significant fields, the comparison is not equal.
     let is_equal = current_sorter_values
         .iter()
-        .all(|v| !matches!(v, RefValue::Null))
+        .all(|v| !matches!(v, ValueRef::Null))
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
@@ -4952,7 +5031,7 @@ pub fn op_function(
                 }
                 #[cfg(feature = "json")]
                 {
-                    use crate::types::{TextRef, TextSubtype};
+                    use crate::types::TextSubtype;
 
                     let table = state.registers[*start_reg].get_value();
                     let Value::Text(table) = table else {
@@ -4977,10 +5056,7 @@ pub fn op_function(
                     for column in table.columns() {
                         let name = column.name.as_ref().unwrap();
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            &RefValue::Text(TextRef::create_from(
-                                name.as_str().as_bytes(),
-                                TextSubtype::Text,
-                            )),
+                            ValueRef::Text(name.as_bytes(), TextSubtype::Text),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());
@@ -5048,13 +5124,13 @@ pub fn op_function(
                         json.append_jsonb_to_end(column_name.data());
 
                         let val = record_cursor.get_value(&record, i)?;
-                        if let RefValue::Blob(..) = val {
+                        if let ValueRef::Blob(..) = val {
                             return Err(LimboError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
                             ));
                         }
                         let val_json =
-                            json::convert_ref_dbtype_to_jsonb(&val, json::Conv::NotStrict)?;
+                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
                         json.append_jsonb_to_end(val_json.data());
                     }
                     json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
@@ -5695,31 +5771,52 @@ pub fn op_insert(
 
                 turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
 
+                // Get the key we're going to insert
+                let insert_key = match &state.registers[*key_reg].get_value() {
+                    Value::Integer(i) => *i,
+                    _ => {
+                        // If key is not an integer, we can't check - assume no old record
+                        state.op_insert_state.old_record = None;
+                        state.op_insert_state.sub_state = if flag.has(InsertFlags::REQUIRE_SEEK) {
+                            OpInsertSubState::Seek
+                        } else {
+                            OpInsertSubState::Insert
+                        };
+                        continue;
+                    }
+                };
+
                 let old_record = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     // Get the current key - for INSERT operations, there may not be a current row
                     let maybe_key = return_if_io!(cursor.rowid());
                     if let Some(key) = maybe_key {
-                        // Get the current record before deletion and extract values
-                        let maybe_record = return_if_io!(cursor.record());
-                        if let Some(record) = maybe_record {
-                            let mut values = record
-                                .get_values()
-                                .into_iter()
-                                .map(|v| v.to_owned())
-                                .collect::<Vec<_>>();
+                        // Only capture as old record if the cursor is at the position we're inserting to
+                        if key == insert_key {
+                            // Get the current record before deletion and extract values
+                            let maybe_record = return_if_io!(cursor.record());
+                            if let Some(record) = maybe_record {
+                                let mut values = record
+                                    .get_values()
+                                    .into_iter()
+                                    .map(|v| v.to_owned())
+                                    .collect::<Vec<_>>();
 
-                            // Fix rowid alias columns: replace Null with actual rowid value
-                            if let Some(table) = schema.get_table(table_name) {
-                                for (i, col) in table.columns().iter().enumerate() {
-                                    if col.is_rowid_alias && i < values.len() {
-                                        values[i] = Value::Integer(key);
+                                // Fix rowid alias columns: replace Null with actual rowid value
+                                if let Some(table) = schema.get_table(table_name) {
+                                    for (i, col) in table.columns().iter().enumerate() {
+                                        if col.is_rowid_alias && i < values.len() {
+                                            values[i] = Value::Integer(key);
+                                        }
                                     }
                                 }
+                                Some((key, values))
+                            } else {
+                                None
                             }
-                            Some((key, values))
                         } else {
+                            // Cursor is at wrong position - this is a fresh INSERT, not a replacement
                             None
                         }
                     } else {
@@ -6227,9 +6324,9 @@ pub fn op_idx_insert(
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if cursor.has_rowid() {
                     let count = cursor.record_cursor.borrow_mut().count(record);
-                    record.get_values()[..count.saturating_sub(1)].to_vec()
+                    &record.get_values()[..count.saturating_sub(1)]
                 } else {
-                    record.get_values().to_vec()
+                    &record.get_values()[..]
                 };
                 let inserted_key_vals = &record_to_insert.get_values();
                 if existing_key.len() != inserted_key_vals.len() {
@@ -6237,7 +6334,7 @@ pub fn op_idx_insert(
                 }
 
                 let conflict = compare_immutable(
-                    existing_key.as_slice(),
+                    existing_key,
                     inserted_key_vals,
                     &cursor.index_info.as_ref().unwrap().key_info,
                 ) == std::cmp::Ordering::Equal;
@@ -6528,7 +6625,7 @@ pub fn op_no_conflict(
                         record
                             .get_values()
                             .iter()
-                            .any(|val| matches!(val, RefValue::Null))
+                            .any(|val| matches!(val, ValueRef::Null))
                     }
                     RecordSource::Unpacked {
                         start_reg,
@@ -6810,6 +6907,11 @@ pub fn op_create_btree(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub enum OpDestroyState {
+    CreateCursor,
+    DestroyBtree(Arc<RwLock<BTreeCursor>>),
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -6833,15 +6935,26 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
-    let former_root_page_result = cursor.btree_destroy()?;
-    if let IOResult::Done(former_root_page) = former_root_page_result {
-        state.registers[*former_root_reg] =
-            Register::Value(Value::Integer(former_root_page.unwrap_or(0) as i64));
+
+    loop {
+        match state.op_destroy_state {
+            OpDestroyState::CreateCursor => {
+                // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
+                // table btree cursor for both.
+                let cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
+                state.op_destroy_state =
+                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
+            }
+            OpDestroyState::DestroyBtree(ref mut cursor) => {
+                let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
+                state.registers[*former_root_reg] =
+                    Register::Value(Value::Integer(maybe_former_root_page.unwrap_or(0) as i64));
+                state.op_destroy_state = OpDestroyState::CreateCursor;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_reset_sorter(
@@ -7795,12 +7908,13 @@ pub fn op_integrity_check(
     );
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
-            let freelist_trunk_page =
-                return_if_io!(with_header(pager, mv_store, program, |header| header
-                    .freelist_trunk_page
-                    .get()));
+            let (freelist_trunk_page, db_size) =
+                return_if_io!(with_header(pager, mv_store, program, |header| (
+                    header.freelist_trunk_page.get(),
+                    header.database_size.get()
+                )));
             let mut errors = Vec::new();
-            let mut integrity_check_state = IntegrityCheckState::new();
+            let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
             // check freelist pages first, if there are any for database
             if freelist_trunk_page > 0 {
@@ -7842,6 +7956,16 @@ pub fn op_integrity_check(
                         actual_count: integrity_check_state.freelist_count.actual_count,
                         expected_count: integrity_check_state.freelist_count.expected_count,
                     });
+                }
+                for page_number in 2..=integrity_check_state.db_size {
+                    if !integrity_check_state
+                        .page_reference
+                        .contains_key(&(page_number as i64))
+                    {
+                        errors.push(IntegrityCheckError::PageNeverUsed {
+                            page_id: page_number as i64,
+                        });
+                    }
                 }
                 let message = if errors.is_empty() {
                     "ok".to_string()
@@ -8018,7 +8142,7 @@ pub fn op_drop_column(
         let schema = conn.schema.read();
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
-            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
                     column_name, view.sql,
@@ -8149,7 +8273,7 @@ pub fn op_alter_column(
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             // FIXME: this should rewrite the view to reference the new column name
-            conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
                     old_column_name, view.sql,
@@ -8232,6 +8356,72 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
             }
         }
     }
+}
+
+pub fn op_fk_counter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkCounter {
+            increment_value,
+            is_scope,
+        },
+        insn
+    );
+    if *is_scope {
+        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+    } else {
+        // Transaction-level counter: add/subtract for deferred FKs.
+        program
+            .connection
+            .fk_deferred_violations
+            .fetch_add(*increment_value, Ordering::AcqRel);
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_fk_if_zero(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FkIfZero {
+            is_scope,
+            target_pc,
+        },
+        insn
+    );
+    let fk_enabled = program.connection.foreign_keys_enabled();
+
+    // Jump if any:
+    // Foreign keys are disabled globally
+    // p1 is true AND deferred constraint counter is zero
+    // p1 is false AND deferred constraint counter is non-zero
+    if !fk_enabled {
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let v = if !*is_scope {
+        program.connection.get_deferred_foreign_key_violations()
+    } else {
+        state.fk_scope_counter
+    };
+
+    state.pc = if v == 0 {
+        target_pc.as_offset_int()
+    } else {
+        state.pc + 1
+    };
+    Ok(InsnFunctionStepResult::Step)
 }
 
 mod cmath {
