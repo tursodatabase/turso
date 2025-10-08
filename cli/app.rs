@@ -1327,7 +1327,7 @@ impl Limbo {
             }
             Ok(())
         };
-        match self.handle_row(&sql, handler) {
+        match self.handle_row(sql, handler) {
             Ok(_) => Ok(db_names),
             Err(e) => Err(anyhow::anyhow!("Error in database list: {}", e)),
         }
