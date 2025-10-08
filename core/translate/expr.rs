@@ -3272,11 +3272,14 @@ impl ParamState {
 /// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
 ///
 /// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
+///
+/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
     TryResultColumnsFirst,
     TryCanonicalColumnsFirst,
     ResultColumnsNotAllowed,
+    AllowUnboundIdentifiers,
 }
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
@@ -3329,6 +3332,9 @@ pub fn bind_and_rewrite_expr<'a>(
             match expr {
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such column: {}", id.as_str());
                     };
                     let normalized_id = normalize_ident(id.as_str());
@@ -3459,6 +3465,9 @@ pub fn bind_and_rewrite_expr<'a>(
                 Expr::Qualified(tbl, id) => {
                     tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
                     let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}",
                             tbl.as_str(),
@@ -3499,6 +3508,9 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 Expr::DoublyQualified(db_name, tbl_name, col_name) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!(
                             "no such column: {}.{}.{}",
                             db_name.as_str(),

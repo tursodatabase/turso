@@ -190,7 +190,7 @@ pub fn translate_insert(
                         None,
                         connection,
                         &mut program.param_ctx,
-                        BindingBehavior::ResultColumnsNotAllowed,
+                        BindingBehavior::AllowUnboundIdentifiers,
                     )?;
                 }
                 if let Some(ref mut where_expr) = where_clause {
@@ -200,7 +200,7 @@ pub fn translate_insert(
                         None,
                         connection,
                         &mut program.param_ctx,
-                        BindingBehavior::ResultColumnsNotAllowed,
+                        BindingBehavior::AllowUnboundIdentifiers,
                     )?;
                 }
             }
