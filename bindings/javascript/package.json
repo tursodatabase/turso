@@ -18,5 +18,5 @@
     "examples/sync-node",
     "examples/sync-wasm-vite"
   ],
-  "version": "0.2.1"
+  "version": "0.2.2"
 }
