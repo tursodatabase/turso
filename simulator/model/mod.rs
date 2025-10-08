@@ -413,7 +413,7 @@ impl Shadow for SelectTable {
 #[cfg(test)]
 mod from_clause_tests {
     use sql_generation::model::{
-        query::predicate::Predicate,
+        query::{predicate::Predicate, select::SelectBody},
         table::{Column, ColumnType, JoinedTable},
     };
     use turso_parser::ast::{Expr, Name};
@@ -431,8 +431,9 @@ mod from_clause_tests {
             transaction_tables: &mut transaction_tables,
         };
 
+        let table1_name = "table1".to_string();
         let table1 = Table {
-            name: "table1".to_string(),
+            name: table1_name.clone(),
             columns: vec![
                 ("id".to_string(), ColumnType::Integer),
                 ("value".to_string(), ColumnType::Text),
@@ -478,9 +479,24 @@ mod from_clause_tests {
         tables.push(table1);
         tables.push(table2);
 
-        // SELECT * FROM table1 INNER JOIN table2 ON table1.id = table2.id;
+        // SELECT * FROM (SELECT * FROM table1) INNER JOIN table2 ON table1.id = table2.id;
         let from_clause = FromClause {
-            table: "table1".to_string(),
+            table: SelectTable::Select(super::Select {
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(FromClause {
+                            table: SelectTable::Table(table1_name),
+                            joins: vec![],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![],
+                },
+                limit: None,
+            }),
             joins: vec![JoinedTable {
                 table: "table2".to_string(),
                 join_type: JoinType::Inner,
