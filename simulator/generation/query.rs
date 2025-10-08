@@ -79,6 +79,13 @@ fn random_create_index<R: rand::Rng + ?Sized>(
     Query::CreateIndex(create_index)
 }
 
+fn random_alter_table<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    todo!()
+}
+
 /// Possible queries that can be generated given the table state
 ///
 /// Does not take into account transactional statements
@@ -93,7 +100,7 @@ pub const fn possible_queries(tables: &[Table]) -> &'static [QueryDiscriminants]
 type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;
 
 impl QueryDiscriminants {
-    pub fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
+    fn gen_function<R, G>(&self) -> QueryGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -106,6 +113,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Update => random_update,
             QueryDiscriminants::Drop => random_drop,
             QueryDiscriminants::CreateIndex => random_create_index,
+            QueryDiscriminants::AlterTable => random_alter_table,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
@@ -117,7 +125,7 @@ impl QueryDiscriminants {
         }
     }
 
-    pub fn weight(&self, remaining: &Remaining) -> u32 {
+    fn weight(&self, remaining: &Remaining) -> u32 {
         match self {
             QueryDiscriminants::Create => remaining.create,
             // remaining.select / 3 is for the random_expr generation
@@ -128,6 +136,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Update => remaining.update,
             QueryDiscriminants::Drop => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
+            QueryDiscriminants::AlterTable => remaining.alter_table,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {

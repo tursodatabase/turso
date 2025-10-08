@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, Insert, Select,
+        alter_table::AlterTable,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
@@ -29,6 +30,7 @@ pub enum Query {
     Update(Update),
     Drop(Drop),
     CreateIndex(CreateIndex),
+    AlterTable(AlterTable),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
@@ -67,10 +69,13 @@ impl Query {
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => IndexSet::from_iter([table.clone()]),
-            Query::CreateIndex(CreateIndex { table_name, .. }) => {
-                IndexSet::from_iter([table_name.clone()])
-            }
+            | Query::Drop(Drop { table, .. })
+            | Query::CreateIndex(CreateIndex {
+                table_name: table, ..
+            })
+            | Query::AlterTable(AlterTable {
+                table_name: table, ..
+            }) => IndexSet::from_iter([table.clone()]),
             Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
             Query::Placeholder => IndexSet::new(),
         }
@@ -83,8 +88,13 @@ impl Query {
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => vec![table.clone()],
-            Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
+            | Query::Drop(Drop { table, .. })
+            | Query::CreateIndex(CreateIndex {
+                table_name: table, ..
+            })
+            | Query::AlterTable(AlterTable {
+                table_name: table, ..
+            }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
         }
@@ -117,6 +127,7 @@ impl Display for Query {
             Self::Update(update) => write!(f, "{update}"),
             Self::Drop(drop) => write!(f, "{drop}"),
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
+            Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
@@ -137,6 +148,7 @@ impl Shadow for Query {
             Query::Update(update) => update.shadow(env),
             Query::Drop(drop) => drop.shadow(env),
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
+            Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
@@ -154,6 +166,7 @@ bitflags! {
         const UPDATE = 1 << 4;
         const DROP = 1 << 5;
         const CREATE_INDEX = 1 << 6;
+        const ALTER_TABLE = 1 << 7;
     }
 }
 
@@ -182,6 +195,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Update => Self::UPDATE,
             QueryDiscriminants::Drop => Self::DROP,
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
+            QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
@@ -519,6 +533,14 @@ impl Shadow for Update {
             }
         }
 
+        Ok(vec![])
+    }
+}
+
+impl Shadow for AlterTable {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
         Ok(vec![])
     }
 }

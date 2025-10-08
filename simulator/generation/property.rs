@@ -1352,17 +1352,18 @@ fn assert_all_table_values(
 }
 
 #[derive(Debug)]
-pub(crate) struct Remaining {
-    pub(crate) select: u32,
-    pub(crate) insert: u32,
-    pub(crate) create: u32,
-    pub(crate) create_index: u32,
-    pub(crate) delete: u32,
-    pub(crate) update: u32,
-    pub(crate) drop: u32,
+pub(super) struct Remaining {
+    pub select: u32,
+    pub insert: u32,
+    pub create: u32,
+    pub create_index: u32,
+    pub delete: u32,
+    pub update: u32,
+    pub drop: u32,
+    pub alter_table: u32,
 }
 
-pub(crate) fn remaining(
+pub(super) fn remaining(
     max_interactions: u32,
     opts: &QueryProfile,
     stats: &InteractionStats,
@@ -1417,6 +1418,7 @@ pub(crate) fn remaining(
         delete: remaining_delete,
         drop: remaining_drop,
         update: remaining_update,
+        alter_table: 0, // TODO: calculate remaining
     }
 }
 
@@ -1727,7 +1729,7 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
-    pub(super) fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
+    fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -1756,7 +1758,7 @@ impl PropertyDiscriminants {
         }
     }
 
-    pub fn weight(
+    fn weight(
         &self,
         env: &SimulatorEnv,
         remaining: &Remaining,

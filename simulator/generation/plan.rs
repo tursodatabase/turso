@@ -165,18 +165,7 @@ impl InteractionPlan {
     }
 
     pub(crate) fn stats(&self) -> InteractionStats {
-        let mut stats = InteractionStats {
-            select_count: 0,
-            insert_count: 0,
-            delete_count: 0,
-            update_count: 0,
-            create_count: 0,
-            create_index_count: 0,
-            drop_count: 0,
-            begin_count: 0,
-            commit_count: 0,
-            rollback_count: 0,
-        };
+        let mut stats = InteractionStats::default();
 
         fn query_stat(q: &Query, stats: &mut InteractionStats) {
             match q {
@@ -190,6 +179,7 @@ impl InteractionPlan {
                 Query::Begin(_) => stats.begin_count += 1,
                 Query::Commit(_) => stats.commit_count += 1,
                 Query::Rollback(_) => stats.rollback_count += 1,
+                Query::AlterTable(_) => stats.alter_table_count += 1,
                 Query::Placeholder => {}
             }
         }
@@ -699,18 +689,19 @@ impl Display for InteractionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InteractionStats {
-    pub(crate) select_count: u32,
-    pub(crate) insert_count: u32,
-    pub(crate) delete_count: u32,
-    pub(crate) update_count: u32,
-    pub(crate) create_count: u32,
-    pub(crate) create_index_count: u32,
-    pub(crate) drop_count: u32,
-    pub(crate) begin_count: u32,
-    pub(crate) commit_count: u32,
-    pub(crate) rollback_count: u32,
+    pub select_count: u32,
+    pub insert_count: u32,
+    pub delete_count: u32,
+    pub update_count: u32,
+    pub create_count: u32,
+    pub create_index_count: u32,
+    pub drop_count: u32,
+    pub begin_count: u32,
+    pub commit_count: u32,
+    pub rollback_count: u32,
+    pub alter_table_count: u32,
 }
 
 impl Display for InteractionStats {
