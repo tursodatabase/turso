@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.2 -- 2025-10-08
+
+### Added
+
+* add basic examples for database-wasm package (Nikita Sivukhin)
+* core/incremental: Implement "is null" and "is not null" tests for view filter (Glauber Costa)
+
+### Updated
+
+* core/mvcc: filter out seek results where is not same table_id (Pere Diaz Bou)
+
+### Fixed
+
+* Fix attach I/O error with in-memory databases (Preston Thorpe)
+* core/incremental: Fix re-insertion of data with same key (Glauber Costa)
+
 ## 0.2.1 -- 2025-10-04
 
 ### Added
