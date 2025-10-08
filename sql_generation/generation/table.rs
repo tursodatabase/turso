@@ -51,8 +51,7 @@ impl Arbitrary for Column {
         Self {
             name,
             column_type,
-            primary: false,
-            unique: false,
+            constraints: vec![], // TODO: later implement arbitrary here for ColumnConstraint
         }
     }
 }

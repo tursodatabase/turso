@@ -18,7 +18,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use turso_core::{
     CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
 };
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod io;
 use crate::io::FILE_SIZE_SOFT_LIMIT;
@@ -332,12 +332,18 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
         let num_columns = rng.random_range(2..=8);
         let mut columns = Vec::new();
 
+        // TODO: there is no proper unique generation yet in whopper, so disable primary keys for now
+
+        // let primary = ColumnConstraint::PrimaryKey {
+        //     order: None,
+        //     conflict_clause: None,
+        //     auto_increment: false,
+        // };
         // Always add an id column as primary key
         columns.push(Column {
             name: "id".to_string(),
             column_type: ColumnType::Integer,
-            primary: true,
-            unique: false,
+            constraints: vec![],
         });
 
         // Add random columns
@@ -348,11 +354,19 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
                 _ => ColumnType::Float,
             };
 
+            // FIXME: before sql_generation did not incorporate ColumnConstraint into the sql string
+            // now it does and it the simulation here fails `whopper` with UNIQUE CONSTRAINT ERROR
+            // 20% chance of unique
+            let constraints = if rng.random_bool(0.0) {
+                vec![ColumnConstraint::Unique(None)]
+            } else {
+                Vec::new()
+            };
+
             columns.push(Column {
                 name: format!("col_{j}"),
                 column_type: col_type,
-                primary: false,
-                unique: rng.random_bool(0.2), // 20% chance of unique
+                constraints,
             });
         }
 
@@ -364,6 +378,10 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
         };
 
         schema.push(Create { table });
+    }
+
+    for create in &schema {
+        println!("{create}");
     }
 
     schema
