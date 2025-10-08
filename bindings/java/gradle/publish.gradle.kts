@@ -52,8 +52,8 @@ configure<SigningExtension> {
     setRequired(true)
 
     // For CI/GitHub Actions: use in-memory keys
-    val signingKey = providers.environmentVariable("GPG_PRIVATE_KEY").orNull
-    val signingPassword = providers.environmentVariable("GPG_PASSPHRASE").orNull
+    val signingKey = providers.environmentVariable("MAVEN_SIGNING_KEY").orNull
+    val signingPassword = providers.environmentVariable("MAVEN_SIGNING_PASSPHRASE").orNull
 
     if (signingKey != null && signingPassword != null) {
         // CI mode: use in-memory keys
@@ -222,12 +222,12 @@ tasks.register("publishToMavenCentral") {
     createMavenCentralBundle.get().mustRunAfter("publish")
 
     doLast {
-        val username = providers.environmentVariable("MAVEN_CENTRAL_USERNAME").orNull
-        val password = providers.environmentVariable("MAVEN_CENTRAL_PASSWORD").orNull
+        val username = providers.environmentVariable("MAVEN_UPLOAD_USERNAME").orNull
+        val password = providers.environmentVariable("MAVEN_UPLOAD_PASSWORD").orNull
         val bundleFile = createMavenCentralBundle.get().archiveFile.get().asFile
 
-        require(username != null) { "MAVEN_CENTRAL_USERNAME environment variable must be set" }
-        require(password != null) { "MAVEN_CENTRAL_PASSWORD environment variable must be set" }
+        require(username != null) { "MAVEN_UPLOAD_USERNAME environment variable must be set" }
+        require(password != null) { "MAVEN_UPLOAD_PASSWORD environment variable must be set" }
         require(bundleFile.exists()) { "Bundle file does not exist: ${bundleFile.absolutePath}" }
 
         logger.lifecycle("Uploading bundle to Maven Central Portal...")
