@@ -195,7 +195,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let row_data = ImmutableRecord::from_bin_record(version.row.data.clone());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor.parse_full_header(&row_data).unwrap();
-                        let ValueRef::Integer(root_page) =
+                        if let ValueRef::Integer(root_page) =
                             record_cursor.get_value(&row_data, 3).unwrap()
                         {
                             if is_delete {
