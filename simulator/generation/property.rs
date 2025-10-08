@@ -246,9 +246,9 @@ pub enum Property {
     /// statement.
     ///
     /// The nesting_level controls the level of nesting of the SELECT clause. For example,
-    /// nesting_level=1 generates the query above, nesting_level=1 generates this query:
+    /// nesting_level=0 generates the query above, nesting_level=1 generates this query:
     ///     INSERT INTO <table> SELECT * FROM (SELECT * FROM <table>)
-    /// and nesting_level=2 generates this query:
+    /// and nesting_level=1 generates this query:
     ///     INSERT INTO <table> SELECT * FROM (SELECT * FROM (SELECT * FROM <table>))
     InsertSelectNested {
         table: String,
@@ -1352,7 +1352,6 @@ impl Property {
                 let select_interaction =
                     InteractionType::Query(Query::Select(select_query.clone()));
 
-                //TODO check off-by-one
                 for _ in 0..*nesting_level {
                     select_query = Select {
                         body: SelectBody {
@@ -2203,4 +2202,92 @@ fn print_row(row: &[SimValue]) -> String {
         })
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactions_insertselectnested_base_interactions() {
+        let property = Property::InsertSelectNested {
+            table: "table1".to_owned(),
+            nesting_level: 0,
+        };
+        let result = property.interactions(123);
+        let _expected: Vec<Interaction> = vec![];
+        assert_eq!(4, result.len());
+        //TODO maybe try to fail the assumption?
+        assert!(matches!(
+            result[0].interaction,
+            InteractionType::Assumption(_)
+        ));
+        let InteractionType::Query(crate::model::Query::Select(actual_select)) =
+            &result[1].interaction
+        else {
+            panic!(
+                "unexpected interaction type for select: {:?}",
+                result[1].interaction
+            );
+        };
+        assert_eq!(
+            &Select {
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(FromClause {
+                            table: SelectTable::Table("table1".to_owned()),
+                            joins: vec![],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![]
+                },
+                limit: None,
+            },
+            actual_select,
+        );
+
+        assert!(matches!(result[2].interaction, InteractionType::Query(_)));
+        let InteractionType::Query(crate::model::Query::Insert(Insert::Select {
+            table: actual_insert_table,
+            select: actual_insert_select,
+        })) = &result[2].interaction
+        else {
+            panic!(
+                "unexpected interaction type for insert: {:?}",
+                result[2].interaction
+            );
+        };
+
+        assert_eq!("table1", actual_insert_table);
+        assert_eq!(
+            Select {
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(FromClause {
+                            table: SelectTable::Table("table1".to_owned()),
+                            joins: vec![],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![]
+                },
+                limit: None,
+            },
+            **actual_insert_select,
+        );
+        //TODO test with a non-0 nesting level
+
+        //TODO maybe try to fail the assertion?
+        assert!(matches!(
+            result[3].interaction,
+            InteractionType::Assertion(_)
+        ));
+    }
 }
