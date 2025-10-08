@@ -18,11 +18,35 @@ pub struct IOContext {
 }
 
 impl IOContext {
+    pub fn new_from_encryption_context(ctx: EncryptionContext) -> Self {
+        Self {
+            encryption_or_checksum: EncryptionOrChecksum::Encryption(ctx),
+        }
+    }
+
+    pub fn cipher_mode(&self) -> Option<crate::CipherMode> {
+        match &self.encryption_or_checksum {
+            EncryptionOrChecksum::Encryption(ctx) => Some(ctx.cipher_mode()),
+            _ => None,
+        }
+    }
+
     pub fn encryption_context(&self) -> Option<&EncryptionContext> {
         match &self.encryption_or_checksum {
             EncryptionOrChecksum::Encryption(ctx) => Some(ctx),
             _ => None,
         }
+    }
+
+    pub(crate) fn is_checksum_enabled(&self) -> bool {
+        matches!(
+            &self.encryption_or_checksum,
+            EncryptionOrChecksum::Checksum(_)
+        )
+    }
+
+    pub fn set_checksum(&mut self) {
+        self.encryption_or_checksum = EncryptionOrChecksum::Checksum(ChecksumContext::default());
     }
 
     pub fn get_reserved_space_bytes(&self) -> u8 {

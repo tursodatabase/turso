@@ -23,6 +23,7 @@ use crate::storage::sqlite3_ondisk::{
     write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
 use crate::types::{IOCompletions, IOResult};
+use crate::util::IOExt;
 use crate::{
     bail_corrupt_error, io_yield_one, return_if_io, turso_assert, Buffer, Completion,
     CompletionError, IOContext, LimboError, Result,
@@ -235,6 +236,13 @@ pub trait Wal: Debug {
     /// Begin a write transaction.
     fn begin_write_tx(&mut self) -> Result<()>;
 
+    fn commit_rekey_transaction(
+        &mut self,
+        pages: Vec<PageRef>,
+        db_size: u32,
+        new_salt: (u32, u32),
+    ) -> Result<Completion>;
+
     /// End a read transaction.
     fn end_read_tx(&self);
 
@@ -295,6 +303,7 @@ pub trait Wal: Debug {
         &mut self,
         pager: &Pager,
         mode: CheckpointMode,
+        rekey_ctx: Option<&crate::EncryptionContext>,
     ) -> Result<IOResult<CheckpointResult>>;
     fn sync(&mut self) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
@@ -807,6 +816,55 @@ impl Drop for CheckpointLocks {
 }
 
 impl Wal for WalFile {
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn commit_rekey_transaction(
+        &mut self,
+        pages: Vec<PageRef>,
+        db_size: u32,
+        new_salt: (u32, u32),
+    ) -> Result<Completion> {
+        let page_sz = self.get_shared().wal_header.lock().page_size;
+        let page_sz = PageSize::new(page_sz).unwrap();
+
+        let data_completion = self.append_frames_vectored(pages, page_sz, Some(db_size))?;
+        self.io.wait_for_completion(data_completion)?;
+
+        let (header, _epoch) = {
+            let shared = self.get_shared();
+            let hdr_guard = shared.wal_header.lock();
+            (*hdr_guard, shared.epoch.load(Ordering::Acquire))
+        };
+
+        let next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
+
+        let (new_checksum, frame_bytes) = sqlite3_ondisk::prepare_rekey_commit_frame(
+            &self.buffer_pool,
+            &header,
+            self.last_checksum,
+            new_salt,
+        );
+
+        let start_off = self.frame_offset(next_frame_id);
+        let c = Completion::new_write(|_| {});
+        let rekey_completion =
+            self.get_shared()
+                .file
+                .as_ref()
+                .unwrap()
+                .pwrite(start_off, frame_bytes, c)?;
+        self.io.wait_for_completion(rekey_completion)?;
+
+        self.complete_append_frame(
+            sqlite3_ondisk::REKEY_COMMIT_PAGE_NO as u64,
+            next_frame_id,
+            new_checksum,
+        );
+
+        self.finish_append_frames_commit()?;
+
+        self.sync()
+    }
+
     /// Begin a read transaction. The caller must ensure that there is not already
     /// an ongoing read transaction.
     /// Returns whether the database state has changed since the last read transaction.
@@ -1307,11 +1365,13 @@ impl Wal for WalFile {
         &mut self,
         pager: &Pager,
         mode: CheckpointMode,
+        rekey_ctx: Option<&crate::EncryptionContext>,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode).inspect_err(|_| {
-            let _ = self.checkpoint_guard.take();
-            self.ongoing_checkpoint.state = CheckpointState::Start;
-        })
+        self.checkpoint_inner(pager, mode, rekey_ctx)
+            .inspect_err(|_| {
+                let _ = self.checkpoint_guard.take();
+                self.ongoing_checkpoint.state = CheckpointState::Start;
+            })
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
@@ -1732,14 +1792,14 @@ impl WalFile {
         &mut self,
         pager: &Pager,
         mode: CheckpointMode,
+        rekey_ctx: Option<&crate::EncryptionContext>,
     ) -> Result<IOResult<CheckpointResult>> {
+        let mut rekey_info: Option<(u32, u32)> = None;
+
         loop {
             let state = &mut self.ongoing_checkpoint.state;
             tracing::debug!(?state);
             match state {
-                // Acquire the relevant exclusive locks and checkpoint_lock
-                // so no other checkpointer can run. fsync WAL if there are unapplied frames.
-                // Decide the largest frame we are allowed to back‑fill.
                 CheckpointState::Start => {
                     let (max_frame, nbackfills) = {
                         let shared = self.get_shared();
@@ -1749,8 +1809,6 @@ impl WalFile {
                     };
                     let needs_backfill = max_frame > nbackfills;
                     if !needs_backfill && !mode.should_restart_log() {
-                        // there are no frames to copy over and we don't need to reset
-                        // the log so we can return early success.
                         return Ok(IOResult::Done(CheckpointResult {
                             num_attempted: self.prev_checkpoint.num_attempted,
                             num_backfilled: self.prev_checkpoint.num_backfilled,
@@ -1760,7 +1818,6 @@ impl WalFile {
                             db_truncate_sent: false,
                         }));
                     }
-                    // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
 
@@ -1782,29 +1839,94 @@ impl WalFile {
 
                     self.ongoing_checkpoint.max_frame = max_frame;
                     self.ongoing_checkpoint.min_frame = nbackfills + 1;
+
                     let to_checkpoint = {
-                        let shared = self.get_shared();
-                        let frame_cache = shared.frame_cache.lock();
-                        let mut list = Vec::with_capacity(
-                            self.ongoing_checkpoint
-                                .max_frame
-                                .checked_sub(nbackfills)
-                                .unwrap_or_default() as usize,
-                        );
-                        for (&page_id, frames) in frame_cache.iter() {
-                            // for each page in the frame cache, grab the last (latest) frame for
-                            // that page that falls in the range of our safe min..max frame
-                            if let Some(&frame) = frames.iter().rev().find(|&&f| {
-                                f >= self.ongoing_checkpoint.min_frame
-                                    && f <= self.ongoing_checkpoint.max_frame
-                            }) {
-                                list.push((page_id, frame));
+                        let mut pages_map: HashMap<u64, u64> = HashMap::new();
+                        let mut frame_header_buf = vec![0u8; WAL_FRAME_HEADER_SIZE];
+
+                        for frame_id in
+                            self.ongoing_checkpoint.min_frame..=self.ongoing_checkpoint.max_frame
+                        {
+                            let offset = self.frame_offset(frame_id);
+
+                            let completion = Completion::new_read(
+                                Arc::new(Buffer::new_temporary(WAL_FRAME_HEADER_SIZE)),
+                                {
+                                    let mut_ptr = frame_header_buf.as_mut_ptr();
+                                    move |res| {
+                                        if let Ok((buf, len)) = res {
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    buf.as_ptr(),
+                                                    mut_ptr,
+                                                    len as usize,
+                                                );
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                            let c = self
+                                .shared
+                                .read()
+                                .file
+                                .as_ref()
+                                .unwrap()
+                                .pread(offset, completion)?;
+                            self.io.wait_for_completion(c)?;
+
+                            let (header, _) =
+                                sqlite3_ondisk::parse_wal_frame_header(&frame_header_buf);
+
+                            if header.page_number == sqlite3_ondisk::REKEY_COMMIT_PAGE_NO {
+                                turso_assert!(rekey_ctx.is_some(), "RekeyCommit frame found but no rekey context was provided to checkpoint.");
+                                turso_assert!(
+                                    matches!(mode, CheckpointMode::Full),
+                                    "Rekey checkpoint must be in 'Full' mode."
+                                );
+
+                                tracing::info!("RekeyCommit frame detected at frame_id={}. Preparing for rekey checkpoint.", frame_id);
+
+                                let mut salt_buf = vec![0u8; 8];
+                                let salt_offset = offset + WAL_FRAME_HEADER_SIZE as u64;
+
+                                let completion =
+                                    Completion::new_read(Arc::new(Buffer::new_temporary(8)), {
+                                        let mut_ptr = salt_buf.as_mut_ptr();
+                                        move |res| {
+                                            if let Ok((buf, len)) = res {
+                                                unsafe {
+                                                    std::ptr::copy_nonoverlapping(
+                                                        buf.as_ptr(),
+                                                        mut_ptr,
+                                                        len as usize,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
+                                let c = self
+                                    .shared
+                                    .read()
+                                    .file
+                                    .as_ref()
+                                    .unwrap()
+                                    .pread(salt_offset, completion)?;
+                                self.io.wait_for_completion(c)?;
+
+                                let salt1 = u32::from_be_bytes(salt_buf[0..4].try_into().unwrap());
+                                let salt2 = u32::from_be_bytes(salt_buf[4..8].try_into().unwrap());
+                                rekey_info = Some((salt1, salt2));
+                            } else {
+                                pages_map.insert(header.page_number as u64, frame_id);
                             }
                         }
+                        let mut list: Vec<(u64, u64)> = pages_map.into_iter().collect();
                         // sort by frame_id for read locality
                         list.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                         list
                     };
+
                     self.ongoing_checkpoint.pages_to_checkpoint = to_checkpoint;
                     self.ongoing_checkpoint.current_page = 0;
                     self.ongoing_checkpoint.inflight_writes.clear();
@@ -1888,24 +2010,54 @@ impl WalFile {
                                 continue 'inner;
                             }
                         }
+
+                        let temp_io_ctx;
+                        let checkpoint_io_ctx =
+                            if let (Some(_), Some(ctx)) = (rekey_info, rekey_ctx) {
+                                temp_io_ctx =
+                                    crate::IOContext::new_from_encryption_context(ctx.clone());
+                                &temp_io_ctx
+                            } else {
+                                &*self.io_ctx.read()
+                            };
+
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
-                        let inflight =
-                            self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
+
+                        let inflight = self.issue_wal_read_into_buffer(
+                            page_id as usize,
+                            target_frame,
+                            checkpoint_io_ctx,
+                        )?;
                         group.add(&inflight.completion);
                         nr_completions += 1;
                         self.ongoing_checkpoint.inflight_reads.push(inflight);
                         self.ongoing_checkpoint.current_page += 1;
                     }
 
-                    // Start a write if batch is ready and we're not at write limit
                     if self.ongoing_checkpoint.inflight_writes.len() < MAX_INFLIGHT_WRITES
                         && self.ongoing_checkpoint.should_flush_batch()
                     {
                         let batch_map = self.ongoing_checkpoint.pending_writes.take();
                         if !batch_map.is_empty() {
                             let done_flag = self.ongoing_checkpoint.add_write();
-                            for c in write_pages_vectored(pager, batch_map, done_flag)? {
+
+                            let temp_io_ctx;
+                            let checkpoint_io_ctx =
+                                if let (Some(_), Some(ctx)) = (rekey_info, rekey_ctx) {
+                                    temp_io_ctx =
+                                        crate::IOContext::new_from_encryption_context(ctx.clone());
+                                    &temp_io_ctx
+                                } else {
+                                    &*pager.io_ctx.read()
+                                };
+
+                            for c in write_pages_vectored(
+                                pager,
+                                batch_map,
+                                done_flag,
+                                checkpoint_io_ctx,
+                            )? {
                                 group.add(&c);
                                 nr_completions += 1;
                             }
@@ -1927,6 +2079,20 @@ impl WalFile {
                         self.ongoing_checkpoint.complete(),
                         "checkpoint pending flush must have finished"
                     );
+
+                    if let Some(new_salt) = rekey_info {
+                        tracing::info!(
+                            "Finalizing rekey: atomically updating database header salt."
+                        );
+
+                        pager.io.block(|| {
+                            pager.with_header_mut(|header| {
+                                header.version_valid_for = new_salt.0.into();
+                                header.version_number = new_salt.1.into();
+                            })
+                        })?;
+                    }
+
                     let checkpoint_result = {
                         let shared = self.get_shared();
                         let current_mx = shared.max_frame.load(Ordering::Acquire);
@@ -2227,7 +2393,12 @@ impl WalFile {
         Ok(())
     }
 
-    fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
+    fn issue_wal_read_into_buffer(
+        &self,
+        page_id: usize,
+        frame_id: u64,
+        io_ctx: &IOContext,
+    ) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
 
@@ -2255,7 +2426,7 @@ impl WalFile {
             self.buffer_pool.clone(),
             complete,
             page_id,
-            &self.io_ctx.read(),
+            io_ctx, // &self.io_ctx.read(),
         )?;
 
         Ok(InflightRead {
@@ -2601,7 +2772,10 @@ pub mod test {
         pager: &crate::Pager,
         mode: CheckpointMode,
     ) -> CheckpointResult {
-        pager.io.block(|| wal.checkpoint(pager, mode)).unwrap()
+        pager
+            .io
+            .block(|| wal.checkpoint(pager, mode, None))
+            .unwrap()
     }
 
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
@@ -2810,7 +2984,7 @@ pub mod test {
         let p = conn1.pager.read();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart, None) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(db.io.as_ref()).unwrap();
                 }
@@ -2839,7 +3013,7 @@ pub mod test {
         let p = conn1.pager.read();
         let mut w = p.wal.as_ref().unwrap().borrow_mut();
         loop {
-            match w.checkpoint(&p, CheckpointMode::Restart) {
+            match w.checkpoint(&p, CheckpointMode::Restart, None) {
                 Ok(IOResult::IO(io)) => {
                     io.wait(db.io.as_ref()).unwrap();
                 }
@@ -3018,7 +3192,7 @@ pub mod test {
         let result = {
             let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            wal.checkpoint(&pager, CheckpointMode::Restart)
+            wal.checkpoint(&pager, CheckpointMode::Restart, None)
         };
 
         assert!(
@@ -3414,7 +3588,7 @@ pub mod test {
         {
             let pager = conn1.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
-            let result = wal.checkpoint(&pager, CheckpointMode::Restart);
+            let result = wal.checkpoint(&pager, CheckpointMode::Restart, None);
 
             assert!(
                 matches!(result, Err(LimboError::Busy)),
@@ -3513,7 +3687,7 @@ pub mod test {
             let pager = writer.pager.read();
             let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             loop {
-                match wal.checkpoint(&pager, CheckpointMode::Full) {
+                match wal.checkpoint(&pager, CheckpointMode::Full, None) {
                     Ok(IOResult::IO(io)) => {
                         // Drive any pending IO (should quickly become Busy or Done)
                         io.wait(db.io.as_ref()).unwrap();

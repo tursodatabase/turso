@@ -28,6 +28,17 @@ pub fn insn_to_row(
         }
     };
     match insn {
+                #[cfg(feature = "encryption")]
+          Insn::Rekey { new_key: _ } => (
+            "Rekey",
+            0,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            "database".to_string(),
+        ),
+
             Insn::Init { target_pc } => (
                 "Init",
                 0,

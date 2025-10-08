@@ -131,6 +131,9 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["mvcc_checkpoint_threshold"],
         ),
+
+        PragmaName::Rekey => Pragma::new(PragmaFlags::NoColumns1, &[]),
+        PragmaName::ReHexKey => Pragma::new(PragmaFlags::NoColumns1, &[]),
     }
 }
 

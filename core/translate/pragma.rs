@@ -341,6 +341,26 @@ fn update_pragma(
             connection.set_encryption_cipher(cipher)?;
             Ok((program, TransactionMode::None))
         }
+        PragmaName::Rekey => Err(LimboError::InternalError(
+            "PRAGMA rekey is not yet supported. Use PRAGMA rehexkey.".to_string(),
+        )),
+        PragmaName::ReHexKey => {
+            #[cfg(feature = "encryption")]
+            {
+                let hex_value = parse_string(&value)?;
+                let new_key = EncryptionKey::from_hex_string(&hex_value)?;
+
+                program.emit_insn(Insn::Rekey { new_key });
+
+                Ok((program, TransactionMode::Write))
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                Err(LimboError::Unsupported(
+                    "PRAGMA rehexkey is not supported because the database was not compiled with the encryption feature.".to_string()
+                ))
+            }
+        }
         PragmaName::Synchronous => {
             use crate::SyncMode;
 
@@ -703,6 +723,9 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
+        }
+        PragmaName::Rekey | PragmaName::ReHexKey => {
+            unreachable!("rekey/rehexkey pragma don't need em")
         }
     }
 }

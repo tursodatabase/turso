@@ -79,6 +79,7 @@ pub const CELL_PTR_SIZE_BYTES: usize = 2;
 pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
 pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
 pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
+pub const REKEY_COMMIT_PAGE_NO: u32 = 0;
 
 #[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy, Debug)]
 #[repr(transparent)]
@@ -999,6 +1000,7 @@ pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
+    io_ctx_override: &IOContext,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::SeqCst);
@@ -1049,12 +1051,11 @@ pub fn write_pages_vectored(
                 }
             });
 
-            let io_ctx = pager.io_ctx.read();
             match pager.db_file.write_pages(
                 start_id,
                 page_sz,
                 std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY)),
-                &io_ctx,
+                io_ctx_override,
                 cmp,
             ) {
                 Ok(c) => completions.push(c),
@@ -2037,6 +2038,45 @@ pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
     };
     let page = &frame[WAL_FRAME_HEADER_SIZE..];
     (header, page)
+}
+
+pub fn prepare_rekey_commit_frame(
+    buffer_pool: &Arc<BufferPool>,
+    wal_header: &WalHeader,
+    prev_checksums: (u32, u32),
+    new_salt: (u32, u32),
+) -> ((u32, u32), Arc<Buffer>) {
+    tracing::trace!("prepare_rekey_commit_frame");
+
+    let buffer = buffer_pool.get_wal_frame();
+    let frame = buffer.as_mut_slice();
+    let page_size = wal_header.page_size as usize;
+    let page_data_area = &mut frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size];
+
+    page_data_area[0..4].copy_from_slice(&new_salt.0.to_be_bytes());
+    page_data_area[4..8].copy_from_slice(&new_salt.1.to_be_bytes());
+    page_data_area[8..].fill(0);
+
+    frame[0..4].copy_from_slice(&REKEY_COMMIT_PAGE_NO.to_be_bytes());
+    frame[4..8].copy_from_slice(&0u32.to_be_bytes()); // db_size is 0, this is not a traditional commit frame.
+    frame[8..12].copy_from_slice(&wal_header.salt_1.to_be_bytes());
+    frame[12..16].copy_from_slice(&wal_header.salt_2.to_be_bytes());
+
+    let expects_be = wal_header.magic & 1;
+    let use_native_endian = cfg!(target_endian = "big") as u32 == expects_be;
+
+    let header_checksum = checksum_wal(&frame[0..8], wal_header, prev_checksums, use_native_endian);
+    let final_checksum = checksum_wal(
+        &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size],
+        wal_header,
+        header_checksum,
+        use_native_endian,
+    );
+
+    frame[16..20].copy_from_slice(&final_checksum.0.to_be_bytes());
+    frame[20..24].copy_from_slice(&final_checksum.1.to_be_bytes());
+
+    (final_checksum, Arc::new(buffer))
 }
 
 pub fn prepare_wal_frame(

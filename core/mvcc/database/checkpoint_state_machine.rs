@@ -308,6 +308,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
             },
+            None,
         )? {
             IOResult::Done(result) => Ok(IOResult::Done(result)),
             IOResult::IO(io) => Ok(IOResult::IO(io)),

@@ -1169,6 +1169,10 @@ pub enum Insn {
         p2: Option<usize>, // P2: address of parent explain instruction
         detail: String,    // P4: detail text
     },
+    #[cfg(feature = "encryption")]
+    Rekey {
+        new_key: crate::EncryptionKey,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1335,6 +1339,8 @@ impl InsnVariants {
             InsnVariants::MemMax => execute::op_mem_max,
             InsnVariants::Sequence => execute::op_sequence,
             InsnVariants::SequenceTest => execute::op_sequence_test,
+            #[cfg(feature = "encryption")]
+            InsnVariants::Rekey => execute::op_rekey,
         }
     }
 }

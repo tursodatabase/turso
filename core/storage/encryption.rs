@@ -10,6 +10,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes128Gcm, Aes256Gcm, Key, Nonce,
 };
+use rand::RngCore;
 use turso_macros::match_ignore_ascii_case;
 
 /// Encryption Scheme
@@ -480,6 +481,7 @@ pub struct EncryptionContext {
     cipher_mode: CipherMode,
     cipher: Cipher,
     page_size: usize,
+    salt: (u32, u32),
 }
 
 impl EncryptionContext {
@@ -504,11 +506,32 @@ impl EncryptionContext {
             CipherMode::Aegis128X2 => Cipher::Aegis128X2(Box::new(Aegis128X2Cipher::new(key))),
             CipherMode::Aegis128X4 => Cipher::Aegis128X4(Box::new(Aegis128X4Cipher::new(key))),
         };
+
+        let mut salt1_bytes = [0u8; 4];
+        let mut salt2_bytes = [0u8; 4];
+        OsRng.fill_bytes(&mut salt1_bytes);
+        OsRng.fill_bytes(&mut salt2_bytes);
+        let salt = (
+            u32::from_ne_bytes(salt1_bytes),
+            u32::from_ne_bytes(salt2_bytes),
+        );
+
         Ok(Self {
             cipher_mode,
             cipher,
             page_size,
+            salt,
         })
+    }
+
+    pub fn get_salt(&self) -> (u32, u32) {
+        self.salt
+    }
+
+    pub fn encrypt_page_in_place(&self, page_data: &mut [u8], page_id: usize) -> Result<()> {
+        let encrypted_vec = self.encrypt_page(page_data, page_id)?;
+        page_data.copy_from_slice(&encrypted_vec);
+        Ok(())
     }
 
     pub fn cipher_mode(&self) -> CipherMode {

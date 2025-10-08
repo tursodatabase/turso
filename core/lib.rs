@@ -42,6 +42,7 @@ mod numeric;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
+use crate::types::IOCompletions;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -1114,6 +1115,99 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn rekey(&self, new_key: &EncryptionKey) -> Result<()> {
+        if !self.db.opts.enable_encryption {
+            return Err(LimboError::InvalidArgument(
+                "Cannot rekey database: encryption is not enabled.".to_string(),
+            ));
+        }
+
+        let tx_state = self.get_tx_state();
+
+        if !matches!(tx_state, TransactionState::Write { .. }) {
+            return Err(LimboError::InternalError(
+                "Rekey operation must be performed within a write transaction.".to_string(),
+            ));
+        }
+
+        let pager = self.pager.read();
+
+        if !pager.is_encryption_ctx_set() {
+            return Err(LimboError::InvalidArgument(
+                "Cannot rekey a database that is not encrypted.".to_string(),
+            ));
+        }
+
+        let cipher_mode = self.get_encryption_cipher_mode().ok_or_else(|| {
+            LimboError::InternalError(
+                "Cannot rekey: cipher mode not set on connection.".to_string(),
+            )
+        })?;
+
+        pager.io.block(|| {
+            let db_size = match pager.with_header(|header| header.database_size.get())? {
+                IOResult::Done(size) => size,
+                IOResult::IO(completions) => {
+                    match completions {
+                        IOCompletions::Single(c) => pager.io.wait_for_completion(c)?,
+                        IOCompletions::Many(cs) => {
+                            for c in cs {
+                                pager.io.wait_for_completion(c)?
+                            }
+                        }
+                    }
+                    match pager.with_header(|header| header.database_size.get())? {
+                        IOResult::Done(size) => size,
+                        IOResult::IO(_) => {
+                            return Err(LimboError::InternalError(
+                                "Could not get db_size after I/O".into(),
+                            ))
+                        }
+                    }
+                }
+            };
+
+            let mut pages_in_cache = Vec::with_capacity(db_size as usize);
+            for page_id in 1..=db_size {
+                let (page, completion) = pager.read_page(page_id as i64)?;
+                if let Some(c) = completion {
+                    pager.io.wait_for_completion(c)?;
+                }
+                pages_in_cache.push(page);
+            }
+
+            pager.replace_encryption_context(cipher_mode, new_key)?;
+            *self.encryption_key.write() = Some(new_key.clone());
+
+            for page in pages_in_cache {
+                pager.add_dirty(&page);
+            }
+
+            match pager.commit_tx(self)? {
+                IOResult::Done(_) => (),
+
+                IOResult::IO(completions) => match completions {
+                    IOCompletions::Single(c) => pager.io.wait_for_completion(c)?,
+                    IOCompletions::Many(cs) => {
+                        for c in cs {
+                            pager.io.wait_for_completion(c)?
+                        }
+                    }
+                },
+            };
+
+            self.checkpoint(CheckpointMode::Full)?;
+
+            self.set_tx_state(TransactionState::None);
+
+            pager.clear_page_cache();
+
+            Ok(IOResult::Done(()))
+        })?;
+
+        Ok(())
+    }
+
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
             // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
@@ -1730,7 +1824,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.read().wal_checkpoint(mode)
+        self.pager.read().wal_checkpoint(mode, None)
     }
 
     /// Close a connection and checkpoint.

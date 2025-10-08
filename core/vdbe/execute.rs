@@ -407,7 +407,7 @@ pub fn op_checkpoint_inner(
                     .connection
                     .pager
                     .write()
-                    .wal_checkpoint_start(*checkpoint_mode);
+                    .wal_checkpoint_start(*checkpoint_mode, None);
                 match step_result {
                     Ok(IOResult::Done(result)) => {
                         state.op_checkpoint_state = OpCheckpointState::FinishCheckpoint {
@@ -1395,6 +1395,22 @@ pub fn op_open_pseudo(
             .unwrap()
             .replace(Cursor::new_pseudo(cursor));
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+#[cfg(feature = "encryption")]
+pub fn op_rekey(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Rekey { new_key }, insn);
+
+    program.connection.rekey(new_key)?;
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

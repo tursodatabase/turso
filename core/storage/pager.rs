@@ -10,7 +10,7 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield_many, io_yield_one, Buffer, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
@@ -607,6 +607,32 @@ enum FreePageState {
 }
 
 impl Pager {
+    pub fn replace_encryption_context(
+        &self,
+        cipher_mode: CipherMode,
+        key: &EncryptionKey,
+    ) -> Result<()> {
+        if !self.enable_encryption.load(Ordering::SeqCst) {
+            return Err(LimboError::InvalidArgument(
+                "Encryption is not enabled.".into(),
+            ));
+        }
+
+        let page_size = self.get_page_size_unchecked().get() as usize;
+        let new_encryption_ctx = EncryptionContext::new(cipher_mode, key, page_size)?;
+
+        {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.set_encryption(new_encryption_ctx);
+        }
+
+        if let Some(wal) = self.wal.as_ref() {
+            wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+        }
+
+        Ok(())
+    }
+
     pub fn new(
         db_file: DatabaseFile,
         wal: Option<Rc<RefCell<dyn Wal>>>,
@@ -1784,7 +1810,8 @@ impl Pager {
                         self,
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None
-                        }
+                        },
+                        None
                     ));
                     *self.checkpoint_state.write() = CheckpointState::SyncDbFile { res };
                 }
@@ -1844,9 +1871,12 @@ impl Pager {
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            }) {
+            while let Err(LimboError::Busy) = self.wal_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                None,
+            ) {
                 if attempts == 3 {
                     // don't return error on `close` if we are unable to checkpoint, we can silently fail
                     tracing::warn!(
@@ -1863,14 +1893,18 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint_start(&self, mode: CheckpointMode) -> Result<IOResult<CheckpointResult>> {
+    pub fn wal_checkpoint_start(
+        &self,
+        mode: CheckpointMode,
+        rekey_ctx: Option<&EncryptionContext>,
+    ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "wal_checkpoint() called on database without WAL".to_string(),
             ));
         };
 
-        wal.borrow_mut().checkpoint(self, mode)
+        wal.borrow_mut().checkpoint(self, mode, rekey_ctx)
     }
 
     pub fn wal_checkpoint_finish(
@@ -1928,8 +1962,14 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
-        let mut result = self.io.block(|| self.wal_checkpoint_start(mode))?;
+    pub fn wal_checkpoint(
+        &self,
+        mode: CheckpointMode,
+        rekey_ctx: Option<&EncryptionContext>,
+    ) -> Result<CheckpointResult> {
+        let mut result = self
+            .io
+            .block(|| self.wal_checkpoint_start(mode, rekey_ctx))?;
         self.io.block(|| self.wal_checkpoint_finish(&mut result))?;
         Ok(result)
     }
@@ -2134,6 +2174,77 @@ impl Pager {
             *self.allocate_page1_state.read(),
             AllocatePage1State::Writing { .. }
         )
+    }
+
+    pub fn rekey(&self, new_key: &EncryptionKey) -> Result<()> {
+        let wal_ref = self.wal.as_ref().ok_or_else(|| {
+            LimboError::InternalError(
+                "Cannot rekey a database that does not use a WAL.".to_string(),
+            )
+        })?;
+
+        self.io.block(|| self.begin_write_tx())?;
+
+        let db_size = self
+            .io
+            .block(|| self.with_header(|h| h.database_size.get()))?;
+
+        let mut pages_in_cache = Vec::with_capacity(db_size as usize);
+        for page_id in 1..=db_size {
+            let (page, completion) = self.read_page(page_id as i64)?;
+            if let Some(c) = completion {
+                self.io.wait_for_completion(c)?;
+            }
+            pages_in_cache.push(page);
+        }
+
+        let (new_ctx, new_salt) = {
+            let current_io_ctx = self.io_ctx.read();
+            let cipher_mode = current_io_ctx.cipher_mode().ok_or_else(|| {
+                LimboError::InternalError("Cipher mode not set on connection.".to_string())
+            })?;
+            let page_size = self.get_page_size_unchecked().get() as usize;
+            let ctx = EncryptionContext::new(cipher_mode, new_key, page_size)?;
+            let salt = ctx.get_salt();
+            (ctx, salt)
+        };
+
+        for page in &pages_in_cache {
+            let contents = page.get_contents();
+            let buffer = contents.buffer.as_mut_slice();
+
+            let page_data_to_encrypt = &mut buffer[contents.offset..];
+
+            new_ctx.encrypt_page_in_place(page_data_to_encrypt, page.get().id)?;
+
+            self.add_dirty(page);
+        }
+
+        {
+            let mut wal = wal_ref.borrow_mut();
+            let rekey_commit_completion =
+                wal.commit_rekey_transaction(pages_in_cache, db_size, new_salt)?;
+
+            self.io.wait_for_completion(rekey_commit_completion)?;
+        }
+        self.dirty_pages.write().clear();
+
+        self.wal_checkpoint(CheckpointMode::Full, Some(&new_ctx))?;
+
+        {
+            let mut io_ctx = self.io_ctx.write();
+            io_ctx.set_encryption(new_ctx);
+        }
+
+        wal_ref
+            .borrow_mut()
+            .set_io_context(self.io_ctx.read().clone());
+
+        self.clear_page_cache();
+
+        wal_ref.borrow().end_write_tx();
+
+        Ok(())
     }
 
     /// Tries to reuse a page from the freelist if available.

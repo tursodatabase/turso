@@ -1420,6 +1420,13 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    #[strum(serialize = "rekey")]
+    #[cfg_attr(feature = "serde", serde(rename = "rekey"))]
+    Rekey,
+
+    #[strum(serialize = "rehexkey")]
+    #[cfg_attr(feature = "serde", serde(rename = "rehexkey"))]
+    ReHexKey,
     /// encryption key for encrypted databases, specified as hexadecimal string.
     #[strum(serialize = "hexkey")]
     #[cfg_attr(feature = "serde", serde(rename = "hexkey"))]
