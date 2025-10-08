@@ -371,8 +371,10 @@ fn update_pragma(
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = match parse_signed_number(&value)? {
-                Value::Integer(size) if size > 0 => size as u64,
-                _ => bail_parse_error!("mvcc_checkpoint_threshold must be a positive integer"),
+                Value::Integer(size) if size >= -1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_checkpoint_threshold must be -1, 0, or a positive integer"
+                ),
             };
 
             connection.set_mvcc_checkpoint_threshold(threshold)?;
@@ -695,7 +697,7 @@ fn query_pragma(
         PragmaName::MvccCheckpointThreshold => {
             let threshold = connection.mvcc_checkpoint_threshold()?;
             let register = program.alloc_register();
-            program.emit_int(threshold as i64, register);
+            program.emit_int(threshold, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

@@ -2025,11 +2025,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(true)
     }
 
-    pub fn set_checkpoint_threshold(&self, threshold: u64) {
+    pub fn set_checkpoint_threshold(&self, threshold: i64) {
         self.storage.set_checkpoint_threshold(threshold)
     }
 
-    pub fn checkpoint_threshold(&self) -> u64 {
+    pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
     }
 }
