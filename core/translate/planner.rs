@@ -180,7 +180,26 @@ pub fn resolve_window_and_aggregate_functions(
                                 name.as_str()
                             );
                         }
-                        crate::bail_parse_error!("Invalid aggregate function: {}", name.as_str());
+
+                        // Check if the function supports (*) syntax using centralized logic
+                        match crate::function::Func::resolve_function(name.as_str(), 0) {
+                            Ok(func) => {
+                                if func.supports_star_syntax() {
+                                    return Ok(WalkControl::Continue);
+                                } else {
+                                    crate::bail_parse_error!(
+                                        "wrong number of arguments to function {}()",
+                                        name.as_str()
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                crate::bail_parse_error!(
+                                    "wrong number of arguments to function {}()",
+                                    name.as_str()
+                                );
+                            }
+                        }
                     }
                     Err(e) => match e {
                         crate::LimboError::ParseError(e) => {
