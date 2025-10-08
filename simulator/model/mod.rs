@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, Insert, Select,
-        alter_table::AlterTable,
+        alter_table::{AlterTable, AlterTableType},
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
@@ -21,7 +21,6 @@ use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
-#[strum_discriminants(derive(strum::VariantArray, strum::EnumIter))]
 pub enum Query {
     Create(Create),
     Select(Select),
@@ -541,6 +540,43 @@ impl Shadow for AlterTable {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let table = tables
+            .iter_mut()
+            .find(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", self.table_name))?;
+
+        match &self.alter_table_type {
+            AlterTableType::RenameTo { new_name } => {
+                table.name = new_name.clone();
+            }
+            AlterTableType::AddColumn { column } => {
+                table.columns.push(column.clone());
+                table.rows.iter_mut().for_each(|row| {
+                    row.push(SimValue(turso_core::Value::Null));
+                });
+            }
+            AlterTableType::AlterColumn { old, new } => {
+                // TODO: have to see correct behaviour with indexes to see if we should error out
+                // in case there is some sort of conflict with this change
+                let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
+                *col = new.clone();
+            }
+            AlterTableType::RenameColumn { old, new } => {
+                let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
+                col.name = new.clone();
+            }
+            AlterTableType::DropColumn { column_name } => {
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *column_name)
+                    .unwrap();
+                table.columns.remove(col_idx);
+                table.rows.iter_mut().for_each(|row| {
+                    row.remove(col_idx);
+                });
+            }
+        };
         Ok(vec![])
     }
 }
