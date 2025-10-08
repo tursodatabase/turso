@@ -7837,12 +7837,13 @@ pub fn op_integrity_check(
     );
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
-            let freelist_trunk_page =
-                return_if_io!(with_header(pager, mv_store, program, |header| header
-                    .freelist_trunk_page
-                    .get()));
+            let (freelist_trunk_page, db_size) =
+                return_if_io!(with_header(pager, mv_store, program, |header| (
+                    header.freelist_trunk_page.get(),
+                    header.database_size.get()
+                )));
             let mut errors = Vec::new();
-            let mut integrity_check_state = IntegrityCheckState::new();
+            let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
             // check freelist pages first, if there are any for database
             if freelist_trunk_page > 0 {
@@ -7884,6 +7885,16 @@ pub fn op_integrity_check(
                         actual_count: integrity_check_state.freelist_count.actual_count,
                         expected_count: integrity_check_state.freelist_count.expected_count,
                     });
+                }
+                for page_number in 2..=integrity_check_state.db_size {
+                    if !integrity_check_state
+                        .page_reference
+                        .contains_key(&(page_number as i64))
+                    {
+                        errors.push(IntegrityCheckError::PageNeverUsed {
+                            page_id: page_number as i64,
+                        });
+                    }
                 }
                 let message = if errors.is_empty() {
                     "ok".to_string()
