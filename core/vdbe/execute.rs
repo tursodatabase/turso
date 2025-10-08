@@ -65,7 +65,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{info, turso_assert, OpenFlags, RefValue, Row, TransactionState};
+use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -2705,7 +2705,7 @@ pub fn op_row_id(
                     let record_cursor = record_cursor_ref.deref_mut();
                     let rowid = record.last_value(record_cursor).unwrap();
                     match rowid {
-                        Ok(RefValue::Integer(rowid)) => rowid,
+                        Ok(ValueRef::Integer(rowid)) => rowid,
                         _ => unreachable!(),
                     }
                 };
@@ -4275,7 +4275,14 @@ pub fn op_sorter_compare(
         &record.get_values()[..*num_regs]
     };
 
-    let cursor = state.get_cursor(*cursor_id);
+    // Inlined `state.get_cursor` to prevent borrowing conflit with `state.registers`
+    let cursor = state
+        .cursors
+        .get_mut(*cursor_id)
+        .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
+        .as_mut()
+        .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"));
+
     let cursor = cursor.as_sorter_mut();
     let Some(current_sorter_record) = cursor.record() else {
         return Err(LimboError::InternalError(
@@ -4287,7 +4294,7 @@ pub fn op_sorter_compare(
     // If the current sorter record has a NULL in any of the significant fields, the comparison is not equal.
     let is_equal = current_sorter_values
         .iter()
-        .all(|v| !matches!(v, RefValue::Null))
+        .all(|v| !matches!(v, ValueRef::Null))
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
@@ -4953,7 +4960,7 @@ pub fn op_function(
                 }
                 #[cfg(feature = "json")]
                 {
-                    use crate::types::{TextRef, TextSubtype};
+                    use crate::types::TextSubtype;
 
                     let table = state.registers[*start_reg].get_value();
                     let Value::Text(table) = table else {
@@ -4978,10 +4985,7 @@ pub fn op_function(
                     for column in table.columns() {
                         let name = column.name.as_ref().unwrap();
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            &RefValue::Text(TextRef::create_from(
-                                name.as_str().as_bytes(),
-                                TextSubtype::Text,
-                            )),
+                            ValueRef::Text(name.as_bytes(), TextSubtype::Text),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());
@@ -5049,13 +5053,13 @@ pub fn op_function(
                         json.append_jsonb_to_end(column_name.data());
 
                         let val = record_cursor.get_value(&record, i)?;
-                        if let RefValue::Blob(..) = val {
+                        if let ValueRef::Blob(..) = val {
                             return Err(LimboError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
                             ));
                         }
                         let val_json =
-                            json::convert_ref_dbtype_to_jsonb(&val, json::Conv::NotStrict)?;
+                            json::convert_ref_dbtype_to_jsonb(val, json::Conv::NotStrict)?;
                         json.append_jsonb_to_end(val_json.data());
                     }
                     json.finalize_unsafe(json::jsonb::ElementType::OBJECT)?;
@@ -6249,9 +6253,9 @@ pub fn op_idx_insert(
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if cursor.has_rowid() {
                     let count = cursor.record_cursor.borrow_mut().count(record);
-                    record.get_values()[..count.saturating_sub(1)].to_vec()
+                    &record.get_values()[..count.saturating_sub(1)]
                 } else {
-                    record.get_values().to_vec()
+                    &record.get_values()[..]
                 };
                 let inserted_key_vals = &record_to_insert.get_values();
                 if existing_key.len() != inserted_key_vals.len() {
@@ -6259,7 +6263,7 @@ pub fn op_idx_insert(
                 }
 
                 let conflict = compare_immutable(
-                    existing_key.as_slice(),
+                    existing_key,
                     inserted_key_vals,
                     &cursor.index_info.as_ref().unwrap().key_info,
                 ) == std::cmp::Ordering::Equal;
@@ -6550,7 +6554,7 @@ pub fn op_no_conflict(
                         record
                             .get_values()
                             .iter()
-                            .any(|val| matches!(val, RefValue::Null))
+                            .any(|val| matches!(val, ValueRef::Null))
                     }
                     RecordSource::Unpacked {
                         start_reg,
@@ -6832,6 +6836,11 @@ pub fn op_create_btree(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub enum OpDestroyState {
+    CreateCursor,
+    DestroyBtree(Arc<RwLock<BTreeCursor>>),
+}
+
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -6855,15 +6864,26 @@ pub fn op_destroy(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    // TODO not sure if should be BTreeCursor::new_table or BTreeCursor::new_index here or neither and just pass an emtpy vec
-    let mut cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
-    let former_root_page_result = cursor.btree_destroy()?;
-    if let IOResult::Done(former_root_page) = former_root_page_result {
-        state.registers[*former_root_reg] =
-            Register::Value(Value::Integer(former_root_page.unwrap_or(0) as i64));
+
+    loop {
+        match state.op_destroy_state {
+            OpDestroyState::CreateCursor => {
+                // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
+                // table btree cursor for both.
+                let cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
+                state.op_destroy_state =
+                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
+            }
+            OpDestroyState::DestroyBtree(ref mut cursor) => {
+                let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
+                state.registers[*former_root_reg] =
+                    Register::Value(Value::Integer(maybe_former_root_page.unwrap_or(0) as i64));
+                state.op_destroy_state = OpDestroyState::CreateCursor;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
     }
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_reset_sorter(
@@ -7817,12 +7837,13 @@ pub fn op_integrity_check(
     );
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
-            let freelist_trunk_page =
-                return_if_io!(with_header(pager, mv_store, program, |header| header
-                    .freelist_trunk_page
-                    .get()));
+            let (freelist_trunk_page, db_size) =
+                return_if_io!(with_header(pager, mv_store, program, |header| (
+                    header.freelist_trunk_page.get(),
+                    header.database_size.get()
+                )));
             let mut errors = Vec::new();
-            let mut integrity_check_state = IntegrityCheckState::new();
+            let mut integrity_check_state = IntegrityCheckState::new(db_size as usize);
             let mut current_root_idx = 0;
             // check freelist pages first, if there are any for database
             if freelist_trunk_page > 0 {
@@ -7864,6 +7885,16 @@ pub fn op_integrity_check(
                         actual_count: integrity_check_state.freelist_count.actual_count,
                         expected_count: integrity_check_state.freelist_count.expected_count,
                     });
+                }
+                for page_number in 2..=integrity_check_state.db_size {
+                    if !integrity_check_state
+                        .page_reference
+                        .contains_key(&(page_number as i64))
+                    {
+                        errors.push(IntegrityCheckError::PageNeverUsed {
+                            page_id: page_number as i64,
+                        });
+                    }
                 }
                 let message = if errors.is_empty() {
                     "ok".to_string()

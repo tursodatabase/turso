@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use indexmap::IndexSet;
 use rand::Rng;
 use turso_core::Value;
@@ -9,10 +11,13 @@ use crate::model::table::{Column, ColumnType, Name, SimValue, Table};
 
 use super::ArbitraryFromMaybe;
 
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl Arbitrary for Name {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
-        let name = readable_name_custom("_", rng);
-        Name(name.replace("-", "_"))
+        let base = readable_name_custom("_", rng).replace("-", "_");
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Name(format!("{base}_{id}"))
     }
 }
 

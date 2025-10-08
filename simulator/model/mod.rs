@@ -32,9 +32,33 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    /// Placeholder query that still needs to be generated
+    Placeholder,
 }
 
 impl Query {
+    pub fn as_create(&self) -> &Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn unwrap_create(self) -> Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn unwrap_insert(self) -> Insert {
+        match self {
+            Self::Insert(insert) => insert,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
@@ -48,6 +72,7 @@ impl Query {
                 IndexSet::from_iter([table_name.clone()])
             }
             Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
+            Query::Placeholder => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -61,6 +86,7 @@ impl Query {
             | Query::Drop(Drop { table, .. }) => vec![table.clone()],
             Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
+            Query::Placeholder => vec![],
         }
     }
 
@@ -94,6 +120,7 @@ impl Display for Query {
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
+            Self::Placeholder => Ok(()),
         }
     }
 }
@@ -113,6 +140,7 @@ impl Shadow for Query {
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
+            Query::Placeholder => Ok(vec![]),
         }
     }
 }
@@ -158,6 +186,9 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
                 unreachable!("QueryCapabilities do not apply to transaction queries")
+            }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
         }
     }
@@ -239,6 +270,7 @@ impl Shadow for Drop {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tracing::info!("dropping {:?}", self);
         if !tables.iter().any(|t| t.name == self.table) {
             // If the table does not exist, we return an error
             return Err(anyhow::anyhow!(

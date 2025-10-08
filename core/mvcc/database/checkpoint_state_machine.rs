@@ -9,8 +9,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, Pager, RefValue, Result, TransactionState,
-    Value,
+    CheckpointResult, Completion, Connection, IOExt, Pager, Result, TransactionState, Value,
+    ValueRef,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -191,7 +191,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let row_data = ImmutableRecord::from_bin_record(row_data.clone());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor.parse_full_header(&row_data).unwrap();
-                        let RefValue::Integer(root_page) =
+                        let ValueRef::Integer(root_page) =
                             record_cursor.get_value(&row_data, 3).unwrap()
                         else {
                             panic!(

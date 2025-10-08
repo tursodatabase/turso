@@ -11,9 +11,9 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{RawSlice, Text, TextRef, TextSubtype, Value, ValueType};
+use crate::types::{Text, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
-use crate::{bail_constraint_error, bail_parse_error, LimboError, RefValue};
+use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
 use std::borrow::Cow;
@@ -105,14 +105,12 @@ pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
 
 pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb> {
     convert_ref_dbtype_to_jsonb(
-        &match val {
-            Value::Null => RefValue::Null,
-            Value::Integer(x) => RefValue::Integer(*x),
-            Value::Float(x) => RefValue::Float(*x),
-            Value::Text(text) => {
-                RefValue::Text(TextRef::create_from(text.as_str().as_bytes(), text.subtype))
-            }
-            Value::Blob(items) => RefValue::Blob(RawSlice::create_from(items)),
+        match val {
+            Value::Null => ValueRef::Null,
+            Value::Integer(x) => ValueRef::Integer(*x),
+            Value::Float(x) => ValueRef::Float(*x),
+            Value::Text(text) => ValueRef::Text(text.as_str().as_bytes(), text.subtype),
+            Value::Blob(items) => ValueRef::Blob(items.as_slice()),
         },
         strict,
     )
@@ -124,14 +122,14 @@ fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
     Jsonb::from_str_with_mode(str, Conv::Strict).map_err(Into::into)
 }
 
-pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Result<Jsonb> {
+pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
-        RefValue::Text(text) => {
-            let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                Jsonb::from_str_with_mode(text.as_str(), strict)
+        ValueRef::Text(text, subtype) => {
+            let res = if subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
+                Jsonb::from_str_with_mode(&String::from_utf8_lossy(text), strict)
             } else {
                 // Handle as a string literal otherwise
-                let mut str = text.as_str().replace('"', "\\\"");
+                let mut str = String::from_utf8_lossy(text).replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -139,8 +137,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
             };
             res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
-        RefValue::Blob(blob) => {
-            let bytes = blob.to_slice();
+        ValueRef::Blob(blob) => {
+            let bytes = blob;
             // Valid JSON can start with these whitespace characters
             let index = bytes
                 .iter()
@@ -177,15 +175,15 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
             json.element_type()?;
             Ok(json)
         }
-        RefValue::Null => Ok(Jsonb::from_raw_data(
+        ValueRef::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
         )),
-        RefValue::Float(float) => {
+        ValueRef::Float(float) => {
             let mut buff = ryu::Buffer::new();
-            Jsonb::from_str(buff.format(*float))
+            Jsonb::from_str(buff.format(float))
                 .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
-        RefValue::Integer(int) => Jsonb::from_str(&int.to_string())
+        ValueRef::Integer(int) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
     }
 }

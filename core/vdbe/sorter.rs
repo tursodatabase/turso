@@ -1,6 +1,6 @@
 use turso_parser::ast::SortOrder;
 
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use crate::{
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, RefValue},
+    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
     Result,
 };
 use crate::{io_yield_many, io_yield_one, return_if_io, CompletionError};
@@ -614,7 +614,8 @@ impl SortedChunk {
 struct SortableImmutableRecord {
     record: ImmutableRecord,
     cursor: RecordCursor,
-    key_values: RefCell<Vec<RefValue>>,
+    // SAFETY: borrows from 'self
+    key_values: UnsafeCell<Vec<ValueRef<'static>>>,
     key_len: usize,
     index_key_info: Rc<Vec<KeyInfo>>,
     /// The key deserialization error, if any.
@@ -636,29 +637,34 @@ impl SortableImmutableRecord {
         Ok(Self {
             record,
             cursor,
-            key_values: RefCell::new(Vec::with_capacity(key_len)),
+            key_values: UnsafeCell::new(Vec::with_capacity(key_len)),
             index_key_info,
             deserialization_error: RefCell::new(None),
             key_len,
         })
     }
 
-    /// Attempts to deserialize the key value at the given index.
-    /// If the key value has already been deserialized, this does nothing.
-    /// The deserialized key value is stored in the `key_values` field.
-    /// In case of an error, the error is stored in the `deserialization_error` field.
-    fn try_deserialize_key(&self, idx: usize) {
-        let mut key_values = self.key_values.borrow_mut();
-        if idx < key_values.len() {
-            // The key value with this index has already been deserialized.
-            return;
+    fn key_value<'a>(&'a self, i: usize) -> Option<ValueRef<'a>> {
+        // SAFETY: there are no other active references
+        let key_values = unsafe { &mut *self.key_values.get() };
+
+        if i >= key_values.len() {
+            assert_eq!(key_values.len(), i, "access must be sequential");
+
+            let value = match self.cursor.deserialize_column(&self.record, i) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.deserialization_error.replace(Some(err));
+                    return None;
+                }
+            };
+
+            // SAFETY: no 'static lifetime is exposed, all references are bound to 'self
+            let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
+            key_values.push(value);
         }
-        match self.cursor.deserialize_column(&self.record, idx) {
-            Ok(value) => key_values.push(value),
-            Err(error) => {
-                self.deserialization_error.replace(Some(error));
-            }
-        }
+
+        Some(key_values[i])
     }
 }
 
@@ -674,34 +680,25 @@ impl Ord for SortableImmutableRecord {
             self.cursor.serial_types.len(),
             other.cursor.serial_types.len()
         );
-        let this_key_values_len = self.key_values.borrow().len();
-        let other_key_values_len = other.key_values.borrow().len();
 
         for i in 0..self.key_len {
-            // Lazily deserialize the key values if they haven't been deserialized already.
-            if i >= this_key_values_len {
-                self.try_deserialize_key(i);
-                if self.deserialization_error.borrow().is_some() {
-                    return Ordering::Equal;
-                }
-            }
-            if i >= other_key_values_len {
-                other.try_deserialize_key(i);
-                if other.deserialization_error.borrow().is_some() {
-                    return Ordering::Equal;
-                }
-            }
+            let Some(this_key_value) = self.key_value(i) else {
+                return Ordering::Equal;
+            };
 
-            let this_key_value = &self.key_values.borrow()[i];
-            let other_key_value = &other.key_values.borrow()[i];
+            let Some(other_key_value) = other.key_value(i) else {
+                return Ordering::Equal;
+            };
+
             let column_order = self.index_key_info[i].sort_order;
             let collation = self.index_key_info[i].collation;
 
             let cmp = match (this_key_value, other_key_value) {
-                (RefValue::Text(left), RefValue::Text(right)) => {
-                    collation.compare_strings(left.as_str(), right.as_str())
-                }
-                _ => this_key_value.partial_cmp(other_key_value).unwrap(),
+                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
+                    &String::from_utf8_lossy(left),
+                    &String::from_utf8_lossy(right),
+                ),
+                _ => this_key_value.partial_cmp(&other_key_value).unwrap(),
             };
             if !cmp.is_eq() {
                 return match column_order {
@@ -742,7 +739,7 @@ enum SortedChunkIOState {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
-    use crate::types::{ImmutableRecord, RefValue, Value, ValueType};
+    use crate::types::{ImmutableRecord, Value, ValueRef, ValueType};
     use crate::util::IOExt;
     use crate::PlatformIO;
     use rand_chacha::{
@@ -806,7 +803,7 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values()[0], RefValue::Integer(i));
+                assert_eq!(record.get_values()[0], ValueRef::Integer(i));
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 

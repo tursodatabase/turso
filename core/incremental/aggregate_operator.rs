@@ -7,7 +7,7 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
-use crate::types::{IOResult, ImmutableRecord, RefValue, SeekKey, SeekOp, SeekResult};
+use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Display};
@@ -1546,7 +1546,7 @@ impl ScanState {
         };
 
         // Check if we're still in the same group
-        if let RefValue::Integer(rec_sid) = rec_storage_id {
+        if let ValueRef::Integer(rec_sid) = rec_storage_id {
             if *rec_sid != storage_id {
                 return Ok(IOResult::Done(None));
             }
@@ -1555,8 +1555,8 @@ impl ScanState {
         }
 
         // Compare zset_hash as blob
-        if let RefValue::Blob(rec_zset_blob) = rec_zset_hash {
-            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob.to_slice()) {
+        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash {
+            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
                 if rec_hash != zset_hash {
                     return Ok(IOResult::Done(None));
                 }
