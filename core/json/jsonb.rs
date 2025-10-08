@@ -976,7 +976,9 @@ impl Jsonb {
             ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
                 let payload = &self.data[payload_start..payload_end];
                 std::str::from_utf8(payload).map_err(|_| {
-                    LimboError::ParseError("Invalid UTF-8 in text payload".to_string())
+                    LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                        "Invalid UTF-8 in text payload".to_string(),
+                    ))
                 })?;
                 Ok(())
             }
@@ -1207,7 +1209,9 @@ impl Jsonb {
             // Can be serialized as is. Do not need escaping
             ElementType::TEXT => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    LimboError::ParseError(
+                        turso_parser::error::ParseError::FailedToSerializeString,
+                    )
                 })?;
                 string.push_str(word);
             }
@@ -1215,7 +1219,9 @@ impl Jsonb {
             // Contain standard json escapes
             ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    LimboError::ParseError(
+                        turso_parser::error::ParseError::FailedToSerializeString,
+                    )
                 })?;
                 string.push_str(word);
             }
@@ -1332,7 +1338,9 @@ impl Jsonb {
 
             ElementType::TEXTRAW => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    LimboError::ParseError(
+                        turso_parser::error::ParseError::FailedToSerializeString,
+                    )
                 })?;
 
                 for ch in word.chars() {
@@ -1371,8 +1379,11 @@ impl Jsonb {
         kind: &ElementType,
     ) -> Result<usize> {
         let current_cursor = cursor + len;
-        let num_slice = from_utf8(&self.data[cursor..current_cursor])
-            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
+        let num_slice = from_utf8(&self.data[cursor..current_cursor]).map_err(|_| {
+            LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                "Failed to parse integer".to_string(),
+            ))
+        })?;
 
         match kind {
             ElementType::INT | ElementType::FLOAT => {
@@ -1421,8 +1432,11 @@ impl Jsonb {
 
                 value = value * 16 + ch.to_digit(16).unwrap_or(0) as u64;
             }
-            write!(string, "{value}")
-                .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string()))?;
+            write!(string, "{value}").map_err(|_| {
+                LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                    "Error writing string to json!".to_string(),
+                ))
+            })?;
         } else {
             string.push_str(hex_str);
         }
@@ -2866,7 +2880,9 @@ impl Jsonb {
             }
         };
 
-        Err(LimboError::ParseError("Not found".to_string()))
+        Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(
+            "Not found".to_string(),
+        )))
     }
 
     fn skip_element(&self, mut pos: usize) -> Result<usize> {
@@ -2910,7 +2926,11 @@ impl Jsonb {
             while patch_key_cursor < patch_end {
                 let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
                 if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+                    return Err(LimboError::ParseError(
+                        turso_parser::error::ParseError::Custom(
+                            "Invalid key type".to_string(),
+                        ),
+                    ));
                 }
 
                 let key_start = patch_key_cursor + key_header_size;

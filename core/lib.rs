@@ -493,8 +493,9 @@ impl Database {
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
                     return Err(LimboError::ParseError(
-                        "Database contains indexes which are not supported when MVCC is enabled."
-                            .to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "Database contains indexes which are not supported when MVCC is enabled.".to_string(),
+                        ),
                     ));
                 }
 

@@ -573,12 +573,14 @@ fn transform_args_into_where_terms(
     }
 
     if args_iter.next().is_some() {
-        return Err(crate::LimboError::ParseError(format!(
-            "Too many arguments for {}: expected at most {}, got {}",
-            table.get_name(),
-            hidden_count,
-            hidden_count + 1 + args_iter.count()
-        )));
+        return Err(crate::LimboError::ParseError(
+            turso_parser::error::ParseError::Custom(format!(
+                "Too many arguments for {}: expected at most {}, got {}",
+                table.get_name(),
+                hidden_count,
+                hidden_count + 1 + args_iter.count()
+            )),
+        ));
     }
 
     Ok(())

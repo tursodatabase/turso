@@ -376,22 +376,30 @@ impl JoinOperator {
         match join_type {
             JoinType::Left => {
                 return Err(crate::LimboError::ParseError(
-                    "LEFT OUTER JOIN is not yet supported in incremental views".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "LEFT OUTER JOIN is not yet supported in incremental views".to_string(),
+                    ),
                 ))
             }
             JoinType::Right => {
                 return Err(crate::LimboError::ParseError(
-                    "RIGHT OUTER JOIN is not yet supported in incremental views".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "RIGHT OUTER JOIN is not yet supported in incremental views".to_string(),
+                    ),
                 ))
             }
             JoinType::Full => {
                 return Err(crate::LimboError::ParseError(
-                    "FULL OUTER JOIN is not yet supported in incremental views".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "FULL OUTER JOIN is not yet supported in incremental views".to_string(),
+                    ),
                 ))
             }
             JoinType::Cross => {
                 return Err(crate::LimboError::ParseError(
-                    "CROSS JOIN is not yet supported in incremental views".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "CROSS JOIN is not yet supported in incremental views".to_string(),
+                    ),
                 ))
             }
             JoinType::Inner => {} // Inner join is supported

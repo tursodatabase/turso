@@ -424,7 +424,9 @@ impl<'a> LogicalPlanBuilder<'a> {
         match stmt {
             ast::Stmt::Select(select) => self.build_select(select),
             _ => Err(LimboError::ParseError(
-                "Only SELECT statements are currently supported in logical plans".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "Only SELECT statements are currently supported in logical plans".to_string(),
+                ),
             )),
         }
     }
@@ -616,10 +618,14 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
             ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
             ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
-                "Table-valued functions are not supported in logical plans".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "Table-valued functions are not supported in logical plans".to_string(),
+                ),
             )),
             ast::SelectTable::Sub(_, _) => Err(LimboError::ParseError(
-                "Subquery in FROM clause not yet supported".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "Subquery in FROM clause not yet supported".to_string(),
+                ),
             )),
         }
     }
@@ -807,14 +813,18 @@ impl<'a> LogicalPlanBuilder<'a> {
                 .iter()
                 .position(|col| col.name == name)
                 .ok_or_else(|| {
-                    LimboError::ParseError(format!("Column {name} not found in left table"))
+                    LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+                        "Column {name} not found in left table"
+                    )))
                 })?;
             let _right_idx = right_schema
                 .columns
                 .iter()
                 .position(|col| col.name == name)
                 .ok_or_else(|| {
-                    LimboError::ParseError(format!("Column {name} not found in right table"))
+                    LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+                        "Column {name} not found in right table"
+                    )))
                 })?;
 
             conditions.push((
@@ -1325,9 +1335,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                             if !Self::is_constant_expr(&logical_expr)
                                 && !Self::is_valid_in_group_by(&logical_expr, &group_exprs)
                             {
-                                return Err(LimboError::ParseError(format!(
+                                return Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
                                     "Column '{col_name}' must appear in the GROUP BY clause or be used in an aggregate function"
-                                )));
+                                ))));
                             }
 
                             // If this expression matches a GROUP BY expression, replace it with a reference
@@ -1352,9 +1362,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                             // arbitrary row. We should support this for full compatibility,
                             // but for now we're stricter to simplify DBSP compilation.
                             if !Self::is_constant_expr(&logical_expr) {
-                                return Err(LimboError::ParseError(format!(
+                                return Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
                                     "Column '{col_name}' must be used in an aggregate function when using aggregates without GROUP BY"
-                                )));
+                                ))));
                             }
                             projection_exprs.push(logical_expr);
                         }
@@ -1366,7 +1376,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                     } else {
                         "* not supported with aggregate functions".to_string()
                     };
-                    return Err(LimboError::ParseError(error_msg));
+                    return Err(LimboError::ParseError(
+                        turso_parser::error::ParseError::Custom(error_msg),
+                    ));
                 }
             }
         }
@@ -1494,7 +1506,9 @@ impl<'a> LogicalPlanBuilder<'a> {
     #[allow(clippy::vec_box)]
     fn build_values(&mut self, values: &[Vec<Box<ast::Expr>>]) -> Result<LogicalPlan> {
         if values.is_empty() {
-            return Err(LimboError::ParseError("Empty VALUES clause".to_string()));
+            return Err(LimboError::ParseError(
+                turso_parser::error::ParseError::Custom("Empty VALUES clause".to_string()),
+            ));
         }
 
         let mut rows = Vec::new();
@@ -1515,7 +1529,9 @@ impl<'a> LogicalPlanBuilder<'a> {
         for row in values {
             if row.len() != first_row_len {
                 return Err(LimboError::ParseError(
-                    "All rows in VALUES must have the same number of columns".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "All rows in VALUES must have the same number of columns".to_string(),
+                    ),
                 ));
             }
 
@@ -1564,7 +1580,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Literal(ast::Literal::Numeric(s)) => s.parse::<usize>().ok(),
             _ => {
                 return Err(LimboError::ParseError(
-                    "LIMIT must be a literal integer".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "LIMIT must be a literal integer".to_string(),
+                    ),
                 ))
             }
         };
@@ -1574,7 +1592,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                 ast::Expr::Literal(ast::Literal::Numeric(s)) => s.parse::<usize>().ok(),
                 _ => {
                     return Err(LimboError::ParseError(
-                        "OFFSET must be a literal integer".to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "OFFSET must be a literal integer".to_string(),
+                        ),
                     ))
                 }
             }
@@ -1598,7 +1618,9 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Check schema compatibility
         if left.schema().column_count() != right.schema().column_count() {
             return Err(LimboError::ParseError(
-                "UNION/INTERSECT/EXCEPT requires same number of columns".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "UNION/INTERSECT/EXCEPT requires same number of columns".to_string(),
+                ),
             ));
         }
 
@@ -1614,7 +1636,9 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }))
             }
             _ => Err(LimboError::ParseError(
-                "INTERSECT and EXCEPT not yet supported in logical plans".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "INTERSECT and EXCEPT not yet supported in logical plans".to_string(),
+                ),
             )),
         }
     }
@@ -1681,8 +1705,10 @@ impl<'a> LogicalPlanBuilder<'a> {
                 // Check for window functions (OVER clause)
                 if filter_over.over_clause.is_some() {
                     return Err(LimboError::ParseError(
-                        "Unsupported expression type: window functions are not yet supported"
-                            .to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "Unsupported expression type: window functions are not yet supported"
+                                .to_string(),
+                        ),
                     ));
                 }
 
@@ -1724,9 +1750,11 @@ impl<'a> LogicalPlanBuilder<'a> {
                         distinct: false,
                     })
                 } else {
-                    Err(LimboError::ParseError(format!(
-                        "Function {func_name}(*) is not supported"
-                    )))
+                    Err(LimboError::ParseError(
+                        turso_parser::error::ParseError::Custom(format!(
+                            "Function {func_name}(*) is not supported"
+                        )),
+                    ))
                 }
             }
 
@@ -1874,9 +1902,11 @@ impl<'a> LogicalPlanBuilder<'a> {
                 })
             }
 
-            _ => Err(LimboError::ParseError(format!(
-                "Unsupported expression type in logical plan: {expr:?}"
-            ))),
+            _ => Err(LimboError::ParseError(
+                turso_parser::error::ParseError::Custom(format!(
+                    "Unsupported expression type in logical plan: {expr:?}"
+                )),
+            )),
         }
     }
 
@@ -1915,7 +1945,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
-                "Temporal literals not yet supported".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "Temporal literals not yet supported".to_string(),
+                ),
             )),
         }
     }
@@ -2255,10 +2287,11 @@ impl<'a> LogicalPlanBuilder<'a> {
     // Get table schema
     fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
         // Look up table in schema
-        let table = self
-            .schema
-            .get_table(table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
+        let table = self.schema.get_table(table_name).ok_or_else(|| {
+            LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+                "Table '{table_name}' not found"
+            )))
+        })?;
 
         // Parse table_name which might be "db.table" for attached databases
         let (database, actual_table) = if table_name.contains('.') {
@@ -2575,17 +2608,18 @@ mod tests {
 
     fn parse_and_build(sql: &str, schema: &Schema) -> Result<LogicalPlan> {
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser
-            .next()
-            .ok_or_else(|| LimboError::ParseError("Empty statement".to_string()))?
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let cmd = parser.next().ok_or(LimboError::ParseError(
+            turso_parser::error::ParseError::Custom("Empty statement".to_string()),
+        ))??;
         match cmd {
             ast::Cmd::Stmt(stmt) => {
                 let mut builder = LogicalPlanBuilder::new(schema);
                 builder.build_statement(&stmt)
             }
             _ => Err(LimboError::ParseError(
-                "Only SQL statements are supported".to_string(),
+                turso_parser::error::ParseError::Custom(
+                    "Only SQL statements are supported".to_string(),
+                ),
             )),
         }
     }

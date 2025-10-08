@@ -468,7 +468,9 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
                     CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
+                        LimboError::ParseError(turso_parser::error::ParseError::Custom(
+                            format!("Unknown Checkpoint Mode: {e}")
+                        ))
                     })?
                 }
                 _ => CheckpointMode::Passive {
@@ -623,9 +625,11 @@ fn query_pragma(
                         })
                     }
                     _ => {
-                        return Err(LimboError::ParseError(format!(
-                            "Invalid value for PRAGMA query_only: {value_expr:?}"
-                        )));
+                        return Err(LimboError::ParseError(
+                            turso_parser::error::ParseError::Custom(format!(
+                                "Invalid value for PRAGMA query_only: {value_expr:?}"
+                            )),
+                        ));
                     }
                 };
                 connection.set_query_only(is_query_only);
