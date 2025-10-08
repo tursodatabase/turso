@@ -341,6 +341,14 @@ impl ProgramBuilder {
         self.insns.push((insn, self.insns.len()));
     }
 
+    /// Emit an instruction that is guaranteed not to be in any constant span.
+    /// This ensures the instruction won't be hoisted when emit_constant_insns is called.
+    #[instrument(skip(self), level = Level::DEBUG)]
+    pub fn emit_no_constant_insn(&mut self, insn: Insn) {
+        self.constant_span_end_all();
+        self.emit_insn(insn);
+    }
+
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
         for cursor in cursors {
             self.emit_insn(Insn::Close { cursor_id: *cursor });

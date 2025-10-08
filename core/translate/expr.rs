@@ -43,13 +43,6 @@ pub struct ReturningValueRegisters {
     pub num_columns: usize,
 }
 
-/// Emit an instruction that is guaranteed not to be in any constant span.
-/// This ensures the instruction won't be hoisted when emit_constant_insns is called.
-fn emit_no_constant_insn(program: &mut ProgramBuilder, insn: Insn) {
-    program.constant_span_end_all();
-    program.emit_insn(insn);
-}
-
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
     if cond_meta.jump_if_condition_is_true {
@@ -2100,21 +2093,10 @@ pub fn translate_expr(
             let dest_if_true = program.allocate_label();
 
             let tmp = program.alloc_register();
-            emit_no_constant_insn(
-                program,
-                Insn::Null {
-                    dest: tmp,
-                    dest_end: None,
-                },
-            );
-            translate_expr_no_constant_opt(
-                program,
-                referenced_tables,
-                &ast::Expr::Literal(ast::Literal::Null),
-                tmp,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            program.emit_no_constant_insn(Insn::Null {
+                dest: tmp,
+                dest_end: None,
+            });
 
             // Call the core InList logic with expression-appropriate condition metadata
             translate_in_list(
