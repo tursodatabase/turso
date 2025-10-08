@@ -216,6 +216,7 @@ impl QueryDiscriminants {
         QueryDiscriminants::Delete,
         QueryDiscriminants::Drop,
         QueryDiscriminants::CreateIndex,
+        QueryDiscriminants::AlterTable,
     ];
 }
 
