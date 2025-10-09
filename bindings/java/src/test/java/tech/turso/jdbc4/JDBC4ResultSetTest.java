@@ -1,17 +1,14 @@
 package tech.turso.jdbc4;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.nio.ByteBuffer;
+import java.sql.*;
+import java.util.Calendar;
+import java.util.Date;
 import java.util.Properties;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
@@ -511,5 +508,365 @@ class JDBC4ResultSetTest {
 
     // Test negative column index
     assertThrows(SQLException.class, () -> resultSet.getInt(-1));
+  }
+
+  @Test
+  void test_findColumn_with_exact_name() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER, username TEXT, age INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1, 'minseok', 30);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM users");
+    assertTrue(resultSet.next());
+
+    assertEquals(1, resultSet.findColumn("id"));
+    assertEquals(2, resultSet.findColumn("username"));
+    assertEquals(3, resultSet.findColumn("age"));
+  }
+
+  @Test
+  void test_findColumn_with_duplicate_names() throws Exception {
+    // SQLite allows duplicate column names in SELECT
+    stmt.executeUpdate("CREATE TABLE test (a INTEGER, b INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES (1, 2);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT a, a FROM test");
+    assertTrue(resultSet.next());
+
+    // Should return the FIRST occurrence
+    assertEquals(1, resultSet.findColumn("a"));
+  }
+
+  @Test
+  void test_findColumn_with_nonexistent_column() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM users");
+    assertTrue(resultSet.next());
+
+    SQLException exception =
+        assertThrows(SQLException.class, () -> resultSet.findColumn("nonexistent"));
+    assertEquals("column name nonexistent not found", exception.getMessage());
+  }
+
+  @Test
+  void test_findColumn_with_alias() throws Exception {
+    stmt.executeUpdate("CREATE TABLE users (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO users VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT id AS user_id FROM users");
+    assertTrue(resultSet.next());
+
+    // Should find by alias, not original column name
+    assertEquals(1, resultSet.findColumn("user_id"));
+    SQLException exception = assertThrows(SQLException.class, () -> resultSet.findColumn("id"));
+    assertEquals("column name id not found", exception.getMessage());
+  }
+
+  @Test
+  void test_findColumn_with_empty_string() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test (col INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES (1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test");
+    assertTrue(resultSet.next());
+
+    SQLException exception = assertThrows(SQLException.class, () -> resultSet.findColumn(""));
+    assertEquals("column name not found", exception.getMessage());
+  }
+
+  @Test
+  void test_findColumn_with_special_characters() throws Exception {
+    // SQLite allows spaces and special chars in column names if quoted
+    stmt.executeUpdate("CREATE TABLE test ([user name] TEXT, [user-id] INTEGER);");
+    stmt.executeUpdate("INSERT INTO test VALUES ('minseok', 1);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test");
+    assertTrue(resultSet.next());
+
+    assertEquals(1, resultSet.findColumn("user name"));
+    assertEquals(2, resultSet.findColumn("user-id"));
+  }
+
+  @Test
+  void test_getCharacterStream() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_char_stream (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_char_stream (text_col) VALUES ('Hello World');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_char_stream");
+    assertTrue(resultSet.next());
+
+    Reader reader = resultSet.getCharacterStream(1);
+    char[] buffer = new char[11];
+    int charsRead = reader.read(buffer);
+
+    assertEquals(11, charsRead);
+    assertEquals("Hello World", new String(buffer));
+  }
+
+  @Test
+  void test_getCharacterStream_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_char_stream (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_char_stream (text_col) VALUES ('Test Data');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_char_stream");
+    assertTrue(resultSet.next());
+
+    Reader reader = resultSet.getCharacterStream("text_col");
+    char[] buffer = new char[9];
+    reader.read(buffer);
+
+    assertEquals("Test Data", new String(buffer));
+  }
+
+  @Test
+  void test_getCharacterStream_returns_null_on_null() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_null (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_null (text_col) VALUES (NULL);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_null");
+    assertTrue(resultSet.next());
+    assertNull(resultSet.getCharacterStream(1));
+  }
+
+  @Test
+  void test_getBigDecimal_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_bigdecimal (amount REAL);");
+    stmt.executeUpdate("INSERT INTO test_bigdecimal (amount) VALUES (12345.67);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_bigdecimal");
+    assertTrue(resultSet.next());
+
+    assertEquals(BigDecimal.valueOf(12345.67), resultSet.getBigDecimal("amount"));
+  }
+
+  @Test
+  void test_isBeforeFirst_and_isAfterLast() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_position (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO test_position VALUES (1);");
+    stmt.executeUpdate("INSERT INTO test_position VALUES (2);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_position");
+
+    // Before first row
+    assertTrue(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // First row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // Second row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertFalse(resultSet.isAfterLast());
+
+    // After last row
+    resultSet.next();
+    assertFalse(resultSet.isBeforeFirst());
+    assertTrue(resultSet.isAfterLast());
+  }
+
+  @Test
+  void test_isBeforeFirst_with_empty_resultSet() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_empty (id INTEGER);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_empty");
+
+    // After calling next() on empty ResultSet
+    assertFalse(resultSet.next());
+    assertFalse(resultSet.isBeforeFirst());
+    assertTrue(resultSet.isAfterLast());
+  }
+
+  @Test
+  void test_getRow() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_row (id INTEGER);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (1);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (2);");
+    stmt.executeUpdate("INSERT INTO test_row VALUES (3);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_row");
+
+    // Before first row
+    assertEquals(0, resultSet.getRow());
+
+    // First row
+    resultSet.next();
+    assertEquals(1, resultSet.getRow());
+
+    // Second row
+    resultSet.next();
+    assertEquals(2, resultSet.getRow());
+
+    // Third row
+    resultSet.next();
+    assertEquals(3, resultSet.getRow());
+
+    // After last row
+    resultSet.next();
+    assertEquals(3, resultSet.getRow());
+  }
+
+  @Test
+  void test_getDate_with_calendar() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_date_cal (date_col BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_date_cal (date_col) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_date_cal");
+    assertTrue(resultSet.next());
+
+    // Get date with UTC calendar
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Date utcDate = resultSet.getDate(1, utcCal);
+
+    // Get date with Seoul calendar (UTC+9)
+    Calendar seoulCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    Date seoulDate = resultSet.getDate(1, seoulCal);
+
+    // Seoul time should be 9 hours ahead
+    long timeDiff = seoulDate.getTime() - utcDate.getTime();
+    assertEquals(9 * 60 * 60 * 1000, timeDiff);
+  }
+
+  @Test
+  void test_getDate_with_calendar_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_date_cal (created_at BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_date_cal (created_at) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_date_cal");
+    assertTrue(resultSet.next());
+
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Date date = resultSet.getDate("created_at", utcCal);
+
+    assertNotNull(date);
+  }
+
+  @Test
+  void test_getTime_with_calendar() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_time_cal (time_col BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_time_cal (time_col) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_time_cal");
+    assertTrue(resultSet.next());
+
+    // Get time with UTC calendar
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Time utcTime2 = resultSet.getTime(1, utcCal);
+
+    // Get time with Seoul calendar (UTC+9)
+    Calendar seoulCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    Time seoulTime = resultSet.getTime(1, seoulCal);
+
+    // Seoul time should be 9 hours ahead
+    long timeDiff = seoulTime.getTime() - utcTime2.getTime();
+    assertEquals(9 * 60 * 60 * 1000, timeDiff);
+  }
+
+  @Test
+  void test_getTime_with_calendar_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_time_cal (created_at BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_time_cal (created_at) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_time_cal");
+    assertTrue(resultSet.next());
+
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Time time = resultSet.getTime("created_at", utcCal);
+
+    assertNotNull(time);
+  }
+
+  @Test
+  void test_getTimestamp_with_calendar() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_timestamp_cal (timestamp_col BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate(
+        "INSERT INTO test_timestamp_cal (timestamp_col) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_timestamp_cal");
+    assertTrue(resultSet.next());
+
+    // Get timestamp with UTC calendar
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Timestamp utcTimestamp = resultSet.getTimestamp(1, utcCal);
+
+    // Get timestamp with Seoul calendar (UTC+9)
+    Calendar seoulCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    Timestamp seoulTimestamp = resultSet.getTimestamp(1, seoulCal);
+
+    // Seoul time should be 9 hours ahead
+    long timeDiff = seoulTimestamp.getTime() - utcTimestamp.getTime();
+    assertEquals(9 * 60 * 60 * 1000, timeDiff);
+  }
+
+  @Test
+  void test_getTimestamp_with_calendar_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_timestamp_cal (created_at BLOB);");
+
+    // 2025-10-07 03:00:00 UTC in milliseconds
+    long utcTime = 1728270000000L;
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(utcTime).array();
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate(
+        "INSERT INTO test_timestamp_cal (created_at) VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_timestamp_cal");
+    assertTrue(resultSet.next());
+
+    Calendar utcCal = Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+    Timestamp timestamp = resultSet.getTimestamp("created_at", utcCal);
+
+    assertNotNull(timestamp);
   }
 }

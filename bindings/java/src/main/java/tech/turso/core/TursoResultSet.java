@@ -91,12 +91,30 @@ public final class TursoResultSet {
     }
 
     pastLastRow = lastStepResult.isDone();
+    if (pastLastRow && row == 0) {
+      isEmptyResultSet = true;
+    }
     return !pastLastRow;
   }
 
   /** Checks whether the last step result has returned row result. */
   public boolean hasLastStepReturnedRow() {
     return lastStepResult != null && lastStepResult.isRow();
+  }
+
+  /** Checks whether the cursor is positioned after the last row. */
+  public boolean isPastLastRow() {
+    return pastLastRow;
+  }
+
+  /** Checks whether the result set is empty (has no rows). */
+  public boolean isEmpty() {
+    return isEmptyResultSet;
+  }
+
+  /** Gets the current row number (0-based, 0 means before first row). */
+  public int getRow() {
+    return row;
   }
 
   /**
