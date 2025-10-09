@@ -87,17 +87,17 @@ pub enum ParseError {
     CircuitHasNoRootNode,
     /// Only column references are supported in a given feature for incremental views
     #[error("Only column references are supported in {0} for incremental views")]
-    OnlyColumnReferencesSupported(String),
+    MatviewOnlyColumnReferencesSupported(String),
     /// <feature> column '{column}' not found in input
     #[error("{0} column '{1}' not found in input")]
     FeatureColumnNotFoundInInput(String, String),
     /// Operation requires an argument
     #[error("{0} requires an argument")]
     OperationRequiresArgument(String),
-    /// Table not found in get_collseq_from_expr
+    /// Table not found
     #[error("table not found")]
     TableNotFound,
-    /// Column not found in get_collseq_from_expr
+    /// Column not found
     #[error("column not found")]
     ColumnNotFound,
     // Custom error message

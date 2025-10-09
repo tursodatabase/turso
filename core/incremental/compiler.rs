@@ -1150,7 +1150,7 @@ impl DbspCompiler {
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
                         return Err(LimboError::ParseError(
-                            turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                            turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                 "GROUP BY".to_string(),
                             ),
                         ));
@@ -1191,7 +1191,7 @@ impl DbspCompiler {
                                     aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                        turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                             "aggregate functions".to_string(),
                                         ),
                                     ));
@@ -1219,7 +1219,7 @@ impl DbspCompiler {
                                     aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                        turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                             "aggregate functions".to_string(),
                                         ),
                                     ));
@@ -1247,7 +1247,7 @@ impl DbspCompiler {
                                     aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                        turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                             "MIN".to_string(),
                                         ),
                                     ));
@@ -1275,7 +1275,7 @@ impl DbspCompiler {
                                     aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
-                                        turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                                        turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                             "MAX".to_string(),
                                         ),
                                     ));
@@ -1378,7 +1378,7 @@ impl DbspCompiler {
                         ));
                     } else {
                         return Err(LimboError::ParseError(
-                            turso_parser::error::ParseError::OnlyColumnReferencesSupported(
+                            turso_parser::error::ParseError::MatviewOnlyColumnReferencesSupported(
                                 "join conditions".to_string(),
                             ),
                         ));
