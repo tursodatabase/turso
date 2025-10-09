@@ -21,8 +21,8 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
         }
         (VectorType::Float64Dense, VectorType::Float32Dense) => {
             let mut data = Vec::with_capacity(v.dims * 4);
-            for &x in v.as_f32_slice() {
-                data.extend_from_slice(&f64::to_le_bytes(x as f64));
+            for &x in v.as_f64_slice() {
+                data.extend_from_slice(&f32::to_le_bytes(x as f32));
             }
             Ok(Vector {
                 vector_type: target_type,
@@ -88,6 +88,69 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
                 dims: v.dims,
                 data,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vector::{
+        operations::convert::vector_convert,
+        vector_types::{Vector, VectorType},
+    };
+
+    fn concat<const N: usize>(data: &[[u8; N]]) -> Vec<u8> {
+        data.iter().flatten().cloned().collect::<Vec<u8>>()
+    }
+
+    fn assert_vectors(v1: &Vector, v2: &Vector) {
+        assert_eq!(v1.vector_type, v2.vector_type);
+        assert_eq!(v1.dims, v2.dims);
+        assert_eq!(v1.data, v2.data);
+    }
+
+    #[test]
+    pub fn test_vector_convert() {
+        let vf32 = Vector {
+            vector_type: VectorType::Float32Dense,
+            dims: 3,
+            data: concat(&[
+                1.0f32.to_le_bytes(),
+                0.0f32.to_le_bytes(),
+                2.0f32.to_le_bytes(),
+            ]),
+        };
+        let vf64 = Vector {
+            vector_type: VectorType::Float64Dense,
+            dims: 3,
+            data: concat(&[
+                1.0f64.to_le_bytes(),
+                0.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+            ]),
+        };
+        let vf32_sparse = Vector {
+            vector_type: VectorType::Float32Sparse,
+            dims: 3,
+            data: concat(&[
+                1.0f32.to_le_bytes(),
+                2.0f32.to_le_bytes(),
+                0u32.to_le_bytes(),
+                2u32.to_le_bytes(),
+            ]),
+        };
+
+        let vectors = [vf32, vf64, vf32_sparse];
+        for v1 in &vectors {
+            for v2 in &vectors {
+                println!("{:?} -> {:?}", v1.vector_type, v2.vector_type);
+                let v_copy = Vector {
+                    vector_type: v1.vector_type,
+                    dims: v1.dims,
+                    data: v1.data.clone(),
+                };
+                assert_vectors(&vector_convert(v_copy, v2.vector_type).unwrap(), &v2);
+            }
         }
     }
 }
