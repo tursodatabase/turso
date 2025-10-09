@@ -50,6 +50,64 @@ impl Vector {
             ))),
         }
     }
+    pub fn from_f32(mut values_f32: Vec<f32>) -> Self {
+        let dims = values_f32.len();
+        let values = unsafe {
+            Vec::from_raw_parts(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+            )
+        };
+        std::mem::forget(values_f32);
+        Self {
+            vector_type: VectorType::Float32Dense,
+            dims,
+            data: values,
+        }
+    }
+    pub fn from_f64(mut values_f64: Vec<f64>) -> Self {
+        let dims = values_f64.len();
+        let values = unsafe {
+            Vec::from_raw_parts(
+                values_f64.as_mut_ptr() as *mut u8,
+                values_f64.len() * 8,
+                values_f64.capacity() * 8,
+            )
+        };
+        std::mem::forget(values_f64);
+        Self {
+            vector_type: VectorType::Float64Dense,
+            dims,
+            data: values,
+        }
+    }
+    pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
+        let mut values = unsafe {
+            Vec::from_raw_parts(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+            )
+        };
+        std::mem::forget(values_f32);
+
+        let idx = unsafe {
+            Vec::from_raw_parts(
+                idx_u32.as_mut_ptr() as *mut u8,
+                idx_u32.len() * 4,
+                idx_u32.capacity() * 4,
+            )
+        };
+        std::mem::forget(idx_u32);
+
+        values.extend_from_slice(&idx);
+        Self {
+            vector_type: VectorType::Float32Sparse,
+            dims,
+            data: values,
+        }
+    }
     pub fn from_blob(blob: Vec<u8>) -> Result<Self> {
         let (vector_type, data) = Self::vector_type(blob)?;
         Self::from_data(vector_type, data)
@@ -107,6 +165,7 @@ impl Vector {
     /// - The buffer is correctly aligned for `f32`
     /// - The length of the buffer is exactly `dims * size_of::<f32>()`
     pub fn as_f32_slice(&self) -> &[f32] {
+        debug_assert!(self.vector_type == VectorType::Float32Dense);
         if self.dims == 0 {
             return &[];
         }
@@ -135,6 +194,7 @@ impl Vector {
     /// - The buffer is correctly aligned for `f64`
     /// - The length of the buffer is exactly `dims * size_of::<f64>()`
     pub fn as_f64_slice(&self) -> &[f64] {
+        debug_assert!(self.vector_type == VectorType::Float64Dense);
         if self.dims == 0 {
             return &[];
         }
@@ -157,6 +217,7 @@ impl Vector {
     }
 
     pub fn as_f32_sparse(&self) -> VectorSparse<'_, f32> {
+        debug_assert!(self.vector_type == VectorType::Float32Sparse);
         let ptr = self.data.as_ptr();
         let align = std::mem::align_of::<f32>();
         assert_eq!(
@@ -173,7 +234,7 @@ impl Vector {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::vector::operations;
 
     use super::*;
@@ -182,7 +243,7 @@ mod tests {
 
     // Helper to generate arbitrary vectors of specific type and dimensions
     #[derive(Debug, Clone)]
-    struct ArbitraryVector<const DIMS: usize> {
+    pub struct ArbitraryVector<const DIMS: usize> {
         vector_type: VectorType,
         data: Vec<u8>,
     }
@@ -193,6 +254,10 @@ mod tests {
             (0..DIMS)
                 .map(|_| {
                     loop {
+                        // generate zeroes with some probability since we have support for sparse vectors
+                        if bool::arbitrary(g) {
+                            return 0.0;
+                        }
                         let f = f32::arbitrary(g);
                         // f32::arbitrary() can generate "problem values" like NaN, infinity, and very small values
                         // Skip these values
@@ -209,6 +274,10 @@ mod tests {
             (0..DIMS)
                 .map(|_| {
                     loop {
+                        // generate zeroes with some probability since we have support for sparse vectors
+                        if bool::arbitrary(g) {
+                            return 0.0;
+                        }
                         let f = f64::arbitrary(g);
                         // f64::arbitrary() can generate "problem values" like NaN, infinity, and very small values
                         // Skip these values
@@ -375,7 +444,7 @@ mod tests {
     /// - The distance must be between 0 and 2
     fn test_vector_distance<const DIMS: usize>(v1: &Vector, v2: &Vector) -> bool {
         match operations::distance_cos::vector_distance_cos(v1, v2) {
-            Ok(distance) => (0.0..=2.0).contains(&distance),
+            Ok(distance) => distance.is_nan() || (0.0..=2.0).contains(&distance),
             Err(_) => true,
         }
     }

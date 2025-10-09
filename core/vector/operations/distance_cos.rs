@@ -111,10 +111,15 @@ fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) 
 
 #[cfg(test)]
 mod tests {
+    use crate::vector::{
+        operations::convert::vector_convert, vector_types::tests::ArbitraryVector,
+    };
+
     use super::*;
+    use quickcheck_macros::quickcheck;
 
     #[test]
-    fn test_distance_cos_f32() {
+    fn test_vector_distance_cos_f32() {
         assert!(vector_f32_distance_cos(&[], &[]).is_nan());
         assert!(vector_f32_distance_cos(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
         assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
@@ -123,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_distance_cos_f64() {
+    fn test_vector_distance_cos_f64() {
         assert!(vector_f64_distance_cos(&[], &[]).is_nan());
         assert!(vector_f64_distance_cos(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
         assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
@@ -132,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_distance_cos_f32_sparse() {
+    fn test_vector_distance_cos_f32_sparse() {
         assert!(
             (vector_f32_sparse_distance_cos(
                 VectorSparse {
@@ -147,5 +152,21 @@ mod tests {
             .abs()
                 < 1e-7
         );
+    }
+
+    #[quickcheck]
+    fn prop_vector_distance_cos_dense_vs_sparse(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let d1 = vector_distance_cos(&v1, &v2).unwrap();
+
+        let sparse1 = vector_convert(v1, VectorType::Float32Sparse).unwrap();
+        let sparse2 = vector_convert(v2, VectorType::Float32Sparse).unwrap();
+        let d2 = vector_f32_sparse_distance_cos(sparse1.as_f32_sparse(), sparse2.as_f32_sparse());
+
+        (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
     }
 }
