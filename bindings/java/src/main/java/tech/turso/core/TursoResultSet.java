@@ -91,6 +91,9 @@ public final class TursoResultSet {
     }
 
     pastLastRow = lastStepResult.isDone();
+    if (pastLastRow && row == 0) {
+      isEmptyResultSet = true;
+    }
     return !pastLastRow;
   }
 
