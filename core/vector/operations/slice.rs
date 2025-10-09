@@ -17,12 +17,12 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
     match vector.vector_type {
         VectorType::Float32Dense => Ok(Vector {
             vector_type: vector.vector_type,
-            dims: end - start + 1,
+            dims: end - start,
             data: vector.data[start * 4..end * 4].to_vec(),
         }),
         VectorType::Float64Dense => Ok(Vector {
             vector_type: vector.vector_type,
-            dims: end - start + 1,
+            dims: end - start,
             data: vector.data[start * 8..end * 8].to_vec(),
         }),
         VectorType::Float32Sparse => {
@@ -40,7 +40,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
             values.extend_from_slice(&idx);
             Ok(Vector {
                 vector_type: vector.vector_type,
-                dims: end - start + 1,
+                dims: end - start,
                 data: values,
             })
         }
