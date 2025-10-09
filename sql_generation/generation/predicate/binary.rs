@@ -6,7 +6,7 @@ use crate::{
     generation::{
         backtrack, one_of, pick,
         predicate::{CompoundPredicate, SimplePredicate},
-        table::{GTValue, LTValue, LikeValue},
+        value::{GTValue, LTValue, LikeValue},
         ArbitraryFrom, ArbitraryFromMaybe as _, GenerationContext,
     },
     model::{

@@ -8,6 +8,7 @@ pub mod opts;
 pub mod predicate;
 pub mod query;
 pub mod table;
+pub mod value;
 
 pub use opts::*;
 
