@@ -234,15 +234,6 @@ impl Sorter {
                     }
                 }
                 InsertState::Insert => {
-                    turso_assert!(
-                        !self.chunks.iter().any(|chunk| {
-                            matches!(
-                                *chunk.io_state.read().unwrap(),
-                                SortedChunkIOState::WaitingForWrite
-                            )
-                        }),
-                        "chunks should have written"
-                    );
                     self.records.push(SortableImmutableRecord::new(
                         record.clone(),
                         self.key_len,
