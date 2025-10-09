@@ -827,7 +827,8 @@ class JDBC4ResultSetTest {
     for (byte b : timeBytes) {
       hexString.append(String.format("%02X", b));
     }
-    stmt.executeUpdate("INSERT INTO test_timestamp_cal (timestamp_col) VALUES (X'" + hexString + "');");
+    stmt.executeUpdate(
+        "INSERT INTO test_timestamp_cal (timestamp_col) VALUES (X'" + hexString + "');");
 
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_timestamp_cal");
     assertTrue(resultSet.next());
@@ -857,7 +858,8 @@ class JDBC4ResultSetTest {
     for (byte b : timeBytes) {
       hexString.append(String.format("%02X", b));
     }
-    stmt.executeUpdate("INSERT INTO test_timestamp_cal (created_at) VALUES (X'" + hexString + "');");
+    stmt.executeUpdate(
+        "INSERT INTO test_timestamp_cal (created_at) VALUES (X'" + hexString + "');");
 
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_timestamp_cal");
     assertTrue(resultSet.next());
