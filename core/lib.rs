@@ -489,7 +489,7 @@ impl Database {
                 conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
                 conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
@@ -1513,7 +1513,7 @@ impl Connection {
             let pager = conn.pager.read();
             if db.db_state.is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache();
+                pager.clear_page_cache(false);
             }
         }
         Ok((io, conn))
@@ -1740,11 +1740,6 @@ impl Connection {
         self.pager.read().cacheflush()
     }
 
-    pub fn clear_page_cache(&self) -> Result<()> {
-        self.pager.read().clear_page_cache();
-        Ok(())
-    }
-
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1888,7 +1883,7 @@ impl Connection {
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
-        self.pager.write().clear_page_cache();
+        self.pager.write().clear_page_cache(false);
         let pager = self.db.init_pager(Some(size.get() as usize))?;
         pager.enable_encryption(self.db.opts.enable_encryption);
         *self.pager.write() = Arc::new(pager);
