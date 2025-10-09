@@ -326,7 +326,6 @@ impl Property {
 
                     let rows = insert.rows();
                     let row = &rows[*row_index];
-
                     match &query {
                         Query::Delete(Delete {
                             table: t,
@@ -1385,6 +1384,7 @@ pub(crate) struct Remaining {
     pub(crate) delete: u32,
     pub(crate) update: u32,
     pub(crate) drop: u32,
+    pub(crate) pragma: u32,
 }
 
 pub(crate) fn remaining(
@@ -1408,6 +1408,7 @@ pub(crate) fn remaining(
     let total_delete = (max_interactions * opts.delete_weight) / total_weight;
     let total_update = (max_interactions * opts.update_weight) / total_weight;
     let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
+    let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
 
     let remaining_select = total_select
         .checked_sub(stats.select_count)
@@ -1428,6 +1429,9 @@ pub(crate) fn remaining(
         .checked_sub(stats.update_count)
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
+    let remaining_pragma = total_pragma
+        .checked_sub(stats.pragma_count)
+        .unwrap_or_default();
 
     if mvcc {
         // TODO: index not supported yet for mvcc
@@ -1442,6 +1446,7 @@ pub(crate) fn remaining(
         delete: remaining_delete,
         drop: remaining_drop,
         update: remaining_update,
+        pragma: remaining_pragma,
     }
 }
 

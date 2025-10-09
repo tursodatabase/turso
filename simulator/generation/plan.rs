@@ -181,6 +181,7 @@ impl InteractionPlan {
             begin_count: 0,
             commit_count: 0,
             rollback_count: 0,
+            pragma_count: 0,
         };
 
         fn query_stat(q: &Query, stats: &mut InteractionStats) {
@@ -196,6 +197,7 @@ impl InteractionPlan {
                 Query::Commit(_) => stats.commit_count += 1,
                 Query::Rollback(_) => stats.rollback_count += 1,
                 Query::Placeholder => {}
+                Query::Pragma(_) => stats.pragma_count += 1,
             }
         }
         for interactions in &self.plan {
@@ -724,6 +726,7 @@ pub(crate) struct InteractionStats {
     pub(crate) begin_count: u32,
     pub(crate) commit_count: u32,
     pub(crate) rollback_count: u32,
+    pub(crate) pragma_count: u32,
 }
 
 impl InteractionStats {

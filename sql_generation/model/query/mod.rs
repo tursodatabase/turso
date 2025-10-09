@@ -16,3 +16,4 @@ pub mod predicate;
 pub mod select;
 pub mod transaction;
 pub mod update;
+pub mod pragma;

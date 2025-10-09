@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, Insert, Select,
+        pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
@@ -32,6 +33,7 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    Pragma(Pragma),
     /// Placeholder query that still needs to be generated
     Placeholder,
 }
@@ -71,8 +73,11 @@ impl Query {
             Query::CreateIndex(CreateIndex { table_name, .. }) => {
                 IndexSet::from_iter([table_name.clone()])
             }
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
-            Query::Placeholder => IndexSet::new(),
+            Query::Begin(_)
+            | Query::Commit(_)
+            | Query::Rollback(_)
+            | Query::Placeholder
+            | Query::Pragma(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -80,13 +85,14 @@ impl Query {
             Query::Create(Create { table }) => vec![table.name.clone()],
             Query::Select(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
-            | Query::Insert(Insert::Values { table, .. })
-            | Query::Delete(Delete { table, .. })
-            | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => vec![table.clone()],
+                    | Query::Insert(Insert::Values { table, .. })
+                    | Query::Delete(Delete { table, .. })
+                    | Query::Update(Update { table, .. })
+                    | Query::Drop(Drop { table, .. }) => vec![table.clone()],
             Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
+            Query::Pragma(_) => vec![],
         }
     }
 
@@ -121,6 +127,7 @@ impl Display for Query {
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
             Self::Placeholder => Ok(()),
+            Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
     }
 }
@@ -141,12 +148,14 @@ impl Shadow for Query {
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
             Query::Placeholder => Ok(vec![]),
+            Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
         }
     }
 }
 
 bitflags! {
     pub struct QueryCapabilities: u32 {
+        const NONE = 0;
         const CREATE = 1 << 0;
         const SELECT = 1 << 1;
         const INSERT = 1 << 2;
@@ -190,6 +199,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Placeholder => {
                 unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
+            QueryDiscriminants::Pragma => QueryCapabilities::NONE,
         }
     }
 }
@@ -203,6 +213,7 @@ impl QueryDiscriminants {
         QueryDiscriminants::Delete,
         QueryDiscriminants::Drop,
         QueryDiscriminants::CreateIndex,
+        QueryDiscriminants::Pragma,
     ];
 
     #[inline]
