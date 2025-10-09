@@ -150,29 +150,6 @@ macro_rules! expect_arguments_even {
     }};
 }
 
-fn expr_vec_size(expr: &ast::Expr) -> usize {
-    match expr {
-        Expr::Parenthesized(v) => v.len(),
-        _ => 1,
-    }
-}
-
-fn expr_code_vector(program: &mut ProgramBuilder, expr: &ast::Expr) -> usize {
-    let size = expr_vec_size(expr);
-    program.alloc_registers(size)
-}
-
-fn expr_can_be_null(expr: &ast::Expr) -> bool {
-    // todo: better handling columns. Check sqlite3ExprCanBeNull
-    match expr {
-        Expr::Literal(literal) => !matches!(
-            literal,
-            ast::Literal::Numeric(_) | ast::Literal::String(_) | ast::Literal::Blob(_)
-        ),
-        _ => true,
-    }
-}
-
 /// Core implementation of IN expression logic that can be used in both conditional and expression contexts.
 /// This follows SQLite's approach where a single core function handles all InList cases.
 ///
@@ -213,7 +190,11 @@ fn translate_in_list(
     // dest if null should be in ConditionMetadata
     resolver: &Resolver,
 ) -> Result<()> {
-    let lhs_reg = expr_code_vector(program, lhs);
+    let lhs_reg = if let Expr::Parenthesized(v) = lhs {
+        program.alloc_registers(v.len())
+    } else {
+        program.alloc_register()
+    };
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
@@ -232,7 +213,7 @@ fn translate_in_list(
         let rhs_reg = program.alloc_register();
         let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
-        if check_null_reg != 0 && expr_can_be_null(expr) {
+        if check_null_reg != 0 && expr.can_be_null() {
             program.emit_insn(Insn::BitAnd {
                 lhs: check_null_reg,
                 rhs: rhs_reg,
@@ -2089,16 +2070,17 @@ pub fn translate_expr(
 
             let dest_if_false = program.allocate_label();
             let dest_if_null = program.allocate_label();
-            // won't use this label :/
             let dest_if_true = program.allocate_label();
 
+            // Ideally we wouldn't need a tmp register, but currently if an IN expression
+            // is used inside an aggregator the target_register is cleared on every iteration,
+            // losing the state of the aggregator.
             let tmp = program.alloc_register();
             program.emit_no_constant_insn(Insn::Null {
                 dest: tmp,
                 dest_end: None,
             });
 
-            // Call the core InList logic with expression-appropriate condition metadata
             translate_in_list(
                 program,
                 referenced_tables,
@@ -2118,13 +2100,16 @@ pub fn translate_expr(
                 value: 1,
                 dest: tmp,
             });
+
             // False path: set result to 0
             program.resolve_label(dest_if_false, program.offset());
+
             // Force integer conversion with AddImm 0
             program.emit_insn(Insn::AddImm {
                 register: tmp,
                 value: 0,
             });
+
             if *not {
                 program.emit_insn(Insn::Not {
                     reg: tmp,

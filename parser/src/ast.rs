@@ -542,6 +542,17 @@ impl Expr {
     pub fn raise(resolve_type: ResolveType, expr: Option<Expr>) -> Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
+
+    pub fn can_be_null(&self) -> bool {
+        // todo: better handling columns. Check sqlite3ExprCanBeNull
+        match self {
+            Expr::Literal(literal) => !matches!(
+                literal,
+                Literal::Numeric(_) | Literal::String(_) | Literal::Blob(_)
+            ),
+            _ => true,
+        }
+    }
 }
 
 /// SQL literal
