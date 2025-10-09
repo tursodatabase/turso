@@ -11,7 +11,7 @@ use crate::model::query::select::{
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
 use crate::model::table::{
-    Column, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+    Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -362,9 +362,11 @@ impl Arbitrary for CreateIndex {
         );
 
         CreateIndex {
-            index_name,
-            table_name: table.name.clone(),
-            columns,
+            index: Index {
+                index_name,
+                table_name: table.name.clone(),
+                columns,
+            },
         }
     }
 }

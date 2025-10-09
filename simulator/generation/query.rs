@@ -73,7 +73,7 @@ fn random_create_index<R: rand::Rng + ?Sized>(
         .expect("table should exist")
         .indexes
         .iter()
-        .any(|i| i == &create_index.index_name)
+        .any(|i| i.index_name == create_index.index_name)
     {
         create_index = CreateIndex::arbitrary(rng, conn_ctx);
     }
