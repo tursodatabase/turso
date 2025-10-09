@@ -2,32 +2,16 @@ use turso_core::Value;
 
 use crate::{
     generation::{ArbitraryFrom, GenerationContext},
-    model::table::SimValue,
+    model::table::{ColumnType, SimValue},
 };
 
 pub struct LTValue(pub SimValue);
 
-impl ArbitraryFrom<&Vec<&SimValue>> for LTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        values: &Vec<&SimValue>,
-    ) -> Self {
-        if values.is_empty() {
-            return Self(SimValue(Value::Null));
-        }
-
-        // Get value less than all values
-        let value = Value::exec_min(values.iter().map(|value| &value.0));
-        Self::arbitrary_from(rng, context, &SimValue(value))
-    }
-}
-
-impl ArbitraryFrom<&SimValue> for LTValue {
+impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
     fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
-        value: &SimValue,
+        (value, _col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
             Value::Integer(i) => Value::Integer(rng.random_range(i64::MIN..*i - 1)),
@@ -69,7 +53,8 @@ impl ArbitraryFrom<&SimValue> for LTValue {
                     Value::Blob(b)
                 }
             }
-            _ => unreachable!(),
+            // A value with storage class NULL is considered less than any other value (including another value with storage class NULL)
+            Value::Null => Value::Null,
         };
         Self(SimValue(new_value))
     }
@@ -77,27 +62,11 @@ impl ArbitraryFrom<&SimValue> for LTValue {
 
 pub struct GTValue(pub SimValue);
 
-impl ArbitraryFrom<&Vec<&SimValue>> for GTValue {
+impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
     fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
-        values: &Vec<&SimValue>,
-    ) -> Self {
-        if values.is_empty() {
-            return Self(SimValue(Value::Null));
-        }
-        // Get value greater than all values
-        let value = Value::exec_max(values.iter().map(|value| &value.0));
-
-        Self::arbitrary_from(rng, context, &SimValue(value))
-    }
-}
-
-impl ArbitraryFrom<&SimValue> for GTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
-        rng: &mut R,
-        _context: &C,
-        value: &SimValue,
+        (value, col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
             Value::Integer(i) => Value::Integer(rng.random_range(*i..i64::MAX)),
@@ -139,7 +108,10 @@ impl ArbitraryFrom<&SimValue> for GTValue {
                     Value::Blob(b)
                 }
             }
-            _ => unreachable!(),
+            Value::Null => {
+                // Any value is greater than NULL, except NULL
+                SimValue::arbitrary_from(rng, context, col_type).0
+            }
         };
         Self(SimValue(new_value))
     }

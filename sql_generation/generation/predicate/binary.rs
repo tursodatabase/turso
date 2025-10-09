@@ -16,44 +16,6 @@ use crate::{
 };
 
 impl Predicate {
-    /// Generate an [ast::Expr::Binary] [Predicate] from a column and [SimValue]
-    pub fn from_column_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        column_name: &str,
-        value: &SimValue,
-    ) -> Predicate {
-        let expr = one_of(
-            vec![
-                Box::new(|_| {
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Equals,
-                        Box::new(Expr::Literal(value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Greater,
-                        Box::new(Expr::Literal(gt_value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Less,
-                        Box::new(Expr::Literal(lt_value.into())),
-                    )
-                }),
-            ],
-            rng,
-        );
-        Predicate(expr)
-    }
-
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
     pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
@@ -117,7 +79,8 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let lt_value = LTValue::arbitrary_from(rng, context, value).0;
+                        let lt_value =
+                            LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
                                 ast::Name::from_string(&table_name),
@@ -131,7 +94,8 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let gt_value = GTValue::arbitrary_from(rng, context, value).0;
+                        let gt_value =
+                            GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
                                 ast::Name::from_string(&table_name),
@@ -223,7 +187,8 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
+                    let gt_value =
+                        GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(&table_name),
@@ -234,7 +199,8 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
+                    let lt_value =
+                        LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(&table_name),
@@ -283,7 +249,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -294,7 +265,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -341,7 +317,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -352,7 +333,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(table_name),

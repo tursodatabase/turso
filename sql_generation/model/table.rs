@@ -98,7 +98,7 @@ impl Display for Column {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ColumnType {
     Integer,
     Float,
