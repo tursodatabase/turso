@@ -58,3 +58,11 @@ do_execsql_test_on_specific_db {:memory:} col-named-rowid {
 do_execsql_test_in_memory_any_error create_table_duplicate_column_names {
     CREATE TABLE t(a, a);
 }
+
+do_execsql_test_in_memory_any_error create_table_duplicate_column_names_case_insensitive {
+    CREATE TABLE t(A, a);
+}
+
+do_execsql_test_in_memory_any_error create_table_duplicate_column_names_quoted {
+    CREATE TABLE t("a", a);
+}
