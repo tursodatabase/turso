@@ -111,6 +111,19 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
     Ok(Value::Float(dist))
 }
 
+pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(LimboError::ConversionError(
+            "distance_jaccard requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let x = parse_vector(&args[0], None)?;
+    let y = parse_vector(&args[1], None)?;
+    let dist = operations::jaccard::vector_distance_jaccard(&x, &y)?;
+    Ok(Value::Float(dist))
+}
+
 pub fn vector_concat(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::InvalidArgument(

@@ -158,6 +158,7 @@ pub enum VectorFunc {
     VectorExtract,
     VectorDistanceCos,
     VectorDistanceL2,
+    VectorDistanceJaccard,
     VectorConcat,
     VectorSlice,
 }
@@ -178,6 +179,7 @@ impl Display for VectorFunc {
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
             Self::VectorDistanceL2 => "vector_distance_l2".to_string(),
+            Self::VectorDistanceJaccard => "vector_distance_jaccard".to_string(),
             Self::VectorConcat => "vector_concat".to_string(),
             Self::VectorSlice => "vector_slice".to_string(),
         };
@@ -871,6 +873,7 @@ impl Func {
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
             "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceL2)),
+            "vector_distance_jaccard" => Ok(Self::Vector(VectorFunc::VectorDistanceJaccard)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             _ => crate::bail_parse_error!("no such function: {}", name),
