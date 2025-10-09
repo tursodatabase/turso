@@ -7,6 +7,7 @@ pub fn vector_serialize(x: Vector) -> Value {
     match x.vector_type {
         VectorType::Float32Dense => vector_f32_serialize(x),
         VectorType::Float64Dense => vector_f64_serialize(x),
+        _ => todo!(),
     }
 }
 

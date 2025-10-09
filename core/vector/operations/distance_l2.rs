@@ -21,6 +21,7 @@ pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
         VectorType::Float64Dense => {
             Ok(vector_f64_distance_l2(v1.as_f64_slice(), v2.as_f64_slice()))
         }
+        _ => todo!(),
     }
 }
 

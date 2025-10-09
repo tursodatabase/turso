@@ -21,5 +21,6 @@ pub fn vector_convert(v: Vector, target_type: VectorType) -> Result<Vector> {
             }
             Vector::from_data(target_type, data)
         }
+        _ => todo!(),
     }
 }

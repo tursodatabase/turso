@@ -4,6 +4,7 @@ use crate::{LimboError, Result};
 pub enum VectorType {
     Float32Dense,
     Float64Dense,
+    Float32Sparse,
 }
 
 #[derive(Debug)]
@@ -11,6 +12,11 @@ pub struct Vector {
     pub vector_type: VectorType,
     pub dims: usize,
     pub data: Vec<u8>,
+}
+
+pub struct VectorSparse<'a, T> {
+    idx: &'a [u32],
+    values: &'a [T],
 }
 
 impl Vector {
@@ -21,12 +27,26 @@ impl Vector {
         }
         // Odd-sized blobs have type byte at the end
         let vector_type = blob.pop().unwrap();
+        /*
+        vector types used by LibSQL:
+        (see https://github.com/tursodatabase/libsql/blob/a55bf61192bdb89e97568de593c4af5b70d24bde/libsql-sqlite3/src/vectorInt.h#L52)
+            #define VECTOR_TYPE_FLOAT32   1
+            #define VECTOR_TYPE_FLOAT64   2
+            #define VECTOR_TYPE_FLOAT1BIT 3
+            #define VECTOR_TYPE_FLOAT8    4
+            #define VECTOR_TYPE_FLOAT16   5
+            #define VECTOR_TYPE_FLOATB16  6
+        */
         match vector_type {
             1 => Ok((VectorType::Float32Dense, blob)),
             2 => Ok((VectorType::Float64Dense, blob)),
-            _ => Err(LimboError::ConversionError(
-                "Invalid vector type".to_string(),
+            3 | 4 | 5 | 6 => Err(LimboError::ConversionError(
+                "unsupported vector type from LibSQL".to_string(),
             )),
+            9 => Ok((VectorType::Float32Sparse, blob)),
+            _ => Err(LimboError::ConversionError(format!(
+                "unknown vector type: {vector_type}"
+            ))),
         }
     }
     pub fn from_blob(blob: Vec<u8>) -> Result<Self> {
@@ -60,6 +80,21 @@ impl Vector {
                     dims: data.len() / 8,
                     data,
                 })
+            }
+            VectorType::Float32Sparse => {
+                if data.len() == 0 || data.len() % 4 != 0 || (data.len() - 4) % 8 != 0 {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f32 sparse vector unexpected data length: {}",
+                        data.len(),
+                    )));
+                }
+                let dims = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+                let vector = Vector {
+                    vector_type,
+                    dims,
+                    data,
+                };
+                Ok(vector)
             }
         }
     }
@@ -116,7 +151,21 @@ impl Vector {
             "data pointer must be aligned to {align} bytes for f64 access"
         );
 
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f64, self.dims) }
+        unsafe { std::slice::from_raw_parts(ptr as *const f64, self.dims) }
+    }
+
+    pub fn as_f32_sparse(&self) -> VectorSparse<'_, f32> {
+        let ptr = self.data.as_ptr();
+        let align = std::mem::align_of::<f32>();
+        assert_eq!(
+            ptr.align_offset(align),
+            0,
+            "data pointer must be aligned to {align} bytes for f32 access"
+        );
+        let length = (self.data.len() - 4) / 4 / 2;
+        let values = unsafe { std::slice::from_raw_parts(ptr as *const f32, length) };
+        let idx = unsafe { std::slice::from_raw_parts((ptr as *const u32).add(length), length) };
+        VectorSparse { idx, values }
     }
 }
 
@@ -199,6 +248,7 @@ mod tests {
                     let floats = Self::generate_f64_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
+                _ => unreachable!(),
             };
 
             ArbitraryVector { vector_type, data }
@@ -281,6 +331,7 @@ mod tests {
                 // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
                 slice.len() == DIMS && (slice.len() * 8 == v.data.len())
             }
+            _ => unreachable!(),
         }
     }
 
@@ -404,6 +455,7 @@ mod tests {
                         let parsed = parsed_vector.as_f64_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
+                    _ => unreachable!(),
                 }
             }
             Err(_) => false,

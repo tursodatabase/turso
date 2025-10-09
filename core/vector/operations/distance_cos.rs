@@ -23,6 +23,7 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
             v1.as_f64_slice(),
             v2.as_f64_slice(),
         )),
+        _ => todo!(),
     }
 }
 

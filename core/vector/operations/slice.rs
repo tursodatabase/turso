@@ -21,6 +21,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
         VectorType::Float64Dense => {
             Vector::from_data(vector.vector_type, vector.data[start * 8..end * 8].to_vec())
         }
+        _ => todo!(),
     }
 }
 

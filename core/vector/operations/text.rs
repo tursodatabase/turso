@@ -25,6 +25,7 @@ pub fn vector_to_text(vector: &Vector) -> String {
                 }
             }
         }
+        _ => todo!(),
     }
     text.push(']');
     text
@@ -85,6 +86,7 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
                 }
                 data.extend_from_slice(&x.to_le_bytes());
             }
+            _ => todo!(),
         };
     }
     Vector::from_data(vector_type, data)
