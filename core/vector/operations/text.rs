@@ -87,10 +87,5 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
             }
         };
     }
-    let dims = vector_type.size_to_dims(data.len());
-    Ok(Vector {
-        vector_type,
-        dims,
-        data,
-    })
+    Vector::from_data(vector_type, data)
 }

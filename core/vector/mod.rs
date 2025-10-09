@@ -1,4 +1,5 @@
 use crate::types::Value;
+use crate::types::ValueType;
 use crate::vdbe::Register;
 use crate::LimboError;
 use crate::Result;
@@ -6,6 +7,26 @@ use crate::Result;
 pub mod operations;
 pub mod vector_types;
 use vector_types::*;
+
+pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vector> {
+    match value.get_value().value_type() {
+        ValueType::Text => operations::text::vector_from_text(
+            vec_ty.unwrap_or(VectorType::Float32Dense),
+            value.get_value().to_text().expect("value must be text"),
+        ),
+        ValueType::Blob => {
+            let Some(blob) = value.get_value().to_blob() else {
+                return Err(LimboError::ConversionError(
+                    "Invalid vector value".to_string(),
+                ));
+            };
+            Vector::from_blob(blob.to_vec())
+        }
+        _ => Err(LimboError::ConversionError(
+            "Invalid vector type".to_string(),
+        )),
+    }
+}
 
 pub fn vector32(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
@@ -47,8 +68,7 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         return Ok(Value::build_text("[]"));
     }
 
-    let vector_type = vector_type(blob)?;
-    let vector = vector_deserialize(vector_type, blob)?;
+    let vector = Vector::from_blob(blob.to_vec())?;
     Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 
