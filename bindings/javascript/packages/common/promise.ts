@@ -343,7 +343,6 @@ class Statement {
    */
   async run(...bindParameters) {
     let stmt = await this.stmt.resolve();
-    stmt.reset();
 
     bindParams(stmt, bindParameters);
 
@@ -370,6 +369,7 @@ class Statement {
 
       return { changes, lastInsertRowid };
     } finally {
+      stmt.reset();
       this.execLock.release();
     }
   }
@@ -382,7 +382,6 @@ class Statement {
   async get(...bindParameters) {
     let stmt = await this.stmt.resolve();
 
-    stmt.reset();
     bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
@@ -397,10 +396,12 @@ class Statement {
           return undefined;
         }
         if (stepResult === STEP_ROW) {
-          return stmt.row();
+          const row = stmt.row();
+          return row;
         }
       }
     } finally {
+      stmt.reset();
       this.execLock.release();
     }
   }
@@ -413,7 +414,6 @@ class Statement {
   async *iterate(...bindParameters) {
     let stmt = await this.stmt.resolve();
 
-    stmt.reset();
     bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
@@ -432,6 +432,7 @@ class Statement {
         }
       }
     } finally {
+      stmt.reset();
       this.execLock.release();
     }
   }
@@ -444,7 +445,6 @@ class Statement {
   async all(...bindParameters) {
     let stmt = await this.stmt.resolve();
 
-    stmt.reset();
     bindParams(stmt, bindParameters);
     const rows: any[] = [];
 
@@ -466,6 +466,7 @@ class Statement {
       return rows;
     }
     finally {
+      stmt.reset();
       this.execLock.release();
     }
   }
