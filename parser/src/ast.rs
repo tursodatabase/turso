@@ -1121,6 +1121,11 @@ pub struct NamedColumnConstraint {
 // https://sqlite.org/syntax/column-constraint.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "simulator", derive(strum::EnumDiscriminants))]
+#[cfg_attr(
+    feature = "simulator",
+    strum_discriminants(derive(strum::VariantArray))
+)]
 pub enum ColumnConstraint {
     /// `PRIMARY KEY`
     PrimaryKey {

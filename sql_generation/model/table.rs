@@ -1,8 +1,9 @@
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types};
-use turso_parser::ast;
+use turso_parser::ast::{self, ColumnConstraint};
 
 use crate::model::query::predicate::Predicate;
 
@@ -63,8 +64,7 @@ impl Table {
 pub struct Column {
     pub name: String,
     pub column_type: ColumnType,
-    pub primary: bool,
-    pub unique: bool,
+    pub constraints: Vec<ColumnConstraint>,
 }
 
 // Uniquely defined by name in this case
@@ -81,6 +81,22 @@ impl PartialEq for Column {
 }
 
 impl Eq for Column {}
+
+impl Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let constraints = self
+            .constraints
+            .iter()
+            .map(|constraint| constraint.to_string())
+            .join(" ");
+        let mut col_string = format!("{} {}", self.name, self.column_type);
+        if !constraints.is_empty() {
+            col_string.push(' ');
+            col_string.push_str(&constraints);
+        }
+        write!(f, "{col_string}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ColumnType {

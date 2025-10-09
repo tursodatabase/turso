@@ -1,4 +1,4 @@
-#![allow(clippy::arc_with_non_send_sync, dead_code)]
+#![allow(clippy::arc_with_non_send_sync)]
 use anyhow::anyhow;
 use clap::Parser;
 use generation::plan::{InteractionPlan, InteractionPlanState};
@@ -421,6 +421,7 @@ enum SandboxedResult {
         error: String,
         last_execution: Execution,
     },
+    #[expect(dead_code)]
     FoundBug {
         error: String,
         history: ExecutionHistory,

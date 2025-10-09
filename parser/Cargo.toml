@@ -13,6 +13,7 @@ name = "turso_parser"
 [features]
 default = []
 serde = ["dep:serde", "bitflags/serde"]
+simulator = []
 
 [dependencies]
 bitflags = { workspace = true }

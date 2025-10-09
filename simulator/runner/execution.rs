@@ -46,6 +46,7 @@ impl ExecutionHistory {
 }
 
 pub struct ExecutionResult {
+    #[expect(dead_code)]
     pub history: ExecutionHistory,
     pub error: Option<LimboError>,
 }
