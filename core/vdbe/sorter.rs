@@ -227,7 +227,9 @@ impl Sorter {
                     self.insert_state = InsertState::Insert;
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
-                            io_yield_one!(c);
+                            if !c.succeeded() {
+                                io_yield_one!(c);
+                            }
                         }
                     }
                 }
