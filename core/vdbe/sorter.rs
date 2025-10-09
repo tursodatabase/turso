@@ -296,14 +296,6 @@ impl Sorter {
 
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
         // Make sure all chunks read at least one record into their buffer.
-        turso_assert!(
-            !self.chunks.iter().any(|chunk| matches!(
-                *chunk.io_state.read().unwrap(),
-                SortedChunkIOState::WaitingForRead
-            )),
-            "chunks should have been read"
-        );
-
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
             // TODO: blocking will be unnecessary here with IO completions
             let io = self.io.clone();
