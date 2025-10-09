@@ -2209,82 +2209,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interactions_insertselectnested_base_interactions() {
+    fn interactions_insertselectednested() {
+        assert_insertselectnested_with_nesting_level(
+            0,
+            "INSERT INTO table1 SELECT * FROM table1 WHERE TRUE",
+        );
+        assert_insertselectnested_with_nesting_level(
+            1,
+            "INSERT INTO table1 SELECT * FROM (SELECT * FROM table1 WHERE TRUE) WHERE TRUE",
+        );
+    }
+
+    fn assert_insertselectnested_with_nesting_level(nesting_level: u8, expected_insert: &str) {
         let property = Property::InsertSelectNested {
             table: "table1".to_owned(),
-            nesting_level: 0,
+            nesting_level,
         };
         let result = property.interactions(123);
         let _expected: Vec<Interaction> = vec![];
         assert_eq!(4, result.len());
-        //TODO maybe try to fail the assumption?
-        assert!(matches!(
-            result[0].interaction,
-            InteractionType::Assumption(_)
-        ));
-        let InteractionType::Query(crate::model::Query::Select(actual_select)) =
-            &result[1].interaction
-        else {
+
+        if !matches!(result[0].interaction, InteractionType::Assumption(_)) {
             panic!(
-                "unexpected interaction type for select: {:?}",
-                result[1].interaction
+                "unexpected interaction type for assumption: {}",
+                result[0].interaction
             );
-        };
+        }
+
         assert_eq!(
-            &Select {
-                body: SelectBody {
-                    select: Box::new(SelectInner {
-                        distinctness: Distinctness::All,
-                        columns: vec![ResultColumn::Star],
-                        from: Some(FromClause {
-                            table: SelectTable::Table("table1".to_owned()),
-                            joins: vec![],
-                        }),
-                        where_clause: Predicate::true_(),
-                        order_by: None,
-                    }),
-                    compounds: vec![]
-                },
-                limit: None,
-            },
-            actual_select,
+            "SELECT * FROM table1 WHERE TRUE",
+            format!("{}", &result[1].interaction)
         );
 
         assert!(matches!(result[2].interaction, InteractionType::Query(_)));
-        let InteractionType::Query(crate::model::Query::Insert(Insert::Select {
-            table: actual_insert_table,
-            select: actual_insert_select,
-        })) = &result[2].interaction
-        else {
-            panic!(
-                "unexpected interaction type for insert: {:?}",
-                result[2].interaction
-            );
-        };
 
-        assert_eq!("table1", actual_insert_table);
-        assert_eq!(
-            Select {
-                body: SelectBody {
-                    select: Box::new(SelectInner {
-                        distinctness: Distinctness::All,
-                        columns: vec![ResultColumn::Star],
-                        from: Some(FromClause {
-                            table: SelectTable::Table("table1".to_owned()),
-                            joins: vec![],
-                        }),
-                        where_clause: Predicate::true_(),
-                        order_by: None,
-                    }),
-                    compounds: vec![]
-                },
-                limit: None,
-            },
-            **actual_insert_select,
-        );
-        //TODO test with a non-0 nesting level
+        assert_eq!(expected_insert, format!("{}", &result[2].interaction));
 
-        //TODO maybe try to fail the assertion?
         assert!(matches!(
             result[3].interaction,
             InteractionType::Assertion(_)
