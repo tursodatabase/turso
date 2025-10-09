@@ -63,11 +63,6 @@ impl InteractionPlan {
         Self { plan, mvcc, len }
     }
 
-    #[inline]
-    pub fn plan(&self) -> &[Interactions] {
-        &self.plan
-    }
-
     /// Length of interactions that are not transaction statements
     #[inline]
     pub fn len(&self) -> usize {
@@ -629,14 +624,6 @@ impl InteractionsType {
 }
 
 impl Interactions {
-    pub(crate) fn name(&self) -> Option<&str> {
-        match &self.interactions {
-            InteractionsType::Property(property) => Some(property.name()),
-            InteractionsType::Query(_) => None,
-            InteractionsType::Fault(_) => None,
-        }
-    }
-
     pub(crate) fn interactions(&self) -> Vec<Interaction> {
         match &self.interactions {
             InteractionsType::Property(property) => property.interactions(self.connection_index),
@@ -726,17 +713,6 @@ pub(crate) struct InteractionStats {
     pub(crate) rollback_count: u32,
 }
 
-impl InteractionStats {
-    pub fn total_writes(&self) -> u32 {
-        self.insert_count
-            + self.delete_count
-            + self.update_count
-            + self.create_count
-            + self.create_index_count
-            + self.drop_count
-    }
-}
-
 impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -757,10 +733,6 @@ impl Display for InteractionStats {
 }
 
 type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
-
-enum AssertionAST {
-    Pick(),
-}
 
 #[derive(Clone)]
 pub struct Assertion {

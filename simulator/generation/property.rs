@@ -8,7 +8,7 @@
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use sql_generation::{
-    generation::{Arbitrary, ArbitraryFrom, GenerationContext, Opts, pick, pick_index},
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
         query::{
             Create, Delete, Drop, Insert, Select,
@@ -17,7 +17,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::Update,
         },
-        table::{SimValue, Table},
+        table::SimValue,
     },
 };
 use strum::IntoEnumIterator;
@@ -27,39 +27,14 @@ use turso_parser::ast::{self, Distinctness};
 use crate::{
     common::print_diff,
     generation::{
-        Shadow as _, WeightedDistribution,
-        plan::InteractionType,
-        query::{QueryDistribution, possible_queries},
+        Shadow as _, WeightedDistribution, plan::InteractionType, query::QueryDistribution,
     },
     model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
-    runner::env::{ShadowTablesMut, SimulatorEnv},
+    runner::env::SimulatorEnv,
 };
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
-
-#[derive(Debug, Clone, Copy)]
-struct PropertyGenContext<'a> {
-    tables: &'a Vec<sql_generation::model::table::Table>,
-    opts: &'a sql_generation::generation::Opts,
-}
-
-impl<'a> PropertyGenContext<'a> {
-    #[inline]
-    fn new(tables: &'a Vec<Table>, opts: &'a Opts) -> Self {
-        Self { tables, opts }
-    }
-}
-
-impl<'a> GenerationContext for PropertyGenContext<'a> {
-    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        self.tables
-    }
-
-    fn opts(&self) -> &sql_generation::generation::Opts {
-        self.opts
-    }
-}
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -1925,11 +1900,6 @@ impl PropertyDiscriminants {
     }
 }
 
-pub fn possiple_properties(tables: &[Table]) -> Vec<PropertyDiscriminants> {
-    let queries = possible_queries(tables);
-    PropertyDiscriminants::can_generate(queries)
-}
-
 pub(super) struct PropertyDistribution<'a> {
     properties: Vec<PropertyDiscriminants>,
     weights: WeightedIndex<u32>,
@@ -1993,49 +1963,6 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
     }
-}
-
-fn generate_queries<R: rand::Rng + ?Sized, F>(
-    rng: &mut R,
-    ctx: &impl GenerationContext,
-    amount: usize,
-    init_queries: &[&Query],
-    func: F,
-) -> Vec<Query>
-where
-    F: Fn(&mut R, PropertyGenContext) -> Option<Query>,
-{
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-
-    let range = 0..amount;
-    if !range.is_empty() {
-        let mut tmp_tables = ctx.tables().clone();
-
-        for query in init_queries {
-            tmp_shadow(&mut tmp_tables, query);
-        }
-
-        for _ in range {
-            let tmp_ctx = PropertyGenContext::new(&tmp_tables, ctx.opts());
-
-            let Some(query) = func(rng, tmp_ctx) else {
-                continue;
-            };
-
-            tmp_shadow(&mut tmp_tables, &query);
-
-            queries.push(query);
-        }
-    }
-    queries
-}
-
-fn tmp_shadow(tmp_tables: &mut Vec<Table>, query: &Query) {
-    let mut tx_tables = None;
-    let mut tmp_shadow_tables = ShadowTablesMut::new(tmp_tables, &mut tx_tables);
-
-    let _ = query.shadow(&mut tmp_shadow_tables);
 }
 
 fn print_row(row: &[SimValue]) -> String {
