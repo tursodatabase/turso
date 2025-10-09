@@ -369,6 +369,10 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public int findColumn(String columnLabel) throws SQLException {
+    if (columnLabel == null || columnLabel.isEmpty()) {
+      throw new SQLException("column name not found");
+    }
+    
     final String[] columnNames = resultSet.getColumnNames();
     for (int i = 0; i < columnNames.length; i++) {
       if (columnNames[i].equals(columnLabel)) {
