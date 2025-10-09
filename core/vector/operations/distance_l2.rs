@@ -4,7 +4,6 @@ use crate::{
 };
 
 pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
-    // Validate that both vectors have the same dimensions and type
     if v1.dims != v2.dims {
         return Err(LimboError::ConversionError(
             "Vectors must have the same dimensions".to_string(),
