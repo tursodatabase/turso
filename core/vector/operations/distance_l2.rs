@@ -1,24 +1,31 @@
-use super::{DistanceCalculator, DistanceType};
-use crate::vector::vector_types::{Vector, VectorType};
-use crate::Result;
+use crate::{
+    vector::vector_types::{Vector, VectorType},
+    LimboError, Result,
+};
 
-#[derive(Debug, Clone)]
-pub struct Euclidean;
-
-impl DistanceCalculator for Euclidean {
-    fn distance_type() -> DistanceType {
-        DistanceType::Euclidean
+pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
+    // Validate that both vectors have the same dimensions and type
+    if v1.dims != v2.dims {
+        return Err(LimboError::ConversionError(
+            "Vectors must have the same dimensions".to_string(),
+        ));
     }
-
-    fn calculate(v1: &Vector, v2: &Vector) -> Result<f64> {
-        match v1.vector_type {
-            VectorType::Float32Dense => Ok(euclidean_distance_f32(v1.as_f32_slice(), v2.as_f32_slice())),
-            VectorType::Float64Dense => Ok(euclidean_distance_f64(v1.as_f64_slice(), v2.as_f64_slice())),
+    if v1.vector_type != v2.vector_type {
+        return Err(LimboError::ConversionError(
+            "Vectors must be of the same type".to_string(),
+        ));
+    }
+    match v1.vector_type {
+        VectorType::Float32Dense => {
+            Ok(vector_f32_distance_l2(v1.as_f32_slice(), v2.as_f32_slice()))
+        }
+        VectorType::Float64Dense => {
+            Ok(vector_f64_distance_l2(v1.as_f64_slice(), v2.as_f64_slice()))
         }
     }
 }
 
-fn euclidean_distance_f32(v1: &[f32], v2: &[f32]) -> f64 {
+fn vector_f32_distance_l2(v1: &[f32], v2: &[f32]) -> f64 {
     let sum = v1
         .iter()
         .zip(v2.iter())
@@ -27,7 +34,7 @@ fn euclidean_distance_f32(v1: &[f32], v2: &[f32]) -> f64 {
     sum.sqrt()
 }
 
-fn euclidean_distance_f64(v1: &[f64], v2: &[f64]) -> f64 {
+fn vector_f64_distance_l2(v1: &[f64], v2: &[f64]) -> f64 {
     let sum = v1
         .iter()
         .zip(v2.iter())
@@ -58,7 +65,7 @@ mod tests {
         ];
         let results = vectors
             .iter()
-            .map(|v| euclidean_distance_f32(&query, v))
+            .map(|v| vector_f32_distance_l2(&query, v))
             .collect::<Vec<f64>>();
         assert_eq!(results, expected);
     }
@@ -67,6 +74,6 @@ mod tests {
     fn test_odd_len() {
         let v = (0..5).map(|x| x as f32).collect::<Vec<f32>>();
         let query = (2..7).map(|x| x as f32).collect::<Vec<f32>>();
-        assert_eq!(euclidean_distance_f32(&v, &query), 20.0_f64.sqrt());
+        assert_eq!(vector_f32_distance_l2(&v, &query), 20.0_f64.sqrt());
     }
 }

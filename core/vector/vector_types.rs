@@ -241,93 +241,6 @@ pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {
     })
 }
 
-pub fn do_vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    match v1.vector_type {
-        VectorType::Float32Dense => vector_f32_distance_cos(v1, v2),
-        VectorType::Float64Dense => vector_f64_distance_cos(v1, v2),
-    }
-}
-
-pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
-            "Invalid vector dimensions".to_string(),
-        ));
-    }
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        ));
-    }
-    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f32_slice();
-    let v2_data = v2.as_f32_slice();
-
-    // Check for non-finite values
-    if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    for i in 0..v1.dims {
-        let e1 = v1_data[i];
-        let e2 = v2_data[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
-    }
-
-    // Check for zero norms to avoid division by zero
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    Ok(1.0 - (dot / (norm1 * norm2).sqrt()) as f64)
-}
-
-pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
-            "Invalid vector dimensions".to_string(),
-        ));
-    }
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        ));
-    }
-    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f64_slice();
-    let v2_data = v2.as_f64_slice();
-
-    // Check for non-finite values
-    if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    for i in 0..v1.dims {
-        let e1 = v1_data[i];
-        let e2 = v2_data[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
-    }
-
-    // Check for zero norms
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    Ok(1.0 - (dot / (norm1 * norm2).sqrt()))
-}
-
 pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
     // Even-sized blobs are always float32.
     if blob.len() % 2 == 0 {
@@ -359,73 +272,10 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
     }
 }
 
-pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Mismatched vector types".into(),
-        ));
-    }
-
-    let mut data = Vec::with_capacity(v1.data.len() + v2.data.len());
-    data.extend_from_slice(&v1.data);
-    data.extend_from_slice(&v2.data);
-
-    Ok(Vector {
-        vector_type: v1.vector_type,
-        dims: v1.dims + v2.dims,
-        data,
-    })
-}
-
-pub fn vector_slice(vector: &Vector, start_idx: usize, end_idx: usize) -> Result<Vector> {
-    fn extract_bytes<T, const N: usize>(
-        slice: &[T],
-        start: usize,
-        end: usize,
-        to_bytes: impl Fn(&T) -> [u8; N],
-    ) -> Result<Vec<u8>> {
-        if start > end {
-            return Err(LimboError::InvalidArgument(
-                "start index must not be greater than end index".into(),
-            ));
-        }
-        if end > slice.len() || end < start {
-            return Err(LimboError::ConversionError(
-                "vector_slice range out of bounds".into(),
-            ));
-        }
-
-        let mut buf = Vec::with_capacity((end - start) * N);
-        for item in &slice[start..end] {
-            buf.extend_from_slice(&to_bytes(item));
-        }
-        Ok(buf)
-    }
-
-    let (vector_type, data) = match vector.vector_type {
-        VectorType::Float32Dense => (
-            VectorType::Float32Dense,
-            extract_bytes::<f32, 4>(vector.as_f32_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-        VectorType::Float64Dense => (
-            VectorType::Float64Dense,
-            extract_bytes::<f64, 8>(vector.as_f64_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-    };
-
-    Ok(Vector {
-        vector_type,
-        dims: end_idx - start_idx,
-        data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::vector::operations;
+
     use super::*;
     use quickcheck::{Arbitrary, Gen};
     use quickcheck_macros::quickcheck;
@@ -659,7 +509,7 @@ mod tests {
     /// - Assumes vectors are well-formed (same type and dimension)
     /// - The distance must be between 0 and 2
     fn test_vector_distance<const DIMS: usize>(v1: &Vector, v2: &Vector) -> bool {
-        match do_vector_distance_cos(v1, v2) {
+        match operations::distance_cos::vector_distance_cos(v1, v2) {
             Ok(distance) => (0.0..=2.0).contains(&distance),
             Err(_) => true,
         }
@@ -687,143 +537,6 @@ mod tests {
         let vector = parse_string_vector(VectorType::Float32Dense, &value).unwrap();
         assert_eq!(vector.dims, 3);
         assert_eq!(vector.vector_type, VectorType::Float32Dense);
-    }
-
-    fn float32_vec_from(slice: &[f32]) -> Vector {
-        let mut data = Vec::new();
-        for &v in slice {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-
-        Vector {
-            vector_type: VectorType::Float32Dense,
-            dims: slice.len(),
-            data,
-        }
-    }
-
-    fn f32_slice_from_vector(vector: &Vector) -> Vec<f32> {
-        vector.as_f32_slice().to_vec()
-    }
-
-    #[test]
-    fn test_vector_concat_normal_case() {
-        let v1 = float32_vec_from(&[1.0, 2.0, 3.0]);
-        let v2 = float32_vec_from(&[4.0, 5.0, 6.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 6);
-        assert_eq!(result.vector_type, VectorType::Float32Dense);
-        assert_eq!(
-            f32_slice_from_vector(&result),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-        );
-    }
-
-    #[test]
-    fn test_vector_concat_empty_left() {
-        let v1 = float32_vec_from(&[]);
-        let v2 = float32_vec_from(&[4.0, 5.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 2);
-        assert_eq!(f32_slice_from_vector(&result), vec![4.0, 5.0]);
-    }
-
-    #[test]
-    fn test_vector_concat_empty_right() {
-        let v1 = float32_vec_from(&[1.0, 2.0]);
-        let v2 = float32_vec_from(&[]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 2);
-        assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0]);
-    }
-
-    #[test]
-    fn test_vector_concat_both_empty() {
-        let v1 = float32_vec_from(&[]);
-        let v2 = float32_vec_from(&[]);
-        let result = vector_concat(&v1, &v2).unwrap();
-        assert_eq!(result.dims, 0);
-        assert_eq!(f32_slice_from_vector(&result), Vec::<f32>::new());
-    }
-
-    #[test]
-    fn test_vector_concat_different_lengths() {
-        let v1 = float32_vec_from(&[1.0]);
-        let v2 = float32_vec_from(&[2.0, 3.0, 4.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 4);
-        assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_normal_case() {
-        let input_vec = float32_vec_from(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-        let result = vector_slice(&input_vec, 1, 4).unwrap();
-
-        assert_eq!(result.dims, 3);
-        assert_eq!(f32_slice_from_vector(&result), vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_full_range() {
-        let input_vec = float32_vec_from(&[10.0, 20.0, 30.0]);
-        let result = vector_slice(&input_vec, 0, 3).unwrap();
-
-        assert_eq!(result.dims, 3);
-        assert_eq!(f32_slice_from_vector(&result), vec![10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_single_element() {
-        let input_vec = float32_vec_from(&[4.40, 2.71]);
-        let result = vector_slice(&input_vec, 1, 2).unwrap();
-
-        assert_eq!(result.dims, 1);
-        assert_eq!(f32_slice_from_vector(&result), vec![2.71]);
-    }
-
-    #[test]
-    fn test_vector_slice_empty_list() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let result = vector_slice(&input_vec, 2, 2).unwrap();
-
-        assert_eq!(result.dims, 0);
-    }
-
-    #[test]
-    fn test_vector_slice_zero_length() {
-        let input_vec = float32_vec_from(&[1.0, 2.0, 3.0]);
-        let err = vector_slice(&input_vec, 2, 1);
-        assert!(err.is_err(), "Expected error on zero-length range");
-    }
-
-    #[test]
-    fn test_vector_slice_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 0, 5);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_vector_slice_start_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 5, 5);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_vector_slice_end_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 1, 3);
-        assert!(err.is_err());
     }
 
     #[quickcheck]

@@ -1,10 +1,9 @@
 use crate::types::Value;
 use crate::vdbe::Register;
-use crate::vector::distance::{euclidean::Euclidean, DistanceCalculator};
 use crate::LimboError;
 use crate::Result;
 
-pub mod distance;
+pub mod operations;
 pub mod vector_types;
 use vector_types::*;
 
@@ -76,7 +75,7 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-    let dist = do_vector_distance_cos(&x, &y)?;
+    let dist = operations::distance_cos::vector_distance_cos(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
@@ -89,19 +88,7 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-    // Validate that both vectors have the same dimensions and type
-    if x.dims != y.dims {
-        return Err(LimboError::ConversionError(
-            "Vectors must have the same dimensions".to_string(),
-        ));
-    }
-    if x.vector_type != y.vector_type {
-        return Err(LimboError::ConversionError(
-            "Vectors must be of the same type".to_string(),
-        ));
-    }
-
-    let dist = Euclidean::calculate(&x, &y)?;
+    let dist = operations::distance_l2::vector_distance_l2(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
@@ -114,14 +101,7 @@ pub fn vector_concat(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-
-    if x.vector_type != y.vector_type {
-        return Err(LimboError::InvalidArgument(
-            "Vectors must be of the same type".into(),
-        ));
-    }
-
-    let vector = vector_types::vector_concat(&x, &y)?;
+    let vector = operations::concat::vector_concat(&x, &y)?;
     match vector.vector_type {
         VectorType::Float32Dense => Ok(vector_serialize_f32(vector)),
         VectorType::Float64Dense => Ok(vector_serialize_f64(vector)),
@@ -153,7 +133,8 @@ pub fn vector_slice(args: &[Register]) -> Result<Value> {
         ));
     }
 
-    let result = vector_types::vector_slice(&vector, start_index as usize, end_index as usize)?;
+    let result =
+        operations::slice::vector_slice(&vector, start_index as usize, end_index as usize)?;
 
     Ok(match result.vector_type {
         VectorType::Float32Dense => vector_serialize_f32(result),
