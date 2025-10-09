@@ -51,8 +51,18 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
             ColumnType::Integer => Value::Integer(rng.random_range(i64::MIN..i64::MAX)),
             ColumnType::Float => Value::Float(rng.random_range(-1e10..1e10)),
             ColumnType::Text => Value::build_text(gen_random_text(rng)),
-            ColumnType::Blob => Value::Blob(gen_random_text(rng).as_bytes().to_vec()),
+            ColumnType::Blob => Value::Blob(gen_random_text(rng).into_bytes()),
         };
         SimValue(value)
+    }
+}
+
+impl ArbitraryFrom<ColumnType> for SimValue {
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        column_type: ColumnType,
+    ) -> Self {
+        SimValue::arbitrary_from(rng, context, &column_type)
     }
 }
