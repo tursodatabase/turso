@@ -2128,6 +2128,7 @@ pub enum Type {
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
+    None,
     Integer,
     Text,
     Blob,
@@ -2135,7 +2136,8 @@ pub enum Affinity {
     Numeric,
 }
 
-pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
+pub const SQLITE_AFF_NONE: char = '@';
+pub const SQLITE_AFF_BLOB: char = 'A';
 pub const SQLITE_AFF_TEXT: char = 'B';
 pub const SQLITE_AFF_NUMERIC: char = 'C';
 pub const SQLITE_AFF_INTEGER: char = 'D';
@@ -2151,9 +2153,10 @@ impl Affinity {
     /// So this opcode can cause persistent changes to registers P1 and P3.""
     pub fn aff_mask(&self) -> char {
         match self {
+            Affinity::None => SQLITE_AFF_NONE,
             Affinity::Integer => SQLITE_AFF_INTEGER,
             Affinity::Text => SQLITE_AFF_TEXT,
-            Affinity::Blob => SQLITE_AFF_NONE,
+            Affinity::Blob => SQLITE_AFF_BLOB,
             Affinity::Real => SQLITE_AFF_REAL,
             Affinity::Numeric => SQLITE_AFF_NUMERIC,
         }
@@ -2163,9 +2166,10 @@ impl Affinity {
         match char {
             SQLITE_AFF_INTEGER => Affinity::Integer,
             SQLITE_AFF_TEXT => Affinity::Text,
-            SQLITE_AFF_NONE => Affinity::Blob,
+            SQLITE_AFF_BLOB => Affinity::Blob,
             SQLITE_AFF_REAL => Affinity::Real,
             SQLITE_AFF_NUMERIC => Affinity::Numeric,
+            SQLITE_AFF_NONE => Affinity::None,
             _ => Affinity::Blob,
         }
     }
@@ -2183,7 +2187,7 @@ impl Affinity {
     }
 
     pub fn has_affinity(&self) -> bool {
-        !matches!(self, Affinity::Blob)
+        !matches!(self, Affinity::None)
     }
 }
 

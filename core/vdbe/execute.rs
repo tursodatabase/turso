@@ -939,7 +939,7 @@ pub fn op_comparison(
             }
         }
 
-        Affinity::Blob => {} // Do nothing for blob affinity.
+        Affinity::Blob | Affinity::None => {} // Do nothing for blob affinity.
     }
 
     let should_jump = op.compare(
@@ -8002,6 +8002,7 @@ pub fn op_cast(
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),
+        Affinity::None => unreachable!(),
     };
 
     state.registers[*reg] = Register::Value(result);
@@ -9043,6 +9044,7 @@ impl Value {
                     }
                 }
             },
+            Affinity::None => unreachable!(),
         }
     }
 
@@ -9400,7 +9402,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
         }
 
         match affinity {
-            Affinity::Blob => return true,
+            Affinity::Blob | Affinity::None => return true,
 
             Affinity::Text => {
                 if matches!(value, Value::Text(_) | Value::Null) {
@@ -9887,7 +9889,7 @@ fn stringify_register(reg: &mut Register) -> bool {
             true
         }
         Value::Float(f) => {
-            *reg = Register::Value(Value::build_text(f.to_string()));
+            *reg = Register::Value(Value::build_text(crate::numeric::format_float(*f)));
             true
         }
         Value::Text(_) | Value::Null | Value::Blob(_) => false,
