@@ -513,26 +513,7 @@ impl Property {
                 interactions
             }
             Property::SelectSelectOptimizer { table, predicate } => {
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {table} exists"),
-                    {
-                        let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table) {
-                                Ok(Ok(()))
-                            } else {
-                                {
-                                    let available_tables: Vec<String> =
-                                        conn_tables.iter().map(|t| t.name.clone()).collect();
-                                    Ok(Err(format!(
-                                        "table \'{table}\' not found. Available tables: {available_tables:?}"
-                                    )))
-                                }
-                            }
-                        }
-                    },
-                ));
+                let assumption = InteractionType::Assumption(Assertion::table_exists(table));
 
                 let select1 = InteractionType::Query(Query::Select(Select::single(
                     table.clone(),
@@ -648,34 +629,11 @@ impl Property {
                 Vec::from_iter(first.chain(checks))
             }
             Property::WhereTrueFalseNull { select, predicate } => {
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!(
-                        "tables ({}) exists",
-                        select
-                            .dependencies()
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    {
-                        let tables = select.dependencies();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if tables
-                                .iter()
-                                .all(|table| conn_tables.iter().any(|t| t.name == *table))
-                            {
-                                Ok(Ok(()))
-                            } else {
-                                let missing_tables = tables
-                                    .iter()
-                                    .filter(|t| !conn_tables.iter().any(|t2| t2.name == **t))
-                                    .collect::<Vec<&String>>();
-                                Ok(Err(format!("missing tables: {missing_tables:?}")))
-                            }
-                        }
-                    },
-                ));
+                let assumptions = select
+                    .dependencies()
+                    .iter()
+                    .map(|table| Assertion::table_exists(table))
+                    .collect::<Vec<Assertion>>();
 
                 let old_predicate = select.body.select.where_clause.clone();
 
@@ -798,12 +756,17 @@ impl Property {
                     },
                 ));
 
-                vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select),
-                    Interaction::new(connection_index, select_tlp),
-                    Interaction::new(connection_index, assertion),
-                ]
+                let mut interactions = Vec::new();
+                interactions.extend(
+                    assumptions.into_iter().map(|a| {
+                        Interaction::new(connection_index, InteractionType::Assumption(a))
+                    }),
+                );
+                interactions.push(Interaction::new(connection_index, select));
+                interactions.push(Interaction::new(connection_index, select_tlp));
+                interactions.push(Interaction::new(connection_index, assertion));
+
+                interactions
             }
             Property::UNIONAllPreservesCardinality {
                 select,
