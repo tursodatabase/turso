@@ -41,15 +41,17 @@ pub fn translate_create_table(
     }
 
     if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
-        let mut indexes = (0..columns.len()).collect::<Vec<usize>>();
+        for i in 0..columns.len() {
+            let col_i = &columns[i];
 
-        indexes.sort_unstable_by_key(|&i| normalize_ident(columns[i].col_name.as_str()));
-
-        for w in indexes.windows(2) {
-            let name1 = normalize_ident(columns[w[0]].col_name.as_str());
-            let name2 = normalize_ident(columns[w[1]].col_name.as_str());
-            if name1 == name2 {
-                bail_parse_error!("duplicate column name: {}", columns[w[0]].col_name.as_str());
+            for j in &columns[(i + 1)..] {
+                if col_i
+                    .col_name
+                    .as_str()
+                    .eq_ignore_ascii_case(j.col_name.as_str())
+                {
+                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
+                }
             }
         }
     }
