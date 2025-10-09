@@ -1,5 +1,5 @@
 use crate::{
-    vector::vector_types::{Vector, VectorType},
+    vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
 
@@ -21,6 +21,10 @@ pub fn vector_distance_l2(v1: &Vector, v2: &Vector) -> Result<f64> {
         VectorType::Float64Dense => {
             Ok(vector_f64_distance_l2(v1.as_f64_slice(), v2.as_f64_slice()))
         }
+        VectorType::Float32Sparse => Ok(vector_f32_sparse_distance_l2(
+            v1.as_f32_sparse(),
+            v2.as_f32_sparse(),
+        )),
         _ => todo!(),
     }
 }
@@ -41,6 +45,24 @@ fn vector_f64_distance_l2(v1: &[f64], v2: &[f64]) -> f64 {
         .map(|(a, b)| (a - b).powi(2))
         .sum::<f64>();
     sum.sqrt()
+}
+
+fn vector_f32_sparse_distance_l2(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -> f64 {
+    let mut v1_pos = 0;
+    let mut v2_pos = 0;
+    let mut sum = 0.0;
+    while v1_pos < v1.idx.len() && v2_pos < v2.idx.len() {
+        if v1.idx[v1_pos] == v2.idx[v2_pos] {
+            sum += (v1.values[v1_pos] - v2.values[v2_pos]).powi(2);
+            v1_pos += 1;
+            v2_pos += 1;
+        } else if v1.idx[v1_pos] < v2.idx[v2_pos] {
+            v1_pos += 1;
+        } else {
+            v2_pos += 1;
+        }
+    }
+    sum as f64
 }
 
 #[cfg(test)]

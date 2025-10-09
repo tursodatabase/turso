@@ -1,5 +1,5 @@
 use crate::{
-    vector::vector_types::{Vector, VectorType},
+    vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
 
@@ -22,6 +22,10 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
         VectorType::Float64Dense => Ok(vector_f64_distance_cos(
             v1.as_f64_slice(),
             v2.as_f64_slice(),
+        )),
+        VectorType::Float32Sparse => Ok(vector_f32_sparse_distance_cos(
+            v1.as_f32_sparse(),
+            v2.as_f32_sparse(),
         )),
         _ => todo!(),
     }
@@ -67,6 +71,45 @@ fn vector_f64_distance_cos(v1: &[f64], v2: &[f64]) -> f64 {
     1.0 - (dot / (norm1 * norm2).sqrt())
 }
 
+fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -> f64 {
+    let mut v1_pos = 0;
+    let mut v2_pos = 0;
+    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
+    while v1_pos < v1.idx.len() && v2_pos < v2.idx.len() {
+        let e1 = v1.values[v1_pos];
+        let e2 = v2.values[v2_pos];
+        if v1.idx[v1_pos] == v2.idx[v2_pos] {
+            dot += e1 * e2;
+            norm1 += e1 * e1;
+            norm2 += e2 * e2;
+            v1_pos += 1;
+            v2_pos += 1;
+        } else if v1.idx[v1_pos] < v2.idx[v2_pos] {
+            norm1 += e1 * e1;
+            v1_pos += 1;
+        } else {
+            norm2 += e2 * e2;
+            v2_pos += 1;
+        }
+    }
+
+    while v1_pos < v1.idx.len() {
+        norm1 += v1.values[v1_pos] * v1.values[v1_pos];
+        v1_pos += 1;
+    }
+    while v2_pos < v2.idx.len() {
+        norm1 += v2.values[v2_pos] * v2.values[v2_pos];
+        v2_pos += 1;
+    }
+
+    // Check for zero norms
+    if norm1 == 0.0f32 || norm2 == 0.0f32 {
+        return f64::NAN;
+    }
+
+    (1.0f32 - (dot / (norm1 * norm2).sqrt())) as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +121,14 @@ mod tests {
         assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
         assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[-1.0, -2.0]), 2.0);
         assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[-2.0, 1.0]), 1.0);
+    }
+
+    #[test]
+    fn test_distance_cos_f64() {
+        assert!(vector_f64_distance_cos(&[], &[]).is_nan());
+        assert!(vector_f64_distance_cos(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
+        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-1.0, -2.0]), 2.0);
+        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-2.0, 1.0]), 1.0);
     }
 }

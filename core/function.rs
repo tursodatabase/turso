@@ -153,6 +153,7 @@ impl Display for JsonFunc {
 pub enum VectorFunc {
     Vector,
     Vector32,
+    Vector32Sparse,
     Vector64,
     VectorExtract,
     VectorDistanceCos,
@@ -172,6 +173,7 @@ impl Display for VectorFunc {
         let str = match self {
             Self::Vector => "vector".to_string(),
             Self::Vector32 => "vector32".to_string(),
+            Self::Vector32Sparse => "vector32_sparse".to_string(),
             Self::Vector64 => "vector64".to_string(),
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
@@ -864,6 +866,7 @@ impl Func {
             "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
             "vector" => Ok(Self::Vector(VectorFunc::Vector)),
             "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
+            "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
             "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),

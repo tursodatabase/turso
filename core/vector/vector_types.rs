@@ -14,9 +14,10 @@ pub struct Vector {
     pub data: Vec<u8>,
 }
 
-pub struct VectorSparse<'a, T> {
-    idx: &'a [u32],
-    values: &'a [T],
+#[derive(Debug)]
+pub struct VectorSparse<'a, T: std::fmt::Debug> {
+    pub idx: &'a [u32],
+    pub values: &'a [T],
 }
 
 impl Vector {
@@ -53,7 +54,7 @@ impl Vector {
         let (vector_type, data) = Self::vector_type(blob)?;
         Self::from_data(vector_type, data)
     }
-    pub fn from_data(vector_type: VectorType, data: Vec<u8>) -> Result<Self> {
+    pub fn from_data(vector_type: VectorType, mut data: Vec<u8>) -> Result<Self> {
         match vector_type {
             VectorType::Float32Dense => {
                 if data.len() % 4 != 0 {
@@ -88,7 +89,8 @@ impl Vector {
                         data.len(),
                     )));
                 }
-                let dims = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+                let dims_bytes = data.split_off(data.len() - 4);
+                let dims = u32::from_le_bytes(dims_bytes.try_into().unwrap()) as usize;
                 let vector = Vector {
                     vector_type,
                     dims,
@@ -162,9 +164,10 @@ impl Vector {
             0,
             "data pointer must be aligned to {align} bytes for f32 access"
         );
-        let length = (self.data.len() - 4) / 4 / 2;
+        let length = self.data.len() / 4 / 2;
         let values = unsafe { std::slice::from_raw_parts(ptr as *const f32, length) };
         let idx = unsafe { std::slice::from_raw_parts((ptr as *const u32).add(length), length) };
+        debug_assert!(idx.is_sorted());
         VectorSparse { idx, values }
     }
 }

@@ -20,7 +20,7 @@ use crate::types::{
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::{registers_to_ref_values, TxnCleanup};
-use crate::vector::{vector_concat, vector_slice};
+use crate::vector::{vector32_sparse, vector_concat, vector_slice};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -5195,6 +5195,10 @@ pub fn op_function(
             }
             VectorFunc::Vector32 => {
                 let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
+                state.registers[*dest] = Register::Value(result);
+            }
+            VectorFunc::Vector32Sparse => {
+                let result = vector32_sparse(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
             VectorFunc::Vector64 => {

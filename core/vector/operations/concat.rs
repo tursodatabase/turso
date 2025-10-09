@@ -17,6 +17,14 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
             data.extend_from_slice(&v2.data);
             data
         }
+        VectorType::Float32Sparse => {
+            let mut data = Vec::with_capacity(v1.data.len() + v2.data.len());
+            data.extend_from_slice(&v1.data[..v1.data.len() / 2]);
+            data.extend_from_slice(&v2.data[..v2.data.len() / 2]);
+            data.extend_from_slice(&v1.data[v1.data.len() / 2..]);
+            data.extend_from_slice(&v2.data[v2.data.len() / 2..]);
+            data
+        }
         _ => todo!(),
     };
 

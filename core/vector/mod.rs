@@ -8,10 +8,10 @@ pub mod operations;
 pub mod vector_types;
 use vector_types::*;
 
-pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vector> {
+pub fn parse_vector(value: &Register, type_hint: Option<VectorType>) -> Result<Vector> {
     match value.get_value().value_type() {
         ValueType::Text => operations::text::vector_from_text(
-            vec_ty.unwrap_or(VectorType::Float32Dense),
+            type_hint.unwrap_or(VectorType::Float32Dense),
             value.get_value().to_text().expect("value must be text"),
         ),
         ValueType::Blob => {
@@ -36,6 +36,17 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
     }
     let vector = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
+    Ok(operations::serialize::vector_serialize(vector))
+}
+
+pub fn vector32_sparse(args: &[Register]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(LimboError::ConversionError(
+            "vector32_sparse requires exactly one argument".to_string(),
+        ));
+    }
+    let vector = parse_vector(&args[0], Some(VectorType::Float32Sparse))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float32Sparse)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 

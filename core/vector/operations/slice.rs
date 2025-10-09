@@ -15,13 +15,35 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
         ));
     }
     match vector.vector_type {
-        VectorType::Float32Dense => {
-            Vector::from_data(vector.vector_type, vector.data[start * 4..end * 4].to_vec())
+        VectorType::Float32Dense => Ok(Vector {
+            vector_type: vector.vector_type,
+            dims: end - start + 1,
+            data: vector.data[start * 4..end * 4].to_vec(),
+        }),
+        VectorType::Float64Dense => Ok(Vector {
+            vector_type: vector.vector_type,
+            dims: end - start + 1,
+            data: vector.data[start * 8..end * 8].to_vec(),
+        }),
+        VectorType::Float32Sparse => {
+            let mut values = Vec::new();
+            let mut idx = Vec::new();
+            let sparse = vector.as_f32_sparse();
+            for (&i, &value) in sparse.idx.iter().zip(sparse.values.iter()) {
+                let i = i as usize;
+                if i < start || i >= end {
+                    continue;
+                }
+                values.extend_from_slice(&value.to_le_bytes());
+                idx.extend_from_slice(&i.to_le_bytes());
+            }
+            values.extend_from_slice(&idx);
+            Ok(Vector {
+                vector_type: vector.vector_type,
+                dims: end - start + 1,
+                data: values,
+            })
         }
-        VectorType::Float64Dense => {
-            Vector::from_data(vector.vector_type, vector.data[start * 8..end * 8].to_vec())
-        }
-        _ => todo!(),
     }
 }
 
