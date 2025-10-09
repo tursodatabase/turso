@@ -1,16 +1,37 @@
-use crate::types::ImmutableRecord;
+use std::cell::{Ref, RefCell};
 
-#[derive(Default)]
+use crate::{
+    types::{ImmutableRecord, RecordCursor},
+    Result, Value,
+};
+
 pub struct PseudoCursor {
-    current: Option<ImmutableRecord>,
+    record_cursor: RecordCursor,
+    current: RefCell<Option<ImmutableRecord>>,
 }
 
 impl PseudoCursor {
-    pub fn record(&self) -> Option<&ImmutableRecord> {
-        self.current.as_ref()
+    pub fn new() -> Self {
+        Self {
+            record_cursor: RecordCursor::new(),
+            current: RefCell::new(None),
+        }
+    }
+
+    pub fn record(&self) -> Ref<Option<ImmutableRecord>> {
+        self.current.borrow()
     }
 
     pub fn insert(&mut self, record: ImmutableRecord) {
-        self.current = Some(record);
+        self.record_cursor.invalidate();
+        self.current.replace(Some(record));
+    }
+
+    pub fn get_value(&mut self, column: usize) -> Result<Value> {
+        if let Some(record) = self.current.borrow().as_ref() {
+            Ok(self.record_cursor.get_value(record, column)?.to_owned())
+        } else {
+            Ok(Value::Null)
+        }
     }
 }
