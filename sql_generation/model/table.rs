@@ -3,7 +3,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types};
-use turso_parser::ast::{self, ColumnConstraint};
+use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
 
@@ -46,7 +46,7 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
-    pub indexes: Vec<String>,
+    pub indexes: Vec<Index>,
 }
 
 impl Table {
@@ -115,6 +115,13 @@ impl Display for ColumnType {
             Self::Blob => write!(f, "BLOB"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Index {
+    pub table_name: String,
+    pub index_name: String,
+    pub columns: Vec<(String, SortOrder)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

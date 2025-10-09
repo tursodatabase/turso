@@ -1,11 +1,26 @@
+use std::ops::{Deref, DerefMut};
+
 use serde::{Deserialize, Serialize};
-use turso_parser::ast::SortOrder;
+
+use crate::model::table::Index;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CreateIndex {
-    pub index_name: String,
-    pub table_name: String,
-    pub columns: Vec<(String, SortOrder)>,
+    pub index: Index,
+}
+
+impl Deref for CreateIndex {
+    type Target = Index;
+
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
+}
+
+impl DerefMut for CreateIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.index
+    }
 }
 
 impl std::fmt::Display for CreateIndex {
@@ -13,9 +28,10 @@ impl std::fmt::Display for CreateIndex {
         write!(
             f,
             "CREATE INDEX {} ON {} ({})",
-            self.index_name,
-            self.table_name,
-            self.columns
+            self.index.index_name,
+            self.index.table_name,
+            self.index
+                .columns
                 .iter()
                 .map(|(name, order)| format!("{name} {order}"))
                 .collect::<Vec<String>>()

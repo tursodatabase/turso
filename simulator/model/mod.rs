@@ -13,7 +13,7 @@ use sql_generation::model::{
         transaction::{Begin, Commit, Rollback},
         update::Update,
     },
-    table::{JoinTable, JoinType, SimValue, Table, TableContext},
+    table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
 use turso_parser::ast::Distinctness;
 
@@ -70,7 +70,9 @@ impl Query {
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
             | Query::CreateIndex(CreateIndex {
-                table_name: table, ..
+                index: Index {
+                    table_name: table, ..
+                },
             })
             | Query::AlterTable(AlterTable {
                 table_name: table, ..
@@ -89,7 +91,9 @@ impl Query {
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
             | Query::CreateIndex(CreateIndex {
-                table_name: table, ..
+                index: Index {
+                    table_name: table, ..
+                },
             })
             | Query::AlterTable(AlterTable {
                 table_name: table, ..
@@ -243,7 +247,7 @@ impl Shadow for CreateIndex {
             .find(|t| t.name == self.table_name)
             .unwrap()
             .indexes
-            .push(self.index_name.clone());
+            .push(self.index.clone());
         vec![]
     }
 }

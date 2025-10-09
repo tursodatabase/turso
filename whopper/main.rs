@@ -4,11 +4,13 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
-    model::query::{
-        create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
-        insert::Insert, select::Select, update::Update,
+    model::{
+        query::{
+            create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
+            insert::Insert, select::Select, update::Update,
+        },
+        table::{Column, ColumnType, Index, Table},
     },
-    model::table::{Column, ColumnType, Table},
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -306,9 +308,11 @@ fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateI
                 if !selected_columns.is_empty() {
                     let index_name = format!("idx_{}_{}", table.name, i);
                     let create_index = CreateIndex {
-                        index_name,
-                        table_name: table.name.clone(),
-                        columns: selected_columns,
+                        index: Index {
+                            index_name,
+                            table_name: table.name.clone(),
+                            columns: selected_columns,
+                        },
                     };
                     indexes.push(create_index);
                 }
