@@ -280,9 +280,8 @@ impl Sorter {
                 // TODO: blocking will be unnecessary here with IO completions
                 let mut completions = vec![];
                 for chunk_idx in 0..self.chunks.len() {
-                    match self.push_to_chunk_heap(chunk_idx)? {
-                        Some(c) => completions.push(c),
-                        None => (),
+                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                        completions.push(c);
                     };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;

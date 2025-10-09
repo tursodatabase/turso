@@ -10,14 +10,16 @@ pub struct PseudoCursor {
     current: RefCell<Option<ImmutableRecord>>,
 }
 
-impl PseudoCursor {
-    pub fn new() -> Self {
+impl Default for PseudoCursor {
+    fn default() -> Self {
         Self {
             record_cursor: RecordCursor::new(),
             current: RefCell::new(None),
         }
     }
+}
 
+impl PseudoCursor {
     pub fn record(&self) -> Ref<Option<ImmutableRecord>> {
         self.current.borrow()
     }

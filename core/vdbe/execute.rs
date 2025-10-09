@@ -1389,7 +1389,7 @@ pub fn op_open_pseudo(
     );
     {
         let cursors = &mut state.cursors;
-        let cursor = PseudoCursor::new();
+        let cursor = PseudoCursor::default();
         cursors
             .get_mut(*cursor_id)
             .unwrap()
