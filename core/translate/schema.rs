@@ -40,6 +40,19 @@ pub fn translate_create_table(
         bail_parse_error!("TEMPORARY table not supported yet");
     }
 
+    // maybe we can do better than this.
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        for i in 0..columns.len() {
+            let name1 = normalize_ident(columns[i].col_name.as_str());
+            for j in (i + 1)..columns.len() {
+                let name2 = normalize_ident(columns[j].col_name.as_str());
+                if name1 == name2 {
+                    bail_parse_error!("duplicate column name: {}", columns[i].col_name.as_str());
+                }
+            }
+        }
+    }
+
     // Check for STRICT mode without experimental flag
     if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
         if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
