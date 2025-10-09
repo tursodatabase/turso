@@ -100,7 +100,9 @@ pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
-pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
+pub use vdbe::{
+    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, likeop,
+};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
