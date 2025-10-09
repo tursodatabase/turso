@@ -13,15 +13,8 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
             "vector32 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
-    // Extract the Vec<u8> from Value
-    if let Value::Blob(data) = vector_serialize_f32(x) {
-        Ok(Value::Blob(data))
-    } else {
-        Err(LimboError::ConversionError(
-            "Failed to serialize vector".to_string(),
-        ))
-    }
+    let vector = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector64(args: &[Register]) -> Result<Value> {
@@ -30,15 +23,8 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
             "vector64 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float64Dense))?;
-    // Extract the Vec<u8> from Value
-    if let Value::Blob(data) = vector_serialize_f64(x) {
-        Ok(Value::Blob(data))
-    } else {
-        Err(LimboError::ConversionError(
-            "Failed to serialize vector".to_string(),
-        ))
-    }
+    let vector = parse_vector(&args[0], Some(VectorType::Float64Dense))?;
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector_extract(args: &[Register]) -> Result<Value> {
@@ -63,7 +49,7 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
 
     let vector_type = vector_type(blob)?;
     let vector = vector_deserialize(vector_type, blob)?;
-    Ok(Value::build_text(vector_to_text(&vector)))
+    Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 
 pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
@@ -102,10 +88,7 @@ pub fn vector_concat(args: &[Register]) -> Result<Value> {
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
     let vector = operations::concat::vector_concat(&x, &y)?;
-    match vector.vector_type {
-        VectorType::Float32Dense => Ok(vector_serialize_f32(vector)),
-        VectorType::Float64Dense => Ok(vector_serialize_f64(vector)),
-    }
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector_slice(args: &[Register]) -> Result<Value> {
@@ -136,8 +119,5 @@ pub fn vector_slice(args: &[Register]) -> Result<Value> {
     let result =
         operations::slice::vector_slice(&vector, start_index as usize, end_index as usize)?;
 
-    Ok(match result.vector_type {
-        VectorType::Float32Dense => vector_serialize_f32(result),
-        VectorType::Float64Dense => vector_serialize_f64(result),
-    })
+    Ok(operations::serialize::vector_serialize(result))
 }
