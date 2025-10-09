@@ -27,7 +27,6 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
             v1.as_f32_sparse(),
             v2.as_f32_sparse(),
         )),
-        _ => todo!(),
     }
 }
 
@@ -98,7 +97,7 @@ fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) 
         v1_pos += 1;
     }
     while v2_pos < v2.idx.len() {
-        norm1 += v2.values[v2_pos] * v2.values[v2_pos];
+        norm2 += v2.values[v2_pos] * v2.values[v2_pos];
         v2_pos += 1;
     }
 
@@ -130,5 +129,23 @@ mod tests {
         assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
         assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-1.0, -2.0]), 2.0);
         assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-2.0, 1.0]), 1.0);
+    }
+
+    #[test]
+    fn test_distance_cos_f32_sparse() {
+        assert!(
+            (vector_f32_sparse_distance_cos(
+                VectorSparse {
+                    idx: &[0, 1],
+                    values: &[1.0, 2.0]
+                },
+                VectorSparse {
+                    idx: &[1, 2],
+                    values: &[1.0, 3.0]
+                },
+            ) - vector_f32_distance_cos(&[1.0, 2.0, 0.0], &[0.0, 1.0, 3.0]))
+            .abs()
+                < 1e-7
+        );
     }
 }

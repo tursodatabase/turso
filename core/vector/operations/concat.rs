@@ -25,7 +25,6 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
             data.extend_from_slice(&v2.data[v2.data.len() / 2..]);
             data
         }
-        _ => todo!(),
     };
 
     Ok(Vector {
