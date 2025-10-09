@@ -39,7 +39,7 @@ fn vector_f32_distance_jaccard(v1: &[f32], v2: &[f32]) -> f64 {
     if max_sum == 0.0 {
         return f64::NAN;
     }
-    1. - (min_sum / min_sum) as f64
+    1. - (min_sum / max_sum) as f64
 }
 
 fn vector_f64_distance_jaccard(v1: &[f64], v2: &[f64]) -> f64 {
@@ -51,7 +51,7 @@ fn vector_f64_distance_jaccard(v1: &[f64], v2: &[f64]) -> f64 {
     if max_sum == 0.0 {
         return f64::NAN;
     }
-    1. - min_sum / min_sum
+    1. - min_sum / max_sum
 }
 
 fn vector_f32_sparse_distance_jaccard(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -> f64 {

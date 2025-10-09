@@ -41,7 +41,7 @@ impl Vector {
         match vector_type {
             1 => Ok((VectorType::Float32Dense, blob)),
             2 => Ok((VectorType::Float64Dense, blob)),
-            3 | 4 | 5 | 6 => Err(LimboError::ConversionError(
+            3..=6 => Err(LimboError::ConversionError(
                 "unsupported vector type from LibSQL".to_string(),
             )),
             9 => Ok((VectorType::Float32Sparse, blob)),
@@ -83,7 +83,7 @@ impl Vector {
                 })
             }
             VectorType::Float32Sparse => {
-                if data.len() == 0 || data.len() % 4 != 0 || (data.len() - 4) % 8 != 0 {
+                if data.is_empty() || data.len() % 4 != 0 || (data.len() - 4) % 8 != 0 {
                     return Err(LimboError::InvalidArgument(format!(
                         "f32 sparse vector unexpected data length: {}",
                         data.len(),
