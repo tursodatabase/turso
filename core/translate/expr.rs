@@ -904,7 +904,7 @@ pub fn translate_expr(
                         emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
                         Ok(target_register)
                     }
-                    VectorFunc::VectorDistanceEuclidean => {
+                    VectorFunc::VectorDistanceL2 => {
                         let args = expect_arguments_exact!(args, 2, vector_func);
                         let regs = program.alloc_registers(2);
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;

@@ -5210,7 +5210,7 @@ pub fn op_function(
                     vector_distance_cos(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
-            VectorFunc::VectorDistanceEuclidean => {
+            VectorFunc::VectorDistanceL2 => {
                 let result =
                     vector_distance_l2(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
