@@ -3,51 +3,25 @@ use crate::{
     LimboError, Result,
 };
 
-pub fn vector_slice(vector: &Vector, start_idx: usize, end_idx: usize) -> Result<Vector> {
-    fn extract_bytes<T, const N: usize>(
-        slice: &[T],
-        start: usize,
-        end: usize,
-        to_bytes: impl Fn(&T) -> [u8; N],
-    ) -> Result<Vec<u8>> {
-        if start > end {
-            return Err(LimboError::InvalidArgument(
-                "start index must not be greater than end index".into(),
-            ));
-        }
-        if end > slice.len() || end < start {
-            return Err(LimboError::ConversionError(
-                "vector_slice range out of bounds".into(),
-            ));
-        }
-
-        let mut buf = Vec::with_capacity((end - start) * N);
-        for item in &slice[start..end] {
-            buf.extend_from_slice(&to_bytes(item));
-        }
-        Ok(buf)
+pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector> {
+    if start > end {
+        return Err(LimboError::InvalidArgument(
+            "start index must not be greater than end index".into(),
+        ));
     }
-
-    let (vector_type, data) = match vector.vector_type {
-        VectorType::Float32Dense => (
-            VectorType::Float32Dense,
-            extract_bytes::<f32, 4>(vector.as_f32_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-        VectorType::Float64Dense => (
-            VectorType::Float64Dense,
-            extract_bytes::<f64, 8>(vector.as_f64_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-    };
-
-    Ok(Vector {
-        vector_type,
-        dims: end_idx - start_idx,
-        data,
-    })
+    if end > vector.dims || end < start {
+        return Err(LimboError::ConversionError(
+            "vector_slice range out of bounds".into(),
+        ));
+    }
+    match vector.vector_type {
+        VectorType::Float32Dense => {
+            Vector::from_data(vector.vector_type, vector.data[start * 4..end * 4].to_vec())
+        }
+        VectorType::Float64Dense => {
+            Vector::from_data(vector.vector_type, vector.data[start * 8..end * 8].to_vec())
+        }
+    }
 }
 
 #[cfg(test)]
