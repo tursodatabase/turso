@@ -35,6 +35,7 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
         ));
     }
     let vector = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
@@ -45,6 +46,7 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
         ));
     }
     let vector = parse_vector(&args[0], Some(VectorType::Float64Dense))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float64Dense)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
