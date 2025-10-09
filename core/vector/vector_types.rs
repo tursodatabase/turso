@@ -4,15 +4,15 @@ use crate::{LimboError, Result};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
-    Float32,
-    Float64,
+    Float32Dense,
+    Float64Dense,
 }
 
 impl VectorType {
     pub fn size_to_dims(&self, size: usize) -> usize {
         match self {
-            VectorType::Float32 => size / 4,
-            VectorType::Float64 => size / 8,
+            VectorType::Float32Dense => size / 4,
+            VectorType::Float64Dense => size / 8,
         }
     }
 }
@@ -120,7 +120,7 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
             ));
         }
         match vector_type {
-            VectorType::Float32 => {
+            VectorType::Float32Dense => {
                 let x = x
                     .parse::<f32>()
                     .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
@@ -131,7 +131,7 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
                 }
                 data.extend_from_slice(&x.to_le_bytes());
             }
-            VectorType::Float64 => {
+            VectorType::Float64Dense => {
                 let x = x
                     .parse::<f64>()
                     .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
@@ -154,9 +154,10 @@ pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vec
 
 pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vector> {
     match value.get_value().value_type() {
-        ValueType::Text => {
-            parse_string_vector(vec_ty.unwrap_or(VectorType::Float32), value.get_value())
-        }
+        ValueType::Text => parse_string_vector(
+            vec_ty.unwrap_or(VectorType::Float32Dense),
+            value.get_value(),
+        ),
         ValueType::Blob => {
             let Some(blob) = value.get_value().to_blob() else {
                 return Err(LimboError::ConversionError(
@@ -183,7 +184,7 @@ pub fn vector_to_text(vector: &Vector) -> String {
     let mut text = String::new();
     text.push('[');
     match vector.vector_type {
-        VectorType::Float32 => {
+        VectorType::Float32Dense => {
             let data = vector.as_f32_slice();
             for (i, value) in data.iter().enumerate().take(vector.dims) {
                 text.push_str(&value.to_string());
@@ -192,7 +193,7 @@ pub fn vector_to_text(vector: &Vector) -> String {
                 }
             }
         }
-        VectorType::Float64 => {
+        VectorType::Float64Dense => {
             let data = vector.as_f64_slice();
             for (i, value) in data.iter().enumerate().take(vector.dims) {
                 text.push_str(&value.to_string());
@@ -208,8 +209,8 @@ pub fn vector_to_text(vector: &Vector) -> String {
 
 pub fn vector_deserialize(vector_type: VectorType, blob: &[u8]) -> Result<Vector> {
     match vector_type {
-        VectorType::Float32 => vector_deserialize_f32(blob),
-        VectorType::Float64 => vector_deserialize_f64(blob),
+        VectorType::Float32Dense => vector_deserialize_f32(blob),
+        VectorType::Float64Dense => vector_deserialize_f64(blob),
     }
 }
 
@@ -222,7 +223,7 @@ pub fn vector_serialize_f64(x: Vector) -> Value {
 
 pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
     Ok(Vector {
-        vector_type: VectorType::Float64,
+        vector_type: VectorType::Float64Dense,
         dims: (blob.len() - 1) / 8,
         data: blob[..blob.len() - 1].to_vec(),
     })
@@ -234,7 +235,7 @@ pub fn vector_serialize_f32(x: Vector) -> Value {
 
 pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {
     Ok(Vector {
-        vector_type: VectorType::Float32,
+        vector_type: VectorType::Float32Dense,
         dims: blob.len() / 4,
         data: blob.to_vec(),
     })
@@ -242,8 +243,8 @@ pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {
 
 pub fn do_vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
     match v1.vector_type {
-        VectorType::Float32 => vector_f32_distance_cos(v1, v2),
-        VectorType::Float64 => vector_f64_distance_cos(v1, v2),
+        VectorType::Float32Dense => vector_f32_distance_cos(v1, v2),
+        VectorType::Float64Dense => vector_f64_distance_cos(v1, v2),
     }
 }
 
@@ -330,7 +331,7 @@ pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
 pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
     // Even-sized blobs are always float32.
     if blob.len() % 2 == 0 {
-        return Ok(VectorType::Float32);
+        return Ok(VectorType::Float32Dense);
     }
     // Odd-sized blobs have type byte at the end
     let (data_blob, type_byte) = blob.split_at(blob.len() - 1);
@@ -342,7 +343,7 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
                     "Invalid vector value".to_string(),
                 ));
             }
-            Ok(VectorType::Float32)
+            Ok(VectorType::Float32Dense)
         }
         2 => {
             if data_blob.len() % 8 != 0 {
@@ -350,7 +351,7 @@ pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
                     "Invalid vector value".to_string(),
                 ));
             }
-            Ok(VectorType::Float64)
+            Ok(VectorType::Float64Dense)
         }
         _ => Err(LimboError::ConversionError(
             "Invalid vector type".to_string(),
@@ -402,14 +403,14 @@ pub fn vector_slice(vector: &Vector, start_idx: usize, end_idx: usize) -> Result
     }
 
     let (vector_type, data) = match vector.vector_type {
-        VectorType::Float32 => (
-            VectorType::Float32,
+        VectorType::Float32Dense => (
+            VectorType::Float32Dense,
             extract_bytes::<f32, 4>(vector.as_f32_slice(), start_idx, end_idx, |v| {
                 v.to_le_bytes()
             })?,
         ),
-        VectorType::Float64 => (
-            VectorType::Float64,
+        VectorType::Float64Dense => (
+            VectorType::Float64Dense,
             extract_bytes::<f64, 8>(vector.as_f64_slice(), start_idx, end_idx, |v| {
                 v.to_le_bytes()
             })?,
@@ -486,17 +487,17 @@ mod tests {
     impl<const DIMS: usize> Arbitrary for ArbitraryVector<DIMS> {
         fn arbitrary(g: &mut Gen) -> Self {
             let vector_type = if bool::arbitrary(g) {
-                VectorType::Float32
+                VectorType::Float32Dense
             } else {
-                VectorType::Float64
+                VectorType::Float64Dense
             };
 
             let data = match vector_type {
-                VectorType::Float32 => {
+                VectorType::Float32Dense => {
                     let floats = Self::generate_f32_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
-                VectorType::Float64 => {
+                VectorType::Float64Dense => {
                     let floats = Self::generate_f64_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
@@ -535,8 +536,8 @@ mod tests {
     fn test_vector_type<const DIMS: usize>(v: Vector) -> bool {
         let vtype = v.vector_type;
         let value = match &vtype {
-            VectorType::Float32 => vector_serialize_f32(v),
-            VectorType::Float64 => vector_serialize_f64(v),
+            VectorType::Float32Dense => vector_serialize_f32(v),
+            VectorType::Float64Dense => vector_serialize_f64(v),
         };
 
         let blob = value.to_blob().unwrap();
@@ -576,12 +577,12 @@ mod tests {
     /// - The data length is correct (4 bytes per float for f32, 8 bytes per float for f64)
     fn test_slice_conversion<const DIMS: usize>(v: Vector) -> bool {
         match v.vector_type {
-            VectorType::Float32 => {
+            VectorType::Float32Dense => {
                 let slice = v.as_f32_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (4 bytes per float)
                 slice.len() == DIMS && (slice.len() * 4 == v.data.len())
             }
-            VectorType::Float64 => {
+            VectorType::Float64Dense => {
                 let slice = v.as_f64_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
                 slice.len() == DIMS && (slice.len() * 8 == v.data.len())
@@ -667,25 +668,25 @@ mod tests {
     #[test]
     fn parse_string_vector_zero_length() {
         let value = Value::from_text("[]");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
+        let vector = parse_string_vector(VectorType::Float32Dense, &value).unwrap();
         assert_eq!(vector.dims, 0);
-        assert_eq!(vector.vector_type, VectorType::Float32);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     #[test]
     fn test_parse_string_vector_valid_whitespace() {
         let value = Value::from_text("  [  1.0  ,  2.0  ,  3.0  ]  ");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
+        let vector = parse_string_vector(VectorType::Float32Dense, &value).unwrap();
         assert_eq!(vector.dims, 3);
-        assert_eq!(vector.vector_type, VectorType::Float32);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     #[test]
     fn test_parse_string_vector_valid() {
         let value = Value::from_text("[1.0, 2.0, 3.0]");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
+        let vector = parse_string_vector(VectorType::Float32Dense, &value).unwrap();
         assert_eq!(vector.dims, 3);
-        assert_eq!(vector.vector_type, VectorType::Float32);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     fn float32_vec_from(slice: &[f32]) -> Vector {
@@ -695,7 +696,7 @@ mod tests {
         }
 
         Vector {
-            vector_type: VectorType::Float32,
+            vector_type: VectorType::Float32Dense,
             dims: slice.len(),
             data,
         }
@@ -713,7 +714,7 @@ mod tests {
         let result = vector_concat(&v1, &v2).unwrap();
 
         assert_eq!(result.dims, 6);
-        assert_eq!(result.vector_type, VectorType::Float32);
+        assert_eq!(result.vector_type, VectorType::Float32Dense);
         assert_eq!(
             f32_slice_from_vector(&result),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -867,12 +868,12 @@ mod tests {
                 }
 
                 match v.vector_type {
-                    VectorType::Float32 => {
+                    VectorType::Float32Dense => {
                         let original = v.as_f32_slice();
                         let parsed = parsed_vector.as_f32_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
-                    VectorType::Float64 => {
+                    VectorType::Float64Dense => {
                         let original = v.as_f64_slice();
                         let parsed = parsed_vector.as_f64_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)

@@ -12,8 +12,8 @@ impl DistanceCalculator for Euclidean {
 
     fn calculate(v1: &Vector, v2: &Vector) -> Result<f64> {
         match v1.vector_type {
-            VectorType::Float32 => Ok(euclidean_distance_f32(v1.as_f32_slice(), v2.as_f32_slice())),
-            VectorType::Float64 => Ok(euclidean_distance_f64(v1.as_f64_slice(), v2.as_f64_slice())),
+            VectorType::Float32Dense => Ok(euclidean_distance_f32(v1.as_f32_slice(), v2.as_f32_slice())),
+            VectorType::Float64Dense => Ok(euclidean_distance_f64(v1.as_f64_slice(), v2.as_f64_slice())),
         }
     }
 }

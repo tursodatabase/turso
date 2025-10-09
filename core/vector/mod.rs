@@ -14,7 +14,7 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
             "vector32 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float32))?;
+    let x = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
     // Extract the Vec<u8> from Value
     if let Value::Blob(data) = vector_serialize_f32(x) {
         Ok(Value::Blob(data))
@@ -31,7 +31,7 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
             "vector64 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float64))?;
+    let x = parse_vector(&args[0], Some(VectorType::Float64Dense))?;
     // Extract the Vec<u8> from Value
     if let Value::Blob(data) = vector_serialize_f64(x) {
         Ok(Value::Blob(data))
@@ -123,8 +123,8 @@ pub fn vector_concat(args: &[Register]) -> Result<Value> {
 
     let vector = vector_types::vector_concat(&x, &y)?;
     match vector.vector_type {
-        VectorType::Float32 => Ok(vector_serialize_f32(vector)),
-        VectorType::Float64 => Ok(vector_serialize_f64(vector)),
+        VectorType::Float32Dense => Ok(vector_serialize_f32(vector)),
+        VectorType::Float64Dense => Ok(vector_serialize_f64(vector)),
     }
 }
 
@@ -156,7 +156,7 @@ pub fn vector_slice(args: &[Register]) -> Result<Value> {
     let result = vector_types::vector_slice(&vector, start_index as usize, end_index as usize)?;
 
     Ok(match result.vector_type {
-        VectorType::Float32 => vector_serialize_f32(result),
-        VectorType::Float64 => vector_serialize_f64(result),
+        VectorType::Float32Dense => vector_serialize_f32(result),
+        VectorType::Float64Dense => vector_serialize_f64(result),
     })
 }
