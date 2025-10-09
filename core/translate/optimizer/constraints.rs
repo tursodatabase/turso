@@ -67,17 +67,17 @@ pub enum BinaryExprSide {
 }
 
 impl Constraint {
-    /// Get the constraining expression, e.g. '2+3' from 't.x = 2+3'
-    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> ast::Expr {
+    /// Get the constraining expression and operator, e.g. ('>=', '2+3') from 't.x >= 2+3'
+    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> (ast::Operator, ast::Expr) {
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
         let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
             panic!("Expected a valid binary expression");
         };
         if side == BinaryExprSide::Lhs {
-            lhs.clone()
+            (self.operator, lhs.clone())
         } else {
-            rhs.clone()
+            (self.operator, rhs.clone())
         }
     }
 
@@ -106,19 +106,6 @@ pub struct ConstraintRef {
     pub index_col_pos: usize,
     /// The sort order of the constrained column in the index. Always ascending for rowid indices.
     pub sort_order: SortOrder,
-}
-
-impl ConstraintRef {
-    /// Convert the constraint to a column usable in a [crate::translate::plan::SeekDef::key].
-    pub fn as_seek_key_column(
-        &self,
-        constraints: &[Constraint],
-        where_clause: &[WhereTerm],
-    ) -> (ast::Expr, SortOrder) {
-        let constraint = &constraints[self.constraint_vec_pos];
-        let constraining_expr = constraint.get_constraining_expr(where_clause);
-        (constraining_expr, self.sort_order)
-    }
 }
 
 /// A collection of [ConstraintRef]s for a given index, or if index is None, for the table's rowid index.
@@ -150,6 +137,7 @@ pub struct ConstraintUseCandidate {
     /// The index that may be used to satisfy the constraints. If none, the table's rowid index is used.
     pub index: Option<Arc<Index>>,
     /// References to the constraints that may be used as an access path for the index.
+    /// Refs are sorted by [ConstraintRef::index_col_pos]
     pub refs: Vec<ConstraintRef>,
 }
 
@@ -193,6 +181,9 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
+///
+/// This method do not perform much filtering of constraints and delegate this tasks to the consumers of the method
+/// Consumers must inspect [TableConstraints] and its candidates and pick best constraints for optimized access
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
@@ -379,24 +370,6 @@ pub fn constraints_from_where_clause(
         for candidate in cs.candidates.iter_mut() {
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
-            // Deduplicate by position, keeping first occurrence (which will be equality if one exists, since the constraints vec is sorted that way)
-            candidate.refs.dedup_by_key(|cref| cref.index_col_pos);
-            // Truncate at first gap in positions -- again, index columns must be consumed in contiguous order.
-            let contiguous_len = candidate
-                .refs
-                .iter()
-                .enumerate()
-                .take_while(|(i, cref)| cref.index_col_pos == *i)
-                .count();
-            candidate.refs.truncate(contiguous_len);
-
-            // Truncate after the first inequality, since the left-prefix rule of indexes requires that all constraints but the last one must be equalities;
-            // again see: https://www.solarwinds.com/blog/the-left-prefix-index-rule
-            if let Some(first_inequality) = candidate.refs.iter().position(|cref| {
-                cs.constraints[cref.constraint_vec_pos].operator != ast::Operator::Equals
-            }) {
-                candidate.refs.truncate(first_inequality + 1);
-            }
         }
         cs.candidates.retain(|c| {
             if let Some(idx) = &c.index {
@@ -413,6 +386,87 @@ pub fn constraints_from_where_clause(
     Ok(constraints)
 }
 
+#[derive(Clone, Debug)]
+/// A reference to a [Constraint]s in a [TableConstraints] for single column.
+///
+/// This is specialized version of [ConstraintRef] which specifically holds range-like constraints:
+/// - x = 10 (eq is set)
+/// - x >= 10, x > 10 (lower_bound is set)
+/// - x <= 10, x < 10 (upper_bound is set)
+/// - x > 10 AND x < 20 (both lower_bound and upper_bound are set)
+///
+/// eq, lower_bound and upper_bound holds None or position of the constraint in the [Constraint] array
+pub struct RangeConstraintRef {
+    /// position of the column in the table definition
+    pub table_col_pos: usize,
+    /// position of the column in the index definition
+    pub index_col_pos: usize,
+    /// sort order for the column in the index definition
+    pub sort_order: SortOrder,
+    /// equality constraint
+    pub eq: Option<usize>,
+    /// lower bound constraint (either > or >=)
+    pub lower_bound: Option<usize>,
+    /// upper bound constraint (either < or <=)
+    pub upper_bound: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+/// Represent seek range which can be used in query planning to emit range scan over table or index
+pub struct SeekRangeConstraint {
+    pub sort_order: SortOrder,
+    pub eq: Option<(ast::Operator, ast::Expr)>,
+    pub lower_bound: Option<(ast::Operator, ast::Expr)>,
+    pub upper_bound: Option<(ast::Operator, ast::Expr)>,
+}
+
+impl SeekRangeConstraint {
+    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr)) -> Self {
+        Self {
+            sort_order,
+            eq: Some(eq),
+            lower_bound: None,
+            upper_bound: None,
+        }
+    }
+    pub fn new_range(
+        sort_order: SortOrder,
+        lower_bound: Option<(ast::Operator, ast::Expr)>,
+        upper_bound: Option<(ast::Operator, ast::Expr)>,
+    ) -> Self {
+        assert!(lower_bound.is_some() || upper_bound.is_some());
+        Self {
+            sort_order,
+            eq: None,
+            lower_bound,
+            upper_bound,
+        }
+    }
+}
+
+impl RangeConstraintRef {
+    /// Convert the [RangeConstraintRef] to a [SeekRangeConstraint] usable in a [crate::translate::plan::SeekDef::key].
+    pub fn as_seek_range_constraint(
+        &self,
+        constraints: &[Constraint],
+        where_clause: &[WhereTerm],
+    ) -> SeekRangeConstraint {
+        if let Some(eq) = self.eq {
+            return SeekRangeConstraint::new_eq(
+                self.sort_order,
+                constraints[eq].get_constraining_expr(where_clause),
+            );
+        }
+        SeekRangeConstraint::new_range(
+            self.sort_order,
+            self.lower_bound
+                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+            self.upper_bound
+                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+        )
+    }
+}
+
 /// Find which [Constraint]s are usable for a given join order.
 /// Returns a slice of the references to the constraints that are usable.
 /// A constraint is considered usable for a given table if all of the other tables referenced by the constraint
@@ -421,28 +475,88 @@ pub fn usable_constraints_for_join_order<'a>(
     constraints: &'a [Constraint],
     refs: &'a [ConstraintRef],
     join_order: &[JoinOrderMember],
-) -> &'a [ConstraintRef] {
+) -> Vec<RangeConstraintRef> {
+    debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
+
     let table_idx = join_order.last().unwrap().original_idx;
-    let mut usable_until = 0;
+    let lhs_mask = TableMask::from_table_number_iter(
+        join_order
+            .iter()
+            .take(join_order.len() - 1)
+            .map(|j| j.original_idx),
+    );
+    let mut usable: Vec<RangeConstraintRef> = Vec::new();
+    let mut last_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
         let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
         if other_side_refers_to_self {
             break;
         }
-        let lhs_mask = TableMask::from_table_number_iter(
-            join_order
-                .iter()
-                .take(join_order.len() - 1)
-                .map(|j| j.original_idx),
-        );
         let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
         if !all_required_tables_are_on_left_side {
             break;
         }
-        usable_until += 1;
+        if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
+            assert_eq!(cref.sort_order, usable.last().unwrap().sort_order);
+            assert_eq!(cref.index_col_pos, usable.last().unwrap().index_col_pos);
+            assert_eq!(
+                constraints[cref.constraint_vec_pos].table_col_pos,
+                usable.last().unwrap().table_col_pos
+            );
+            // if we already have eq constraint - we must not add anything to it
+            // otherwise, we can incorrectly consume filters which will not be used in the access path
+            if usable.last().unwrap().eq.is_some() {
+                continue;
+            }
+            match constraints[cref.constraint_vec_pos].operator {
+                ast::Operator::Greater | ast::Operator::GreaterEquals => {
+                    usable.last_mut().unwrap().lower_bound = Some(cref.constraint_vec_pos);
+                }
+                ast::Operator::Less | ast::Operator::LessEquals => {
+                    usable.last_mut().unwrap().upper_bound = Some(cref.constraint_vec_pos);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if cref.index_col_pos != last_column_pos {
+            break;
+        }
+        if usable.last().is_some_and(|x| x.eq.is_none()) {
+            break;
+        }
+        let constraint_group = match constraints[cref.constraint_vec_pos].operator {
+            ast::Operator::Equals => RangeConstraintRef {
+                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                index_col_pos: cref.index_col_pos,
+                sort_order: cref.sort_order,
+                eq: Some(cref.constraint_vec_pos),
+                lower_bound: None,
+                upper_bound: None,
+            },
+            ast::Operator::Greater | ast::Operator::GreaterEquals => RangeConstraintRef {
+                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                index_col_pos: cref.index_col_pos,
+                sort_order: cref.sort_order,
+                eq: None,
+                lower_bound: Some(cref.constraint_vec_pos),
+                upper_bound: None,
+            },
+            ast::Operator::Less | ast::Operator::LessEquals => RangeConstraintRef {
+                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                index_col_pos: cref.index_col_pos,
+                sort_order: cref.sort_order,
+                eq: None,
+                lower_bound: None,
+                upper_bound: Some(cref.constraint_vec_pos),
+            },
+            _ => continue,
+        };
+        usable.push(constraint_group);
+        last_column_pos += 1;
     }
-    &refs[..usable_until]
+    usable
 }
 
 fn can_use_partial_index(index: &Index, query_where_clause: &[WhereTerm]) -> bool {

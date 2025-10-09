@@ -1119,7 +1119,7 @@ impl Pager {
         let changed = wal.borrow_mut().begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
-            self.clear_page_cache();
+            self.clear_page_cache(false);
         }
         Ok(())
     }
@@ -1808,7 +1808,7 @@ impl Pager {
     /// Invalidates entire page cache by removing all dirty and clean pages. Usually used in case
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
-    pub fn clear_page_cache(&self) {
+    pub fn clear_page_cache(&self, clear_dirty: bool) {
         let dirty_pages = self.dirty_pages.read();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -1817,7 +1817,9 @@ impl Pager {
                 page.clear_dirty();
             }
         }
-        cache.clear().expect("Failed to clear page cache");
+        cache
+            .clear(clear_dirty)
+            .expect("Failed to clear page cache");
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
@@ -1922,7 +1924,7 @@ impl Pager {
         // TODO: only clear cache of things that are really invalidated
         self.page_cache
             .write()
-            .clear()
+            .clear(false)
             .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
         Ok(IOResult::Done(()))
     }
@@ -2403,7 +2405,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
-        self.clear_page_cache();
+        self.clear_page_cache(is_write);
         if is_write {
             self.dirty_pages.write().clear();
         } else {
@@ -2484,7 +2486,7 @@ impl Pager {
         // might have been loaded with page 1 to initialise the connection. During initialisation,
         // we only read the header which is unencrypted, but the rest of the page is. If so, lets
         // clear the cache.
-        self.clear_page_cache();
+        self.clear_page_cache(false);
         Ok(())
     }
 

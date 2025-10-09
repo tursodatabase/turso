@@ -381,11 +381,28 @@ mod tests {
             // Use a small limit to make the test complete faster
             let limit = 5;
 
-            // Generate WHERE clause string
+            /// Generate a comparison string (e.g. x > 10 AND x < 20) or just x > 10.
+            fn generate_comparison(
+                operator: &str,
+                col_name: &str,
+                col_val: i32,
+                rng: &mut ChaCha8Rng,
+            ) -> String {
+                if operator != "=" && rng.random_range(0..3) == 1 {
+                    let val2 = rng.random_range(0..=3000);
+                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
+                    format!("{col_name} {operator} {col_val} AND {col_name} {op2} {val2}")
+                } else {
+                    format!("{col_name} {operator} {col_val}")
+                }
+            }
+
+            // Generate WHERE clause string.
+            // Sometimes add another inequality to the WHERE clause (e.g. x > 10 AND x < 20) to exercise range queries.
             let where_clause_components = vec![
-                comp1.map(|x| format!("x {} {}", x, col_val_first.unwrap())),
-                comp2.map(|x| format!("y {} {}", x, col_val_second.unwrap())),
-                comp3.map(|x| format!("z {} {}", x, col_val_third.unwrap())),
+                comp1.map(|x| generate_comparison(x, "x", col_val_first.unwrap(), &mut rng)),
+                comp2.map(|x| generate_comparison(x, "y", col_val_second.unwrap(), &mut rng)),
+                comp3.map(|x| generate_comparison(x, "z", col_val_third.unwrap(), &mut rng)),
             ]
             .into_iter()
             .flatten()

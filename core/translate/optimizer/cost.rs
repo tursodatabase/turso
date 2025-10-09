@@ -1,4 +1,6 @@
-use super::constraints::{Constraint, ConstraintRef};
+use crate::translate::optimizer::constraints::RangeConstraintRef;
+
+use super::constraints::Constraint;
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -43,7 +45,7 @@ pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
 pub fn estimate_cost_for_scan_or_seek(
     index_info: Option<IndexInfo>,
     constraints: &[Constraint],
-    usable_constraint_refs: &[ConstraintRef],
+    usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
 ) -> Cost {
     let Some(index_info) = index_info else {
@@ -55,8 +57,18 @@ pub fn estimate_cost_for_scan_or_seek(
     let selectivity_multiplier: f64 = usable_constraint_refs
         .iter()
         .map(|cref| {
-            let constraint = &constraints[cref.constraint_vec_pos];
-            constraint.selectivity
+            if let Some(eq) = cref.eq {
+                let constraint = &constraints[eq];
+                return constraint.selectivity;
+            }
+            let mut selectivity = 1.0;
+            if let Some(lower_bound) = cref.lower_bound {
+                selectivity *= constraints[lower_bound].selectivity;
+            }
+            if let Some(upper_bound) = cref.upper_bound {
+                selectivity *= constraints[upper_bound].selectivity;
+            }
+            selectivity
         })
         .product();
 

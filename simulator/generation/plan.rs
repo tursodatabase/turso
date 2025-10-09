@@ -201,6 +201,11 @@ impl InteractionPlan {
         for interactions in &self.plan {
             match &interactions.interactions {
                 InteractionsType::Property(property) => {
+                    if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
+                        // Skip Property::AllTableHaveExpectedContent when counting stats
+                        // this allows us to generate more relevant interactions as we count less Select's to the Stats
+                        continue;
+                    }
                     for interaction in &property.interactions(interactions.connection_index) {
                         if let InteractionType::Query(query) = &interaction.interaction {
                             query_stat(query, &mut stats);

@@ -720,6 +720,176 @@ do_execsql_test_on_specific_db {:memory:} select-no-match-in-leaf-page {
 2
 2}
 
+do_execsql_test_on_specific_db {:memory:} select-range-search-count-asc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a ASC, b ASC;
+    
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a DESC, b DESC;
+} {5
+4
+4
+3
+3
+2
+2
+1
+5
+4
+4
+3
+3
+2
+2
+1}
+
+do_execsql_test_on_specific_db {:memory:} select-range-search-count-desc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b DESC);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a ASC, b DESC;
+    
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a DESC, b ASC;
+} {5
+4
+4
+3
+3
+2
+2
+1
+5
+4
+4
+3
+3
+2
+2
+1}
+
+do_execsql_test_on_specific_db {:memory:} select-range-search-scan-asc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a ASC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a DESC, b DESC;
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a DESC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a ASC, b DESC;
+} {1|2
+1|3
+1|4
+1|5
+2|5
+2|4
+2|3
+2|2
+1|2
+1|3
+1|4
+1|5
+2|5
+2|4
+2|3
+2|2}
+
+do_execsql_test_on_specific_db {:memory:} select-range-search-scan-desc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b DESC);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a ASC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a DESC, b DESC;
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a DESC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a ASC, b DESC;
+} {1|2
+1|3
+1|4
+1|5
+2|5
+2|4
+2|3
+2|2
+1|2
+1|3
+1|4
+1|5
+2|5
+2|4
+2|3
+2|2}
+
 # Regression tests for double-quoted strings in SELECT statements
 do_execsql_test_skip_lines_on_specific_db 1 {:memory:} select-double-quotes-values {
     .dbconfig dqs_dml on
@@ -812,3 +982,7 @@ do_execsql_test_on_specific_db {:memory:} null-in-search {
 2|2
 2|2}
 
+do_execsql_test_in_memory_any_error limit-column-reference-error {
+  CREATE TABLE t(a);
+  SELECT * FROM t LIMIT (t.a);
+}

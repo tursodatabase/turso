@@ -40,6 +40,22 @@ pub fn translate_create_table(
         bail_parse_error!("TEMPORARY table not supported yet");
     }
 
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        for i in 0..columns.len() {
+            let col_i = &columns[i];
+
+            for j in &columns[(i + 1)..] {
+                if col_i
+                    .col_name
+                    .as_str()
+                    .eq_ignore_ascii_case(j.col_name.as_str())
+                {
+                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
+                }
+            }
+        }
+    }
+
     // Check for STRICT mode without experimental flag
     if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
         if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
