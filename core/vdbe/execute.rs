@@ -6,7 +6,7 @@ use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
+    integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
@@ -1099,7 +1099,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(cursor));
+                .replace(Cursor::new_btree(Box::new(cursor)));
         }
         CursorType::BTreeIndex(index) => {
             let cursor = BTreeCursor::new_index(
@@ -1112,7 +1112,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(cursor));
+                .replace(Cursor::new_btree(Box::new(cursor)));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -1630,7 +1630,7 @@ pub fn op_column(
                                 break 'ifnull;
                             };
 
-                            let mut record_cursor = cursor.record_cursor.borrow_mut();
+                            let mut record_cursor = cursor.record_cursor_mut();
 
                             if record_cursor.offsets.is_empty() {
                                 let (header_size, header_len_bytes) = read_varint_fast(payload)?;
@@ -2768,7 +2768,7 @@ pub fn op_row_id(
                     let index_cursor = index_cursor.as_btree_mut();
                     let record = return_if_io!(index_cursor.record());
                     let record = record.as_ref().unwrap();
-                    let mut record_cursor_ref = index_cursor.record_cursor.borrow_mut();
+                    let mut record_cursor_ref = index_cursor.record_cursor_mut();
                     let record_cursor = record_cursor_ref.deref_mut();
                     let rowid = record.last_value(record_cursor).unwrap();
                     match rowid {
@@ -3285,7 +3285,7 @@ pub fn seek_internal(
                         // this same logic applies for indexes, but the next/prev record is expected to be found in the parent page's
                         // divider cell.
                         turso_assert!(
-                            !cursor.skip_advance.get(),
+                            !cursor.get_skip_advance(),
                             "skip_advance should not be true in the middle of a seek operation"
                         );
                         let result = match op {
@@ -3295,7 +3295,7 @@ pub fn seek_internal(
                         };
                         match result {
                             IOResult::Done(found) => {
-                                cursor.has_record.set(found);
+                                cursor.set_has_record(found);
                                 cursor.invalidate_record();
                                 found
                             }
@@ -3409,9 +3409,9 @@ pub fn op_idx_ge(
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record,                         // The serialized record from the index
-                &values,                             // The record built from registers
-                cursor.index_info.as_ref().unwrap(), // Sort order flags
+                &idx_record,             // The serialized record from the index
+                &values,                 // The record built from registers
+                cursor.get_index_info(), // Sort order flags
                 0,
                 tie_breaker,
             )?;
@@ -3479,7 +3479,7 @@ pub fn op_idx_le(
             let ord = compare_records_generic(
                 &idx_record,
                 &values,
-                cursor.index_info.as_ref().unwrap(),
+                cursor.get_index_info(),
                 0,
                 tie_breaker,
             )?;
@@ -3530,7 +3530,7 @@ pub fn op_idx_gt(
             let ord = compare_records_generic(
                 &idx_record,
                 &values,
-                cursor.index_info.as_ref().unwrap(),
+                cursor.get_index_info(),
                 0,
                 tie_breaker,
             )?;
@@ -3582,7 +3582,7 @@ pub fn op_idx_lt(
             let ord = compare_records_generic(
                 &idx_record,
                 &values,
-                cursor.index_info.as_ref().unwrap(),
+                cursor.get_index_info(),
                 0,
                 tie_breaker,
             )?;
@@ -6332,7 +6332,7 @@ pub fn op_idx_insert(
                 // Cursor is pointing at a record; if the index has a rowid, exclude it from the comparison since it's a pointer to the table row;
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if cursor.has_rowid() {
-                    let count = cursor.record_cursor.borrow_mut().count(record);
+                    let count = cursor.record_cursor_mut().count(record);
                     &record.get_values()[..count.saturating_sub(1)]
                 } else {
                     &record.get_values()[..]
@@ -6345,7 +6345,7 @@ pub fn op_idx_insert(
                 let conflict = compare_immutable(
                     existing_key,
                     inserted_key_vals,
-                    &cursor.index_info.as_ref().unwrap().key_info,
+                    &cursor.get_index_info().key_info,
                 ) == std::cmp::Ordering::Equal;
                 if conflict {
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
@@ -6842,7 +6842,7 @@ pub fn op_open_write(
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(cursor));
+            .replace(Cursor::new_btree(Box::new(cursor)));
     } else {
         let num_columns = match cursor_type {
             CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -6856,7 +6856,7 @@ pub fn op_open_write(
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(cursor));
+            .replace(Cursor::new_btree(Box::new(cursor)));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7514,7 +7514,7 @@ pub enum OpOpenEphemeralState {
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
-        cursor: Box<BTreeCursor>,
+        cursor: Box<dyn CursorTrait>,
     },
 }
 pub fn op_open_ephemeral(
@@ -7642,13 +7642,13 @@ pub fn op_open_ephemeral(
                     cursors
                         .get_mut(cursor_id)
                         .unwrap()
-                        .replace(Cursor::new_btree(*cursor));
+                        .replace(Cursor::new_btree(cursor));
                 }
                 CursorType::BTreeIndex(_) => {
                     cursors
                         .get_mut(cursor_id)
                         .unwrap()
-                        .replace(Cursor::new_btree(*cursor));
+                        .replace(Cursor::new_btree(cursor));
                 }
                 CursorType::Pseudo(_) => {
                     panic!("OpenEphemeral on pseudo cursor");
@@ -7694,7 +7694,7 @@ pub fn op_open_dup(
     // We use the pager from the original cursor instead of the one attached to
     // the connection because each ephemeral table creates its own pager (and
     // a separate database file).
-    let pager = &original_cursor.pager;
+    let pager = original_cursor.get_pager();
 
     let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
         let mv_store = mv_store.unwrap().clone();
@@ -7718,7 +7718,7 @@ pub fn op_open_dup(
             cursors
                 .get_mut(*new_cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(cursor));
+                .replace(Cursor::new_btree(Box::new(cursor)));
         }
         CursorType::BTreeIndex(table) => {
             // In principle, we could implement OpenDup for BTreeIndex,
