@@ -318,7 +318,6 @@ fn emit_parent_key_change_check_for_fk(
     new_values_start_reg: usize,
     new_rowid_reg: usize,
 ) -> Result<()> {
-
     let parent_key_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
         parent_btree
             .primary_key_columns
@@ -339,7 +338,14 @@ fn emit_parent_key_change_check_for_fk(
             collation: None,
         });
 
-        emit_fk_parent_pk_change_counters(program, &[fk_ref.clone()], resolver, old_rowid_reg, new_rowid_reg, 1)?;
+        emit_fk_parent_pk_change_counters(
+            program,
+            &[fk_ref.clone()],
+            resolver,
+            old_rowid_reg,
+            new_rowid_reg,
+            1,
+        )?;
         program.preassign_label_to_next_insn(skip_label);
         return Ok(());
     }
@@ -350,14 +356,22 @@ fn emit_parent_key_change_check_for_fk(
 
     for (i, col_name) in parent_key_cols.iter().enumerate() {
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
-            program.emit_insn(Insn::Copy { src_reg: old_rowid_reg, dst_reg: old_key_regs + i, extra_amount: 0 });
+            program.emit_insn(Insn::Copy {
+                src_reg: old_rowid_reg,
+                dst_reg: old_key_regs + i,
+                extra_amount: 0,
+            });
             continue;
         }
         let (pos, col) = parent_btree.get_column(col_name).ok_or_else(|| {
             crate::LimboError::InternalError(format!("Parent column {} not found", col_name))
         })?;
         if col.is_rowid_alias {
-            program.emit_insn(Insn::Copy { src_reg: old_rowid_reg, dst_reg: old_key_regs + i, extra_amount: 0 });
+            program.emit_insn(Insn::Copy {
+                src_reg: old_rowid_reg,
+                dst_reg: old_key_regs + i,
+                extra_amount: 0,
+            });
         } else {
             program.emit_insn(Insn::Column {
                 cursor_id,
@@ -370,7 +384,11 @@ fn emit_parent_key_change_check_for_fk(
 
     for (i, col_name) in parent_key_cols.iter().enumerate() {
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
-            program.emit_insn(Insn::Copy { src_reg: new_rowid_reg, dst_reg: new_key_regs + i, extra_amount: 0 });
+            program.emit_insn(Insn::Copy {
+                src_reg: new_rowid_reg,
+                dst_reg: new_key_regs + i,
+                extra_amount: 0,
+            });
             continue;
         }
         let (pos, col) = parent_btree.get_column(col_name).unwrap();
@@ -379,7 +397,11 @@ fn emit_parent_key_change_check_for_fk(
         } else {
             new_values_start_reg + pos
         };
-        program.emit_insn(Insn::Copy { src_reg, dst_reg: new_key_regs + i, extra_amount: 0 });
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: new_key_regs + i,
+            extra_amount: 0,
+        });
     }
 
     let skip_checks_label = program.allocate_label();
@@ -394,10 +416,19 @@ fn emit_parent_key_change_check_for_fk(
         });
     }
 
-    program.emit_insn(Insn::Goto { target_pc: skip_checks_label });
+    program.emit_insn(Insn::Goto {
+        target_pc: skip_checks_label,
+    });
 
     program.preassign_label_to_next_insn(values_changed_label);
-    emit_fk_parent_pk_change_counters(program, &[fk_ref.clone()], resolver, old_key_regs, new_key_regs, key_len)?;
+    emit_fk_parent_pk_change_counters(
+        program,
+        &[fk_ref.clone()],
+        resolver,
+        old_key_regs,
+        new_key_regs,
+        key_len,
+    )?;
 
     program.preassign_label_to_next_insn(skip_checks_label);
     Ok(())
