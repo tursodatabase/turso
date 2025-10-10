@@ -254,6 +254,7 @@ mod tests {
     use super::*;
     use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
     use crate::incremental::dbsp::HashableRow;
+    use crate::storage::btree::CursorTrait;
     use crate::storage::pager::CreateBTreeFlags;
     use crate::types::Text;
     use crate::util::IOExt;

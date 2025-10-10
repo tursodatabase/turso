@@ -2742,6 +2742,8 @@ mod tests {
     // This reads the actual persisted data from the BTree
     #[cfg(test)]
     fn get_current_state(pager: Arc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
+        use crate::storage::btree::CursorTrait;
+
         let mut delta = Delta::new();
 
         let main_data_root = circuit.main_data_root;

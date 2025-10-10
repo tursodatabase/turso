@@ -2,7 +2,7 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::CursorTrait;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -1112,7 +1112,7 @@ impl IncrementalView {
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
         pager: &std::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut BTreeCursor,
+        _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
         assert!(
