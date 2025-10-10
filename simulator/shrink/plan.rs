@@ -120,6 +120,8 @@ impl InteractionPlan {
                             | Property::DeleteSelect { queries, .. }
                             | Property::DropSelect { queries, .. }
                             | Property::Queries { queries } => {
+                                // Remove placeholder queries
+                                queries.retain(|query| !matches!(query, Query::Placeholder));
                                 extensional_queries.append(queries);
                             }
                             Property::AllTableHaveExpectedContent { tables } => {
