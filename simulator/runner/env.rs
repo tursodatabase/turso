@@ -171,6 +171,8 @@ pub(crate) struct SimulatorEnv {
 }
 
 impl UnwindSafe for SimulatorEnv {}
+unsafe impl Send for SimulatorEnv {}
+unsafe impl Sync for SimulatorEnv {}
 
 impl SimulatorEnv {
     pub(crate) fn clone_without_connections(&self) -> Self {
