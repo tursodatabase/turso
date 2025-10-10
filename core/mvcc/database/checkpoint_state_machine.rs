@@ -169,6 +169,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let mut exists_in_db_file = false;
             entry.value().for_each_node(|node| {
                 let version = node.row_version()?;
+                //TODO: garbage collect row versions after checkpointing.
                 if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
                     if ts > self.checkpointed_txid_max_old {
                         if version_to_checkpoint.is_none() {

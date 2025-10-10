@@ -1734,6 +1734,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for rowid in &tx.write_set {
             let rowid = rowid.value();
             if let Some(row_versions) = self.rows.get(rowid) {
+                // Find rows that were written by this transaction.
                 row_versions.value().for_each_node(|node| {
                     let row_version = (unsafe { node.row_version_mut() })?;
                     if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
@@ -1898,7 +1899,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             _ => false,
                         }
                     }),
+                    // Let's skip potentially complex logic if the transafction is still
+                    // active/tracked. We will drop the row version when the transaction
+                    // gets garbage-collected itself, it will always happen eventually.
                     Some(TxTimestampOrID::TxID(tx_id)) => !self.txs.contains_key(&tx_id),
+                    // this row version is current, ergo visible
                     None => true,
                 };
                 if !should_stay {
@@ -1953,8 +1958,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    /// Inserts a new row version into the database, while making sure that
-    /// the row version is inserted in the correct order.
+    /// Inserts a new row version into the database by appending it to the
+    /// corresponding row version chain.
     fn insert_version(&self, id: RowID, row_version: RowVersion) {
         let versions = self.rows.get_or_insert_with(id, RowVersionChain::new);
         versions
