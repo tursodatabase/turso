@@ -38,6 +38,7 @@ fn main() -> anyhow::Result<()> {
     init_logger()?;
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
+    setup_panic_hook();
 
     let profile = Profile::parse_from_type(cli_opts.profile.clone())?;
     tracing::debug!(sim_profile = ?profile);
@@ -209,12 +210,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
     Ok(())
 }
 
-fn run_simulator(
-    mut bugbase: Option<&mut BugBase>,
-    cli_opts: &SimulatorCLI,
-    env: SimulatorEnv,
-    plan: InteractionPlan,
-) -> anyhow::Result<()> {
+fn setup_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic occurred");
 
