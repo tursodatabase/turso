@@ -1,6 +1,5 @@
 use turso_parser::ast::SortOrder;
 
-use std::cell::{RefCell, UnsafeCell};
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
@@ -8,7 +7,6 @@ use std::sync::{atomic, Arc, RwLock};
 use tempfile;
 
 use crate::types::IOCompletions;
-use crate::util::IOExt;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, File, OpenFlags, IO},
@@ -89,6 +87,7 @@ pub struct Sorter {
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
     seq_count: i64,
+    pending_completions: Vec<Completion>,
 }
 
 impl Sorter {
@@ -127,6 +126,7 @@ impl Sorter {
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
             seq_count: 0,
+            pending_completions: Vec::new(),
         }
     }
 
@@ -204,7 +204,7 @@ impl Sorter {
         };
         match record {
             Some(record) => {
-                if let Some(error) = record.deserialization_error.replace(None) {
+                if let Some(error) = record.deserialization_error {
                     // If there was a key deserialization error during the comparison, return the error.
                     return Err(error);
                 }
@@ -227,20 +227,13 @@ impl Sorter {
                     self.insert_state = InsertState::Insert;
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
-                            io_yield_one!(c);
+                            if !c.succeeded() {
+                                io_yield_one!(c);
+                            }
                         }
                     }
                 }
                 InsertState::Insert => {
-                    turso_assert!(
-                        !self.chunks.iter().any(|chunk| {
-                            matches!(
-                                *chunk.io_state.read().unwrap(),
-                                SortedChunkIOState::WaitingForWrite
-                            )
-                        }),
-                        "chunks should have written"
-                    );
                     self.records.push(SortableImmutableRecord::new(
                         record.clone(),
                         self.key_len,
@@ -285,51 +278,57 @@ impl Sorter {
                 );
                 self.chunk_heap.reserve(self.chunks.len());
                 // TODO: blocking will be unnecessary here with IO completions
-                let io = self.io.clone();
+                let mut completions = vec![];
                 for chunk_idx in 0..self.chunks.len() {
-                    io.block(|| self.push_to_chunk_heap(chunk_idx))?;
+                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                        completions.push(c);
+                    };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
+                if !completions.is_empty() {
+                    io_yield_many!(completions);
+                }
                 Ok(IOResult::Done(()))
             }
         }
     }
 
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
+        if !self.pending_completions.is_empty() {
+            return Ok(IOResult::IO(IOCompletions::Many(
+                self.pending_completions.drain(..).collect(),
+            )));
+        }
         // Make sure all chunks read at least one record into their buffer.
-        turso_assert!(
-            !self.chunks.iter().any(|chunk| matches!(
-                *chunk.io_state.read().unwrap(),
-                SortedChunkIOState::WaitingForRead
-            )),
-            "chunks should have been read"
-        );
-
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
             // TODO: blocking will be unnecessary here with IO completions
-            let io = self.io.clone();
-            io.block(|| self.push_to_chunk_heap(next_chunk_idx))?;
+            if let Some(c) = self.push_to_chunk_heap(next_chunk_idx)? {
+                self.pending_completions.push(c);
+            }
             Ok(IOResult::Done(Some(next_record.0)))
         } else {
             Ok(IOResult::Done(None))
         }
     }
 
-    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<IOResult<()>> {
+    fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
         let chunk = &mut self.chunks[chunk_idx];
 
-        if let Some(record) = return_if_io!(chunk.next()) {
-            self.chunk_heap.push((
-                Reverse(SortableImmutableRecord::new(
-                    record,
-                    self.key_len,
-                    self.index_key_info.clone(),
-                )?),
-                chunk_idx,
-            ));
+        match chunk.next()? {
+            ChunkNextResult::Done(Some(record)) => {
+                self.chunk_heap.push((
+                    Reverse(SortableImmutableRecord::new(
+                        record,
+                        self.key_len,
+                        self.index_key_info.clone(),
+                    )?),
+                    chunk_idx,
+                ));
+                Ok(None)
+            }
+            ChunkNextResult::Done(None) => Ok(None),
+            ChunkNextResult::IO(io) => Ok(Some(io)),
         }
-
-        Ok(IOResult::Done(()))
     }
 
     fn flush(&mut self) -> Result<Option<Completion>> {
@@ -413,6 +412,11 @@ struct SortedChunk {
     next_state: NextState,
 }
 
+enum ChunkNextResult {
+    Done(Option<ImmutableRecord>),
+    IO(Completion),
+}
+
 impl SortedChunk {
     fn new(file: Arc<dyn File>, start_offset: usize, buffer_size: usize) -> Self {
         Self {
@@ -436,13 +440,13 @@ impl SortedChunk {
         self.buffer_len.store(len, atomic::Ordering::SeqCst);
     }
 
-    fn next(&mut self) -> Result<IOResult<Option<ImmutableRecord>>> {
+    fn next(&mut self) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
                 NextState::Start => {
                     let mut buffer_len = self.buffer_len();
                     if self.records.is_empty() && buffer_len == 0 {
-                        return Ok(IOResult::Done(None));
+                        return Ok(ChunkNextResult::Done(None));
                     }
 
                     if self.records.is_empty() {
@@ -506,13 +510,15 @@ impl SortedChunk {
                             *self.io_state.write().unwrap() = SortedChunkIOState::ReadEOF;
                         } else {
                             let c = self.read()?;
-                            io_yield_one!(c);
+                            if !c.succeeded() {
+                                return Ok(ChunkNextResult::IO(c));
+                            }
                         }
                     }
                 }
                 NextState::Finish => {
                     self.next_state = NextState::Start;
-                    return Ok(IOResult::Done(self.records.pop()));
+                    return Ok(ChunkNextResult::Done(self.records.pop()));
                 }
             }
         }
@@ -614,12 +620,14 @@ impl SortedChunk {
 struct SortableImmutableRecord {
     record: ImmutableRecord,
     cursor: RecordCursor,
-    // SAFETY: borrows from 'self
-    key_values: UnsafeCell<Vec<ValueRef<'static>>>,
+    /// SAFETY: borrows from self
+    /// These are precomputed on record construction so that they can be reused during
+    /// sorting comparisons.
+    key_values: Vec<ValueRef<'static>>,
     key_len: usize,
     index_key_info: Rc<Vec<KeyInfo>>,
     /// The key deserialization error, if any.
-    deserialization_error: RefCell<Option<LimboError>>,
+    deserialization_error: Option<LimboError>,
 }
 
 impl SortableImmutableRecord {
@@ -634,45 +642,40 @@ impl SortableImmutableRecord {
             index_key_info.len() >= cursor.serial_types.len(),
             "index_key_info.len() < cursor.serial_types.len()"
         );
+
+        // Pre-compute all key values upfront
+        let mut key_values = Vec::with_capacity(key_len);
+        let mut deserialization_error = None;
+
+        for i in 0..key_len {
+            match cursor.deserialize_column(&record, i) {
+                Ok(value) => {
+                    // SAFETY: We're storing the value with 'static lifetime but it's actually bound to the record
+                    // This is safe because the record lives as long as this struct
+                    let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
+                    key_values.push(value);
+                }
+                Err(err) => {
+                    deserialization_error = Some(err);
+                    break;
+                }
+            }
+        }
+
         Ok(Self {
             record,
             cursor,
-            key_values: UnsafeCell::new(Vec::with_capacity(key_len)),
+            key_values,
             index_key_info,
-            deserialization_error: RefCell::new(None),
+            deserialization_error,
             key_len,
         })
-    }
-
-    fn key_value<'a>(&'a self, i: usize) -> Option<ValueRef<'a>> {
-        // SAFETY: there are no other active references
-        let key_values = unsafe { &mut *self.key_values.get() };
-
-        if i >= key_values.len() {
-            assert_eq!(key_values.len(), i, "access must be sequential");
-
-            let value = match self.cursor.deserialize_column(&self.record, i) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.deserialization_error.replace(Some(err));
-                    return None;
-                }
-            };
-
-            // SAFETY: no 'static lifetime is exposed, all references are bound to 'self
-            let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
-            key_values.push(value);
-        }
-
-        Some(key_values[i])
     }
 }
 
 impl Ord for SortableImmutableRecord {
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.deserialization_error.borrow().is_some()
-            || other.deserialization_error.borrow().is_some()
-        {
+        if self.deserialization_error.is_some() || other.deserialization_error.is_some() {
             // If one of the records has a deserialization error, circumvent the comparison and return early.
             return Ordering::Equal;
         }
@@ -682,21 +685,17 @@ impl Ord for SortableImmutableRecord {
         );
 
         for i in 0..self.key_len {
-            let Some(this_key_value) = self.key_value(i) else {
-                return Ordering::Equal;
-            };
-
-            let Some(other_key_value) = other.key_value(i) else {
-                return Ordering::Equal;
-            };
+            let this_key_value = self.key_values[i];
+            let other_key_value = other.key_values[i];
 
             let column_order = self.index_key_info[i].sort_order;
             let collation = self.index_key_info[i].collation;
 
             let cmp = match (this_key_value, other_key_value) {
                 (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                    &String::from_utf8_lossy(left),
-                    &String::from_utf8_lossy(right),
+                    // SAFETY: these were checked to be valid UTF-8 on construction.
+                    unsafe { std::str::from_utf8_unchecked(left) },
+                    unsafe { std::str::from_utf8_unchecked(right) },
                 ),
                 _ => this_key_value.partial_cmp(&other_key_value).unwrap(),
             };

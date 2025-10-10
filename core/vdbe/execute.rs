@@ -1875,11 +1875,7 @@ pub fn op_column(
                         let value = {
                             let cursor = state.get_cursor(*cursor_id);
                             let cursor = cursor.as_pseudo_mut();
-                            if let Some(record) = cursor.record() {
-                                record.get_value(*column)?.to_owned()
-                            } else {
-                                Value::Null
-                            }
+                            cursor.get_value(*column)?
                         };
                         state.registers[*dest] = Register::Value(value);
                     }
