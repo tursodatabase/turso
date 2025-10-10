@@ -1538,31 +1538,11 @@ pub fn translate_expr(
 
                             Ok(target_register)
                         }
-                        ScalarFunc::SqliteVersion => {
+                        ScalarFunc::SqliteVersion
+                        | ScalarFunc::TursoVersion
+                        | ScalarFunc::SqliteSourceId => {
                             if !args.is_empty() {
                                 crate::bail_parse_error!("sqlite_version function with arguments");
-                            }
-
-                            let output_register = program.alloc_register();
-                            program.emit_insn(Insn::Function {
-                                constant_mask: 0,
-                                start_reg: output_register,
-                                dest: output_register,
-                                func: func_ctx,
-                            });
-
-                            program.emit_insn(Insn::Copy {
-                                src_reg: output_register,
-                                dst_reg: target_register,
-                                extra_amount: 0,
-                            });
-                            Ok(target_register)
-                        }
-                        ScalarFunc::SqliteSourceId => {
-                            if !args.is_empty() {
-                                crate::bail_parse_error!(
-                                    "sqlite_source_id function with arguments"
-                                );
                             }
 
                             let output_register = program.alloc_register();

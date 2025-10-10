@@ -4971,7 +4971,7 @@ pub fn op_function(
                     }
                 }
             }
-            ScalarFunc::SqliteVersion => {
+            ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
                     state.registers[*dest] =
                         Register::Value(Value::build_text(info::build::PKG_VERSION));
@@ -4979,9 +4979,13 @@ pub fn op_function(
                     let version_integer =
                         return_if_io!(pager.with_header(|header| header.version_number)).get()
                             as i64;
-                    let version = execute_sqlite_version(version_integer);
+                    let version = execute_turso_version(version_integer);
                     state.registers[*dest] = Register::Value(Value::build_text(version));
                 }
+            }
+            ScalarFunc::SqliteVersion => {
+                let version = execute_sqlite_version();
+                state.registers[*dest] = Register::Value(Value::build_text(version));
             }
             ScalarFunc::SqliteSourceId => {
                 let src_id = format!(
@@ -9508,7 +9512,12 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-fn execute_sqlite_version(version_integer: i64) -> String {
+// Compat for applications that test for SQLite.
+fn execute_sqlite_version() -> String {
+    "3.50.4".to_string()
+}
+
+fn execute_turso_version(version_integer: i64) -> String {
     let major = version_integer / 1_000_000;
     let minor = (version_integer % 1_000_000) / 1_000;
     let release = version_integer % 1_000;
@@ -10392,7 +10401,7 @@ mod tests {
 
     use crate::vdbe::{Bitfield, Register};
 
-    use super::{exec_char, execute_sqlite_version};
+    use super::{exec_char, execute_turso_version};
     use std::collections::HashMap;
 
     #[test]
@@ -11180,7 +11189,7 @@ mod tests {
     fn test_execute_sqlite_version() {
         let version_integer = 3046001;
         let expected = "3.46.1";
-        assert_eq!(execute_sqlite_version(version_integer), expected);
+        assert_eq!(execute_turso_version(version_integer), expected);
     }
 
     #[test]

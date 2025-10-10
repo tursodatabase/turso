@@ -310,6 +310,7 @@ pub enum ScalarFunc {
     Unicode,
     Quote,
     SqliteVersion,
+    TursoVersion,
     SqliteSourceId,
     UnixEpoch,
     JulianDay,
@@ -373,6 +374,7 @@ impl ScalarFunc {
             ScalarFunc::Unicode => true,
             ScalarFunc::Quote => true,
             ScalarFunc::SqliteVersion => true,
+            ScalarFunc::TursoVersion => true,
             ScalarFunc::SqliteSourceId => true,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
@@ -437,6 +439,7 @@ impl Display for ScalarFunc {
             Self::Unicode => "unicode".to_string(),
             Self::Quote => "quote".to_string(),
             Self::SqliteVersion => "sqlite_version".to_string(),
+            Self::TursoVersion => "turso_version".to_string(),
             Self::SqliteSourceId => "sqlite_source_id".to_string(),
             Self::JulianDay => "julianday".to_string(),
             Self::UnixEpoch => "unixepoch".to_string(),
@@ -652,6 +655,7 @@ impl Func {
                         | ScalarFunc::Random
                         | ScalarFunc::TotalChanges
                         | ScalarFunc::SqliteVersion
+                        | ScalarFunc::TursoVersion
                         | ScalarFunc::SqliteSourceId
                         | ScalarFunc::LastInsertRowid
                 )
@@ -770,6 +774,7 @@ impl Func {
             "unicode" => Ok(Self::Scalar(ScalarFunc::Unicode)),
             "quote" => Ok(Self::Scalar(ScalarFunc::Quote)),
             "sqlite_version" => Ok(Self::Scalar(ScalarFunc::SqliteVersion)),
+            "turso_version" => Ok(Self::Scalar(ScalarFunc::TursoVersion)),
             "sqlite_source_id" => Ok(Self::Scalar(ScalarFunc::SqliteSourceId)),
             "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
             "likely" => Ok(Self::Scalar(ScalarFunc::Likely)),
