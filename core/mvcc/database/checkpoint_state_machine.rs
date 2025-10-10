@@ -165,20 +165,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 continue;
             }
 
-            let row_versions = entry.value().read();
-
-            let mut version_to_checkpoint = None;
+            let mut version_to_checkpoint: Option<RowVersion> = None;
             let mut exists_in_db_file = false;
-            for version in row_versions.iter() {
+            entry.value().for_each_node(|node| {
+                let version = node.row_version()?;
                 if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    //TODO: garbage collect row versions after checkpointing.
                     if ts > self.checkpointed_txid_max_old {
-                        version_to_checkpoint = Some(version);
+                        version_to_checkpoint = Some(version.clone());
                     } else {
                         exists_in_db_file = true;
                     }
                 }
-            }
+                None::<()>
+            });
 
             if let Some(version) = version_to_checkpoint {
                 let is_delete = version.end.is_some();
