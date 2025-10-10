@@ -115,7 +115,7 @@ impl Query {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self,
-            Self::Create(..) | Self::CreateIndex(..) | Self::Drop(..)
+            Self::Create(..) | Self::CreateIndex(..) | Self::Drop(..) | Self::AlterTable(..)
         )
     }
 }
