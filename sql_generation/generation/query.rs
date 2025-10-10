@@ -395,14 +395,25 @@ impl Arbitrary for Update {
 const ALTER_TABLE_ALL: &[AlterTableTypeDiscriminants] = &[
     AlterTableTypeDiscriminants::RenameTo,
     AlterTableTypeDiscriminants::AddColumn,
-    // AlterTableTypeDiscriminants::AlterColumn,
+    AlterTableTypeDiscriminants::AlterColumn,
     AlterTableTypeDiscriminants::RenameColumn,
     AlterTableTypeDiscriminants::DropColumn,
 ];
 const ALTER_TABLE_NO_DROP: &[AlterTableTypeDiscriminants] = &[
     AlterTableTypeDiscriminants::RenameTo,
     AlterTableTypeDiscriminants::AddColumn,
-    // AlterTableTypeDiscriminants::AlterColumn,
+    AlterTableTypeDiscriminants::AlterColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+];
+const ALTER_TABLE_NO_ALTER_COL: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+    AlterTableTypeDiscriminants::DropColumn,
+];
+const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
     AlterTableTypeDiscriminants::RenameColumn,
 ];
 
@@ -459,7 +470,14 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                     return AlterTableType::arbitrary_from(
                         rng,
                         context,
-                        (table, ALTER_TABLE_NO_DROP),
+                        (
+                            table,
+                            if context.opts().query.alter_table.alter_column {
+                                ALTER_TABLE_NO_DROP
+                            } else {
+                                ALTER_TABLE_NO_ALTER_COL_NO_DROP
+                            },
+                        ),
                     );
                 }
 
@@ -477,10 +495,14 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
 impl Arbitrary for AlterTable {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let table = pick(context.tables(), rng);
-        let choices: &'static [AlterTableTypeDiscriminants] = if table.columns.len() > 1 {
-            ALTER_TABLE_ALL
-        } else {
-            ALTER_TABLE_NO_DROP
+        let choices = match (
+            table.columns.len() > 1,
+            context.opts().query.alter_table.alter_column,
+        ) {
+            (true, true) => ALTER_TABLE_ALL,
+            (true, false) => ALTER_TABLE_NO_ALTER_COL,
+            (false, true) => ALTER_TABLE_NO_DROP,
+            (false, false) => ALTER_TABLE_NO_ALTER_COL_NO_DROP,
         };
 
         let alter_table_type = AlterTableType::arbitrary_from(rng, context, (table, choices));

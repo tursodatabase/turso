@@ -93,6 +93,8 @@ pub struct QueryOpts {
     pub from_clause: FromClauseOpts,
     #[garde(dive)]
     pub insert: InsertOpts,
+    #[garde(dive)]
+    pub alter_table: AlterTableOpts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
@@ -198,6 +200,19 @@ impl Default for InsertOpts {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct AlterTableOpts {
+    #[garde(skip)]
+    pub alter_column: bool,
+}
+
+impl Default for AlterTableOpts {
+    fn default() -> Self {
+        Self { alter_column: true }
+    }
+}
+
 fn range_struct_min<T: PartialOrd + Display>(
     min: T,
 ) -> impl FnOnce(&Range<T>, &()) -> garde::Result {
@@ -217,7 +232,7 @@ fn range_struct_min<T: PartialOrd + Display>(
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn range_struct_max<T: PartialOrd + Display>(
     max: T,
 ) -> impl FnOnce(&Range<T>, &()) -> garde::Result {
