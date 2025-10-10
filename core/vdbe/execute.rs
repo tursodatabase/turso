@@ -20,7 +20,7 @@ use crate::types::{
 use crate::util::normalize_ident;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::{registers_to_ref_values, TxnCleanup};
-use crate::vector::{vector_concat, vector_slice};
+use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -5197,6 +5197,10 @@ pub fn op_function(
                 let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
+            VectorFunc::Vector32Sparse => {
+                let result = vector32_sparse(&state.registers[*start_reg..*start_reg + arg_count])?;
+                state.registers[*dest] = Register::Value(result);
+            }
             VectorFunc::Vector64 => {
                 let result = vector64(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
@@ -5210,9 +5214,14 @@ pub fn op_function(
                     vector_distance_cos(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
-            VectorFunc::VectorDistanceEuclidean => {
+            VectorFunc::VectorDistanceL2 => {
                 let result =
                     vector_distance_l2(&state.registers[*start_reg..*start_reg + arg_count])?;
+                state.registers[*dest] = Register::Value(result);
+            }
+            VectorFunc::VectorDistanceJaccard => {
+                let result =
+                    vector_distance_jaccard(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
             VectorFunc::VectorConcat => {

@@ -1,12 +1,32 @@
 use crate::types::Value;
+use crate::types::ValueType;
 use crate::vdbe::Register;
-use crate::vector::distance::{euclidean::Euclidean, DistanceCalculator};
 use crate::LimboError;
 use crate::Result;
 
-pub mod distance;
+pub mod operations;
 pub mod vector_types;
 use vector_types::*;
+
+pub fn parse_vector(value: &Register, type_hint: Option<VectorType>) -> Result<Vector> {
+    match value.get_value().value_type() {
+        ValueType::Text => operations::text::vector_from_text(
+            type_hint.unwrap_or(VectorType::Float32Dense),
+            value.get_value().to_text().expect("value must be text"),
+        ),
+        ValueType::Blob => {
+            let Some(blob) = value.get_value().to_blob() else {
+                return Err(LimboError::ConversionError(
+                    "Invalid vector value".to_string(),
+                ));
+            };
+            Vector::from_blob(blob.to_vec())
+        }
+        _ => Err(LimboError::ConversionError(
+            "Invalid vector type".to_string(),
+        )),
+    }
+}
 
 pub fn vector32(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
@@ -14,15 +34,20 @@ pub fn vector32(args: &[Register]) -> Result<Value> {
             "vector32 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float32))?;
-    // Extract the Vec<u8> from Value
-    if let Value::Blob(data) = vector_serialize_f32(x) {
-        Ok(Value::Blob(data))
-    } else {
-        Err(LimboError::ConversionError(
-            "Failed to serialize vector".to_string(),
-        ))
+    let vector = parse_vector(&args[0], Some(VectorType::Float32Dense))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
+    Ok(operations::serialize::vector_serialize(vector))
+}
+
+pub fn vector32_sparse(args: &[Register]) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(LimboError::ConversionError(
+            "vector32_sparse requires exactly one argument".to_string(),
+        ));
     }
+    let vector = parse_vector(&args[0], Some(VectorType::Float32Sparse))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float32Sparse)?;
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector64(args: &[Register]) -> Result<Value> {
@@ -31,15 +56,9 @@ pub fn vector64(args: &[Register]) -> Result<Value> {
             "vector64 requires exactly one argument".to_string(),
         ));
     }
-    let x = parse_vector(&args[0], Some(VectorType::Float64))?;
-    // Extract the Vec<u8> from Value
-    if let Value::Blob(data) = vector_serialize_f64(x) {
-        Ok(Value::Blob(data))
-    } else {
-        Err(LimboError::ConversionError(
-            "Failed to serialize vector".to_string(),
-        ))
-    }
+    let vector = parse_vector(&args[0], Some(VectorType::Float64Dense))?;
+    let vector = operations::convert::vector_convert(vector, VectorType::Float64Dense)?;
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector_extract(args: &[Register]) -> Result<Value> {
@@ -62,9 +81,8 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         return Ok(Value::build_text("[]"));
     }
 
-    let vector_type = vector_type(blob)?;
-    let vector = vector_deserialize(vector_type, blob)?;
-    Ok(Value::build_text(vector_to_text(&vector)))
+    let vector = Vector::from_blob(blob.to_vec())?;
+    Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 
 pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
@@ -76,7 +94,7 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-    let dist = do_vector_distance_cos(&x, &y)?;
+    let dist = operations::distance_cos::vector_distance_cos(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
@@ -89,19 +107,20 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-    // Validate that both vectors have the same dimensions and type
-    if x.dims != y.dims {
+    let dist = operations::distance_l2::vector_distance_l2(&x, &y)?;
+    Ok(Value::Float(dist))
+}
+
+pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
+    if args.len() != 2 {
         return Err(LimboError::ConversionError(
-            "Vectors must have the same dimensions".to_string(),
-        ));
-    }
-    if x.vector_type != y.vector_type {
-        return Err(LimboError::ConversionError(
-            "Vectors must be of the same type".to_string(),
+            "distance_jaccard requires exactly two arguments".to_string(),
         ));
     }
 
-    let dist = Euclidean::calculate(&x, &y)?;
+    let x = parse_vector(&args[0], None)?;
+    let y = parse_vector(&args[1], None)?;
+    let dist = operations::jaccard::vector_distance_jaccard(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
@@ -114,18 +133,8 @@ pub fn vector_concat(args: &[Register]) -> Result<Value> {
 
     let x = parse_vector(&args[0], None)?;
     let y = parse_vector(&args[1], None)?;
-
-    if x.vector_type != y.vector_type {
-        return Err(LimboError::InvalidArgument(
-            "Vectors must be of the same type".into(),
-        ));
-    }
-
-    let vector = vector_types::vector_concat(&x, &y)?;
-    match vector.vector_type {
-        VectorType::Float32 => Ok(vector_serialize_f32(vector)),
-        VectorType::Float64 => Ok(vector_serialize_f64(vector)),
-    }
+    let vector = operations::concat::vector_concat(&x, &y)?;
+    Ok(operations::serialize::vector_serialize(vector))
 }
 
 pub fn vector_slice(args: &[Register]) -> Result<Value> {
@@ -153,10 +162,8 @@ pub fn vector_slice(args: &[Register]) -> Result<Value> {
         ));
     }
 
-    let result = vector_types::vector_slice(&vector, start_index as usize, end_index as usize)?;
+    let result =
+        operations::slice::vector_slice(&vector, start_index as usize, end_index as usize)?;
 
-    Ok(match result.vector_type {
-        VectorType::Float32 => vector_serialize_f32(result),
-        VectorType::Float64 => vector_serialize_f64(result),
-    })
+    Ok(operations::serialize::vector_serialize(result))
 }
