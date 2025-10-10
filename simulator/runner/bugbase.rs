@@ -293,22 +293,23 @@ impl BugBase {
             None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.json"))
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
                         .with_context(|| {
                             format!(
                                 "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("test.json").display()
+                                self.path.join(seed.to_string()).join("plan.json").display()
                             )
                         })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
                     .with_context(|| "should be able to deserialize plan")?;
 
-                let shrunk_plan: Option<String> = std::fs::read_to_string(
-                    self.path.join(seed.to_string()).join("shrunk_test.json"),
-                )
-                .with_context(|| "should be able to read shrunk plan file")
-                .and_then(|shrunk| serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e)))
-                .ok();
+                let shrunk_plan: Option<String> =
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("shrunk.json"))
+                        .with_context(|| "should be able to read shrunk plan file")
+                        .and_then(|shrunk| {
+                            serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e))
+                        })
+                        .ok();
 
                 let shrunk_plan: Option<InteractionPlan> =
                     shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
