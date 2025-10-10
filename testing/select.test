@@ -913,6 +913,19 @@ do_execsql_test_on_specific_db {:memory:} select-in-simple {
 } {1
 0}
 
+do_execsql_test_on_specific_db {:memory:} select-in-with-nulls {
+  SELECT 4 IN (1, 4, null);
+  SELECT 4 NOT IN (1, 4, null);
+} {1
+0}
+
+# All should be null
+do_execsql_test_on_specific_db {:memory:} select-in-with-nulls-2 {
+SELECT 1 IN (2, 3, null);
+SELECT 1 NOT IN (2, 3, null);
+SELECT null in (null);
+} {\n\n}
+
 do_execsql_test_on_specific_db {:memory:} select-in-complex {
   CREATE TABLE test_table (id INTEGER, category TEXT, value INTEGER);
   INSERT INTO test_table VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30), (4, 'C', 40);

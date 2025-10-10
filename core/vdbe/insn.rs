@@ -853,10 +853,12 @@ pub enum Insn {
         db: usize,
     },
 
+    /// Make a copy of register src..src+extra_amount into dst..dst+extra_amount.
     Copy {
         src_reg: usize,
         dst_reg: usize,
-        extra_amount: usize, // 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        /// 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        extra_amount: usize,
     },
 
     /// Allocate a new b-tree.
