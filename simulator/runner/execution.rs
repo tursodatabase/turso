@@ -341,6 +341,9 @@ fn execute_query_rusqlite(
     connection: &rusqlite::Connection,
     query: &Query,
 ) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    // https://sqlite.org/forum/forumpost/9fe5d047f0
+    // Due to a bug in sqlite, we need to execute this query to clear the internal stmt cache so that schema changes become visible always to other connections
+    connection.query_one("SELECT * FROM pragma_user_version()", (), |_| Ok(()))?;
     match query {
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
