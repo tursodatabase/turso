@@ -58,9 +58,17 @@ impl InteractionPlan {
     pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
         let len = plan
             .iter()
-            .filter(|interaction| !interaction.is_transaction())
+            .filter(|interaction| !interaction.ignore())
             .count();
         Self { plan, mvcc, len }
+    }
+
+    #[inline]
+    fn new_len(&self) -> usize {
+        self.plan
+            .iter()
+            .filter(|interaction| !interaction.ignore())
+            .count()
     }
 
     /// Length of interactions that are not transaction statements
@@ -70,10 +78,57 @@ impl InteractionPlan {
     }
 
     pub fn push(&mut self, interactions: Interactions) {
-        if !interactions.is_transaction() {
+        if !interactions.ignore() {
             self.len += 1;
         }
         self.plan.push(interactions);
+    }
+
+    pub fn remove(&mut self, index: usize) -> Interactions {
+        let interactions = self.plan.remove(index);
+        if !interactions.ignore() {
+            self.len -= 1;
+        }
+        interactions
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.plan.truncate(len);
+        self.len = self.new_len();
+    }
+
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut Interactions) -> bool,
+    {
+        let f = |t: &mut Interactions| {
+            let ignore = t.ignore();
+            let retain = f(t);
+            // removed an interaction that was not previously ignored
+            if !retain && !ignore {
+                self.len -= 1;
+            }
+            retain
+        };
+        self.plan.retain_mut(f);
+    }
+
+    #[expect(dead_code)]
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&Interactions) -> bool,
+    {
+        let f = |t: &Interactions| {
+            let ignore = t.ignore();
+            let retain = f(t);
+            // removed an interaction that was not previously ignored
+            if !retain && !ignore {
+                self.len -= 1;
+            }
+            retain
+        };
+        self.plan.retain(f);
+        self.len = self.new_len();
     }
 
     /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
@@ -580,6 +635,17 @@ impl Interactions {
             InteractionsType::Property(property) => property.check_tables(),
             InteractionsType::Query(..) | InteractionsType::Fault(..) => false,
         }
+    }
+
+    /// Interactions that are not counted/ignored in the InteractionPlan.
+    /// Used in InteractionPlan to not count certain interactions to its length, as they are just auxiliary. This allows more
+    /// meaningful interactions to be generation
+    fn ignore(&self) -> bool {
+        self.is_transaction()
+            || matches!(
+                self.interactions,
+                InteractionsType::Property(Property::AllTableHaveExpectedContent { .. })
+            )
     }
 }
 
