@@ -8,27 +8,35 @@ plugins {
     application
     `java-library`
     `maven-publish`
+    signing
     id("net.ltgt.errorprone") version "3.1.0"
 
     // If you're stuck on JRE 8, use id 'com.diffplug.spotless' version '6.13.0' or older.
     id("com.diffplug.spotless") version "6.13.0"
 }
 
-group = properties["projectGroup"]!!
-version = properties["projectVersion"]!!
+// Apply publishing configuration
+apply(from = "gradle/publish.gradle.kts")
+
+// Helper function to read properties with defaults
+fun prop(key: String, default: String? = null): String? =
+    findProperty(key)?.toString() ?: default
+
+group = prop("projectGroup") ?: error("projectGroup must be set in gradle.properties")
+version = prop("projectVersion") ?: error("projectVersion must be set in gradle.properties")
 
 java {
     sourceCompatibility = JavaVersion.VERSION_1_8
     targetCompatibility = JavaVersion.VERSION_1_8
+    withJavadocJar()
+    withSourcesJar()
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            from(components["java"])
-            groupId = "tech.turso"
-            artifactId = "turso"
-            version = "0.0.1-SNAPSHOT"
+// TODO: Add javadoc to required class and methods. After that, let's remove this settings
+tasks.withType<Javadoc> {
+    options {
+        (this as StandardJavadocDocletOptions).apply {
+            addStringOption("Xdoclint:none", "-quiet")
         }
     }
 }
