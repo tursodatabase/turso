@@ -152,6 +152,7 @@ impl RowVersionNode {
         unsafe { (*self.version.get()).as_ref() }
     }
 
+    #[allow(clippy::mut_from_ref)]
     unsafe fn row_version_mut(&self) -> Option<&mut RowVersion> {
         (&mut *self.version.get()).as_mut()
     }
