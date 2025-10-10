@@ -456,7 +456,31 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 column: Column::arbitrary(rng, context),
             },
             AlterTableTypeDiscriminants::AlterColumn => {
-                todo!();
+                let col_diff = get_column_diff(table);
+
+                if col_diff.is_empty() {
+                    // Generate a DropColumn if we can drop a column
+                    return AlterTableType::arbitrary_from(
+                        rng,
+                        context,
+                        (
+                            table,
+                            if choices.contains(&AlterTableTypeDiscriminants::DropColumn) {
+                                ALTER_TABLE_NO_ALTER_COL
+                            } else {
+                                ALTER_TABLE_NO_ALTER_COL_NO_DROP
+                            },
+                        ),
+                    );
+                }
+
+                let col_idx = pick_index(col_diff.len(), rng);
+                let col_name = col_diff.get_index(col_idx).unwrap();
+
+                AlterTableType::AlterColumn {
+                    old: col_name.to_string(),
+                    new: Column::arbitrary(rng, context),
+                }
             }
             AlterTableTypeDiscriminants::RenameColumn => AlterTableType::RenameColumn {
                 old: pick(&table.columns, rng).name.clone(),
@@ -501,8 +525,7 @@ impl Arbitrary for AlterTable {
         ) {
             (true, true) => ALTER_TABLE_ALL,
             (true, false) => ALTER_TABLE_NO_ALTER_COL,
-            (false, true) => ALTER_TABLE_NO_DROP,
-            (false, false) => ALTER_TABLE_NO_ALTER_COL_NO_DROP,
+            (false, true) | (false, false) => ALTER_TABLE_NO_ALTER_COL_NO_DROP,
         };
 
         let alter_table_type = AlterTableType::arbitrary_from(rng, context, (table, choices));

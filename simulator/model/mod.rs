@@ -561,8 +561,6 @@ impl Shadow for AlterTable {
                 });
             }
             AlterTableType::AlterColumn { old, new } => {
-                // TODO: have to see correct behaviour with indexes to see if we should error out
-                // in case there is some sort of conflict with this change
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 *col = new.clone();
             }
