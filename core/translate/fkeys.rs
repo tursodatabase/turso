@@ -282,216 +282,124 @@ pub fn emit_parent_pk_change_checks(
     old_rowid_reg: usize,
     start: usize,
     rowid_new_reg: usize,
-    rowid_set_clause_reg: Option<usize>,
+    _rowid_set_clause_reg: Option<usize>,
     set_clauses: &[(usize, Box<Expr>)],
 ) -> Result<()> {
     let updated_positions: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let incoming = resolver
         .schema
         .resolved_fks_referencing(&table_btree.name)?;
-    let affects_pk = incoming
-        .iter()
-        .any(|r| r.parent_key_may_change(&updated_positions, table_btree));
-    if !affects_pk {
+
+    for fk_ref in incoming {
+        if fk_ref.parent_key_may_change(&updated_positions, table_btree) {
+            emit_parent_key_change_check_for_fk(
+                program,
+                resolver,
+                table_btree,
+                &fk_ref,
+                cursor_id,
+                old_rowid_reg,
+                start,
+                rowid_new_reg,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_parent_key_change_check_for_fk(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_btree: &BTreeTable,
+    fk_ref: &ResolvedFkRef,
+    cursor_id: usize,
+    old_rowid_reg: usize,
+    new_values_start_reg: usize,
+    new_rowid_reg: usize,
+) -> Result<()> {
+
+    let parent_key_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
+        parent_btree
+            .primary_key_columns
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    } else {
+        fk_ref.fk.parent_columns.clone()
+    };
+
+    if parent_key_cols.is_empty() {
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::Eq {
+            lhs: new_rowid_reg,
+            rhs: old_rowid_reg,
+            target_pc: skip_label,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+
+        emit_fk_parent_pk_change_counters(program, &[fk_ref.clone()], resolver, old_rowid_reg, new_rowid_reg, 1)?;
+        program.preassign_label_to_next_insn(skip_label);
         return Ok(());
     }
 
-    match table_btree.primary_key_columns.len() {
-        0 => emit_rowid_pk_change_check(
-            program,
-            &incoming,
-            resolver,
-            old_rowid_reg,
-            rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-        ),
-        1 => emit_single_pk_change_check(
-            program,
-            &incoming,
-            resolver,
-            table_btree,
-            cursor_id,
-            start,
-            rowid_new_reg,
-        ),
-        _ => emit_composite_pk_change_check(
-            program,
-            &incoming,
-            resolver,
-            table_btree,
-            cursor_id,
-            old_rowid_reg,
-            start,
-            rowid_new_reg,
-        ),
-    }
-}
+    let key_len = parent_key_cols.len();
+    let old_key_regs = program.alloc_registers(key_len);
+    let new_key_regs = program.alloc_registers(key_len);
 
-/// Rowid-table parent PK change: compare rowid OLD vs NEW; if changed, run two-pass counters.
-pub fn emit_rowid_pk_change_check(
-    program: &mut ProgramBuilder,
-    incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
-    old_rowid_reg: usize,
-    new_rowid_reg: usize,
-) -> Result<()> {
-    let skip = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: new_rowid_reg,
-        rhs: old_rowid_reg,
-        target_pc: skip,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-
-    let old_pk = program.alloc_register();
-    let new_pk = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: old_rowid_reg,
-        dst_reg: old_pk,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_rowid_reg,
-        dst_reg: new_pk,
-        extra_amount: 0,
-    });
-
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, 1)?;
-    program.preassign_label_to_next_insn(skip);
-    Ok(())
-}
-
-/// Single-column PK parent change: load OLD and NEW; if changed, run two-pass counters.
-pub fn emit_single_pk_change_check(
-    program: &mut ProgramBuilder,
-    incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
-    table_btree: &BTreeTable,
-    cursor_id: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    let (pk_name, _) = &table_btree.primary_key_columns[0];
-    let (pos, col) = table_btree.get_column(pk_name).unwrap();
-
-    let old_reg = program.alloc_register();
-    if col.is_rowid_alias {
-        program.emit_insn(Insn::RowId {
-            cursor_id,
-            dest: old_reg,
-        });
-    } else {
-        program.emit_insn(Insn::Column {
-            cursor_id,
-            column: pos,
-            dest: old_reg,
-            default: None,
-        });
-    }
-    let new_reg = if col.is_rowid_alias {
-        rowid_new_reg
-    } else {
-        start + pos
-    };
-
-    let skip = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: old_reg,
-        rhs: new_reg,
-        target_pc: skip,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-
-    let old_pk = program.alloc_register();
-    let new_pk = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: old_reg,
-        dst_reg: old_pk,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_reg,
-        dst_reg: new_pk,
-        extra_amount: 0,
-    });
-
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, 1)?;
-    program.preassign_label_to_next_insn(skip);
-    Ok(())
-}
-
-/// Composite-PK parent change: build OLD/NEW vectors; if any component differs, run two-pass counters.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_composite_pk_change_check(
-    program: &mut ProgramBuilder,
-    incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
-    table_btree: &BTreeTable,
-    cursor_id: usize,
-    old_rowid_reg: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    let pk_len = table_btree.primary_key_columns.len();
-
-    let old_pk = program.alloc_registers(pk_len);
-    for (i, (pk_name, _)) in table_btree.primary_key_columns.iter().enumerate() {
-        let (pos, col) = table_btree.get_column(pk_name).unwrap();
+    for (i, col_name) in parent_key_cols.iter().enumerate() {
+        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
+            program.emit_insn(Insn::Copy { src_reg: old_rowid_reg, dst_reg: old_key_regs + i, extra_amount: 0 });
+            continue;
+        }
+        let (pos, col) = parent_btree.get_column(col_name).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("Parent column {} not found", col_name))
+        })?;
         if col.is_rowid_alias {
-            program.emit_insn(Insn::Copy {
-                src_reg: old_rowid_reg,
-                dst_reg: old_pk + i,
-                extra_amount: 0,
-            });
+            program.emit_insn(Insn::Copy { src_reg: old_rowid_reg, dst_reg: old_key_regs + i, extra_amount: 0 });
         } else {
             program.emit_insn(Insn::Column {
                 cursor_id,
                 column: pos,
-                dest: old_pk + i,
+                dest: old_key_regs + i,
                 default: None,
             });
         }
     }
-    let new_pk = program.alloc_registers(pk_len);
-    for (i, (pk_name, _)) in table_btree.primary_key_columns.iter().enumerate() {
-        let (pos, col) = table_btree.get_column(pk_name).unwrap();
-        let src = if col.is_rowid_alias {
-            rowid_new_reg
-        } else {
-            start + pos
-        };
-        program.emit_insn(Insn::Copy {
-            src_reg: src,
-            dst_reg: new_pk + i,
-            extra_amount: 0,
-        });
-    }
 
-    let skip = program.allocate_label();
-    let changed = program.allocate_label();
-    for i in 0..pk_len {
-        let next = if i + 1 == pk_len {
-            None
-        } else {
-            Some(program.allocate_label())
-        };
-        program.emit_insn(Insn::Eq {
-            lhs: old_pk + i,
-            rhs: new_pk + i,
-            target_pc: next.unwrap_or(skip),
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::Goto { target_pc: changed });
-        if let Some(n) = next {
-            program.preassign_label_to_next_insn(n);
+    for (i, col_name) in parent_key_cols.iter().enumerate() {
+        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
+            program.emit_insn(Insn::Copy { src_reg: new_rowid_reg, dst_reg: new_key_regs + i, extra_amount: 0 });
+            continue;
         }
+        let (pos, col) = parent_btree.get_column(col_name).unwrap();
+        let src_reg = if col.is_rowid_alias {
+            new_rowid_reg
+        } else {
+            new_values_start_reg + pos
+        };
+        program.emit_insn(Insn::Copy { src_reg, dst_reg: new_key_regs + i, extra_amount: 0 });
     }
 
-    program.preassign_label_to_next_insn(changed);
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, pk_len)?;
-    program.preassign_label_to_next_insn(skip);
+    let skip_checks_label = program.allocate_label();
+    let values_changed_label = program.allocate_label();
+    for i in 0..key_len {
+        program.emit_insn(Insn::Ne {
+            lhs: old_key_regs + i,
+            rhs: new_key_regs + i,
+            target_pc: values_changed_label,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: Some(super::collate::CollationSeq::Binary),
+        });
+    }
+
+    program.emit_insn(Insn::Goto { target_pc: skip_checks_label });
+
+    program.preassign_label_to_next_insn(values_changed_label);
+    emit_fk_parent_pk_change_counters(program, &[fk_ref.clone()], resolver, old_key_regs, new_key_regs, key_len)?;
+
+    program.preassign_label_to_next_insn(skip_checks_label);
     Ok(())
 }
 
