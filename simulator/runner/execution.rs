@@ -283,16 +283,13 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip(env, interaction, stack), fields(conn_index = interaction.connection_index, interaction = %interaction))]
 fn execute_interaction_rusqlite(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> turso_core::Result<ExecutionContinuation> {
-    tracing::trace!(
-        "execute_interaction_rusqlite(connection_index={}, interaction={})",
-        interaction.connection_index,
-        interaction
-    );
+    tracing::info!("");
     let SimConnection::SQLiteConnection(conn) = &mut env.connections[interaction.connection_index]
     else {
         unreachable!()
@@ -347,11 +344,19 @@ fn execute_query_rusqlite(
     match query {
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let columns = stmt.column_count();
             let rows = stmt.query_map([], |row| {
                 let mut values = vec![];
-                for i in 0..columns {
-                    let value = row.get_unwrap(i);
+                for i in 0.. {
+                    let value = match row.get(i) {
+                        Ok(value) => value,
+                        Err(err) => match err {
+                            rusqlite::Error::InvalidColumnIndex(_) => break,
+                            _ => {
+                                tracing::error!(?err);
+                                panic!("{err}")
+                            }
+                        },
+                    };
                     let value = match value {
                         rusqlite::types::Value::Null => Value::Null,
                         rusqlite::types::Value::Integer(i) => Value::Integer(i),
