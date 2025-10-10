@@ -56,18 +56,20 @@ pub fn translate_alter_table(
         .get_table(table_name)
         .and_then(|table| table.btree())
     else {
-        return Err(LimboError::ParseError(format!(
-            "no such table: {table_name}"
-        )));
+        return Err(LimboError::ParseError(
+            turso_parser::error::ParseError::Custom(format!("no such table: {table_name}")),
+        ));
     };
 
     // Check if this table has dependent materialized views
     let dependent_views = resolver.schema.get_dependent_materialized_views(table_name);
     if !dependent_views.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
-            dependent_views.join(", ")
-        )));
+        return Err(LimboError::ParseError(
+            turso_parser::error::ParseError::Custom(format!(
+                "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
+                dependent_views.join(", ")
+            )),
+        ));
     }
 
     let mut btree = (*original_btree).clone();
@@ -80,13 +82,17 @@ pub fn translate_alter_table(
             assert_ne!(btree.columns.len(), 0);
 
             if btree.columns.len() == 1 {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": no other columns exist"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "cannot drop column \"{column_name}\": no other columns exist"
+                    )),
+                ));
             }
 
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
-                LimboError::ParseError(format!("no such column: \"{column_name}\""))
+                LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+                    "no such column: \"{column_name}\""
+                )))
             })?;
 
             // Column cannot be dropped if:
@@ -100,9 +106,11 @@ pub fn translate_alter_table(
             // The column appears in a trigger or view.
 
             if column.primary_key {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": PRIMARY KEY"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "cannot drop column \"{column_name}\": PRIMARY KEY"
+                    )),
+                ));
             }
 
             if column.unique
@@ -112,9 +120,11 @@ pub fn translate_alter_table(
                         .any(|(name, _)| name == &normalize_ident(column_name))
                 })
             {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": UNIQUE"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "cannot drop column \"{column_name}\": UNIQUE"
+                    )),
+                ));
             }
 
             for index in table_indexes.iter() {
@@ -125,10 +135,12 @@ pub fn translate_alter_table(
                     .enumerate()
                     .find(|(_, col)| col.pos_in_table == dropped_index);
                 if let Some((pos_in_index, indexed_col)) = maybe_indexed_col {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": it is referenced in the index {}; position in index is {pos_in_index}, position in table is {}",
-                        index.name, indexed_col.pos_in_table
-                    )));
+                    return Err(LimboError::ParseError(
+                        turso_parser::error::ParseError::Custom(format!(
+                            "cannot drop column \"{column_name}\": it is referenced in the index {}; position in index is {pos_in_index}, position in table is {}",
+                            index.name, indexed_col.pos_in_table
+                        )),
+                    ));
                 }
                 // Referenced in partial index
                 if index.where_clause.is_some() {
@@ -165,9 +177,11 @@ pub fn translate_alter_table(
                         },
                     )?;
                     if column_referenced {
-                        return Err(LimboError::ParseError(format!(
-                            "cannot drop column \"{column_name}\": indexed"
-                        )));
+                        return Err(LimboError::ParseError(
+                            turso_parser::error::ParseError::Custom(format!(
+                                "cannot drop column \"{column_name}\": indexed"
+                            )),
+                        ));
                     }
                 }
             }
@@ -285,7 +299,9 @@ pub fn translate_alter_table(
                     // TODO: This is slightly inaccurate since sqlite returns a `Runtime
                     // error`.
                     return Err(LimboError::ParseError(
-                        "Cannot add a column with non-constant default".to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "Cannot add a column with non-constant default".to_string(),
+                        ),
                     ));
                 }
             }
@@ -293,7 +309,9 @@ pub fn translate_alter_table(
             let new_column_name = column.name.as_ref().unwrap();
             if btree.get_column(new_column_name).is_some() {
                 return Err(LimboError::ParseError(
-                    "duplicate column name: ".to_string() + new_column_name,
+                    turso_parser::error::ParseError::Custom(
+                        "duplicate column name: ".to_string() + new_column_name,
+                    ),
                 ));
             }
 
@@ -355,9 +373,11 @@ pub fn translate_alter_table(
                     .flatten()
                     .any(|index| index.name == normalize_ident(new_name))
             {
-                return Err(LimboError::ParseError(format!(
-                    "there is already another table or index with this name: {new_name}"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "there is already another table or index with this name: {new_name}"
+                    )),
+                ));
             };
 
             let sqlite_schema = resolver
@@ -465,15 +485,17 @@ pub fn translate_alter_table(
             let col_name = col_name.as_str();
 
             let Some((column_index, _)) = btree.get_column(from) else {
-                return Err(LimboError::ParseError(format!(
-                    "no such column: \"{from}\""
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!("no such column: \"{from}\"")),
+                ));
             };
 
             if btree.get_column(col_name).is_some() {
-                return Err(LimboError::ParseError(format!(
-                    "duplicate column name: \"{col_name}\""
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "duplicate column name: \"{col_name}\""
+                    )),
+                ));
             };
 
             if definition
@@ -482,7 +504,9 @@ pub fn translate_alter_table(
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
             {
                 return Err(LimboError::ParseError(
-                    "PRIMARY KEY constraint cannot be altered".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "PRIMARY KEY constraint cannot be altered".to_string(),
+                    ),
                 ));
             }
 
@@ -492,7 +516,9 @@ pub fn translate_alter_table(
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }))
             {
                 return Err(LimboError::ParseError(
-                    "UNIQUE constraint cannot be altered".to_string(),
+                    turso_parser::error::ParseError::Custom(
+                        "UNIQUE constraint cannot be altered".to_string(),
+                    ),
                 ));
             }
 

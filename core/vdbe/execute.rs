@@ -43,6 +43,7 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
+use turso_parser::error::ParseError;
 
 use crate::pseudo::PseudoCursor;
 
@@ -4964,9 +4965,11 @@ pub fn op_function(
                     match unixepoch {
                         Ok(time) => state.registers[*dest] = Register::Value(time),
                         Err(e) => {
-                            return Err(LimboError::ParseError(format!(
-                                "Error encountered while parsing datetime value: {e}"
-                            )));
+                            return Err(LimboError::ParseError(
+                                turso_parser::error::ParseError::Custom(format!(
+                                    "Error encountered while parsing datetime value: {e}"
+                                )),
+                            ));
                         }
                     }
                 }
@@ -8115,9 +8118,11 @@ pub fn op_drop_column(
                     .iter()
                     .any(|column| column.pos_in_table == *column_index)
                 {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": indexed"
-                    )));
+                    return Err(LimboError::ParseError(
+                        turso_parser::error::ParseError::Custom(format!(
+                            "cannot drop column \"{column_name}\": indexed"
+                        )),
+                    ));
                 }
             }
         }
@@ -8143,10 +8148,10 @@ pub fn op_drop_column(
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
+                LimboError::ParseError(ParseError::Custom(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
                     column_name, view.sql,
-                ))
+                )))
             })?;
         }
     }
@@ -8274,10 +8279,10 @@ pub fn op_alter_column(
             let view_select_sql = format!("SELECT * FROM {view_name}");
             // FIXME: this should rewrite the view to reference the new column name
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
+                LimboError::ParseError(ParseError::Custom(format!(
                     "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
                     old_column_name, view.sql,
-                ))
+                )))
             })?;
         }
     }
@@ -9948,9 +9953,11 @@ pub fn op_journal_mode(
             }
             _ => {
                 // Invalid journal mode
-                return Err(LimboError::ParseError(format!(
-                    "Unknown journal mode: {mode}"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "Unknown journal mode: {mode}"
+                    )),
+                ));
             }
         })
     }

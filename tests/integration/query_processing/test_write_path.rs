@@ -727,7 +727,7 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
                 dbg!(&error);
                 let panic_msg = error.downcast_ref::<LimboError>().unwrap();
                 let msg = match panic_msg {
-                    LimboError::ParseError(message) => message,
+                    LimboError::ParseError(e) => e.to_string(),
                     _ => panic!("Unexpected panic message: {panic_msg}"),
                 };
 
@@ -780,7 +780,7 @@ fn test_insert_with_column_names() -> anyhow::Result<()> {
         Ok(_) => panic!("Expected error but query succeeded."),
         Err(error) => {
             let error_msg = match error {
-                LimboError::ParseError(msg) => msg,
+                LimboError::ParseError(e) => e.to_string(),
                 _ => panic!("Unexpected {error}"),
             };
 

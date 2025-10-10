@@ -8,6 +8,7 @@ use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{Connection, Result};
 use std::sync::Arc;
 use turso_parser::ast;
+use turso_parser::error::ParseError;
 
 pub fn translate_create_materialized_view(
     view_name: &ast::Name,
@@ -19,8 +20,10 @@ pub fn translate_create_materialized_view(
     // Check if experimental views are enabled
     if !connection.experimental_views_enabled() {
         return Err(crate::LimboError::ParseError(
-            "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
-                .to_string(),
+            ParseError::Custom(
+                "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
+                    .to_string(),
+            ),
         ));
     }
 
@@ -32,8 +35,8 @@ pub fn translate_create_materialized_view(
         .get_materialized_view(&normalized_view_name)
         .is_some()
     {
-        return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+        return Err(crate::LimboError::ParseError(ParseError::DuplicateView(
+            normalized_view_name,
         )));
     }
 
@@ -250,8 +253,8 @@ pub fn translate_create_view(
             .get_materialized_view(&normalized_view_name)
             .is_some()
     {
-        return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+        return Err(crate::LimboError::ParseError(ParseError::DuplicateView(
+            normalized_view_name,
         )));
     }
 
@@ -314,8 +317,8 @@ pub fn translate_drop_view(
     let view_exists = is_regular_view || is_materialized_view;
 
     if !view_exists && !if_exists {
-        return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
+        return Err(crate::LimboError::ParseError(ParseError::NoSuchView(
+            normalized_view_name,
         )));
     }
 
