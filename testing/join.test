@@ -384,3 +384,10 @@ do_execsql_test_on_specific_db {:memory:} left-join-using-null {
     select a, b from t left join s using (a, b);
 } {1|
 2|}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3656
+do_execsql_test_on_specific_db {:memory:} redundant-join-condition {
+    create table t(x);
+    insert into t values ('lol');
+    select t1.x from t t1 join t t2 on t1.x=t2.x where t1.x=t2.x;
+} {lol}
