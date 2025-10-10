@@ -112,7 +112,7 @@ mod tests {
                     dims: v1.dims,
                     data: v1.data.clone(),
                 };
-                assert_vectors(&vector_convert(v_copy, v2.vector_type).unwrap(), &v2);
+                assert_vectors(&vector_convert(v_copy, v2.vector_type).unwrap(), v2);
             }
         }
     }
