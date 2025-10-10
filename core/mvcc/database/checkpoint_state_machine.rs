@@ -171,7 +171,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let version = node.row_version()?;
                 if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
                     if ts > self.checkpointed_txid_max_old {
-                        version_to_checkpoint = Some(version.clone());
+                        if version_to_checkpoint.is_none() {
+                            version_to_checkpoint = Some(version.clone());
+                        }
                     } else {
                         exists_in_db_file = true;
                     }
