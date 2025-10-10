@@ -308,6 +308,7 @@ pub fn emit_parent_pk_change_checks(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_parent_key_change_check_for_fk(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -364,7 +365,7 @@ fn emit_parent_key_change_check_for_fk(
             continue;
         }
         let (pos, col) = parent_btree.get_column(col_name).ok_or_else(|| {
-            crate::LimboError::InternalError(format!("Parent column {} not found", col_name))
+            crate::LimboError::InternalError(format!("Parent column {col_name} not found"))
         })?;
         if col.is_rowid_alias {
             program.emit_insn(Insn::Copy {
