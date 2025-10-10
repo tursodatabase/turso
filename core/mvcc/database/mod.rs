@@ -243,6 +243,9 @@ impl RowVersionChain {
         None
     }
 
+    // This function is kinda unreliable when insert the version that has the same beginning,
+    // However this function is just to be compatible with how we currently handle inserting
+    // to row version chain and will be removed in the future, so whatever :)
     fn insert_sorted<F>(&self, row_version: RowVersion, mut get_begin_ts: F)
     where
         F: FnMut(&Option<TxTimestampOrID>) -> u64,
@@ -258,7 +261,7 @@ impl RowVersionChain {
                 let should_insert = match next_ptr.as_ref() {
                     Some(next_node) if next_node.is_data() => {
                         let next_begin = get_begin_ts(&next_node.row_version().unwrap().begin);
-                        next_begin < new_begin
+                        next_begin <= new_begin
                     }
                     Some(_) => false,
                     None => true,
