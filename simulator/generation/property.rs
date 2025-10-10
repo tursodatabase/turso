@@ -12,6 +12,7 @@ use sql_generation::{
     model::{
         query::{
             Create, Delete, Drop, Insert, Select,
+            alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
@@ -283,7 +284,7 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] The inserted row will not be deleted.
                 // - [x] The inserted row will not be updated.
-                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] The table `t` will not be renamed, dropped, or altered.
                 |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
                     let Property::InsertValuesSelect {
                         insert, row_index, ..
@@ -327,6 +328,10 @@ impl Property {
                             // Cannot drop the table we are inserting
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the table we are inserting
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
@@ -334,7 +339,7 @@ impl Property {
             Property::DoubleCreateFailure { .. } => {
                 // The interactions in the middle has the following constraints;
                 // - [x] There will be no errors in the middle interactions.(best effort)
-                // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] Table `t` will not be renamed or dropped.
                 |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
                     let Property::DoubleCreateFailure { create, .. } = property else {
                         unreachable!()
@@ -358,6 +363,10 @@ impl Property {
                             // Cannot Drop the created table
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the table we created
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
@@ -365,7 +374,7 @@ impl Property {
             Property::DeleteSelect { .. } => {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
-                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] The table `t` will not be renamed, dropped, or altered.
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -412,13 +421,17 @@ impl Property {
                             // Cannot Drop the same table
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the same table
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
             }
             Property::DropSelect { .. } => {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-                // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+                // - [x] The table `t` will not be created, no table will be renamed to `t`.
                 |rng, ctx, query_distr, property: &Property| {
                     let Property::DropSelect {
                         table: table_name, ..
@@ -428,13 +441,19 @@ impl Property {
                     };
 
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
-                    if let Query::Create(Create { table: t }) = &query
-                        && t.name == *table_name
-                    {
-                        // - The table `t` will not be created
-                        None
-                    } else {
-                        Some(query)
+                    match &query {
+                        Query::Create(Create { table: t }) if t.name == *table_name => {
+                            // - The table `t` will not be created
+                            None
+                        }
+                        Query::AlterTable(AlterTable {
+                            table_name: t,
+                            alter_table_type: AlterTableType::RenameTo { new_name },
+                        }) if t == table_name || new_name == table_name => {
+                            // no table will be renamed to `t`
+                            None
+                        }
+                        _ => Some(query),
                     }
                 }
             }
