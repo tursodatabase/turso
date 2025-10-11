@@ -5,7 +5,7 @@ use crate::generation::{
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner,
+    SelectInner, SelectTable,
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
@@ -80,7 +80,10 @@ impl Arbitrary for FromClause {
                 })
             })
             .collect();
-        FromClause { table: name, joins }
+        FromClause {
+            table: SelectTable::Table(name),
+            joins,
+        }
     }
 }
 
@@ -97,8 +100,8 @@ impl Arbitrary for SelectInner {
                 let order_by_table_candidates = from
                     .joins
                     .iter()
-                    .map(|j| &j.table)
-                    .chain(std::iter::once(&from.table))
+                    .map(|j| j.table.clone())
+                    .chain(from.table.dependencies())
                     .collect::<Vec<_>>();
                 let order_by_col_count =
                     (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
@@ -154,8 +157,8 @@ impl ArbitrarySized for SelectInner {
         let table_names = select_from
             .joins
             .iter()
-            .map(|j| &j.table)
-            .chain(std::iter::once(&select_from.table));
+            .map(|j| j.table.clone())
+            .chain(select_from.dependencies());
 
         let flat_columns_names = table_names
             .flat_map(|t| {

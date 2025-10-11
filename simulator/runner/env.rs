@@ -54,14 +54,14 @@ impl TransactionTables {
 
 #[derive(Debug)]
 pub struct ShadowTables<'a> {
-    commited_tables: &'a Vec<Table>,
-    transaction_tables: Option<&'a TransactionTables>,
+    pub(crate) commited_tables: &'a Vec<Table>,
+    pub(crate) transaction_tables: Option<&'a TransactionTables>,
 }
 
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
-    commited_tables: &'a mut Vec<Table>,
-    transaction_tables: &'a mut Option<TransactionTables>,
+    pub(crate) commited_tables: &'a mut Vec<Table>,
+    pub(crate) transaction_tables: &'a mut Option<TransactionTables>,
 }
 
 impl<'a> ShadowTables<'a> {
@@ -315,6 +315,7 @@ impl SimulatorEnv {
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
+            disable_insert_nested_select: cli_opts.disable_insert_values_select,
         };
 
         // Remove existing database file if it exists
@@ -575,6 +576,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
+    pub(crate) disable_insert_nested_select: bool,
 
     pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,

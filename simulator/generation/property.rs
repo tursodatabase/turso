@@ -6,6 +6,7 @@
 //! an optimization issue that is good to point out for the future
 
 use rand::distr::{Distribution, weighted::WeightedIndex};
+
 use serde::{Deserialize, Serialize};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
@@ -13,7 +14,10 @@ use sql_generation::{
         query::{
             Create, Delete, Drop, Insert, Select,
             predicate::Predicate,
-            select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
+            select::{
+                CompoundOperator, CompoundSelect, FromClause, ResultColumn, SelectBody,
+                SelectInner, SelectTable,
+            },
             transaction::{Begin, Commit, Rollback},
             update::Update,
         },
@@ -212,6 +216,19 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+    /// InsertedSelectNested tests that when after a statement of the format `INSERT INTO <table> SELECT *
+    /// FROM <table>`, the table contains exactly 2 rows for each row that it contained before the
+    /// statement.
+    ///
+    /// The nesting_level controls the level of nesting of the SELECT clause. For example,
+    /// nesting_level=0 generates the query above, nesting_level=1 generates this query:
+    ///     INSERT INTO <table> SELECT * FROM (SELECT * FROM <table>)
+    /// and nesting_level=1 generates this query:
+    ///     INSERT INTO <table> SELECT * FROM (SELECT * FROM (SELECT * FROM <table>))
+    InsertSelectNested {
+        table: String,
+        nesting_level: u8,
+    },
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -244,6 +261,7 @@ impl Property {
             Property::FaultyQuery { .. } => "FaultyQuery",
             Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
             Property::Queries { .. } => "Queries",
+            Property::InsertSelectNested { .. } => "InsertSelectNested",
         }
     }
 
@@ -268,6 +286,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::InsertSelectNested { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
@@ -450,6 +469,7 @@ impl Property {
             | Property::UNIONAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
+            | Property::InsertSelectNested { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
             }
@@ -1285,6 +1305,110 @@ impl Property {
                 .into_iter()
                 .map(|query| Interaction::new(connection_index, InteractionType::Query(query)))
                 .collect(),
+            Property::InsertSelectNested {
+                table,
+                nesting_level,
+            } => {
+                let table = table.to_string();
+                let table_name = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {} exists", table.clone()),
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table_name) {
+                            Ok(Ok(()))
+                        } else {
+                            Ok(Err(format!("table {table_name} does not exist")))
+                        }
+                    },
+                ));
+
+                let mut select_query = Select::simple(table.clone(), Predicate::true_());
+                let select_interaction =
+                    InteractionType::Query(Query::Select(select_query.clone()));
+
+                for _ in 0..*nesting_level {
+                    select_query = Select {
+                        body: SelectBody {
+                            select: Box::new(SelectInner {
+                                distinctness: Distinctness::All,
+                                columns: vec![ResultColumn::Star],
+                                from: Some(FromClause {
+                                    table: SelectTable::Select(select_query),
+                                    joins: vec![],
+                                }),
+                                where_clause: Predicate::true_(),
+                                order_by: None,
+                            }),
+                            compounds: Vec::new(),
+                        },
+                        limit: None,
+                    }
+                }
+
+                let insert_interaction = InteractionType::Query(Query::Insert(Insert::Select {
+                    table: table.clone(),
+                    select: Box::new(select_query),
+                }));
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("table {} should have the expected content", table.clone()),
+                    move |stack: &Vec<ResultSet>, env| {
+                        let before_rows = &stack[stack.len() - 2];
+                        let Ok(before_rows) = before_rows else {
+                            return Ok(Err(format!(
+                                "expected rows but got error: {before_rows:?}"
+                            )));
+                        };
+                        let mut expected_rows = {
+                            let mut rows = Vec::new();
+                            rows.extend(before_rows.clone());
+                            rows.extend(before_rows.clone());
+                            rows
+                        };
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        let sim_table = conn_tables
+                            .iter()
+                            .find(|t| t.name == table)
+                            .expect("table should be in enviroment");
+
+                        if expected_rows.len() != sim_table.rows.len() {
+                            return Ok(Err(format!(
+                                "expected {} rows after self-inserting table but got {} for table {}",
+                                expected_rows.len(),
+                                sim_table.rows.len(),
+                                table.clone()
+                            )));
+                        }
+
+                        let after_rows = &sim_table.rows.clone();
+                        for after_row in after_rows.iter() {
+                            if !expected_rows.contains(after_row) {
+                                return Ok(Err(format!(
+                                    "expected row {:?} not found in table {}",
+                                    after_row,
+                                    table.clone()
+                                )));
+                            } else {
+                                let idx = expected_rows
+                                    .iter()
+                                    .position(|row| row == after_row)
+                                    .unwrap();
+                                expected_rows.remove(idx);
+                            }
+                        }
+
+                        Ok(Ok(()))
+                    },
+                ));
+
+                vec![
+                    Interaction::new(connection_index, assumption),
+                    Interaction::new(connection_index, select_interaction),
+                    Interaction::new(connection_index, insert_interaction),
+                    Interaction::new(connection_index, assertion),
+                ]
+            }
         }
     }
 }
@@ -1724,6 +1848,20 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_insert_select_nested<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let table = pick(ctx.tables(), rng).name.clone();
+    let nesting_level = rng.random_range(0..=10);
+    Property::InsertSelectNested {
+        table,
+        nesting_level,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1750,6 +1888,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::InsertSelectNested => property_insert_select_nested,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1855,6 +1994,13 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::InsertSelectNested => {
+                if !env.opts.disable_insert_nested_select {
+                    u32::min(remaining.select, remaining.insert).max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -1895,6 +2041,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UNIONAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::InsertSelectNested => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::INSERT)
+            }
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }
@@ -1980,4 +2129,52 @@ fn print_row(row: &[SimValue]) -> String {
         })
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactions_insertselectednested() {
+        assert_insertselectnested_with_nesting_level(
+            0,
+            "INSERT INTO table1 SELECT * FROM table1 WHERE TRUE",
+        );
+        assert_insertselectnested_with_nesting_level(
+            1,
+            "INSERT INTO table1 SELECT * FROM (SELECT * FROM table1 WHERE TRUE) WHERE TRUE",
+        );
+    }
+
+    fn assert_insertselectnested_with_nesting_level(nesting_level: u8, expected_insert: &str) {
+        let property = Property::InsertSelectNested {
+            table: "table1".to_owned(),
+            nesting_level,
+        };
+        let result = property.interactions(123);
+        let _expected: Vec<Interaction> = vec![];
+        assert_eq!(4, result.len());
+
+        if !matches!(result[0].interaction, InteractionType::Assumption(_)) {
+            panic!(
+                "unexpected interaction type for assumption: {}",
+                result[0].interaction
+            );
+        }
+
+        assert_eq!(
+            "SELECT * FROM table1 WHERE TRUE",
+            format!("{}", &result[1].interaction)
+        );
+
+        assert!(matches!(result[2].interaction, InteractionType::Query(_)));
+
+        assert_eq!(expected_insert, format!("{}", &result[2].interaction));
+
+        assert!(matches!(
+            result[3].interaction,
+            InteractionType::Assertion(_)
+        ));
+    }
 }
