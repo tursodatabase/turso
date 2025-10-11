@@ -314,7 +314,12 @@ pub fn prepare_update_plan(
                 Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
                 _ => unreachable!(),
             },
-            identifier: table_name.to_string(),
+        // get em aliases
+        identifier: body.tbl_name.alias.as_ref().map_or_else(
+            || table_name.to_string(),
+            |alias| alias.as_str().to_string(),
+        ),
+
             internal_id,
             op: build_scan_op(&table, iter_dir),
             join_info: None,
