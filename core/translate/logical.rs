@@ -196,6 +196,7 @@ pub struct Join {
     pub on: Vec<(LogicalExpr, LogicalExpr)>, // Equijoin conditions (left_expr, right_expr)
     pub filter: Option<LogicalExpr>,         // Additional filter conditions
     pub schema: SchemaRef,
+    pub using_columns: Vec<String>, // Column names from USING clause
 }
 
 /// Sort operator - ORDER BY
@@ -673,19 +674,22 @@ impl<'a> LogicalPlanBuilder<'a> {
         };
 
         // Build join conditions
-        let (on_conditions, filter) = match constraint {
+        let (on_conditions, filter, using_columns) = match constraint {
             Some(ast::JoinConstraint::On(expr)) => {
                 // Parse ON clause into equijoin conditions and filters
-                self.parse_join_conditions(expr, left.schema(), right.schema())?
+                let (on, filter) =
+                    self.parse_join_conditions(expr, left.schema(), right.schema())?;
+                (on, filter, Vec::new())
             }
             Some(ast::JoinConstraint::Using(columns)) => {
                 // Build equijoin conditions from USING clause
                 let on = self.build_using_conditions(columns, left.schema(), right.schema())?;
-                (on, None)
+                let using_cols: Vec<String> = columns.iter().map(Self::name_to_string).collect();
+                (on, None, using_cols)
             }
             None => {
                 // Cross join or natural join
-                (Vec::new(), None)
+                (Vec::new(), None, Vec::new())
             }
         };
 
@@ -699,6 +703,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             on: on_conditions,
             filter,
             schema,
+            using_columns,
         }))
     }
 
@@ -864,12 +869,16 @@ impl<'a> LogicalPlanBuilder<'a> {
                 on: Vec::new(),
                 filter: None,
                 schema,
+                using_columns: Vec::new(),
             }));
         }
 
         // Build equijoin conditions for common columns
         let on = self.build_using_conditions(&common_columns, left_schema, right_schema)?;
         let schema = self.build_join_schema(&left, &right, &join_type)?;
+
+        // Convert common columns to string names for USING tracking
+        let using_cols: Vec<String> = common_columns.iter().map(Self::name_to_string).collect();
 
         Ok(LogicalPlan::Join(Join {
             left: Arc::new(left),
@@ -878,6 +887,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             on,
             filter: None,
             schema,
+            using_columns: using_cols,
         }))
     }
 
@@ -957,8 +967,27 @@ impl<'a> LogicalPlanBuilder<'a> {
                     }
                 }
                 ast::ResultColumn::Star => {
-                    // Expand * to all columns
+                    // Expand * to all columns, but skip duplicates from JOIN USING
+                    let using_columns = if let LogicalPlan::Join(join) = &input {
+                        &join.using_columns
+                    } else {
+                        &vec![]
+                    };
+
+                    let mut seen_using_columns = std::collections::HashSet::new();
                     for col in &input_schema.columns {
+                        // Skip duplicate USING columns from the right side of the join
+                        let is_using_column = using_columns
+                            .iter()
+                            .any(|uc| uc.eq_ignore_ascii_case(&col.name));
+                        if is_using_column {
+                            if seen_using_columns.contains(&col.name.to_lowercase()) {
+                                // This is a duplicate USING column, skip it
+                                continue;
+                            }
+                            seen_using_columns.insert(col.name.to_lowercase());
+                        }
+
                         proj_exprs.push(LogicalExpr::Column(Column::new(col.name.clone())));
                         schema_columns.push(col.clone());
                     }
