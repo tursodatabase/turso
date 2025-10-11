@@ -207,9 +207,12 @@ pub struct AlterTableOpts {
     pub alter_column: bool,
 }
 
+#[expect(clippy::derivable_impls)]
 impl Default for AlterTableOpts {
     fn default() -> Self {
-        Self { alter_column: true }
+        Self {
+            alter_column: Default::default(),
+        }
     }
 }
 
