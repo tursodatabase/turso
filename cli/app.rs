@@ -1453,6 +1453,10 @@ impl Limbo {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let name: &str = row.get::<&str>(0)?;
+                        // Skip sqlite_sequence table
+                        if name == "sqlite_sequence" {
+                            continue;
+                        }
                         let ddl: &str = row.get::<&str>(1)?;
                         writeln!(out, "{ddl};")?;
                         Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
@@ -1567,7 +1571,6 @@ impl Limbo {
         if !has_seq {
             return Ok(());
         }
-
         writeln!(out, "DELETE FROM sqlite_sequence;")?;
         if let Some(mut rows) = conn.query("SELECT name, seq FROM sqlite_sequence")? {
             loop {
