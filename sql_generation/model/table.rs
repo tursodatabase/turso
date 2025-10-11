@@ -3,7 +3,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use turso_core::{numeric::Numeric, types};
-use turso_parser::ast::{self, ColumnConstraint};
+use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
 
@@ -46,7 +46,7 @@ pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
-    pub indexes: Vec<String>,
+    pub indexes: Vec<Index>,
 }
 
 impl Table {
@@ -98,7 +98,7 @@ impl Display for Column {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ColumnType {
     Integer,
     Float,
@@ -115,6 +115,13 @@ impl Display for ColumnType {
             Self::Blob => write!(f, "BLOB"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Index {
+    pub table_name: String,
+    pub index_name: String,
+    pub columns: Vec<(String, SortOrder)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -179,10 +186,24 @@ impl Display for SimValue {
 impl SimValue {
     pub const FALSE: Self = SimValue(types::Value::Integer(0));
     pub const TRUE: Self = SimValue(types::Value::Integer(1));
+    pub const NULL: Self = SimValue(types::Value::Null);
 
     pub fn as_bool(&self) -> bool {
         Numeric::from(&self.0).try_into_bool().unwrap_or_default()
     }
+
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(self.0, types::Value::Null)
+    }
+
+    // The result of any binary operator is either a numeric value or NULL, except for the || concatenation operator, and the -> and ->> extract operators which can return values of any type.
+    // All operators generally evaluate to NULL when any operand is NULL, with specific exceptions as stated below. This is in accordance with the SQL92 standard.
+    // When paired with NULL:
+    //   AND evaluates to 0 (false) when the other operand is false; and
+    //   OR evaluates to 1 (true) when the other operand is true.
+    // The IS and IS NOT operators work like = and != except when one or both of the operands are NULL. In this case, if both operands are NULL, then the IS operator evaluates to 1 (true) and the IS NOT operator evaluates to 0 (false). If one operand is NULL and the other is not, then the IS operator evaluates to 0 (false) and the IS NOT operator is 1 (true). It is not possible for an IS or IS NOT expression to evaluate to NULL.
+    // The IS NOT DISTINCT FROM operator is an alternative spelling for the IS operator. Likewise, the IS DISTINCT FROM operator means the same thing as IS NOT. Standard SQL does not support the compact IS and IS NOT notation. Those compact forms are an SQLite extension. You must use the less readable IS NOT DISTINCT FROM and IS DISTINCT FROM operators in most other SQL database engines.
 
     // TODO: support more predicates
     /// Returns a Result of a Binary Operation
@@ -190,8 +211,9 @@ impl SimValue {
     /// TODO: forget collations for now
     /// TODO: have the [ast::Operator::Equals], [ast::Operator::NotEquals], [ast::Operator::Greater],
     /// [ast::Operator::GreaterEquals], [ast::Operator::Less], [ast::Operator::LessEquals] function to be extracted
-    /// into its functions in turso_core so that it can be used here
+    /// into its functions in turso_core so that it can be used here. For now we just do the `not_null` check to avoid refactoring code in core
     pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> SimValue {
+        let not_null = !self.is_null() && !other.is_null();
         match operator {
             ast::Operator::Add => self.0.exec_add(&other.0).into(),
             ast::Operator::And => self.0.exec_and(&other.0).into(),
@@ -201,10 +223,10 @@ impl SimValue {
             ast::Operator::BitwiseOr => self.0.exec_bit_or(&other.0).into(),
             ast::Operator::BitwiseNot => todo!(), // TODO: Do not see any function usage of this operator in Core
             ast::Operator::Concat => self.0.exec_concat(&other.0).into(),
-            ast::Operator::Equals => (self == other).into(),
+            ast::Operator::Equals => not_null.then(|| self == other).into(),
             ast::Operator::Divide => self.0.exec_divide(&other.0).into(),
-            ast::Operator::Greater => (self > other).into(),
-            ast::Operator::GreaterEquals => (self >= other).into(),
+            ast::Operator::Greater => not_null.then(|| self > other).into(),
+            ast::Operator::GreaterEquals => not_null.then(|| self >= other).into(),
             // TODO: Test these implementations
             ast::Operator::Is => match (&self.0, &other.0) {
                 (types::Value::Null, types::Value::Null) => true.into(),
@@ -216,11 +238,11 @@ impl SimValue {
                 .binary_compare(other, ast::Operator::Is)
                 .unary_exec(ast::UnaryOperator::Not),
             ast::Operator::LeftShift => self.0.exec_shift_left(&other.0).into(),
-            ast::Operator::Less => (self < other).into(),
-            ast::Operator::LessEquals => (self <= other).into(),
+            ast::Operator::Less => not_null.then(|| self < other).into(),
+            ast::Operator::LessEquals => not_null.then(|| self <= other).into(),
             ast::Operator::Modulus => self.0.exec_remainder(&other.0).into(),
             ast::Operator::Multiply => self.0.exec_multiply(&other.0).into(),
-            ast::Operator::NotEquals => (self != other).into(),
+            ast::Operator::NotEquals => not_null.then(|| self != other).into(),
             ast::Operator::Or => self.0.exec_or(&other.0).into(),
             ast::Operator::RightShift => self.0.exec_shift_right(&other.0).into(),
             ast::Operator::Subtract => self.0.exec_subtract(&other.0).into(),
@@ -365,7 +387,18 @@ impl From<&SimValue> for ast::Literal {
     }
 }
 
+impl From<Option<bool>> for SimValue {
+    #[inline]
+    fn from(value: Option<bool>) -> Self {
+        if value.is_none() {
+            return SimValue::NULL;
+        }
+        SimValue::from(value.unwrap())
+    }
+}
+
 impl From<bool> for SimValue {
+    #[inline]
     fn from(value: bool) -> Self {
         if value {
             SimValue::TRUE

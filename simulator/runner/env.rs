@@ -351,6 +351,9 @@ impl SimulatorEnv {
             profile.io.enable = false;
             // Disable limits due to differences in return order from turso and rusqlite
             opts.disable_select_limit = true;
+
+            // There is no `ALTER COLUMN` in SQLite
+            profile.query.gen_opts.query.alter_table.alter_column = false;
         }
 
         profile.validate().unwrap();

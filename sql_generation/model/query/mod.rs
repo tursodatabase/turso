@@ -6,6 +6,7 @@ pub use drop_index::DropIndex;
 pub use insert::Insert;
 pub use select::Select;
 
+pub mod alter_table;
 pub mod create;
 pub mod create_index;
 pub mod delete;

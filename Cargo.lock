@@ -3854,6 +3854,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "schemars 1.0.4",
  "serde",
+ "strum",
  "tracing",
  "turso_core",
  "turso_parser",
