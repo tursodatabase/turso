@@ -7,10 +7,9 @@ use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use turso_parser::ast;
 use turso_parser::{
@@ -72,54 +71,54 @@ impl fmt::Debug for PopulateState {
 }
 
 /// Per-connection transaction state for incremental views
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct ViewTransactionState {
     // Per-table deltas for uncommitted changes
     // Maps table_name -> Delta for that table
-    // Using RefCell for interior mutability
-    table_deltas: RefCell<HashMap<String, Delta>>,
+    // Using RwLock for interior mutability
+    table_deltas: RwLock<HashMap<String, Delta>>,
 }
 
 impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::new()),
+            table_deltas: RwLock::new(HashMap::new()),
         }
     }
 
     /// Insert a row into the delta for a specific table
     pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.write();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.insert(key, values);
     }
 
     /// Delete a row from the delta for a specific table
     pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.write();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.delete(key, values);
     }
 
     /// Clear all changes in the delta
     pub fn clear(&self) {
-        self.table_deltas.borrow_mut().clear();
+        self.table_deltas.write().clear();
     }
 
     /// Get deltas organized by table
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.borrow().clone()
+        self.table_deltas.read().clone()
     }
 
     /// Check if the delta is empty
     pub fn is_empty(&self) -> bool {
-        self.table_deltas.borrow().values().all(|d| d.is_empty())
+        self.table_deltas.read().values().all(|d| d.is_empty())
     }
 
     /// Returns how many elements exist in the delta.
     pub fn len(&self) -> usize {
-        self.table_deltas.borrow().values().map(|d| d.len()).sum()
+        self.table_deltas.read().values().map(|d| d.len()).sum()
     }
 }
 
@@ -127,20 +126,20 @@ impl ViewTransactionState {
 /// Provides interior mutability for the map of view states
 #[derive(Debug, Clone, Default)]
 pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
+    states: Arc<RwLock<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::new())),
+            states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Get or create a transaction state for a view
     pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
-        let mut states = self.states.borrow_mut();
+        let mut states = self.states.write();
         states
             .entry(view_name.to_string())
             .or_insert_with(|| Arc::new(ViewTransactionState::new()))
@@ -149,22 +148,22 @@ impl AllViewsTxState {
 
     /// Get a transaction state for a view if it exists
     pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
-        self.states.borrow().get(view_name).cloned()
+        self.states.read().get(view_name).cloned()
     }
 
     /// Clear all transaction states
     pub fn clear(&self) {
-        self.states.borrow_mut().clear();
+        self.states.write().clear();
     }
 
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
-        self.states.borrow().is_empty()
+        self.states.read().is_empty()
     }
 
     /// Get all view names that have transaction states
     pub fn get_view_names(&self) -> Vec<String> {
-        self.states.borrow().keys().cloned().collect()
+        self.states.read().keys().cloned().collect()
     }
 }
 
