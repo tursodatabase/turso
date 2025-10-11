@@ -1,7 +1,8 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
 use crate::types::{IOResult, SeekKey, SeekOp, SeekResult};
-use crate::Result;
+use crate::util::{generate_random_rowid, MAX_ATTEMPTS_GENERATE_ROWID, MAX_ROWID};
+use crate::{LimboError, Result, IO};
 use crate::{Pager, Value};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -164,12 +165,31 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         }
     }
 
-    pub fn get_next_rowid(&mut self) -> i64 {
+    pub fn get_next_rowid(&mut self, io: &Arc<dyn IO>) -> Result<i64> {
         self.last();
         match self.current_pos {
-            CursorPosition::Loaded(id) => id.row_id + 1,
-            CursorPosition::BeforeFirst => 1,
-            CursorPosition::End => i64::MAX,
+            CursorPosition::Loaded(id) => {
+                if id.row_id < MAX_ROWID {
+                    Ok(id.row_id + 1)
+                } else {
+                    for _ in 0..MAX_ATTEMPTS_GENERATE_ROWID {
+                        let random_rowid = generate_random_rowid(io);
+                        let IOResult::Done(exists) = self.exists(&Value::Integer(random_rowid))?
+                        else {
+                            todo!("io on mvcc exists not implemented yet");
+                        };
+                        if !exists {
+                            return Ok(random_rowid);
+                        }
+                    }
+                    Err(LimboError::DatabaseFull(
+                    "Unable to find an unused rowid after 100 attempts - database is probably full"
+                        .to_string(),
+                ))
+                }
+            }
+            CursorPosition::BeforeFirst => Ok(1),
+            CursorPosition::End => Ok(i64::MAX),
         }
     }
 
