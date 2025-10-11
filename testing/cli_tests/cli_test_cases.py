@@ -157,6 +157,7 @@ def test_output_file():
 
     # Clean up
     os.remove(output_file)
+    shell.quit()
 
 
 def test_multi_line_single_line_comments_succession():
@@ -367,6 +368,16 @@ def test_parse_error():
         lambda res: "Parse error: " in res,
         "Try to LIMIT using an identifier should trigger a Parse error",
     )
+    turso.quit()
+
+
+def test_tables_with_attached_db():
+    shell = TestTursoShell()
+    shell.execute_dot(".open :memory:")
+    shell.execute_dot("CREATE TABLE orders(a);")
+    shell.execute_dot("ATTACH DATABASE 'testing/testing.db' AS attached;")
+    shell.run_test("tables-with-attached-database", ".tables", "orders attached.products attached.users")
+    shell.quit()
 
 
 def main():
@@ -393,6 +404,7 @@ def main():
     test_copy_db_file()
     test_copy_memory_db_to_file()
     test_parse_error()
+    test_tables_with_attached_db()
     console.info("All tests have passed")
 
 
