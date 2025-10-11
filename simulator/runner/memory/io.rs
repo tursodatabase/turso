@@ -190,6 +190,17 @@ impl SimIO for MemorySimIO {
             file.closed.set(true);
         }
     }
+
+    fn persist_files(&self) -> anyhow::Result<()> {
+        let files = self.files.borrow();
+        for (file_path, file) in files.iter() {
+            if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
+            {
+                std::fs::write(file_path, &*file.buffer.borrow())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Clock for MemorySimIO {

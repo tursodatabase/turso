@@ -20,4 +20,6 @@ pub trait SimIO: turso_core::IO {
     fn syncing(&self) -> bool;
 
     fn close_files(&self);
+
+    fn persist_files(&self) -> anyhow::Result<()>;
 }
