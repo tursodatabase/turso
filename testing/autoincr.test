@@ -175,3 +175,16 @@ do_execsql_test_on_specific_db {:memory:} autoinc-conflict-on-nothing {
     INSERT INTO t (k) VALUES ('b');
     SELECT * FROM t ORDER BY id;
 } {1|a 2|a 4|b}
+
+# https://github.com/tursodatabase/turso/issues/3664
+do_execsql_test_on_specific_db {:memory:} autoinc-skips-manually-updated-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
+    INSERT INTO t DEFAULT VALUES;
+    select * from sqlite_sequence;
+    UPDATE t SET a = a + 1;
+    SELECT * FROM sqlite_sequence;
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM sqlite_sequence;
+} {t|1
+t|1
+t|3}
