@@ -6,7 +6,7 @@ use turso_parser::{
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::{Column, Table},
+    schema::{Column, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
@@ -39,6 +39,17 @@ pub fn translate_alter_table(
     // Check if someone is trying to ALTER a system table
     if crate::schema::is_system_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+
+    if let ast::AlterTableBody::RenameTo(new_table_name) = &alter_table {
+        let normalized_new_name = normalize_ident(new_table_name.as_str());
+
+        if RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized_new_name.starts_with(prefix))
+        {
+            crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
+        }
     }
 
     let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
