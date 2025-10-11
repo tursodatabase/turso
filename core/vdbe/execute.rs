@@ -6412,7 +6412,7 @@ pub fn op_new_rowid(
         NewRowid {
             cursor,
             rowid_reg,
-            ..
+            prev_largest_reg,
         },
         insn
     );
@@ -6454,6 +6454,11 @@ pub fn op_new_rowid(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
+
+                if *prev_largest_reg > 0 {
+                    state.registers[*prev_largest_reg] =
+                        Register::Value(Value::Integer(current_max.unwrap_or(0)));
+                }
 
                 match current_max {
                     Some(rowid) if rowid < MAX_ROWID => {
