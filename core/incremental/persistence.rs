@@ -1,5 +1,6 @@
 use crate::incremental::operator::{AggregateState, DbspStateCursors};
-use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::cursor::CursorTrait;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_if_io, LimboError, Result, Value};
 

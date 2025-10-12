@@ -6,8 +6,9 @@ use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
+    integrity_check, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
+use crate::storage::cursor::{CursorDispatch, CursorTrait};
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
@@ -1099,7 +1100,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
             let cursor = BTreeCursor::new_index(
@@ -1112,7 +1113,7 @@ pub fn op_open_read(
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -6847,7 +6848,7 @@ pub fn op_open_write(
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     } else {
         let num_columns = match cursor_type {
             CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -6861,7 +6862,7 @@ pub fn op_open_write(
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7519,7 +7520,7 @@ pub enum OpOpenEphemeralState {
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
-        cursor: Box<dyn CursorTrait>,
+        cursor: Box<CursorDispatch>,
     },
 }
 pub fn op_open_ephemeral(
@@ -7625,7 +7626,7 @@ pub fn op_open_ephemeral(
                 BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
-                cursor: Box::new(cursor),
+                cursor: Box::new(CursorDispatch::BTree(cursor)),
             };
         }
         OpOpenEphemeralState::Rewind { cursor } => {
@@ -7647,13 +7648,13 @@ pub fn op_open_ephemeral(
                     cursors
                         .get_mut(cursor_id)
                         .unwrap()
-                        .replace(Cursor::new_btree(cursor));
+                        .replace(Cursor::from_dispatch(cursor));
                 }
                 CursorType::BTreeIndex(_) => {
                     cursors
                         .get_mut(cursor_id)
                         .unwrap()
-                        .replace(Cursor::new_btree(cursor));
+                        .replace(Cursor::from_dispatch(cursor));
                 }
                 CursorType::Pseudo(_) => {
                     panic!("OpenEphemeral on pseudo cursor");
@@ -7723,7 +7724,7 @@ pub fn op_open_dup(
             cursors
                 .get_mut(*new_cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(table) => {
             // In principle, we could implement OpenDup for BTreeIndex,

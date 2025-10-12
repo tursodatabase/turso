@@ -4,6 +4,7 @@ use crate::{
     io_yield_many, io_yield_one,
     schema::Index,
     storage::{
+        cursor::CursorTrait,
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
@@ -40,7 +41,6 @@ use super::{
 };
 use parking_lot::RwLock;
 use std::{
-    any::Any,
     cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
@@ -508,57 +508,6 @@ pub enum CursorSeekState {
         /// If it doesn't, we want to land in the place where rowid 666 WOULD be inserted.
         target_cell_when_not_found: Cell<i32>,
     },
-}
-
-pub trait CursorTrait: Any {
-    /// Move cursor to last entry.
-    fn last(&mut self) -> Result<IOResult<()>>;
-    /// Move cursor to next entry.
-    fn next(&mut self) -> Result<IOResult<bool>>;
-    /// Move cursor to previous entry.
-    fn prev(&mut self) -> Result<IOResult<bool>>;
-    /// Get the rowid of the entry the cursor is poiting to if any
-    fn rowid(&self) -> Result<IOResult<Option<i64>>>;
-    /// Get the record of the entry the cursor is poiting to if any
-    fn record(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>>;
-    /// Move the cursor based on the key and the type of operation (op).
-    fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>>;
-    /// Insert a record in the position the cursor is at.
-    fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>>;
-    /// Delete a record in the position the cursor is at.
-    fn delete(&mut self) -> Result<IOResult<()>>;
-    fn set_null_flag(&mut self, flag: bool);
-    fn get_null_flag(&self) -> bool;
-    /// Check if a key exists.
-    fn exists(&mut self, key: &Value) -> Result<IOResult<bool>>;
-    fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>>;
-    fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>>;
-    /// Count the number of entries in the b-tree
-    ///
-    /// Only supposed to be used in the context of a simple Count Select Statement
-    fn count(&mut self) -> Result<IOResult<usize>>;
-    fn is_empty(&self) -> bool;
-    fn root_page(&self) -> i64;
-    /// Move cursor at the start.
-    fn rewind(&mut self) -> Result<IOResult<()>>;
-    /// Check if cursor is poiting at a valid entry with a record.
-    fn has_record(&self) -> bool;
-    fn set_has_record(&self, has_record: bool);
-    fn get_index_info(&self) -> &IndexInfo;
-
-    fn seek_end(&mut self) -> Result<IOResult<()>>;
-    fn seek_to_last(&mut self) -> Result<IOResult<()>>;
-
-    // --- start: BTreeCursor specific functions ----
-    fn invalidate_record(&mut self);
-    fn has_rowid(&self) -> bool;
-    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor>;
-    fn get_pager(&self) -> Arc<Pager>;
-    fn get_skip_advance(&self) -> bool;
-
-    // FIXME: remove once we implement trait for mvcc
-    fn get_mvcc_cursor(&self) -> Arc<RwLock<MvCursor>>;
-    // --- end: BTreeCursor specific functions ----
 }
 
 pub struct BTreeCursor {

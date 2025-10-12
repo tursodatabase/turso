@@ -2,7 +2,7 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::CursorTrait;
+use crate::storage::cursor::CursorTrait;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -1108,11 +1108,11 @@ impl IncrementalView {
     /// Populate the view by scanning the source table using a state machine
     /// This can be called multiple times and will resume from where it left off
     /// This method is only for materialized views and will persist data to the btree
-    pub fn populate_from_table(
+    pub fn populate_from_table<C: CursorTrait>(
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
         pager: &std::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut dyn CursorTrait,
+        _btree_cursor: &mut C,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
         assert!(

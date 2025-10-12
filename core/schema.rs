@@ -1,5 +1,6 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
+use crate::storage::cursor::CursorTrait;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
@@ -72,7 +73,7 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
-use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::storage::btree::BTreeCursor;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{

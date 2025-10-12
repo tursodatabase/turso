@@ -8,7 +8,8 @@ use crate::ext::{ExtValue, ExtValueType};
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
-use crate::storage::btree::CursorTrait;
+use crate::storage::btree::BTreeCursor;
+use crate::storage::cursor::{CursorDispatch, CursorTrait};
 use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
@@ -2269,7 +2270,7 @@ impl Record {
 }
 
 pub enum Cursor {
-    BTree(Box<dyn CursorTrait>),
+    BTree(Box<CursorDispatch>),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
@@ -2289,8 +2290,12 @@ impl Debug for Cursor {
 }
 
 impl Cursor {
-    pub fn new_btree(cursor: Box<dyn CursorTrait>) -> Self {
+    pub fn from_dispatch(cursor: Box<CursorDispatch>) -> Self {
         Self::BTree(cursor)
+    }
+
+    pub fn new_btree(cursor: BTreeCursor) -> Self {
+        Self::BTree(Box::new(CursorDispatch::BTree(cursor)))
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -2307,7 +2312,7 @@ impl Cursor {
         Self::MaterializedView(Box::new(cursor))
     }
 
-    pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
+    pub fn as_btree_mut(&mut self) -> &mut impl CursorTrait {
         match self {
             Self::BTree(cursor) => cursor.as_mut(),
             _ => panic!("Cursor is not a btree"),

@@ -2742,7 +2742,7 @@ mod tests {
     // This reads the actual persisted data from the BTree
     #[cfg(test)]
     fn get_current_state(pager: Arc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
-        use crate::storage::btree::CursorTrait;
+        use crate::storage::cursor::CursorTrait;
 
         let mut delta = Delta::new();
 
