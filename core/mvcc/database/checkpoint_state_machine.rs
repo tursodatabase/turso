@@ -617,10 +617,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 }
 
 impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
-    type Context = ();
+    type Context<'a> = ();
     type SMResult = CheckpointResult;
 
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    fn step(&mut self, _context: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>> {
         let res = self.step_inner(&());
         match res {
             Err(err) => {
@@ -645,7 +645,7 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+    fn finalize(&mut self, _context: &Self::Context<'_>) -> Result<()> {
         Ok(())
     }
 

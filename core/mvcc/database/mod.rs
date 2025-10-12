@@ -434,11 +434,11 @@ impl WriteRowStateMachine {
 }
 
 impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
-    type Context = Arc<MvStore<Clock>>;
+    type Context<'a> = Arc<MvStore<Clock>>;
     type SMResult = ();
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
-    fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    fn step(&mut self, mvcc_store: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
@@ -727,7 +727,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+    fn finalize(&mut self, _context: &Self::Context<'_>) -> Result<()> {
         self.is_finalized = true;
         Ok(())
     }
@@ -738,11 +738,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 }
 
 impl StateTransition for WriteRowStateMachine {
-    type Context = ();
+    type Context<'a> = ();
     type SMResult = ();
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::DEBUG)]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    fn step(&mut self, _context: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
         match self.state {
@@ -813,7 +813,7 @@ impl StateTransition for WriteRowStateMachine {
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+    fn finalize(&mut self, _context: &Self::Context<'_>) -> Result<()> {
         self.is_finalized = true;
         Ok(())
     }
@@ -824,11 +824,11 @@ impl StateTransition for WriteRowStateMachine {
 }
 
 impl StateTransition for DeleteRowStateMachine {
-    type Context = ();
+    type Context<'a> = ();
     type SMResult = ();
 
     #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    fn step(&mut self, _context: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
         match self.state {
@@ -884,7 +884,7 @@ impl StateTransition for DeleteRowStateMachine {
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+    fn finalize(&mut self, _context: &Self::Context<'_>) -> Result<()> {
         self.is_finalized = true;
         Ok(())
     }
