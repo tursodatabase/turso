@@ -502,7 +502,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let write_set_index = *write_set_index;
                 let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
 
-                match write_row_state_machine.step(&())? {
+                match write_row_state_machine.step(&mut ())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
                         self.state = CheckpointState::WriteRow {
@@ -518,7 +518,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let write_set_index = *write_set_index;
                 let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
 
-                match delete_row_state_machine.step(&())? {
+                match delete_row_state_machine.step(&mut ())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
                     IOResult::Done(_) => {
                         self.state = CheckpointState::WriteRow {
@@ -607,7 +607,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .checkpointed_txid_max
                     .store(self.checkpointed_txid_max_new, Ordering::SeqCst);
                 self.checkpoint_lock.unlock();
-                self.finalize(&())?;
+                self.finalize(&mut ())?;
                 Ok(TransitionResult::Done(
                     self.checkpoint_result.take().unwrap(),
                 ))
@@ -617,10 +617,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 }
 
 impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
-    type Context<'a> = ();
+    type Context<'a>
+        = ()
+    where
+        Self: 'a;
     type SMResult = CheckpointResult;
 
-    fn step(&mut self, _context: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>> {
+    fn step<'a>(
+        &mut self,
+        _context: &mut Self::Context<'a>,
+    ) -> Result<TransitionResult<Self::SMResult>>
+    where
+        Self: 'a,
+    {
         let res = self.step_inner(&());
         match res {
             Err(err) => {
@@ -645,7 +654,10 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context<'_>) -> Result<()> {
+    fn finalize<'a>(&mut self, _context: &mut Self::Context<'a>) -> Result<()>
+    where
+        Self: 'a,
+    {
         Ok(())
     }
 

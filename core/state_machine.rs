@@ -11,7 +11,9 @@ pub enum TransitionResult<Result> {
 
 /// A generic trait for state machines.
 pub trait StateTransition {
-    type Context<'a>;
+    type Context<'a>
+    where
+        Self: 'a;
     type SMResult;
 
     /// Transition the state machine to the next state.
@@ -19,12 +21,19 @@ pub trait StateTransition {
     /// Returns `TransitionResult::Io` if the state machine needs to perform an IO operation.
     /// Returns `TransitionResult::Continue` if the state machine needs to continue.
     /// Returns `TransitionResult::Done` if the state machine is done.
-    fn step(&mut self, context: &Self::Context<'_>) -> Result<TransitionResult<Self::SMResult>>;
+    fn step<'a>(
+        &mut self,
+        context: &mut Self::Context<'a>,
+    ) -> Result<TransitionResult<Self::SMResult>>
+    where
+        Self: 'a;
 
     /// Finalize the state machine.
     ///
     /// This is called when the state machine is done.
-    fn finalize(&mut self, context: &Self::Context<'_>) -> Result<()>;
+    fn finalize<'a>(&mut self, context: &mut Self::Context<'a>) -> Result<()>
+    where
+        Self: 'a;
 
     /// Check if the state machine is finalized.
     fn is_finalized(&self) -> bool;
@@ -45,7 +54,7 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
-    pub fn step(&mut self, context: &State::Context<'_>) -> Result<IOResult<State::SMResult>> {
+    pub fn step(&mut self, context: &mut State::Context<'_>) -> Result<IOResult<State::SMResult>> {
         loop {
             if self.is_finalized {
                 unreachable!("StateMachine::transition: state machine is finalized");
@@ -66,7 +75,7 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
-    pub fn finalize(&mut self, context: &State::Context<'_>) -> Result<()> {
+    pub fn finalize(&mut self, context: &mut State::Context<'_>) -> Result<()> {
         self.state.finalize(context)?;
         self.is_finalized = true;
         Ok(())

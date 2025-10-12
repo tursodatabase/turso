@@ -783,7 +783,7 @@ pub(crate) fn commit_tx(
     let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
-        let res = sm.step(&mv_store)?;
+        let res = sm.step(&mut &mv_store)?;
         match res {
             IOResult::IO(io) => {
                 io.wait(conn.db.io.as_ref())?;
@@ -804,7 +804,7 @@ pub(crate) fn commit_tx_no_conn(
     let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
     // TODO: sync IO hack
     loop {
-        let res = sm.step(&mv_store)?;
+        let res = sm.step(&mut &mv_store)?;
         match res {
             IOResult::IO(io) => {
                 io.wait(conn.db.io.as_ref())?;

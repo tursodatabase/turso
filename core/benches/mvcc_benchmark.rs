@@ -45,11 +45,11 @@ fn bench(c: &mut Criterion) {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
-            let mv_store = &db.mvcc_store;
+            let mut mv_store = &db.mvcc_store;
             let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
-                let res = sm.step(mv_store).unwrap();
+                let res = sm.step(&mut mv_store).unwrap();
                 match res {
                     IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
                     IOResult::Done(_) => break,
@@ -72,11 +72,11 @@ fn bench(c: &mut Criterion) {
                     },
                 )
                 .unwrap();
-            let mv_store = &db.mvcc_store;
+            let mut mv_store = &db.mvcc_store;
             let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
-                let res = sm.step(mv_store).unwrap();
+                let res = sm.step(&mut mv_store).unwrap();
                 match res {
                     IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
                     IOResult::Done(_) => break,
@@ -105,11 +105,11 @@ fn bench(c: &mut Criterion) {
                     },
                 )
                 .unwrap();
-            let mv_store = &db.mvcc_store;
+            let mut mv_store = &db.mvcc_store;
             let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
             loop {
-                let res = sm.step(mv_store).unwrap();
+                let res = sm.step(&mut mv_store).unwrap();
                 match res {
                     IOResult::IO(io) => io.wait(db._db.io.as_ref()).unwrap(),
                     IOResult::Done(_) => break,

@@ -955,9 +955,9 @@ impl Program {
     fn step_end_mvcc_txn(
         &self,
         commit_state: &mut StateMachine<CommitStateMachine<LocalClock>>,
-        mv_store: &Arc<MvStore>,
+        mut mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
-        commit_state.step(mv_store)
+        commit_state.step(&mut mv_store)
     }
 
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
