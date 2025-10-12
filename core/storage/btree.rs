@@ -3,6 +3,7 @@ use tracing::{instrument, Level};
 use crate::{
     io_yield_many, io_yield_one,
     schema::Index,
+    state_machine::{StateTransition, TransitionResult},
     storage::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
@@ -6351,33 +6352,111 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn rewind(&mut self) -> Result<IOResult<()>> {
-        if self.valid_state == CursorValidState::Invalid {
-            return Ok(IOResult::Done(()));
+        struct RewindMachine {
+            state: RewindState,
+            done: bool,
         }
-        self.skip_advance.set(false);
-        loop {
-            match self.rewind_state {
-                RewindState::Start => {
-                    self.rewind_state = RewindState::NextRecord;
-                    if let Some(mv_cursor) = &self.mv_cursor {
-                        let mut mv_cursor = mv_cursor.write();
-                        mv_cursor.rewind();
-                    } else {
-                        let c = self.move_to_root()?;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
+
+        impl StateTransition for RewindMachine {
+            type Context<'a>
+                = &'a mut BTreeCursor
+            where
+                Self: 'a;
+
+            type SMResult = ();
+
+            fn step<'a>(
+                &mut self,
+                cursor: &mut Self::Context<'a>,
+            ) -> Result<crate::state_machine::TransitionResult<Self::SMResult>>
+            where
+                Self: 'a,
+            {
+                if cursor.valid_state == CursorValidState::Invalid {
+                    return Ok(TransitionResult::Done(()));
+                }
+                cursor.skip_advance.set(false);
+                match self.state {
+                    RewindState::Start => {
+                        self.state = RewindState::NextRecord;
+                        if let Some(mv_cursor) = &cursor.mv_cursor {
+                            let mut mv_cursor = mv_cursor.write();
+                            mv_cursor.rewind();
+                        } else {
+                            let c = cursor.move_to_root()?;
+                            if let Some(c) = c {
+                                return Ok(TransitionResult::Io(IOCompletions::Single(c)));
+                            }
                         }
+                        Ok(TransitionResult::Continue)
+                    }
+                    RewindState::NextRecord => {
+                        let cursor_has_record = match cursor.get_next_record()? {
+                            IOResult::Done(cursor_has_record) => cursor_has_record,
+                            IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+                        };
+                        cursor.invalidate_record();
+                        cursor.has_record.replace(cursor_has_record);
+                        self.state = RewindState::Start;
+                        self.finalize(cursor)?;
+                        Ok(TransitionResult::Done(()))
                     }
                 }
-                RewindState::NextRecord => {
-                    let cursor_has_record = return_if_io!(self.get_next_record());
-                    self.invalidate_record();
-                    self.has_record.replace(cursor_has_record);
-                    self.rewind_state = RewindState::Start;
-                    return Ok(IOResult::Done(()));
-                }
+            }
+
+            fn finalize<'a>(&mut self, _context: &mut Self::Context<'a>) -> Result<()>
+            where
+                Self: 'a,
+            {
+                self.done = true;
+                Ok(())
+            }
+
+            fn is_finalized(&self) -> bool {
+                self.done
             }
         }
+
+        let x = RewindMachine {
+            done: false,
+            state: RewindState::Start,
+        };
+        let mut machine = crate::state_machine::StateMachine::new(x);
+
+        {
+            let mut cursor = self;
+
+            machine.step(&mut cursor);
+        }
+
+        // if self.valid_state == CursorValidState::Invalid {
+        //     return Ok(IOResult::Done(()));
+        // }
+        // self.skip_advance.set(false);
+        // loop {
+        //     match self.rewind_state {
+        //         RewindState::Start => {
+        //             self.rewind_state = RewindState::NextRecord;
+        //             if let Some(mv_cursor) = &self.mv_cursor {
+        //                 let mut mv_cursor = mv_cursor.write();
+        //                 mv_cursor.rewind();
+        //             } else {
+        //                 let c = self.move_to_root()?;
+        //                 if let Some(c) = c {
+        //                     io_yield_one!(c);
+        //                 }
+        //             }
+        //         }
+        //         RewindState::NextRecord => {
+        //             let cursor_has_record = return_if_io!(self.get_next_record());
+        //             self.invalidate_record();
+        //             self.has_record.replace(cursor_has_record);
+        //             self.rewind_state = RewindState::Start;
+        //             return Ok(IOResult::Done(()));
+        //         }
+        //     }
+        // }
+        Ok(IOResult::Done(()))
     }
 
     fn has_rowid(&self) -> bool {
