@@ -1116,26 +1116,27 @@ impl Schema {
 
     fn check_object_name_conflict(&self, name: &str) -> Result<()> {
         let normalized_name = normalize_ident(name);
+
         if self.tables.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(format!(
-                "table \"{}\" already exists",
-                name
-            )));
+            return Err(crate::LimboError::ParseError(
+                ["table \"", name, "\" already exists"].concat().to_string(),
+            ));
         }
+
         if self.views.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(format!(
-                "view \"{}\" already exists",
-                name
-            )));
+            return Err(crate::LimboError::ParseError(
+                ["view \"", name, "\" already exists"].concat().to_string(),
+            ));
         }
+
         for index_list in self.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
-                return Err(crate::LimboError::ParseError(format!(
-                    "index \"{}\" already exists",
-                    name
-                )));
+                return Err(crate::LimboError::ParseError(
+                    ["index \"", name, "\" already exists"].concat().to_string(),
+                ));
             }
         }
+
         Ok(())
     }
 }
