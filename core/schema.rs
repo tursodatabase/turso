@@ -289,9 +289,11 @@ impl Schema {
     }
 
     /// Add a regular (non-materialized) view
-    pub fn add_view(&mut self, view: View) {
+    pub fn add_view(&mut self, view: View) -> Result<()> {
+        self.check_object_name_conflict(&view.name)?;
         let name = normalize_ident(&view.name);
         self.views.insert(name, Arc::new(view));
+        Ok(())
     }
 
     /// Get a regular view by name
@@ -300,14 +302,18 @@ impl Schema {
         self.views.get(&name).cloned()
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) {
+    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
+        self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::BTree(table).into());
+        Ok(())
     }
 
-    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) {
+    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
+        self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
+        Ok(())
     }
 
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
@@ -340,7 +346,8 @@ impl Schema {
         }
     }
 
-    pub fn add_index(&mut self, index: Arc<Index>) {
+    pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
+        self.check_object_name_conflict(&index.name)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -350,7 +357,8 @@ impl Schema {
         self.indexes
             .entry(table_name)
             .or_default()
-            .push_front(index.clone())
+            .push_front(index.clone());
+        Ok(())
     }
 
     pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
@@ -507,7 +515,7 @@ impl Schema {
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
                 )?;
-                self.add_index(Arc::new(index));
+                self.add_index(Arc::new(index))?;
             }
         }
 
@@ -549,7 +557,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         1,
-                    )?));
+                    )?))?;
                 } else {
                     // Add single column unique index
                     if let Some(autoidx) = automatic_indexes.pop() {
@@ -557,7 +565,7 @@ impl Schema {
                             table.as_ref(),
                             autoidx,
                             vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                        )?));
+                        )?))?;
                     }
                 }
             }
@@ -575,7 +583,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         unique_set.columns.len(),
-                    )?));
+                    )?))?;
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
@@ -593,7 +601,7 @@ impl Schema {
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
                         column_indices_and_sort_orders,
-                    )?));
+                    )?))?;
                 }
             }
 
@@ -701,7 +709,7 @@ impl Schema {
                             syms,
                         )?
                     };
-                    self.add_virtual_table(vtab);
+                    self.add_virtual_table(vtab)?;
                 } else {
                     let table = BTreeTable::from_sql(sql, root_page)?;
 
@@ -735,7 +743,7 @@ impl Schema {
                         }
                     }
 
-                    self.add_btree_table(Arc::new(table));
+                    self.add_btree_table(Arc::new(table))?;
                 }
             }
             "index" => {
@@ -834,7 +842,7 @@ impl Schema {
                             // Create regular view
                             let view =
                                 View::new(name.to_string(), sql.to_string(), select, final_columns);
-                            self.add_view(view);
+                            self.add_view(view)?;
                         }
                         _ => {}
                     }
@@ -1104,6 +1112,31 @@ impl Schema {
         self.get_table(table_name)
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
+    }
+
+    fn check_object_name_conflict(&self, name: &str) -> Result<()> {
+        let normalized_name = normalize_ident(name);
+        if self.tables.contains_key(&normalized_name) {
+            return Err(crate::LimboError::ParseError(format!(
+                "table \"{}\" already exists",
+                name
+            )));
+        }
+        if self.views.contains_key(&normalized_name) {
+            return Err(crate::LimboError::ParseError(format!(
+                "view \"{}\" already exists",
+                name
+            )));
+        }
+        for index_list in self.indexes.values() {
+            if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
+                return Err(crate::LimboError::ParseError(format!(
+                    "index \"{}\" already exists",
+                    name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
