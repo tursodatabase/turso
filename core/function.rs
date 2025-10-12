@@ -752,7 +752,7 @@ impl Func {
             "total_changes" => Ok(Self::Scalar(ScalarFunc::TotalChanges)),
             "glob" => Ok(Self::Scalar(ScalarFunc::Glob)),
             "ifnull" => Ok(Self::Scalar(ScalarFunc::IfNull)),
-            "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
+            "if" | "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
             "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),
             "like" => Ok(Self::Scalar(ScalarFunc::Like)),
             "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
