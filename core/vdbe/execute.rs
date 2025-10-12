@@ -8697,6 +8697,14 @@ impl Value {
         start_value: &Value,
         length_value: Option<&Value>,
     ) -> Value {
+        // If any argument is NULL, the result of substr should be NULL.
+        if value == &Value::Null
+            || start_value == &Value::Null
+            || length_value.map_or(false, |v| v == &Value::Null)
+        {
+            return Value::Null;
+        }
+
         /// Function is stabilized but not released for version 1.88 \
         /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
         const fn ceil_char_boundary(s: &str, index: usize) -> usize {
