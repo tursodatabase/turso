@@ -1023,7 +1023,58 @@ do_execsql_test sum-8 {
 } {1.2}
 
 
+# https://github.com/tursodatabase/turso/issues/3689
+do_execsql_test iif-3-args-true {
+  select iif(1 < 2, 'yes', 'no');
+} {yes}
+
+do_execsql_test iif-3-args-false {
+  select iif(1 > 2, 'yes', 'no');
+} {no}
+
+do_execsql_test iif-2-args-true {
+  select iif(1 < 2, 'yes');
+} {yes}
+
+do_execsql_test iif-2-args-false-is-null {
+  select iif(1 > 2, 'yes');
+} {}
+
+do_execsql_test iif-multi-args-finds-first-true {
+  select iif(0, 'a', 1, 'b', 2, 'c', 'default');
+} {b}
+
+do_execsql_test iif-multi-args-falls-to-else {
+  select iif(0, 'a', 0, 'b', 0, 'c', 'default');
+} {default}
+
+do_execsql_test if-alias-3-args-true {
+  select if(1 < 2, 'yes', 'no');
+} {yes}
+
+do_execsql_test if-alias-3-args-false {
+  select if(1 > 2, 'yes', 'no');
+} {no}
+
+do_execsql_test if-alias-2-args-true {
+  select if(1 < 2, 'ok');
+} {ok}
+
+do_execsql_test if-alias-multi-args-finds-first-true {
+  select if(0, 'a', 1, 'b', 'c');
+} {b}
+
+do_execsql_test if-alias-multi-args-falls-to-else {
+  select if(0, 'a', 0, 'b', 'c');
+} {c}
+
+do_execsql_test if-alias-multi-args-no-else-is-null {
+  select if(0, 'a', 0, 'b');
+} {}
+
+
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
 # } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
+

@@ -1187,7 +1187,7 @@ pub fn translate_expr(
                                 translate_expr_no_constant_opt(
                                     program,
                                     referenced_tables,
-                                    args.last().unwrap(), 
+                                    args.last().unwrap(),
                                     target_register,
                                     resolver,
                                     NoConstantOptReason::RegisterReuse,
