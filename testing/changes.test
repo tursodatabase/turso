@@ -32,3 +32,13 @@ do_execsql_test_on_specific_db {:memory:} changes-doesnt-track-indexes {
 	UPDATE users SET name = 'young' where age < 40;
 	select changes();
 } {6}
+
+# https://github.com/tursodatabase/turso/issues/3688
+do_execsql_test_on_specific_db {:memory:} changes-1.69 {
+    create table t(id integer primary key, value text);
+    insert into t values (1, 'a');
+     select changes();
+     update t set id = id+10 where id = 1;
+     select changes();
+} {1
+1}
