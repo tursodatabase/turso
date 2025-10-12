@@ -1,9 +1,13 @@
 use std::fmt::Display;
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Pragma {
     AutoVacuumMode(VacuumMode),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VacuumMode {
     None,
     Incremental,
