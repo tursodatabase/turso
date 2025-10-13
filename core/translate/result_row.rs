@@ -1,5 +1,3 @@
-use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
-
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -171,37 +169,4 @@ pub fn emit_offset(program: &mut ProgramBuilder, jump_to: BranchOffset, reg_offs
         target_pc: jump_to,
         decrement_by: 1,
     });
-}
-
-#[allow(clippy::borrowed_box)]
-pub fn try_fold_expr_to_i64(expr: &Box<Expr>) -> Option<i64> {
-    match expr.as_ref() {
-        Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
-        Expr::Literal(Literal::Null) => Some(0),
-        Expr::Id(name) if !name.quoted() => {
-            let lowered = name.as_str();
-            if lowered == "true" {
-                Some(1)
-            } else if lowered == "false" {
-                Some(0)
-            } else {
-                None
-            }
-        }
-        Expr::Unary(UnaryOperator::Negative, inner) => try_fold_expr_to_i64(inner).map(|v| -v),
-        Expr::Unary(UnaryOperator::Positive, inner) => try_fold_expr_to_i64(inner),
-        Expr::Binary(left, op, right) => {
-            let l = try_fold_expr_to_i64(left)?;
-            let r = try_fold_expr_to_i64(right)?;
-            match op {
-                Operator::Add => Some(l.saturating_add(r)),
-                Operator::Subtract => Some(l.saturating_sub(r)),
-                Operator::Multiply => Some(l.saturating_mul(r)),
-                Operator::Divide if r != 0 => Some(l.saturating_div(r)),
-                _ => None,
-            }
-        }
-
-        _ => None,
-    }
 }
