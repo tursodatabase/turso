@@ -9,7 +9,7 @@ use crate::model::query::select::{
     SelectInner,
 };
 use crate::model::query::update::Update;
-use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
+use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
     Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
@@ -532,6 +532,25 @@ impl Arbitrary for AlterTable {
         Self {
             table_name: table.name.clone(),
             alter_table_type,
+        }
+    }
+}
+
+impl Arbitrary for DropIndex {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let tables_with_indexes = context
+            .tables()
+            .iter()
+            .filter(|table| !table.indexes.is_empty())
+            .collect::<Vec<_>>();
+
+        // Cannot DROP INDEX if there is no index to drop
+        assert!(!tables_with_indexes.is_empty());
+        let table = tables_with_indexes.choose(rng).unwrap();
+        let index = table.indexes.choose(rng).unwrap();
+        Self {
+            index_name: index.index_name.clone(),
+            table_name: table.name.clone(),
         }
     }
 }

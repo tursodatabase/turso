@@ -68,7 +68,7 @@ struct SimulatorFiber {
 struct SimulatorContext {
     fibers: Vec<SimulatorFiber>,
     tables: Vec<Table>,
-    indexes: Vec<String>,
+    indexes: Vec<(String, String)>,
     opts: Opts,
     stats: Stats,
     disable_indexes: bool,
@@ -210,7 +210,10 @@ fn main() -> anyhow::Result<()> {
     let mut context = SimulatorContext {
         fibers,
         tables,
-        indexes: indexes.iter().map(|idx| idx.index_name.clone()).collect(),
+        indexes: indexes
+            .iter()
+            .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
+            .collect(),
         opts: Opts::default(),
         stats: Stats::default(),
         disable_indexes: args.disable_indexes,
@@ -567,7 +570,10 @@ fn perform_work(
                         let sql = create_index.to_string();
                         if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
                             context.fibers[fiber_idx].statement.replace(Some(stmt));
-                            context.indexes.push(create_index.index_name.clone());
+                            context.indexes.push((
+                                create_index.index.table_name.clone(),
+                                create_index.index_name.clone(),
+                            ));
                         }
                         trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
@@ -576,8 +582,11 @@ fn perform_work(
                     // DROP INDEX (2%)
                     if !context.disable_indexes && !context.indexes.is_empty() {
                         let index_idx = rng.random_range(0..context.indexes.len());
-                        let index_name = context.indexes.remove(index_idx);
-                        let drop_index = DropIndex { index_name };
+                        let (table_name, index_name) = context.indexes.remove(index_idx);
+                        let drop_index = DropIndex {
+                            table_name,
+                            index_name,
+                        };
                         let sql = drop_index.to_string();
                         if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
                             context.fibers[fiber_idx].statement.replace(Some(stmt));
