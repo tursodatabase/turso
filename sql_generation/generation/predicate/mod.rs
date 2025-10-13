@@ -76,16 +76,6 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
     }
 }
 
-impl ArbitraryFrom<(&str, &SimValue)> for Predicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        (column_name, value): (&str, &SimValue),
-    ) -> Self {
-        Predicate::from_column_binary(rng, context, column_name, value)
-    }
-}
-
 impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
     fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,

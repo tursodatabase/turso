@@ -72,7 +72,7 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{

@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -121,7 +121,7 @@ pub struct MemorySimIO {
     timeouts: CallbackQueue,
     pub files: RefCell<IndexMap<Fd, Arc<MemorySimFile>>>,
     pub rng: RefCell<ChaCha8Rng>,
-    pub nr_run_once_faults: Cell<usize>,
+    #[expect(dead_code)]
     pub page_size: usize,
     seed: u64,
     latency_probability: u8,
@@ -141,13 +141,11 @@ impl MemorySimIO {
     ) -> Self {
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
-        let nr_run_once_faults = Cell::new(0);
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             timeouts: Arc::new(Mutex::new(Vec::new())),
             files,
             rng,
-            nr_run_once_faults,
             page_size,
             seed,
             latency_probability,
@@ -191,6 +189,17 @@ impl SimIO for MemorySimIO {
         for file in self.files.borrow().values() {
             file.closed.set(true);
         }
+    }
+
+    fn persist_files(&self) -> anyhow::Result<()> {
+        let files = self.files.borrow();
+        for (file_path, file) in files.iter() {
+            if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
+            {
+                std::fs::write(file_path, &*file.buffer.borrow())?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -49,6 +49,7 @@ pub(crate) struct BugRun {
 }
 
 impl Bug {
+    #[expect(dead_code)]
     /// Check if the bug is loaded.
     pub(crate) fn is_loaded(&self) -> bool {
         match self {
@@ -130,6 +131,7 @@ impl BugBase {
         Err(anyhow!("failed to create bug base"))
     }
 
+    #[expect(dead_code)]
     /// Load the bug base from one of the potential paths.
     pub(crate) fn interactive_load() -> anyhow::Result<Self> {
         let potential_paths = vec![
@@ -291,22 +293,23 @@ impl BugBase {
             None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.json"))
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
                         .with_context(|| {
                             format!(
                                 "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("test.json").display()
+                                self.path.join(seed.to_string()).join("plan.json").display()
                             )
                         })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
                     .with_context(|| "should be able to deserialize plan")?;
 
-                let shrunk_plan: Option<String> = std::fs::read_to_string(
-                    self.path.join(seed.to_string()).join("shrunk_test.json"),
-                )
-                .with_context(|| "should be able to read shrunk plan file")
-                .and_then(|shrunk| serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e)))
-                .ok();
+                let shrunk_plan: Option<String> =
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("shrunk.json"))
+                        .with_context(|| "should be able to read shrunk plan file")
+                        .and_then(|shrunk| {
+                            serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e))
+                        })
+                        .ok();
 
                 let shrunk_plan: Option<InteractionPlan> =
                     shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
@@ -338,6 +341,7 @@ impl BugBase {
         }
     }
 
+    #[expect(dead_code)]
     pub(crate) fn mark_successful_run(
         &mut self,
         seed: u64,
@@ -434,6 +438,7 @@ impl BugBase {
 }
 
 impl BugBase {
+    #[expect(dead_code)]
     /// Get the path to the bug base directory.
     pub(crate) fn path(&self) -> &PathBuf {
         &self.path

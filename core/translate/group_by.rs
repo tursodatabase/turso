@@ -786,6 +786,8 @@ pub fn group_by_emit_row_phase<'a>(
                     jump_if_condition_is_true: false,
                     jump_target_when_false: labels.label_group_by_end_without_emitting_row,
                     jump_target_when_true: if_true_target,
+                    // treat null result has false for now
+                    jump_target_when_null: labels.label_group_by_end_without_emitting_row,
                 },
                 &t_ctx.resolver,
             )?;

@@ -646,7 +646,8 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(tbl_name.name.as_str().to_string()); //  r3
+    let table_reg =
+        program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()).to_string()); //  r3
     program.mark_last_insn_constant();
     let table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();

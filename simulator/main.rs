@@ -1,4 +1,4 @@
-#![allow(clippy::arc_with_non_send_sync, dead_code)]
+#![allow(clippy::arc_with_non_send_sync)]
 use anyhow::anyhow;
 use clap::Parser;
 use generation::plan::{InteractionPlan, InteractionPlanState};
@@ -421,6 +421,7 @@ enum SandboxedResult {
         error: String,
         last_execution: Execution,
     },
+    #[expect(dead_code)]
     FoundBug {
         error: String,
         history: ExecutionHistory,
@@ -610,6 +611,8 @@ fn run_simulation_default(
 
     tracing::info!("Simulation completed");
 
+    env.io.persist_files().unwrap();
+
     if result.error.is_none() {
         let ic = integrity_check(&env.get_db_path());
         if let Err(err) = ic {
@@ -683,6 +686,7 @@ const BANNER: &str = r#"
 "#;
 
 fn integrity_check(db_path: &Path) -> anyhow::Result<()> {
+    assert!(db_path.exists());
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
     let mut rows = stmt.query(())?;

@@ -388,6 +388,7 @@ pub fn init_loop(
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+            jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -713,6 +714,7 @@ fn emit_conditions(
             jump_if_condition_is_true: false,
             jump_target_when_true,
             jump_target_when_false: next,
+            jump_target_when_null: next,
         };
         translate_condition_expr(
             program,
@@ -727,7 +729,7 @@ fn emit_conditions(
     Ok(())
 }
 
-/// SQLite (and so Limbo) processes joins as a nested loop.
+/// SQLite (and so Turso) processes joins as a nested loop.
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)

@@ -66,4 +66,12 @@ pub struct Opts {
     /// Number of tables to use
     #[clap(long, help = "Select number of tables to create")]
     pub tables: Option<usize>,
+
+    /// Busy timeout in milliseconds
+    #[clap(
+        long,
+        help = "Set busy timeout in milliseconds",
+        default_value_t = 5000
+    )]
+    pub busy_timeout: u64,
 }

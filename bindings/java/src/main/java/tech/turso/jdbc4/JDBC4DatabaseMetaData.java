@@ -13,6 +13,7 @@ import tech.turso.core.TursoPropertiesHolder;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
 
+/** JDBC 4 DatabaseMetaData implementation for Turso databases. */
 public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   private static final Logger logger = LoggerFactory.getLogger(JDBC4DatabaseMetaData.class);
@@ -51,6 +52,11 @@ public final class JDBC4DatabaseMetaData implements DatabaseMetaData {
 
   @Nullable private PreparedStatement getColumnPrivileges = null;
 
+  /**
+   * Creates a new JDBC4DatabaseMetaData instance.
+   *
+   * @param connection the database connection
+   */
   public JDBC4DatabaseMetaData(JDBC4Connection connection) {
     this.connection = connection;
   }

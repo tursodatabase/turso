@@ -493,6 +493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
+        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+
         conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         // Apply each DDL statement individually
@@ -525,6 +527,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
+            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
             println!("\rExecuting queries...");
@@ -542,6 +546,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
+                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
                 } else if gen_bool(0.0) {
                     // disabled
                     // Reconnect to the database
@@ -550,6 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     let db_guard = db.lock().await;
                     conn = db_guard.connect()?;
+                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
                 }
                 let sql = &plan.queries_per_thread[thread][query_index];
                 if !opts.silent {

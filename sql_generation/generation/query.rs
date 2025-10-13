@@ -1,7 +1,8 @@
 use crate::generation::{
-    gen_random_text, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom, ArbitrarySized,
-    GenerationContext,
+    gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
+    ArbitrarySized, GenerationContext,
 };
+use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
@@ -9,9 +10,12 @@ use crate::model::query::select::{
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
-use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext};
+use crate::model::table::{
+    Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+};
 use indexmap::IndexSet;
 use itertools::Itertools;
+use rand::seq::IndexedRandom;
 use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
 
@@ -358,9 +362,11 @@ impl Arbitrary for CreateIndex {
         );
 
         CreateIndex {
-            index_name,
-            table_name: table.name.clone(),
-            columns,
+            index: Index {
+                index_name,
+                table_name: table.name.clone(),
+                columns,
+            },
         }
     }
 }
@@ -382,6 +388,150 @@ impl Arbitrary for Update {
             table: table.name.clone(),
             set_values,
             predicate: Predicate::arbitrary_from(rng, env, table),
+        }
+    }
+}
+
+const ALTER_TABLE_ALL: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
+    AlterTableTypeDiscriminants::AlterColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+    AlterTableTypeDiscriminants::DropColumn,
+];
+const ALTER_TABLE_NO_DROP: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
+    AlterTableTypeDiscriminants::AlterColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+];
+const ALTER_TABLE_NO_ALTER_COL: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+    AlterTableTypeDiscriminants::DropColumn,
+];
+const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
+    AlterTableTypeDiscriminants::RenameTo,
+    AlterTableTypeDiscriminants::AddColumn,
+    AlterTableTypeDiscriminants::RenameColumn,
+];
+
+// TODO: Unfortunately this diff strategy allocates a couple of IndexSet's
+// in the future maybe change this to be more efficient. This is currently acceptable because this function
+// is only called for `DropColumn`
+fn get_column_diff(table: &Table) -> IndexSet<&str> {
+    // Columns that are referenced in INDEXES cannot be dropped
+    let column_cannot_drop = table
+        .indexes
+        .iter()
+        .flat_map(|index| index.columns.iter().map(|(col_name, _)| col_name.as_str()))
+        .collect::<IndexSet<_>>();
+    if column_cannot_drop.len() == table.columns.len() {
+        // Optimization: all columns are present in indexes so we do not need to but the table column set
+        return IndexSet::new();
+    }
+
+    let column_set: IndexSet<_, std::hash::RandomState> =
+        IndexSet::from_iter(table.columns.iter().map(|col| col.name.as_str()));
+
+    let diff = column_set
+        .difference(&column_cannot_drop)
+        .copied()
+        .collect::<IndexSet<_, std::hash::RandomState>>();
+    diff
+}
+
+impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType {
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        (table, choices): (&Table, &[AlterTableTypeDiscriminants]),
+    ) -> Self {
+        match choices.choose(rng).unwrap() {
+            AlterTableTypeDiscriminants::RenameTo => AlterTableType::RenameTo {
+                new_name: Name::arbitrary(rng, context).0,
+            },
+            AlterTableTypeDiscriminants::AddColumn => AlterTableType::AddColumn {
+                column: Column::arbitrary(rng, context),
+            },
+            AlterTableTypeDiscriminants::AlterColumn => {
+                let col_diff = get_column_diff(table);
+
+                if col_diff.is_empty() {
+                    // Generate a DropColumn if we can drop a column
+                    return AlterTableType::arbitrary_from(
+                        rng,
+                        context,
+                        (
+                            table,
+                            if choices.contains(&AlterTableTypeDiscriminants::DropColumn) {
+                                ALTER_TABLE_NO_ALTER_COL
+                            } else {
+                                ALTER_TABLE_NO_ALTER_COL_NO_DROP
+                            },
+                        ),
+                    );
+                }
+
+                let col_idx = pick_index(col_diff.len(), rng);
+                let col_name = col_diff.get_index(col_idx).unwrap();
+
+                AlterTableType::AlterColumn {
+                    old: col_name.to_string(),
+                    new: Column::arbitrary(rng, context),
+                }
+            }
+            AlterTableTypeDiscriminants::RenameColumn => AlterTableType::RenameColumn {
+                old: pick(&table.columns, rng).name.clone(),
+                new: Name::arbitrary(rng, context).0,
+            },
+            AlterTableTypeDiscriminants::DropColumn => {
+                let col_diff = get_column_diff(table);
+
+                if col_diff.is_empty() {
+                    // Generate a DropColumn if we can drop a column
+                    return AlterTableType::arbitrary_from(
+                        rng,
+                        context,
+                        (
+                            table,
+                            if context.opts().query.alter_table.alter_column {
+                                ALTER_TABLE_NO_DROP
+                            } else {
+                                ALTER_TABLE_NO_ALTER_COL_NO_DROP
+                            },
+                        ),
+                    );
+                }
+
+                let col_idx = pick_index(col_diff.len(), rng);
+                let col_name = col_diff.get_index(col_idx).unwrap();
+
+                AlterTableType::DropColumn {
+                    column_name: col_name.to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl Arbitrary for AlterTable {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let table = pick(context.tables(), rng);
+        let choices = match (
+            table.columns.len() > 1,
+            context.opts().query.alter_table.alter_column,
+        ) {
+            (true, true) => ALTER_TABLE_ALL,
+            (true, false) => ALTER_TABLE_NO_ALTER_COL,
+            (false, true) | (false, false) => ALTER_TABLE_NO_ALTER_COL_NO_DROP,
+        };
+
+        let alter_table_type = AlterTableType::arbitrary_from(rng, context, (table, choices));
+        Self {
+            table_name: table.name.clone(),
+            alter_table_type,
         }
     }
 }

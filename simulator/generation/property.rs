@@ -8,16 +8,17 @@
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use serde::{Deserialize, Serialize};
 use sql_generation::{
-    generation::{Arbitrary, ArbitraryFrom, GenerationContext, Opts, pick, pick_index},
+    generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
         query::{
             Create, Delete, Drop, Insert, Select,
+            alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
             update::Update,
         },
-        table::{SimValue, Table},
+        table::SimValue,
     },
 };
 use strum::IntoEnumIterator;
@@ -27,39 +28,14 @@ use turso_parser::ast::{self, Distinctness};
 use crate::{
     common::print_diff,
     generation::{
-        Shadow as _, WeightedDistribution,
-        plan::InteractionType,
-        query::{QueryDistribution, possible_queries},
+        Shadow as _, WeightedDistribution, plan::InteractionType, query::QueryDistribution,
     },
     model::{Query, QueryCapabilities, QueryDiscriminants},
     profiles::query::QueryProfile,
-    runner::env::{ShadowTablesMut, SimulatorEnv},
+    runner::env::SimulatorEnv,
 };
 
 use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
-
-#[derive(Debug, Clone, Copy)]
-struct PropertyGenContext<'a> {
-    tables: &'a Vec<sql_generation::model::table::Table>,
-    opts: &'a sql_generation::generation::Opts,
-}
-
-impl<'a> PropertyGenContext<'a> {
-    #[inline]
-    fn new(tables: &'a Vec<Table>, opts: &'a Opts) -> Self {
-        Self { tables, opts }
-    }
-}
-
-impl<'a> GenerationContext for PropertyGenContext<'a> {
-    fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
-        self.tables
-    }
-
-    fn opts(&self) -> &sql_generation::generation::Opts {
-        self.opts
-    }
-}
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -308,7 +284,7 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] The inserted row will not be deleted.
                 // - [x] The inserted row will not be updated.
-                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] The table `t` will not be renamed, dropped, or altered.
                 |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
                     let Property::InsertValuesSelect {
                         insert, row_index, ..
@@ -352,6 +328,10 @@ impl Property {
                             // Cannot drop the table we are inserting
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the table we are inserting
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
@@ -359,7 +339,7 @@ impl Property {
             Property::DoubleCreateFailure { .. } => {
                 // The interactions in the middle has the following constraints;
                 // - [x] There will be no errors in the middle interactions.(best effort)
-                // - [ ] Table `t` will not be renamed or dropped.(todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] Table `t` will not be renamed or dropped.
                 |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, property: &Property| {
                     let Property::DoubleCreateFailure { create, .. } = property else {
                         unreachable!()
@@ -383,6 +363,10 @@ impl Property {
                             // Cannot Drop the created table
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the table we created
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
@@ -390,7 +374,7 @@ impl Property {
             Property::DeleteSelect { .. } => {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
-                // - [ ] The table `t` will not be renamed, dropped, or altered. (todo: add this constraint once ALTER or DROP is implemented)
+                // - [x] The table `t` will not be renamed, dropped, or altered.
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -437,13 +421,17 @@ impl Property {
                             // Cannot Drop the same table
                             None
                         }
+                        Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
+                            // Cannot alter the same table
+                            None
+                        }
                         _ => Some(query),
                     }
                 }
             }
             Property::DropSelect { .. } => {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
-                // - [-] The table `t` will not be created, no table will be renamed to `t`. (todo: update this constraint once ALTER is implemented)
+                // - [x] The table `t` will not be created, no table will be renamed to `t`.
                 |rng, ctx, query_distr, property: &Property| {
                     let Property::DropSelect {
                         table: table_name, ..
@@ -453,13 +441,19 @@ impl Property {
                     };
 
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
-                    if let Query::Create(Create { table: t }) = &query
-                        && t.name == *table_name
-                    {
-                        // - The table `t` will not be created
-                        None
-                    } else {
-                        Some(query)
+                    match &query {
+                        Query::Create(Create { table: t }) if t.name == *table_name => {
+                            // - The table `t` will not be created
+                            None
+                        }
+                        Query::AlterTable(AlterTable {
+                            table_name: t,
+                            alter_table_type: AlterTableType::RenameTo { new_name },
+                        }) if t == table_name || new_name == table_name => {
+                            // no table will be renamed to `t`
+                            None
+                        }
+                        _ => Some(query),
                     }
                 }
             }
@@ -1377,29 +1371,24 @@ fn assert_all_table_values(
 }
 
 #[derive(Debug)]
-pub(crate) struct Remaining {
-    pub(crate) select: u32,
-    pub(crate) insert: u32,
-    pub(crate) create: u32,
-    pub(crate) create_index: u32,
-    pub(crate) delete: u32,
-    pub(crate) update: u32,
-    pub(crate) drop: u32,
+pub(super) struct Remaining {
+    pub select: u32,
+    pub insert: u32,
+    pub create: u32,
+    pub create_index: u32,
+    pub delete: u32,
+    pub update: u32,
+    pub drop: u32,
+    pub alter_table: u32,
 }
 
-pub(crate) fn remaining(
+pub(super) fn remaining(
     max_interactions: u32,
     opts: &QueryProfile,
     stats: &InteractionStats,
     mvcc: bool,
 ) -> Remaining {
-    let total_weight = opts.select_weight
-        + opts.create_table_weight
-        + opts.create_index_weight
-        + opts.insert_weight
-        + opts.update_weight
-        + opts.delete_weight
-        + opts.drop_table_weight;
+    let total_weight = opts.total_weight();
 
     let total_select = (max_interactions * opts.select_weight) / total_weight;
     let total_insert = (max_interactions * opts.insert_weight) / total_weight;
@@ -1408,6 +1397,7 @@ pub(crate) fn remaining(
     let total_delete = (max_interactions * opts.delete_weight) / total_weight;
     let total_update = (max_interactions * opts.update_weight) / total_weight;
     let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
+    let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
 
     let remaining_select = total_select
         .checked_sub(stats.select_count)
@@ -1429,6 +1419,10 @@ pub(crate) fn remaining(
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
 
+    let remaining_alter_table = total_alter_table
+        .checked_sub(stats.alter_table_count)
+        .unwrap_or_default();
+
     if mvcc {
         // TODO: index not supported yet for mvcc
         remaining_create_index = 0;
@@ -1442,6 +1436,7 @@ pub(crate) fn remaining(
         delete: remaining_delete,
         drop: remaining_drop,
         update: remaining_update,
+        alter_table: remaining_alter_table,
     }
 }
 
@@ -1752,7 +1747,7 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
-    pub(super) fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
+    fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -1781,7 +1776,7 @@ impl PropertyDiscriminants {
         }
     }
 
-    pub fn weight(
+    fn weight(
         &self,
         env: &SimulatorEnv,
         remaining: &Remaining,
@@ -1925,11 +1920,6 @@ impl PropertyDiscriminants {
     }
 }
 
-pub fn possiple_properties(tables: &[Table]) -> Vec<PropertyDiscriminants> {
-    let queries = possible_queries(tables);
-    PropertyDiscriminants::can_generate(queries)
-}
-
 pub(super) struct PropertyDistribution<'a> {
     properties: Vec<PropertyDiscriminants>,
     weights: WeightedIndex<u32>,
@@ -1993,49 +1983,6 @@ impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
     ) -> Self {
         property_distr.sample(rng, conn_ctx)
     }
-}
-
-fn generate_queries<R: rand::Rng + ?Sized, F>(
-    rng: &mut R,
-    ctx: &impl GenerationContext,
-    amount: usize,
-    init_queries: &[&Query],
-    func: F,
-) -> Vec<Query>
-where
-    F: Fn(&mut R, PropertyGenContext) -> Option<Query>,
-{
-    // Create random queries respecting the constraints
-    let mut queries = Vec::new();
-
-    let range = 0..amount;
-    if !range.is_empty() {
-        let mut tmp_tables = ctx.tables().clone();
-
-        for query in init_queries {
-            tmp_shadow(&mut tmp_tables, query);
-        }
-
-        for _ in range {
-            let tmp_ctx = PropertyGenContext::new(&tmp_tables, ctx.opts());
-
-            let Some(query) = func(rng, tmp_ctx) else {
-                continue;
-            };
-
-            tmp_shadow(&mut tmp_tables, &query);
-
-            queries.push(query);
-        }
-    }
-    queries
-}
-
-fn tmp_shadow(tmp_tables: &mut Vec<Table>, query: &Query) {
-    let mut tx_tables = None;
-    let mut tmp_shadow_tables = ShadowTablesMut::new(tmp_tables, &mut tx_tables);
-
-    let _ = query.shadow(&mut tmp_shadow_tables);
 }
 
 fn print_row(row: &[SimValue]) -> String {

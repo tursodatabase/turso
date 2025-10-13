@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     branches: ["main", "notmain", "master"]
   schedule:
-    - cron: '24 6,11,14,20 * * *'
+    - cron: '24 4 * * *'
   push:
   #   branches: ["main", "notmain", "master"]
     branches: ["notmain"]
@@ -98,7 +98,7 @@ jobs:
       - name: Analyze SQLITE3 result with Nyrkiö
         uses: nyrkio/change-detection@HEAD
         with:
-          name: clickbench/sqlite3
+          name: nightly/clickbench/sqlite3
           tool: time
           output-file-path: clickbench-sqlite3.txt
           fail-on-alert: false

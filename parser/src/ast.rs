@@ -542,6 +542,17 @@ impl Expr {
     pub fn raise(resolve_type: ResolveType, expr: Option<Expr>) -> Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
+
+    pub fn can_be_null(&self) -> bool {
+        // todo: better handling columns. Check sqlite3ExprCanBeNull
+        match self {
+            Expr::Literal(literal) => !matches!(
+                literal,
+                Literal::Numeric(_) | Literal::String(_) | Literal::Blob(_)
+            ),
+            _ => true,
+        }
+    }
 }
 
 /// SQL literal
@@ -1121,6 +1132,11 @@ pub struct NamedColumnConstraint {
 // https://sqlite.org/syntax/column-constraint.html
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "simulator", derive(strum::EnumDiscriminants))]
+#[cfg_attr(
+    feature = "simulator",
+    strum_discriminants(derive(strum::VariantArray))
+)]
 pub enum ColumnConstraint {
     /// `PRIMARY KEY`
     PrimaryKey {

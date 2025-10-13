@@ -10,7 +10,7 @@ LINUX_X86_DIR := $(RELEASE_DIR)/linux_x86
 
 .PHONY: libs macos_x86 macos_arm64 windows lint lint_apply test build_test
 
-libs: macos_x86 macos_arm64 windows
+libs: macos_x86 macos_arm64 windows linux_x86
 
 macos_x86:
 	@echo "Building release version for macOS x86_64..."

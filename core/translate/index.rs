@@ -245,6 +245,7 @@ pub fn translate_create_index(
                 jump_if_condition_is_true: false,
                 jump_target_when_false: label,
                 jump_target_when_true: BranchOffset::Placeholder,
+                jump_target_when_null: label,
             },
             resolver,
         )?;

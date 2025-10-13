@@ -83,18 +83,6 @@ impl<'a, 'b> ShadowTablesMut<'a>
 where
     'a: 'b,
 {
-    /// Creation of [ShadowTablesMut] outside of [SimulatorEnv] should be done sparingly and carefully.
-    /// Should only need to call this function if we need to do shadowing in a temporary model table
-    pub fn new(
-        commited_tables: &'a mut Vec<Table>,
-        transaction_tables: &'a mut Option<TransactionTables>,
-    ) -> Self {
-        ShadowTablesMut {
-            commited_tables,
-            transaction_tables,
-        }
-    }
-
     fn tables(&'a self) -> &'a Vec<Table> {
         self.transaction_tables
             .as_ref()
@@ -312,7 +300,6 @@ impl SimulatorEnv {
             seed,
             ticks: rng
                 .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
-            max_tables: rng.random_range(0..128),
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
             disable_double_create_failure: cli_opts.disable_double_create_failure,
@@ -364,6 +351,9 @@ impl SimulatorEnv {
             profile.io.enable = false;
             // Disable limits due to differences in return order from turso and rusqlite
             opts.disable_select_limit = true;
+
+            // There is no `ALTER COLUMN` in SQLite
+            profile.query.gen_opts.query.alter_table.alter_column = false;
         }
 
         profile.validate().unwrap();
@@ -528,14 +518,6 @@ impl SimulatorEnv {
     }
 }
 
-pub trait ConnectionTrait
-where
-    Self: std::marker::Sized + Clone,
-{
-    fn is_connected(&self) -> bool;
-    fn disconnect(&mut self);
-}
-
 pub(crate) enum SimConnection {
     LimboConnection(Arc<turso_core::Connection>),
     SQLiteConnection(rusqlite::Connection),
@@ -584,7 +566,6 @@ impl Display for SimConnection {
 pub(crate) struct SimulatorOpts {
     pub(crate) seed: u64,
     pub(crate) ticks: usize,
-    pub(crate) max_tables: usize,
 
     pub(crate) disable_select_optimizer: bool,
     pub(crate) disable_insert_values_select: bool,

@@ -486,7 +486,7 @@ pub fn usable_constraints_for_join_order<'a>(
             .map(|j| j.original_idx),
     );
     let mut usable: Vec<RangeConstraintRef> = Vec::new();
-    let mut last_column_pos = 0;
+    let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
         let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
@@ -498,6 +498,7 @@ pub fn usable_constraints_for_join_order<'a>(
             break;
         }
         if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
+            // Two constraints on the same index column can be combined into a single range constraint.
             assert_eq!(cref.sort_order, usable.last().unwrap().sort_order);
             assert_eq!(cref.index_col_pos, usable.last().unwrap().index_col_pos);
             assert_eq!(
@@ -520,15 +521,28 @@ pub fn usable_constraints_for_join_order<'a>(
             }
             continue;
         }
-        if cref.index_col_pos != last_column_pos {
+        if cref.index_col_pos != current_required_column_pos {
+            // Index columns must be consumed contiguously in the order they appear in the index.
             break;
         }
         if usable.last().is_some_and(|x| x.eq.is_none()) {
+            // Usable index key must have 0-n equalities and then a maximum of 1 range constraint with one or both bounds set.
+            // If we already have a range constraint before this one, we must not add anything to it
             break;
         }
-        let constraint_group = match constraints[cref.constraint_vec_pos].operator {
+        let operator = constraints[cref.constraint_vec_pos].operator;
+        let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
+        if operator == ast::Operator::Equals
+            && usable
+                .last()
+                .is_some_and(|x| x.table_col_pos == table_col_pos)
+        {
+            // If we already have an equality constraint for this column, we can't use it again
+            continue;
+        }
+        let constraint_group = match operator {
             ast::Operator::Equals => RangeConstraintRef {
-                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
                 eq: Some(cref.constraint_vec_pos),
@@ -536,7 +550,7 @@ pub fn usable_constraints_for_join_order<'a>(
                 upper_bound: None,
             },
             ast::Operator::Greater | ast::Operator::GreaterEquals => RangeConstraintRef {
-                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
                 eq: None,
@@ -544,7 +558,7 @@ pub fn usable_constraints_for_join_order<'a>(
                 upper_bound: None,
             },
             ast::Operator::Less | ast::Operator::LessEquals => RangeConstraintRef {
-                table_col_pos: constraints[cref.constraint_vec_pos].table_col_pos,
+                table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
                 eq: None,
@@ -554,7 +568,7 @@ pub fn usable_constraints_for_join_order<'a>(
             _ => continue,
         };
         usable.push(constraint_group);
-        last_column_pos += 1;
+        current_required_column_pos += 1;
     }
     usable
 }
