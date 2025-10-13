@@ -171,7 +171,7 @@ impl TursoRwLock {
         // for success, Acquire establishes happens-before relationship with the previous Release from unlock
         // for failure we only care about reading it for the next iteration so we can use Relaxed.
         self.0
-            .compare_exchange_weak(cur, desired, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
