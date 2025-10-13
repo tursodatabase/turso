@@ -6200,7 +6200,7 @@ pub fn op_idx_delete(
                             .map(|i| &state.registers[i])
                             .collect::<Vec<_>>();
                         return Err(LimboError::Corrupt(format!(
-                            "IdxDelete: no matching index entry found for key {reg_values:?}"
+                            "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
                         )));
                     }
                     state.pc += 1;
@@ -6221,7 +6221,7 @@ pub fn op_idx_delete(
                         .map(|i| &state.registers[i])
                         .collect::<Vec<_>>();
                     return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for key {reg_values:?}"
+                        "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
                 state.op_idx_delete_state = Some(OpIdxDeleteState::Deleting);
