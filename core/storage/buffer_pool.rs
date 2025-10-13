@@ -429,9 +429,6 @@ impl Arena {
 
 #[cfg(unix)]
 mod arena {
-    #[cfg(target_vendor = "apple")]
-    use libc::MAP_ANON as MAP_ANONYMOUS;
-    #[cfg(target_os = "linux")]
     use libc::MAP_ANONYMOUS;
     use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
     use std::ffi::c_void;
