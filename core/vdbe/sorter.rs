@@ -298,9 +298,11 @@ impl Sorter {
 
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
         if !self.pending_completions.is_empty() {
-            return Ok(IOResult::IO(IOCompletions::Many(
-                self.pending_completions.drain(..).collect(),
-            )));
+            let mut group = CompletionGroup::new(|_| {});
+            for c in self.pending_completions.drain(..) {
+                group.add(&c);
+            }
+            return Ok(IOResult::IO(IOCompletions::Single(group.build())));
         }
         // Make sure all chunks read at least one record into their buffer.
         if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
