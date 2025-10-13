@@ -59,12 +59,12 @@ pub struct GenericFile {
 impl File for GenericFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive: bool) -> Result<()> {
-        unimplemented!()
+        Ok(())
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
-        unimplemented!()
+        Ok(())
     }
 
     #[instrument(skip(self, c), level = Level::TRACE)]
