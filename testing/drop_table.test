@@ -12,6 +12,15 @@ do_execsql_test_on_specific_db {:memory:} drop-table-basic-1 {
     SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='t1';
 } {0}
 
+# The table should be dropped irrespective of the case of the table name.
+do_execsql_test_on_specific_db {:memory:} drop-table-case-insensitive {
+    CREATE TABLE test (x INTEGER PRIMARY KEY);
+    INSERT INTO test VALUES (1);
+    INSERT INTO test VALUES (2);
+    DROP TABLE TeSt;
+    SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='test';
+} {0}
+
 # Test DROP TABLE IF EXISTS on existing table
 do_execsql_test_on_specific_db {:memory:} drop-table-if-exists-1 {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY);
