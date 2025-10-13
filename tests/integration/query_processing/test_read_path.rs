@@ -906,14 +906,14 @@ fn test_max_joined_tables_limit() {
 
     // Create 64 tables
     for i in 0..64 {
-        conn.execute(&format!("CREATE TABLE t{} (id INTEGER)", i))
+        conn.execute(format!("CREATE TABLE t{i} (id INTEGER)"))
             .unwrap();
     }
 
     // Try to join 64 tables - should fail
     let mut sql = String::from("SELECT * FROM t0");
     for i in 1..64 {
-        sql.push_str(&format!(" JOIN t{} ON t{}.id = t0.id", i, i));
+        sql.push_str(&format!(" JOIN t{i} ON t{i}.id = t0.id"));
     }
 
     let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
@@ -930,7 +930,7 @@ fn test_many_columns() {
         if i > 0 {
             create_sql.push_str(", ");
         }
-        create_sql.push_str(&format!("col{} INTEGER", i));
+        create_sql.push_str(&format!("col{i} INTEGER"));
     }
     create_sql.push(')');
 
@@ -956,7 +956,7 @@ fn test_many_columns() {
         if !first {
             select_sql.push_str(", ");
         }
-        select_sql.push_str(&format!("col{}", i));
+        select_sql.push_str(&format!("col{i}"));
         first = false;
     }
     select_sql.push_str(" FROM test");
