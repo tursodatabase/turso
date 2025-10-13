@@ -1,5 +1,5 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
-use turso_core::{StepResult, Value};
+use turso_core::{LimboError, StepResult, Value};
 
 #[test]
 fn test_statement_reset_bind() -> anyhow::Result<()> {
@@ -919,4 +919,74 @@ fn test_max_joined_tables_limit() {
         panic!("Expected an error but got no error");
     };
     assert!(result.contains("Only up to 63 tables can be joined"));
+}
+
+#[test]
+/// Test that we can create and select from a table with 1000 columns.
+fn test_many_columns() {
+    let mut create_sql = String::from("CREATE TABLE test (");
+    for i in 0..1000 {
+        if i > 0 {
+            create_sql.push_str(", ");
+        }
+        create_sql.push_str(&format!("col{} INTEGER", i));
+    }
+    create_sql.push(')');
+
+    let tmp_db = TempDatabase::new("test_many_columns", false);
+    let conn = tmp_db.connect_limbo();
+    conn.execute(&create_sql).unwrap();
+
+    // Insert a row with values 0-999
+    let mut insert_sql = String::from("INSERT INTO test VALUES (");
+    for i in 0..1000 {
+        if i > 0 {
+            insert_sql.push_str(", ");
+        }
+        insert_sql.push_str(&i.to_string());
+    }
+    insert_sql.push(')');
+    conn.execute(&insert_sql).unwrap();
+
+    // Select every 100th column
+    let mut select_sql = String::from("SELECT ");
+    let mut first = true;
+    for i in (0..1000).step_by(100) {
+        if !first {
+            select_sql.push_str(", ");
+        }
+        select_sql.push_str(&format!("col{}", i));
+        first = false;
+    }
+    select_sql.push_str(" FROM test");
+
+    let mut rows = Vec::new();
+    let mut stmt = conn.prepare(&select_sql).unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::IO => stmt.run_once().unwrap(),
+            _ => break,
+        }
+    }
+
+    // Verify we got values 0,100,200,...,900
+    assert_eq!(
+        rows,
+        vec![vec![
+            turso_core::Value::Integer(0),
+            turso_core::Value::Integer(100),
+            turso_core::Value::Integer(200),
+            turso_core::Value::Integer(300),
+            turso_core::Value::Integer(400),
+            turso_core::Value::Integer(500),
+            turso_core::Value::Integer(600),
+            turso_core::Value::Integer(700),
+            turso_core::Value::Integer(800),
+            turso_core::Value::Integer(900),
+        ]]
+    );
 }

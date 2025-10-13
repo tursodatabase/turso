@@ -4450,6 +4450,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "regex",
  "regex-syntax",
+ "roaring",
  "rstest",
  "rusqlite",
  "rustix 1.0.7",

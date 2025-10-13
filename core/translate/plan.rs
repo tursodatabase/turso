@@ -757,33 +757,25 @@ impl TableReferences {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[repr(transparent)]
-pub struct ColumnUsedMask(u128);
+pub struct ColumnUsedMask(roaring::RoaringBitmap);
 
 impl ColumnUsedMask {
     pub fn set(&mut self, index: usize) {
-        assert!(
-            index < 128,
-            "ColumnUsedMask only supports up to 128 columns"
-        );
-        self.0 |= 1 << index;
+        self.0.insert(index as u32);
     }
 
     pub fn get(&self, index: usize) -> bool {
-        assert!(
-            index < 128,
-            "ColumnUsedMask only supports up to 128 columns"
-        );
-        self.0 & (1 << index) != 0
+        self.0.contains(index as u32)
     }
 
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
-        self.0 & other.0 == other.0
+        other.0.is_subset(&self.0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0 == 0
+        self.0.is_empty()
     }
 }
 
