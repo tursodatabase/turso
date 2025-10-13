@@ -23,24 +23,31 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{Expr, Name, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
-    unique_if_not_exists: (bool, bool),
-    resolver: &Resolver,
-    idx_name: &Name,
-    tbl_name: &Name,
-    columns: &[SortedColumn],
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    where_clause: Option<Box<Expr>>,
+    resolver: &Resolver,
+    stmt: ast::Stmt,
 ) -> crate::Result<ProgramBuilder> {
+    let ast::Stmt::CreateIndex {
+        unique,
+        if_not_exists,
+        idx_name,
+        tbl_name,
+        columns,
+        where_clause,
+        ..
+    } = &stmt
+    else {
+        panic!("translate_create_index must be called with CreateIndex AST node");
+    };
     let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let idx_name = normalize_ident(idx_name.as_str());
+    let idx_name = normalize_ident(idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -80,7 +87,7 @@ pub fn translate_create_index(
     // the name is globally unique in the schema.
     if !resolver.schema.is_unique_idx_name(&idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
-        if unique_if_not_exists.1 {
+        if *if_not_exists {
             return Ok(program);
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
@@ -92,8 +99,7 @@ pub fn translate_create_index(
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
     let original_columns = columns;
-    let columns = resolve_sorted_columns(&tbl, columns)?;
-    let unique = unique_if_not_exists.0;
+    let columns = resolve_sorted_columns(&tbl, &columns)?;
 
     let idx = Arc::new(Index {
         name: idx_name.clone(),
@@ -109,7 +115,7 @@ pub fn translate_create_index(
                 default: col.default.clone(),
             })
             .collect(),
-        unique,
+        unique: *unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
         // store the *original* where clause, because we need to rewrite it
@@ -121,6 +127,7 @@ pub fn translate_create_index(
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
+                .as_ref()
                 .expect("where expr has to exist in order to fail")
                 .to_string()
         );
@@ -178,13 +185,7 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let sql = create_idx_stmt_to_sql(
-        &original_tbl_name.as_ident(),
-        &original_idx_name.as_ident(),
-        unique_if_not_exists,
-        original_columns,
-        &idx.where_clause.clone(),
-    );
+    let sql = stmt.to_string();
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
         &mut program,
@@ -302,7 +303,7 @@ pub fn translate_create_index(
 
     let sorted_record_reg = program.alloc_register();
 
-    if unique {
+    if *unique {
         // Since the records to be inserted are sorted, we can compare prev with current and if they are equal,
         // we fall through to Halt with a unique constraint violation error.
         let goto_label = program.allocate_label();
@@ -397,47 +398,6 @@ fn resolve_sorted_columns<'a>(
         resolved.push((col, sc.order.unwrap_or(SortOrder::Asc)));
     }
     Ok(resolved)
-}
-
-fn create_idx_stmt_to_sql(
-    tbl_name: &str,
-    idx_name: &str,
-    unique_if_not_exists: (bool, bool),
-    cols: &[SortedColumn],
-    where_clause: &Option<Box<Expr>>,
-) -> String {
-    let mut sql = String::with_capacity(128);
-    sql.push_str("CREATE ");
-    if unique_if_not_exists.0 {
-        sql.push_str("UNIQUE ");
-    }
-    sql.push_str("INDEX ");
-    if unique_if_not_exists.1 {
-        sql.push_str("IF NOT EXISTS ");
-    }
-    sql.push_str(idx_name);
-    sql.push_str(" ON ");
-    sql.push_str(tbl_name);
-    sql.push_str(" (");
-    for (i, col) in cols.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        let col_ident = match col.expr.as_ref() {
-            Expr::Id(name) | Expr::Name(name) => name.as_ident(),
-            _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
-        };
-        sql.push_str(&col_ident);
-        if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
-            sql.push_str(" DESC");
-        }
-    }
-    sql.push(')');
-    if let Some(where_clause) = where_clause {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clause.to_string());
-    }
-    sql
 }
 
 pub fn translate_drop_index(
