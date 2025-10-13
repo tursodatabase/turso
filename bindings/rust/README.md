@@ -18,7 +18,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-turso = "0.1"
+turso = "0.2"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
