@@ -897,3 +897,26 @@ fn test_multiple_connections_visibility() -> anyhow::Result<()> {
     assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     Ok(())
 }
+
+#[test]
+/// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
+fn test_max_joined_tables_limit() {
+    let tmp_db = TempDatabase::new("test_max_joined_tables_limit", false);
+    let conn = tmp_db.connect_limbo();
+
+    // Create 64 tables
+    for i in 0..64 {
+        conn.execute(&format!("CREATE TABLE t{} (id INTEGER)", i)).unwrap();
+    }
+
+    // Try to join 64 tables - should fail
+    let mut sql = String::from("SELECT * FROM t0");
+    for i in 1..64 {
+        sql.push_str(&format!(" JOIN t{} ON t{}.id = t0.id", i, i));
+    }
+
+    let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
+        panic!("Expected an error but got no error");
+    };
+    assert!(result.contains("Only up to 63 tables can be joined"));
+}

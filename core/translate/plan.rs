@@ -583,6 +583,11 @@ pub struct TableReferences {
 }
 
 impl TableReferences {
+    /// The maximum number of tables that can be joined together in a query.
+    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
+    /// which can represent up to 128 tables.
+    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
+    pub const MAX_JOINED_TABLES: usize = 63;
     pub fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
