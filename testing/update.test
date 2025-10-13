@@ -386,3 +386,13 @@ do_execsql_test_on_specific_db {:memory:} can-update-rowid-directly {
     UPDATE test SET rowid = 5;
 	SELECT rowid, name from test;
 } {5|test}
+
+# https://github.com/tursodatabase/turso/issues/3648
+do_execsql_test_in_memory_any_error fk-parent-update-error {
+    PRAGMA foreign_keys = true;
+    CREATE TABLE t(a UNIQUE);
+    CREATE TABLE s(a, FOREIGN KEY(a) REFERENCES t(a));
+    INSERT INTO t VALUES (1);
+    INSERT INTO s VALUES (1);
+    UPDATE t SET a = a + 1;
+}
