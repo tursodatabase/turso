@@ -179,6 +179,12 @@ impl CompletionGroup {
         self.completions.push(completion.clone());
     }
 
+    pub fn cancel(&self) {
+        for c in &self.completions {
+            c.abort();
+        }
+    }
+
     pub fn build(self) -> Completion {
         let total = self.completions.len();
         if total == 0 {
