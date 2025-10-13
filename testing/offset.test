@@ -64,3 +64,52 @@ do_execsql_test_on_specific_db {:memory:} select-ungrouped-aggregate-with-offset
     INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
     SELECT COUNT(a) FROM t LIMIT 1 OFFSET 1;
 } {}
+
+
+do_execsql_test_on_specific_db {:memory:} offset-expr-can-be-cast-losslessly-1 {
+  SELECT 1 LIMIT 3 OFFSET 1.1 + 2.9;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} offset-expr-can-be-cast-losslessly-2 {
+  CREATE TABLE T(a);
+  INSERT INTO T VALUES (1),(2),(3),(4);
+  SELECT * FROM T LIMIT 1+'2' OFFSET 1.6/2 + 3.6/3 + 4*0.25;
+} {4}
+
+# Strings are cast to float. Final result is integer losslessly
+do_execsql_test_on_specific_db {:memory:} offset-expr-can-be-cast-losslessly-3 {
+  CREATE TABLE T(a);
+  INSERT INTO T VALUES (1),(2),(3),(4);
+  SELECT * FROM T LIMIT 3 OFFSET '0.8' + '1.2' + '4'*'0.25';
+} {4}
+
+# Strings are cast to 0. Expression still valid.
+do_execsql_test_on_specific_db {:memory:} offset-expr-int-and-string {
+  SELECT 1 LIMIT 3 OFFSET 3/3 + 'test' + 4*'test are best';
+} {}
+
+do_execsql_test_in_memory_error_content offset-expr-cannot-be-cast-losslessly-1 {
+  SELECT 1 LIMIT 3 OFFSET 1.1;
+} {"the value in register cannot be cast to integer"}
+
+do_execsql_test_in_memory_error_content offset-expr-cannot-be-cast-losslessly-2 {
+  SELECT 1 LIMIT 3 OFFSET 1.1 + 2.2 + 1.9/8;
+} {"the value in register cannot be cast to integer"}
+
+# Return error as float in expression cannot be cast losslessly
+do_execsql_test_in_memory_error_content offset-expr-cannot-be-cast-losslessly-3 {
+  SELECT 1 LIMIT 3 OFFSET 1.1 + 'a';
+} {"the value in register cannot be cast to integer"}
+
+do_execsql_test_in_memory_error_content offset-expr-invalid-data-type-1 {
+  SELECT 1 LIMIT 3 OFFSET 'a';
+} {"the value in register cannot be cast to integer"}
+
+do_execsql_test_in_memory_error_content offset-expr-invalid-data-type-2 {
+  SELECT 1 LIMIT 3 OFFSET NULL;
+} {"the value in register cannot be cast to integer"}
+
+# Expression below evaluates to NULL (string → 0)
+do_execsql_test_in_memory_error_content offset-expr-invalid-data-type-3 {
+  SELECT 1 LIMIT 3 OFFSET 1/'iwillbezero ;-; ';
+} {"the value in register cannot be cast to integer"}
