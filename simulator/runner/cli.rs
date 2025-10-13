@@ -149,6 +149,11 @@ pub struct SimulatorCLI {
     pub keep_files: bool,
     #[clap(
         long,
+        help = "Disable the SQLite integrity check at the end of a simulation"
+    )]
+    pub disable_integrity_check: bool,
+    #[clap(
+        long,
         help = "Use memory IO for complex simulations",
         default_value_t = false
     )]

@@ -315,6 +315,7 @@ impl SimulatorEnv {
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
+            disable_integrity_check: cli_opts.disable_integrity_check,
         };
 
         // Remove existing database file if it exists
@@ -575,6 +576,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
+    pub(crate) disable_integrity_check: bool,
 
     pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,
