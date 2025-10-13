@@ -1258,3 +1258,127 @@ pub struct WindowFunction {
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_chacha::{
+        rand_core::{RngCore, SeedableRng},
+        ChaCha8Rng,
+    };
+
+    #[test]
+    fn test_column_used_mask_empty() {
+        let mask = ColumnUsedMask::default();
+        assert!(mask.is_empty());
+
+        let mut mask2 = ColumnUsedMask::default();
+        mask2.set(0);
+        assert!(!mask2.is_empty());
+    }
+
+    #[test]
+    fn test_column_used_mask_set_and_get() {
+        let mut mask = ColumnUsedMask::default();
+
+        let max_columns = 10000;
+        let mut set_indices = Vec::new();
+        let mut rng = ChaCha8Rng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+
+        for i in 0..max_columns {
+            if rng.next_u32() % 3 == 0 {
+                set_indices.push(i);
+                mask.set(i);
+            }
+        }
+
+        // Verify set bits are present
+        for &i in &set_indices {
+            assert!(mask.get(i), "Expected bit {i} to be set");
+        }
+
+        // Verify unset bits are not present
+        for i in 0..max_columns {
+            if !set_indices.contains(&i) {
+                assert!(!mask.get(i), "Expected bit {i} to not be set");
+            }
+        }
+    }
+
+    #[test]
+    fn test_column_used_mask_subset_relationship() {
+        let mut full_mask = ColumnUsedMask::default();
+        let mut subset_mask = ColumnUsedMask::default();
+
+        let max_columns = 5000;
+        let mut rng = ChaCha8Rng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+
+        // Create a pattern where subset has fewer bits
+        for i in 0..max_columns {
+            if rng.next_u32() % 5 == 0 {
+                full_mask.set(i);
+                if i % 2 == 0 {
+                    subset_mask.set(i);
+                }
+            }
+        }
+
+        // full_mask contains all bits of subset_mask
+        assert!(full_mask.contains_all_set_bits_of(&subset_mask));
+
+        // subset_mask does not contain all bits of full_mask
+        assert!(!subset_mask.contains_all_set_bits_of(&full_mask));
+
+        // A mask contains itself
+        assert!(full_mask.contains_all_set_bits_of(&full_mask));
+        assert!(subset_mask.contains_all_set_bits_of(&subset_mask));
+    }
+
+    #[test]
+    fn test_column_used_mask_empty_subset() {
+        let mut mask = ColumnUsedMask::default();
+        for i in (0..1000).step_by(7) {
+            mask.set(i);
+        }
+
+        let empty_mask = ColumnUsedMask::default();
+
+        // Empty mask is subset of everything
+        assert!(mask.contains_all_set_bits_of(&empty_mask));
+        assert!(empty_mask.contains_all_set_bits_of(&empty_mask));
+    }
+
+    #[test]
+    fn test_column_used_mask_sparse_indices() {
+        let mut sparse_mask = ColumnUsedMask::default();
+
+        // Test with very sparse, large indices
+        let sparse_indices = vec![0, 137, 1042, 5389, 10000, 50000, 100000, 500000, 1000000];
+
+        for &idx in &sparse_indices {
+            sparse_mask.set(idx);
+        }
+
+        for &idx in &sparse_indices {
+            assert!(sparse_mask.get(idx), "Expected bit {idx} to be set");
+        }
+
+        // Check some indices that shouldn't be set
+        let unset_indices = vec![1, 100, 1000, 5000, 25000, 75000, 250000, 750000];
+        for &idx in &unset_indices {
+            assert!(!sparse_mask.get(idx), "Expected bit {idx} to not be set");
+        }
+
+        assert!(!sparse_mask.is_empty());
+    }
+}

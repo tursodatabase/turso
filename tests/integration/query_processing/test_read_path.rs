@@ -906,7 +906,8 @@ fn test_max_joined_tables_limit() {
 
     // Create 64 tables
     for i in 0..64 {
-        conn.execute(&format!("CREATE TABLE t{} (id INTEGER)", i)).unwrap();
+        conn.execute(&format!("CREATE TABLE t{} (id INTEGER)", i))
+            .unwrap();
     }
 
     // Try to join 64 tables - should fail
