@@ -396,7 +396,7 @@ ROLLBACK [ TRANSACTION ]
 SELECT expression
     [ FROM table-or-subquery ]
     [ WHERE condition ]
-    [ GROU BY expression ]
+    [ GROUP BY expression ]
 ```
 
 **Example:**
