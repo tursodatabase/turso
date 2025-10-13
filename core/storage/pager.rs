@@ -1633,9 +1633,6 @@ impl Pager {
                                     IOCompletions::Single(c) => {
                                         commit_info.completions.push(c);
                                     }
-                                    IOCompletions::Many(c) => {
-                                        commit_info.completions.extend(c);
-                                    }
                                 }
                                 let mut group = CompletionGroup::new(|_| {});
                                 for c in commit_info.completions.drain(..) {
