@@ -563,10 +563,24 @@ impl Shadow for AlterTable {
             AlterTableType::AlterColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 *col = new.clone();
+                table.indexes.iter_mut().for_each(|index| {
+                    index.columns.iter_mut().for_each(|(col_name, _)| {
+                        if col_name == old {
+                            *col_name = new.name.clone();
+                        }
+                    });
+                });
             }
             AlterTableType::RenameColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name = new.clone();
+                table.indexes.iter_mut().for_each(|index| {
+                    index.columns.iter_mut().for_each(|(col_name, _)| {
+                        if col_name == old {
+                            *col_name = new.clone();
+                        }
+                    });
+                });
             }
             AlterTableType::DropColumn { column_name } => {
                 let col_idx = table
