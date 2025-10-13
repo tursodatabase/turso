@@ -12,3 +12,45 @@ do_execsql_test vector-functions-valid {
   {[1,2,3]} 
   {[-1000000000000000000]} 
 }
+
+do_execsql_test_on_specific_db {:memory:} vector-insert {
+    CREATE TABLE IF NOT EXISTS vector_test (
+			id INTEGER PRIMARY KEY,
+			format TEXT NOT NULL,
+			vec_data F32_BLOB(3) -- 3-dimensional vector
+		);
+    INSERT INTO vector_test (id, format, vec_data)
+		VALUES (2, 'Bracketed_comma_separated', vector('[4.000000,5.000000,6.000000]'));
+    SELECT id, format, vector_extract(vec_data) from vector_test;
+} {2|Bracketed_comma_separated|[4,5,6]}
+
+do_execsql_test_on_specific_db {:memory:} vector-insert {
+    CREATE TABLE IF NOT EXISTS vector_test (
+			id INTEGER PRIMARY KEY,
+			format TEXT NOT NULL,
+			vec_data F32_BLOB(3) -- 3-dimensional vector
+		);
+    INSERT INTO vector_test (id, format, vec_data)
+		VALUES (2, 'Bracketed_comma_separated', vector('[4.000000,5.000000,6.000000]'));
+    SELECT id, format, vector_extract(vec_data) from vector_test;
+} {2|Bracketed_comma_separated|[4,5,6]}
+
+do_execsql_test_in_memory_error vector-insert-no-quotes {
+  CREATE TABLE IF NOT EXISTS vector_test (
+			id INTEGER PRIMARY KEY,
+			format TEXT NOT NULL,
+			vec_data F32_BLOB(3) -- 3-dimensional vector
+		);
+    INSERT INTO vector_test (id, format, vec_data)
+		VALUES (2, 'Bracketed_comma_separated', vector([4.000000,5.000000,6.000000]));
+} {  × Parse error: no such column: [4.000000,5.000000,6.000000]}
+
+do_execsql_test_in_memory_error_content vector-insert-double-quotes {
+  CREATE TABLE IF NOT EXISTS vector_test (
+			id INTEGER PRIMARY KEY,
+			format TEXT NOT NULL,
+			vec_data F32_BLOB(3) -- 3-dimensional vector
+		);
+    INSERT INTO vector_test (id, format, vec_data)
+		VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
+} {no such column: [4.000000,5.000000,6.000000]}
