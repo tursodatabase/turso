@@ -1,8 +1,10 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
-use crate::types::{IOResult, SeekKey, SeekOp, SeekResult};
+use crate::storage::btree::{BTreeKey, CursorTrait};
+use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::Result;
 use crate::{Pager, Value};
+use std::cell::{Ref, RefCell};
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -19,12 +21,14 @@ enum CursorPosition {
 #[derive(Debug)]
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
-    current_pos: CursorPosition,
+    current_pos: RefCell<CursorPosition>,
     pub table_id: MVTableId,
     tx_id: u64,
+    /// Reusable immutable record, used to allow better allocation strategy.
+    reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
 }
 
-impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
+impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     pub fn new(
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
@@ -36,55 +40,15 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         let cursor = Self {
             db,
             tx_id,
-            current_pos: CursorPosition::BeforeFirst,
+            current_pos: RefCell::new(CursorPosition::BeforeFirst),
             table_id,
+            reusable_immutable_record: RefCell::new(None),
         };
         Ok(cursor)
     }
 
-    /// Insert a row into the table.
-    /// Sets the cursor to the inserted row.
-    pub fn insert(&mut self, row: Row) -> Result<()> {
-        self.current_pos = CursorPosition::Loaded(row.id);
-        if self.db.read(self.tx_id, row.id)?.is_some() {
-            self.db.update(self.tx_id, row).inspect_err(|_| {
-                self.current_pos = CursorPosition::BeforeFirst;
-            })?;
-        } else {
-            self.db.insert(self.tx_id, row).inspect_err(|_| {
-                self.current_pos = CursorPosition::BeforeFirst;
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn delete(&mut self, rowid: RowID) -> Result<()> {
-        self.db.delete(self.tx_id, rowid)?;
-        Ok(())
-    }
-
-    pub fn current_row_id(&mut self) -> Option<RowID> {
-        match self.current_pos {
-            CursorPosition::Loaded(id) => Some(id),
-            CursorPosition::BeforeFirst => {
-                // If we are before first, we need to try and find the first row.
-                let maybe_rowid =
-                    self.db
-                        .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id);
-                if let Some(id) = maybe_rowid {
-                    self.current_pos = CursorPosition::Loaded(id);
-                    Some(id)
-                } else {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                    None
-                }
-            }
-            CursorPosition::End => None,
-        }
-    }
-
-    pub fn current_row(&mut self) -> Result<Option<Row>> {
-        match self.current_pos {
+    pub fn current_row(&self) -> Result<Option<Row>> {
+        match *self.current_pos.borrow() {
             CursorPosition::Loaded(id) => self.db.read(self.tx_id, id),
             CursorPosition::BeforeFirst => {
                 // If we are before first, we need to try and find the first row.
@@ -92,7 +56,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
                     self.db
                         .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id);
                 if let Some(id) = maybe_rowid {
-                    self.current_pos = CursorPosition::Loaded(id);
+                    self.current_pos.replace(CursorPosition::Loaded(id));
                     self.db.read(self.tx_id, id)
                 } else {
                     Ok(None)
@@ -106,19 +70,57 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         Ok(())
     }
 
+    pub fn get_next_rowid(&mut self) -> i64 {
+        let _ = self.last();
+        match *self.current_pos.borrow() {
+            CursorPosition::Loaded(id) => id.row_id + 1,
+            CursorPosition::BeforeFirst => 1,
+            CursorPosition::End => i64::MAX,
+        }
+    }
+
+    fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
+        let mut reusable_immutable_record = self.reusable_immutable_record.borrow_mut();
+        if reusable_immutable_record.is_none() {
+            let record = ImmutableRecord::new(1024);
+            reusable_immutable_record.replace(record);
+        }
+        reusable_immutable_record
+    }
+
+    fn get_current_pos(&self) -> CursorPosition {
+        *self.current_pos.borrow()
+    }
+}
+
+impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
+    fn last(&mut self) -> Result<IOResult<()>> {
+        let last_rowid = self.db.get_last_rowid(self.table_id);
+        if let Some(last_rowid) = last_rowid {
+            self.current_pos.replace(CursorPosition::Loaded(RowID {
+                table_id: self.table_id,
+                row_id: last_rowid,
+            }));
+        } else {
+            self.current_pos.replace(CursorPosition::BeforeFirst);
+        }
+        Ok(IOResult::Done(()))
+    }
+
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
-    pub fn forward(&mut self) -> bool {
-        let before_first = matches!(self.current_pos, CursorPosition::BeforeFirst);
-        let min_id = match self.current_pos {
+    fn next(&mut self) -> Result<IOResult<bool>> {
+        let before_first = matches!(self.get_current_pos(), CursorPosition::BeforeFirst);
+        let min_id = match *self.current_pos.borrow() {
             CursorPosition::Loaded(id) => id.row_id + 1,
             // TODO: do we need to forward twice?
             CursorPosition::BeforeFirst => i64::MIN, // we need to find first row, so we look from the first id,
             CursorPosition::End => {
                 // let's keep same state, we reached the end so no point in moving forward.
-                return false;
+                return Ok(IOResult::Done(false));
             }
         };
-        self.current_pos =
+
+        let new_position =
             match self
                 .db
                 .get_next_row_id_for_table(self.table_id, min_id, self.tx_id)
@@ -134,46 +136,59 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
                     }
                 }
             };
-        matches!(self.current_pos, CursorPosition::Loaded(_))
+        self.current_pos.replace(new_position);
+
+        Ok(IOResult::Done(matches!(
+            self.get_current_pos(),
+            CursorPosition::Loaded(_)
+        )))
     }
 
-    /// Returns true if the is not pointing to any row.
-    pub fn is_empty(&self) -> bool {
-        // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
-        // If we have loaded a row, it means there is something in the table.
-        match self.current_pos {
-            CursorPosition::Loaded(_) => false,
-            CursorPosition::BeforeFirst => true,
-            CursorPosition::End => true,
+    fn prev(&mut self) -> Result<IOResult<bool>> {
+        todo!()
+    }
+
+    fn rowid(&self) -> Result<IOResult<Option<i64>>> {
+        let rowid = match self.get_current_pos() {
+            CursorPosition::Loaded(id) => Some(id.row_id),
+            CursorPosition::BeforeFirst => {
+                // If we are before first, we need to try and find the first row.
+                let maybe_rowid =
+                    self.db
+                        .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id);
+                if let Some(id) = maybe_rowid {
+                    self.current_pos.replace(CursorPosition::Loaded(id));
+                    Some(id.row_id)
+                } else {
+                    self.current_pos.replace(CursorPosition::BeforeFirst);
+                    None
+                }
+            }
+            CursorPosition::End => None,
+        };
+        Ok(IOResult::Done(rowid))
+    }
+
+    fn record(
+        &self,
+    ) -> Result<IOResult<Option<std::cell::Ref<'_, crate::types::ImmutableRecord>>>> {
+        let Some(row) = self.current_row()? else {
+            return Ok(IOResult::Done(None));
+        };
+
+        {
+            let mut record = self.get_immutable_record_or_create();
+            let record = record.as_mut().unwrap();
+            record.invalidate();
+            record.start_serialization(&row.data);
         }
+
+        let record_ref =
+            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref()).unwrap();
+        Ok(IOResult::Done(Some(record_ref)))
     }
 
-    pub fn rewind(&mut self) {
-        self.current_pos = CursorPosition::BeforeFirst;
-    }
-
-    pub fn last(&mut self) {
-        let last_rowid = self.db.get_last_rowid(self.table_id);
-        if let Some(last_rowid) = last_rowid {
-            self.current_pos = CursorPosition::Loaded(RowID {
-                table_id: self.table_id,
-                row_id: last_rowid,
-            });
-        } else {
-            self.current_pos = CursorPosition::BeforeFirst;
-        }
-    }
-
-    pub fn get_next_rowid(&mut self) -> i64 {
-        self.last();
-        match self.current_pos {
-            CursorPosition::Loaded(id) => id.row_id + 1,
-            CursorPosition::BeforeFirst => 1,
-            CursorPosition::End => i64::MAX,
-        }
-    }
-
-    pub fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
+    fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
         let row_id = match seek_key {
             SeekKey::TableRowId(row_id) => row_id,
             SeekKey::IndexKey(_) => {
@@ -196,7 +211,7 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         };
         let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
         if let Some(rowid) = rowid {
-            self.current_pos = CursorPosition::Loaded(rowid);
+            self.current_pos.replace(CursorPosition::Loaded(rowid));
             if op.eq_only() {
                 if rowid.row_id == row_id {
                     Ok(IOResult::Done(SeekResult::Found))
@@ -209,15 +224,59 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
         } else {
             let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
             if forwards {
-                self.last();
+                let _ = self.last()?;
             } else {
-                self.rewind();
+                let _ = self.rewind()?;
             }
             Ok(IOResult::Done(SeekResult::NotFound))
         }
     }
 
-    pub fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
+    /// Insert a row into the table.
+    /// Sets the cursor to the inserted row.
+    fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+        let Some(rowid) = key.maybe_rowid() else {
+            todo!()
+        };
+        let row_id = RowID::new(self.table_id, rowid);
+        let record_buf = key.get_record().unwrap().get_payload().to_vec();
+        let num_columns = match key {
+            BTreeKey::IndexKey(record) => record.column_count(),
+            BTreeKey::TableRowId((_, record)) => record.as_ref().unwrap().column_count(),
+        };
+        let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
+
+        self.current_pos.replace(CursorPosition::Loaded(row.id));
+        if self.db.read(self.tx_id, row.id)?.is_some() {
+            self.db.update(self.tx_id, row).inspect_err(|_| {
+                self.current_pos.replace(CursorPosition::BeforeFirst);
+            })?;
+        } else {
+            self.db.insert(self.tx_id, row).inspect_err(|_| {
+                self.current_pos.replace(CursorPosition::BeforeFirst);
+            })?;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    fn delete(&mut self) -> Result<IOResult<()>> {
+        let IOResult::Done(Some(rowid)) = self.rowid()? else {
+            todo!();
+        };
+        let rowid = RowID::new(self.table_id, rowid);
+        self.db.delete(self.tx_id, rowid)?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn set_null_flag(&mut self, _flag: bool) {
+        todo!()
+    }
+
+    fn get_null_flag(&self) -> bool {
+        todo!()
+    }
+
+    fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
         let int_key = match key {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
@@ -234,11 +293,90 @@ impl<Clock: LogicalClock> MvccLazyCursor<Clock> {
             )
             .is_some();
         if exists {
-            self.current_pos = CursorPosition::Loaded(RowID {
+            self.current_pos.replace(CursorPosition::Loaded(RowID {
                 table_id: self.table_id,
                 row_id: *int_key,
-            });
+            }));
         }
         Ok(IOResult::Done(exists))
+    }
+
+    fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
+        todo!()
+    }
+
+    fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
+        todo!()
+    }
+
+    fn count(&mut self) -> Result<IOResult<usize>> {
+        todo!()
+    }
+
+    /// Returns true if the is not pointing to any row.
+    fn is_empty(&self) -> bool {
+        // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
+        // If we have loaded a row, it means there is something in the table.
+        match self.get_current_pos() {
+            CursorPosition::Loaded(_) => false,
+            CursorPosition::BeforeFirst => true,
+            CursorPosition::End => true,
+        }
+    }
+
+    fn root_page(&self) -> i64 {
+        self.table_id.into()
+    }
+
+    fn rewind(&mut self) -> Result<IOResult<()>> {
+        self.current_pos.replace(CursorPosition::BeforeFirst);
+        Ok(IOResult::Done(()))
+    }
+
+    fn has_record(&self) -> bool {
+        todo!()
+    }
+
+    fn set_has_record(&self, _has_record: bool) {
+        todo!()
+    }
+
+    fn get_index_info(&self) -> &crate::types::IndexInfo {
+        todo!()
+    }
+
+    fn seek_end(&mut self) -> Result<IOResult<()>> {
+        todo!()
+    }
+
+    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
+        todo!()
+    }
+
+    fn invalidate_record(&mut self) {
+        self.get_immutable_record_or_create()
+            .as_mut()
+            .unwrap()
+            .invalidate();
+    }
+
+    fn has_rowid(&self) -> bool {
+        todo!()
+    }
+
+    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, crate::types::RecordCursor> {
+        todo!()
+    }
+
+    fn get_pager(&self) -> Arc<Pager> {
+        todo!()
+    }
+
+    fn get_skip_advance(&self) -> bool {
+        todo!()
+    }
+
+    fn get_mvcc_cursor(&self) -> Arc<parking_lot::RwLock<crate::MvCursor>> {
+        todo!()
     }
 }
