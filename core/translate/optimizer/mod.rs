@@ -187,6 +187,12 @@ fn optimize_table_access(
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
+        crate::bail_parse_error!(
+            "Only up to {} tables can be joined",
+            TableReferences::MAX_JOINED_TABLES
+        );
+    }
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
     let constraints_per_table =
