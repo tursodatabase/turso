@@ -2142,6 +2142,11 @@ pub fn translate_expr(
         }
         ast::Expr::Raise(_, _) => todo!(),
         ast::Expr::Subquery(_) => todo!(),
+        ast::Expr::Trigger {
+            table: _,
+            column: _,
+            view: _,
+        } => todo!(),
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)
@@ -2885,6 +2890,12 @@ where
                 | ast::Expr::Variable(_) => {
                     // No nested expressions
                 }
+
+                ast::Expr::Trigger {
+                    table: _,
+                    column: _,
+                    view: _,
+                } => {}
             }
         }
         WalkControl::SkipChildren => return Ok(WalkControl::Continue),
@@ -3081,6 +3092,11 @@ where
         | ast::Expr::Variable(_) => {
             // No nested expressions
         }
+        ast::Expr::Trigger {
+            table: _,
+            column: _,
+            view: _,
+        } => {}
     }
 
     Ok(())

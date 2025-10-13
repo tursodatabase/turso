@@ -219,6 +219,15 @@ pub fn bind_column_references(
                 let normalized_table_name = normalize_ident(tbl.as_str());
                 let matching_tbl = referenced_tables
                     .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                // TODO: special handling of OLD and NEW identifier for triggers
+                //if tbl.as_str().eq_ignore_ascii_case("new") {
+                //    *expr = Expr::Trigger();
+                //    return Ok(());
+                //}
+                //if tbl.as_str().eq_ignore_ascii_case("old") {
+                //    *expr = Expr::Trigger();
+                //    return Ok(());
+                //}
                 if matching_tbl.is_none() {
                     crate::bail_parse_error!("no such table: {}", normalized_table_name);
                 }

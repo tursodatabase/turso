@@ -556,6 +556,11 @@ impl Optimizable for ast::Expr {
             }
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
+            Expr::Trigger {
+                table: _,
+                view: _,
+                column: _,
+            } => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
         }
@@ -640,6 +645,11 @@ impl Optimizable for ast::Expr {
             }
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
+            Expr::Trigger {
+                table: _,
+                column: _,
+                view: _,
+            } => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => false,
         }

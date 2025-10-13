@@ -11,6 +11,7 @@ use crate::schema::Schema;
 use crate::schema::Table;
 use crate::schema::Type;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::translate_insert;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
@@ -23,6 +24,8 @@ use crate::SymbolTable;
 use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
+use turso_sqlite3_parser::ast::QualifiedName;
+use turso_sqlite3_parser::ast::SelectBody;
 use turso_sqlite3_parser::ast::{fmt::ToTokens, CreateVirtualTable};
 
 pub fn translate_create_table(
@@ -518,8 +521,104 @@ fn create_vtable_body_to_str(vtab: &CreateVirtualTable, module: Rc<VTabImpl>) ->
     )
 }
 
-pub fn translate_create_trigger() -> Result<ProgramBuilder> {
-    unimplemented!();
+pub fn translate_create_trigger(
+    trigger: Box<ast::CreateTrigger>,
+    program: ProgramBuilder,
+    schema: &Schema,
+    syms: &SymbolTable,
+    connection: &Arc<crate::Connection>,
+) -> Result<ProgramBuilder> {
+    dbg!(&trigger);
+    let program = translate_insert(
+        schema,
+        None,
+        None,
+        QualifiedName {
+            db_name: None,
+            name: ast::Name::Quoted("sqlite_master".to_string()),
+            alias: None,
+        },
+        None, // columns
+        ast::InsertBody::Select(
+            Box::new(ast::Select {
+                with: None,
+                order_by: None,
+                limit: None,
+                body: SelectBody {
+                    select: Box::new(ast::OneSelect::Values(vec![vec![
+                        ast::Expr::Literal(ast::Literal::String("'trigger'".to_string())),
+                        ast::Expr::Literal(ast::Literal::String(format!(
+                            "'{}'",
+                            trigger.trigger_name
+                        ))),
+                        ast::Expr::Literal(ast::Literal::String(format!("'{}'", trigger.tbl_name))),
+                        ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+                        ast::Expr::Literal(ast::Literal::String(format!("'{}'", trigger))),
+                    ]])),
+                    compounds: None,
+                },
+            }),
+            None,
+        ), //body
+        None, // returning
+        syms, // syms
+        program,
+        connection,
+    )?;
+
+    //schema.add_trigger(
+    //    &trigger.trigger_name.to_string(),
+    //    &trigger.tbl_name.to_string(),
+    //    &trigger.commands,
+    //);
+    //let sqlite_schema = schema
+    //    .get_btree_table(SQLITE_TABLEID)
+    //    .expect("sqlite_schema should be on schema");
+    //let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+    //program.emit_insn(Insn::OpenWrite {
+    //    cursor_id,
+    //    root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+    //    db: 0,
+    //});
+    //#[allow(unused_variables)]
+    //let trigger_string = program.emit_string8_new_reg("trigger".to_string());
+    //#[allow(unused_variables)]
+    //let trigger_reg = program.emit_string8_new_reg(trigger.trigger_name.to_string());
+    //#[allow(unused_variables)]
+    //let table_name_string = program.emit_string8_new_reg(trigger.tbl_name.to_string());
+    //let integer_reg = program.alloc_register();
+    //program.emit_int(1, integer_reg);
+    //let sql_string = format!("{}", trigger);
+    //#[allow(unused_variables)]
+    //let sql_stmt_reg = program.emit_string8_new_reg(sql_string);
+    //let rowid_reg = program.alloc_register();
+    //program.emit_insn(Insn::NewRowid {
+    //    cursor: cursor_id,
+    //    rowid_reg,
+    //    prev_largest_reg: 0,
+    //});
+    //let record_reg = program.alloc_register();
+    //program.emit_insn(Insn::MakeRecord {
+    //    start_reg: trigger_string,
+    //    count: 5,
+    //    dest_reg: record_reg,
+    //    index_name: None,
+    //});
+    //program.emit_insn(Insn::Insert {
+    //    cursor: cursor_id,
+    //    key_reg: rowid_reg,
+    //    record_reg,
+    //    flag: InsertFlags::new().require_seek(),
+    //    table_name: "".to_string(),
+    //});
+    //program.emit_insn(Insn::SetCookie {
+    //    db: 0,
+    //    cookie: Cookie::SchemaVersion,
+    //});
+    //program.emit_insn(Insn::ParseSchema {});
+    //program.epilogue(super::emitter::TransactionMode::Write);
+
+    Ok(program)
 }
 
 pub fn translate_create_virtual_table(

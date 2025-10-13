@@ -640,6 +640,44 @@ impl ToTokens for Stmt {
             }
         }
     }
+
+    /// Send token(s) to the specified stream
+    fn to_tokens<S: TokenStream + ?Sized>(&self, s: &mut S) -> Result<(), S::Error> {
+        self.to_tokens_with_context(s, &BlankContext)
+    }
+
+    /// Format AST node
+    fn to_fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.to_fmt_with_context(f, &BlankContext)
+    }
+
+    /// Format AST node with context
+    fn to_fmt_with_context<C: ToSqlContext>(
+        &self,
+        f: &mut Formatter<'_>,
+        context: &C,
+    ) -> fmt::Result {
+        let mut s = FmtTokenStream { f, spaced: true };
+        self.to_tokens_with_context(&mut s, context)
+    }
+
+    /// Format AST node to string
+    fn format(&self) -> Result<String, fmt::Error> {
+        self.format_with_context(&BlankContext)
+    }
+
+    /// Format AST node to string with context
+    fn format_with_context<C: ToSqlContext>(&self, context: &C) -> Result<String, fmt::Error> {
+        let mut s = String::new();
+        let mut w = WriteTokenStream {
+            write: &mut s,
+            spaced: true,
+        };
+
+        self.to_tokens_with_context(&mut w, context)?;
+
+        Ok(s)
+    }
 }
 
 impl ToTokens for Expr {
@@ -856,6 +894,7 @@ impl ToTokens for Expr {
                 query.to_tokens_with_context(s, context)?;
                 s.append(TK_RP, None)
             }
+            Self::Trigger { .. } => Ok(()),
             Self::Unary(op, sub_expr) => {
                 op.to_tokens_with_context(s, context)?;
                 sub_expr.to_tokens_with_context(s, context)

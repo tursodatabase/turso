@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use fallible_iterator::FallibleIterator;
 use turso_sqlite3_parser::ast::{
-    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
+    Cmd, DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn,
+    Select, TriggerCmd, TriggerCmdDelete, TriggerCmdInsert, TriggerCmdUpdate, With,
 };
 
 use crate::error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY};
-use crate::schema::{self, IndexColumn, Table};
+use crate::schema::{self, IndexColumn, Table, Trigger};
 use crate::translate::emitter::{emit_cdc_insns, emit_cdc_patch_record, OperationMode};
 use crate::translate::expr::{
     emit_returning_results, process_returning_clause, ReturningValueRegisters,
@@ -14,6 +16,7 @@ use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
+use crate::vdbe::builder::QueryMode;
 use crate::vdbe::insn::{IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
@@ -37,6 +40,81 @@ struct TempTableCtx {
     loop_end_label: BranchOffset,
 }
 
+fn translate_trigger_body(
+    commands: &Vec<TriggerCmd>,
+    schema: &Schema,
+    connection: &Arc<crate::Connection>,
+    syms: &SymbolTable,
+) -> Result<ProgramBuilder> {
+    let mut program = ProgramBuilder::new(
+        QueryMode::Normal,
+        connection.get_capture_data_changes().clone(),
+        ProgramBuilderOpts {
+            num_cursors: 1,
+            approx_num_insns: 2,
+            approx_num_labels: 2,
+        },
+    );
+    program.prologue();
+    assert!(commands.len() == 1);
+    let t = commands[0].clone();
+    let mut program = match t {
+        crate::ast::TriggerCmd::Update(update) => {
+            translate_trigger_update(&update, schema, connection, syms)?
+        }
+        crate::ast::TriggerCmd::Insert(insert) => {
+            translate_trigger_insert(&insert, schema, connection, syms)?
+        }
+        crate::ast::TriggerCmd::Delete(delete) => {
+            translate_trigger_delete(&delete, schema, connection, syms)?
+        }
+        crate::ast::TriggerCmd::Select(select) => {
+            let translated_select = translate_select(
+                schema,
+                select.as_ref().clone(),
+                syms,
+                program,
+                QueryDestination::ResultRows,
+                connection,
+            )?;
+            translated_select.program
+        }
+    };
+    program.epilogue(super::emitter::TransactionMode::Write);
+    Ok(program)
+}
+
+pub fn translate_trigger_update(
+    update: &TriggerCmdUpdate,
+    schema: &Schema,
+    connection: &Arc<crate::Connection>,
+    syms: &SymbolTable,
+) -> Result<ProgramBuilder> {
+    unimplemented!()
+}
+
+pub fn translate_trigger_insert(
+    insert: &TriggerCmdInsert,
+    schema: &Schema,
+    connection: &Arc<crate::Connection>,
+    syms: &SymbolTable,
+) -> Result<ProgramBuilder> {
+    unimplemented!();
+}
+
+pub fn translate_trigger_delete(
+    delete: &TriggerCmdDelete,
+    schema: &Schema,
+    connection: &Arc<crate::Connection>,
+    syms: &SymbolTable,
+) -> Result<ProgramBuilder> {
+    unimplemented!();
+}
+
+pub fn translate_trigger_select(select: &Select) -> Result<ProgramBuilder> {
+    unimplemented!();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
     schema: &Schema,
@@ -50,6 +128,32 @@ pub fn translate_insert(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
+    let triggers: Vec<Arc<Trigger>> = schema
+        .triggers
+        .iter()
+        .filter_map(|(_, trigger)| {
+            if trigger.table_name == tbl_name.to_string() {
+                return Some(trigger.clone());
+            }
+            None
+        })
+        .collect();
+
+    if triggers.len() > 0 {
+        // crate::bail_parse_error!("INSERT trigger is not supported");
+
+        for trigger in triggers {
+            // TODO: Execute each trigger
+            // 1. First parse the sql string into a statement
+            // 2. Create a new vdbe program that will contain the translated statement
+            // 3. Generate OP_Program and other necessary instructions in the current
+            //    ProgramBuilder with the subprogram as the argument
+            // 4. Cache this subprogram inside the trigger
+            dbg!(&trigger);
+            unimplemented!();
+        }
+    }
+
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 30,

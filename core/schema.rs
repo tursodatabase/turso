@@ -14,7 +14,9 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::trace;
-use turso_sqlite3_parser::ast::{self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions};
+use turso_sqlite3_parser::ast::{
+    self, ColumnDefinition, Expr, Literal, SortOrder, TableOptions, TriggerCmd,
+};
 use turso_sqlite3_parser::{
     ast::{Cmd, CreateTableBody, QualifiedName, ResultColumn, Stmt},
     lexer::sql::Parser,
@@ -28,6 +30,7 @@ pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, Vec<Arc<Index>>>,
+    pub triggers: HashMap<String, Arc<Trigger>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
@@ -52,6 +55,7 @@ impl Schema {
         Self {
             tables,
             indexes,
+            triggers: HashMap::new(),
             has_indexes,
             indexes_enabled,
             schema_version: 0,
@@ -271,6 +275,19 @@ impl Schema {
                         }
                     }
                 }
+                "trigger" => {
+                    let name = record_cursor.get_value(&row, 1)?;
+                    let table_name = record_cursor.get_value(&row, 2)?;
+                    let sql = record_cursor.get_value(&row, 4)?;
+                    let RefValue::Text(table_name) = table_name else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let RefValue::Text(sql) = sql else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let trigger = Trigger::from_sql(&sql.to_string(), &table_name.to_string())?;
+                    self.triggers.insert(name.to_string(), Arc::new(trigger));
+                }
                 _ => {}
             };
             drop(record_cursor);
@@ -360,6 +377,7 @@ impl Clone for Schema {
         Self {
             tables,
             indexes,
+            triggers: self.triggers.clone(),
             has_indexes: self.has_indexes.clone(),
             indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
@@ -432,6 +450,46 @@ impl PartialEq for Table {
             (Self::Virtual(a), Self::Virtual(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Trigger {
+    pub name: String,
+    pub table_name: String,
+    pub cmds: Vec<TriggerCmd>,
+    pub sql: String,
+}
+
+impl Trigger {
+    fn from_sql(sql: &str, table_name: &str) -> Result<Self> {
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next()?;
+        match cmd {
+            Some(cmd) => match cmd {
+                Cmd::Stmt(stmt) => match stmt {
+                    Stmt::CreateTrigger(create_trigger) => {
+                        let mut trigger = Self {
+                            name: create_trigger.trigger_name.name.as_str().to_string(),
+                            table_name: table_name.to_string(),
+                            cmds: Vec::new(),
+                            sql: sql.to_string(),
+                        };
+                        for cmd in create_trigger.commands {
+                            trigger.cmds.push(cmd);
+                        }
+                        Ok(trigger)
+                    }
+                    _ => unreachable!(),
+                },
+                _ => unreachable!(),
+            },
+            None => unreachable!(),
+        }
+    }
+
+    pub fn execute(&self) {
+        println!("Trigger executed");
     }
 }
 

@@ -225,7 +225,7 @@ fn prepare_one_select_plan(
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
             parse_from(
                 schema,
-                from,
+                from.clone(),
                 syms,
                 with,
                 &mut where_predicates,
@@ -333,6 +333,10 @@ fn prepare_one_select_plan(
                         }
                     }
                     ResultColumn::Expr(ref mut expr, maybe_alias) => {
+                        //TODO: If a new/old string is encountered here, check the table ( from
+                        // parser ) to identify any triggers on it
+                        // if a trigger exists resolve it
+                        //TODO: How should the resolution happen
                         bind_column_references(
                             expr,
                             &mut plan.table_references,

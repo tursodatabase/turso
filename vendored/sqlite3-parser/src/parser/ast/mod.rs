@@ -230,6 +230,12 @@ pub struct CreateTrigger {
     pub commands: Vec<TriggerCmd>,
 }
 
+impl std::fmt::Display for CreateTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Stmt::CreateTrigger(Box::new(self.clone())).to_fmt(f)
+    }
+}
+
 /// `INSERT`
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -474,10 +480,26 @@ pub enum Expr {
     Raise(ResolveType, Option<Box<Expr>>),
     /// Subquery expression
     Subquery(Box<Select>),
+    /// Trigger expression,
+    Trigger {
+        table: TableInternalId,
+        column: usize,
+        view: TriggerView,
+    },
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
     Variable(String),
+}
+
+/// SQL trigger table views
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TriggerView {
+    /// View of Table pre-execution of query
+    Old,
+    /// View of Table post-execution of query
+    New,
 }
 
 impl Expr {

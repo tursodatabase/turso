@@ -149,7 +149,9 @@ pub fn translate_inner(
             tbl_name,
             body,
         } => translate_create_table(tbl_name, temporary, *body, if_not_exists, schema, program)?,
-        ast::Stmt::CreateTrigger { .. } => translate_create_trigger()?,
+        ast::Stmt::CreateTrigger(trigger_statement) => {
+            translate_create_trigger(trigger_statement, program, schema, syms, connection)?
+        }
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(*vtab, schema, syms, program)?
