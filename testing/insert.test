@@ -679,3 +679,19 @@ do_execsql_test_on_specific_db {:memory:} insert-rowid-select-rowid-success {
     SELECT * FROM t;
 } {2
 1}
+
+
+# Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+# SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+# Issue: https://github.com/tursodatabase/turso/issues/3665
+do_execsql_test_on_specific_db {:memory:} insert-rowid-backwards-compability {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC);
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+} {1|123}
+
+do_execsql_test_on_specific_db {:memory:} insert-rowid-backwards-compability-2 {
+    CREATE TABLE t(a INTEGER, PRIMARY KEY (a DESC));
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+} {123|123}

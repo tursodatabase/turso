@@ -1553,6 +1553,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     foreign_keys.push(Arc::new(fk));
                 }
             }
+
+            // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+            // SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+            // Issue: https://github.com/tursodatabase/turso/issues/3665
+            let mut primary_key_desc_columns_constraint = false;
+
             for ast::ColumnDefinition {
                 col_name,
                 col_type,
@@ -1690,6 +1696,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
                 if primary_key {
                     primary_key_columns.push((name.clone(), order));
+                    if order == SortOrder::Desc {
+                        primary_key_desc_columns_constraint = true;
+                    }
                 } else if primary_key_columns
                     .iter()
                     .any(|(col_name, _)| col_name == &name)
@@ -1702,7 +1711,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     ty,
                     ty_str,
                     primary_key,
-                    is_rowid_alias: typename_exactly_integer && primary_key,
+                    is_rowid_alias: typename_exactly_integer
+                        && primary_key
+                        && !primary_key_desc_columns_constraint,
                     notnull,
                     default,
                     unique,
