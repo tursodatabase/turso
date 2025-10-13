@@ -3,14 +3,13 @@ use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
 use crate::{emit_explain, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
-use turso_parser::ast::{CompoundOperator, SortOrder};
+use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
 use tracing::Level;
 
@@ -43,34 +42,46 @@ pub fn emit_program_for_compound_select(
     // the entire compound select, not just a single subselect.
     let limit_ctx = limit.as_ref().map(|limit| {
         let reg = program.alloc_register();
-        if let Some(val) = try_fold_expr_to_i64(limit) {
-            program.emit_insn(Insn::Integer {
-                value: val,
-                dest: reg,
-            });
-        } else {
-            program.add_comment(program.offset(), "OFFSET expr");
-            _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
-            program.emit_insn(Insn::MustBeInt { reg });
+        match limit.as_ref() {
+            Expr::Literal(Literal::Numeric(n)) => {
+                if let Ok(value) = n.parse::<i64>() {
+                    program.add_comment(program.offset(), "LIMIT counter");
+                    program.emit_insn(Insn::Integer { value, dest: reg });
+                } else {
+                    let value = n.parse::<f64>().unwrap();
+                    program.emit_insn(Insn::Real { value, dest: reg });
+                    program.add_comment(program.offset(), "LIMIT counter");
+                    program.emit_insn(Insn::MustBeInt { reg });
+                }
+            }
+            _ => {
+                _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
+                program.add_comment(program.offset(), "LIMIT counter");
+                program.emit_insn(Insn::MustBeInt { reg });
+            }
         }
         LimitCtx::new_shared(reg)
     });
     let offset_reg = offset.as_ref().map(|offset_expr| {
         let reg = program.alloc_register();
-
-        if let Some(val) = try_fold_expr_to_i64(offset_expr) {
-            // Compile-time constant offset
-            program.emit_insn(Insn::Integer {
-                value: val,
-                dest: reg,
-            });
-        } else {
-            program.add_comment(program.offset(), "OFFSET expr");
-            _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
-            program.emit_insn(Insn::MustBeInt { reg });
+        match offset_expr.as_ref() {
+            Expr::Literal(Literal::Numeric(n)) => {
+                // Compile-time constant offset
+                if let Ok(value) = n.parse::<i64>() {
+                    program.emit_insn(Insn::Integer { value, dest: reg });
+                } else {
+                    let value = n.parse::<f64>().unwrap();
+                    program.emit_insn(Insn::Real { value, dest: reg });
+                }
+            }
+            _ => {
+                _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
+            }
         }
-
+        program.add_comment(program.offset(), "OFFSET counter");
+        program.emit_insn(Insn::MustBeInt { reg });
         let combined_reg = program.alloc_register();
+        program.add_comment(program.offset(), "OFFSET + LIMIT");
         program.emit_insn(Insn::OffsetLimit {
             offset_reg: reg,
             combined_reg,

@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, Literal};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -37,7 +37,6 @@ use crate::translate::fkeys::{
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -1964,52 +1963,72 @@ fn init_limit(
 
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
-            if let Some(value) = try_fold_expr_to_i64(expr) {
-                program.emit_insn(Insn::Integer {
-                    value,
-                    dest: limit_ctx.reg_limit,
-                });
-            } else {
-                let r = limit_ctx.reg_limit;
-                program.add_comment(program.offset(), "OFFSET expr");
-                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
-                program.emit_insn(Insn::MustBeInt { reg: r });
+            match expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::Integer {
+                            value,
+                            dest: limit_ctx.reg_limit,
+                        });
+                    } else {
+                        program.emit_insn(Insn::Real {
+                            value: n.parse::<f64>().unwrap(),
+                            dest: limit_ctx.reg_limit,
+                        });
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: limit_ctx.reg_limit,
+                        });
+                    }
+                }
+                _ => {
+                    let r = limit_ctx.reg_limit;
+
+                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
+                    program.emit_insn(Insn::MustBeInt { reg: r });
+                }
             }
         }
     }
 
     if t_ctx.reg_offset.is_none() {
         if let Some(expr) = offset {
-            if let Some(value) = try_fold_expr_to_i64(expr) {
-                if value != 0 {
-                    let reg = program.alloc_register();
-                    t_ctx.reg_offset = Some(reg);
-                    program.emit_insn(Insn::Integer { value, dest: reg });
-                    let combined_reg = program.alloc_register();
-                    t_ctx.reg_limit_offset_sum = Some(combined_reg);
-                    program.emit_insn(Insn::OffsetLimit {
-                        limit_reg: limit_ctx.reg_limit,
-                        offset_reg: reg,
-                        combined_reg,
-                    });
+            let offset_reg = program.alloc_register();
+            t_ctx.reg_offset = Some(offset_reg);
+            match expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer {
+                            value,
+                            dest: offset_reg,
+                        });
+                    } else {
+                        let value = n.parse::<f64>().unwrap();
+                        program.emit_insn(Insn::Real {
+                            value,
+                            dest: limit_ctx.reg_limit,
+                        });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: limit_ctx.reg_limit,
+                        });
+                    }
                 }
-            } else {
-                let reg = program.alloc_register();
-                t_ctx.reg_offset = Some(reg);
-                let r = reg;
-
-                program.add_comment(program.offset(), "OFFSET expr");
-                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
-                program.emit_insn(Insn::MustBeInt { reg: r });
-
-                let combined_reg = program.alloc_register();
-                t_ctx.reg_limit_offset_sum = Some(combined_reg);
-                program.emit_insn(Insn::OffsetLimit {
-                    limit_reg: limit_ctx.reg_limit,
-                    offset_reg: reg,
-                    combined_reg,
-                });
+                _ => {
+                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver);
+                }
             }
+            program.add_comment(program.offset(), "OFFSET counter");
+            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+
+            let combined_reg = program.alloc_register();
+            t_ctx.reg_limit_offset_sum = Some(combined_reg);
+            program.add_comment(program.offset(), "OFFSET + LIMIT");
+            program.emit_insn(Insn::OffsetLimit {
+                limit_reg: limit_ctx.reg_limit,
+                offset_reg,
+                combined_reg,
+            });
         }
     }
 
