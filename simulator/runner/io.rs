@@ -79,6 +79,11 @@ impl SimIO for SimulatorIO {
     fn close_files(&self) {
         self.files.borrow_mut().clear()
     }
+
+    fn persist_files(&self) -> anyhow::Result<()> {
+        // Files are persisted automatically
+        Ok(())
+    }
 }
 
 impl Clock for SimulatorIO {
