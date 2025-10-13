@@ -1143,51 +1143,66 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Iif => {
-                            if args.len() != 3 {
-                                crate::bail_parse_error!(
-                                    "{} requires exactly 3 arguments",
-                                    srf.to_string()
-                                );
+                            let args = expect_arguments_min!(args, 2, srf);
+
+                            let iif_end_label = program.allocate_label();
+                            let condition_reg = program.alloc_register();
+
+                            for pair in args.chunks_exact(2) {
+                                let condition_expr = &pair[0];
+                                let value_expr = &pair[1];
+                                let next_check_label = program.allocate_label();
+
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    condition_expr,
+                                    condition_reg,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+
+                                program.emit_insn(Insn::IfNot {
+                                    reg: condition_reg,
+                                    target_pc: next_check_label,
+                                    jump_if_null: true,
+                                });
+
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    value_expr,
+                                    target_register,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                                program.emit_insn(Insn::Goto {
+                                    target_pc: iif_end_label,
+                                });
+
+                                program.preassign_label_to_next_insn(next_check_label);
                             }
-                            let temp_reg = program.alloc_register();
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                temp_reg,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            let jump_target_when_false = program.allocate_label();
-                            program.emit_insn(Insn::IfNot {
-                                reg: temp_reg,
-                                target_pc: jump_target_when_false,
-                                jump_if_null: true,
-                            });
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                target_register,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            let jump_target_result = program.allocate_label();
-                            program.emit_insn(Insn::Goto {
-                                target_pc: jump_target_result,
-                            });
-                            program.preassign_label_to_next_insn(jump_target_when_false);
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[2],
-                                target_register,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            program.preassign_label_to_next_insn(jump_target_result);
+
+                            if args.len() % 2 != 0 {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    args.last().unwrap(),
+                                    target_register,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                            } else {
+                                program.emit_insn(Insn::Null {
+                                    dest: target_register,
+                                    dest_end: None,
+                                });
+                            }
+
+                            program.preassign_label_to_next_insn(iif_end_label);
                             Ok(target_register)
                         }
+
                         ScalarFunc::Glob | ScalarFunc::Like => {
                             if args.len() < 2 {
                                 crate::bail_parse_error!(
