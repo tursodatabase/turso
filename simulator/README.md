@@ -118,6 +118,17 @@ For development purposes, you can run `make sim-schema` to generate a JsonSchema
 }
 ```
 
+## Run simulator using the Miri interpreter
+
+Miri is a deterministic Rust interpreter designed to identify undefined behavior. To run the simulator under Miri, use
+```bash
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-disable-stacked-borrows" RUST_LOG=limbo_sim=debug cargo +nightly miri run --bin limbo_sim -- --disable-integrity-check
+````
+Notes:
+- `-Zmiri-disable-isolation` is needed for host access (like opening a file)
+- `-Zmiri-disable-stacked-borrows` this alias checking is experimental, so disabled for now
+- `--disable-integrity-check` is needed since we can't run sqlite via the FFI in Miri
+
 ## Resources
 
 - [(reading) TigerBeetle Deterministic Simulation Testing](https://docs.tigerbeetle.com/about/vopr/)
