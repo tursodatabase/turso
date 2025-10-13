@@ -320,12 +320,9 @@ fn run_simulator(
                 let env = env.clone_at_phase(SimulationPhase::Shrink);
                 let env = Arc::new(Mutex::new(env));
                 let last_execution_clone = last_execution.clone();
-                let shrunk_plan_clone = shrunk_plan.clone();
+                let generated_plan = shrunk_plan.static_iterator();
                 let shrunk = SandboxedResult::from(
-                    move || {
-                        let generated_plan = shrunk_plan_clone.static_iterator();
-                        run_simulation(env, generated_plan, last_execution_clone)
-                    },
+                    move || run_simulation(env, generated_plan, last_execution_clone),
                     Arc::clone(&last_execution),
                 );
                 (shrunk_plan, shrunk)
