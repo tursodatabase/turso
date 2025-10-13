@@ -128,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_and_strip_checksum_valid() {
+    fn test_verify_checksum_valid() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();
 
@@ -139,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_and_strip_checksum_mismatch() {
+    fn test_verify_checksum_mismatch() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();
 
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_and_strip_checksum_corrupted_checksum() {
+    fn test_verify_checksum_corrupted_checksum() {
         let ctx = ChecksumContext::new();
         let mut page = get_random_page();
 
