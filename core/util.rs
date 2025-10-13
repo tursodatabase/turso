@@ -29,12 +29,6 @@ macro_rules! io_yield_one {
         return Ok(IOResult::IO(IOCompletions::Single($c)));
     };
 }
-#[macro_export]
-macro_rules! io_yield_many {
-    ($v:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Many($v)));
-    };
-}
 
 #[macro_export]
 macro_rules! eq_ignore_ascii_case {
