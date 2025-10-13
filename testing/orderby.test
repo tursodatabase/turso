@@ -240,3 +240,12 @@ do_execsql_test_on_specific_db {:memory:} orderby_alias_precedence {
     SELECT x AS y, y AS x FROM t ORDER BY x;
 } {2|100
 1|200}
+
+# https://github.com/tursodatabase/turso/issues/3684
+do_execsql_test_on_specific_db {:memory:} orderby_alias_shadows_column {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    SELECT a, -b AS a FROM t ORDER BY a;
+} {3|-3
+2|-2
+1|-1}
