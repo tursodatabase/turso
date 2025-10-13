@@ -599,3 +599,19 @@ impl Shadow for AlterTable {
         Ok(vec![])
     }
 }
+
+impl Shadow for DropIndex {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let table = tables
+            .iter_mut()
+            .find(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", self.table_name))?;
+
+        table
+            .indexes
+            .retain(|index| index.index_name != self.index_name);
+        Ok(vec![])
+    }
+}
