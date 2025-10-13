@@ -427,7 +427,7 @@ impl Arena {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 mod arena {
     #[cfg(target_vendor = "apple")]
     use libc::MAP_ANON as MAP_ANONYMOUS;
@@ -463,7 +463,7 @@ mod arena {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), miri))]
 mod arena {
     pub fn alloc(len: usize) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
