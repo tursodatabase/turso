@@ -379,11 +379,6 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
 
         schema.push(Create { table });
     }
-
-    for create in &schema {
-        println!("{create}");
-    }
-
     schema
 }
 
