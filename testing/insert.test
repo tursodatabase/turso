@@ -529,6 +529,13 @@ do_execsql_test_on_specific_db {:memory:} null-value-insert-null-type-column {
     SELECT * FROM test;
 } {1|}
 
+# https://github.com/tursodatabase/turso/issues/1710
+do_execsql_test_in_memory_error_content uniq_constraint {
+    CREATE TABLE test (id INTEGER unique);
+    insert into test values (1);
+    insert into test values (1);
+} {UNIQUE constraint failed: test.id (19)}
+
 do_execsql_test_in_memory_error_content insert-explicit-rowid-conflict {
     create table t (x);
     insert into t(rowid, x) values (1, 1);
