@@ -9,9 +9,7 @@ use crate::turso_assert;
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2_000;
 
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
@@ -79,6 +77,7 @@ pub struct PageCache {
     queue: LinkedList<EntryAdapter>,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
     clock_hand: *mut PageCacheEntry,
+    spill_threshold: usize,
 }
 
 unsafe impl Send for PageCache {}
@@ -96,8 +95,8 @@ pub enum CacheError {
     Pinned { pgno: usize },
     #[error("cache active refs")]
     ActiveRefs,
-    #[error("Page cache is full")]
-    Full,
+    #[error("Page cache is full: should_spill={should_spill}")]
+    Full { should_spill: bool },
     #[error("key already exists")]
     KeyExists,
 }
@@ -122,6 +121,7 @@ impl PageCache {
             map: HashMap::new(),
             queue: LinkedList::new(EntryAdapter::new()),
             clock_hand: std::ptr::null_mut(),
+            spill_threshold: capacity,
         }
     }
 
@@ -348,7 +348,9 @@ impl PageCache {
     /// Returns `CacheError::Full` if not enough pages can be evicted
     pub fn make_room_for(&mut self, n: usize) -> Result<(), CacheError> {
         if n > self.capacity {
-            return Err(CacheError::Full);
+            return Err(CacheError::Full {
+                should_spill: false,
+            });
         }
         let available = self.capacity - self.len();
         if n <= available {
@@ -422,7 +424,9 @@ impl PageCache {
             }
         }
 
-        Err(CacheError::Full)
+        Err(CacheError::Full {
+            should_spill: self.len() >= self.spill_threshold,
+        })
     }
 
     pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
@@ -540,9 +544,7 @@ impl PageCache {
 
 impl Default for PageCache {
     fn default() -> Self {
-        PageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        PageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
@@ -799,7 +801,12 @@ mod tests {
         let page3 = page_with_content(3);
         let result = cache.insert(key3, page3);
 
-        assert_eq!(result, Err(CacheError::Full));
+        assert_eq!(
+            result,
+            Err(CacheError::Full {
+                should_spill: false
+            })
+        );
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
     }
@@ -1028,7 +1035,7 @@ mod tests {
 
                     tracing::debug!("inserting page {:?}", key);
                     match cache.insert(key, page.clone()) {
-                        Err(CacheError::Full | CacheError::ActiveRefs) => {} // Expected, ignore
+                        Err(CacheError::Full { .. } | CacheError::ActiveRefs) => {} // Expected, ignore
                         Err(err) => {
                             panic!("Cache insertion failed unexpectedly: {err:?}");
                         }
