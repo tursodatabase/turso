@@ -244,8 +244,6 @@ impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use rand::{Rng as _, SeedableRng as _};
     use rand_chacha::ChaCha8Rng;
 
@@ -287,8 +285,7 @@ mod tests {
             let row = pick(&values, &mut rng);
             let predicate =
                 SimplePredicate::arbitrary_from(&mut rng, context, (&table, row, true)).0;
-            let mut regex_cache = HashMap::new();
-            let value = expr_to_value(&predicate.0, row, &table, &mut Some(&mut regex_cache));
+            let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 value.as_ref().is_some_and(|value| value.as_bool()),
                 "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
@@ -317,8 +314,7 @@ mod tests {
             let row = pick(&values, &mut rng);
             let predicate =
                 SimplePredicate::arbitrary_from(&mut rng, context, (&table, row, false)).0;
-            let mut regex_cache = HashMap::new();
-            let value = expr_to_value(&predicate.0, row, &table, &mut Some(&mut regex_cache));
+            let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 !value.as_ref().is_some_and(|value| value.as_bool()),
                 "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
@@ -346,8 +342,7 @@ mod tests {
                 .collect();
             let row = pick(&values, &mut rng);
             let predicate = Predicate::arbitrary_from(&mut rng, context, (&table, row));
-            let mut regex_cache = HashMap::new();
-            let value = expr_to_value(&predicate.0, row, &table, &mut Some(&mut regex_cache));
+            let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 value.as_ref().is_some_and(|value| value.as_bool()),
                 "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"

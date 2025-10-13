@@ -459,8 +459,6 @@ impl CompoundPredicate {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use rand::{Rng as _, SeedableRng as _};
     use rand_chacha::ChaCha8Rng;
 
@@ -501,8 +499,7 @@ mod tests {
                 .collect();
             let row = pick(&values, &mut rng);
             let predicate = Predicate::true_binary(&mut rng, context, &table, row);
-            let mut regex_cache = HashMap::new();
-            let value = expr_to_value(&predicate.0, row, &table, &mut Some(&mut regex_cache));
+            let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 value.as_ref().is_some_and(|value| value.as_bool()),
                 "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"
@@ -530,8 +527,7 @@ mod tests {
                 .collect();
             let row = pick(&values, &mut rng);
             let predicate = Predicate::false_binary(&mut rng, context, &table, row);
-            let mut regex_cache = HashMap::new();
-            let value = expr_to_value(&predicate.0, row, &table, &mut Some(&mut regex_cache));
+            let value = expr_to_value(&predicate.0, row, &table);
             assert!(
                 !value.as_ref().is_some_and(|value| value.as_bool()),
                 "Predicate: {predicate:#?}\nValue: {value:#?}\nSeed: {seed}"

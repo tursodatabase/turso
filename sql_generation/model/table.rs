@@ -1,13 +1,8 @@
-use std::{collections::HashMap, fmt::Display, hash::Hash, ops::Deref};
+use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use turso_core::{
-    likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape},
-    numeric::Numeric,
-    types,
-};
+use turso_core::{likeop::exec_glob, numeric::Numeric, types, Value};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -258,27 +253,16 @@ impl SimValue {
         &self,
         other: &Self,
         operator: ast::LikeOperator,
-        escape: Option<Option<SimValue>>,
-        regex_cache: Option<&mut HashMap<String, Regex>>,
+        escape: Option<&Value>,
     ) -> bool {
         let lhs = self.0.to_string();
         let rhs = other.0.to_string();
 
         match operator {
-            ast::LikeOperator::Glob => exec_glob(regex_cache, lhs.as_str(), rhs.as_str()),
+            ast::LikeOperator::Glob => exec_glob(None, lhs.as_str(), rhs.as_str()),
             ast::LikeOperator::Like => {
-                let should_use_escape = escape
-                    .as_ref()
-                    .and_then(|opt| opt.as_ref())
-                    .and_then(|e| construct_like_escape_arg(&e.0).ok());
-
-                if let Some(escape_char) = should_use_escape {
-                    exec_like_with_escape(rhs.as_str(), lhs.as_str(), escape_char)
-                } else {
-                    types::Value::exec_like(regex_cache, rhs.as_str(), lhs.as_str())
-                }
+                types::Value::exec_like(None, rhs.as_str(), rhs.as_str(), escape).unwrap()
             }
-
             ast::LikeOperator::Match | ast::LikeOperator::Regexp => todo!(),
         }
     }

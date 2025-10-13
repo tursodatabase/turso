@@ -4751,14 +4751,19 @@ pub fn op_function(
 
                 let result = match (pattern, match_expression) {
                     (Value::Text(pattern), Value::Text(match_expression)) if arg_count == 3 => {
-                        let escape =
-                            construct_like_escape_arg(state.registers[*start_reg + 2].get_value())?;
+                        let escape = state.registers[*start_reg + 2].get_value();
+                        let cache = if *constant_mask > 0 {
+                            Some(&mut state.regex_cache.like)
+                        } else {
+                            None
+                        };
 
-                        Value::Integer(exec_like_with_escape(
+                        Value::Integer(Value::exec_like(
+                            cache,
                             pattern.as_str(),
                             match_expression.as_str(),
-                            escape,
-                        ) as i64)
+                            Some(escape),
+                        )? as i64)
                     }
                     (Value::Text(pattern), Value::Text(match_expression)) => {
                         let cache = if *constant_mask > 0 {
@@ -4770,7 +4775,8 @@ pub fn op_function(
                             cache,
                             pattern.as_str(),
                             match_expression.as_str(),
-                        ) as i64)
+                            None,
+                        )? as i64)
                     }
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
@@ -9304,21 +9310,25 @@ impl Value {
         regex_cache: Option<&mut HashMap<String, Regex>>,
         pattern: &str,
         text: &str,
-    ) -> bool {
-        if let Some(cache) = regex_cache {
-            match cache.get(pattern) {
-                Some(re) => re.is_match(text),
-                None => {
-                    let re = construct_like_regex(pattern);
-                    let res = re.is_match(text);
-                    cache.insert(pattern.to_string(), re);
-                    res
-                }
-            }
-        } else {
-            let re = construct_like_regex(pattern);
-            re.is_match(text)
+        escape: Option<&Value>,
+    ) -> Result<bool, LimboError> {
+        if let Some(escape_value) = escape {
+            let escape_char = construct_like_escape_arg(escape_value)?;
+            return Ok(exec_like_with_escape(pattern, text, escape_char));
         }
+
+        if let Some(cache) = regex_cache {
+            if let Some(re) = cache.get(pattern) {
+                return Ok(re.is_match(text));
+            }
+
+            let re = construct_like_regex(pattern);
+            let is_match = re.is_match(text);
+            cache.insert(pattern.to_string(), re);
+            return Ok(is_match);
+        }
+
+        Ok(construct_like_regex(pattern).is_match(text))
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
@@ -10746,34 +10756,34 @@ mod tests {
 
     #[test]
     fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
+        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#, None).unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa", None).unwrap());
     }
 
     #[test]
     fn test_like_no_cache() {
-        assert!(Value::exec_like(None, "a%", "aaaa"));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.a", "aaaa"));
-        assert!(!Value::exec_like(None, "a.a%", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.ab", "aaaa"));
+        assert!(Value::exec_like(None, "a%", "aaaa", None).unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(None, "%a.a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(None, "a.a%", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(None, "%a.ab", "aaaa", None).unwrap());
     }
 
     #[test]
     fn test_like_with_cache() {
         let mut cache = HashMap::new();
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa", None).unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa", None).unwrap());
 
         // again after values have been cached
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa", None).unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa", None).unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa", None).unwrap());
     }
 
     #[test]

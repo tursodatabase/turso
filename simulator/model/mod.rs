@@ -441,8 +441,7 @@ impl Shadow for SelectInner {
             for col in &self.columns {
                 match col {
                     ResultColumn::Expr(expr) => {
-                        let value =
-                            expr.eval(&[], &Table::anonymous(vec![]), &mut Some(env.regex_cache()));
+                        let value = expr.eval(&[], &Table::anonymous(vec![]));
                         if let Some(value) = value {
                             row.push(value);
                         } else {
