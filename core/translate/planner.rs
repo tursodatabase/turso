@@ -665,7 +665,7 @@ pub fn parse_from(
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
             if ctes_as_subqueries
                 .iter()
-                .any(|t| t.table.get_name() == cte_name_normalized.to_string())
+                .any(|t| t.table.get_name() == cte_name_normalized)
             {
                 crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
             }
