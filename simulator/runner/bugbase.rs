@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
-    io::{self, Write},
-    path::PathBuf,
-    process::Command,
+    env::current_dir,
+    fs::File,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -452,28 +453,50 @@ impl BugBase {
 
 impl BugBase {
     pub(crate) fn get_current_commit_hash() -> anyhow::Result<String> {
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .with_context(|| "should be able to get the commit hash")?;
-        let commit_hash = String::from_utf8(output.stdout)
-            .with_context(|| "commit hash should be valid utf8")?
-            .trim()
-            .to_string();
-        Ok(commit_hash)
+        let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
+        let hash =
+            resolve_head(&git_dir).with_context(|| "should be able to get the commit hash")?;
+        Ok(hash)
     }
 
     pub(crate) fn get_limbo_project_dir() -> anyhow::Result<PathBuf> {
-        Ok(PathBuf::from(
-            String::from_utf8(
-                Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .output()
-                    .with_context(|| "should be able to get the git path")?
-                    .stdout,
-            )
-            .with_context(|| "commit hash should be valid utf8")?
-            .trim(),
-        ))
+        let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
+        let workdir = git_dir
+            .parent()
+            .with_context(|| "work tree should be parent of .git")?;
+        Ok(workdir.to_path_buf())
     }
+}
+
+fn find_git_dir(start_path: impl AsRef<Path>) -> Option<PathBuf> {
+    // HACK ignores stuff like bare repo, worktree, etc.
+    let mut current = start_path.as_ref().to_path_buf();
+    loop {
+        let git_path = current.join(".git");
+        if git_path.is_dir() {
+            return Some(git_path);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_head(git_dir: impl AsRef<Path>) -> anyhow::Result<String> {
+    // HACK ignores stuff like packed-refs
+    let head_path = git_dir.as_ref().join("HEAD");
+    let head_contents = read_to_string(&head_path)?;
+    if let Some(ref_path) = head_contents.strip_prefix("ref: ") {
+        let ref_file = git_dir.as_ref().join(ref_path);
+        read_to_string(&ref_file)
+    } else {
+        Ok(head_contents)
+    }
+}
+
+fn read_to_string(path: impl AsRef<Path>) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents.trim().to_string())
 }
