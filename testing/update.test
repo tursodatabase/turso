@@ -386,3 +386,13 @@ do_execsql_test_on_specific_db {:memory:} can-update-rowid-directly {
     UPDATE test SET rowid = 5;
 	SELECT rowid, name from test;
 } {5|test}
+
+# https://github.com/tursodatabase/turso/issues/3678
+do_execsql_test_on_specific_db {:memory:} update-alias-visibility-in-where-clause {
+    create table t(a);
+    insert into t values (0);
+    insert into t values (5);
+    update t as tt set a = 1 where tt.a = 0;
+    select * from t;
+} {1
+5}
