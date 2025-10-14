@@ -2445,7 +2445,9 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
         };
-        schema.add_btree_table(Arc::new(users_table));
+        schema
+            .add_btree_table(Arc::new(users_table))
+            .expect("Test setup: failed to add users table");
 
         // Create orders table
         let orders_table = BTreeTable {
@@ -2508,7 +2510,9 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
         };
-        schema.add_btree_table(Arc::new(orders_table));
+        schema
+            .add_btree_table(Arc::new(orders_table))
+            .expect("Test setup: failed to add orders table");
 
         // Create products table
         let products_table = BTreeTable {
@@ -2571,7 +2575,9 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
         };
-        schema.add_btree_table(Arc::new(products_table));
+        schema
+            .add_btree_table(Arc::new(products_table))
+            .expect("Test setup: failed to add products table");
 
         schema
     }
