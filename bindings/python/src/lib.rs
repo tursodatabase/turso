@@ -356,11 +356,11 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
     } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else {
-        return Err(PyErr::new::<ProgrammingError, _>(format!(
+        Err(PyErr::new::<ProgrammingError, _>(format!(
             "Unsupported Python type: {}",
             obj.get_type().name()?
         ))
-        .into());
+        .into())
     }
 }
 

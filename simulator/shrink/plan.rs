@@ -226,14 +226,14 @@ impl InteractionPlan {
 
             let iter = range_transactions.get_mut(&interactions.connection_index);
 
-            if let Some(iter) = iter {
-                if let Some(txn_interaction_idx) = iter.peek().copied() {
-                    if txn_interaction_idx == idx {
-                        iter.next();
-                    }
-                    if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
-                        retain = false;
-                    }
+            if let Some(iter) = iter
+                && let Some(txn_interaction_idx) = iter.peek().copied()
+            {
+                if txn_interaction_idx == idx {
+                    iter.next();
+                }
+                if txn_interaction_idx == idx || txn_interaction_idx.saturating_sub(1) == idx {
+                    retain = false;
                 }
             }
 

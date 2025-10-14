@@ -673,7 +673,7 @@ impl IO for UringIO {
 
     fn register_fixed_buffer(&self, ptr: std::ptr::NonNull<u8>, len: usize) -> Result<u32> {
         turso_assert!(
-            len % 512 == 0,
+            len.is_multiple_of(512),
             "fixed buffer length must be logical block aligned"
         );
         let mut inner = self.inner.lock();

@@ -23,7 +23,7 @@ pub struct VectorSparse<'a, T: std::fmt::Debug> {
 impl Vector {
     pub fn vector_type(mut blob: Vec<u8>) -> Result<(VectorType, Vec<u8>)> {
         // Even-sized blobs are always float32.
-        if blob.len() % 2 == 0 {
+        if blob.len().is_multiple_of(2) {
             return Ok((VectorType::Float32Dense, blob));
         }
         // Odd-sized blobs have type byte at the end
@@ -115,7 +115,7 @@ impl Vector {
     pub fn from_data(vector_type: VectorType, mut data: Vec<u8>) -> Result<Self> {
         match vector_type {
             VectorType::Float32Dense => {
-                if data.len() % 4 != 0 {
+                if !data.len().is_multiple_of(4) {
                     return Err(LimboError::InvalidArgument(format!(
                         "f32 dense vector unexpected data length: {}",
                         data.len(),
@@ -128,7 +128,7 @@ impl Vector {
                 })
             }
             VectorType::Float64Dense => {
-                if data.len() % 8 != 0 {
+                if !data.len().is_multiple_of(8) {
                     return Err(LimboError::InvalidArgument(format!(
                         "f64 dense vector unexpected data length: {}",
                         data.len(),
@@ -141,7 +141,10 @@ impl Vector {
                 })
             }
             VectorType::Float32Sparse => {
-                if data.is_empty() || data.len() % 4 != 0 || (data.len() - 4) % 8 != 0 {
+                if data.is_empty()
+                    || !data.len().is_multiple_of(4)
+                    || !(data.len() - 4).is_multiple_of(8)
+                {
                     return Err(LimboError::InvalidArgument(format!(
                         "f32 sparse vector unexpected data length: {}",
                         data.len(),

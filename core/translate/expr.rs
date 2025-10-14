@@ -3470,7 +3470,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 .as_ref()
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                         });
-                        if col_idx.is_some() {
+                        if let Some(col_idx) = col_idx {
                             if match_result.is_some() {
                                 let mut ok = false;
                                 // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
@@ -3486,13 +3486,9 @@ pub fn bind_and_rewrite_expr<'a>(
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
                             } else {
-                                let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    joined_table.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias,
-                                ));
+                                let col = joined_table.table.columns().get(col_idx).unwrap();
+                                match_result =
+                                    Some((joined_table.internal_id, col_idx, col.is_rowid_alias));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
                         } else if let Some(row_id_expr) = parse_row_id(
@@ -3521,16 +3517,13 @@ pub fn bind_and_rewrite_expr<'a>(
                                     .as_ref()
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
-                            if col_idx.is_some() {
+                            if let Some(col_idx) = col_idx {
                                 if match_result.is_some() {
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                match_result = Some((
-                                    outer_ref.internal_id,
-                                    col_idx.unwrap(),
-                                    col.is_rowid_alias,
-                                ));
+                                let col = outer_ref.table.columns().get(col_idx).unwrap();
+                                match_result =
+                                    Some((outer_ref.internal_id, col_idx, col.is_rowid_alias));
                             }
                         }
                     }

@@ -886,15 +886,12 @@ impl DbspCompiler {
             right_schema.find_column(&second_col.name, second_col.table.as_deref());
 
         // Determine the correct pairing: one column must be from left, one from right
-        if first_in_left.is_some() && second_in_right.is_some() {
+        if let (Some((left_idx, _)), Some((right_idx, _))) = (first_in_left, second_in_right) {
             // first is from left, second is from right
-            let (left_idx, _) = first_in_left.unwrap();
-            let (right_idx, _) = second_in_right.unwrap();
             Ok((first_col.clone(), left_idx, second_col.clone(), right_idx))
-        } else if first_in_right.is_some() && second_in_left.is_some() {
+        } else if let (Some((left_idx, _)), Some((right_idx, _))) = (first_in_right, second_in_left)
+        {
             // first is from right, second is from left
-            let (left_idx, _) = second_in_left.unwrap();
-            let (right_idx, _) = first_in_right.unwrap();
             Ok((second_col.clone(), left_idx, first_col.clone(), right_idx))
         } else {
             // Provide specific error messages for different failure cases

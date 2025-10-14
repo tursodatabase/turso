@@ -251,17 +251,18 @@ pub fn constraints_from_where_clause(
                     // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
                     // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
                     // we check it here.
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator,
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
-                            usable: true,
-                        });
+                    if *table == table_reference.internal_id {
+                        if let Some(rowid_alias_column) = rowid_alias_column {
+                            let table_column = &table_reference.table.columns()[rowid_alias_column];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
+                                operator,
+                                table_col_pos: rowid_alias_column,
+                                lhs_mask: table_mask_from_expr(rhs, table_references)?,
+                                selectivity: estimate_selectivity(table_column, operator),
+                                usable: true,
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -281,17 +282,18 @@ pub fn constraints_from_where_clause(
                     }
                 }
                 ast::Expr::RowId { table, .. } => {
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Lhs),
-                            operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
-                            selectivity: estimate_selectivity(table_column, operator),
-                            usable: true,
-                        });
+                    if *table == table_reference.internal_id {
+                        if let Some(rowid_alias_column) = rowid_alias_column {
+                            let table_column = &table_reference.table.columns()[rowid_alias_column];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Lhs),
+                                operator: opposite_cmp_op(operator),
+                                table_col_pos: rowid_alias_column,
+                                lhs_mask: table_mask_from_expr(lhs, table_references)?,
+                                selectivity: estimate_selectivity(table_column, operator),
+                                usable: true,
+                            });
+                        }
                     }
                 }
                 _ => {}
