@@ -461,7 +461,9 @@ pub(crate) mod tests {
             dims: 2,
             data: vec![0, 0, 0, 0, 58, 100, 45, 192],
         };
-        assert!((operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6);
+        assert!(
+            (operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6
+        );
     }
 
     #[test]
