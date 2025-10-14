@@ -889,7 +889,7 @@ impl DbspCompiler {
         if let (Some((left_idx, _)), Some((right_idx, _))) = (first_in_left, second_in_right) {
             // first is from left, second is from right
             Ok((first_col.clone(), left_idx, second_col.clone(), right_idx))
-        } else if let (Some((left_idx, _)), Some((right_idx, _))) = (first_in_right, second_in_left)
+        } else if let (Some((right_idx, _)), Some((left_idx, _))) = (first_in_right, second_in_left)
         {
             // first is from right, second is from left
             Ok((second_col.clone(), left_idx, first_col.clone(), right_idx))
