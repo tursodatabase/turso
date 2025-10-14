@@ -440,7 +440,10 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // If the UPDATE modifies any column that is present in the key of the btree used to iterate over the table (either the table itself or an index),
+    // gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // This ensures the keys of the btree used to iterate cannot be changed during the UPDATE loop itself, ensuring all the intended rows actually get
+    // updated and none are skipped.
     pub ephemeral_plan: Option<SelectPlan>,
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
