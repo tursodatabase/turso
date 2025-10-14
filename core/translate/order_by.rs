@@ -429,8 +429,9 @@ pub fn order_by_sorter_insert(
         let insert_label = program.allocate_label();
         let skip_label = program.allocate_label();
         let limit = t_ctx.limit_ctx.as_ref().expect("limit must be set");
+        let limit_reg = t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit);
         program.emit_insn(Insn::IfPos {
-            reg: limit.reg_limit,
+            reg: limit_reg,
             target_pc: insert_label,
             decrement_by: 1,
         });
