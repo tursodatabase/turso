@@ -311,6 +311,18 @@ impl ProgramBuilder {
         self._alloc_cursor_id(Some(key), cursor_type)
     }
 
+    pub fn alloc_cursor_id_keyed_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        cursor_type: CursorType,
+    ) -> usize {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            cursor_id
+        } else {
+            self._alloc_cursor_id(Some(key), cursor_type)
+        }
+    }
+
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
     }

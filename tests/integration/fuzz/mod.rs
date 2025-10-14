@@ -1844,7 +1844,7 @@ mod tests {
     pub fn table_index_mutation_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
-        println!("index_scan_single_key_mutation_fuzz seed: {seed}");
+        println!("table_index_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERATIONS: usize = 100;
         for i in 0..OUTER_ITERATIONS {
@@ -1866,9 +1866,33 @@ mod tests {
             let table_def = format!("CREATE TABLE t ({table_def})");
 
             let num_indexes = rng.random_range(0..=num_cols);
-            let indexes = (0..num_indexes)
-                .map(|i| format!("CREATE INDEX idx_{i} ON t(c{i})"))
-                .collect::<Vec<_>>();
+            let mut indexes = Vec::new();
+            for i in 0..num_indexes {
+                // Decide if this should be a single-column or multi-column index
+                let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
+
+                if is_multi_column {
+                    // Create a multi-column index with 2-3 columns
+                    let num_index_cols = rng.random_range(2..=3.min(num_cols));
+                    let mut index_cols = Vec::new();
+                    let mut available_cols: Vec<usize> = (0..num_cols).collect();
+
+                    for _ in 0..num_index_cols {
+                        let idx = rng.random_range(0..available_cols.len());
+                        let col = available_cols.remove(idx);
+                        index_cols.push(format!("c{col}"));
+                    }
+
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON t({})",
+                        index_cols.join(", ")
+                    ));
+                } else {
+                    // Single-column index
+                    let col = rng.random_range(0..num_cols);
+                    indexes.push(format!("CREATE INDEX idx_{i} ON t(c{col})"));
+                }
+            }
 
             // Create tables and indexes in both databases
             let limbo_conn = limbo_db.connect_limbo();
@@ -1952,8 +1976,22 @@ mod tests {
                 };
 
                 let query = if do_update {
-                    let new_y = rng.random_range(0..1000);
-                    format!("UPDATE t SET c{affected_col} = {new_y} {where_clause}")
+                    let num_updates = rng.random_range(1..=num_cols);
+                    let mut values = Vec::new();
+                    for _ in 0..num_updates {
+                        let new_y = if rng.random_bool(0.5) {
+                            // Update to a constant value
+                            rng.random_range(0..1000).to_string()
+                        } else {
+                            let source_col = rng.random_range(0..num_cols);
+                            // Update to a value that is a function of the another column
+                            let operator = *["+", "-"].choose(&mut rng).unwrap();
+                            let amount = rng.random_range(0..1000);
+                            format!("c{source_col} {operator} {amount}")
+                        };
+                        values.push(format!("c{affected_col} = {new_y}"));
+                    }
+                    format!("UPDATE t SET {} {where_clause}", values.join(", "))
                 } else {
                     format!("DELETE FROM t {where_clause}")
                 };
@@ -1990,6 +2028,19 @@ mod tests {
                     sqlite_rows, limbo_rows,
                     "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
                 );
+
+                // Run integrity check on limbo db using rusqlite
+                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                    println!("{table_def};");
+                    for t in indexes.iter() {
+                        println!("{t};");
+                    }
+                    for t in dml_statements.iter() {
+                        println!("{t};");
+                    }
+                    println!("{query};");
+                    panic!("seed: {seed}, error: {e}");
+                }
 
                 if sqlite_rows.is_empty() {
                     break;

@@ -112,6 +112,7 @@ pub struct InsertFlags(pub u8);
 impl InsertFlags {
     pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
+    pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -128,6 +129,11 @@ impl InsertFlags {
 
     pub fn update_rowid_change(mut self) -> Self {
         self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
+        self
+    }
+
+    pub fn is_ephemeral_table_insert(mut self) -> Self {
+        self.0 |= InsertFlags::EPHEMERAL_TABLE_INSERT;
         self
     }
 }
@@ -791,6 +797,8 @@ pub enum Insn {
     Delete {
         cursor_id: CursorID,
         table_name: String,
+        /// Whether the DELETE is part of an UPDATE statement. If so, it doesn't count towards the change counter.
+        is_part_of_update: bool,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry

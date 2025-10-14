@@ -6,6 +6,7 @@ use turso_parser::ast::{self, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::ROWID_SENTINEL;
+use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_pk_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
@@ -720,6 +721,7 @@ pub fn emit_upsert(
         program.emit_insn(Insn::Delete {
             cursor_id: ctx.cursor_id,
             table_name: table.get_name().to_string(),
+            is_part_of_update: true,
         });
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
@@ -809,7 +811,7 @@ pub fn emit_upsert(
             emit_cdc_insns(
                 program,
                 resolver,
-                OperationMode::UPDATE,
+                OperationMode::UPDATE(UpdateRowSource::Normal),
                 cdc_id,
                 ctx.conflict_rowid_reg,
                 before_rec,
