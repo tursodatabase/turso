@@ -2000,6 +2000,19 @@ mod tests {
                     "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
                 );
 
+                // Run integrity check on limbo db using rusqlite
+                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                    println!("{table_def};");
+                    for t in indexes.iter() {
+                        println!("{t};");
+                    }
+                    for t in dml_statements.iter() {
+                        println!("{t};");
+                    }
+                    println!("{query};");
+                    panic!("seed: {seed}, error: {e}");
+                }
+
                 if sqlite_rows.is_empty() {
                     break;
                 }
