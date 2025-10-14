@@ -999,3 +999,8 @@ do_execsql_test_in_memory_any_error limit-column-reference-error {
   CREATE TABLE t(a);
   SELECT * FROM t LIMIT (t.a);
 }
+
+do_execsql_test select-binary-collation {
+  SELECT 'a' = 'A';
+  SELECT 'a' = 'a';
+} {0 1}
