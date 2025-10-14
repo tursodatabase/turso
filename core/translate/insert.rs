@@ -42,12 +42,6 @@ use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptR
 use super::plan::QueryDestination;
 use super::select::translate_select;
 
-pub struct TempTableCtx {
-    cursor_id: usize,
-    loop_start_label: BranchOffset,
-    loop_end_label: BranchOffset,
-}
-
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -86,24 +80,48 @@ fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> 
     Ok(())
 }
 
+pub struct TempTableCtx {
+    cursor_id: usize,
+    loop_start_label: BranchOffset,
+    loop_end_label: BranchOffset,
+}
+
 #[allow(dead_code)]
 pub struct InsertEmitCtx<'a> {
+    /// Parent table being inserted into
     pub table: &'a Arc<BTreeTable>,
+
+    /// Index cursors we need to populate for this table
+    /// (idx name, root_page, idx cursor id)
     pub idx_cursors: Vec<(&'a String, i64, usize)>,
+
+    /// Context for if the insert values are materialized first
+    /// into a temporary table
     pub temp_table_ctx: Option<TempTableCtx>,
+    /// on conflict, default to ABORT
     pub on_conflict: ResolveType,
+    /// Arity of the insert values
     pub num_values: usize,
+    /// The yield register, if a coroutine is used to yield multiple rows
     pub yield_reg_opt: Option<usize>,
+    /// The register to hold the rowid of a conflicting row
     pub conflict_rowid_reg: usize,
+    /// The cursor id of the table being inserted into
     pub cursor_id: usize,
 
-    /// Labels
+    /// Label to jump to on HALT
     pub halt_label: BranchOffset,
+    /// Label to jump to when a row is done processing (either inserted or upserted)
     pub row_done_label: BranchOffset,
+    /// Jump here at the complete end of the statement
     pub stmt_epilogue: BranchOffset,
+    /// Beginning of the loop for multiple-row inserts
     pub loop_start_label: BranchOffset,
+    /// Label to jump to when a generated key is ready for uniqueness check
     pub key_ready_for_uniqueness_check_label: BranchOffset,
+    /// Label to jump to when no key is provided and one must be generated
     pub key_generation_label: BranchOffset,
+    /// Jump here when the insert value SELECT source has been fully exhausted
     pub select_exhausted_label: Option<BranchOffset>,
 
     /// CDC table info
@@ -123,7 +141,6 @@ impl<'a> InsertEmitCtx<'a> {
         temp_table_ctx: Option<TempTableCtx>,
     ) -> Self {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
-        // (idx name, root_page, idx cursor id)
         let idx_cursors = resolver
             .schema
             .get_indices(table.name.as_str())
