@@ -35,11 +35,7 @@ impl Default for MemoryIO {
 
 impl Clock for MemoryIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        std::time::Instant::now()
     }
 }
 
