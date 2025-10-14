@@ -18,7 +18,7 @@ tracing_release = ["turso_core/tracing_release"]
 
 [dependencies]
 anyhow = "1.0"
-turso_core = { path = "../../core", features = ["io_uring"] }
+turso_core = { workspace = true, features = ["io_uring"] }
 pyo3 = { version = "0.24.1", features = ["anyhow"] }
 
 [build-dependencies]
