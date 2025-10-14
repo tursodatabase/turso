@@ -61,13 +61,11 @@ pub fn init_order_by(
         .iter()
         .all(|(e, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
-    // only emit sequence column if we have GROUP BY and ORDER BY is not only aggregates or constants
-    let has_sequence = has_group_by && !only_aggs;
-
     let use_heap_sort = !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some();
-    if use_heap_sort {
-        assert!(!has_sequence);
-    }
+
+    // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
+    let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
+
     let remappings = order_by_deduplicate_result_columns(order_by, result_columns, has_sequence);
     let sort_cursor = if use_heap_sort {
         let index_name = format!("heap_sort_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
@@ -83,6 +81,15 @@ pub fn init_order_by(
                 default: None,
             })
         }
+        let pos_in_table = index_columns.len();
+        // add sequence number between ORDER BY columns and result column
+        index_columns.push(IndexColumn {
+            name: pos_in_table.to_string(),
+            order: SortOrder::Asc,
+            pos_in_table,
+            collation: Some(CollationSeq::Binary),
+            default: None,
+        });
         for _ in remappings.iter().filter(|r| !r.deduplicated) {
             let pos_in_table = index_columns.len();
             index_columns.push(IndexColumn {
