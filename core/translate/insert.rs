@@ -821,6 +821,7 @@ fn emit_notnulls(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &
 }
 
 struct BoundInsertResult {
+    #[allow(clippy::vec_box)]
     values: Vec<Box<Expr>>,
     upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
     inserting_multiple_rows: bool,
@@ -948,7 +949,7 @@ fn bind_insert(
 /// For DefaultValues, we allocate the cursor and extend the empty values vector with either the
 /// default expressions registered for the columns, or NULLs, so they can be translated into
 /// registers later.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::vec_box)]
 fn init_source_emission<'a>(
     mut program: ProgramBuilder,
     table: &Table,
@@ -1112,7 +1113,7 @@ fn init_source_emission<'a>(
         }
         InsertBody::DefaultValues => {
             let num_values = table.columns().len();
-            values.extend(table.columns().into_iter().map(|c| {
+            values.extend(table.columns().iter().map(|c| {
                 c.default
                     .clone()
                     .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
@@ -1685,7 +1686,7 @@ fn emit_preflight_constraint_checks(
                             err_code: SQLITE_CONSTRAINT_UNIQUE,
                             description: format_unique_violation_desc(
                                 ctx.table.name.as_str(),
-                                &index,
+                                index,
                             ),
                         });
 
@@ -1705,7 +1706,7 @@ fn emit_preflight_constraint_checks(
                             err_code: SQLITE_CONSTRAINT_UNIQUE,
                             description: format_unique_violation_desc(
                                 ctx.table.name.as_str(),
-                                &index,
+                                index,
                             ),
                         });
                         program.preassign_label_to_next_insn(ok);
