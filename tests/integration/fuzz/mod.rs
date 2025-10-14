@@ -1844,7 +1844,7 @@ mod tests {
     pub fn table_index_mutation_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time();
-        println!("index_scan_single_key_mutation_fuzz seed: {seed}");
+        println!("table_index_mutation_fuzz seed: {seed}");
 
         const OUTER_ITERATIONS: usize = 100;
         for i in 0..OUTER_ITERATIONS {
@@ -1866,9 +1866,33 @@ mod tests {
             let table_def = format!("CREATE TABLE t ({table_def})");
 
             let num_indexes = rng.random_range(0..=num_cols);
-            let indexes = (0..num_indexes)
-                .map(|i| format!("CREATE INDEX idx_{i} ON t(c{i})"))
-                .collect::<Vec<_>>();
+            let mut indexes = Vec::new();
+            for i in 0..num_indexes {
+                // Decide if this should be a single-column or multi-column index
+                let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
+
+                if is_multi_column {
+                    // Create a multi-column index with 2-3 columns
+                    let num_index_cols = rng.random_range(2..=3.min(num_cols));
+                    let mut index_cols = Vec::new();
+                    let mut available_cols: Vec<usize> = (0..num_cols).collect();
+
+                    for _ in 0..num_index_cols {
+                        let idx = rng.random_range(0..available_cols.len());
+                        let col = available_cols.remove(idx);
+                        index_cols.push(format!("c{col}"));
+                    }
+
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON t({})",
+                        index_cols.join(", ")
+                    ));
+                } else {
+                    // Single-column index
+                    let col = rng.random_range(0..num_cols);
+                    indexes.push(format!("CREATE INDEX idx_{i} ON t(c{col})"));
+                }
+            }
 
             // Create tables and indexes in both databases
             let limbo_conn = limbo_db.connect_limbo();
