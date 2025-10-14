@@ -444,9 +444,24 @@ pub(crate) mod tests {
     /// - The distance must be between 0 and 2
     fn test_vector_distance<const DIMS: usize>(v1: &Vector, v2: &Vector) -> bool {
         match operations::distance_cos::vector_distance_cos(v1, v2) {
-            Ok(distance) => distance.is_nan() || (0.0..=2.0).contains(&distance),
+            Ok(distance) => distance.is_nan() || (0.0 - 1e-6..=2.0 + 1e-6).contains(&distance),
             Err(_) => true,
         }
+    }
+
+    #[test]
+    fn test_vector_some_cosine_dist() {
+        let a = Vector {
+            vector_type: VectorType::Float32Dense,
+            dims: 2,
+            data: vec![0, 0, 0, 0, 52, 208, 106, 63],
+        };
+        let b = Vector {
+            vector_type: VectorType::Float32Dense,
+            dims: 2,
+            data: vec![0, 0, 0, 0, 58, 100, 45, 192],
+        };
+        assert!((operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6);
     }
 
     #[test]
