@@ -3543,12 +3543,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
