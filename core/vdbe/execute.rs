@@ -5553,8 +5553,9 @@ pub fn op_sequence(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    let seq_num = cursor.next_sequence();
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let seq_num = *cursor_seq;
+    *cursor_seq += 1;
     state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5575,8 +5576,10 @@ pub fn op_sequence_test(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    state.pc = if cursor.seq_beginning() {
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let was_zero = *cursor_seq == 0;
+    *cursor_seq += 1;
+    state.pc = if was_zero {
         target_pc.as_offset_int()
     } else {
         state.pc + 1
