@@ -46,6 +46,7 @@ pub struct SortMetadata {
 }
 
 /// Initialize resources needed for ORDER BY processing
+#[allow(clippy::too_many_arguments)]
 pub fn init_order_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -432,7 +433,7 @@ pub fn order_by_sorter_insert(
         });
         program.emit_insn(Insn::IdxLE {
             cursor_id: *sort_cursor,
-            start_reg: start_reg,
+            start_reg,
             num_regs: orderby_sorter_column_count,
             target_pc: skip_label,
         });
