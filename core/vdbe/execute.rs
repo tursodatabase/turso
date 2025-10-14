@@ -110,7 +110,7 @@ macro_rules! load_insn {
         };
         #[cfg(not(debug_assertions))]
         let Insn::$variant { $($field $(: $binding)?),*} = $insn else {
-             // this will optimize away the branch
+            // this will optimize away the branch
             unsafe { std::hint::unreachable_unchecked() };
         };
     };
