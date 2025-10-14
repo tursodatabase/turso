@@ -54,7 +54,7 @@ pub fn translate_delete(
         result_columns,
         connection,
     )?;
-    optimize_plan(&mut delete_plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };

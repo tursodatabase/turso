@@ -115,7 +115,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
+fn optimize_update_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut UpdatePlan,
+    schema: &Schema,
+) -> Result<()> {
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?

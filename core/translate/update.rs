@@ -59,7 +59,7 @@ pub fn translate_update(
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -86,7 +86,7 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
