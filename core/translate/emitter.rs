@@ -43,7 +43,6 @@ use crate::translate::window::{emit_window_results, init_window, WindowMetadata}
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
@@ -190,13 +189,30 @@ impl<'a> TranslateCtx<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Update row source for UPDATE statements
+/// `Normal` is the default mode, it will iterate either the table itself or an index on the table.
+/// `PrebuiltEphemeralTable` is used when an ephemeral table containing the target rowids to update has
+/// been built and it is being used for iteration.
+pub enum UpdateRowSource {
+    /// Iterate over the table itself or an index on the table
+    Normal,
+    /// Iterate over an ephemeral table containing the target rowids to update
+    PrebuiltEphemeralTable {
+        /// The cursor id of the ephemeral table that is being used to iterate the target rowids to update.
+        ephemeral_table_cursor_id: usize,
+        /// The table that is being updated.
+        target_table: Arc<JoinedTable>,
+    },
+}
+
 /// Used to distinguish database operations
 #[allow(clippy::upper_case_acronyms, dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum OperationMode {
     SELECT,
     INSERT,
-    UPDATE,
+    UPDATE(UpdateRowSource),
     DELETE,
 }
 
@@ -363,6 +379,7 @@ pub fn emit_query<'a>(
         &plan.join_order,
         &plan.where_clause,
         None,
+        OperationMode::SELECT,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -374,7 +391,7 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &plan.join_order,
-        None,
+        OperationMode::SELECT,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -456,6 +473,7 @@ fn emit_program_for_delete(
         &[JoinOrderMember::default()],
         &plan.where_clause,
         None,
+        OperationMode::DELETE,
     )?;
 
     emit_delete_insns(
@@ -472,7 +490,7 @@ fn emit_program_for_delete(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        None,
+        OperationMode::DELETE,
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
     // Finalize program
@@ -896,7 +914,15 @@ fn emit_program_for_update(
         };
         *cursor_id
     });
-    if let Some(ephemeral_plan) = ephemeral_plan {
+    let has_ephemeral_table = ephemeral_plan.is_some();
+
+    let target_table = if let Some(ephemeral_plan) = ephemeral_plan {
+        let table = ephemeral_plan
+            .table_references
+            .joined_tables()
+            .first()
+            .unwrap()
+            .clone();
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
@@ -904,7 +930,27 @@ fn emit_program_for_update(
         program.incr_nesting();
         emit_program_for_select(program, resolver, ephemeral_plan)?;
         program.decr_nesting();
-    }
+        Arc::new(table)
+    } else {
+        Arc::new(
+            plan.table_references
+                .joined_tables()
+                .first()
+                .unwrap()
+                .clone(),
+        )
+    };
+
+    let mode = OperationMode::UPDATE(if has_ephemeral_table {
+        UpdateRowSource::PrebuiltEphemeralTable {
+            ephemeral_table_cursor_id: temp_cursor_id.expect(
+                "ephemeral table cursor id is always allocated if has_ephemeral_table is true",
+            ),
+            target_table: target_table.clone(),
+        }
+    } else {
+        UpdateRowSource::Normal
+    });
 
     // Initialize the main loop
     init_loop(
@@ -913,7 +959,7 @@ fn emit_program_for_update(
         &plan.table_references,
         &mut [],
         None,
-        OperationMode::UPDATE,
+        mode.clone(),
         &plan.where_clause,
     )?;
 
@@ -950,7 +996,17 @@ fn emit_program_for_update(
         &[JoinOrderMember::default()],
         &plan.where_clause,
         temp_cursor_id,
+        mode.clone(),
     )?;
+
+    let target_table_cursor_id =
+        program.resolve_cursor_id(&CursorKey::table(target_table.internal_id));
+
+    let iteration_cursor_id = if has_ephemeral_table {
+        temp_cursor_id.unwrap()
+    } else {
+        target_table_cursor_id
+    };
 
     // Emit update instructions
     emit_update_insns(
@@ -959,7 +1015,9 @@ fn emit_program_for_update(
         &t_ctx,
         program,
         index_cursors,
-        temp_cursor_id,
+        iteration_cursor_id,
+        target_table_cursor_id,
+        target_table,
     )?;
 
     // Close the main loop
@@ -968,7 +1026,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        temp_cursor_id,
+        mode.clone(),
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -980,20 +1038,28 @@ fn emit_program_for_update(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
+#[allow(clippy::too_many_arguments)]
+/// Emits the instructions for the UPDATE loop.
+///
+/// `iteration_cursor_id` is the cursor id of the table that is being iterated over. This can be either the table itself, an index, or an ephemeral table (see [crate::translate::plan::UpdatePlan]).
+///
+/// `target_table_cursor_id` is the cursor id of the table that is being updated.
+///
+/// `target_table` is the table that is being updated.
 fn emit_update_insns(
     connection: &Arc<Connection>,
     plan: &mut UpdatePlan,
     t_ctx: &TranslateCtx,
     program: &mut ProgramBuilder,
     index_cursors: Vec<(usize, usize)>,
-    temp_cursor_id: Option<CursorID>,
+    iteration_cursor_id: usize,
+    target_table_cursor_id: usize,
+    target_table: Arc<JoinedTable>,
 ) -> crate::Result<()> {
-    // we can either use this obviously safe raw pointer or we can clone it
-    let table_ref: *const JoinedTable = plan.table_references.joined_tables().first().unwrap();
-    let internal_id = unsafe { (*table_ref).internal_id };
+    let internal_id = target_table.internal_id;
     let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
-    let (index, is_virtual) = match &unsafe { &*table_ref }.op {
+    let source_table = plan.table_references.joined_tables().first().unwrap();
+    let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
@@ -1003,7 +1069,7 @@ fn emit_update_insns(
             }),
             false,
         ),
-        Operation::Scan(_) => (None, unsafe { &*table_ref }.virtual_table().is_some()),
+        Operation::Scan(_) => (None, target_table.virtual_table().is_some()),
         Operation::Search(search) => match search {
             &Search::RowidEq { .. } | Search::Seek { index: None, .. } => (None, false),
             Search::Seek {
@@ -1019,7 +1085,7 @@ fn emit_update_insns(
     };
 
     let beg = program.alloc_registers(
-        unsafe { &*table_ref }.table.columns().len()
+        target_table.table.columns().len()
             + if is_virtual {
                 2 // two args before the relevant columns for VUpdate
             } else {
@@ -1027,12 +1093,13 @@ fn emit_update_insns(
             },
     );
     program.emit_insn(Insn::RowId {
-        cursor_id: temp_cursor_id.unwrap_or(cursor_id),
+        cursor_id: iteration_cursor_id,
         dest: beg,
     });
 
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
-    let rowid_alias_index = unsafe { &*table_ref }
+    let rowid_alias_index = target_table
+        .table
         .columns()
         .iter()
         .position(|c| c.is_rowid_alias);
@@ -1054,15 +1121,18 @@ fn emit_update_insns(
         None
     };
 
-    let check_rowid_not_exists_label = if has_user_provided_rowid {
+    let not_exists_check_required =
+        has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
+
+    let check_rowid_not_exists_label = if not_exists_check_required {
         Some(program.allocate_label())
     } else {
         None
     };
 
-    if has_user_provided_rowid {
+    if not_exists_check_required {
         program.emit_insn(Insn::NotExists {
-            cursor: cursor_id,
+            cursor: target_table_cursor_id,
             rowid_reg: beg,
             target_pc: check_rowid_not_exists_label.unwrap(),
         });
@@ -1089,7 +1159,7 @@ fn emit_update_insns(
             decrement_by: 1,
         });
     }
-    let col_len = unsafe { &*table_ref }.columns().len();
+    let col_len = target_table.table.columns().len();
 
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
@@ -1101,7 +1171,7 @@ fn emit_update_insns(
     } else {
         None
     };
-    let table_name = unsafe { &*table_ref }.table.get_name();
+    let table_name = target_table.table.get_name();
 
     let start = if is_virtual { beg + 2 } else { beg + 1 };
 
@@ -1120,7 +1190,7 @@ fn emit_update_insns(
             });
         }
     }
-    for (idx, table_column) in unsafe { &*table_ref }.columns().iter().enumerate() {
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         let target_reg = start + idx;
         if let Some((col_idx, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
             // Skip if this is the sentinel value
@@ -1203,7 +1273,7 @@ fn emit_update_insns(
                 program.emit_null(target_reg, None);
             } else if is_virtual {
                 program.emit_insn(Insn::VColumn {
-                    cursor_id,
+                    cursor_id: target_table_cursor_id,
                     column: idx,
                     dest: target_reg,
                 });
@@ -1217,7 +1287,7 @@ fn emit_update_insns(
                             None
                         }
                     })
-                    .unwrap_or(&cursor_id);
+                    .unwrap_or(&target_table_cursor_id);
                 program.emit_column_or_rowid(
                     cursor_id,
                     column_idx_in_index.unwrap_or(idx),
@@ -1238,12 +1308,12 @@ fn emit_update_insns(
 
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
-        if let Some(table_btree) = unsafe { &*table_ref }.btree() {
+        if let Some(table_btree) = target_table.table.btree() {
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
                 &plan.set_clauses,
-                cursor_id,
+                target_table_cursor_id,
                 start,
                 rowid_new_reg,
             )?;
@@ -1255,7 +1325,7 @@ fn emit_update_insns(
                     &t_ctx.resolver,
                     &table_btree,
                     table_name,
-                    cursor_id,
+                    target_table_cursor_id,
                     start,
                     rowid_new_reg,
                     &plan
@@ -1278,7 +1348,7 @@ fn emit_update_insns(
                     program,
                     &t_ctx.resolver,
                     &table_btree,
-                    cursor_id,
+                    target_table_cursor_id,
                     beg,
                     start,
                     rowid_new_reg,
@@ -1320,7 +1390,7 @@ fn emit_update_insns(
             // to refer to the new values, which are already loaded into registers starting at `start`.
             rewrite_where_for_update_registers(
                 &mut new_where,
-                unsafe { &*table_ref }.columns(),
+                target_table.table.columns(),
                 start,
                 rowid_set_clause_reg.unwrap_or(beg),
             )?;
@@ -1362,13 +1432,13 @@ fn emit_update_insns(
         let delete_start_reg = program.alloc_registers(num_regs);
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             program.emit_column_or_rowid(
-                cursor_id,
+                target_table_cursor_id,
                 column_index.pos_in_table,
                 delete_start_reg + reg_offset,
             );
         }
         program.emit_insn(Insn::RowId {
-            cursor_id,
+            cursor_id: target_table_cursor_id,
             dest: delete_start_reg + num_regs - 1,
         });
         program.emit_insn(Insn::IdxDelete {
@@ -1400,7 +1470,8 @@ fn emit_update_insns(
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
         for (i, col) in index.columns.iter().enumerate() {
-            let col_in_table = unsafe { &*table_ref }
+            let col_in_table = target_table
+                .table
                 .columns()
                 .get(col.pos_in_table)
                 .expect("column index out of bounds");
@@ -1435,7 +1506,7 @@ fn emit_update_insns(
                 .columns
                 .iter()
                 .map(|ic| {
-                    unsafe { &*table_ref }.columns()[ic.pos_in_table]
+                    target_table.table.columns()[ic.pos_in_table]
                         .affinity()
                         .aff_mask()
                 })
@@ -1505,7 +1576,7 @@ fn emit_update_insns(
         }
     }
 
-    if let Some(btree_table) = unsafe { &*table_ref }.btree() {
+    if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
@@ -1528,7 +1599,7 @@ fn emit_update_insns(
             });
 
             program.emit_insn(Insn::NotExists {
-                cursor: cursor_id,
+                cursor: target_table_cursor_id,
                 rowid_reg: target_reg,
                 target_pc: record_label,
             });
@@ -1536,7 +1607,8 @@ fn emit_update_insns(
             let description = if let Some(idx) = rowid_alias_index {
                 String::from(table_name)
                     + "."
-                    + unsafe { &*table_ref }
+                    + target_table
+                        .table
                         .columns()
                         .get(idx)
                         .unwrap()
@@ -1557,7 +1629,8 @@ fn emit_update_insns(
 
         let record_reg = program.alloc_register();
 
-        let affinity_str = unsafe { &*table_ref }
+        let affinity_str = target_table
+            .table
             .columns()
             .iter()
             .map(|col| col.affinity().aff_mask())
@@ -1571,9 +1644,9 @@ fn emit_update_insns(
             affinity_str: Some(affinity_str),
         });
 
-        if has_user_provided_rowid {
+        if not_exists_check_required {
             program.emit_insn(Insn::NotExists {
-                cursor: cursor_id,
+                cursor: target_table_cursor_id,
                 rowid_reg: beg,
                 target_pc: check_rowid_not_exists_label.unwrap(),
             });
@@ -1587,7 +1660,7 @@ fn emit_update_insns(
             let cdc_rowid_before_reg = program.alloc_register();
             if has_user_provided_rowid {
                 program.emit_insn(Insn::RowId {
-                    cursor_id,
+                    cursor_id: target_table_cursor_id,
                     dest: cdc_rowid_before_reg,
                 });
                 Some(cdc_rowid_before_reg)
@@ -1602,8 +1675,8 @@ fn emit_update_insns(
         let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                unsafe { &*table_ref }.table.columns(),
-                cursor_id,
+                target_table.table.columns(),
+                target_table_cursor_id,
                 cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
             ))
         } else {
@@ -1613,25 +1686,25 @@ fn emit_update_insns(
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
         // and later insert the updated record
-        if has_user_provided_rowid {
+        if not_exists_check_required {
             program.emit_insn(Insn::Delete {
-                cursor_id,
+                cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
             });
         }
 
         program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
+            cursor: target_table_cursor_id,
             key_reg: rowid_set_clause_reg.unwrap_or(beg),
             record_reg,
-            flag: if has_user_provided_rowid {
+            flag: if not_exists_check_required {
                 // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
                 // so to insert a new user-provided rowid, we need to seek to the correct place.
                 InsertFlags::new().require_seek().update_rowid_change()
             } else {
                 InsertFlags::new()
             },
-            table_name: unsafe { &*table_ref }.identifier.clone(),
+            table_name: target_table.identifier.clone(),
         });
 
         // Emit RETURNING results if specified
@@ -1651,7 +1724,7 @@ fn emit_update_insns(
         let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
             Some(emit_cdc_patch_record(
                 program,
-                &unsafe { &*table_ref }.table,
+                &target_table.table,
                 start,
                 record_reg,
                 cdc_rowid_after_reg,
@@ -1705,7 +1778,14 @@ fn emit_update_insns(
                 emit_cdc_insns(
                     program,
                     &t_ctx.resolver,
-                    OperationMode::UPDATE,
+                    OperationMode::UPDATE(if plan.ephemeral_plan.is_some() {
+                        UpdateRowSource::PrebuiltEphemeralTable {
+                            ephemeral_table_cursor_id: iteration_cursor_id,
+                            target_table: target_table.clone(),
+                        }
+                    } else {
+                        UpdateRowSource::Normal
+                    }),
                     cdc_cursor_id,
                     cdc_rowid_before_reg,
                     cdc_before_reg,
@@ -1715,10 +1795,10 @@ fn emit_update_insns(
                 )?;
             }
         }
-    } else if unsafe { &*table_ref }.virtual_table().is_some() {
+    } else if target_table.virtual_table().is_some() {
         let arg_count = col_len + 2;
         program.emit_insn(Insn::VUpdate {
-            cursor_id,
+            cursor_id: target_table_cursor_id,
             arg_count,
             start_reg: beg,
             conflict_action: 0u16,
@@ -1873,7 +1953,7 @@ pub fn emit_cdc_insns(
 
     let change_type = match operation_mode {
         OperationMode::INSERT => 1,
-        OperationMode::UPDATE | OperationMode::SELECT => 0,
+        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0,
         OperationMode::DELETE => -1,
     };
     program.emit_int(change_type, turso_cdc_registers + 2);

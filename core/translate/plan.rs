@@ -4,7 +4,10 @@ use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, 
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
-    translate::{collate::get_collseq_from_expr, optimizer::constraints::SeekRangeConstraint},
+    translate::{
+        collate::get_collseq_from_expr, emitter::UpdateRowSource,
+        optimizer::constraints::SeekRangeConstraint,
+    },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -910,22 +913,43 @@ impl JoinedTable {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
                 let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
-                let table_not_required =
-                    OperationMode::SELECT == mode && use_covering_index && !index_is_ephemeral;
+                let table_not_required = matches!(mode, OperationMode::SELECT)
+                    && use_covering_index
+                    && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {
                     None
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
-                    Some(
-                        program
-                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
-                    )
+                    if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                        target_table,
+                        ..
+                    }) = &mode
+                    {
+                        // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table though.
+                        Some(program.alloc_cursor_id_keyed(
+                            CursorKey::table(target_table.internal_id),
+                            match &target_table.table {
+                                Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
+                                Table::Virtual(virtual_table) => {
+                                    CursorType::VirtualTable(virtual_table.clone())
+                                }
+                                _ => unreachable!("target table must be a btree or virtual table"),
+                            },
+                        ))
+                    } else {
+                        // Check if this is a materialized view
+                        let cursor_type =
+                            if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                                CursorType::MaterializedView(btree.clone(), view_mutex)
+                            } else {
+                                CursorType::BTreeTable(btree.clone())
+                            };
+                        Some(
+                            program.alloc_cursor_id_keyed(
+                                CursorKey::table(self.internal_id),
+                                cursor_type,
+                            ),
+                        )
+                    }
                 };
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
@@ -951,9 +975,19 @@ impl JoinedTable {
     pub fn resolve_cursors(
         &self,
         program: &mut ProgramBuilder,
+        mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id = program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id));
+        let table_cursor_id =
+            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                target_table,
+                ..
+            }) = &mode
+            {
+                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+            } else {
+                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+            };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });

@@ -4,7 +4,7 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
@@ -674,7 +674,7 @@ pub fn emit_simple_count(
         .joined_tables()
         .first()
         .unwrap()
-        .resolve_cursors(program)?;
+        .resolve_cursors(program, OperationMode::SELECT)?;
 
     let cursor_id = {
         match cursors {

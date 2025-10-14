@@ -18,7 +18,9 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
-use crate::translate::{collate::get_collseq_from_expr, window::emit_window_loop_source};
+use crate::translate::{
+    collate::get_collseq_from_expr, emitter::UpdateRowSource, window::emit_window_loop_source,
+};
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
@@ -129,8 +131,8 @@ pub fn init_loop(
     );
 
     if matches!(
-        mode,
-        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+        &mode,
+        OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
     ) {
         assert!(tables.joined_tables().len() == 1);
         let changed_table = &tables.joined_tables()[0].table;
@@ -202,9 +204,9 @@ pub fn init_loop(
             }
         }
         let (table_cursor_id, index_cursor_id) =
-            table.open_cursors(program, mode, t_ctx.resolver.schema)?;
+            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
         match &table.op {
-            Operation::Scan(Scan::BTreeTable { index, .. }) => match (mode, &table.table) {
+            Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
                     if let Some(cursor_id) = table_cursor_id {
@@ -259,14 +261,28 @@ pub fn init_loop(
                         }
                     }
                 }
-                (OperationMode::UPDATE, Table::BTree(btree)) => {
+                (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
                     let root_page = btree.root_page;
-                    program.emit_insn(Insn::OpenWrite {
-                        cursor_id: table_cursor_id
-                            .expect("table cursor is always opened in OperationMode::UPDATE"),
-                        root_page: root_page.into(),
-                        db: table.database_id,
-                    });
+                    match &update_mode {
+                        UpdateRowSource::Normal => {
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: table_cursor_id.expect(
+                                    "table cursor is always opened in OperationMode::UPDATE",
+                                ),
+                                root_page: root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                        UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
+                            let target_table_cursor_id = program
+                                .resolve_cursor_id(&CursorKey::table(target_table.internal_id));
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: target_table_cursor_id,
+                                root_page: target_table.btree().unwrap().root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                    }
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
@@ -281,7 +297,9 @@ pub fn init_loop(
                 if let Table::Virtual(tbl) = &table.table {
                     let is_write = matches!(
                         mode,
-                        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+                        OperationMode::INSERT
+                            | OperationMode::UPDATE { .. }
+                            | OperationMode::DELETE
                     );
                     if is_write && tbl.readonly() {
                         return Err(crate::LimboError::ReadOnly);
@@ -303,7 +321,7 @@ pub fn init_loop(
                             });
                         }
                     }
-                    OperationMode::DELETE | OperationMode::UPDATE => {
+                    OperationMode::DELETE | OperationMode::UPDATE { .. } => {
                         let table_cursor_id = table_cursor_id.expect(
                                         "table cursor is always opened in OperationMode::DELETE or OperationMode::UPDATE",
                                     );
@@ -316,7 +334,7 @@ pub fn init_loop(
 
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
-                        if mode == OperationMode::DELETE {
+                        if matches!(mode, OperationMode::DELETE) {
                             if let Some(indexes) =
                                 t_ctx.resolver.schema.indexes.get(table.table.get_name())
                             {
@@ -361,7 +379,7 @@ pub fn init_loop(
                                     db: table.database_id,
                                 });
                             }
-                            OperationMode::UPDATE | OperationMode::DELETE => {
+                            OperationMode::UPDATE { .. } | OperationMode::DELETE => {
                                 program.emit_insn(Insn::OpenWrite {
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
@@ -407,6 +425,7 @@ pub fn open_loop(
     join_order: &[JoinOrderMember],
     predicates: &[WhereTerm],
     temp_cursor_id: Option<CursorID>,
+    mode: OperationMode,
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
@@ -433,7 +452,7 @@ pub fn open_loop(
             }
         }
 
-        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
+        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
 
         match &table.op {
             Operation::Scan(scan) => {
@@ -987,7 +1006,7 @@ pub fn close_loop(
     t_ctx: &mut TranslateCtx,
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
-    temp_cursor_id: Option<CursorID>,
+    mode: OperationMode,
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
     // OPEN t1
@@ -1005,20 +1024,28 @@ pub fn close_loop(
             .get(table_index)
             .expect("source has no loop labels");
 
-        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
+        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
 
         match &table.op {
             Operation::Scan(scan) => {
                 program.resolve_label(loop_labels.next, program.offset());
                 match scan {
                     Scan::BTreeTable { iter_dir, .. } => {
-                        let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                        let iteration_cursor_id = if let OperationMode::UPDATE(
+                            UpdateRowSource::PrebuiltEphemeralTable {
+                                ephemeral_table_cursor_id,
+                                ..
+                            },
+                        ) = &mode
+                        {
+                            *ephemeral_table_cursor_id
+                        } else {
                             index_cursor_id.unwrap_or_else(|| {
                                 table_cursor_id.expect(
                                     "Either ephemeral or index or table cursor must be opened",
                                 )
                             })
-                        });
+                        };
                         if *iter_dir == IterationDirection::Backwards {
                             program.emit_insn(Insn::Prev {
                                 cursor_id: iteration_cursor_id,
@@ -1055,12 +1082,19 @@ pub fn close_loop(
                     "Subqueries do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
-                let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                    index_cursor_id.unwrap_or_else(|| {
-                        table_cursor_id
-                            .expect("Either ephemeral or index or table cursor must be opened")
-                    })
-                });
+                let iteration_cursor_id =
+                    if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                        ephemeral_table_cursor_id,
+                        ..
+                    }) = &mode
+                    {
+                        *ephemeral_table_cursor_id
+                    } else {
+                        index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id
+                                .expect("Either ephemeral or index or table cursor must be opened")
+                        })
+                    };
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
                 if !matches!(search, Search::RowidEq { .. }) {
                     let iter_dir = match search {
