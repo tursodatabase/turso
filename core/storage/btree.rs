@@ -337,7 +337,7 @@ impl BTreeKey<'_> {
     }
 
     /// Get the record, if present. Index will always be present,
-    fn get_record(&self) -> Option<&'_ ImmutableRecord> {
+    pub fn get_record(&self) -> Option<&'_ ImmutableRecord> {
         match self {
             BTreeKey::TableRowId((_, record)) => *record,
             BTreeKey::IndexKey(record) => Some(record),
@@ -345,7 +345,7 @@ impl BTreeKey<'_> {
     }
 
     /// Get the rowid, if present. Index will never be present.
-    fn maybe_rowid(&self) -> Option<i64> {
+    pub fn maybe_rowid(&self) -> Option<i64> {
         match self {
             BTreeKey::TableRowId((rowid, _)) => Some(*rowid),
             BTreeKey::IndexKey(_) => None,
@@ -1297,8 +1297,10 @@ impl BTreeCursor {
     pub fn get_next_record(&mut self) -> Result<IOResult<bool>> {
         if let Some(mv_cursor) = &self.mv_cursor {
             let mut mv_cursor = mv_cursor.write();
-            mv_cursor.forward();
-            let rowid = mv_cursor.current_row_id();
+            assert!(matches!(mv_cursor.next()?, IOResult::Done(_)));
+            let IOResult::Done(rowid) = mv_cursor.rowid()? else {
+                todo!()
+            };
             match rowid {
                 Some(_rowid) => {
                     return Ok(IOResult::Done(true));
@@ -4453,11 +4455,14 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn rowid(&self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
-            let Some(rowid) = mv_cursor.current_row_id() else {
+            let mv_cursor = mv_cursor.write();
+            let IOResult::Done(rowid) = mv_cursor.rowid()? else {
+                todo!()
+            };
+            let Some(rowid) = rowid else {
                 return Ok(IOResult::Done(None));
             };
-            return Ok(IOResult::Done(Some(rowid.row_id)));
+            return Ok(IOResult::Done(Some(rowid)));
         }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
@@ -4520,7 +4525,7 @@ impl BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
+            let mv_cursor = mv_cursor.write();
             let Some(row) = mv_cursor.current_row()? else {
                 return Ok(IOResult::Done(None));
             };
@@ -4586,22 +4591,9 @@ impl BTreeCursor {
     pub fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         match &self.mv_cursor {
-            Some(mv_cursor) => match key.maybe_rowid() {
-                Some(rowid) => {
-                    let row_id =
-                        crate::mvcc::database::RowID::new(mv_cursor.read().table_id, rowid);
-                    let record_buf = key.get_record().unwrap().get_payload().to_vec();
-                    let num_columns = match key {
-                        BTreeKey::IndexKey(record) => record.column_count(),
-                        BTreeKey::TableRowId((_, record)) => {
-                            record.as_ref().unwrap().column_count()
-                        }
-                    };
-                    let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.write().insert(row)?;
-                }
-                None => todo!("Support mvcc inserts with index btrees"),
-            },
+            Some(mv_cursor) => {
+                return_if_io!(mv_cursor.write().insert(key));
+            }
             None => {
                 return_if_io!(self.insert_into_page(key));
                 if key.maybe_rowid().is_some() {
@@ -4627,8 +4619,7 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let rowid = mv_cursor.write().current_row_id().unwrap();
-            mv_cursor.write().delete(rowid)?;
+            return_if_io!(mv_cursor.write().delete());
             return Ok(IOResult::Done(()));
         }
 
@@ -5679,11 +5670,14 @@ impl CursorTrait for BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     fn rowid(&self) -> Result<IOResult<Option<i64>>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
-            let Some(rowid) = mv_cursor.current_row_id() else {
+            let mv_cursor = mv_cursor.write();
+            let IOResult::Done(rowid) = mv_cursor.rowid()? else {
+                todo!();
+            };
+            let Some(rowid) = rowid else {
                 return Ok(IOResult::Done(None));
             };
-            return Ok(IOResult::Done(Some(rowid.row_id)));
+            return Ok(IOResult::Done(Some(rowid)));
         }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
@@ -5743,7 +5737,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(Some(record_ref)));
         }
         if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
+            let mv_cursor = mv_cursor.write();
             let Some(row) = mv_cursor.current_row()? else {
                 return Ok(IOResult::Done(None));
             };
@@ -5809,22 +5803,9 @@ impl CursorTrait for BTreeCursor {
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         match &self.mv_cursor {
-            Some(mv_cursor) => match key.maybe_rowid() {
-                Some(rowid) => {
-                    let row_id =
-                        crate::mvcc::database::RowID::new(mv_cursor.read().table_id, rowid);
-                    let record_buf = key.get_record().unwrap().get_payload().to_vec();
-                    let num_columns = match key {
-                        BTreeKey::IndexKey(record) => record.column_count(),
-                        BTreeKey::TableRowId((_, record)) => {
-                            record.as_ref().unwrap().column_count()
-                        }
-                    };
-                    let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
-                    mv_cursor.write().insert(row)?;
-                }
-                None => todo!("Support mvcc inserts with index btrees"),
-            },
+            Some(mv_cursor) => {
+                return_if_io!(mv_cursor.write().insert(key));
+            }
             None => {
                 return_if_io!(self.insert_into_page(key));
                 if key.maybe_rowid().is_some() {
@@ -5838,8 +5819,7 @@ impl CursorTrait for BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG)]
     fn delete(&mut self) -> Result<IOResult<()>> {
         if let Some(mv_cursor) = &self.mv_cursor {
-            let rowid = mv_cursor.write().current_row_id().unwrap();
-            mv_cursor.write().delete(rowid)?;
+            return_if_io!(mv_cursor.write().delete());
             return Ok(IOResult::Done(()));
         }
 
@@ -6361,7 +6341,7 @@ impl CursorTrait for BTreeCursor {
                     self.rewind_state = RewindState::NextRecord;
                     if let Some(mv_cursor) = &self.mv_cursor {
                         let mut mv_cursor = mv_cursor.write();
-                        mv_cursor.rewind();
+                        return_if_io!(mv_cursor.rewind());
                     } else {
                         let c = self.move_to_root()?;
                         if let Some(c) = c {
