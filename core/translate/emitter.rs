@@ -859,6 +859,7 @@ fn emit_delete_insns(
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
+            is_part_of_update: false,
         });
 
         if let Some(index) = iteration_index {
@@ -867,6 +868,7 @@ fn emit_delete_insns(
             program.emit_insn(Insn::Delete {
                 cursor_id: iteration_index_cursor,
                 table_name: index.name.clone(),
+                is_part_of_update: false,
             });
         }
     }
@@ -1690,6 +1692,7 @@ fn emit_update_insns(
             program.emit_insn(Insn::Delete {
                 cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
+                is_part_of_update: true,
             });
         }
 

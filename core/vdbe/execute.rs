@@ -6046,7 +6046,8 @@ pub fn op_delete(
     load_insn!(
         Delete {
             cursor_id,
-            table_name
+            table_name,
+            is_part_of_update,
         },
         insn
     );
@@ -6131,9 +6132,13 @@ pub fn op_delete(
     }
 
     state.op_delete_state.sub_state = OpDeleteSubState::MaybeCaptureRecord;
-    program
-        .n_change
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if !is_part_of_update {
+        // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
+        // i.e. the DELETE and subsequent INSERT of a row are the same "change".
+        program
+            .n_change
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

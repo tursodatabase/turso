@@ -595,6 +595,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
     });
 
     program.resolve_label(next_label, program.offset());
