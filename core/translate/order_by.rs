@@ -239,7 +239,11 @@ pub fn emit_order_by(
         plan,
         start_reg,
         t_ctx.limit_ctx,
-        Some(sort_loop_end_label),
+        if !use_heap_sort {
+            Some(sort_loop_end_label)
+        } else {
+            None
+        },
     )?;
 
     program.resolve_label(sort_loop_next_label, program.offset());
