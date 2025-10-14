@@ -616,6 +616,11 @@ impl TableReferences {
         self.joined_tables.push(joined_table);
     }
 
+    /// Add a new [OuterQueryReference] to the query plan.
+    pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
+        self.outer_query_refs.push(outer_query_reference);
+    }
+
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
     pub fn joined_tables(&self) -> &[JoinedTable] {
         &self.joined_tables

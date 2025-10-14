@@ -1951,7 +1951,12 @@ pub fn translate_expr(
             let table = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
-                .expect("table reference should be found");
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "table reference should be found: {} (referenced_tables: {:?})",
+                        table_ref_id, referenced_tables
+                    )
+                });
 
             let Some(table_column) = table.get_column_at(*column) else {
                 crate::bail_parse_error!("column index out of bounds");
