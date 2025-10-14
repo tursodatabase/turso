@@ -1976,17 +1976,22 @@ mod tests {
                 };
 
                 let query = if do_update {
-                    let new_y = if rng.random_bool(0.5) {
-                        // Update to a constant value
-                        rng.random_range(0..1000).to_string()
-                    } else {
-                        let source_col = rng.random_range(0..num_cols);
-                        // Update to a value that is a function of the another column
-                        let operator = *["+", "-"].choose(&mut rng).unwrap();
-                        let amount = rng.random_range(0..1000);
-                        format!("c{source_col} {operator} {amount}")
-                    };
-                    format!("UPDATE t SET c{affected_col} = {new_y} {where_clause}")
+                    let num_updates = rng.random_range(1..=num_cols);
+                    let mut values = Vec::new();
+                    for _ in 0..num_updates {
+                        let new_y = if rng.random_bool(0.5) {
+                            // Update to a constant value
+                            rng.random_range(0..1000).to_string()
+                        } else {
+                            let source_col = rng.random_range(0..num_cols);
+                            // Update to a value that is a function of the another column
+                            let operator = *["+", "-"].choose(&mut rng).unwrap();
+                            let amount = rng.random_range(0..1000);
+                            format!("c{source_col} {operator} {amount}")
+                        };
+                        values.push(format!("c{affected_col} = {new_y}"));
+                    }
+                    format!("UPDATE t SET {} {where_clause}", values.join(", "))
                 } else {
                     format!("DELETE FROM t {where_clause}")
                 };
