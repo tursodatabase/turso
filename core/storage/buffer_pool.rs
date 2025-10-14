@@ -427,7 +427,7 @@ impl Arena {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 mod arena {
     use libc::MAP_ANONYMOUS;
     use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
@@ -460,11 +460,11 @@ mod arena {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), miri))]
 mod arena {
     pub fn alloc(len: usize) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
-        unsafe { std::alloc::alloc(layout) }
+        unsafe { std::alloc::alloc_zeroed(layout) }
     }
     pub fn dealloc(ptr: *mut u8, len: usize) {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();

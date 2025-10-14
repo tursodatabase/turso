@@ -53,9 +53,9 @@ use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionM
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
-#[cfg(all(feature = "fs", target_family = "unix"))]
+#[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
-#[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
+#[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
@@ -791,7 +791,7 @@ impl Database {
             None => match vfs.as_ref() {
                 "memory" => Arc::new(MemoryIO::new()),
                 "syscall" => Arc::new(SyscallIO::new()?),
-                #[cfg(all(target_os = "linux", feature = "io_uring"))]
+                #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
                 "io_uring" => Arc::new(UringIO::new()?),
                 other => {
                     return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));

@@ -717,13 +717,13 @@ impl TempBufferCache {
 }
 
 cfg_block! {
-    #[cfg(all(target_os = "linux", feature = "io_uring"))] {
+    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
         mod io_uring;
         #[cfg(feature = "fs")]
         pub use io_uring::UringIO;
     }
 
-    #[cfg(target_family = "unix")] {
+    #[cfg(all(target_family = "unix", not(miri)))] {
         mod unix;
         #[cfg(feature = "fs")]
         pub use unix::UnixIO;
@@ -731,7 +731,7 @@ cfg_block! {
         pub use PlatformIO as SyscallIO;
     }
 
-    #[cfg(not(any(target_family = "unix", target_os = "android", target_os = "ios")))] {
+    #[cfg(any(not(any(target_family = "unix", target_os = "android", target_os = "ios")), miri))] {
         mod generic;
         pub use generic::GenericIO as PlatformIO;
         pub use PlatformIO as SyscallIO;

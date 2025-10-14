@@ -16,7 +16,7 @@ use std::{
     sync::{atomic::Ordering, LazyLock},
 };
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), not(miri)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

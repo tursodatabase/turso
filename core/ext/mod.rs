@@ -2,7 +2,7 @@
 mod dynamic;
 mod vtab_xconnect;
 use crate::schema::{Schema, Table};
-#[cfg(all(target_os = "linux", feature = "io_uring"))]
+#[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database};
 use crate::{vtab::VirtualTable, SymbolTable};
@@ -146,7 +146,7 @@ impl Database {
         let io: Arc<dyn IO> = match vfs {
             "memory" => Arc::new(MemoryIO::new()),
             "syscall" => Arc::new(SyscallIO::new()?),
-            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
             "io_uring" => Arc::new(UringIO::new()?),
             other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
                 Some((_, vfs)) => vfs.clone(),
