@@ -188,6 +188,11 @@ impl CompletionGroup {
         let group_completion = GroupCompletion::new(self.callback, total);
         let group = Completion::new(CompletionType::Group(group_completion));
 
+        // Store the group completion reference for later callback
+        if let CompletionType::Group(ref g) = group.get_inner().completion_type {
+            let _ = g.inner.self_completion.set(group.clone());
+        }
+
         for mut c in self.completions {
             // If the completion has not completed, link it to the group.
             if !c.finished() {
@@ -242,6 +247,8 @@ struct GroupCompletionInner {
     complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
     /// Cached result after all completions finish
     result: OnceLock<Option<CompletionError>>,
+    /// Reference to the group's own Completion for notifying parents
+    self_completion: OnceLock<Completion>,
 }
 
 impl GroupCompletion {
@@ -254,6 +261,7 @@ impl GroupCompletion {
                 outstanding: AtomicUsize::new(outstanding),
                 complete: Box::new(complete),
                 result: OnceLock::new(),
+                self_completion: OnceLock::new(),
             }),
         }
     }
@@ -452,12 +460,14 @@ impl Completion {
                 }
                 let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
 
-                // If this was the last completion, call the group callback
+                // If this was the last completion in the group, trigger the group's callback
+                // which will recursively call this same callback() method to notify parents
                 if prev == 1 {
-                    let group_result = group.result.get().and_then(|e| *e);
-                    (group.complete)(group_result.map_or(Ok(0), Err));
+                    if let Some(group_completion) = group.self_completion.get() {
+                        let group_result = group.result.get().and_then(|e| *e);
+                        group_completion.callback(group_result.map_or(Ok(0), Err));
+                    }
                 }
-                // TODO: remove self from parent group
             }
 
             result.err()
@@ -1053,5 +1063,139 @@ mod tests {
         assert!(group.succeeded());
         assert!(callback_called.load(Ordering::SeqCst));
         assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_nested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Track callbacks at different levels
+        let parent_called = Arc::new(AtomicUsize::new(0));
+        let child1_called = Arc::new(AtomicUsize::new(0));
+        let child2_called = Arc::new(AtomicUsize::new(0));
+
+        // Create child group 1 with 2 completions
+        let child1_called_clone = child1_called.clone();
+        let mut child_group1 = CompletionGroup::new(move |_| {
+            child1_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        child_group1.add(&c1);
+        child_group1.add(&c2);
+        let child_group1 = child_group1.build();
+
+        // Create child group 2 with 2 completions
+        let child2_called_clone = child2_called.clone();
+        let mut child_group2 = CompletionGroup::new(move |_| {
+            child2_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let c3 = Completion::new_write(|_| {});
+        let c4 = Completion::new_write(|_| {});
+        child_group2.add(&c3);
+        child_group2.add(&c4);
+        let child_group2 = child_group2.build();
+
+        // Create parent group containing both child groups
+        let parent_called_clone = parent_called.clone();
+        let mut parent_group = CompletionGroup::new(move |_| {
+            parent_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        parent_group.add(&child_group1);
+        parent_group.add(&child_group2);
+        let parent_group = parent_group.build();
+
+        // Initially nothing should be finished
+        assert!(!parent_group.finished());
+        assert!(!child_group1.finished());
+        assert!(!child_group2.finished());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+        assert_eq!(child1_called.load(Ordering::SeqCst), 0);
+        assert_eq!(child2_called.load(Ordering::SeqCst), 0);
+
+        // Complete first completion in child group 1
+        c1.complete(0);
+        assert!(!child_group1.finished());
+        assert!(!parent_group.finished());
+        assert_eq!(child1_called.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete second completion in child group 1 - should finish child group 1
+        c2.complete(0);
+        assert!(child_group1.finished());
+        assert!(child_group1.succeeded());
+        assert_eq!(child1_called.load(Ordering::SeqCst), 1);
+
+        // Parent should not be finished yet because child group 2 is still pending
+        assert!(!parent_group.finished());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete first completion in child group 2
+        c3.complete(0);
+        assert!(!child_group2.finished());
+        assert!(!parent_group.finished());
+        assert_eq!(child2_called.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete second completion in child group 2 - should finish everything
+        c4.complete(0);
+        assert!(child_group2.finished());
+        assert!(child_group2.succeeded());
+        assert_eq!(child2_called.load(Ordering::SeqCst), 1);
+
+        // Parent should now be finished
+        assert!(parent_group.finished());
+        assert!(parent_group.succeeded());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 1);
+        assert!(parent_group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_nested_with_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let parent_called = Arc::new(AtomicBool::new(false));
+        let child_called = Arc::new(AtomicBool::new(false));
+
+        // Create child group with 2 completions
+        let child_called_clone = child_called.clone();
+        let mut child_group = CompletionGroup::new(move |_| {
+            child_called_clone.store(true, Ordering::SeqCst);
+        });
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        child_group.add(&c1);
+        child_group.add(&c2);
+        let child_group = child_group.build();
+
+        // Create parent group containing child group and another completion
+        let parent_called_clone = parent_called.clone();
+        let mut parent_group = CompletionGroup::new(move |_| {
+            parent_called_clone.store(true, Ordering::SeqCst);
+        });
+        let c3 = Completion::new_write(|_| {});
+        parent_group.add(&child_group);
+        parent_group.add(&c3);
+        let parent_group = parent_group.build();
+
+        // Complete child group with success
+        c1.complete(0);
+        c2.complete(0);
+        assert!(child_group.finished());
+        assert!(child_group.succeeded());
+        assert!(child_called.load(Ordering::SeqCst));
+
+        // Parent still pending
+        assert!(!parent_group.finished());
+        assert!(!parent_called.load(Ordering::SeqCst));
+
+        // Complete c3 with error
+        c3.error(CompletionError::Aborted);
+
+        // Parent should finish with error
+        assert!(parent_group.finished());
+        assert!(!parent_group.succeeded());
+        assert_eq!(parent_group.get_error(), Some(CompletionError::Aborted));
+        assert!(parent_called.load(Ordering::SeqCst));
     }
 }
