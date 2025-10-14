@@ -235,6 +235,7 @@ impl InteractionPlan {
                 Query::Commit(_) => stats.commit_count += 1,
                 Query::Rollback(_) => stats.rollback_count += 1,
                 Query::AlterTable(_) => stats.alter_table_count += 1,
+                Query::DropIndex(_) => stats.drop_index_count += 1,
                 Query::Placeholder => {}
             }
         }
@@ -472,11 +473,14 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                 if let InteractionType::Query(Query::Placeholder) = &interaction.interaction {
                     let stats = self.plan.stats();
 
+                    let conn_ctx = env.connection_context(interaction.connection_index);
+
                     let remaining_ = remaining(
                         env.opts.max_interactions,
                         &env.profile.query,
                         &stats,
                         env.profile.experimental_mvcc,
+                        &conn_ctx,
                     );
 
                     let InteractionsType::Property(property) =
@@ -484,8 +488,6 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                     else {
                         unreachable!("only properties have extensional queries");
                     };
-
-                    let conn_ctx = env.connection_context(interaction.connection_index);
 
                     let queries = possible_queries(conn_ctx.tables());
                     let query_distr = QueryDistribution::new(queries, &remaining_);
@@ -768,13 +770,14 @@ pub(crate) struct InteractionStats {
     pub commit_count: u32,
     pub rollback_count: u32,
     pub alter_table_count: u32,
+    pub drop_index_count: u32,
 }
 
 impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -786,6 +789,7 @@ impl Display for InteractionStats {
             self.commit_count,
             self.rollback_count,
             self.alter_table_count,
+            self.drop_index_count,
         )
     }
 }
@@ -1272,12 +1276,13 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
             &env.profile.query,
             &stats,
             env.profile.experimental_mvcc,
+            conn_ctx,
         );
 
         let queries = possible_queries(conn_ctx.tables());
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![
             (
                 query_distr.weights().total_weight(),

@@ -1380,6 +1380,7 @@ pub(super) struct Remaining {
     pub update: u32,
     pub drop: u32,
     pub alter_table: u32,
+    pub drop_index: u32,
 }
 
 pub(super) fn remaining(
@@ -1387,6 +1388,7 @@ pub(super) fn remaining(
     opts: &QueryProfile,
     stats: &InteractionStats,
     mvcc: bool,
+    context: &impl GenerationContext,
 ) -> Remaining {
     let total_weight = opts.total_weight();
 
@@ -1398,6 +1400,7 @@ pub(super) fn remaining(
     let total_update = (max_interactions * opts.update_weight) / total_weight;
     let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
     let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
+    let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
 
     let remaining_select = total_select
         .checked_sub(stats.select_count)
@@ -1423,9 +1426,23 @@ pub(super) fn remaining(
         .checked_sub(stats.alter_table_count)
         .unwrap_or_default();
 
+    let mut remaining_drop_index = total_drop_index
+        .checked_sub(stats.alter_table_count)
+        .unwrap_or_default();
+
     if mvcc {
         // TODO: index not supported yet for mvcc
         remaining_create_index = 0;
+        remaining_drop_index = 0;
+    }
+
+    // if there are no indexes do not allow creation of drop_index
+    if !context
+        .tables()
+        .iter()
+        .any(|table| !table.indexes.is_empty())
+    {
+        remaining_drop_index = 0;
     }
 
     Remaining {
@@ -1437,6 +1454,7 @@ pub(super) fn remaining(
         drop: remaining_drop,
         update: remaining_update,
         alter_table: remaining_alter_table,
+        drop_index: remaining_drop_index,
     }
 }
 

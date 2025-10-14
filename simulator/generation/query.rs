@@ -10,7 +10,8 @@ use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
         query::{
-            Create, CreateIndex, Delete, Insert, Select, alter_table::AlterTable, update::Update,
+            Create, CreateIndex, Delete, DropIndex, Insert, Select, alter_table::AlterTable,
+            update::Update,
         },
         table::Table,
     },
@@ -89,6 +90,19 @@ fn random_alter_table<R: rand::Rng + ?Sized>(
     Query::AlterTable(AlterTable::arbitrary(rng, conn_ctx))
 }
 
+fn random_drop_index<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    assert!(
+        conn_ctx
+            .tables()
+            .iter()
+            .any(|table| !table.indexes.is_empty())
+    );
+    Query::DropIndex(DropIndex::arbitrary(rng, conn_ctx))
+}
+
 /// Possible queries that can be generated given the table state
 ///
 /// Does not take into account transactional statements
@@ -117,6 +131,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Drop => random_drop,
             QueryDiscriminants::CreateIndex => random_create_index,
             QueryDiscriminants::AlterTable => random_alter_table,
+            QueryDiscriminants::DropIndex => random_drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
@@ -140,6 +155,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Drop => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
             QueryDiscriminants::AlterTable => remaining.alter_table,
+            QueryDiscriminants::DropIndex => remaining.drop_index,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {

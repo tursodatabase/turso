@@ -24,6 +24,8 @@ pub struct QueryProfile {
     pub drop_table_weight: u32,
     #[garde(skip)]
     pub alter_table_weight: u32,
+    #[garde(skip)]
+    pub drop_index: u32,
 }
 
 impl Default for QueryProfile {
@@ -38,6 +40,7 @@ impl Default for QueryProfile {
             delete_weight: 20,
             drop_table_weight: 2,
             alter_table_weight: 2,
+            drop_index: 2,
         }
     }
 }

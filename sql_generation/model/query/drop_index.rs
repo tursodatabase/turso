@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DropIndex {
     pub index_name: String,
+    pub table_name: String,
 }
 
 impl std::fmt::Display for DropIndex {

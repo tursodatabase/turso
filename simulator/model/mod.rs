@@ -7,7 +7,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
-        Create, CreateIndex, Delete, Drop, Insert, Select,
+        Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
@@ -30,6 +30,7 @@ pub enum Query {
     Drop(Drop),
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
+    DropIndex(DropIndex),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
@@ -76,6 +77,9 @@ impl Query {
             })
             | Query::AlterTable(AlterTable {
                 table_name: table, ..
+            })
+            | Query::DropIndex(DropIndex {
+                table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
             Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
             Query::Placeholder => IndexSet::new(),
@@ -97,6 +101,9 @@ impl Query {
             })
             | Query::AlterTable(AlterTable {
                 table_name: table, ..
+            })
+            | Query::DropIndex(DropIndex {
+                table_name: table, ..
             }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
@@ -115,7 +122,11 @@ impl Query {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self,
-            Self::Create(..) | Self::CreateIndex(..) | Self::Drop(..) | Self::AlterTable(..)
+            Self::Create(..)
+                | Self::CreateIndex(..)
+                | Self::Drop(..)
+                | Self::AlterTable(..)
+                | Self::DropIndex(..)
         )
     }
 }
@@ -131,6 +142,7 @@ impl Display for Query {
             Self::Drop(drop) => write!(f, "{drop}"),
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
+            Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
@@ -152,6 +164,7 @@ impl Shadow for Query {
             Query::Drop(drop) => drop.shadow(env),
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
+            Query::DropIndex(drop_index) => drop_index.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
@@ -170,6 +183,7 @@ bitflags! {
         const DROP = 1 << 5;
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
+        const DROP_INDEX = 1 << 8;
     }
 }
 
@@ -199,6 +213,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Drop => Self::DROP,
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
+            QueryDiscriminants::DropIndex => Self::DROP_INDEX,
             QueryDiscriminants::Begin
             | QueryDiscriminants::Commit
             | QueryDiscriminants::Rollback => {
@@ -221,6 +236,7 @@ impl QueryDiscriminants {
         QueryDiscriminants::Drop,
         QueryDiscriminants::CreateIndex,
         QueryDiscriminants::AlterTable,
+        QueryDiscriminants::DropIndex,
     ];
 }
 
@@ -580,6 +596,22 @@ impl Shadow for AlterTable {
                 });
             }
         };
+        Ok(vec![])
+    }
+}
+
+impl Shadow for DropIndex {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let table = tables
+            .iter_mut()
+            .find(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", self.table_name))?;
+
+        table
+            .indexes
+            .retain(|index| index.index_name != self.index_name);
         Ok(vec![])
     }
 }
