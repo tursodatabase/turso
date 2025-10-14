@@ -2429,9 +2429,7 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                let res = with_header(&pager, mv_store, program, |header| {
-                    header.schema_cookie.get()
-                });
+                let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -10221,6 +10219,21 @@ where
             .map(IOResult::Done)
     } else {
         pager.with_header_mut(&f)
+    }
+}
+
+fn get_schema_cookie(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+) -> Result<IOResult<u32>> {
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.get_mv_tx_id();
+        mv_store
+            .with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
+            .map(IOResult::Done)
+    } else {
+        pager.get_schema_cookie()
     }
 }
 
