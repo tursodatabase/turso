@@ -918,40 +918,37 @@ impl JoinedTable {
                     && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {
                     None
+                } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                    target_table,
+                    ..
+                }) = &mode
+                {
+                    // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
+                    // in case it wasn't already allocated when populating the ephemeral table.
+                    Some(program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(target_table.internal_id),
+                        match &target_table.table {
+                            Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
+                            Table::Virtual(virtual_table) => {
+                                CursorType::VirtualTable(virtual_table.clone())
+                            }
+                            _ => unreachable!("target table must be a btree or virtual table"),
+                        },
+                    ))
                 } else {
-                    if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
-                        target_table,
-                        ..
-                    }) = &mode
-                    {
-                        // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
-                        // in case it wasn't already allocated when populating the ephemeral table.
-                        Some(program.alloc_cursor_id_keyed_if_not_exists(
-                            CursorKey::table(target_table.internal_id),
-                            match &target_table.table {
-                                Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
-                                Table::Virtual(virtual_table) => {
-                                    CursorType::VirtualTable(virtual_table.clone())
-                                }
-                                _ => unreachable!("target table must be a btree or virtual table"),
-                            },
-                        ))
-                    } else {
-                        // Check if this is a materialized view
-                        let cursor_type =
-                            if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                                CursorType::MaterializedView(btree.clone(), view_mutex)
-                            } else {
-                                CursorType::BTreeTable(btree.clone())
-                            };
-                        Some(
-                            program.alloc_cursor_id_keyed(
-                                CursorKey::table(self.internal_id),
-                                cursor_type,
-                            ),
-                        )
-                    }
+                    // Check if this is a materialized view
+                    let cursor_type =
+                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
+                            CursorType::MaterializedView(btree.clone(), view_mutex)
+                        } else {
+                            CursorType::BTreeTable(btree.clone())
+                        };
+                    Some(
+                        program
+                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
+                    )
                 };
+
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
                         CursorKey::index(self.internal_id, index.clone()),
