@@ -924,8 +924,9 @@ impl JoinedTable {
                         ..
                     }) = &mode
                     {
-                        // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table though.
-                        Some(program.alloc_cursor_id_keyed(
+                        // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
+                        // in case it wasn't already allocated when populating the ephemeral table.
+                        Some(program.alloc_cursor_id_keyed_if_not_exists(
                             CursorKey::table(target_table.internal_id),
                             match &target_table.table {
                                 Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
