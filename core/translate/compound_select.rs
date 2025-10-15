@@ -6,7 +6,7 @@ use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::BranchOffset;
-use crate::{emit_explain, QueryMode, SymbolTable};
+use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
 use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
@@ -40,56 +40,66 @@ pub fn emit_program_for_compound_select(
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
-    let limit_ctx = limit.as_ref().map(|limit| {
-        let reg = program.alloc_register();
-        match limit.as_ref() {
-            Expr::Literal(Literal::Numeric(n)) => {
-                if let Ok(value) = n.parse::<i64>() {
-                    program.add_comment(program.offset(), "LIMIT counter");
-                    program.emit_insn(Insn::Integer { value, dest: reg });
-                } else {
-                    let value = n.parse::<f64>().unwrap();
-                    program.emit_insn(Insn::Real { value, dest: reg });
+    let limit_ctx = limit
+        .as_ref()
+        .map(|limit| {
+            let reg = program.alloc_register();
+            match limit.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::MustBeInt { reg });
+                    }
+                }
+                _ => {
+                    _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
                     program.add_comment(program.offset(), "LIMIT counter");
                     program.emit_insn(Insn::MustBeInt { reg });
                 }
             }
-            _ => {
-                _ = translate_expr(program, None, limit, reg, &right_most_ctx.resolver);
-                program.add_comment(program.offset(), "LIMIT counter");
-                program.emit_insn(Insn::MustBeInt { reg });
-            }
-        }
-        LimitCtx::new_shared(reg)
-    });
-    let offset_reg = offset.as_ref().map(|offset_expr| {
-        let reg = program.alloc_register();
-        match offset_expr.as_ref() {
-            Expr::Literal(Literal::Numeric(n)) => {
-                // Compile-time constant offset
-                if let Ok(value) = n.parse::<i64>() {
-                    program.emit_insn(Insn::Integer { value, dest: reg });
-                } else {
-                    let value = n.parse::<f64>().unwrap();
-                    program.emit_insn(Insn::Real { value, dest: reg });
+            Ok::<_, LimboError>(LimitCtx::new_shared(reg))
+        })
+        .transpose()?;
+    let offset_reg = offset
+        .as_ref()
+        .map(|offset_expr| {
+            let reg = program.alloc_register();
+            match offset_expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    // Compile-time constant offset
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer { value, dest: reg });
+                    } else {
+                        let value = n
+                            .parse::<f64>()
+                            .map_err(|_| LimboError::ParseError("invalid offset".to_string()))?;
+                        program.emit_insn(Insn::Real { value, dest: reg });
+                    }
+                }
+                _ => {
+                    _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
                 }
             }
-            _ => {
-                _ = translate_expr(program, None, offset_expr, reg, &right_most_ctx.resolver);
-            }
-        }
-        program.add_comment(program.offset(), "OFFSET counter");
-        program.emit_insn(Insn::MustBeInt { reg });
-        let combined_reg = program.alloc_register();
-        program.add_comment(program.offset(), "OFFSET + LIMIT");
-        program.emit_insn(Insn::OffsetLimit {
-            offset_reg: reg,
-            combined_reg,
-            limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
-        });
+            program.add_comment(program.offset(), "OFFSET counter");
+            program.emit_insn(Insn::MustBeInt { reg });
+            let combined_reg = program.alloc_register();
+            program.add_comment(program.offset(), "OFFSET + LIMIT");
+            program.emit_insn(Insn::OffsetLimit {
+                offset_reg: reg,
+                combined_reg,
+                limit_reg: limit_ctx.as_ref().unwrap().reg_limit,
+            });
 
-        reg
-    });
+            Ok::<_, LimboError>(reg)
+        })
+        .transpose()?;
 
     // When a compound SELECT is part of a query that yields results to a coroutine (e.g. within an INSERT clause),
     // we must allocate registers for the result columns to be yielded. Each subselect will then yield to

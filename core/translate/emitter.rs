@@ -256,7 +256,7 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset);
+    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
 
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
@@ -427,7 +427,7 @@ fn emit_program_for_delete(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, &mut t_ctx, &plan.limit, &None);
+    init_limit(program, &mut t_ctx, &plan.limit, &None)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -879,7 +879,7 @@ fn emit_program_for_update(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset);
+    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -1953,12 +1953,12 @@ fn init_limit(
     t_ctx: &mut TranslateCtx,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
-) {
+) -> Result<()> {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));
     }
     let Some(limit_ctx) = &t_ctx.limit_ctx else {
-        return;
+        return Ok(());
     };
 
     if limit_ctx.initialize_counter {
@@ -2004,7 +2004,7 @@ fn init_limit(
                             dest: offset_reg,
                         });
                     } else {
-                        let value = n.parse::<f64>().unwrap();
+                        let value = n.parse::<f64>()?;
                         program.emit_insn(Insn::Real {
                             value,
                             dest: limit_ctx.reg_limit,
@@ -2041,6 +2041,8 @@ fn init_limit(
         target_pc: main_loop_end,
         jump_if_null: false,
     });
+
+    Ok(())
 }
 
 /// We have `Expr`s which have *not* had column references bound to them,
