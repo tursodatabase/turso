@@ -5082,30 +5082,26 @@ impl CursorTrait for BTreeCursor {
                 first_overflow_page,
                 ..
             }) => (payload, payload_size, first_overflow_page),
+            BTreeCell::IndexLeafCell(IndexLeafCell {
+                payload,
+                payload_size,
+                first_overflow_page,
+            }) => (payload, payload_size, first_overflow_page),
             BTreeCell::IndexInteriorCell(IndexInteriorCell {
                 payload,
                 payload_size,
                 first_overflow_page,
                 ..
             }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexLeafCell(IndexLeafCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-            }) => (payload, payload_size, first_overflow_page),
             _ => unreachable!("unexpected page_type"),
         };
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .start_serialization(payload);
+            let mut record = self.get_immutable_record_or_create();
+            let record = record.as_mut().unwrap();
+            record.invalidate();
+            record.start_serialization(payload);
             self.record_cursor.borrow_mut().invalidate();
         };
 
