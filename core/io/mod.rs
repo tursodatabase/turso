@@ -182,8 +182,8 @@ impl CompletionGroup {
     pub fn build(self) -> Completion {
         let total = self.completions.len();
         if total == 0 {
-            let group_completion = GroupCompletion::new(self.callback, 0);
-            return Completion::new(CompletionType::Group(group_completion));
+            (self.callback)(Ok(0));
+            return Completion::new_yield();
         }
         let group_completion = GroupCompletion::new(self.callback, total);
         let group = Completion::new(CompletionType::Group(group_completion));
@@ -759,11 +759,24 @@ mod tests {
 
     #[test]
     fn test_completion_group_empty() {
-        let group = CompletionGroup::new(|_| {});
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_clone = callback_called.clone();
+
+        let group = CompletionGroup::new(move |_| {
+            callback_called_clone.store(true, Ordering::SeqCst);
+        });
         let group = group.build();
         assert!(group.finished());
         assert!(group.succeeded());
         assert!(group.get_error().is_none());
+
+        // Verify the callback was actually called
+        assert!(
+            callback_called.load(Ordering::SeqCst),
+            "callback should be called for empty group"
+        );
     }
 
     #[test]
