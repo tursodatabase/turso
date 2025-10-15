@@ -94,6 +94,7 @@ fn setup_database(db_path: &str) -> Result<Connection> {
 
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "fullfsync", "true")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_table (
@@ -115,6 +116,9 @@ fn worker_thread(
     compute_usec: u64,
 ) -> Result<u64> {
     let conn = Connection::open(&db_path)?;
+
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "fullfsync", "true")?;
 
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
 
