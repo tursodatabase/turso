@@ -324,6 +324,40 @@ pub fn order_by_sorter_insert(
             )?;
         }
     }
+
+    let SortMetadata {
+        sort_cursor,
+        reg_sorter_data,
+        use_heap_sort,
+        ..
+    } = sort_metadata;
+
+    let (insert_label, skip_label) = if *use_heap_sort {
+        // skip records which greater than current top-k maintained in a separate BTreeIndex
+        let insert_label = program.allocate_label();
+        let skip_label = program.allocate_label();
+        let limit = t_ctx.limit_ctx.as_ref().expect("limit must be set");
+        let limit_reg = t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit);
+        program.emit_insn(Insn::IfPos {
+            reg: limit_reg,
+            target_pc: insert_label,
+            decrement_by: 1,
+        });
+        program.emit_insn(Insn::Last {
+            cursor_id: *sort_cursor,
+            pc_if_empty: insert_label,
+        });
+        program.emit_insn(Insn::IdxLE {
+            cursor_id: *sort_cursor,
+            start_reg,
+            num_regs: orderby_sorter_column_count,
+            target_pc: skip_label,
+        });
+        (Some(insert_label), Some(skip_label))
+    } else {
+        (None, None)
+    };
+
     let mut cur_reg = start_reg + order_by_len;
     if sort_metadata.has_sequence {
         program.emit_insn(Insn::Sequence {
@@ -417,41 +451,13 @@ pub fn order_by_sorter_insert(
         }
     }
 
-    let SortMetadata {
-        sort_cursor,
-        reg_sorter_data,
-        use_heap_sort,
-        ..
-    } = sort_metadata;
-
     if *use_heap_sort {
-        // maintain top-k records in the index instead of materializing the whole sequence
-        let insert_label = program.allocate_label();
-        let skip_label = program.allocate_label();
-        let limit = t_ctx.limit_ctx.as_ref().expect("limit must be set");
-        let limit_reg = t_ctx.reg_limit_offset_sum.unwrap_or(limit.reg_limit);
-        program.emit_insn(Insn::IfPos {
-            reg: limit_reg,
-            target_pc: insert_label,
-            decrement_by: 1,
-        });
-        program.emit_insn(Insn::Last {
-            cursor_id: *sort_cursor,
-            pc_if_empty: insert_label,
-        });
-        program.emit_insn(Insn::IdxLE {
-            cursor_id: *sort_cursor,
-            start_reg,
-            num_regs: orderby_sorter_column_count,
-            target_pc: skip_label,
-        });
-
         program.emit_insn(Insn::Delete {
             cursor_id: *sort_cursor,
             table_name: "".to_string(),
         });
 
-        program.preassign_label_to_next_insn(insert_label);
+        program.preassign_label_to_next_insn(insert_label.unwrap());
         program.emit_insn(Insn::MakeRecord {
             start_reg,
             count: orderby_sorter_column_count,
@@ -466,7 +472,7 @@ pub fn order_by_sorter_insert(
             unpacked_count: None,
             flags: IdxInsertFlags::new(),
         });
-        program.preassign_label_to_next_insn(skip_label);
+        program.preassign_label_to_next_insn(skip_label.unwrap());
     } else {
         sorter_insert(
             program,
