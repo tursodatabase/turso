@@ -1486,71 +1486,40 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
-///
-/// This function is a performance-optimized version of `read_varint()` that handles
-/// the most common varint cases inline before falling back to the full implementation.
-/// It follows the same varint encoding as SQLite.
-///
-/// # Optimized Cases
-///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-///
-/// This function is similar to `sqlite3GetVarint32`
-#[inline(always)]
-pub fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
-}
-
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut v: u64 = 0;
-    for i in 0..8 {
-        match buf.get(i) {
-            Some(c) => {
-                v = (v << 7) + (c & 0x7f) as u64;
-                if (c & 0x80) == 0 {
-                    return Ok((v, i + 1));
-                }
-            }
-            None => {
-                crate::bail_corrupt_error!("Invalid varint");
-            }
+    let mut i = 0;
+    let chunks = buf.chunks_exact(2);
+    for chunk in chunks {
+        let c1 = chunk[0];
+        v = (v << 7) + (c1 & 0x7f) as u64;
+        i += 1;
+        if (c1 & 0x80) == 0 {
+            return Ok((v, i));
+        }
+        let c2 = chunk[1];
+        v = (v << 7) + (c2 & 0x7f) as u64;
+        i += 1;
+        if (c2 & 0x80) == 0 {
+            return Ok((v, i));
+        }
+        if i == 8 {
+            break;
         }
     }
-    match buf.get(8) {
+    match buf.get(i) {
         Some(&c) => {
-            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
-            // If those are zero, this should be treated as corrupt.
-            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-            if (v >> 48) == 0 {
-                bail_corrupt_error!("Invalid varint");
+            if i < 8 && (c & 0x80) == 0 {
+                return Ok(((v << 7) + c as u64, i + 1));
+            } else if i == 8 && (v >> 48) > 0 {
+                // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+                // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+                // If those are zero, this should be treated as corrupt.
+                // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+                return Ok(((v << 8) + c as u64, i + 1));
             }
-            v = (v << 8) + c as u64;
-            Ok((v, 9))
+            bail_corrupt_error!("Invalid varint");
         }
         None => {
             bail_corrupt_error!("Invalid varint");
