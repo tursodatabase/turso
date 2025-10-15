@@ -11,7 +11,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
@@ -1595,7 +1595,7 @@ pub fn op_column(
                             let mut record_cursor = cursor.record_cursor_mut();
 
                             if record_cursor.offsets.is_empty() {
-                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
+                                let (header_size, header_len_bytes) = read_varint(payload)?;
                                 let header_size = header_size as usize;
 
                                 debug_assert!(header_size <= payload.len() && header_size <= 98307, "header_size: {header_size}, header_len_bytes: {header_len_bytes}, payload.len(): {}", payload.len());
@@ -1617,8 +1617,7 @@ pub fn op_column(
                             while record_cursor.serial_types.len() <= target_column
                                 && parse_pos < record_cursor.header_size
                             {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
+                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
                                 record_cursor.serial_types.push(serial_type);
                                 parse_pos += varint_len;
                                 let data_size = match serial_type {
