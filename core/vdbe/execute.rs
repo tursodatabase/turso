@@ -5915,12 +5915,9 @@ pub fn op_insert(
                 };
                 if let Some(rowid) = maybe_rowid {
                     program.connection.update_last_rowid(rowid);
-
-                    if !flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
-                        program
-                            .n_change
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
+                    program
+                        .n_change
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
