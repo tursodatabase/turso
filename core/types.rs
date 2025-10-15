@@ -218,6 +218,12 @@ pub enum ValueRef<'a> {
     Blob(&'a [u8]),
 }
 
+impl<'a, 'b> From<&'b ValueRef<'a>> for ValueRef<'a> {
+    fn from(value: &'b ValueRef<'a>) -> Self {
+        *value
+    }
+}
+
 impl Debug for ValueRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1813,12 +1819,15 @@ fn compare_records_int(
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_string(
+fn compare_records_string<'a, T>(
     serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
+    unpacked: &'a [T],
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
-) -> Result<std::cmp::Ordering> {
+) -> Result<std::cmp::Ordering>
+where
+    ValueRef<'a>: From<&'a T>,
+{
     turso_assert!(
         index_info.key_info.len() >= unpacked.len(),
         "index_info.key_info.len() < unpacked.len()"
@@ -1846,7 +1855,7 @@ fn compare_records_string(
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let ValueRef::Text(rhs_text, _) = &unpacked[0] else {
+    let ValueRef::Text(rhs_text, _) = (&unpacked[0]).into() else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
@@ -1925,13 +1934,16 @@ fn compare_records_string(
 /// The serialized and unpacked records do not have to contain the same number
 /// of fields. If all fields that appear in both records are equal, then
 /// `tie_breaker` is returned.
-pub fn compare_records_generic(
+pub fn compare_records_generic<'a, T>(
     serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
+    unpacked: &'a [T],
     index_info: &IndexInfo,
     skip: usize,
     tie_breaker: std::cmp::Ordering,
-) -> Result<std::cmp::Ordering> {
+) -> Result<std::cmp::Ordering>
+where
+    ValueRef<'a>: From<&'a T>,
+{
     turso_assert!(
         index_info.key_info.len() >= unpacked.len(),
         "index_info.key_info.len() < unpacked.len()"
@@ -1971,7 +1983,7 @@ pub fn compare_records_generic(
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
-        let rhs_value = &unpacked[field_idx];
+        let rhs_value = (&unpacked[field_idx]).into();
 
         let lhs_value = match serial_type.kind() {
             SerialTypeKind::ConstInt0 => ValueRef::Integer(0),
@@ -1993,14 +2005,14 @@ pub fn compare_records_generic(
             }
 
             (ValueRef::Integer(lhs_int), ValueRef::Float(rhs_float)) => {
-                sqlite_int_float_compare(*lhs_int, *rhs_float)
+                sqlite_int_float_compare(*lhs_int, rhs_float)
             }
 
             (ValueRef::Float(lhs_float), ValueRef::Integer(rhs_int)) => {
-                sqlite_int_float_compare(*rhs_int, *lhs_float).reverse()
+                sqlite_int_float_compare(rhs_int, *lhs_float).reverse()
             }
 
-            _ => lhs_value.partial_cmp(rhs_value).unwrap(),
+            _ => lhs_value.partial_cmp(&rhs_value).unwrap(),
         };
 
         let final_comparison = match index_info.key_info[field_idx].sort_order {
