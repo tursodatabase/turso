@@ -433,3 +433,17 @@ do_execsql_test subquery-count-all {
         where u.id < 100
     );
 } {1089}
+
+do_execsql_test_on_specific_db {:memory:} subquery-cte-available-in-arbitrary-depth {
+    with cte as (select 1 as one)
+    select onehundredandeleven+1 as onehundredandtwelve
+    from (
+        with cte2 as (select 10 as ten)
+        select onehundredandone+ten as onehundredandeleven
+        from (
+            with cte3 as (select 100 as hundred)
+            select one+hundred as onehundredandone
+            from cte join cte3
+        ) join cte2
+    );
+} {112}
