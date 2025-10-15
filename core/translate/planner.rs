@@ -317,11 +317,26 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
+            let outer_query_refs_for_subquery = table_references
+                .outer_query_refs()
+                .iter()
+                .cloned()
+                .chain(
+                    ctes.iter()
+                        .cloned()
+                        .map(|t: JoinedTable| OuterQueryReference {
+                            identifier: t.identifier,
+                            internal_id: t.internal_id,
+                            table: t.table,
+                            col_used_mask: ColumnUsedMask::default(),
+                        }),
+                )
+                .collect::<Vec<_>>();
             let Plan::Select(subplan) = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
-                table_references.outer_query_refs(),
+                &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?
