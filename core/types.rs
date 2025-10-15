@@ -1622,11 +1622,11 @@ pub enum RecordCompare {
 }
 
 impl RecordCompare {
-    pub fn compare(
+    pub fn compare<'short, 'long: 'short>(
         &self,
-        serialized: &ImmutableRecord,
-        unpacked: &[ValueRef],
-        index_info: &IndexInfo,
+        serialized: &'short ImmutableRecord,
+        unpacked: impl Iterator<Item = &'long ValueRef<'long>> + Clone,
+        index_info: &'long IndexInfo,
         skip: usize,
         tie_breaker: std::cmp::Ordering,
     ) -> Result<std::cmp::Ordering> {
@@ -1712,14 +1712,14 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_int(
-    serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
-    index_info: &IndexInfo,
+fn compare_records_int<'short, 'long: 'short>(
+    serialized: &'short ImmutableRecord,
+    unpacked: impl Iterator<Item = impl std::borrow::Borrow<ValueRef<'long>>> + Clone,
+    index_info: &'long IndexInfo,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
+    debug_assert!(
+        index_info.key_info.len() >= unpacked.clone().count(),
         "index_info.key_info.len() < unpacked.len()"
     );
     let payload = serialized.get_payload();
@@ -1748,7 +1748,8 @@ fn compare_records_int(
     let data_start = header_size;
 
     let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
-    let ValueRef::Integer(rhs_int) = unpacked[0] else {
+    let first_value = unpacked.clone().next().unwrap();
+    let ValueRef::Integer(rhs_int) = first_value.borrow() else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
     let comparison = match index_info.key_info[0].sort_order {
@@ -1758,7 +1759,7 @@ fn compare_records_int(
     match comparison {
         std::cmp::Ordering::Equal => {
             // First fields equal, compare remaining fields if any
-            if unpacked.len() > 1 {
+            if unpacked.clone().count() > 1 {
                 return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
             }
             Ok(tie_breaker)
@@ -1805,14 +1806,14 @@ fn compare_records_int(
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_string(
-    serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
-    index_info: &IndexInfo,
+fn compare_records_string<'short, 'long: 'short>(
+    serialized: &'short ImmutableRecord,
+    unpacked: impl Iterator<Item = impl std::borrow::Borrow<ValueRef<'long>>> + Clone,
+    index_info: &'long IndexInfo,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
+    debug_assert!(
+        index_info.key_info.len() >= unpacked.clone().count(),
         "index_info.key_info.len() < unpacked.len()"
     );
     let payload = serialized.get_payload();
@@ -1838,7 +1839,8 @@ fn compare_records_string(
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let ValueRef::Text(rhs_text, _) = &unpacked[0] else {
+    let first_value = unpacked.clone().next().unwrap();
+    let ValueRef::Text(rhs_text, _) = first_value.borrow() else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
@@ -1876,7 +1878,7 @@ fn compare_records_string(
                 return Ok(adjusted);
             }
 
-            if unpacked.len() > 1 {
+            if unpacked.clone().count() > 1 {
                 return compare_records_generic(serialized, unpacked, index_info, 1, tie_breaker);
             }
             Ok(tie_breaker)
@@ -1917,15 +1919,15 @@ fn compare_records_string(
 /// The serialized and unpacked records do not have to contain the same number
 /// of fields. If all fields that appear in both records are equal, then
 /// `tie_breaker` is returned.
-pub fn compare_records_generic(
-    serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
-    index_info: &IndexInfo,
+pub fn compare_records_generic<'short, 'long: 'short>(
+    serialized: &'short ImmutableRecord,
+    unpacked: impl Iterator<Item = impl std::borrow::Borrow<ValueRef<'long>>> + Clone,
+    index_info: &'long IndexInfo,
     skip: usize,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
+    debug_assert!(
+        index_info.key_info.len() >= unpacked.clone().count(),
         "index_info.key_info.len() < unpacked.len()"
     );
     let payload = serialized.get_payload();
@@ -1957,13 +1959,15 @@ pub fn compare_records_generic(
         }
     }
 
-    let mut field_idx = skip;
-    while field_idx < unpacked.len() && header_pos < header_end {
+    for (field_idx, rhs_value) in unpacked.enumerate().skip(skip) {
+        if header_pos >= header_end {
+            break;
+        }
+
         let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
-        let rhs_value = &unpacked[field_idx];
 
         let lhs_value = match serial_type.kind() {
             SerialTypeKind::ConstInt0 => ValueRef::Integer(0),
@@ -1976,7 +1980,7 @@ pub fn compare_records_generic(
             }
         };
 
-        let comparison = match (&lhs_value, rhs_value) {
+        let comparison = match (&lhs_value, rhs_value.borrow()) {
             (ValueRef::Text(lhs_text, _), ValueRef::Text(rhs_text, _)) => {
                 index_info.key_info[field_idx].collation.compare_strings(
                     &String::from_utf8_lossy(lhs_text),
@@ -1992,7 +1996,7 @@ pub fn compare_records_generic(
                 sqlite_int_float_compare(*rhs_int, *lhs_float).reverse()
             }
 
-            _ => lhs_value.partial_cmp(rhs_value).unwrap(),
+            _ => lhs_value.partial_cmp(rhs_value.borrow()).unwrap(),
         };
 
         let final_comparison = match index_info.key_info[field_idx].sort_order {
@@ -2003,8 +2007,6 @@ pub fn compare_records_generic(
         if final_comparison != std::cmp::Ordering::Equal {
             return Ok(final_comparison);
         }
-
-        field_idx += 1;
     }
 
     Ok(tie_breaker)
@@ -2638,7 +2640,13 @@ mod tests {
 
         let comparer = find_compare(&unpacked_values, index_info);
         let optimized_result = comparer
-            .compare(&serialized, &unpacked_values, index_info, 0, tie_breaker)
+            .compare(
+                &serialized,
+                unpacked_values.iter(),
+                index_info,
+                0,
+                tie_breaker,
+            )
             .unwrap();
 
         assert_eq!(
@@ -2646,9 +2654,14 @@ mod tests {
             "Test '{test_name}' failed: Full Comparison: {gold_result:?}, Optimized: {optimized_result:?}, Strategy: {comparer:?}"
         );
 
-        let generic_result =
-            compare_records_generic(&serialized, &unpacked_values, index_info, 0, tie_breaker)
-                .unwrap();
+        let generic_result = compare_records_generic(
+            &serialized,
+            unpacked_values.iter(),
+            index_info,
+            0,
+            tie_breaker,
+        )
+        .unwrap();
         assert_eq!(
             gold_result, generic_result,
             "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}"
@@ -3047,10 +3060,22 @@ mod tests {
         ];
 
         let tie_breaker = std::cmp::Ordering::Equal;
-        let result_skip_0 =
-            compare_records_generic(&serialized, &unpacked, &index_info, 0, tie_breaker).unwrap();
-        let result_skip_1 =
-            compare_records_generic(&serialized, &unpacked, &index_info, 1, tie_breaker).unwrap();
+        let result_skip_0 = compare_records_generic(
+            &serialized,
+            unpacked.clone().into_iter(),
+            &index_info,
+            0,
+            tie_breaker,
+        )
+        .unwrap();
+        let result_skip_1 = compare_records_generic(
+            &serialized,
+            unpacked.into_iter(),
+            &index_info,
+            1,
+            tie_breaker,
+        )
+        .unwrap();
 
         assert_eq!(result_skip_0, std::cmp::Ordering::Less);
 

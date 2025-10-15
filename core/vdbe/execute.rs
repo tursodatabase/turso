@@ -3410,7 +3410,7 @@ pub fn op_idx_ge(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,             // The serialized record from the index
-                &values,                 // The record built from registers
+                values,                  // The record built from registers
                 cursor.get_index_info(), // Sort order flags
                 0,
                 tie_breaker,
@@ -3478,7 +3478,7 @@ pub fn op_idx_le(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3529,7 +3529,7 @@ pub fn op_idx_gt(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3581,7 +3581,7 @@ pub fn op_idx_lt(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,

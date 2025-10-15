@@ -1815,7 +1815,7 @@ impl BTreeCursor {
                 let interior_cell_vs_index_key = record_comparer
                     .compare(
                         record,
-                        &key_values,
+                        key_values.iter(),
                         self.index_info
                             .as_ref()
                             .expect("indexbtree_move_to without index_info"),
@@ -2167,7 +2167,7 @@ impl BTreeCursor {
                 self.record_cursor.borrow_mut().invalidate();
             };
             let (cmp, found) = self.compare_with_current_record(
-                key_values.as_slice(),
+                key_values.iter(),
                 seek_op,
                 &record_comparer,
                 self.index_info
@@ -2209,12 +2209,12 @@ impl BTreeCursor {
         }
     }
 
-    fn compare_with_current_record(
-        &self,
-        key_values: &[ValueRef],
+    fn compare_with_current_record<'a>(
+        &'a self,
+        key_values: impl Iterator<Item = &'a ValueRef<'a>> + Clone,
         seek_op: SeekOp,
-        record_comparer: &RecordCompare,
-        index_info: &IndexInfo,
+        record_comparer: &'a RecordCompare,
+        index_info: &'a IndexInfo,
     ) -> (Ordering, bool) {
         let record = self.get_immutable_record();
         let record = record.as_ref().unwrap();
