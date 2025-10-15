@@ -251,6 +251,12 @@ pub enum Register {
     Record(ImmutableRecord),
 }
 
+impl<'a> From<&'a Register> for ValueRef<'a> {
+    fn from(value: &'a Register) -> Self {
+        value.get_value().as_ref()
+    }
+}
+
 impl Register {
     #[inline]
     pub fn is_null(&self) -> bool {
@@ -1018,12 +1024,6 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
-    registers
-        .iter()
-        .map(|reg| reg.get_value().as_ref())
-        .collect()
-}
 
 #[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
