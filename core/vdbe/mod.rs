@@ -133,8 +133,8 @@ impl BranchOffset {
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
     pub fn as_offset_int(&self) -> InsnReference {
         match self {
-            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Offset(v) => *v,
+            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
         }
     }
