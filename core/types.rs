@@ -1753,8 +1753,8 @@ fn compare_records_int<'short, 'long: 'short>(
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
     let comparison = match index_info.key_info[0].sort_order {
-        SortOrder::Asc => lhs_int.cmp(&rhs_int),
-        SortOrder::Desc => lhs_int.cmp(&rhs_int).reverse(),
+        SortOrder::Asc => lhs_int.cmp(rhs_int),
+        SortOrder::Desc => lhs_int.cmp(rhs_int).reverse(),
     };
     match comparison {
         std::cmp::Ordering::Equal => {
