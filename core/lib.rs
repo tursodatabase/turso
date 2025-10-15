@@ -63,6 +63,7 @@ pub use io::{
 };
 use parking_lot::RwLock;
 use schema::Schema;
+use std::task::Waker;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -2437,7 +2438,7 @@ impl BusyTimeout {
             }
         }
 
-        self.iteration += 1;
+        self.iteration = self.iteration.saturating_add(1);
         self.timeout = now + delay;
     }
 }
@@ -2509,10 +2510,13 @@ impl Statement {
         self.state.interrupt();
     }
 
-    pub fn step(&mut self) -> Result<StepResult> {
+    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if let Some(busy_timeout) = self.busy_timeout.as_ref() {
             if self.pager.io.now() < busy_timeout.timeout {
                 // Yield the query as the timeout has not been reached yet
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
                 return Ok(StepResult::IO);
             }
         }
@@ -2523,6 +2527,7 @@ impl Statement {
                 self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
+                waker,
             )
         } else {
             const MAX_SCHEMA_RETRY: usize = 50;
@@ -2531,6 +2536,7 @@ impl Statement {
                 self.mv_store.as_ref(),
                 self.pager.clone(),
                 self.query_mode,
+                waker,
             );
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
@@ -2544,6 +2550,7 @@ impl Statement {
                     self.mv_store.as_ref(),
                     self.pager.clone(),
                     self.query_mode,
+                    waker,
                 );
             }
             res
@@ -2574,11 +2581,22 @@ impl Statement {
             };
 
             if now < self.busy_timeout.as_ref().unwrap().timeout {
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
                 res = Ok(StepResult::IO);
             }
         }
 
         res
+    }
+
+    pub fn step(&mut self) -> Result<StepResult> {
+        self._step(None)
+    }
+
+    pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
+        self._step(Some(waker))
     }
 
     pub(crate) fn run_ignore_rows(&mut self) -> Result<()> {

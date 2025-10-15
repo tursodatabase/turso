@@ -1,4 +1,6 @@
-use crate::{Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO};
+use crate::{
+    io::clock::DefaultClock, Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO,
+};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -44,11 +46,7 @@ impl IO for WindowsIO {
 
 impl Clock for WindowsIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 

@@ -2,7 +2,9 @@ use turso_core::types::FromValue;
 
 use crate::{Error, Result, Value};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 /// Results of a prepared statement query.
 pub struct Rows {
@@ -28,33 +30,50 @@ impl Rows {
     }
     /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
-        loop {
-            let mut stmt = self
-                .inner
-                .lock()
-                .map_err(|e| Error::MutexError(e.to_string()))?;
-            match stmt.step()? {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    return Ok(Some(Row {
-                        values: row.get_values().map(|v| v.to_owned()).collect(),
-                    }));
-                }
-                turso_core::StepResult::Done => return Ok(None),
-                turso_core::StepResult::IO => {
-                    if let Err(e) = stmt.run_once() {
-                        return Err(e.into());
+        struct Next {
+            stmt: Arc<Mutex<turso_core::Statement>>,
+        }
+
+        impl Future for Next {
+            type Output = Result<Option<Row>>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                let mut stmt = self
+                    .stmt
+                    .lock()
+                    .map_err(|e| Error::MutexError(e.to_string()))?;
+                match stmt.step_with_waker(cx.waker())? {
+                    turso_core::StepResult::Row => {
+                        let row = stmt.row().unwrap();
+                        Poll::Ready(Ok(Some(Row {
+                            values: row.get_values().map(|v| v.to_owned()).collect(),
+                        })))
                     }
-                    continue;
-                }
-                turso_core::StepResult::Busy => {
-                    return Err(Error::SqlExecutionFailure("database is locked".to_string()))
-                }
-                turso_core::StepResult::Interrupt => {
-                    return Err(Error::SqlExecutionFailure("interrupted".to_string()))
+                    turso_core::StepResult::Done => Poll::Ready(Ok(None)),
+                    turso_core::StepResult::IO => {
+                        stmt.run_once()?;
+                        Poll::Pending
+                    }
+                    turso_core::StepResult::Busy => Poll::Ready(Err(Error::SqlExecutionFailure(
+                        "database is locked".to_string(),
+                    ))),
+                    turso_core::StepResult::Interrupt => {
+                        Poll::Ready(Err(Error::SqlExecutionFailure("interrupted".to_string())))
+                    }
                 }
             }
         }
+
+        unsafe impl Send for Next {}
+
+        let next = Next {
+            stmt: self.inner.clone(),
+        };
+
+        next.await
     }
 }
 
