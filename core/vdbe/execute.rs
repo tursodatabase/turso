@@ -1642,17 +1642,14 @@ pub fn op_column(
                                     8 => 0,
                                     // CONST_INT1
                                     9 => 0,
-                                    // BLOB
-                                    n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
-                                    // TEXT
-                                    n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
                                     // Reserved
                                     10 | 11 => {
                                         return Err(LimboError::Corrupt(format!(
                                             "Reserved serial type: {serial_type}"
                                         )))
                                     }
-                                    _ => unreachable!("Invalid serial type: {serial_type}"),
+                                    // BLOB or TEXT
+                                    n => (n - 12) / 2,
                                 } as usize;
                                 data_offset += data_size;
                                 record_cursor.offsets.push(data_offset);
