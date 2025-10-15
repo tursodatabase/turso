@@ -1060,7 +1060,15 @@ impl ImmutableRecord {
     }
 
     pub fn start_serialization(&mut self, payload: &[u8]) {
-        self.as_blob_mut().extend_from_slice(payload);
+        let blob = self.as_blob_mut();
+        blob.reserve(payload.len());
+
+        let len = blob.len();
+        unsafe {
+            let dst = blob.as_mut_ptr().add(len);
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len());
+            blob.set_len(len + payload.len());
+        }
     }
 
     pub fn invalidate(&mut self) {
