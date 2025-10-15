@@ -505,7 +505,7 @@ fn prepare_one_select_plan(
             // Return the unoptimized query plan
             Ok(plan)
         }
-        ast::OneSelect::Values(values) => {
+        ast::OneSelect::Values(mut values) => {
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }
@@ -522,6 +522,21 @@ fn prepare_one_select_plan(
                     contains_aggregates: false,
                 });
             }
+
+            for value_row in values.iter_mut() {
+                for value in value_row.iter_mut() {
+                    bind_and_rewrite_expr(
+                        value,
+                        None,
+                        None,
+                        connection,
+                        &mut program.param_ctx,
+                        // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
+                        BindingBehavior::AllowUnboundIdentifiers,
+                    )?;
+                }
+            }
+
             let plan = SelectPlan {
                 join_order: vec![],
                 table_references: TableReferences::new(vec![], vec![]),
