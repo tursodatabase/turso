@@ -329,6 +329,11 @@ pub struct DbspNode {
     pub executable: Box<dyn IncrementalOperator>,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspNode {}
+unsafe impl Sync for DbspNode {}
+
 impl std::fmt::Debug for DbspNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbspNode")
@@ -394,6 +399,11 @@ pub struct DbspCircuit {
     /// Root page for the DBSP state table's primary key index
     pub(super) internal_state_index_root: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspCircuit {}
+unsafe impl Sync for DbspCircuit {}
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema

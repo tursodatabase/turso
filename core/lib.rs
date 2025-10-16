@@ -225,6 +225,8 @@ pub struct Database {
     n_connections: AtomicUsize,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 
@@ -1106,6 +1108,11 @@ pub struct Connection {
     fk_pragma: AtomicBool,
     fk_deferred_violations: AtomicIsize,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
 impl Drop for Connection {
     fn drop(&mut self) {
