@@ -2725,6 +2725,7 @@ impl BTreeCursor {
 
                     let (parent_page_idx, page_type, cell_count, over_cell_count) = {
                         let parent_page = self.stack.top_ref();
+                        parent_page.pin();
                         let parent_contents = parent_page.get_contents();
                         (
                             self.stack.current(),
@@ -2870,6 +2871,7 @@ impl BTreeCursor {
                             }
                             Ok((page, c)) => {
                                 // mark as dirty
+                                page.pin();
                                 self.pager.add_dirty(&page);
                                 pages_to_balance[i].replace(page);
                                 if let Some(c) = c {
@@ -2955,7 +2957,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        turso_assert!(page.is_loaded(), "page should be loaded");
+                        turso_assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
@@ -3468,6 +3470,7 @@ impl BTreeCursor {
                             0,
                             BtreePageAllocMode::Any
                         ));
+                        page.pin();
                         pages_to_balance_new[*i].replace(page);
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
@@ -3531,6 +3534,11 @@ impl BTreeCursor {
                                     .update_dirty_loaded_page_in_cache(*new_id, page.clone())?;
                             }
                         }
+
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                            page.as_ref().unwrap().unpin();
+                        }
+                        parent_page.unpin();
 
                         #[cfg(debug_assertions)]
                         {

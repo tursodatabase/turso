@@ -14,10 +14,10 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, IOContext};
+use crate::{io_yield_many, io_yield_one, Buffer, IOContext};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::hash;
 use std::rc::Rc;
 use std::sync::atomic::{
@@ -28,7 +28,7 @@ use tracing::{instrument, trace, Level};
 
 use super::btree::btree_init_page;
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
-use super::sqlite3_ondisk::begin_write_btree_page;
+use super::sqlite3_ondisk::{begin_write_btree_page, write_pages_vectored};
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -1310,6 +1310,7 @@ impl Pager {
         )
     }
 
+    /// Insert page into PageCache. This function handle spill.
     fn cache_insert(
         &self,
         page_idx: usize,
@@ -1321,6 +1322,11 @@ impl Pager {
             Ok(_) => {}
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
+            }
+            Err(CacheError::Full { should_spill: true }) => {
+                self.spill(page_cache)?;
+                // retry operation
+                page_cache.insert(page_key, page.clone())?;
             }
             Err(e) => return Err(e.into()),
         }
@@ -1394,8 +1400,6 @@ impl Pager {
     #[instrument(skip_all, level = Level::INFO)]
     pub fn cacheflush(&self) -> Result<Vec<Completion>> {
         let Some(wal) = self.wal.as_ref() else {
-            // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
-            // This handling is not yet implemented, but it should be when spilling is implemented.
             return Err(LimboError::InternalError(
                 "cacheflush() called on database without WAL".to_string(),
             ));
@@ -2128,14 +2132,15 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
-                let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
+                self.cache_insert(page.get().id, page.clone(), &mut self.page_cache.write())
+                    .map_err(|e| {
+                        LimboError::InternalError(format!(
+                            "Failed to insert page 1 into cache: {e:?}"
+                        ))
+                    })?;
                 self.db_state.set(DbState::Initialized);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
-                Ok(IOResult::Done(page.clone()))
+                Ok(IOResult::Done(page))
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
@@ -2192,9 +2197,7 @@ impl Pager {
                             new_db_size += 1;
                             let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                             self.add_dirty(&page);
-                            let page_key = PageCacheKey::new(page.get().id as usize);
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            self.cache_insert(page.get().id, page, &mut self.page_cache.write())?;
                         }
                     }
 
@@ -2352,13 +2355,11 @@ impl Pager {
                         let richard_hipp_special_page =
                             allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                         self.add_dirty(&richard_hipp_special_page);
-                        let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
-                        {
-                            let mut cache = self.page_cache.write();
-                            cache
-                                .insert(page_key, richard_hipp_special_page.clone())
-                                .unwrap();
-                        }
+                        self.cache_insert(
+                            richard_hipp_special_page.get().id,
+                            richard_hipp_special_page,
+                            &mut self.page_cache.write(),
+                        )?;
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;
                     }
@@ -2376,13 +2377,11 @@ impl Pager {
                     {
                         // setup page and add to cache
                         self.add_dirty(&page);
-
-                        let page_key = PageCacheKey::new(page.get().id as usize);
-                        {
-                            // Run in separate block to avoid deadlock on page cache write lock
-                            let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
-                        }
+                        self.cache_insert(
+                            page.get().id,
+                            page.clone(),
+                            &mut self.page_cache.write(),
+                        )?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
@@ -2397,16 +2396,18 @@ impl Pager {
         id: usize,
         page: PageRef,
     ) -> Result<(), LimboError> {
-        let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
         assert!(page.is_dirty());
-        cache.upsert_page(page_key, page.clone()).map_err(|e| {
-            LimboError::InternalError(format!(
-                "Failed to insert loaded page {id} into cache: {e:?}"
-            ))
-        })?;
+        self.page_cache
+            .write()
+            .upsert_page(page_key, page.clone())
+            .map_err(|e| {
+                LimboError::InternalError(format!(
+                    "Failed to insert loaded page {id} into cache: {e:?}"
+                ))
+            })?;
         page.set_loaded();
         page.clear_wal_tag();
         Ok(())
@@ -2517,6 +2518,70 @@ impl Pager {
     /// pager, which is then used to set it on the IOContext.
     pub fn enable_encryption(&self, enable: bool) {
         self.enable_encryption.store(enable, Ordering::SeqCst);
+    }
+
+    /// Spill page to disk to make room on PageCache. This function is intended to be used when
+    /// an insertion in PageCache results in a CacheError::Full { should_spill: true }
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn spill(&self, cache: &mut PageCache) -> Result<()> {
+        println!("Spill was called");
+        let mut elected_page = None;
+        for p in self.dirty_pages.read().iter() {
+            let page_cache_key = PageCacheKey::new(*p);
+            println!("Page: {:?}", page_cache_key);
+            let page = cache.get(&page_cache_key)?
+            .expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
+            if !page.is_pinned() {
+                println!("Key: {}", *p);
+                elected_page = Some(page);
+                break;
+            }
+        }
+
+        // We couldn't find a page that can be spilled
+        if elected_page.is_none() {
+            return Err(LimboError::InternalError(
+                "Couldn't find electable page".to_string(),
+            ));
+        }
+        let elected_page = elected_page.unwrap();
+        let page_sz = self.get_page_size().unwrap_or_default();
+
+        // We probably should release the mutex before doing IO. And acquire it later when it resolves.
+        match self.wal.as_ref() {
+            Some(wal) => {
+                let completion = wal.borrow_mut().append_frames_vectored(
+                    vec![elected_page.clone()],
+                    page_sz,
+                    None,
+                )?;
+                // todo: handle errors
+                self.io.wait_for_completion(completion)?;
+
+                // clear page
+            }
+            // Ephemeral table, spill to main file
+            None => {
+                let mut batch: BTreeMap<usize, Arc<Buffer>> = BTreeMap::new();
+                batch.insert(
+                    elected_page.get().id,
+                    elected_page.get_contents().buffer.clone(),
+                );
+                let completions =
+                    write_pages_vectored(&self, batch, Arc::new(AtomicBool::new(false)))?;
+
+                for c in completions {
+                    self.io.wait_for_completion(c)?;
+                }
+            }
+        }
+
+        elected_page.clear_dirty();
+        let cache_key = PageCacheKey::new(elected_page.get().id);
+        cache.delete(cache_key).unwrap();
+        self.dirty_pages.write().remove(&elected_page.get().id);
+
+        Ok(())
     }
 }
 

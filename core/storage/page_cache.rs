@@ -9,7 +9,7 @@ use crate::turso_assert;
 
 use super::pager::PageRef;
 
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2_000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 20;
 
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
