@@ -1074,3 +1074,23 @@ do_execsql_test_on_specific_db {:memory:} rowid-select-from-clause-subquery-expl
 	SELECT rowid,a FROM (SELECT rowid,a FROM t);
 } {1|abc}
 
+# https://github.com/tursodatabase/turso/issues/3505 regression test
+do_execsql_test_in_memory_any_error ambiguous-self-join {
+    CREATE TABLE T(a);
+	INSERT INTO t VALUES (1), (2), (3); 
+	SELECT * fROM t JOIN t;
+}
+
+do_execsql_test_on_specific_db {:memory:} unambiguous-self-join {
+    CREATE TABLE T(a);
+	INSERT INTO t VALUES (1), (2), (3); 
+	SELECT * fROM t as ta JOIN t order by ta.a;
+} {1|1
+1|2
+1|3
+2|1
+2|2
+2|3
+3|1
+3|2
+3|3}
