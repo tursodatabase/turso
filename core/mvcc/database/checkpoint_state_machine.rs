@@ -4,7 +4,7 @@ use crate::mvcc::database::{
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
