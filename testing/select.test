@@ -1061,3 +1061,16 @@ do_execsql_test select-binary-collation {
   SELECT 'a' = 'A';
   SELECT 'a' = 'a';
 } {0 1}
+
+# https://github.com/tursodatabase/turso/issues/3667 regression test
+do_execsql_test_in_memory_error_content rowid-select-from-clause-subquery {
+	CREATE TABLE t(a);
+	SELECT rowid FROM (SELECT * FROM t);
+} {"no such column: rowid"}
+
+do_execsql_test_on_specific_db {:memory:} rowid-select-from-clause-subquery-explicit-works {
+	CREATE TABLE t(a);
+	INSERT INTO t values ('abc');
+	SELECT rowid,a FROM (SELECT rowid,a FROM t);
+} {1|abc}
+
