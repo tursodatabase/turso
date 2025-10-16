@@ -48,6 +48,8 @@ pub use params::IntoParams;
 use std::fmt::Debug;
 use std::future::Future;
 use std::num::NonZero;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 pub use turso_core::EncryptionOpts;
@@ -55,6 +57,7 @@ use turso_core::OpenFlags;
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
+use crate::transaction::DropBehavior;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -218,10 +221,39 @@ impl Database {
     }
 }
 
+/// Atomic wrapper for [DropBehavior]
+struct AtomicDropBehavior {
+    inner: AtomicU8,
+}
+
+impl AtomicDropBehavior {
+    fn new(behavior: DropBehavior) -> Self {
+        Self {
+            inner: AtomicU8::new(behavior.into()),
+        }
+    }
+
+    fn load(&self, ordering: Ordering) -> DropBehavior {
+        self.inner.load(ordering).into()
+    }
+
+    fn store(&self, behavior: DropBehavior, ordering: Ordering) {
+        self.inner.store(behavior.into(), ordering);
+    }
+}
+
 /// A database connection.
 pub struct Connection {
     inner: Arc<Mutex<Arc<turso_core::Connection>>>,
     transaction_behavior: TransactionBehavior,
+    /// If there is a dangling transaction after it was dropped without being finished,
+    /// [Connection::dangling_tx] will be set to the [DropBehavior] of the dangling transaction,
+    /// and the corresponding action will be taken when a new transaction is requested
+    /// or the connection queries/executes.
+    /// We cannot do this eagerly on Drop because drop is not async.
+    ///
+    /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
+    dangling_tx: AtomicDropBehavior,
 }
 
 impl Clone for Connection {
@@ -229,6 +261,7 @@ impl Clone for Connection {
         Self {
             inner: Arc::clone(&self.inner),
             transaction_behavior: self.transaction_behavior,
+            dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
         }
     }
 }
@@ -242,17 +275,43 @@ impl Connection {
         let connection = Connection {
             inner: Arc::new(Mutex::new(conn)),
             transaction_behavior: TransactionBehavior::Deferred,
+            dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
         };
         connection
     }
+
+    async fn maybe_handle_dangling_tx(&self) -> Result<()> {
+        match self.dangling_tx.load(Ordering::SeqCst) {
+            DropBehavior::Rollback => {
+                let mut stmt = self.prepare("ROLLBACK").await?;
+                stmt.execute(()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Commit => {
+                let mut stmt = self.prepare("COMMIT").await?;
+                stmt.execute(()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Ignore => {}
+            DropBehavior::Panic => {
+                panic!("Transaction dropped unexpectedly.");
+            }
+        }
+        Ok(())
+    }
+
     /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
+        self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.query(params).await
     }
 
     /// Execute SQL statement on the database.
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
+        self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
     }
@@ -337,6 +396,7 @@ impl Connection {
 
     /// Execute a batch of SQL statements on the database.
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.maybe_handle_dangling_tx().await?;
         self.prepare_execute_batch(sql).await?;
         Ok(())
     }
@@ -358,6 +418,7 @@ impl Connection {
     }
 
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
+        self.maybe_handle_dangling_tx().await?;
         let conn = self
             .inner
             .lock()
