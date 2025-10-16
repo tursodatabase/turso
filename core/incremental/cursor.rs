@@ -5,7 +5,7 @@ use crate::{
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
-    storage::btree::BTreeCursor,
+    storage::btree::{BTreeCursor, CursorTrait},
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
@@ -35,7 +35,7 @@ enum SeekState {
 /// and overlays transaction changes as needed.
 pub struct MaterializedViewCursor {
     // Core components
-    btree_cursor: Box<BTreeCursor>,
+    btree_cursor: Box<dyn CursorTrait>,
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
 
@@ -62,7 +62,7 @@ pub struct MaterializedViewCursor {
 
 impl MaterializedViewCursor {
     pub fn new(
-        btree_cursor: Box<BTreeCursor>,
+        btree_cursor: Box<dyn CursorTrait>,
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         tx_state: Arc<ViewTransactionState>,

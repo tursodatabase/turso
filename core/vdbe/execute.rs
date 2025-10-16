@@ -1044,16 +1044,9 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
-        ));
-        Some(mv_cursor)
-    } else {
+    if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
-        None
-    };
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -1062,16 +1055,33 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store.unwrap().clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    *root_page,
+                    pager.clone(),
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
+
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
+
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                mv_cursor,
                 pager.clone(),
                 *root_page,
                 num_columns,
             ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().unwrap().name().to_string();
@@ -1082,7 +1092,7 @@ pub fn op_open_read(
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                btree_cursor,
+                cursor,
                 view_mutex.clone(),
                 pager.clone(),
                 tx_state,
@@ -1095,24 +1105,29 @@ pub fn op_open_read(
         }
         CursorType::BTreeTable(_) => {
             // Regular table
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                *root_page,
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let cursor = BTreeCursor::new_index(
-                mv_cursor,
+            let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager.clone(),
                 *root_page,
                 index.as_ref(),
                 num_columns,
-            );
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");

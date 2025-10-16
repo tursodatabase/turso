@@ -706,12 +706,7 @@ impl BTreeCursor {
         }
     }
 
-    pub fn new_table(
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
-        root_page: i64,
-        num_columns: usize,
-    ) -> Self {
+    pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new(pager, root_page, num_columns)
     }
 
@@ -4469,25 +4464,6 @@ impl BTreeCursor {
                     .unwrap();
             return Ok(IOResult::Done(Some(record_ref)));
         }
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mv_cursor = mv_cursor.write();
-            let Some(row) = mv_cursor.current_row()? else {
-                return Ok(IOResult::Done(None));
-            };
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .start_serialization(&row.data);
-            self.record_cursor.borrow_mut().invalidate();
-            let record_ref =
-                Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
-                    .unwrap();
-            return Ok(IOResult::Done(Some(record_ref)));
-        }
 
         let page = self.stack.top_ref();
         let contents = page.get_contents();
@@ -6310,7 +6286,6 @@ impl CursorTrait for BTreeCursor {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
-                    assert!(self.mv_cursor.is_none());
                     let has_record = return_if_io!(self.move_to_rightmost());
                     self.invalidate_record();
                     self.has_record.replace(has_record);
