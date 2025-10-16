@@ -2350,7 +2350,6 @@ impl Cursor {
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
-    Many(Vec<Completion>),
 }
 
 impl IOCompletions {
@@ -2358,26 +2357,12 @@ impl IOCompletions {
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
-            IOCompletions::Many(completions) => {
-                let mut completions = completions.into_iter();
-                while let Some(c) = completions.next() {
-                    let res = io.wait_for_completion(c);
-                    if res.is_err() {
-                        for c in completions {
-                            c.abort();
-                        }
-                        return res;
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
     pub fn finished(&self) -> bool {
         match self {
             IOCompletions::Single(c) => c.finished(),
-            IOCompletions::Many(completions) => completions.iter().all(|c| c.finished()),
         }
     }
 
@@ -2385,14 +2370,12 @@ impl IOCompletions {
     pub fn abort(&self) {
         match self {
             IOCompletions::Single(c) => c.abort(),
-            IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
         }
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
         match self {
             IOCompletions::Single(c) => c.get_error(),
-            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
         }
     }
 

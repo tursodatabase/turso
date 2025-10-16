@@ -1,7 +1,8 @@
 use tracing::{instrument, Level};
 
 use crate::{
-    io_yield_many, io_yield_one,
+    io::CompletionGroup,
+    io_yield_one,
     schema::Index,
     storage::{
         pager::{BtreePageAllocMode, Pager},
@@ -2858,12 +2859,12 @@ impl BTreeCursor {
                     // start loading right page first
                     let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
                     let current_sibling = sibling_pointer;
-                    let mut completions: Vec<Completion> = Vec::with_capacity(current_sibling + 1);
+                    let mut group = CompletionGroup::new(|_| {});
                     for i in (0..=current_sibling).rev() {
                         match btree_read_page(&self.pager, pgno as i64) {
                             Err(e) => {
                                 tracing::error!("error reading page {}: {}", pgno, e);
-                                self.pager.io.cancel(&completions)?;
+                                group.cancel();
                                 self.pager.io.drain()?;
                                 return Err(e);
                             }
@@ -2872,7 +2873,7 @@ impl BTreeCursor {
                                 self.pager.add_dirty(&page);
                                 pages_to_balance[i].replace(page);
                                 if let Some(c) = c {
-                                    completions.push(c);
+                                    group.add(&c);
                                 }
                             }
                         }
@@ -2939,8 +2940,9 @@ impl BTreeCursor {
                         first_divider_cell: first_cell_divider,
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
-                    if !completions.is_empty() {
-                        io_yield_many!(completions);
+                    let completion = group.build();
+                    if !completion.finished() {
+                        io_yield_one!(completion);
                     }
                 }
                 BalanceSubState::NonRootDoBalancing => {
