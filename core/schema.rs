@@ -1730,7 +1730,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             };
                             foreign_keys.push(Arc::new(fk));
                         }
-                        _ => {}
                     }
                 }
 
