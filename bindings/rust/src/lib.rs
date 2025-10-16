@@ -596,7 +596,11 @@ impl Statement {
     pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
         let mut rows = self.query(params).await?;
 
-        rows.next().await?.ok_or(Error::QueryReturnedNoRows)
+        let first_row = rows.next().await?.ok_or(Error::QueryReturnedNoRows)?;
+        // Discard remaining rows so that the statement is executed to completion
+        // Otherwise Drop of the statement will cause transaction rollback
+        while rows.next().await?.is_some() {}
+        Ok(first_row)
     }
 }
 
