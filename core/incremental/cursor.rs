@@ -5,7 +5,7 @@ use crate::{
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
-    storage::btree::BTreeCursor,
+    storage::btree::{BTreeCursor, CursorTrait},
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };

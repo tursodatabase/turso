@@ -12,7 +12,7 @@ use crate::incremental::operator::{
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
 use crate::schema::Type;
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,

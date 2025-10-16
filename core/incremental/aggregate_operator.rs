@@ -7,6 +7,7 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::storage::btree::CursorTrait;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
