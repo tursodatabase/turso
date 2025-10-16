@@ -294,7 +294,9 @@ pub fn translate_insert(
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
-    init_autoincrement(&mut program, &mut ctx, resolver)?;
+    if ctx.table.has_autoincrement {
+        init_autoincrement(&mut program, &mut ctx, resolver)?;
+    }
 
     if has_user_provided_rowid {
         let must_be_int_label = program.allocate_label();
@@ -781,78 +783,74 @@ fn init_autoincrement(
     ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
 ) -> Result<()> {
-    if ctx.table.has_autoincrement {
-        let seq_table = resolver
-            .schema
-            .get_btree_table("sqlite_sequence")
-            .ok_or_else(|| {
-                crate::error::LimboError::InternalError(
-                    "sqlite_sequence table not found".to_string(),
-                )
-            })?;
-        let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: seq_cursor_id,
-            root_page: seq_table.root_page.into(),
-            db: 0,
-        });
+    let seq_table = resolver
+        .schema
+        .get_btree_table("sqlite_sequence")
+        .ok_or_else(|| {
+            crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
+        })?;
+    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: seq_cursor_id,
+        root_page: seq_table.root_page.into(),
+        db: 0,
+    });
 
-        let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
-        let r_seq = program.alloc_register();
-        let r_seq_rowid = program.alloc_register();
+    let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
+    let r_seq = program.alloc_register();
+    let r_seq_rowid = program.alloc_register();
 
-        ctx.autoincrement_meta = Some(AutoincMeta {
-            seq_cursor_id,
-            r_seq,
-            r_seq_rowid,
-            table_name_reg,
-        });
+    ctx.autoincrement_meta = Some(AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+    });
 
-        program.emit_insn(Insn::Integer {
-            dest: r_seq,
-            value: 0,
-        });
-        program.emit_insn(Insn::Null {
-            dest: r_seq_rowid,
-            dest_end: None,
-        });
+    program.emit_insn(Insn::Integer {
+        dest: r_seq,
+        value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: r_seq_rowid,
+        dest_end: None,
+    });
 
-        let loop_start_label = program.allocate_label();
-        let loop_end_label = program.allocate_label();
-        let found_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
+    let found_label = program.allocate_label();
 
-        program.emit_insn(Insn::Rewind {
-            cursor_id: seq_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-        program.preassign_label_to_next_insn(loop_start_label);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: seq_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
 
-        let name_col_reg = program.alloc_register();
-        program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-        program.emit_insn(Insn::Ne {
-            lhs: table_name_reg,
-            rhs: name_col_reg,
-            target_pc: found_label,
-            flags: Default::default(),
-            collation: None,
-        });
+    let name_col_reg = program.alloc_register();
+    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: table_name_reg,
+        rhs: name_col_reg,
+        target_pc: found_label,
+        flags: Default::default(),
+        collation: None,
+    });
 
-        program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
-        program.emit_insn(Insn::RowId {
-            cursor_id: seq_cursor_id,
-            dest: r_seq_rowid,
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: loop_end_label,
-        });
+    program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);
+    program.emit_insn(Insn::RowId {
+        cursor_id: seq_cursor_id,
+        dest: r_seq_rowid,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_end_label,
+    });
 
-        program.preassign_label_to_next_insn(found_label);
-        program.emit_insn(Insn::Next {
-            cursor_id: seq_cursor_id,
-            pc_if_next: loop_start_label,
-        });
-        program.preassign_label_to_next_insn(loop_end_label);
-    }
+    program.preassign_label_to_next_insn(found_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: seq_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+    program.preassign_label_to_next_insn(loop_end_label);
     Ok(())
 }
 
