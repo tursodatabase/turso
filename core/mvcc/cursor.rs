@@ -1,9 +1,10 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
-use crate::storage::btree::{BTreeKey, CursorTrait};
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::Result;
 use crate::{Pager, Value};
+use std::any::Any;
 use std::cell::{Ref, RefCell};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -37,6 +38,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         pager: Arc<Pager>,
         btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
+        assert!(
+            (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
+            "BTreeCursor expected for mvcc cursor"
+        );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
         db.maybe_initialize_table(table_id, pager)?;
         let cursor = Self {

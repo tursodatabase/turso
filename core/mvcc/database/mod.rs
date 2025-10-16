@@ -1884,7 +1884,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .value()
             .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
         let mut cursor = BTreeCursor::new_table(
-            None, // No MVCC cursor for scanning
             pager.clone(),
             root_page as i64,
             1, // We'll adjust this as needed
