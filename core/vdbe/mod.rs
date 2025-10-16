@@ -992,6 +992,7 @@ impl Program {
                             }
                         } else {
                             pager.rollback_tx(&self.connection);
+                            self.connection.auto_commit.store(true, Ordering::SeqCst);
                         }
                         self.connection.set_tx_state(TransactionState::None);
                     }

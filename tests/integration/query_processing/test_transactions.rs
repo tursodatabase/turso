@@ -177,6 +177,38 @@ fn test_transaction_visibility() {
 }
 
 #[test]
+/// Currently, our default conflict resolution strategy is ROLLBACK, which ends the transaction.
+/// In SQLite, the default is ABORT, which rolls back the current statement but allows the transaction to continue.
+/// We should migrate to default ABORT once we support subtransactions.
+fn test_constraint_error_aborts_transaction() {
+    let tmp_db = TempDatabase::new("test_constraint_error_aborts_transaction.db", true);
+    let conn = tmp_db.connect_limbo();
+
+    // Create table succeeds
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // Begin succeeds
+    conn.execute("BEGIN").unwrap();
+
+    // First insert succeeds
+    conn.execute("INSERT INTO t VALUES (1),(2)").unwrap();
+
+    // Second insert fails due to UNIQUE constraint
+    let result = conn.execute("INSERT INTO t VALUES (2),(3)");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Commit fails because the transaction was aborted by the constraint error
+    let result = conn.execute("COMMIT");
+    assert!(matches!(result, Err(LimboError::TxError(_))));
+
+    // Make sure table is empty
+    let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::Integer(0)]);
+}
+
+#[test]
 fn test_mvcc_transactions_autocommit() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_transactions_autocommit.db",
