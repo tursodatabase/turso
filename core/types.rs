@@ -2383,9 +2383,6 @@ impl IOCompletions {
         if let Some(waker) = waker {
             match self {
                 IOCompletions::Single(c) => c.set_waker(waker),
-                IOCompletions::Many(completions) => {
-                    completions.iter().for_each(|c| c.set_waker(waker))
-                }
             }
         }
     }
