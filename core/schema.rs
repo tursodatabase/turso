@@ -1635,6 +1635,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Check { .. } => {
                             crate::bail_parse_error!("CHECK constraints are not yet supported");
                         }
+                        ast::ColumnConstraint::Generated { .. } => {
+                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
