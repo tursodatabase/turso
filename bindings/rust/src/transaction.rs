@@ -126,8 +126,8 @@ impl Transaction<'_> {
 
     #[inline]
     async fn _commit(&mut self) -> Result<()> {
-        self.in_progress = false;
         self.conn.execute("COMMIT", ()).await?;
+        self.in_progress = false;
         Ok(())
     }
 
@@ -139,8 +139,8 @@ impl Transaction<'_> {
 
     #[inline]
     async fn _rollback(&mut self) -> Result<()> {
-        self.in_progress = false;
         self.conn.execute("ROLLBACK", ()).await?;
+        self.in_progress = false;
         Ok(())
     }
 
