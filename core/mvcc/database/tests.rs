@@ -830,6 +830,12 @@ fn test_lazy_scan_cursor_basic() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(
+            None,
+            db.conn.pager.read().clone(),
+            table_id,
+            1,
+        )),
     )
     .unwrap();
 
@@ -872,6 +878,12 @@ fn test_lazy_scan_cursor_with_gaps() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(
+            None,
+            db.conn.pager.read().clone(),
+            table_id,
+            1,
+        )),
     )
     .unwrap();
 
@@ -923,6 +935,12 @@ fn test_cursor_basic() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(
+            None,
+            db.conn.pager.read().clone(),
+            table_id,
+            1,
+        )),
     )
     .unwrap();
 
@@ -977,6 +995,12 @@ fn test_cursor_with_empty_table() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(
+            None,
+            db.conn.pager.read().clone(),
+            table_id,
+            1,
+        )),
     )
     .unwrap();
     assert!(cursor.is_empty());
@@ -994,6 +1018,12 @@ fn test_cursor_modification_during_scan() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(
+            None,
+            db.conn.pager.read().clone(),
+            table_id,
+            1,
+        )),
     )
     .unwrap();
 

@@ -18,7 +18,7 @@ enum CursorPosition {
     /// We have reached the end of the table.
     End,
 }
-#[derive(Debug)]
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
@@ -26,6 +26,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
+    btree_cursor: Box<dyn CursorTrait>,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -34,6 +35,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         tx_id: u64,
         root_page_or_table_id: i64,
         pager: Arc<Pager>,
+        btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
         db.maybe_initialize_table(table_id, pager)?;
@@ -43,6 +45,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             current_pos: RefCell::new(CursorPosition::BeforeFirst),
             table_id,
             reusable_immutable_record: RefCell::new(None),
+            btree_cursor,
         };
         Ok(cursor)
     }
@@ -378,5 +381,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn get_mvcc_cursor(&self) -> Arc<parking_lot::RwLock<crate::MvCursor>> {
         todo!()
+    }
+}
+
+impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvccLazyCursor")
+            .field("current_pos", &self.current_pos)
+            .field("table_id", &self.table_id)
+            .field("tx_id", &self.tx_id)
+            .field("reusable_immutable_record", &self.reusable_immutable_record)
+            .field("btree_cursor", &())
+            .finish()
     }
 }
