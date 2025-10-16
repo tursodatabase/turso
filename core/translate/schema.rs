@@ -41,8 +41,14 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 // don't silently ignore CHECK constraints, throw parse error for now
-                if let ast::ColumnConstraint::Check { .. } = constraint.constraint {
-                    bail_parse_error!("CHECK constraints are not supported yet");
+                match constraint.constraint {
+                    ast::ColumnConstraint::Check { .. } => {
+                        bail_parse_error!("CHECK constraints are not supported yet");
+                    }
+                    ast::ColumnConstraint::Generated { .. } => {
+                        bail_parse_error!("GENERATED columns are not supported yet");
+                    }
+                    _ => {}
                 }
             }
             for j in &columns[(i + 1)..] {
