@@ -65,7 +65,7 @@ impl From<u8> for DropBehavior {
 ///
 /// Transactions will roll back by default. Use `commit` method to explicitly
 /// commit the transaction, or use `set_drop_behavior` to change what happens
-/// when the transaction is dropped.
+/// on the next access to the connection after the transaction is dropped.
 ///
 /// ## Example
 ///
@@ -224,7 +224,8 @@ impl Drop for Transaction<'_> {
 impl Connection {
     /// Begin a new transaction with the default behavior (DEFERRED).
     ///
-    /// The transaction defaults to rolling back when it is dropped. If you
+    /// The transaction defaults to rolling back on the next access to the connection
+    /// if it is not finished when the transaction is dropped. If you
     /// want the transaction to commit, you must call
     /// [`commit`](Transaction::commit) or
     /// [`set_drop_behavior(DropBehavior::Commit)`](Transaction::set_drop_behavior).
