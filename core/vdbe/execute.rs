@@ -6439,18 +6439,6 @@ pub fn op_new_rowid(
         insn
     );
 
-    if let Some(mv_store) = mv_store {
-        let rowid = {
-            let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut();
-            let mvcc_cursor = cursor.get_mvcc_cursor();
-            let mut mvcc_cursor = mvcc_cursor.write();
-            mvcc_cursor.get_next_rowid()
-        };
-        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
-    }
 
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
@@ -6721,16 +6709,10 @@ pub fn op_not_exists(
         },
         insn
     );
-    let exists = if let Some(mv_store) = mv_store {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        let mvcc_cursor = cursor.get_mvcc_cursor();
-        false
-    } else {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()))
-    };
+    let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+    let cursor = cursor.as_btree_mut();
+    let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
+
     if exists {
         state.pc += 1;
     } else {
