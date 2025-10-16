@@ -1641,8 +1641,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
+                            conflict_clause,
                             ..
                         } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             if !primary_key_columns.is_empty() {
                                 crate::bail_parse_error!(
                                     "table \"{}\" has more than one primary key",
@@ -1661,7 +1667,16 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 is_primary_key: true,
                             });
                         }
-                        ast::ColumnConstraint::NotNull { nullable, .. } => {
+                        ast::ColumnConstraint::NotNull {
+                            nullable,
+                            conflict_clause,
+                            ..
+                        } => {
+                            if conflict_clause.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
+                            }
                             notnull = !nullable;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
@@ -1670,9 +1685,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
-                        ast::ColumnConstraint::Unique(on_conflict) => {
-                            if on_conflict.is_some() {
-                                unimplemented!("ON CONFLICT not implemented");
+                        ast::ColumnConstraint::Unique(conflict) => {
+                            if conflict.is_some() {
+                                crate::bail_parse_error!(
+                                    "ON CONFLICT not implemented for column definition"
+                                );
                             }
                             unique = true;
                             unique_sets.push(UniqueSet {
