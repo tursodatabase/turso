@@ -232,7 +232,7 @@ pub fn translate_insert(
         &table,
         &mut body,
         connection,
-        on_conflict.unwrap_or(ResolveType::Abort),
+        on_conflict.unwrap_or(ResolveType::Rollback),
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
@@ -976,7 +976,10 @@ fn bind_insert(
                 next: None,
             }));
         }
-        ResolveType::Abort => {}
+        ResolveType::Rollback => {
+            // This is the current default behavior for INSERT in tursodb - the transaction will be rolled back if the insert fails.
+            // In SQLite, the default is ABORT and we should use that one once we support subtransactions.
+        }
         _ => {
             crate::bail_parse_error!(
                 "INSERT OR {} is only supported with UPSERT",
