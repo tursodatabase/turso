@@ -48,6 +48,16 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                     ast::ColumnConstraint::Generated { .. } => {
                         bail_parse_error!("GENERATED columns are not supported yet");
                     }
+                    ast::ColumnConstraint::NotNull {
+                        conflict_clause, ..
+                    }
+                    | ast::ColumnConstraint::PrimaryKey {
+                        conflict_clause, ..
+                    } if conflict_clause.is_some() => {
+                        bail_parse_error!(
+                            "ON CONFLICT clauses are not supported yet in column definitions"
+                        );
+                    }
                     _ => {}
                 }
             }
