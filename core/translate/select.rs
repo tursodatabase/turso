@@ -225,6 +225,16 @@ fn prepare_one_select_plan(
                 &mut table_references,
                 connection,
             )?;
+            // Validate that all table references have unique identifiers
+            let mut seen_identifiers = std::collections::HashSet::new();
+            for table in table_references.joined_tables().iter() {
+                if !seen_identifiers.insert(&table.identifier) {
+                    crate::bail_parse_error!(
+                "table name {} specified more than once - use aliases to distinguish multiple references",
+                table.identifier
+            );
+                }
+            }
 
             // Preallocate space for the result columns
             let result_columns = Vec::with_capacity(
