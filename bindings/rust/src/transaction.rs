@@ -329,6 +329,7 @@ mod test {
 
     #[tokio::test]
     async fn test_drop() -> Result<()> {
+        let _ = tracing_subscriber::fmt::try_init();
         let mut conn = checked_memory_handle().await?;
         {
             let tx = conn.transaction().await?;
