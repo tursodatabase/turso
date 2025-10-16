@@ -6439,7 +6439,6 @@ pub fn op_new_rowid(
         insn
     );
 
-
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
 
@@ -6827,7 +6826,7 @@ pub fn op_open_write(
                 Ok(Box::new(MvCursor::new(
                     mv_store,
                     tx_id,
-                    *root_page,
+                    root_page,
                     pager.clone(),
                     btree_cursor,
                 )?))
