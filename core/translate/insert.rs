@@ -1629,7 +1629,7 @@ fn emit_preflight_constraint_checks(
     resolver: &Resolver,
     insertion: &Insertion,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
-    constraints: &CheckConstraints,
+    constraints: &ConstraintsToCheck,
 ) -> Result<()> {
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
@@ -2084,7 +2084,7 @@ pub fn rewrite_partial_index_where(
     )
 }
 
-struct CheckConstraints {
+struct ConstraintsToCheck {
     constraints_to_check: Vec<(ResolvedUpsertTarget, Option<usize>)>,
     upsert_catch_all_position: Option<usize>,
 }
@@ -2094,7 +2094,7 @@ fn build_constraints_to_check(
     table_name: &str,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     has_user_provided_rowid: bool,
-) -> CheckConstraints {
+) -> ConstraintsToCheck {
     let mut constraints_to_check = Vec::new();
     if has_user_provided_rowid {
         // Check uniqueness constraint for rowid if it was provided by user.
@@ -2124,7 +2124,7 @@ fn build_constraints_to_check(
         } else {
             None
         };
-    CheckConstraints {
+    ConstraintsToCheck {
         constraints_to_check,
         upsert_catch_all_position,
     }
