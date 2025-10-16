@@ -1322,10 +1322,12 @@ impl Wal for WalFile {
             tracing::debug!("wal_sync finish");
             syncing.store(false, Ordering::SeqCst);
         });
-        let shared = self.get_shared();
+        let file = {
+            let shared = self.get_shared();
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            shared.file.as_ref().unwrap().clone()
+        };
         self.syncing.store(true, Ordering::SeqCst);
-        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-        let file = shared.file.as_ref().unwrap();
         let c = file.sync(completion)?;
         Ok(c)
     }
@@ -1575,9 +1577,11 @@ impl Wal for WalFile {
 
         let c = Completion::new_write_linked(cmp);
 
-        let shared = self.get_shared();
-        assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-        let file = shared.file.as_ref().unwrap();
+        let file = {
+            let shared = self.get_shared();
+            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            shared.file.as_ref().unwrap().clone()
+        };
         let c = file.pwritev(start_off, iovecs, c)?;
         Ok(c)
     }
