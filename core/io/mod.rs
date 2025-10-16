@@ -67,6 +67,11 @@ pub trait File: Send + Sync {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for OpenFlags {}
+unsafe impl Sync for OpenFlags {}
+
 bitflags! {
     impl OpenFlags: i32 {
         const None = 0b00000000;

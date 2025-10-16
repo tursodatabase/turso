@@ -548,6 +548,11 @@ pub struct Pager {
     enable_encryption: AtomicBool,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Pager {}
+unsafe impl Sync for Pager {}
+
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]

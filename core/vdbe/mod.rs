@@ -266,6 +266,11 @@ pub struct Row {
     count: usize,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Row {}
+unsafe impl Sync for Row {}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
     None,
@@ -316,6 +321,11 @@ pub struct ProgramState {
     pub(crate) auto_txn_cleanup: TxnCleanup,
     fk_scope_counter: isize,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for ProgramState {}
+unsafe impl Sync for ProgramState {}
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
