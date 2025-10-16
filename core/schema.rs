@@ -1632,6 +1632,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
+                        ast::ColumnConstraint::Check { .. } => {
+                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+                        }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
                             auto_increment,
