@@ -359,12 +359,7 @@ mod tests {
 
         // Create a btree cursor
         let pager = conn.get_pager();
-        let btree_cursor = Box::new(BTreeCursor::new(
-            None, // No MvCursor
-            pager.clone(),
-            root_page,
-            num_columns,
-        ));
+        let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
         let tx_state = conn.view_transaction_states.get_or_create("test_view");

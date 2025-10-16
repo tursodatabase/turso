@@ -498,7 +498,6 @@ impl DbspCircuit {
             );
             let index_def = create_dbsp_state_index(self.internal_state_index_root);
             let index_cursor = BTreeCursor::new_index(
-                None,
                 pager.clone(),
                 self.internal_state_index_root,
                 &index_def,
@@ -554,7 +553,6 @@ impl DbspCircuit {
                     );
                     let index_def = create_dbsp_state_index(self.internal_state_index_root);
                     let state_index_cursor = BTreeCursor::new_index(
-                        None,
                         pager.clone(),
                         self.internal_state_index_root,
                         &index_def,
@@ -746,7 +744,6 @@ impl DbspCircuit {
                         );
                         let index_def = create_dbsp_state_index(self.internal_state_index_root);
                         let temp_index_cursor = BTreeCursor::new_index(
-                            None,
                             pager.clone(),
                             self.internal_state_index_root,
                             &index_def,
@@ -2775,7 +2772,7 @@ mod tests {
 
         // Create a cursor to read the btree
         let mut btree_cursor =
-            BTreeCursor::new_table(None, pager.clone(), main_data_root, num_columns);
+            BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
 
         // Rewind to the beginning
         pager.io.block(|| btree_cursor.rewind())?;

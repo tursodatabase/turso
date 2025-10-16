@@ -378,10 +378,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn get_skip_advance(&self) -> bool {
         todo!()
     }
-
-    fn get_mvcc_cursor(&self) -> Arc<parking_lot::RwLock<crate::MvCursor>> {
-        todo!()
-    }
 }
 
 impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {

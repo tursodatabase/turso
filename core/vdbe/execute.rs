@@ -7623,9 +7623,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(None, pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
+                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
