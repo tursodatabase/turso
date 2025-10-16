@@ -36,6 +36,29 @@ pub enum DropBehavior {
     Panic,
 }
 
+impl From<DropBehavior> for u8 {
+    fn from(behavior: DropBehavior) -> Self {
+        match behavior {
+            DropBehavior::Rollback => 0,
+            DropBehavior::Commit => 1,
+            DropBehavior::Ignore => 2,
+            DropBehavior::Panic => 3,
+        }
+    }
+}
+
+impl From<u8> for DropBehavior {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => DropBehavior::Rollback,
+            1 => DropBehavior::Commit,
+            2 => DropBehavior::Ignore,
+            3 => DropBehavior::Panic,
+            _ => panic!("Invalid drop behavior: {value}"),
+        }
+    }
+}
+
 /// Represents a transaction on a database connection.
 ///
 /// ## Note
@@ -187,9 +210,13 @@ impl Drop for Transaction<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.in_progress {
-            self.conn.dangling_tx.store(true, Ordering::SeqCst);
+            self.conn
+                .dangling_tx
+                .store(self.drop_behavior(), Ordering::SeqCst);
         } else {
-            self.conn.dangling_tx.store(false, Ordering::SeqCst);
+            self.conn
+                .dangling_tx
+                .store(DropBehavior::Ignore, Ordering::SeqCst);
         }
     }
 }
@@ -239,7 +266,7 @@ impl Connection {
         &mut self,
         behavior: TransactionBehavior,
     ) -> Result<Transaction<'_>> {
-        self.maybe_rollback_dangling_tx().await?;
+        self.maybe_handle_dangling_tx().await?;
         Transaction::new(self, behavior).await
     }
 
@@ -390,14 +417,12 @@ mod test {
         {
             let tx = conn.transaction().await?;
             tx.execute("INSERT INTO foo VALUES(?)", &[1]).await?;
-            tx.finish().await?;
             // default: rollback
         }
         {
             let mut tx = conn.transaction().await?;
             tx.execute("INSERT INTO foo VALUES(?)", &[2]).await?;
             tx.set_drop_behavior(DropBehavior::Commit);
-            tx.finish().await?;
         }
         {
             let tx = conn.transaction().await?;
@@ -408,7 +433,6 @@ mod test {
                 .await?;
 
             assert_eq!(2, result.get::<i32>(0)?);
-            tx.finish().await?;
         }
         Ok(())
     }
