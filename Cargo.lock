@@ -5023,6 +5023,7 @@ dependencies = [
  "antithesis_sdk",
  "clap",
  "hex",
+ "rusqlite",
  "tempfile",
  "tokio",
  "tracing",
