@@ -3495,14 +3495,18 @@ pub fn bind_and_rewrite_expr<'a>(
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Some(row_id_expr) = parse_row_id(
-                            &normalized_id,
-                            referenced_tables.joined_tables()[0].internal_id,
-                            || referenced_tables.joined_tables().len() != 1,
-                        )? {
-                            *expr = row_id_expr;
-
-                            return Ok(WalkControl::Continue);
+                        } else {
+                            let is_btree_table = matches!(joined_table.table, Table::BTree(_));
+                            if is_btree_table {
+                                if let Some(row_id_expr) = parse_row_id(
+                                    &normalized_id,
+                                    referenced_tables.joined_tables()[0].internal_id,
+                                    || referenced_tables.joined_tables().len() != 1,
+                                )? {
+                                    *expr = row_id_expr;
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
                         }
                     }
 
