@@ -169,47 +169,103 @@ impl Drop for EncryptionKey {
 }
 
 macro_rules! define_aegis_cipher {
-    ($struct_name:ident, $cipher_type:ty, key128, $nonce_size:literal, $name:literal) => {
-        define_aegis_cipher!(@impl $struct_name, $cipher_type, $nonce_size, $name, 16, as_128);
+    ($struct_name:ident, $cipher_type:ident::<$tag_bytes:literal>, key128, $nonce_size:literal, $name:literal) => {
+        define_aegis_cipher!(
+            @impl
+            $struct_name,
+            $cipher_type::<$tag_bytes>,
+            $nonce_size,
+            $name,
+            16,
+            as_128
+        );
     };
-    ($struct_name:ident, $cipher_type:ty, key256, $nonce_size:literal, $name:literal) => {
-        define_aegis_cipher!(@impl $struct_name, $cipher_type, $nonce_size, $name, 32, as_256);
+    ($struct_name:ident, $cipher_type:ident::<$tag_bytes:literal>, key256, $nonce_size:literal, $name:literal) => {
+        define_aegis_cipher!(
+            @impl
+            $struct_name,
+            $cipher_type::<$tag_bytes>,
+            $nonce_size,
+            $name,
+            32,
+            as_256
+        );
     };
-    (@impl $struct_name:ident, $cipher_type:ty, $nonce_size:literal, $name:literal, $key_size:literal, $key_method:ident) => {
+    (@impl
+        $struct_name:ident,
+        $cipher_type:ident::<$tag_bytes:literal>,
+        $nonce_size:literal,
+        $name:literal,
+        $key_size:literal,
+        $key_method:ident
+    ) => {
         #[derive(Clone)]
         pub struct $struct_name {
             key: EncryptionKey,
         }
 
         impl $struct_name {
-            const TAG_SIZE: usize = 16;
+            const TAG_SIZE: usize = $tag_bytes;
 
             fn new(key: &EncryptionKey) -> Self {
                 Self { key: key.clone() }
             }
 
-            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; $nonce_size])> {
+            fn encrypt(
+                &self,
+                plaintext: &[u8],
+                ad: &[u8],
+            ) -> Result<(Vec<u8>, [u8; $nonce_size])> {
                 let nonce = generate_secure_nonce::<$nonce_size>();
-                let key_bytes = self.key.$key_method()
-                    .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
-                let (ciphertext, tag) = <$cipher_type>::new(key_bytes, &nonce).encrypt(plaintext, ad);
+                let key_bytes = self
+                    .key
+                    .$key_method()
+                    .ok_or_else(|| -> LimboError {
+                        CipherError::InvalidKeySize {
+                            cipher: $name,
+                            expected: $key_size,
+                        }
+                        .into()
+                    })?;
+                let (ciphertext, tag) =
+                    <$cipher_type::<$tag_bytes>>::new(key_bytes, &nonce)
+                        .encrypt(plaintext, ad);
                 let mut result = ciphertext;
                 result.extend_from_slice(&tag);
                 Ok((result, nonce))
             }
 
-            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; $nonce_size], ad: &[u8]) -> Result<Vec<u8>> {
+            fn decrypt(
+                &self,
+                ciphertext: &[u8],
+                nonce: &[u8; $nonce_size],
+                ad: &[u8],
+            ) -> Result<Vec<u8>> {
                 if ciphertext.len() < Self::TAG_SIZE {
-                    return Err(LimboError::from(CipherError::CiphertextTooShort { cipher: $name }));
+                    return Err(LimboError::from(CipherError::CiphertextTooShort {
+                        cipher: $name,
+                    }));
                 }
                 let (ct, tag) = ciphertext.split_at(ciphertext.len() - Self::TAG_SIZE);
-                let tag_array: [u8; 16] = tag.try_into().map_err(|_| -> LimboError { CipherError::InvalidTagSize { cipher: $name }.into() })?;
+                let tag_array: [u8; Self::TAG_SIZE] = tag.try_into().map_err(|_| {
+                    LimboError::from(CipherError::InvalidTagSize { cipher: $name })
+                })?;
 
-                let key_bytes = self.key.$key_method()
-                    .ok_or_else(|| -> LimboError { CipherError::InvalidKeySize { cipher: $name, expected: $key_size }.into() })?;
-                <$cipher_type>::new(key_bytes, nonce)
+                let key_bytes = self
+                    .key
+                    .$key_method()
+                    .ok_or_else(|| -> LimboError {
+                        CipherError::InvalidKeySize {
+                            cipher: $name,
+                            expected: $key_size,
+                        }
+                        .into()
+                    })?;
+                <$cipher_type::<$tag_bytes>>::new(key_bytes, nonce)
                     .decrypt(ct, &tag_array, ad)
-                    .map_err(|_| -> LimboError { CipherError::DecryptionFailed { cipher: $name }.into() })
+                    .map_err(|_| {
+                        LimboError::from(CipherError::DecryptionFailed { cipher: $name })
+                    })
             }
         }
 
@@ -237,7 +293,6 @@ macro_rules! define_aes_gcm_cipher {
         }
 
         impl $struct_name {
-            const TAG_SIZE: usize = 16;
             const NONCE_SIZE: usize = 12;
 
             fn new(key: &EncryptionKey) -> Result<Self> {
@@ -249,7 +304,7 @@ macro_rules! define_aes_gcm_cipher {
                 })
             }
 
-            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; 12])> {
+            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; Self::NONCE_SIZE])> {
                 let nonce = <$cipher_type>::generate_nonce(&mut OsRng);
                 let ciphertext = self.cipher.encrypt(&nonce, aes_gcm::aead::Payload {
                     msg: plaintext,
@@ -257,12 +312,12 @@ macro_rules! define_aes_gcm_cipher {
                 }).map_err(|e| {
                     LimboError::InternalError(format!("{} encryption failed: {e:?}", $name))
                 })?;
-                let mut nonce_array = [0u8; 12];
+                let mut nonce_array = [0u8; Self::NONCE_SIZE];
                 nonce_array.copy_from_slice(&nonce);
                 Ok((ciphertext, nonce_array))
             }
 
-            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], ad: &[u8]) -> Result<Vec<u8>> {
+            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; Self::NONCE_SIZE], ad: &[u8]) -> Result<Vec<u8>> {
                 let nonce = Nonce::from_slice(nonce);
                 self.cipher
                     .decrypt(nonce, aes_gcm::aead::Payload {
