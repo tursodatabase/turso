@@ -240,3 +240,15 @@ do_execsql_test_on_specific_db {:memory:} orderby_alias_precedence {
     SELECT x AS y, y AS x FROM t ORDER BY x;
 } {2|100
 1|200}
+
+# Check that ORDER BY with heap-sort properly handle multiple rows with same order key + result values
+do_execsql_test_on_specific_db {:memory:} orderby_same_rows {
+    CREATE TABLE t(x,y,z);
+    INSERT INTO t VALUES (1,2,3),(1,2,6),(1,2,9),(1,2,10),(1,3,-1),(1,3,-2);
+    SELECT x, y FROM t ORDER BY x, y LIMIT 10;
+} {1|2
+1|2
+1|2
+1|2
+1|3
+1|3}
