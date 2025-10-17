@@ -1912,7 +1912,7 @@ impl StreamingWalReader {
         wfs.loaded.store(true, Ordering::SeqCst);
 
         self.done.store(true, Ordering::Release);
-        tracing::info!(
+        tracing::debug!(
             "WAL loading complete: {} frames processed, last commit at frame {}",
             st.frame_idx - 1,
             max_frame
