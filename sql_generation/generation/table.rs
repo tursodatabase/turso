@@ -16,21 +16,33 @@ impl Arbitrary for Name {
     }
 }
 
-impl Arbitrary for Table {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+impl Table {
+    /// Generate a table with some predefined columns
+    pub fn arbitrary_with_columns<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        name: String,
+        predefined_columns: Vec<Column>,
+    ) -> Self {
         let opts = context.opts().table.clone();
-        let name = Name::arbitrary(rng, context).0;
         let large_table =
             opts.large_table.enable && rng.random_bool(opts.large_table.large_table_prob);
-        let column_size = if large_table {
+        let target_column_size = if large_table {
             rng.random_range(opts.large_table.column_range)
         } else {
             rng.random_range(opts.column_range)
         } as usize;
-        let mut column_set = IndexSet::with_capacity(column_size);
+
+        // Start with predefined columns
+        let mut column_set = IndexSet::with_capacity(target_column_size);
+        for col in predefined_columns {
+            column_set.insert(col);
+        }
+
+        // Generate additional columns to reach target size
         for col in std::iter::repeat_with(|| Column::arbitrary(rng, context)) {
             column_set.insert(col);
-            if column_set.len() == column_size {
+            if column_set.len() >= target_column_size {
                 break;
             }
         }
@@ -41,6 +53,13 @@ impl Arbitrary for Table {
             columns: Vec::from_iter(column_set),
             indexes: vec![],
         }
+    }
+}
+
+impl Arbitrary for Table {
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+        let name = Name::arbitrary(rng, context).0;
+        Table::arbitrary_with_columns(rng, context, name, vec![])
     }
 }
 
