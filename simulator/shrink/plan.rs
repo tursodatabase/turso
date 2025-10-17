@@ -398,12 +398,10 @@ impl InteractionPlan {
         env: Arc<Mutex<SimulatorEnv>>,
     ) -> bool {
         let last_execution = Arc::new(Mutex::new(*failing_execution));
+        let test_plan_clone = test_plan.clone();
+        let last_execution_clone = last_execution.clone();
         let result = SandboxedResult::from(
-            std::panic::catch_unwind(|| {
-                let plan = test_plan.static_iterator();
-
-                run_simulation(env.clone(), plan, last_execution.clone())
-            }),
+            move || run_simulation(env, test_plan_clone.static_iterator(), last_execution_clone),
             last_execution,
         );
         match (old_result, &result) {

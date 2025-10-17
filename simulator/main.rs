@@ -10,13 +10,13 @@ use runner::cli::{SimulatorCLI, SimulatorCommand};
 use runner::differential;
 use runner::env::SimulatorEnv;
 use runner::execution::{Execution, ExecutionHistory, ExecutionResult, execute_interactions};
-use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
@@ -38,6 +38,7 @@ fn main() -> anyhow::Result<()> {
     init_logger()?;
     let mut cli_opts = SimulatorCLI::parse();
     cli_opts.validate()?;
+    setup_panic_hook();
 
     let profile = Profile::parse_from_type(cli_opts.profile.clone())?;
     tracing::debug!(sim_profile = ?profile);
@@ -178,16 +179,13 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                     tracing::info!("plan file modified, rerunning simulation");
                     let env = env.clone_without_connections();
                     let last_execution_ = last_execution.clone();
+                    let env = Arc::new(Mutex::new(env));
                     let result = SandboxedResult::from(
-                        std::panic::catch_unwind(move || {
-                            let mut env = env;
-                            let plan_path = env.get_plan_path();
+                        move || {
+                            let plan_path = env.lock().unwrap().get_plan_path();
                             let plan = InteractionPlan::compute_via_diff(&plan_path);
-                            env.clear();
-
-                            let env = Arc::new(Mutex::new(env.clone_without_connections()));
                             run_simulation_default(env, plan, last_execution_.clone())
-                        }),
+                        },
                         last_execution.clone(),
                     );
                     match result {
@@ -209,12 +207,7 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
     Ok(())
 }
 
-fn run_simulator(
-    mut bugbase: Option<&mut BugBase>,
-    cli_opts: &SimulatorCLI,
-    env: SimulatorEnv,
-    plan: InteractionPlan,
-) -> anyhow::Result<()> {
+fn setup_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic occurred");
 
@@ -230,28 +223,32 @@ fn run_simulator(
         let bt = Backtrace::force_capture();
         tracing::error!("captured backtrace:\n{}", bt);
     }));
+}
 
+fn run_simulator(
+    mut bugbase: Option<&mut BugBase>,
+    cli_opts: &SimulatorCLI,
+    env: SimulatorEnv,
+    plan: InteractionPlan,
+) -> anyhow::Result<()> {
     let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
     let mut gen_rng = env.gen_rng();
 
     let env = Arc::new(Mutex::new(env));
     // Need to wrap in Rc Mutex due to the UnwindSafe barrier
-    let plan = Rc::new(Mutex::new(plan));
+    let plan = Arc::new(Mutex::new(plan));
+    let sim_execution: Arc<Mutex<Execution>> = last_execution.clone();
+    let sim_env = env.clone();
+    let sim_plan = plan.clone();
 
-    let result = {
-        let sim_execution = last_execution.clone();
-        let sim_plan = plan.clone();
-        let sim_env = env.clone();
-
-        SandboxedResult::from(
-            std::panic::catch_unwind(move || {
-                let mut sim_plan = sim_plan.lock().unwrap();
-                let plan = sim_plan.generator(&mut gen_rng);
-                run_simulation(sim_env, plan, sim_execution)
-            }),
-            last_execution.clone(),
-        )
-    };
+    let result = SandboxedResult::from(
+        move || {
+            let mut plan_lock = sim_plan.lock().unwrap();
+            let generated_plan = plan_lock.generator(&mut gen_rng);
+            run_simulation(sim_env, generated_plan, sim_execution)
+        },
+        Arc::clone(&last_execution),
+    );
     env.clear_poison();
     plan.clear_poison();
     let env = env.lock().unwrap();
@@ -322,13 +319,11 @@ fn run_simulator(
                 let last_execution = Arc::new(Mutex::new(*last_execution));
                 let env = env.clone_at_phase(SimulationPhase::Shrink);
                 let env = Arc::new(Mutex::new(env));
+                let last_execution_clone = last_execution.clone();
+                let generated_plan = shrunk_plan.static_iterator();
                 let shrunk = SandboxedResult::from(
-                    std::panic::catch_unwind(|| {
-                        let plan = shrunk_plan.static_iterator();
-
-                        run_simulation(env.clone(), plan, last_execution.clone())
-                    }),
-                    last_execution,
+                    move || run_simulation(env, generated_plan, last_execution_clone),
+                    Arc::clone(&last_execution),
                 );
                 (shrunk_plan, shrunk)
             } else {
@@ -431,38 +426,33 @@ enum SandboxedResult {
 }
 
 impl SandboxedResult {
-    fn from(
-        result: Result<ExecutionResult, Box<dyn Any + Send>>,
-        last_execution: Arc<Mutex<Execution>>,
-    ) -> Self {
-        match result {
-            Ok(ExecutionResult { error: None, .. }) => SandboxedResult::Correct,
-            Ok(ExecutionResult { error: Some(e), .. }) => {
+    fn from<F>(f: F, last_execution: Arc<Mutex<Execution>>) -> SandboxedResult
+    where
+        F: FnOnce() -> ExecutionResult + Send + 'static,
+    {
+        let handle = thread::spawn(move || std::panic::catch_unwind(AssertUnwindSafe(f)));
+        match handle.join() {
+            Ok(Ok(ExecutionResult { error: None, .. })) => SandboxedResult::Correct,
+            Ok(Ok(ExecutionResult { error: Some(e), .. })) => {
                 let error = format!("{e:?}");
-                let last_execution = last_execution.lock().unwrap();
+                let last_execution = *last_execution.lock().unwrap();
                 SandboxedResult::Panicked {
                     error,
-                    last_execution: *last_execution,
+                    last_execution,
                 }
             }
-            Err(payload) => {
-                tracing::error!("panic occurred");
-                let err = if let Some(s) = payload.downcast_ref::<&str>() {
-                    tracing::error!("{}", s);
+            Ok(Err(payload)) | Err(payload) => {
+                let err_msg = if let Some(s) = payload.downcast_ref::<&str>() {
                     s.to_string()
                 } else if let Some(s) = payload.downcast_ref::<String>() {
-                    tracing::error!("{}", s);
-                    s.to_string()
+                    s.clone()
                 } else {
-                    tracing::error!("unknown panic payload");
                     "unknown panic payload".to_string()
                 };
-
-                last_execution.clear_poison();
-
+                let last_execution = *last_execution.lock().unwrap();
                 SandboxedResult::Panicked {
-                    error: err,
-                    last_execution: *last_execution.lock().unwrap(),
+                    error: err_msg,
+                    last_execution,
                 }
             }
         }
