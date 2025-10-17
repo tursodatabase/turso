@@ -516,14 +516,14 @@ pub mod tests {
         ];
         for &seed in seeds {
             let mut rng = StdRng::seed_from_u64(seed);
-            let n_slots = rng.gen_range(1..10) * 64;
+            let n_slots = rng.random_range(1..10) * 64;
 
             let mut pb = SlotBitmap::new(n_slots);
             let mut model = vec![true; n_slots as usize];
 
             let iters = 2000usize;
             for _ in 0..iters {
-                let op = rng.gen_range(0..100);
+                let op = rng.random_range(0..100);
                 match op {
                     0..=49 => {
                         // alloc_one
@@ -540,8 +540,9 @@ pub mod tests {
                     }
                     50..=79 => {
                         // alloc_run with random length
-                        let need =
-                            rng.gen_range(1..=std::cmp::max(1, (n_slots as usize).min(128))) as u32;
+                        let need = rng
+                            .random_range(1..=std::cmp::max(1, (n_slots as usize).min(128)))
+                            as u32;
                         let got = pb.alloc_run(need);
                         if let Some(start) = got {
                             assert!(start + need <= n_slots, "within bounds");
@@ -560,13 +561,14 @@ pub mod tests {
                     }
                     _ => {
                         // free_run on a random valid range
-                        let len =
-                            rng.gen_range(1..=std::cmp::max(1, (n_slots as usize).min(128))) as u32;
+                        let len = rng
+                            .random_range(1..=std::cmp::max(1, (n_slots as usize).min(128)))
+                            as u32;
                         let max_start = n_slots.saturating_sub(len);
                         let start = if max_start == 0 {
                             0
                         } else {
-                            rng.gen_range(0..=max_start)
+                            rng.random_range(0..=max_start)
                         };
                         pb.free_run(start, len);
                         ref_mark_run(&mut model, start, len, true);
