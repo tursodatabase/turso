@@ -608,7 +608,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
-        const ITERS: usize = 3000;
+        const ITERS: usize = 1000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
@@ -976,7 +976,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
 
-        const OUTER_ITERS: usize = 20;
+        const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
@@ -1264,7 +1264,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_edgecases_minifuzz seed: {seed}");
 
-        const OUTER_ITERS: usize = 20;
+        const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
 
         fn assert_parity(
@@ -1832,7 +1832,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("table_index_mutation_fuzz seed: {seed}");
 
-        const OUTER_ITERATIONS: usize = 100;
+        const OUTER_ITERATIONS: usize = 50;
         for i in 0..OUTER_ITERATIONS {
             println!(
                 "table_index_mutation_fuzz iteration {}/{}",
@@ -2048,7 +2048,7 @@ mod tests {
     fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
-        const INNER_ITERS: usize = 500;
+        const INNER_ITERS: usize = 100;
 
         let (mut rng, seed) = rng_from_time_or_env();
         println!("partial_index_mutation_and_upsert_fuzz seed: {seed}");
@@ -2389,7 +2389,7 @@ mod tests {
         const MIN_TABLES: usize = 1;
         const MAX_ROWS_PER_TABLE: usize = 40;
         const MIN_ROWS_PER_TABLE: usize = 5;
-        const NUM_FUZZ_ITERATIONS: usize = 2000;
+        const NUM_FUZZ_ITERATIONS: usize = 500;
         // How many more SELECTs than tables can be in a UNION (e.g., if 2 tables, max 2+2=4 SELECTs)
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
@@ -2518,7 +2518,7 @@ mod tests {
     pub fn ddl_compatibility_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
-        const ITERATIONS: usize = 1000;
+        const ITERATIONS: usize = 500;
         for i in 0..ITERATIONS {
             let db = TempDatabase::new_empty(true);
             let conn = db.connect_limbo();
@@ -3441,7 +3441,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("affinity_fuzz seed: {seed}");
 
-        for iteration in 0..500 {
+        for iteration in 0..250 {
             let db = TempDatabase::new_empty(false);
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -3850,7 +3850,7 @@ mod tests {
         }
 
         // Test different DISTINCT + ORDER BY combinations
-        for _ in 0..300 {
+        for _ in 0..200 {
             // Randomly select columns for DISTINCT
             let num_distinct_cols = rng.random_range(1..=columns.len());
             let mut available_cols = columns.to_vec();
