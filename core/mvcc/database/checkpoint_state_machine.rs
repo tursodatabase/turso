@@ -165,24 +165,26 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 continue;
             }
 
-            let row_versions = entry.value().read();
-
-            let mut version_to_checkpoint = None;
+            let mut version_to_checkpoint: Option<RowVersion> = None;
             let mut exists_in_db_file = false;
-            for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    //TODO: garbage collect row versions after checkpointing.
+            entry.value().for_each_node(|node| {
+                let version = node.row_version()?;
+                //TODO: garbage collect row versions after checkpointing.
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.bound.load().begin {
                     if ts > self.checkpointed_txid_max_old {
-                        version_to_checkpoint = Some(version);
+                        if version_to_checkpoint.is_none() {
+                            version_to_checkpoint = Some(version.clone());
+                        }
                     } else {
                         exists_in_db_file = true;
                     }
                 }
-            }
+                None::<()>
+            });
 
             if let Some(version) = version_to_checkpoint {
-                let is_delete = version.end.is_some();
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                let is_delete = version.end().is_some();
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin() {
                     max_timestamp = max_timestamp.max(ts);
                 }
 
@@ -479,7 +481,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let (row_version, _) = self.get_current_row_version(write_set_index).unwrap();
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if row_version.end().is_some() {
                     // This is a delete operation
                     let state_machine = self
                         .mvstore
