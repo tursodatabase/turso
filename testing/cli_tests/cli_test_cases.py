@@ -368,6 +368,20 @@ def test_parse_error():
         lambda res: "Parse error: " in res,
         "Try to LIMIT using an identifier should trigger a Parse error",
     )
+    turso.run_test_fn(
+        "select __subquery_0.* from (values (1)) inner join (values (2)) __subquery_0;",
+        lambda x: "Subquery alias cannot start with reserved prefix" in x,
+        "Subquery alias starting with reserved prefix should trigger a Parse error",
+    )
+    turso.run_test_fn(
+        "select * from sqlite_schema as __subquery_;",
+        lambda x: "Table alias cannot start with reserved prefix" in x,
+        "Table alias starting with reserved prefix should trigger a Parse error",
+    )
+    turso.run_test_fn(
+        "select * from (values (1)) as __subquery_0;",
+        lambda x: "Subquery alias cannot start with reserved prefix" in x,
+    )
     turso.quit()
 
 
