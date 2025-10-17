@@ -629,6 +629,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
+            // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
+            let _ = conn.execute("COMMIT", ()).await;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);
