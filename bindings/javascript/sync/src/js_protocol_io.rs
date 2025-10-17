@@ -65,7 +65,7 @@ struct JsDataCompletionInner {
 }
 
 impl JsDataCompletion {
-    fn inner(&self) -> turso_sync_engine::Result<MutexGuard<JsDataCompletionInner>> {
+    fn inner(&self) -> turso_sync_engine::Result<MutexGuard<'_, JsDataCompletionInner>> {
         let inner = self.0.lock().unwrap();
         if let Some(err) = &inner.err {
             return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(

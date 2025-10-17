@@ -360,6 +360,7 @@ impl Value {
     }
 }
 
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalAggState {
     pub state: *mut AggCtx,

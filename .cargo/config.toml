@@ -38,3 +38,7 @@ rustflags = [
   "-C", 
   "link-args=/FORCE"
 ]
+
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clinker-features=-lld"]

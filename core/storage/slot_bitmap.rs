@@ -68,7 +68,7 @@ impl SlotBitmap {
     /// word are marked as allocated to prevent out-of-bounds allocations.
     pub fn new(n_slots: u32) -> Self {
         turso_assert!(
-            n_slots % 64 == 0,
+            n_slots.is_multiple_of(64),
             "number of slots in map must be a multiple of 64"
         );
         let n_words = (n_slots / Self::WORD_BITS) as usize;
