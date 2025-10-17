@@ -673,7 +673,7 @@ impl BTreeCursor {
         root_page: i64,
         num_columns: usize,
     ) -> Self {
-        let valid_state = if root_page == 1 && !pager.db_state.is_initialized() {
+        let valid_state = if root_page == 1 && !pager.db_state.get().is_initialized() {
             CursorValidState::Invalid
         } else {
             CursorValidState::Valid
