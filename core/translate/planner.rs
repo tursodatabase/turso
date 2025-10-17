@@ -37,6 +37,8 @@ use turso_parser::ast::{
 /// Valid ways to refer to the rowid of a btree table.
 pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 
+pub const SUBQUERY_PREFIX: &str = "__subquery_";
+
 /// This function walks the expression tree and identifies aggregate
 /// and window functions.
 ///
@@ -349,10 +351,18 @@ fn parse_from_clause_table(
                     ast::As::As(id) => id,
                     ast::As::Elided(id) => id,
                 })
-                .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or(format!("subquery_{cur_table_index}"));
+                .map(|id| normalize_ident(id.as_str()));
+            if identifier
+                .as_ref()
+                .is_some_and(|a| a.starts_with(SUBQUERY_PREFIX))
+            {
+                crate::bail_parse_error!(
+                    "Subquery alias cannot start with reserved prefix '{}'",
+                    SUBQUERY_PREFIX
+                );
+            }
             table_references.add_joined_table(JoinedTable::new_subquery(
-                identifier,
+                identifier.unwrap_or(format!("{SUBQUERY_PREFIX}{cur_table_index}")),
                 subplan,
                 None,
                 program.table_reference_counter.next(),
@@ -387,6 +397,12 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
+    if normalized_qualified_name.starts_with(SUBQUERY_PREFIX) {
+        crate::bail_parse_error!(
+            "Table name cannot start with reserved prefix '{}'",
+            SUBQUERY_PREFIX
+        );
+    }
     let database_id = connection.resolve_database_id(qualified_name)?;
     let table_name = &qualified_name.name;
 
@@ -405,6 +421,12 @@ fn parse_table(
                 ast::As::Elided(id) => id,
             };
             cte_table.identifier = normalize_ident(alias.as_str());
+            if cte_table.identifier.starts_with(SUBQUERY_PREFIX) {
+                crate::bail_parse_error!(
+                    "CTE alias cannot start with reserved prefix '{}'",
+                    SUBQUERY_PREFIX
+                );
+            }
         }
 
         table_references.add_joined_table(cte_table);
@@ -421,6 +443,16 @@ fn parse_table(
                 ast::As::Elided(id) => id,
             })
             .map(|a| normalize_ident(a.as_str()));
+        if alias
+            .as_ref()
+            .map(|a| a.starts_with(SUBQUERY_PREFIX))
+            .unwrap_or(false)
+        {
+            crate::bail_parse_error!(
+                "Table alias cannot start with reserved prefix '{}'",
+                SUBQUERY_PREFIX
+            );
+        }
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
@@ -522,6 +554,16 @@ fn parse_table(
                 ast::As::Elided(id) => id,
             })
             .map(|a| normalize_ident(a.as_str()));
+        if alias
+            .as_ref()
+            .map(|a| a.starts_with(SUBQUERY_PREFIX))
+            .unwrap_or(false)
+        {
+            crate::bail_parse_error!(
+                "Table alias cannot start with reserved prefix '{}'",
+                SUBQUERY_PREFIX
+            );
+        }
 
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
