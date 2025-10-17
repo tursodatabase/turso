@@ -25,6 +25,7 @@ use std::sync::atomic::{
 };
 use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
+use turso_macros::AtomicEnum;
 
 use super::btree::btree_init_page;
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
@@ -57,7 +58,7 @@ impl HeaderRef {
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.is_initialized() {
+                    if !pager.db_state.get().is_initialized() {
                         return Err(LimboError::Page1NotAlloc);
                     }
 
@@ -97,7 +98,7 @@ impl HeaderRefMut {
             tracing::trace!(?state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.is_initialized() {
+                    if !pager.db_state.get().is_initialized() {
                         return Err(LimboError::Page1NotAlloc);
                     }
 
@@ -416,54 +417,16 @@ impl From<u8> for AutoVacuumMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum DbState {
-    Uninitialized = Self::UNINITIALIZED,
-    Initializing = Self::INITIALIZING,
-    Initialized = Self::INITIALIZED,
+    Uninitialized,
+    Initializing,
+    Initialized,
 }
 
 impl DbState {
-    pub(self) const UNINITIALIZED: usize = 0;
-    pub(self) const INITIALIZING: usize = 1;
-    pub(self) const INITIALIZED: usize = 2;
-
-    #[inline]
     pub fn is_initialized(&self) -> bool {
         matches!(self, DbState::Initialized)
-    }
-}
-
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct AtomicDbState(AtomicUsize);
-
-impl AtomicDbState {
-    #[inline]
-    pub const fn new(state: DbState) -> Self {
-        Self(AtomicUsize::new(state as usize))
-    }
-
-    #[inline]
-    pub fn set(&self, state: DbState) {
-        self.0.store(state as usize, Ordering::Release);
-    }
-
-    #[inline]
-    pub fn get(&self) -> DbState {
-        let v = self.0.load(Ordering::Acquire);
-        match v {
-            DbState::UNINITIALIZED => DbState::Uninitialized,
-            DbState::INITIALIZING => DbState::Initializing,
-            DbState::INITIALIZED => DbState::Initialized,
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline]
-    pub fn is_initialized(&self) -> bool {
-        self.get().is_initialized()
     }
 }
 
@@ -621,7 +584,7 @@ impl Pager {
         db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if !db_state.is_initialized() {
+        let allocate_page1_state = if !db_state.get().is_initialized() {
             RwLock::new(AllocatePage1State::Start)
         } else {
             RwLock::new(AllocatePage1State::Done)
@@ -1131,7 +1094,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
-        if !self.db_state.is_initialized() {
+        if !self.db_state.get().is_initialized() {
             if let Ok(_lock) = self.init_lock.try_lock() {
                 match (self.db_state.get(), self.allocating_page1()) {
                     // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page

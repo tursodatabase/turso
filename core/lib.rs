@@ -40,6 +40,7 @@ pub mod numeric;
 mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
+use crate::storage::encryption::AtomicCipherMode;
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -93,7 +94,7 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
 use tracing::{instrument, Level};
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
@@ -178,7 +179,7 @@ impl EncryptionOpts {
 
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
     Write { schema_did_change: bool },
     Read,
@@ -186,7 +187,7 @@ enum TransactionState {
     None,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Off = 0,
     Full = 2,
@@ -562,7 +563,7 @@ impl Database {
             schema: RwLock::new(self.schema.lock().unwrap().clone()),
             database_schemas: RwLock::new(std::collections::HashMap::new()),
             auto_commit: AtomicBool::new(true),
-            transaction_state: RwLock::new(TransactionState::None),
+            transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
@@ -580,8 +581,8 @@ impl Database {
             metrics: RwLock::new(ConnectionMetrics::new()),
             is_nested_stmt: AtomicBool::new(false),
             encryption_key: RwLock::new(None),
-            encryption_cipher_mode: RwLock::new(None),
-            sync_mode: RwLock::new(SyncMode::Full),
+            encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
+            sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
@@ -604,7 +605,7 @@ impl Database {
     /// we need to read the page_size from the database header.
     fn read_page_size_from_db_header(&self) -> Result<PageSize> {
         turso_assert!(
-            self.db_state.is_initialized(),
+            self.db_state.get().is_initialized(),
             "read_page_size_from_db_header called on uninitialized database"
         );
         turso_assert!(
@@ -622,7 +623,7 @@ impl Database {
 
     fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
         turso_assert!(
-            self.db_state.is_initialized(),
+            self.db_state.get().is_initialized(),
             "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
@@ -658,7 +659,7 @@ impl Database {
                 return Ok(page_size);
             }
         }
-        if self.db_state.is_initialized() {
+        if self.db_state.get().is_initialized() {
             Ok(self.read_page_size_from_db_header()?)
         } else {
             let Some(size) = requested_page_size else {
@@ -674,7 +675,7 @@ impl Database {
     /// if the database is initialized i.e. it exists on disk, return the reserved space bytes from
     /// the header or None
     fn maybe_get_reserved_space_bytes(&self) -> Result<Option<u8>> {
-        if self.db_state.is_initialized() {
+        if self.db_state.get().is_initialized() {
             Ok(Some(self.read_reserved_space_bytes_from_db_header()?))
         } else {
             Ok(None)
@@ -696,7 +697,7 @@ impl Database {
             drop(shared_wal);
 
             let buffer_pool = self.buffer_pool.clone();
-            if self.db_state.is_initialized() {
+            if self.db_state.get().is_initialized() {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
             }
 
@@ -729,7 +730,7 @@ impl Database {
 
         let buffer_pool = self.buffer_pool.clone();
 
-        if self.db_state.is_initialized() {
+        if self.db_state.get().is_initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
@@ -1067,7 +1068,7 @@ pub struct Connection {
     database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
-    transaction_state: RwLock<TransactionState>,
+    transaction_state: AtomicTransactionState,
     last_insert_rowid: AtomicI64,
     last_change: AtomicI64,
     total_changes: AtomicI64,
@@ -1096,8 +1097,8 @@ pub struct Connection {
     /// Generally this is only true for ParseSchema.
     is_nested_stmt: AtomicBool,
     encryption_key: RwLock<Option<EncryptionKey>>,
-    encryption_cipher_mode: RwLock<Option<CipherMode>>,
-    sync_mode: RwLock<SyncMode>,
+    encryption_cipher_mode: AtomicCipherMode,
+    sync_mode: AtomicSyncMode,
     data_sync_retry: AtomicBool,
     /// User defined max accumulated Busy timeout duration
     /// Default is 0 (no timeout)
@@ -1238,8 +1239,7 @@ impl Connection {
 
         let reparse_result = self.reparse_schema();
 
-        let previous =
-            std::mem::replace(&mut *self.transaction_state.write(), TransactionState::None);
+        let previous = self.transaction_state.swap(TransactionState::None);
         turso_assert!(
             matches!(previous, TransactionState::None | TransactionState::Read),
             "unexpected end transaction state"
@@ -1519,7 +1519,7 @@ impl Connection {
             let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
             let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
             let pager = conn.pager.read();
-            if db.db_state.is_initialized() {
+            if db.db_state.get().is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
                 pager.clear_page_cache(false);
             }
@@ -1597,9 +1597,9 @@ impl Connection {
                     header.schema_cookie.get() < version,
                     "cookie can't go back in time"
                 );
-                *self.transaction_state.write() = TransactionState::Write {
+                self.set_tx_state(TransactionState::Write {
                     schema_did_change: true,
-                };
+                });
                 self.with_schema_mut(|schema| schema.schema_version = version);
                 header.schema_cookie = version.into();
             })
@@ -1682,9 +1682,9 @@ impl Connection {
         })?;
 
         // start write transaction and disable auto-commit mode as SQL can be executed within WAL session (at caller own risk)
-        *self.transaction_state.write() = TransactionState::Write {
+        self.set_tx_state(TransactionState::Write {
             schema_did_change: false,
-        };
+        });
         self.auto_commit.store(false, Ordering::SeqCst);
 
         Ok(())
@@ -2029,7 +2029,7 @@ impl Connection {
     }
 
     pub fn is_db_initialized(&self) -> bool {
-        self.db.db_state.is_initialized()
+        self.db.db_state.get().is_initialized()
     }
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
@@ -2259,11 +2259,11 @@ impl Connection {
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
-        *self.sync_mode.read()
+        self.sync_mode.get()
     }
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
-        *self.sync_mode.write() = mode;
+        self.sync_mode.set(mode);
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
@@ -2289,7 +2289,7 @@ impl Connection {
 
     pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
         tracing::trace!("setting encryption cipher for connection");
-        *self.encryption_cipher_mode.write() = Some(cipher_mode);
+        self.encryption_cipher_mode.set(cipher_mode);
         self.set_encryption_context()
     }
 
@@ -2300,7 +2300,10 @@ impl Connection {
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        *self.encryption_cipher_mode.read()
+        match self.encryption_cipher_mode.get() {
+            CipherMode::None => None,
+            mode => Some(mode),
+        }
     }
 
     // if both key and cipher are set, set encryption context on pager
@@ -2309,8 +2312,8 @@ impl Connection {
         let Some(key) = key_guard.as_ref() else {
             return Ok(());
         };
-        let cipher_guard = self.encryption_cipher_mode.read();
-        let Some(cipher_mode) = *cipher_guard else {
+        let cipher_mode = self.get_encryption_cipher_mode();
+        let Some(cipher_mode) = cipher_mode else {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
@@ -2348,11 +2351,11 @@ impl Connection {
     }
 
     fn set_tx_state(&self, state: TransactionState) {
-        *self.transaction_state.write() = state;
+        self.transaction_state.set(state);
     }
 
     fn get_tx_state(&self) -> TransactionState {
-        *self.transaction_state.read()
+        self.transaction_state.get()
     }
 
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {

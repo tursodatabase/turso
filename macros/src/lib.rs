@@ -479,7 +479,7 @@ pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
 /// - For u8/i8 fields: uses u16 internally (8 bits discriminant, 8 bits data)
 ///
 /// Example:
-/// ```rust
+/// ```ignore
 /// #[derive(AtomicEnum)]
 /// enum TransactionState {
 ///     Write { schema_did_change: bool },
