@@ -311,9 +311,11 @@ impl IncrementalView {
                 internal_state_root,
                 internal_state_index_root,
             ),
-            _ => Err(LimboError::ParseError(format!(
-                "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
-            ))),
+            _ => Err(LimboError::ParseError(
+                turso_parser::error::ParseError::Custom(format!(
+                    "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
+                )),
+            )),
         }
     }
 
@@ -468,9 +470,11 @@ impl IncrementalView {
                     aliases.insert(alias_name.to_string(), table_name.to_string());
                 }
             } else {
-                return Err(LimboError::ParseError(format!(
-                    "Table '{table_name}' not found in schema"
-                )));
+                return Err(LimboError::ParseError(
+                    turso_parser::error::ParseError::Custom(format!(
+                        "Table '{table_name}' not found in schema"
+                    )),
+                ));
             }
         }
         Ok(())
@@ -677,7 +681,7 @@ impl IncrementalView {
     ) -> crate::Result<Vec<String>> {
         if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
-                "No tables to populate from".to_string(),
+                turso_parser::error::ParseError::Custom("No tables to populate from".to_string()),
             ));
         }
 
