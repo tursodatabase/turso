@@ -246,19 +246,19 @@ pub(crate) fn derive_atomic_enum_inner(input: TokenStream) -> TokenStream {
             #[inline]
             /// Load and convert the current value to expected enum
             pub fn get(&self) -> #name {
-                Self::from_storage(self.0.load(::std::sync::atomic::Ordering::Acquire))
+                Self::from_storage(self.0.load(::std::sync::atomic::Ordering::SeqCst))
             }
 
             #[inline]
             /// Convert and store new value
             pub fn set(&self, val: #name) {
-                self.0.store(Self::to_storage(&val), ::std::sync::atomic::Ordering::Release)
+                self.0.store(Self::to_storage(&val), ::std::sync::atomic::Ordering::SeqCst)
             }
 
             #[inline]
             /// Store new value and return previous value
             pub fn swap(&self, val: #name) -> #name {
-                let prev = self.0.swap(Self::to_storage(&val), ::std::sync::atomic::Ordering::AcqRel);
+                let prev = self.0.swap(Self::to_storage(&val), ::std::sync::atomic::Ordering::SeqCst);
                 Self::from_storage(prev)
             }
         }
