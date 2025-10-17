@@ -41,6 +41,7 @@ mod numeric;
 
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::translate::display::PlanContext;
+use crate::translate::planner::SUBQUERY_PREFIX;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -2722,11 +2723,19 @@ impl Statement {
             QueryMode::Normal => {
                 let column = &self.program.result_columns.get(idx).expect("No column");
                 match column.name(&self.program.table_references) {
+                    Some(name) if name.starts_with(SUBQUERY_PREFIX) => {
+                        format!("column{idx}").into()
+                    }
                     Some(name) => Cow::Borrowed(name),
                     None => {
                         let tables = [&self.program.table_references];
                         let ctx = PlanContext(&tables);
-                        Cow::Owned(column.expr.displayer(&ctx).to_string())
+                        let name = column.expr.displayer(&ctx).to_string();
+                        if name.starts_with(SUBQUERY_PREFIX) {
+                            format!("column{idx}").into()
+                        } else {
+                            Cow::Owned(name)
+                        }
                     }
                 }
             }
