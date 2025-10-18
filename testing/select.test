@@ -1094,3 +1094,8 @@ do_execsql_test_on_specific_db {:memory:} unambiguous-self-join {
 3|1
 3|2
 3|3}
+
+do_execsql_test_in_memory_any_error duplicate-with-cte-name {
+  CREATE TABLE t2(x INTEGER);
+  WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
+}
