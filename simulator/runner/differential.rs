@@ -8,7 +8,7 @@ use similar_asserts::SimpleDiff;
 use sql_generation::model::table::SimValue;
 
 use crate::{
-    generation::plan::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
+    model::interactions::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
     runner::execution::ExecutionContinuation,
 };
 

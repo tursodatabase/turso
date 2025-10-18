@@ -1,7 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 use anyhow::anyhow;
 use clap::Parser;
-use generation::plan::{InteractionPlan, InteractionPlanState};
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
@@ -22,7 +21,9 @@ use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::generation::plan::{ConnectionState, InteractionPlanIterator};
+use crate::model::interactions::{
+    ConnectionState, InteractionPlan, InteractionPlanIterator, InteractionPlanState,
+};
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
