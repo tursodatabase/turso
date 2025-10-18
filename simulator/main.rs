@@ -289,7 +289,7 @@ fn run_simulator(
                         tracing::trace!(
                             "adding bug to bugbase, seed: {}, plan: {}, error: {}",
                             env.opts.seed,
-                            plan.len(),
+                            plan.len_properties(),
                             error
                         );
                         bugbase
@@ -455,14 +455,15 @@ fn setup_simulation(
         Paths::new(&dir)
     };
 
-    let mut env = SimulatorEnv::new(seed, cli_opts, paths, SimulationType::Default, profile);
+    let env = SimulatorEnv::new(seed, cli_opts, paths, SimulationType::Default, profile);
 
     tracing::info!("Generating database interaction plan...");
 
-    let plan = InteractionPlan::init_plan(&mut env);
+    let plan = InteractionPlan::new(env.profile.experimental_mvcc);
 
     (seed, env, plan)
 }
+
 fn run_simulation(
     env: Arc<Mutex<SimulatorEnv>>,
     plan: impl InteractionPlanIterator,
