@@ -5,14 +5,14 @@ use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult, Value};
 
 use crate::{
-    generation::{
-        Shadow as _,
-        plan::{
+    generation::Shadow as _,
+    model::{
+        Query, ResultSet,
+        interactions::{
             ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
-            InteractionType, ResultSet,
+            InteractionType,
         },
     },
-    model::Query,
 };
 
 use super::env::{SimConnection, SimulatorEnv};
