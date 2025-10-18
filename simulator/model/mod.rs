@@ -9,6 +9,7 @@ use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
+        pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
@@ -34,6 +35,7 @@ pub enum Query {
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    Pragma(Pragma),
     /// Placeholder query that still needs to be generated
     Placeholder,
 }
@@ -81,8 +83,11 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
-            Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
-            Query::Placeholder => IndexSet::new(),
+Query::Begin(_)
+            | Query::Commit(_)
+            | Query::Rollback(_)
+            | Query::Placeholder
+            | Query::Pragma(_) => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -107,6 +112,7 @@ impl Query {
             }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
+            Query::Pragma(_) => vec![],
         }
     }
 
@@ -147,6 +153,7 @@ impl Display for Query {
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
             Self::Placeholder => Ok(()),
+            Query::Pragma(pragma) => write!(f, "{pragma}"),
         }
     }
 }
@@ -169,12 +176,14 @@ impl Shadow for Query {
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
             Query::Placeholder => Ok(vec![]),
+            Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
         }
     }
 }
 
 bitflags! {
     pub struct QueryCapabilities: u32 {
+        const NONE = 0;
         const CREATE = 1 << 0;
         const SELECT = 1 << 1;
         const INSERT = 1 << 2;
@@ -222,6 +231,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
             QueryDiscriminants::Placeholder => {
                 unreachable!("QueryCapabilities do not apply to query Placeholder")
             }
+            QueryDiscriminants::Pragma => QueryCapabilities::NONE,
         }
     }
 }
@@ -237,6 +247,8 @@ impl QueryDiscriminants {
         QueryDiscriminants::CreateIndex,
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
+        QueryDiscriminants::Pragma,
+
     ];
 }
 

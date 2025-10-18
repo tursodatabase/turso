@@ -302,7 +302,6 @@ impl Property {
 
                     let rows = insert.rows();
                     let row = &rows[*row_index];
-
                     match &query {
                         Query::Delete(Delete {
                             table: t,
@@ -1381,6 +1380,7 @@ pub(super) struct Remaining {
     pub drop: u32,
     pub alter_table: u32,
     pub drop_index: u32,
+    pub pragma_count: u32,
 }
 
 pub(super) fn remaining(
@@ -1401,6 +1401,7 @@ pub(super) fn remaining(
     let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
     let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
     let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
+    let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
 
     let remaining_select = total_select
         .checked_sub(stats.select_count)
@@ -1421,6 +1422,9 @@ pub(super) fn remaining(
         .checked_sub(stats.update_count)
         .unwrap_or_default();
     let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
+    let remaining_pragma = total_pragma
+        .checked_sub(stats.pragma_count)
+        .unwrap_or_default();
 
     let remaining_alter_table = total_alter_table
         .checked_sub(stats.alter_table_count)
@@ -1455,6 +1459,7 @@ pub(super) fn remaining(
         update: remaining_update,
         alter_table: remaining_alter_table,
         drop_index: remaining_drop_index,
+        pragma_count: remaining_pragma,
     }
 }
 
