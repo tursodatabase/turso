@@ -43,7 +43,7 @@ impl Default for QueryProfile {
             drop_table_weight: 2,
             alter_table_weight: 2,
             drop_index: 2,
-            pragma_weight: 100,//TODO change this back to 2
+            pragma_weight: 100, //TODO change this back to 2
         }
     }
 }

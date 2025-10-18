@@ -11,7 +11,8 @@ use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
         query::{
-            Create, CreateIndex, Delete, DropIndex, Insert, Select, alter_table::AlterTable,
+            Create, CreateIndex, Delete, DropIndex, Insert, Select,
+            alter_table::AlterTable,
             pragma::{Pragma, VacuumMode},
             update::Update,
         },

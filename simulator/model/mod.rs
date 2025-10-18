@@ -83,7 +83,7 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => IndexSet::from_iter([table.clone()]),
-Query::Begin(_)
+            Query::Begin(_)
             | Query::Commit(_)
             | Query::Rollback(_)
             | Query::Placeholder
@@ -248,7 +248,6 @@ impl QueryDiscriminants {
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
         QueryDiscriminants::Pragma,
-
     ];
 }
 

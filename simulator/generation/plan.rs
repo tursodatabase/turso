@@ -772,7 +772,7 @@ pub(crate) struct InteractionStats {
     pub rollback_count: u32,
     pub alter_table_count: u32,
     pub drop_index_count: u32,
-    pub pragma_count:u32,
+    pub pragma_count: u32,
 }
 
 impl Display for InteractionStats {
