@@ -5,6 +5,8 @@
 //! we can generate queries that reference tables that do not exist. This is not a correctness issue, but more of
 //! an optimization issue that is good to point out for the future
 
+use std::num::NonZeroUsize;
+
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
@@ -26,10 +28,12 @@ use turso_parser::ast::{self, Distinctness};
 
 use crate::{
     common::print_diff,
-    generation::{Shadow as _, WeightedDistribution, query::QueryDistribution},
+    generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
         Query, QueryCapabilities, QueryDiscriminants, ResultSet,
-        interactions::{Assertion, Interaction, InteractionType},
+        interactions::{
+            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata, Span,
+        },
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
@@ -231,7 +235,7 @@ impl Property {
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
-            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
@@ -243,8 +247,12 @@ impl Property {
     /// interactions construct a list of interactions, which is an executable representation of the property.
     /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
-    pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
-        match self {
+    pub(crate) fn interactions(
+        &self,
+        connection_index: usize,
+        id: NonZeroUsize,
+    ) -> Vec<Interaction> {
+        let mut interactions: Vec<InteractionBuilder> = match self {
             Property::AllTableHaveExpectedContent { tables } => {
                 assert_all_table_values(tables, connection_index).collect()
             }
@@ -304,9 +312,9 @@ impl Property {
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select_interaction),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::ReadYourUpdatesBack { update, select } => {
@@ -368,10 +376,10 @@ impl Property {
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, update_interaction),
-                    Interaction::new(connection_index, select_interaction),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(update_interaction),
+                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::InsertValuesSelect {
@@ -448,22 +456,20 @@ impl Property {
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(
-                    connection_index,
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(
                     InteractionType::Query(Query::Insert(insert.clone())),
                 ));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new(
-                    connection_index,
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
                     InteractionType::Query(Query::Select(select.clone())),
                 ));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -505,16 +511,20 @@ impl Property {
                             }) );
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, cq1));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new_ignore_error(connection_index, cq2));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(cq1));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push({
+                    let mut builder = InteractionBuilder::with_interaction(cq2);
+                    builder.ignore_error(true);
+                    builder
+                });
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -574,12 +584,11 @@ impl Property {
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(
-                        connection_index,
-                        InteractionType::Query(Query::Select(select.clone())),
-                    ),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Select(
+                        select.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::DeleteSelect {
@@ -643,16 +652,16 @@ impl Property {
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, delete));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new(connection_index, select));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(delete));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push(InteractionBuilder::with_interaction(select));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -715,16 +724,20 @@ impl Property {
 
                 let mut interactions = Vec::new();
 
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, drop));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new_ignore_error(connection_index, select));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(drop));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push({
+                    let mut builder = InteractionBuilder::with_interaction(select);
+                    builder.ignore_error(true);
+                    builder
+                });
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -811,15 +824,14 @@ impl Property {
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select1),
-                    Interaction::new(connection_index, select2),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select1),
+                    InteractionBuilder::with_interaction(select2),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::FsyncNoWait { query } => {
-                vec![Interaction::new(
-                    connection_index,
+                vec![InteractionBuilder::with_interaction(
                     InteractionType::FsyncQuery(query.clone()),
                 )]
             }
@@ -855,7 +867,7 @@ impl Property {
                     InteractionType::Assertion(assert),
                 ]
                 .into_iter()
-                .map(|i| Interaction::new(connection_index, i))
+                .map(InteractionBuilder::with_interaction)
                 .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
@@ -1010,13 +1022,13 @@ impl Property {
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select),
-                    Interaction::new(connection_index, select_tlp),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select),
+                    InteractionBuilder::with_interaction(select_tlp),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
-            Property::UNIONAllPreservesCardinality {
+            Property::UnionAllPreservesCardinality {
                 select,
                 where_clause,
             } => {
@@ -1062,21 +1074,42 @@ impl Property {
                             }
                         },
                     )),
-                ].into_iter().map(|i| Interaction::new(connection_index, i)).collect()
+                ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
-                .map(|query| Interaction::new(connection_index, InteractionType::Query(query)))
+                .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
-        }
+        };
+
+        assert!(!interactions.is_empty());
+
+        // Add a span to the interactions that matter
+        if interactions.len() == 1 {
+            interactions.first_mut().unwrap().span(Span::StartEnd);
+        } else {
+            interactions.first_mut().unwrap().span(Span::Start);
+            interactions.last_mut().unwrap().span(Span::End);
+        };
+
+        interactions
+            .into_iter()
+            .map(|mut builder| {
+                if !builder.has_property_meta() {
+                    builder.property_meta(PropertyMetadata::new(self, false));
+                }
+                builder.connection_index(connection_index).id(id);
+                builder.build().unwrap()
+            })
+            .collect()
     }
 }
 
 fn assert_all_table_values(
     tables: &[String],
     connection_index: usize,
-) -> impl Iterator<Item = Interaction> + use<'_> {
+) -> impl Iterator<Item = InteractionBuilder> + use<'_> {
     tables.iter().flat_map(move |table| {
         let select = InteractionType::Query(Query::Select(Select::simple(
             table.clone(),
@@ -1131,7 +1164,7 @@ fn assert_all_table_values(
                     }
                 }
             }));
-        [select, assertion].into_iter().map(move |i| Interaction::new(connection_index, i))
+        [select, assertion].into_iter().map(InteractionBuilder::with_interaction)
     })
 }
 
@@ -1411,7 +1444,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
         Distinctness::All,
     );
 
-    Property::UNIONAllPreservesCardinality {
+    Property::UnionAllPreservesCardinality {
         select,
         where_clause: p2,
     }
@@ -1460,7 +1493,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::DropSelect => property_drop_select,
             PropertyDiscriminants::SelectSelectOptimizer => property_select_select_optimizer,
             PropertyDiscriminants::WhereTrueFalseNull => property_where_true_false_null,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
@@ -1543,7 +1576,7 @@ impl PropertyDiscriminants {
                     0
                 }
             }
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 if opts.indexes
                     && !env.opts.disable_union_all_preserves_cardinality
                     && !ctx.tables().is_empty()
@@ -1607,7 +1640,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),

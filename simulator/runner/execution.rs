@@ -9,8 +9,8 @@ use crate::{
     model::{
         Query, ResultSet,
         interactions::{
-            ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
-            InteractionType,
+            ConnectionState, Interaction, InteractionBuilder, InteractionPlanIterator,
+            InteractionPlanState, InteractionType,
         },
     },
 };
@@ -199,10 +199,10 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
 
-            let query_interaction = Interaction::new(
-                interaction.connection_index,
-                InteractionType::Query(query.clone()),
-            );
+            let query_interaction = InteractionBuilder::from_interaction(interaction)
+                .interaction(InteractionType::Query(query.clone()))
+                .build()
+                .unwrap();
 
             execute_interaction(env, &query_interaction, stack)?;
         }
