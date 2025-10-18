@@ -6699,11 +6699,12 @@ pub fn op_must_be_int(
             Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
             Err(_) => crate::bail_parse_error!("datatype mismatch"),
         },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str()) {
+        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Ok(Value::Float(f)) => {
-                state.registers[*reg] = Register::Value(Value::Integer(f as i64))
-            }
+            Ok(Value::Float(f)) => match cast_real_to_integer(f) {
+                Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
+                Err(_) => crate::bail_parse_error!("datatype mismatch"),
+            },
             _ => crate::bail_parse_error!("datatype mismatch"),
         },
         _ => {
@@ -9697,7 +9698,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     if s.starts_with("0x") {
                         return false;
                     }
-                    if let Ok(num) = checked_cast_text_to_numeric(s) {
+                    if let Ok(num) = checked_cast_text_to_numeric(s, false) {
                         *value = num;
                         return true;
                     } else {

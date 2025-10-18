@@ -855,11 +855,19 @@ pub fn cast_text_to_real(text: &str) -> Value {
 /// IEEE 754 64-bit float and thus provides a 1-bit of margin for the text-to-float conversion operation.)
 /// Any text input that describes a value outside the range of a 64-bit signed integer yields a REAL result.
 /// Casting a REAL or INTEGER value to NUMERIC is a no-op, even if a real value could be losslessly converted to an integer.
-pub fn checked_cast_text_to_numeric(text: &str) -> std::result::Result<Value, ()> {
+///
+/// `lossless`: If `true`, rejects the input if any characters remain after the numeric prefix (strict / exact conversion).
+pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::Result<Value, ()> {
     // sqlite will parse the first N digits of a string to numeric value, then determine
     // whether _that_ value is more likely a real or integer value. e.g.
     // '-100234-2344.23e14' evaluates to -100234 instead of -100234.0
+    let original_len = text.trim().len();
     let (kind, text) = parse_numeric_str(text)?;
+
+    if original_len != text.len() && lossless {
+        return Err(());
+    }
+
     match kind {
         ValueType::Integer => match text.parse::<i64>() {
             Ok(i) => Ok(Value::Integer(i)),
@@ -940,7 +948,7 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
 }
 
 pub fn cast_text_to_numeric(txt: &str) -> Value {
-    checked_cast_text_to_numeric(txt).unwrap_or(Value::Integer(0))
+    checked_cast_text_to_numeric(txt, false).unwrap_or(Value::Integer(0))
 }
 
 // Check if float can be losslessly converted to 51-bit integer
