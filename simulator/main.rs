@@ -1,8 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 use anyhow::anyhow;
 use clap::Parser;
-use notify::event::{DataChange, ModifyKind};
-use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
 use runner::bugbase::BugBase;
 use runner::cli::{SimulatorCLI, SimulatorCommand};
@@ -15,7 +13,7 @@ use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
@@ -133,8 +131,7 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
     let (seed, mut env, plans) = setup_simulation(bugbase.as_mut(), cli_opts, profile);
 
     if cli_opts.watch {
-        watch_mode(env).unwrap();
-        return Ok(());
+        anyhow::bail!("watch mode is disabled for now");
     }
 
     let paths = env.paths.clone();
@@ -156,58 +153,6 @@ fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Resul
     }
 
     result
-}
-
-fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    println!("watching {:?}", env.get_plan_path());
-    // Use recommended_watcher() to automatically select the best implementation
-    // for your platform. The `EventHandler` passed to this constructor can be a
-    // closure, a `std::sync::mpsc::Sender`, a `crossbeam_channel::Sender`, or
-    // another type the trait is implemented for.
-    let mut watcher = notify::recommended_watcher(tx)?;
-
-    // Add a path to be watched. All files and directories at that path and
-    // below will be monitored for changes.
-    watcher.watch(&env.get_plan_path(), RecursiveMode::NonRecursive)?;
-    // Block forever, printing out events as they come in
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
-    for res in rx {
-        match res {
-            Ok(event) => {
-                if let EventKind::Modify(ModifyKind::Data(DataChange::Content)) = event.kind {
-                    tracing::info!("plan file modified, rerunning simulation");
-                    let env = env.clone_without_connections();
-                    let last_execution_ = last_execution.clone();
-                    let result = SandboxedResult::from(
-                        std::panic::catch_unwind(move || {
-                            let mut env = env;
-                            let plan_path = env.get_plan_path();
-                            let plan = InteractionPlan::compute_via_diff(&plan_path);
-                            env.clear();
-
-                            let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            run_simulation_default(env, plan, last_execution_.clone())
-                        }),
-                        last_execution.clone(),
-                    );
-                    match result {
-                        SandboxedResult::Correct => {
-                            tracing::info!("simulation succeeded");
-                            println!("simulation succeeded");
-                        }
-                        SandboxedResult::Panicked { error, .. }
-                        | SandboxedResult::FoundBug { error, .. } => {
-                            tracing::error!("simulation failed: '{}'", error);
-                        }
-                    }
-                }
-            }
-            Err(e) => println!("watch error: {e:?}"),
-        }
-    }
-
-    Ok(())
 }
 
 fn run_simulator(
