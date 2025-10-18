@@ -230,13 +230,13 @@ do_execsql_test_on_specific_db {:memory:} view-with-having {
 } {C|380
 A|250}
 
-do_execsql_test_error view-self-circle-detection {
+do_execsql_test_in_memory_error_content view-self-circle-detection {
     CREATE VIEW v AS SELECT * FROM v;
     SELECT * FROM v;
 } {view v is circularly defined}
 
 
-do_execsql_test_error view-mutual-circle-detection {
+do_execsql_test_in_memory_error_content view-mutual-circle-detection {
     CREATE VIEW v AS SELECT * FROM vv;
     CREATE VIEW vv AS SELECT * FROM v;
     SELECT * FROM v;
