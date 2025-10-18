@@ -298,8 +298,7 @@ impl SimulatorEnv {
 
         let mut opts = SimulatorOpts {
             seed,
-            ticks: rng
-                .random_range(cli_opts.minimum_tests as usize..=cli_opts.maximum_tests as usize),
+            ticks: usize::MAX,
             disable_select_optimizer: cli_opts.disable_select_optimizer,
             disable_insert_values_select: cli_opts.disable_insert_values_select,
             disable_double_create_failure: cli_opts.disable_double_create_failure,
