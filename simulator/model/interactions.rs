@@ -12,7 +12,10 @@ use turso_core::{Connection, Result, StepResult};
 
 use crate::{
     generation::Shadow,
-    model::{Query, ResultSet, property::Property},
+    model::{
+        Query, ResultSet,
+        property::{Property, PropertyDiscriminants},
+    },
     runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
 };
 
@@ -491,6 +494,40 @@ impl Display for Fault {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Span {
+    Start,
+    End,
+    // Both start and end
+    StartEnd,
+}
+
+impl Span {
+    fn start(&self) -> bool {
+        matches!(self, Self::Start | Self::StartEnd)
+    }
+
+    fn end(&self) -> bool {
+        matches!(self, Self::End | Self::StartEnd)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyMetadata {
+    pub property: PropertyDiscriminants,
+    // If the query is an extension query
+    pub extension: bool,
+}
+
+impl PropertyMetadata {
+    pub fn new(property: &Property, extension: bool) -> PropertyMetadata {
+        Self {
+            property: property.into(),
+            extension,
         }
     }
 }
