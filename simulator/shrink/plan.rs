@@ -213,6 +213,8 @@ impl InteractionPlan {
                 let retain = if failing_interaction_range.end == idx {
                     true
                 } else {
+                    let is_part_of_property = failing_interaction_range.contains(&idx);
+
                     let has_table = interaction
                         .uses()
                         .iter()
@@ -226,8 +228,8 @@ impl InteractionPlan {
                             | InteractionType::Query(Query::Rollback(..))
                     );
 
-                    let skip_interaction = if let Some(property_meta) = interaction.property_meta
-                        && matches!(
+                    let skip_interaction = if let Some(property_meta) = interaction.property_meta {
+                        if matches!(
                             property_meta.property,
                             PropertyDiscriminants::AllTableHaveExpectedContent
                                 | PropertyDiscriminants::SelectLimit
@@ -236,17 +238,24 @@ impl InteractionPlan {
                                 | PropertyDiscriminants::UnionAllPreservesCardinality
                                 | PropertyDiscriminants::WhereTrueFalseNull
                         ) {
-                        // Theses properties only emit select queries, so they can be discarded entirely
-                        true
+                            // Theses properties only emit select queries, so they can be discarded entirely
+                            true
+                        } else {
+                            property_meta.extension
+                                && matches!(
+                                    &interaction.interaction,
+                                    InteractionType::Query(Query::Select(..))
+                                )
+                        }
                     } else {
-                        // Standalone Select query
                         matches!(
                             &interaction.interaction,
-                            InteractionType::Query(Query::Select(_))
+                            InteractionType::Query(Query::Select(..))
                         )
                     };
 
-                    !skip_interaction && (is_fault || is_transaction || has_table)
+                    (is_part_of_property || !skip_interaction)
+                        && (is_fault || is_transaction || has_table)
                 };
                 retain_map.push(retain);
             }
