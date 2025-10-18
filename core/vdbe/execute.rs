@@ -5579,7 +5579,7 @@ pub fn op_function(
                                                     let (ast::Expr::Name(ref name)
                                                     | ast::Expr::Id(ref name)) = *col.expr
                                                     else {
-                                                        return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()));
+                                                        return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()));
                                                     };
                                                     if normalize_ident(name.as_str()) == rename_from
                                                     {
@@ -5675,7 +5675,6 @@ pub fn op_function(
                                         break 'sql None;
                                     }
                                 }
-
                                 Some(
                                     ast::Stmt::CreateTable {
                                         tbl_name,
