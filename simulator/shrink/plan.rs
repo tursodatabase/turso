@@ -1,4 +1,5 @@
 use indexmap::IndexSet;
+use sql_generation::model::query::alter_table::{AlterTable, AlterTableType};
 
 use crate::{
     SandboxedResult, SimulatorEnv,
@@ -36,7 +37,7 @@ impl InteractionPlan {
             .iter()
             .rev();
 
-        let depending_tables = failing_property
+        let mut depending_tables = failing_property
             .find_map(|interaction| {
                 match &interaction.interaction {
                     InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
@@ -51,6 +52,30 @@ impl InteractionPlan {
                 }
             })
             .unwrap_or_else(IndexSet::new);
+
+        // Iterate over the rest of the interactions to identify if the depending tables ever changed names
+        all_interactions[..range.start]
+            .iter()
+            .rev()
+            .for_each(|interaction| match &interaction.interaction {
+                InteractionType::Query(query)
+                | InteractionType::FsyncQuery(query)
+                | InteractionType::FaultyQuery(query) => {
+                    if let Query::AlterTable(AlterTable {
+                        table_name,
+                        alter_table_type: AlterTableType::RenameTo { new_name },
+                    }) = query
+                    {
+                        if depending_tables.contains(new_name)
+                            || depending_tables.contains(table_name)
+                        {
+                            depending_tables.insert(new_name.clone());
+                            depending_tables.insert(table_name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            });
 
         let before = self.len();
 
