@@ -55,7 +55,7 @@ pub struct SimulatorCLI {
         help = "load plan from the bug base",
         conflicts_with = "seed"
     )]
-    pub load: Option<String>,
+    pub load: Option<u64>,
     #[clap(
         short = 'w',
         long,
