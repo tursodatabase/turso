@@ -47,3 +47,4 @@ similar = { workspace = true }
 similar-asserts = { workspace = true }
 bitmaps = { workspace = true }
 bitflags.workspace = true
+derive_builder = "0.20.2"

@@ -1,11 +1,15 @@
 use std::{
     fmt::{Debug, Display},
-    ops::{Deref, DerefMut},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::{Deref, DerefMut, Range},
+    panic::RefUnwindSafe,
     rc::Rc,
     sync::Arc,
 };
 
-use indexmap::IndexSet;
+use either::Either;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
@@ -14,224 +18,262 @@ use crate::{
     generation::Shadow,
     model::{
         Query, ResultSet,
+        metrics::InteractionStats,
         property::{Property, PropertyDiscriminants},
     },
     runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
-    plan: Vec<Interactions>,
+    plan: Vec<Interaction>,
+    stats: InteractionStats,
+    // In the future, this should probably be a stack of interactions
+    // so we can have nested properties
+    last_interactions: Option<Interactions>,
     pub mvcc: bool,
-    // Len should not count transactions statements, just so we can generate more meaningful interactions per run
-    len: usize,
+
+    /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
+    /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
+    len_properties: usize,
+    next_interaction_id: NonZeroUsize,
 }
 
 impl InteractionPlan {
     pub(crate) fn new(mvcc: bool) -> Self {
         Self {
             plan: Vec::new(),
+            stats: InteractionStats::default(),
+            last_interactions: None,
             mvcc,
-            len: 0,
+            len_properties: 0,
+            next_interaction_id: NonZeroUsize::new(1).unwrap(),
         }
     }
 
-    pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
-        let len = plan
-            .iter()
-            .filter(|interaction| !interaction.ignore())
-            .count();
-        Self { plan, mvcc, len }
-    }
-
-    #[inline]
-    fn new_len(&self) -> usize {
-        self.plan
-            .iter()
-            .filter(|interaction| !interaction.ignore())
-            .count()
-    }
-
-    /// Length of interactions that are not transaction statements
+    /// Count of interactions
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.plan.len()
     }
 
+    /// Count of properties
     #[inline]
-    pub fn plan(&self) -> &[Interactions] {
-        &self.plan
+    pub fn len_properties(&self) -> usize {
+        self.len_properties
     }
 
-    pub fn push(&mut self, interactions: Interactions) {
+    pub fn next_property_id(&mut self) -> NonZeroUsize {
+        let id = self.next_interaction_id;
+        self.next_interaction_id = self
+            .next_interaction_id
+            .checked_add(1)
+            .expect("Generated too many interactions, that overflowed ID generation");
+        id
+    }
+
+    pub fn last_interactions(&self) -> Option<&Interactions> {
+        self.last_interactions.as_ref()
+    }
+
+    pub fn push_interactions(&mut self, interactions: Interactions) {
         if !interactions.ignore() {
-            self.len += 1;
+            self.len_properties += 1;
         }
-        self.plan.push(interactions);
+        self.last_interactions = Some(interactions);
     }
 
-    pub fn remove(&mut self, index: usize) -> Interactions {
-        let interactions = self.plan.remove(index);
-        if !interactions.ignore() {
-            self.len -= 1;
-        }
-        interactions
+    pub fn push(&mut self, interaction: Interaction) {
+        self.plan.push(interaction);
     }
 
+    /// Finds the range of interactions that are contained between the start and end spans for a given ID.
+    pub fn find_interactions_range(&self, id: NonZeroUsize) -> Range<usize> {
+        let interactions = self.interactions_list();
+        let idx = interactions
+            .binary_search_by_key(&id, |interaction| interaction.id())
+            .map_err(|_| format!("Interaction containing id `{id}` should be present"))
+            .unwrap();
+        let interaction = &interactions[idx];
+
+        let backward = || -> usize {
+            interactions
+                .iter()
+                .rev()
+                .skip(interactions.len() - idx)
+                .position(|interaction| {
+                    interaction.id() == id
+                        && interaction
+                            .span
+                            .is_some_and(|span| matches!(span, Span::Start))
+                })
+                .map(|idx| (interactions.len() - 1) - idx - 1)
+                .expect("A start span should have been emitted")
+        };
+
+        let forward = || -> usize {
+            interactions
+                .iter()
+                .skip(idx + 1)
+                .position(|interaction| interaction.id() != id)
+                .map(|idx| idx - 1)
+                .unwrap_or(interactions.len() - 1)
+            // It can happen we do not have an end Span as we can fail in the middle of a property
+        };
+
+        if let Some(span) = interaction.span {
+            match span {
+                Span::Start => {
+                    // go forward and find the end span
+                    let end_idx = forward();
+                    idx..end_idx + 1
+                }
+                Span::End => {
+                    // go backward and find the start span
+                    let start_idx = backward();
+                    start_idx..idx + 1
+                }
+                Span::StartEnd => idx..idx + 1,
+            }
+        } else {
+            // go backward and find the start span
+            let start_idx = backward();
+            // go forward and find the end span
+            let end_idx = forward();
+            start_idx..end_idx + 1
+        }
+    }
+
+    /// Truncates up to a particular interaction
     pub fn truncate(&mut self, len: usize) {
         self.plan.truncate(len);
-        self.len = self.new_len();
     }
 
-    pub fn retain_mut<F>(&mut self, mut f: F)
+    /// Used to remove a particular [Interactions]
+    pub fn remove_property(&mut self, id: NonZeroUsize) {
+        let range = self.find_interactions_range(id);
+        // Consume the drain iterator just to be sure
+        for _interaction in self.plan.drain(range) {}
+    }
+
+    pub fn retain_mut<F>(&mut self, f: F)
     where
-        F: FnMut(&mut Interactions) -> bool,
+        F: FnMut(&mut Interaction) -> bool,
     {
-        let f = |t: &mut Interactions| {
-            let ignore = t.ignore();
-            let retain = f(t);
-            // removed an interaction that was not previously ignored
-            if !retain && !ignore {
-                self.len -= 1;
-            }
-            retain
-        };
         self.plan.retain_mut(f);
     }
 
-    #[expect(dead_code)]
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&Interactions) -> bool,
-    {
-        let f = |t: &Interactions| {
-            let ignore = t.ignore();
-            let retain = f(t);
-            // removed an interaction that was not previously ignored
-            if !retain && !ignore {
-                self.len -= 1;
-            }
-            retain
-        };
-        self.plan.retain(f);
-        self.len = self.new_len();
+    #[inline]
+    pub fn interactions_list(&self) -> &[Interaction] {
+        &self.plan
     }
 
-    pub fn interactions_list(&self) -> Vec<Interaction> {
-        self.plan
-            .clone()
-            .into_iter()
-            .flat_map(|interactions| interactions.interactions().into_iter())
-            .collect()
-    }
-
-    pub fn interactions_list_with_secondary_index(&self) -> Vec<(usize, Interaction)> {
-        self.plan
-            .clone()
-            .into_iter()
-            .enumerate()
-            .flat_map(|(idx, interactions)| {
-                interactions
-                    .interactions()
-                    .into_iter()
-                    .map(move |interaction| (idx, interaction))
-            })
-            .collect()
-    }
-
-    pub(crate) fn stats(&self) -> InteractionStats {
-        let mut stats = InteractionStats::default();
-
-        fn query_stat(q: &Query, stats: &mut InteractionStats) {
-            match q {
-                Query::Select(_) => stats.select_count += 1,
-                Query::Insert(_) => stats.insert_count += 1,
-                Query::Delete(_) => stats.delete_count += 1,
-                Query::Create(_) => stats.create_count += 1,
-                Query::Drop(_) => stats.drop_count += 1,
-                Query::Update(_) => stats.update_count += 1,
-                Query::CreateIndex(_) => stats.create_index_count += 1,
-                Query::Begin(_) => stats.begin_count += 1,
-                Query::Commit(_) => stats.commit_count += 1,
-                Query::Rollback(_) => stats.rollback_count += 1,
-                Query::AlterTable(_) => stats.alter_table_count += 1,
-                Query::DropIndex(_) => stats.drop_index_count += 1,
-                Query::Placeholder => {}
-                Query::Pragma(_) => stats.pragma_count += 1,
-            }
+    pub fn iter_properties(
+        &self,
+    ) -> IterProperty<
+        std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>,
+        Forward,
+    > {
+        IterProperty {
+            iter: self.interactions_list().iter().enumerate().peekable(),
+            _direction: PhantomData,
         }
-        for interactions in &self.plan {
-            match &interactions.interactions {
-                InteractionsType::Property(property) => {
-                    if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
-                        // Skip Property::AllTableHaveExpectedContent when counting stats
-                        // this allows us to generate more relevant interactions as we count less Select's to the Stats
-                        continue;
-                    }
-                    for interaction in &property.interactions(interactions.connection_index) {
-                        if let InteractionType::Query(query) = &interaction.interaction {
-                            query_stat(query, &mut stats);
-                        }
-                    }
-                }
-                InteractionsType::Query(query) => {
-                    query_stat(query, &mut stats);
-                }
-                InteractionsType::Fault(_) => {}
-            }
-        }
+    }
 
-        stats
+    pub fn rev_iter_properties(
+        &self,
+    ) -> IterProperty<
+        std::iter::Peekable<
+            std::iter::Enumerate<std::iter::Rev<std::slice::Iter<'_, Interaction>>>,
+        >,
+        Backward,
+    > {
+        IterProperty {
+            iter: self.interactions_list().iter().rev().enumerate().peekable(),
+            _direction: PhantomData,
+        }
+    }
+
+    pub fn stats(&self) -> &InteractionStats {
+        &self.stats
+    }
+
+    pub fn stats_mut(&mut self) -> &mut InteractionStats {
+        &mut self.stats
     }
 
     pub fn static_iterator(&self) -> impl InteractionPlanIterator {
         PlanIterator {
-            iter: self.interactions_list().into_iter(),
+            iter: self.interactions_list().to_vec().into_iter(),
         }
     }
 }
 
-impl Deref for InteractionPlan {
-    type Target = Vec<Interactions>;
+pub struct Forward;
+pub struct Backward;
 
-    fn deref(&self) -> &Self::Target {
-        &self.plan
+pub struct IterProperty<I, Dir> {
+    iter: I,
+    _direction: PhantomData<Dir>,
+}
+
+impl<'a, I> IterProperty<I, Forward>
+where
+    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext + std::fmt::Debug,
+{
+    pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
+        let (idx, interaction) = self.iter.next()?;
+        let id = interaction.id();
+        // get interactions from a particular property
+        let span = interaction
+            .span
+            .expect("we should loop on interactions that have a span");
+
+        let first = std::iter::once((idx, interaction));
+
+        let property_interactions = match span {
+            Span::Start => Either::Left(
+                first.chain(
+                    self.iter
+                        .peeking_take_while(move |(_idx, interaction)| interaction.id() == id),
+                ),
+            ),
+            Span::End => panic!("we should always be at the start of an interaction"),
+            Span::StartEnd => Either::Right(first),
+        };
+
+        Some(property_interactions)
     }
 }
 
-impl DerefMut for InteractionPlan {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.plan
-    }
-}
+impl<'a, I> IterProperty<I, Backward>
+where
+    I: Iterator<Item = (usize, &'a Interaction)>
+        + DoubleEndedIterator
+        + itertools::PeekingNext
+        + std::fmt::Debug,
+{
+    pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
+        let (idx, interaction) = self.iter.next()?;
+        let id = interaction.id();
+        // get interactions from a particular property
+        let span = interaction
+            .span
+            .expect("we should loop on interactions that have a span");
 
-impl IntoIterator for InteractionPlan {
-    type Item = Interactions;
+        let first = std::iter::once((idx, interaction));
 
-    type IntoIter = <Vec<Interactions> as IntoIterator>::IntoIter;
+        let property_interactions = match span {
+            Span::Start => panic!("we should always be at the end of an interaction"),
+            Span::End => Either::Left(
+                self.iter
+                    .peeking_take_while(move |(_idx, interaction)| interaction.id() == id)
+                    .chain(first),
+            ),
+            Span::StartEnd => Either::Right(first),
+        };
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a InteractionPlan {
-    type Item = &'a Interactions;
-
-    type IntoIter = <&'a Vec<Interactions> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut InteractionPlan {
-    type Item = &'a mut Interactions;
-
-    type IntoIter = <&'a mut Vec<Interactions> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.iter_mut()
+        Some(property_interactions.into_iter())
     }
 }
 
@@ -281,13 +323,6 @@ impl Interactions {
         Self {
             connection_index,
             interactions,
-        }
-    }
-
-    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
-        match &mut self.interactions {
-            InteractionsType::Property(property) => property.get_extensional_queries(),
-            InteractionsType::Query(..) | InteractionsType::Fault(..) => None,
         }
     }
 
@@ -341,75 +376,28 @@ impl InteractionsType {
     }
 }
 
-impl Interactions {
-    pub(crate) fn interactions(&self) -> Vec<Interaction> {
-        match &self.interactions {
-            InteractionsType::Property(property) => property.interactions(self.connection_index),
-            InteractionsType::Query(query) => vec![Interaction::new(
-                self.connection_index,
-                InteractionType::Query(query.clone()),
-            )],
-            InteractionsType::Fault(fault) => vec![Interaction::new(
-                self.connection_index,
-                InteractionType::Fault(*fault),
-            )],
-        }
-    }
-
-    pub(crate) fn dependencies(&self) -> IndexSet<String> {
-        match &self.interactions {
-            InteractionsType::Property(property) => property
-                .interactions(self.connection_index)
-                .iter()
-                .fold(IndexSet::new(), |mut acc, i| match &i.interaction {
-                    InteractionType::Query(q) => {
-                        acc.extend(q.dependencies());
-                        acc
-                    }
-                    _ => acc,
-                }),
-            InteractionsType::Query(query) => query.dependencies(),
-            InteractionsType::Fault(_) => IndexSet::new(),
-        }
-    }
-
-    pub(crate) fn uses(&self) -> Vec<String> {
-        match &self.interactions {
-            InteractionsType::Property(property) => property
-                .interactions(self.connection_index)
-                .iter()
-                .fold(vec![], |mut acc, i| match &i.interaction {
-                    InteractionType::Query(q) => {
-                        acc.extend(q.uses());
-                        acc
-                    }
-                    _ => acc,
-                }),
-            InteractionsType::Query(query) => query.uses(),
-            InteractionsType::Fault(_) => vec![],
-        }
-    }
-}
-
-// FIXME: for the sql display come back and add connection index as a comment
 impl Display for InteractionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for interactions in &self.plan {
-            match &interactions.interactions {
-                InteractionsType::Property(property) => {
-                    let name = property.name();
-                    writeln!(f, "-- begin testing '{name}'")?;
-                    for interaction in property.interactions(interactions.connection_index) {
-                        writeln!(f, "\t{interaction}")?;
-                    }
-                    writeln!(f, "-- end testing '{name}'")?;
-                }
-                InteractionsType::Fault(fault) => {
-                    writeln!(f, "-- FAULT '{fault}'")?;
-                }
-                InteractionsType::Query(query) => {
-                    writeln!(f, "{query}; -- {}", interactions.connection_index)?;
-                }
+        const PAD: usize = 4;
+        let mut indentation_level = 0;
+        for interaction in &self.plan {
+            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                && interaction.span.is_some_and(|span| span.start())
+            {
+                indentation_level += 1;
+                writeln!(f, "-- begin testing '{name}'")?;
+            }
+
+            if indentation_level > 0 {
+                let padding = " ".repeat(indentation_level * PAD);
+                f.pad(&padding)?;
+            }
+            writeln!(f, "{interaction}")?;
+            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                && interaction.span.is_some_and(|span| span.end())
+            {
+                indentation_level -= 1;
+                writeln!(f, "-- end testing '{name}'")?;
             }
         }
 
@@ -417,45 +405,8 @@ impl Display for InteractionPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct InteractionStats {
-    pub select_count: u32,
-    pub insert_count: u32,
-    pub delete_count: u32,
-    pub update_count: u32,
-    pub create_count: u32,
-    pub create_index_count: u32,
-    pub drop_count: u32,
-    pub begin_count: u32,
-    pub commit_count: u32,
-    pub rollback_count: u32,
-    pub alter_table_count: u32,
-    pub drop_index_count: u32,
-    pub pragma_count: u32,
-}
-
-impl Display for InteractionStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
-            self.select_count,
-            self.insert_count,
-            self.delete_count,
-            self.update_count,
-            self.create_count,
-            self.create_index_count,
-            self.drop_count,
-            self.begin_count,
-            self.commit_count,
-            self.rollback_count,
-            self.alter_table_count,
-            self.drop_index_count,
-        )
-    }
-}
-
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
+type AssertionFunc =
+    dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + RefUnwindSafe;
 
 #[derive(Clone)]
 pub struct Assertion {
@@ -474,7 +425,9 @@ impl Debug for Assertion {
 impl Assertion {
     pub fn new<F>(name: String, func: F) -> Self
     where
-        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
+        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>
+            + 'static
+            + RefUnwindSafe,
     {
         Self {
             func: Rc::new(func),
@@ -532,11 +485,61 @@ impl PropertyMetadata {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, derive_builder::Builder)]
+#[builder(build_fn(validate = "Self::validate"))]
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
+    #[builder(default)]
     pub ignore_error: bool,
+    #[builder(setter(strip_option), default)]
+    pub property_meta: Option<PropertyMetadata>,
+    #[builder(setter(strip_option), default)]
+    pub span: Option<Span>,
+    /// 0 id means the ID was not set
+    id: NonZeroUsize,
+}
+
+impl InteractionBuilder {
+    pub fn from_interaction(interaction: &Interaction) -> Self {
+        let mut builder = Self::default();
+        builder
+            .connection_index(interaction.connection_index)
+            .id(interaction.id())
+            .ignore_error(interaction.ignore_error)
+            .interaction(interaction.interaction.clone());
+        if let Some(property_meta) = interaction.property_meta {
+            builder.property_meta(property_meta);
+        }
+        if let Some(span) = interaction.span {
+            builder.span(span);
+        }
+        builder
+    }
+
+    pub fn with_interaction(interaction: InteractionType) -> Self {
+        let mut builder = Self::default();
+        builder.interaction(interaction);
+        builder
+    }
+
+    /// Checks to see if the property metadata was already set
+    pub fn has_property_meta(&self) -> bool {
+        self.property_meta.is_some()
+    }
+
+    fn validate(&self) -> Result<(), InteractionBuilderError> {
+        // Cannot have span and property_meta.extension being true at the same time
+        if let Some(property_meta) = self.property_meta.flatten()
+            && property_meta.extension
+            && self.span.flatten().is_some()
+        {
+            return Err(InteractionBuilderError::ValidationError(
+                "cannot have a span set with an extension query".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Deref for Interaction {
@@ -554,19 +557,16 @@ impl DerefMut for Interaction {
 }
 
 impl Interaction {
-    pub fn new(connection_index: usize, interaction: InteractionType) -> Self {
-        Self {
-            connection_index,
-            interaction,
-            ignore_error: false,
-        }
+    pub fn id(&self) -> NonZeroUsize {
+        self.id
     }
 
-    pub fn new_ignore_error(connection_index: usize, interaction: InteractionType) -> Self {
-        Self {
-            connection_index,
-            interaction,
-            ignore_error: true,
+    pub fn uses(&self) -> Vec<String> {
+        match &self.interaction {
+            InteractionType::Query(query)
+            | InteractionType::FsyncQuery(query)
+            | InteractionType::FaultyQuery(query) => query.uses(),
+            _ => vec![],
         }
     }
 }

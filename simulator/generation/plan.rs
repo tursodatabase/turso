@@ -181,7 +181,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                     let remaining_ = Remaining::new(
                         env.opts.max_interactions,
                         &env.profile.query,
-                        &stats,
+                        stats,
                         env.profile.experimental_mvcc,
                         &conn_ctx,
                     );

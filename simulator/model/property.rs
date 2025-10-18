@@ -5,8 +5,9 @@ use crate::model::Query;
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
-#[strum_discriminants(derive(strum::EnumIter))]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants, strum::IntoStaticStr)]
+#[strum_discriminants(derive(strum::EnumIter, strum::IntoStaticStr))]
+#[strum(serialize_all = "Train-Case")]
 pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
@@ -161,7 +162,7 @@ pub enum Property {
     /// should return the same number of rows as `SELECT <predicate> FROM <t> WHERE <predicate>`.
     /// > The property is succesfull when the UNION ALL of 2 select queries returns the same number of rows
     /// > as the sum of the two select queries.
-    UNIONAllPreservesCardinality {
+    UnionAllPreservesCardinality {
         select: Select,
         where_clause: Predicate,
     },
@@ -192,30 +193,22 @@ pub struct InteractiveQueryInfo {
 }
 
 impl Property {
-    pub(crate) fn name(&self) -> &str {
-        match self {
-            Property::InsertValuesSelect { .. } => "Insert-Values-Select",
-            Property::ReadYourUpdatesBack { .. } => "Read-Your-Updates-Back",
-            Property::TableHasExpectedContent { .. } => "Table-Has-Expected-Content",
-            Property::AllTableHaveExpectedContent { .. } => "All-Tables-Have-Expected-Content",
-            Property::DoubleCreateFailure { .. } => "Double-Create-Failure",
-            Property::SelectLimit { .. } => "Select-Limit",
-            Property::DeleteSelect { .. } => "Delete-Select",
-            Property::DropSelect { .. } => "Drop-Select",
-            Property::SelectSelectOptimizer { .. } => "Select-Select-Optimizer",
-            Property::WhereTrueFalseNull { .. } => "Where-True-False-Null",
-            Property::FsyncNoWait { .. } => "FsyncNoWait",
-            Property::FaultyQuery { .. } => "FaultyQuery",
-            Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
-            Property::Queries { .. } => "Queries",
-        }
-    }
-
     /// Property Does some sort of fault injection
     pub fn check_tables(&self) -> bool {
         matches!(
             self,
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. }
+        )
+    }
+
+    pub fn has_extensional_queries(&self) -> bool {
+        matches!(
+            self,
+            Property::InsertValuesSelect { .. }
+                | Property::DoubleCreateFailure { .. }
+                | Property::DeleteSelect { .. }
+                | Property::DropSelect { .. }
+                | Property::Queries { .. }
         )
     }
 
@@ -230,10 +223,23 @@ impl Property {
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
-            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }
+    }
+}
+
+impl PropertyDiscriminants {
+    pub fn name(&self) -> &'static str {
+        self.into()
+    }
+
+    pub fn check_tables(&self) -> bool {
+        matches!(
+            self,
+            Self::AllTableHaveExpectedContent | Self::TableHasExpectedContent
+        )
     }
 }
