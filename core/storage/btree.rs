@@ -5887,6 +5887,7 @@ pub(crate) enum PageCategory {
     Overflow,
     FreeListTrunk,
     FreePage,
+    PointerMap,
 }
 
 #[derive(Clone)]

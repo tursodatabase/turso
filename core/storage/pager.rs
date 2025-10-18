@@ -2591,7 +2591,7 @@ impl CreateBTreeFlags {
 **               identifies the parent page in the btree.
 */
 #[cfg(not(feature = "omit_autovacuum"))]
-mod ptrmap {
+pub(crate) mod ptrmap {
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
 
     // Constants
