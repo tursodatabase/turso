@@ -9,6 +9,7 @@ use std::{
 };
 
 use either::Either;
+use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
@@ -379,12 +380,12 @@ impl InteractionsType {
 impl Display for InteractionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const PAD: usize = 4;
-        let mut indentation_level = 0;
+        let mut indentation_level: usize = 0;
         for interaction in &self.plan {
             if let Some(name) = interaction.property_meta.map(|p| p.property.name())
                 && interaction.span.is_some_and(|span| span.start())
             {
-                indentation_level += 1;
+                indentation_level = indentation_level.saturating_add(1);
                 writeln!(f, "-- begin testing '{name}'")?;
             }
 
@@ -396,7 +397,7 @@ impl Display for InteractionPlan {
             if let Some(name) = interaction.property_meta.map(|p| p.property.name())
                 && interaction.span.is_some_and(|span| span.end())
             {
-                indentation_level -= 1;
+                indentation_level = indentation_level.saturating_sub(1);
                 writeln!(f, "-- end testing '{name}'")?;
             }
         }
@@ -411,7 +412,8 @@ type AssertionFunc =
 #[derive(Clone)]
 pub struct Assertion {
     pub func: Rc<AssertionFunc>,
-    pub name: String, // For display purposes in the plan
+    pub name: String,        // For display purposes in the plan
+    pub tables: Vec<String>, // Tables it depends on
 }
 
 impl Debug for Assertion {
@@ -423,7 +425,7 @@ impl Debug for Assertion {
 }
 
 impl Assertion {
-    pub fn new<F>(name: String, func: F) -> Self
+    pub fn new<F>(name: String, func: F, tables: Vec<String>) -> Self
     where
         F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>
             + 'static
@@ -432,7 +434,16 @@ impl Assertion {
         Self {
             func: Rc::new(func),
             name,
+            tables,
         }
+    }
+
+    pub fn dependencies(&self) -> IndexSet<String> {
+        IndexSet::from_iter(self.tables.clone())
+    }
+
+    pub fn uses(&self) -> Vec<String> {
+        self.tables.clone()
     }
 }
 
@@ -566,6 +577,9 @@ impl Interaction {
             InteractionType::Query(query)
             | InteractionType::FsyncQuery(query)
             | InteractionType::FaultyQuery(query) => query.uses(),
+            InteractionType::Assertion(assert) | InteractionType::Assumption(assert) => {
+                assert.uses()
+            }
             _ => vec![],
         }
     }

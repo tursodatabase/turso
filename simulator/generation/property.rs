@@ -258,6 +258,7 @@ impl Property {
             }
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
+                let table_dependency = table.clone();
                 let table_name = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
@@ -269,6 +270,7 @@ impl Property {
                             Ok(Err(format!("table {table_name} does not exist")))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let select_interaction = InteractionType::Query(Query::Select(Select::simple(
@@ -309,6 +311,7 @@ impl Property {
                         }
                         Ok(Ok(()))
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 vec![
@@ -319,6 +322,7 @@ impl Property {
             }
             Property::ReadYourUpdatesBack { update, select } => {
                 let table = update.table().to_string();
+                let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
@@ -329,6 +333,7 @@ impl Property {
                             Ok(Err(format!("table {} does not exist", table.clone())))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
@@ -373,6 +378,7 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![table_dependency],
                 ));
 
                 vec![
@@ -419,6 +425,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![insert.table().to_string()],
                 ));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
@@ -453,6 +460,7 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![insert.table().to_string()],
                 ));
 
                 let mut interactions = Vec::new();
@@ -475,6 +483,7 @@ impl Property {
             }
             Property::DoubleCreateFailure { create, queries } => {
                 let table_name = create.table.name.clone();
+                let table_dependency = table_name.clone();
 
                 let assumption = InteractionType::Assumption(Assertion::new(
                     "Double-Create-Failure should not be called on an existing table".to_string(),
@@ -486,6 +495,7 @@ impl Property {
                             Ok(Err(format!("table {table_name} already exists")))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let cq1 = InteractionType::Query(Query::Create(create.clone()));
@@ -508,7 +518,7 @@ impl Property {
                                         }
                                     }
                                 }
-                            }) );
+                            }, vec![table_dependency],) );
 
                 let mut interactions = Vec::new();
                 interactions.push(InteractionBuilder::with_interaction(assumption));
@@ -556,6 +566,7 @@ impl Property {
                             }
                         }
                     },
+                    select.dependencies().into_iter().collect(),
                 ));
 
                 let limit = select
@@ -581,6 +592,7 @@ impl Property {
                             Err(_) => Ok(Ok(())),
                         }
                     },
+                    select.dependencies().into_iter().collect(),
                 ));
 
                 vec![
@@ -615,6 +627,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let delete = InteractionType::Query(Query::Delete(Delete {
@@ -649,6 +662,7 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let mut interactions = Vec::new();
@@ -689,6 +703,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let table_name = table.clone();
@@ -714,6 +729,7 @@ impl Property {
                             },
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let drop = InteractionType::Query(Query::Drop(Drop {
@@ -761,6 +777,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let select1 = InteractionType::Query(Query::Select(Select::single(
@@ -821,6 +838,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 vec![
@@ -861,6 +879,7 @@ impl Property {
                             }
                         }
                     },
+                    query.dependencies().into_iter().collect(),
                 );
                 [
                     InteractionType::FaultyQuery(query.clone()),
@@ -871,6 +890,7 @@ impl Property {
                 .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
+                let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!(
                         "tables ({}) exists",
@@ -898,6 +918,7 @@ impl Property {
                             }
                         }
                     },
+                    tables_dependencies.clone(),
                 ));
 
                 let old_predicate = select.body.select.where_clause.clone();
@@ -1019,6 +1040,7 @@ impl Property {
                             }
                         }
                     },
+                    tables_dependencies,
                 ));
 
                 vec![
@@ -1073,7 +1095,9 @@ impl Property {
                                 }
                             }
                         },
-                    )),
+                        s3.dependencies().into_iter().collect()
+                    )
+                ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
             Property::Queries { queries } => queries
@@ -1163,7 +1187,7 @@ fn assert_all_table_values(
                         Err(err) => Err(LimboError::InternalError(format!("{err}"))),
                     }
                 }
-            }));
+            }, vec![table.clone()]));
         [select, assertion].into_iter().map(InteractionBuilder::with_interaction)
     })
 }

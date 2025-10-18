@@ -44,6 +44,9 @@ impl InteractionPlan {
                     }
                     // Fault does not depend on tables
                     InteractionType::Fault(..) => None,
+                    InteractionType::Assertion(assert) | InteractionType::Assumption(assert) => {
+                        (!assert.tables.is_empty()).then(|| assert.dependencies())
+                    }
                     _ => None,
                 }
             })
@@ -182,7 +185,7 @@ impl InteractionPlan {
         let mut iter_properties = self.iter_properties();
         while let Some(property_interactions) = iter_properties.next_property() {
             for (idx, interaction) in property_interactions {
-                let retain = if failing_interaction_range.contains(&idx) {
+                let retain = if failing_interaction_range.end == idx {
                     true
                 } else {
                     let has_table = interaction
@@ -196,10 +199,6 @@ impl InteractionPlan {
                         InteractionType::Query(Query::Begin(..))
                             | InteractionType::Query(Query::Commit(..))
                             | InteractionType::Query(Query::Rollback(..))
-                    );
-                    let is_assertion = matches!(
-                        &interaction.interaction,
-                        InteractionType::Assertion(..) | InteractionType::Assumption(..)
                     );
 
                     let skip_interaction = if let Some(property_meta) = interaction.property_meta
@@ -222,7 +221,7 @@ impl InteractionPlan {
                         )
                     };
 
-                    !skip_interaction && (is_fault || is_transaction || is_assertion || has_table)
+                    !skip_interaction && (is_fault || is_transaction || has_table)
                 };
                 retain_map.push(retain);
             }
