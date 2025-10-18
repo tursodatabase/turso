@@ -200,6 +200,9 @@ pub enum SimulatorCommand {
 
 impl SimulatorCLI {
     pub fn validate(&mut self) -> anyhow::Result<()> {
+        if self.watch {
+            anyhow::bail!("watch mode is disabled for now");
+        }
         if self.minimum_tests > self.maximum_tests {
             tracing::warn!(
                 "minimum size '{}' is greater than '{}' maximum size, setting both to '{}'",
