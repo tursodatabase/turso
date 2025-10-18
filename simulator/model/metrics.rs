@@ -1,6 +1,14 @@
+use std::fmt::Display;
+
 use sql_generation::generation::GenerationContext;
 
-use crate::{model::interactions::InteractionStats, profiles::query::QueryProfile};
+use crate::{
+    model::{
+        Query,
+        interactions::{Interaction, InteractionType},
+    },
+    profiles::query::QueryProfile,
+};
 
 #[derive(Debug)]
 pub struct Remaining {
@@ -89,5 +97,71 @@ impl Remaining {
             alter_table: remaining_alter_table,
             drop_index: remaining_drop_index,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InteractionStats {
+    pub select_count: u32,
+    pub insert_count: u32,
+    pub delete_count: u32,
+    pub update_count: u32,
+    pub create_count: u32,
+    pub create_index_count: u32,
+    pub drop_count: u32,
+    pub begin_count: u32,
+    pub commit_count: u32,
+    pub rollback_count: u32,
+    pub alter_table_count: u32,
+    pub drop_index_count: u32,
+}
+
+impl InteractionStats {
+    pub fn update(&mut self, interaction: &Interaction) {
+        match &interaction.interaction {
+            InteractionType::Query(query)
+            | InteractionType::FsyncQuery(query)
+            | InteractionType::FaultyQuery(query) => self.query_stat(query),
+            _ => {}
+        }
+    }
+
+    fn query_stat(&mut self, q: &Query) {
+        match q {
+            Query::Select(_) => self.select_count += 1,
+            Query::Insert(_) => self.insert_count += 1,
+            Query::Delete(_) => self.delete_count += 1,
+            Query::Create(_) => self.create_count += 1,
+            Query::Drop(_) => self.drop_count += 1,
+            Query::Update(_) => self.update_count += 1,
+            Query::CreateIndex(_) => self.create_index_count += 1,
+            Query::Begin(_) => self.begin_count += 1,
+            Query::Commit(_) => self.commit_count += 1,
+            Query::Rollback(_) => self.rollback_count += 1,
+            Query::AlterTable(_) => self.alter_table_count += 1,
+            Query::DropIndex(_) => self.drop_index_count += 1,
+            Query::Placeholder => {}
+        }
+    }
+}
+
+impl Display for InteractionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
+            self.select_count,
+            self.insert_count,
+            self.delete_count,
+            self.update_count,
+            self.create_count,
+            self.create_index_count,
+            self.drop_count,
+            self.begin_count,
+            self.commit_count,
+            self.rollback_count,
+            self.alter_table_count,
+            self.drop_index_count,
+        )
     }
 }
