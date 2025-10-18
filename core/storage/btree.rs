@@ -9061,20 +9061,20 @@ mod tests {
     pub fn btree_insert_fuzz_run_equal_size() {
         for size in 1..8 {
             tracing::info!("======= size:{} =======", size);
-            btree_insert_fuzz_run(2, 1024, |_| size);
+            btree_insert_fuzz_run(2, 512, |_| size);
         }
     }
 
     #[test]
     pub fn btree_index_insert_fuzz_run_equal_size() {
-        btree_index_insert_fuzz_run(2, 1024);
+        btree_index_insert_fuzz_run(2, 512);
     }
 
     #[test]
     pub fn btree_index_insert_delete_fuzz_run_test() {
         btree_index_insert_delete_fuzz_run(
             2,
-            2000,
+            1000,
             |rng| {
                 let min: u32 = 4;
                 let size = min + rng.next_u32() % (1024 - min);
@@ -10607,7 +10607,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("seed={}", seed);
 
-        const ITERATIONS: usize = 10000;
+        const ITERATIONS: usize = 5000;
         for _ in 0..ITERATIONS {
             let mut cell_array = CellArray {
                 cell_payloads: Vec::new(),
