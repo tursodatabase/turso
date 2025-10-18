@@ -1376,7 +1376,7 @@ pub fn rewrite_column_references_if_needed(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::schema::Type as SchemaValueType;
+    use crate::{schema::Type as SchemaValueType, types::Text};
     use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
 
     #[test]
@@ -2386,5 +2386,45 @@ pub mod tests {
             let result = type_from_name(input);
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn test_checked_cast_text_to_numeric_lossless_property() {
+        use Value::*;
+        assert_eq!(checked_cast_text_to_numeric("1.xx", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("abc", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("--5", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("12.34.56", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric(" ", true), Err(()));
+        assert_eq!(checked_cast_text_to_numeric("0", true), Ok(Integer(0)));
+        assert_eq!(checked_cast_text_to_numeric("42", true), Ok(Integer(42)));
+        assert_eq!(checked_cast_text_to_numeric("-42", true), Ok(Integer(-42)));
+        assert_eq!(
+            checked_cast_text_to_numeric("999999999999", true),
+            Ok(Integer(999_999_999_999))
+        );
+        assert_eq!(checked_cast_text_to_numeric("1.0", true), Ok(Float(1.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("-3.22", true),
+            Ok(Float(-3.22))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("0.001", true),
+            Ok(Float(0.001))
+        );
+        assert_eq!(checked_cast_text_to_numeric("2e3", true), Ok(Float(2000.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("-5.5e-2", true),
+            Ok(Float(-0.055))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric(" 123 ", true),
+            Ok(Integer(123))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("\t-3.22\n", true),
+            Ok(Float(-3.22))
+        );
     }
 }
