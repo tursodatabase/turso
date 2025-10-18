@@ -134,8 +134,8 @@ impl BranchOffset {
     /// Returns the offset value. Panics if the branch offset is a label or placeholder.
     pub fn as_offset_int(&self) -> InsnReference {
         match self {
-            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Offset(v) => *v,
+            BranchOffset::Label(v) => unreachable!("Unresolved label: {}", v),
             BranchOffset::Placeholder => unreachable!("Unresolved placeholder"),
         }
     }
@@ -249,6 +249,12 @@ pub enum Register {
     Value(Value),
     Aggregate(AggContext),
     Record(ImmutableRecord),
+}
+
+impl<'a> From<&'a Register> for ValueRef<'a> {
+    fn from(value: &'a Register) -> Self {
+        value.get_value().as_ref()
+    }
 }
 
 impl Register {
@@ -1016,13 +1022,6 @@ impl Program {
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
-}
-
-pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
-    registers
-        .iter()
-        .map(|reg| reg.get_value().as_ref())
-        .collect()
 }
 
 #[instrument(skip(program), level = Level::DEBUG)]
