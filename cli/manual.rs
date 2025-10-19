@@ -186,6 +186,8 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
                 KeyCode::Down | KeyCode::Char('j') => view.try_scroll_lines(1),
                 KeyCode::PageUp => view.try_scroll_pages(-1),
                 KeyCode::PageDown => view.try_scroll_pages(1),
+                KeyCode::Char('g') => view.scroll = 0,
+                KeyCode::Char('G') => view.try_scroll_lines(i32::MAX),
 
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => break,
 
