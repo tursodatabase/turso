@@ -1,7 +1,15 @@
 use include_dir::{include_dir, Dir};
 use rand::seq::SliceRandom;
-use std::io::{IsTerminal, Write};
-use termimad::MadSkin;
+use std::io::{stdout, IsTerminal, Write};
+
+use termimad::{
+    crossterm::{
+        event::{read, Event, KeyCode},
+        queue,
+        terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    },
+    Area, MadSkin, MadView,
+};
 
 static MANUAL_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/manuals");
 
@@ -63,35 +71,80 @@ fn strip_frontmatter(content: &str) -> &str {
     }
 }
 
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<_> = a.chars().collect();
+    let b_chars: Vec<_> = b.chars().collect();
+    let (a_len, b_len) = (a_chars.len(), b_chars.len());
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+    let mut prev_row: Vec<usize> = (0..=b_len).collect();
+    let mut current_row = vec![0; b_len + 1];
+    for i in 1..=a_len {
+        current_row[0] = i;
+        for j in 1..=b_len {
+            let substitution_cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            current_row[j] = (prev_row[j] + 1)
+                .min(current_row[j - 1] + 1)
+                .min(prev_row[j - 1] + substitution_cost);
+        }
+        prev_row.clone_from_slice(&current_row);
+    }
+    prev_row[b_len]
+}
+
+fn find_closest_manual_page<'a>(
+    page_name: &str,
+    available_pages: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+
+    const RELATIVE_SIMILARITY_THRESHOLD: f64 = 0.4;
+
+    available_pages
+        .filter_map(|candidate| {
+            let distance = levenshtein(page_name, candidate);
+            let longer_len = std::cmp::max(page_name.chars().count(), candidate.chars().count());
+            if longer_len == 0 { return None; }
+            let relative_distance = distance as f64 / longer_len as f64;
+
+            if relative_distance < RELATIVE_SIMILARITY_THRESHOLD {
+                Some((candidate, distance))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|&(_, score)| score)
+        .map(|(name, _)| name)
+}
+
+
 pub fn display_manual(page: Option<&str>, writer: &mut dyn Write) -> anyhow::Result<()> {
     let page_name = page.unwrap_or("index");
     let file_name = format!("{page_name}.md");
 
-    // Try to find the manual page
-    let content = if let Some(file) = MANUAL_DIR.get_file(&file_name) {
-        file.contents_utf8()
-            .ok_or_else(|| anyhow::anyhow!("Failed to read manual page: {}", page_name))?
+    if let Some(file) = MANUAL_DIR.get_file(&file_name) {
+        let content = file.contents_utf8().ok_or_else(|| anyhow::anyhow!("Failed to read manual page: {}", page_name))?;
+        let content = strip_frontmatter(content);
+        if IsTerminal::is_terminal(&std::io::stdout()) {
+            render_in_terminal(content)?;
+        } else {
+            writeln!(writer, "{content}")?;
+        }
+        Ok(())
     } else if page.is_none() {
         // If no page specified, list available pages
         return list_available_manuals(writer);
     } else {
-        return Err(anyhow::anyhow!("Manual page not found: {}", page_name));
-    };
-
-    // Strip frontmatter before displaying
-    let content = strip_frontmatter(content);
-
-    // Check if we're in a terminal or piped output
-    if IsTerminal::is_terminal(&std::io::stdout()) {
-        // Use termimad for nice terminal rendering
-        render_in_terminal(content)?;
-    } else {
-        // Plain output for pipes/redirects
-        writeln!(writer, "{content}")?;
+        let available_pages = MANUAL_DIR.files().filter_map(|file| {
+            file.path().file_stem().and_then(|stem| stem.to_str())
+        });
+        let mut error_message = format!("Manual page not found: {}", page_name);
+        if let Some(suggestion) = find_closest_manual_page(page_name, available_pages) {
+            error_message.push_str(&format!("\n\nDid you mean '.manual {}'?", suggestion));
+        }
+        Err(anyhow::anyhow!(error_message))
     }
-
-    Ok(())
 }
+
 
 fn render_in_terminal(content: &str) -> anyhow::Result<()> {
     // Create a skin with nice styling
@@ -107,8 +160,40 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
     skin.code_block
         .set_fg(termimad::crossterm::style::Color::Green);
 
-    // Just print the formatted content
-    skin.print_text(content);
+    let mut w = stdout();
+    queue!(w, EnterAlternateScreen)?;
+    enable_raw_mode()?;
+
+    let area = Area::full_screen();
+    let mut view = MadView::from(content.to_string(), area, skin);
+
+    loop {
+        view.write_on(&mut w)?;
+        w.flush()?;
+
+        match read()? {
+            Event::Key(key) => match key.code {
+
+                KeyCode::Up | KeyCode::Char('k') => view.try_scroll_lines(-1),
+                KeyCode::Down | KeyCode::Char('j') => view.try_scroll_lines(1),
+                KeyCode::PageUp => view.try_scroll_pages(-1),
+                KeyCode::PageDown => view.try_scroll_pages(1),
+
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => break,
+
+                _ => {}
+            },
+            Event::Resize(width, height) => {
+                let new_area = Area::new(0, 0, width, height);
+                view.resize(&new_area);
+            }
+            _ => {}
+        }
+    }
+
+    disable_raw_mode()?;
+    queue!(w, LeaveAlternateScreen)?;
+    w.flush()?;
 
     Ok(())
 }
@@ -116,29 +201,21 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
 fn list_available_manuals(writer: &mut dyn Write) -> anyhow::Result<()> {
     writeln!(writer, "Available manual pages:")?;
     writeln!(writer)?;
-
-    let mut pages: Vec<String> = Vec::new();
-
-    for file in MANUAL_DIR.files() {
-        if let Some(name) = file.path().file_stem() {
-            if let Some(name_str) = name.to_str() {
-                pages.push(name_str.to_string());
-            }
-        }
-    }
-
+    let mut pages: Vec<String> = MANUAL_DIR.files()
+        .filter_map(|file| file.path().file_stem()?.to_str().map(String::from))
+        .collect();
     pages.sort();
 
-    for page in pages {
+    for page in &pages {
         writeln!(writer, "  .manual {page}  # or .man {page}")?;
     }
 
-    if MANUAL_DIR.files().count() == 0 {
+    if pages.is_empty() {
         writeln!(writer, "  (No manual pages found)")?;
     }
-
     writeln!(writer)?;
     writeln!(writer, "Usage: .manual <page>  or  .man <page>")?;
 
     Ok(())
 }
+
