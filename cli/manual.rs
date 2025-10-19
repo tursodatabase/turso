@@ -71,6 +71,7 @@ fn strip_frontmatter(content: &str) -> &str {
     }
 }
 
+// not ideal but enough for our usecase , probably overkill maybe.
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<_> = a.chars().collect();
     let b_chars: Vec<_> = b.chars().collect();
@@ -147,9 +148,9 @@ pub fn display_manual(page: Option<&str>, writer: &mut dyn Write) -> anyhow::Res
         let available_pages = MANUAL_DIR
             .files()
             .filter_map(|file| file.path().file_stem().and_then(|stem| stem.to_str()));
-        let mut error_message = format!("Manual page not found: {}", page_name);
+        let mut error_message = format!("Manual page not found: {page_name}");
         if let Some(suggestion) = find_closest_manual_page(page_name, available_pages) {
-            error_message.push_str(&format!("\n\nDid you mean '.manual {}'?", suggestion));
+            error_message.push_str(&format!("\n\nDid you mean '.manual {suggestion}'?"));
         }
         Err(anyhow::anyhow!(error_message))
     }
