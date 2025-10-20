@@ -1,0 +1,38 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+source $testdir/sqlite3/tester.tcl
+
+do_execsql_test_on_specific_db {:memory:} check-1.1-create-table {
+    CREATE TABLE t1(
+      x INTEGER CHECK( x<5 ),
+      y REAL CHECK( y>x )
+    );
+} {}
+
+do_execsql_test_on_specific_db {:memory:} check-1.2-insert-ok {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(3,4);
+    SELECT * FROM t1;
+} {3|4.0}
+
+do_execsql_test_in_memory_any_error check-1.3-insert-fail-x-too-large {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(6,7);
+}
+
+do_execsql_test_in_memory_any_error check-1.5-insert-fail-y-not-greater {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(4,3);
+}
+
+do_execsql_test_on_specific_db {:memory:} check-1.7-through-1.10-insert-nulls-ok {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(3,4);
+    INSERT INTO t1 VALUES(NULL,6);
+    INSERT INTO t1 VALUES(2,NULL);
+    SELECT * FROM t1;
+} {3|4.0
+|6.0
+2|}
