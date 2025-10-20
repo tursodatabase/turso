@@ -21,7 +21,7 @@ pub struct Opts {
         short = 'i',
         long,
         help = "the number of iterations",
-        default_value_t = 100000
+        default_value_t = normal_or_miri(100_000, 1000)
     )]
     pub nr_iterations: usize,
 
@@ -74,4 +74,12 @@ pub struct Opts {
         default_value_t = 5000
     )]
     pub busy_timeout: u64,
+}
+
+const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
+    if cfg!(miri) {
+        miri_val
+    } else {
+        normal_val
+    }
 }
