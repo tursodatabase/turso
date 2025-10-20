@@ -133,7 +133,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions, NamedTableConstraint,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -777,6 +777,7 @@ impl Schema {
                 is_strict: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
+                checks:vec![],
 
                 unique_sets: vec![],
             })));
@@ -1480,6 +1481,7 @@ pub struct BTreeTable {
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    pub checks: Vec<NamedTableConstraint>,
 }
 
 impl BTreeTable {
@@ -1676,6 +1678,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut cols = vec![];
     let is_strict: bool;
     let mut unique_sets: Vec<UniqueSet> = vec![];
+    let mut checks = vec![];
+
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -1746,7 +1750,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
-                } else if let ast::TableConstraint::ForeignKey {
+                } 
+                
+                
+                
+        else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
                     defer_clause,
@@ -1814,6 +1822,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     };
                     foreign_keys.push(Arc::new(fk));
                 }
+
+
+                else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                    trace!("Adding table CHECK constraint: {:?}", expr);
+                    checks.push(c.clone());
+                }
+
             }
 
             // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
@@ -1860,8 +1875,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check { .. } => {
-                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+           ast::ColumnConstraint::Check(expr) => {
+                            trace!("Adding column CHECK constraint: {:?}", expr);
+                            checks.push(NamedTableConstraint {
+                                name: c_def.name.clone(),
+                                constraint: ast::TableConstraint::Check(expr.clone()),
+                            });
                         }
                         ast::ColumnConstraint::Generated { .. } => {
                             // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
@@ -2062,6 +2081,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         columns: cols,
         is_strict,
         foreign_keys,
+        checks,
         unique_sets: {
             // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
             // Examples:
@@ -2516,6 +2536,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: vec![],
+        checks:vec![],
         columns: vec![
             Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
             Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -3186,6 +3207,7 @@ mod tests {
                 "INT".to_string(),
                 None,
             )],
+            checks:vec![],
             unique_sets: vec![],
             foreign_keys: vec![],
         };

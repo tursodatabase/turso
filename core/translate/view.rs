@@ -79,6 +79,7 @@ pub fn translate_create_materialized_view(
         is_strict: false,
         has_autoincrement: false,
 
+        checks: vec![],
         unique_sets: vec![],
         foreign_keys: vec![],
     });
