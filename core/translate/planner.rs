@@ -512,7 +512,7 @@ fn parse_table(
             has_autoincrement: false,
 
             unique_sets: vec![],
-            checks:vec![],
+            checks: vec![],
             foreign_keys: vec![],
         });
         drop(view_guard);

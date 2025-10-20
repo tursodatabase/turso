@@ -2256,6 +2256,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(users_table))
@@ -2312,6 +2313,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(products_table))
@@ -2380,6 +2382,7 @@ mod tests {
                 is_strict: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(orders_table))
@@ -2421,6 +2424,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(customers_table))
@@ -2486,6 +2490,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(purchases_table))
@@ -2539,6 +2544,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(vendors_table))
@@ -2579,6 +2585,7 @@ mod tests {
                 has_autoincrement: false,
                 unique_sets: vec![],
                 foreign_keys: vec![],
+                checks: vec![],
             };
             schema
                 .add_btree_table(Arc::new(sales_table))

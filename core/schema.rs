@@ -90,7 +90,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions, NamedTableConstraint,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, NamedTableConstraint, RefAct,
+    SortOrder, TableOptions,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -657,7 +658,7 @@ impl Schema {
                 is_strict: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
-                checks:vec![],
+                checks: vec![],
 
                 unique_sets: vec![],
             })));
@@ -1522,11 +1523,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         is_primary_key: false,
                     };
                     unique_sets.push(unique_set);
-                } 
-                
-                
-                
-        else if let ast::TableConstraint::ForeignKey {
+                } else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
                     defer_clause,
@@ -1593,14 +1590,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         deferred,
                     };
                     foreign_keys.push(Arc::new(fk));
-                }
-
-
-                else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
                     trace!("Adding table CHECK constraint: {:?}", expr);
                     checks.push(c.clone());
                 }
-
             }
 
             // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
@@ -1647,7 +1640,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-           ast::ColumnConstraint::Check(expr) => {
+                        ast::ColumnConstraint::Check(expr) => {
                             trace!("Adding column CHECK constraint: {:?}", expr);
                             checks.push(NamedTableConstraint {
                                 name: c_def.name.clone(),
@@ -2296,7 +2289,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        checks:vec![],
+        checks: vec![],
         columns: vec![
             Column {
                 name: Some("type".to_string()),
@@ -2957,7 +2950,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
-            checks:vec![],
+            checks: vec![],
             columns: vec![Column {
                 name: Some("a".to_string()),
                 ty: Type::Integer,
