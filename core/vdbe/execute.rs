@@ -72,7 +72,7 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, RngCore};
 use turso_parser::ast::{self, Name, SortOrder};
 use turso_parser::parser::Parser;
 
@@ -8664,7 +8664,7 @@ impl Value {
         .max(1) as usize;
 
         let mut blob: Vec<u8> = vec![0; length];
-        getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
+        rand::thread_rng().fill_bytes(&mut blob);
         Value::Blob(blob)
     }
 
