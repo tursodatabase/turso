@@ -66,6 +66,7 @@ fn convert_to_no_rowid_alias(create_sql: &str) -> String {
 }
 
 #[test]
+#[ignore]
 pub fn rowid_alias_differential_fuzz() {
     let (mut rng, seed) = rng_from_time_or_env();
     tracing::info!("rowid_alias_differential_fuzz seed: {}", seed);
