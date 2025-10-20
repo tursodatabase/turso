@@ -2165,21 +2165,21 @@ pub fn halt(
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
     if auto_commit {
-        let res = program.commit_txn(pager.clone(), state, mv_store, false);
-        if res.is_ok()
-            && program.connection.foreign_keys_enabled()
+        // In autocommit mode, a statement that leaves deferred violations must fail here.
+        if program.connection.foreign_keys_enabled()
             && program
                 .connection
                 .fk_deferred_violations
                 .swap(0, Ordering::AcqRel)
                 > 0
         {
-            // In autocommit mode, a statement that leaves deferred violations must fail here.
             return Err(LimboError::Constraint(
                 "foreign key constraint failed".to_string(),
             ));
         }
-        res.map(Into::into)
+        program
+            .commit_txn(pager.clone(), state, mv_store, false)
+            .map(Into::into)
     } else {
         Ok(InsnFunctionStepResult::Done)
     }
