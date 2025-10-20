@@ -6,7 +6,8 @@ use turso_parser::ast::{
 };
 
 use crate::error::{
-    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+    SQLITE_CONSTRAINT_UNIQUE,
 };
 use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
@@ -415,7 +416,7 @@ pub fn translate_insert(
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
-      emit_check_constraints(&mut program, &ctx, &insertion, resolver)?;
+    emit_check_constraints(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -2954,41 +2955,41 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 ///
 /// For example, `CHECK (age >= 18)` be rewritten to `CHECK (Register(5) >= 18)`
 /// if register 5 holds the value for the 'age' column.
-fn rewrite_check_expr(
-    expr: &mut ast::Expr,
-    insertion: &Insertion,
-) -> crate::Result<WalkControl> {
-    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-        let col_reg = |name: &str| -> Option<usize> {
-            if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-                Some(insertion.key_register())
-            } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-                if c.column.is_rowid_alias {
+fn rewrite_check_expr(expr: &mut ast::Expr, insertion: &Insertion) -> crate::Result<WalkControl> {
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            let col_reg = |name: &str| -> Option<usize> {
+                if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
                     Some(insertion.key_register())
+                } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
+                    if c.column.is_rowid_alias {
+                        Some(insertion.key_register())
+                    } else {
+                        Some(c.register)
+                    }
                 } else {
-                    Some(c.register)
+                    None
                 }
-            } else {
-                None
-            }
-        };
-        match e {
-            Expr::Id(name) => {
-                let normalized = normalize_ident(name.as_str());
-                if let Some(reg) = col_reg(&normalized) {
-                    *e = Expr::Register(reg);
+            };
+            match e {
+                Expr::Id(name) => {
+                    let normalized = normalize_ident(name.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    }
                 }
-            }
-            Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                let normalized = normalize_ident(col.as_str());
-                if let Some(reg) = col_reg(&normalized) {
-                    *e = Expr::Register(reg);
+                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                    let normalized = normalize_ident(col.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })
+            Ok(WalkControl::Continue)
+        },
+    )
 }
 
 fn emit_check_constraints(
@@ -3027,7 +3028,7 @@ fn emit_check_constraints(
         let mut check_expr = expr.clone();
         rewrite_check_expr(&mut check_expr, insertion)?;
 
-           tracing::debug!(
+        tracing::debug!(
             "Rewrote CHECK constraint expression for {:?}: original: {:?}, rewritten: {:?}",
             constraint.name,
             expr,
@@ -3064,4 +3065,3 @@ fn emit_check_constraints(
     }
     Ok(())
 }
-

@@ -1,5 +1,7 @@
 #![allow(unused_variables)]
-use crate::error::{SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
+use crate::error::{
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE,
+};
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::schema::Table;
@@ -2091,7 +2093,7 @@ pub fn halt(
         SQLITE_CONSTRAINT_FOREIGNKEY => {
             return Err(LimboError::Constraint(format!("{description} (19)")));
         }
-         SQLITE_CONSTRAINT_CHECK => {
+        SQLITE_CONSTRAINT_CHECK => {
             return Err(LimboError::Constraint(format!("{description} (19)")));
         }
         _ => {

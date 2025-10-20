@@ -842,7 +842,7 @@ pub fn translate_drop_table(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
-            checks:vec![],
+            checks: vec![],
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));
