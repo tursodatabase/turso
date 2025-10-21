@@ -28,6 +28,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
     _btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
+    record_cursor: RefCell<RecordCursor>,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -52,6 +53,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             reusable_immutable_record: RefCell::new(None),
             _btree_cursor: btree_cursor,
             null_flag: false,
+            record_cursor: RefCell::new(RecordCursor::new()),
     }
 
     pub fn current_row(&self) -> Result<Option<Row>> {
@@ -111,6 +113,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         } else {
             self.current_pos.replace(CursorPosition::BeforeFirst);
         }
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -216,6 +219,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             SeekOp::LT => (Bound::Excluded(&rowid), false),
             SeekOp::LE { eq_only: _ } => (Bound::Included(&rowid), false),
         };
+        self.invalidate_record();
         let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
         if let Some(rowid) = rowid {
             self.current_pos.replace(CursorPosition::Loaded(rowid));
@@ -263,6 +267,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.current_pos.replace(CursorPosition::BeforeFirst);
             })?;
         }
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -272,6 +277,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         };
         let rowid = RowID::new(self.table_id, rowid);
         self.db.delete(self.tx_id, rowid)?;
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -369,6 +375,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             .as_mut()
             .unwrap()
             .invalidate();
+        self.record_cursor.borrow_mut().invalidate();
     }
 
     fn has_rowid(&self) -> bool {
@@ -376,7 +383,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn record_cursor_mut(&self) -> std::cell::RefMut<'_, crate::types::RecordCursor> {
-        todo!()
+        self.record_cursor.borrow_mut()
     }
 
     fn get_pager(&self) -> Arc<Pager> {
