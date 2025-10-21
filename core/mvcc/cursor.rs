@@ -284,21 +284,25 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
+        self.invalidate_record();
         let int_key = match key {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let exists = self
-            .db
-            .seek_rowid(
-                Bound::Included(&RowID {
-                    table_id: self.table_id,
-                    row_id: *int_key,
-                }),
-                true,
-                self.tx_id,
-            )
-            .is_some();
+        let rowid = self.db.seek_rowid(
+            Bound::Included(&RowID {
+                table_id: self.table_id,
+                row_id: *int_key,
+            }),
+            true,
+            self.tx_id,
+        );
+        tracing::trace!("found {rowid:?}");
+        let exists = if let Some(rowid) = rowid {
+            rowid.row_id == *int_key
+        } else {
+            false
+        };
         if exists {
             self.current_pos.replace(CursorPosition::Loaded(RowID {
                 table_id: self.table_id,
