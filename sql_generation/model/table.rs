@@ -48,6 +48,33 @@ pub struct Table {
     pub indexes: Vec<String>,
 }
 
+impl Display for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Table: {}", self.name)?;
+        writeln!(
+            f,
+            "Columns: {}",
+            self.columns
+                .iter()
+                .map(|col| format!("{} {}", col.name, col.column_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        writeln!(f, "Rows:")?;
+        for row in &self.rows {
+            writeln!(
+                f,
+                "  ({})",
+                row.iter()
+                    .map(|val| format!("{}", val))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl Table {
     pub fn anonymous(rows: Vec<Vec<SimValue>>) -> Self {
         Self {

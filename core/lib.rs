@@ -2635,6 +2635,12 @@ impl Statement {
         }
     }
 
+    pub fn column_names(&self) -> Vec<Cow<'_, str>> {
+        (0..self.num_columns())
+            .map(|idx| self.get_column_name(idx))
+            .collect()
+    }
+
     pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
         match self.query_mode {
             QueryMode::Normal => {

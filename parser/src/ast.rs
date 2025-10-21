@@ -542,6 +542,40 @@ impl Expr {
     pub fn raise(resolve_type: ResolveType, expr: Option<Expr>) -> Expr {
         Expr::Raise(resolve_type, expr.map(Box::new))
     }
+
+    pub fn case_when(
+        base: Option<Expr>,
+        when_then_pairs: Vec<(Expr, Expr)>,
+        else_expr: Option<Expr>,
+    ) -> Expr {
+        Expr::Case {
+            base: base.map(Box::new),
+            when_then_pairs: when_then_pairs
+                .into_iter()
+                .map(|(w, t)| (Box::new(w), Box::new(t)))
+                .collect(),
+            else_expr: else_expr.map(Box::new),
+        }
+    }
+
+    pub fn lit_integer(i: i64) -> Expr {
+        Expr::Literal(Literal::Numeric(i.to_string()))
+    }
+    pub fn lit_string(s: impl AsRef<str>) -> Expr {
+        Expr::Literal(Literal::String(s.as_ref().to_string()))
+    }
+    pub fn fun(name: Name, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name,
+            distinctness: None,
+            args: args.into_iter().map(Box::new).collect(),
+            order_by: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        }
+    }
 }
 
 /// SQL literal

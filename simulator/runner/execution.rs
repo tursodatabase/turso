@@ -7,6 +7,7 @@ use turso_core::{Connection, LimboError, Result, StepResult, Value};
 use crate::{
     generation::{
         Shadow as _,
+        assertion::{Bindings, Relation},
         plan::{
             ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
             InteractionType, ResultSet,
@@ -127,7 +128,7 @@ pub fn execute_plan(
         Ok(ExecutionContinuation::Stay)
     } else {
         tracing::debug!("connection {} already connected", connection_index);
-        execute_interaction(env, interaction, &mut conn_state.stack)
+        execute_interaction(env, interaction, &mut conn_state.bindings)
     }
 }
 
@@ -148,23 +149,23 @@ pub(crate) enum ExecutionContinuation {
 pub fn execute_interaction(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
-    stack: &mut Vec<ResultSet>,
+    bindings: &mut Bindings,
 ) -> Result<ExecutionContinuation> {
     let connection = &mut env.connections[interaction.connection_index];
     match connection {
-        SimConnection::LimboConnection(..) => execute_interaction_turso(env, interaction, stack),
+        SimConnection::LimboConnection(..) => execute_interaction_turso(env, interaction, bindings),
         SimConnection::SQLiteConnection(..) => {
-            execute_interaction_rusqlite(env, interaction, stack)
+            execute_interaction_rusqlite(env, interaction, bindings)
         }
         SimConnection::Disconnected => unreachable!(),
     }
 }
 
-#[instrument(skip(env, interaction, stack), fields(conn_index = interaction.connection_index, interaction = %interaction))]
+#[instrument(skip(env, interaction, bindings), fields(conn_index = interaction.connection_index, interaction = %interaction))]
 pub fn execute_interaction_turso(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
-    stack: &mut Vec<ResultSet>,
+    bindings: &mut Bindings,
 ) -> Result<ExecutionContinuation> {
     let SimConnection::LimboConnection(conn) = &mut env.connections[interaction.connection_index]
     else {
@@ -184,7 +185,10 @@ pub fn execute_interaction_turso(
             {
                 return Err(err.clone());
             }
-            stack.push(results);
+            if let Some(name) = interaction.binding.as_ref() {
+                println!("Binding results {:?} to '{}'", results, name);
+                bindings.insert(name.clone(), results);
+            }
             // TODO: skip integrity check with mvcc
             if !env.profile.experimental_mvcc {
                 limbo_integrity_check(conn)?;
@@ -196,27 +200,35 @@ pub fn execute_interaction_turso(
                 .execute_fsync_query(conn.clone(), env)
                 .inspect_err(|err| tracing::error!(?err));
 
-            stack.push(results);
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                return Err(err.clone());
+            }
+            if let Some(name) = interaction.binding.as_ref() {
+                bindings.insert(name.clone(), results.into());
+            }
 
             let query_interaction = Interaction::new(
                 interaction.connection_index,
                 InteractionType::Query(query.clone()),
             );
 
-            execute_interaction(env, &query_interaction, stack)?;
+            execute_interaction(env, &query_interaction, bindings)?;
         }
         InteractionType::Assertion(_) => {
-            interaction.execute_assertion(stack, env)?;
-            stack.clear();
+            interaction.execute_assertion(bindings, env)?;
         }
         InteractionType::Assumption(_) => {
-            let assumption_result = interaction.execute_assumption(stack, env);
-            stack.clear();
+            let assumption_result = interaction.execute_assumption(bindings, env);
 
             if let Err(err) = assumption_result {
                 tracing::warn!("assumption failed: {:?}", err);
                 return Err(err);
             }
+        }
+        InteractionType::Control(_) => {
+            interaction.execute_control(env, bindings)?;
         }
         InteractionType::Fault(_) => {
             interaction.execute_fault(env, interaction.connection_index)?;
@@ -227,7 +239,14 @@ pub fn execute_interaction_turso(
                 .execute_faulty_query(&conn, env)
                 .inspect_err(|err| tracing::error!(?err));
 
-            stack.push(results);
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                return Err(err.clone());
+            }
+            if let Some(name) = interaction.binding.as_ref() {
+                bindings.insert(name.clone(), results.into());
+            }
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
@@ -237,6 +256,7 @@ pub fn execute_interaction_turso(
         }
     }
     let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+    println!("{}", env.get_conn_tables(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -282,11 +302,11 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip(env, interaction, stack), fields(seed = %env.opts.seed, interaction = %interaction))]
+#[instrument(skip(env, interaction, bindings), fields(seed = %env.opts.seed, interaction = %interaction))]
 fn execute_interaction_rusqlite(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
-    stack: &mut Vec<ResultSet>,
+    bindings: &mut Bindings,
 ) -> turso_core::Result<ExecutionContinuation> {
     tracing::info!("");
     let SimConnection::SQLiteConnection(conn) = &mut env.connections[interaction.connection_index]
@@ -305,25 +325,26 @@ fn execute_interaction_rusqlite(
                 return Err(err.clone());
             }
             tracing::debug!("{:?}", results);
-            stack.push(results);
+            if let Some(name) = interaction.binding.as_ref() {
+                bindings.insert(name.clone(), results.into());
+            }
             env.update_conn_last_interaction(interaction.connection_index, Some(query));
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
         }
         InteractionType::Assertion(_) => {
-            interaction.execute_assertion(stack, env)?;
-            stack.clear();
+            interaction.execute_assertion(bindings, env)?;
         }
         InteractionType::Assumption(_) => {
-            let assumption_result = interaction.execute_assumption(stack, env);
-            stack.clear();
+            let assumption_result = interaction.execute_assumption(bindings, env);
 
             if let Err(err) = assumption_result {
                 tracing::warn!("assumption failed: {:?}", err);
                 return Err(err);
             }
         }
+        InteractionType::Control(_) => todo!(),
         InteractionType::Fault(_) => {
             interaction.execute_fault(env, interaction.connection_index)?;
         }
@@ -339,14 +360,15 @@ fn execute_interaction_rusqlite(
 fn execute_query_rusqlite(
     connection: &rusqlite::Connection,
     query: &Query,
-) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+) -> rusqlite::Result<Relation> {
     match query {
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let columns = stmt.column_count();
+            let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let len = columns.len();
             let rows = stmt.query_map([], |row| {
                 let mut values = vec![];
-                for i in 0..columns {
+                for i in 0..len {
                     let value = row.get_unwrap(i);
                     let value = match value {
                         rusqlite::types::Value::Null => Value::Null,
@@ -359,15 +381,15 @@ fn execute_query_rusqlite(
                 }
                 Ok(values)
             })?;
-            let mut result = vec![];
+            let mut result = Relation::new(columns);
             for row in rows {
-                result.push(row?);
+                result.rows.push(row?);
             }
             Ok(result)
         }
         _ => {
             connection.execute(query.to_string().as_str(), ())?;
-            Ok(vec![])
+            Ok(Relation::empty())
         }
     }
 }

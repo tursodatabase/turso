@@ -21,18 +21,21 @@ use sql_generation::{
         table::SimValue,
     },
 };
-use turso_core::{Connection, Result, StepResult};
+use turso_core::{Connection, LimboError, Result, StepResult};
 
 use crate::{
     SimulatorEnv,
-    generation::Shadow,
+    generation::{
+        Shadow,
+        assertion::{Assertion, Bindings, Relation, eval_assertion},
+    },
     model::Query,
     runner::env::{ShadowTablesMut, SimConnection, SimulationType},
 };
 
 use super::property::{Property, remaining};
 
-pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
+pub(crate) type ResultSet = Result<Relation>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InteractionPlan {
@@ -429,7 +432,16 @@ pub struct InteractionPlanState {
 
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionState {
-    pub stack: Vec<ResultSet>,
+    pub bindings: Bindings,
+}
+
+impl ConnectionState {
+    pub fn last_result(&self) -> Option<Result<Vec<Vec<SimValue>>>> {
+        self.bindings.get("__last").cloned().map(|r| match r {
+            Ok(rel) => Ok(rel.rows),
+            Err(e) => Err(e),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,176 +624,6 @@ impl Display for InteractionStats {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
-
-enum AssertionAST {
-    Pick(),
-}
-
-#[derive(Clone)]
-pub struct Assertion {
-    pub func: Rc<AssertionFunc>,
-    pub name: String, // For display purposes in the plan
-}
-
-impl Debug for Assertion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Assertion")
-            .field("name", &self.name)
-            .finish()
-    }
-}
-
-impl Assertion {
-    pub fn new<F>(name: String, func: F) -> Self
-    where
-        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
-    {
-        Self {
-            func: Rc::new(func),
-            name,
-        }
-    }
-
-    pub fn table_should_not_exist(table_name: &str, connection_index: usize) -> Self {
-        let name = format!("table_should_not_exist({})", table_name);
-        let table_name = table_name.to_string();
-        Self::new(name, move |_, env| {
-            let conn_tables = env.get_conn_tables(connection_index);
-            if !conn_tables.iter().any(|t| t.name == table_name) {
-                Ok(Ok(()))
-            } else {
-                Ok(Err(format!("table {table_name} already exists")))
-            }
-        })
-    }
-    pub fn table_exists(table_name: &str) -> Self {
-        let name = format!("table_exists({})", table_name);
-        let table_name = table_name.to_string();
-        Self::new(name, move |_, env| {
-            if env
-                .connection_context(0)
-                .tables()
-                .iter()
-                .any(|t| t.name == table_name)
-            {
-                Ok(Ok(()))
-            } else {
-                Ok(Err(format!("Table '{}' does not exist", table_name)))
-            }
-        })
-    }
-
-    pub fn expect_error(err_str: &str, reason: &str) -> Self {
-        let name = format!("expect_error({}, {})", err_str, reason);
-        let err_str = err_str.to_string();
-        let reason = reason.to_string();
-        Self::new(name, move |stack, _| {
-            if let Some(Err(e)) = stack.last() {
-                if e.to_string().contains(&err_str) {
-                    Ok(Ok(()))
-                } else {
-                    Ok(Err(format!(
-                        "Expected error containing '{}' due to {}, but got '{}'",
-                        err_str, reason, e
-                    )))
-                }
-            } else {
-                Ok(Err(format!(
-                    "Expected error containing '{}' due to {}, but got no error",
-                    err_str, reason
-                )))
-            }
-        })
-    }
-
-    pub fn compare_result_length(other: usize, op: &str, reason: &str) -> Self {
-        let name = format!("compare_result_length({}, {}, {})", other, op, reason);
-        let other = other.clone();
-        let op = op.to_string();
-        let reason = reason.to_string();
-        Self::new(name, move |stack, _| {
-            let len = stack.last().unwrap().clone()?.len();
-            let result = match op.as_str() {
-                "=" => len == other,
-                "!=" => len != other,
-                "<" => len < other,
-                "<=" => len <= other,
-                ">" => len > other,
-                ">=" => len >= other,
-                _ => {
-                    return Ok(Err(format!("Unknown comparison operator '{}'", op)));
-                }
-            };
-            if result {
-                Ok(Ok(()))
-            } else {
-                Ok(Err(format!(
-                    "Comparison for {} failed: {:?} {} {:?}",
-                    reason, len, op, other
-                )))
-            }
-        })
-    }
-
-    pub fn shadow_equivalence(table: &str, conn_index: usize) -> Self {
-        let table = table.to_string();
-        Self::new(
-            format!("table {} should have the expected content", table.clone()),
-            move |stack: &Vec<ResultSet>, env| {
-                let rows = stack.last().unwrap();
-                let Ok(rows) = rows else {
-                    return Ok(Err(format!("expected rows but got error: {rows:?}")));
-                };
-                let conn_tables = env.get_conn_tables(conn_index);
-                let sim_table = conn_tables
-                    .iter()
-                    .find(|t| t.name == table)
-                    .expect("table should be in enviroment");
-                if rows.len() != sim_table.rows.len() {
-                    return Ok(Err(format!(
-                        "expected {} rows but got {} for table {}",
-                        sim_table.rows.len(),
-                        rows.len(),
-                        table.clone()
-                    )));
-                }
-                for expected_row in sim_table.rows.iter() {
-                    if !rows.contains(expected_row) {
-                        return Ok(Err(format!(
-                            "expected row {:?} not found in table {}",
-                            expected_row,
-                            table.clone()
-                        )));
-                    }
-                }
-                Ok(Ok(()))
-            },
-        )
-    }
-
-    pub fn expected_result(expected: Vec<Vec<SimValue>>) -> Self {
-        let expected_clone = expected.clone();
-        Self::new(
-            format!("expected result to be {:?}", expected_clone),
-            move |stack: &Vec<ResultSet>, _| {
-                let rows = stack.last().unwrap();
-                let Ok(rows) = rows else {
-                    return Ok(Err(format!("expected rows but got error: {rows:?}")));
-                };
-                if *rows == expected {
-                    Ok(Ok(()))
-                } else {
-                    Ok(Err(format!(
-                        "expected result to be {:?}, but got {:?}",
-                        expected, rows
-                    )))
-                }
-            },
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Fault {
     Disconnect,
@@ -799,6 +641,7 @@ impl Display for Fault {
 
 #[derive(Debug, Clone)]
 pub struct Interaction {
+    pub binding: Option<String>,
     pub connection_index: usize,
     pub interaction: InteractionType,
     pub ignore_error: bool,
@@ -824,6 +667,7 @@ impl Interaction {
             connection_index,
             interaction,
             ignore_error: false,
+            binding: None,
         }
     }
 
@@ -832,8 +676,22 @@ impl Interaction {
             connection_index,
             interaction,
             ignore_error: true,
+            binding: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum Control {
+    ShadowIfOk {
+        from: String,
+        apply: Query,
+        conn_index: usize,
+    },
+    RollbackIfErr {
+        from: String,
+        conn_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -842,15 +700,26 @@ pub enum InteractionType {
     Assumption(Assertion),
     Assertion(Assertion),
     Fault(Fault),
+    Control(Control),
     /// Will attempt to run any random query. However, when the connection tries to sync it will
     /// close all connections and reopen the database and assert that no data was lost
     FsyncQuery(Query),
     FaultyQuery(Query),
 }
 
+impl Interaction {
+    pub fn bind(mut self, binding: String) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+}
+
 // FIXME: add the connection index here later
 impl Display for Interaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(binding) = &self.binding {
+            writeln!(f, "-- @bind {}", binding)?;
+        }
         write!(f, "{}; -- {}", self.interaction, self.connection_index)
     }
 }
@@ -859,10 +728,30 @@ impl Display for InteractionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(query) => write!(f, "{query};"),
-            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption.name),
+            Self::Assumption(assumption) => write!(f, "-- ASSUME {};", assumption),
             Self::Assertion(assertion) => {
-                write!(f, "-- ASSERT {};", assertion.name)
+                write!(f, "-- ASSERT {};", assertion)
             }
+            Self::Control(control) => match control {
+                Control::ShadowIfOk {
+                    from,
+                    apply,
+                    conn_index,
+                } => {
+                    write!(
+                        f,
+                        "-- CONTROL SHADOW_IF_OK from '{}' apply '{}' on conn {}",
+                        from, apply, conn_index
+                    )
+                }
+                Control::RollbackIfErr { from, conn_index } => {
+                    write!(
+                        f,
+                        "-- CONTROL ROLLBACK_IF_ERR from '{}' on conn {}",
+                        from, conn_index
+                    )
+                }
+            },
             Self::Fault(fault) => write!(f, "-- FAULT '{fault}'"),
             Self::FsyncQuery(query) => {
                 writeln!(f, "-- FSYNC QUERY")?;
@@ -884,6 +773,17 @@ impl Shadow for InteractionType {
                 }
                 query.shadow(env)
             }
+            Self::Control(cnode) => match cnode {
+                Control::ShadowIfOk {
+                    from: _,
+                    apply,
+                    conn_index: _,
+                } => apply.shadow(env),
+                Control::RollbackIfErr {
+                    from: _,
+                    conn_index: _,
+                } => Ok(vec![]),
+            },
             Self::Assumption(_)
             | Self::Assertion(_)
             | Self::Fault(_)
@@ -920,7 +820,8 @@ impl InteractionType {
             let rows = rows?;
             assert!(rows.is_some());
             let mut rows = rows.unwrap();
-            let mut out = Vec::new();
+            let mut out =
+                Relation::new(rows.column_names().iter().map(|s| s.to_string()).collect());
             while let Ok(row) = rows.step() {
                 match row {
                     StepResult::Row => {
@@ -930,7 +831,7 @@ impl InteractionType {
                             let v = v.into();
                             r.push(v);
                         }
-                        out.push(r);
+                        out.rows.push(r);
                     }
                     StepResult::IO => {
                         rows.run_once().unwrap();
@@ -953,53 +854,47 @@ impl InteractionType {
 
     pub(crate) fn execute_assertion(
         &self,
-        stack: &Vec<ResultSet>,
+        bindings: &Bindings,
         env: &mut SimulatorEnv,
     ) -> Result<()> {
         match self {
-            Self::Assertion(assertion) => {
-                let result = assertion.func.as_ref()(stack, env);
-                match result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
-                        "Assertion '{}' failed: {}",
-                        assertion.name, message
-                    ))),
-                    Err(err) => Err(turso_core::LimboError::InternalError(format!(
-                        "Assertion '{}' execution error: {}",
-                        assertion.name, err
-                    ))),
-                }
-            }
-            _ => {
-                unreachable!("unexpected: this function should only be called on assertions")
-            }
+            Self::Assertion(assertion) => match eval_assertion(assertion, bindings, env) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(msg)) => Err(LimboError::InternalError(format!(
+                    "Assertion '{}' failed: {msg}",
+                    assertion
+                ))
+                .into()),
+                Err(e) => Err(LimboError::InternalError(format!(
+                    "Assertion '{}' evaluation error: {e}",
+                    assertion
+                ))
+                .into()),
+            },
+            _ => unreachable!("execute_assertion only valid for Assertion"),
         }
     }
 
     pub(crate) fn execute_assumption(
         &self,
-        stack: &Vec<ResultSet>,
+        bindings: &Bindings,
         env: &mut SimulatorEnv,
     ) -> Result<()> {
         match self {
-            Self::Assumption(assumption) => {
-                let result = assumption.func.as_ref()(stack, env);
-                match result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(message)) => Err(turso_core::LimboError::InternalError(format!(
-                        "Assumption '{}' failed: {}",
-                        assumption.name, message
-                    ))),
-                    Err(err) => Err(turso_core::LimboError::InternalError(format!(
-                        "Assumption '{}' execution error: {}",
-                        assumption.name, err
-                    ))),
-                }
-            }
-            _ => {
-                unreachable!("unexpected: this function should only be called on assumptions")
-            }
+            Self::Assumption(assert) => match eval_assertion(assert, bindings, env) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(msg)) => Err(LimboError::InternalError(format!(
+                    "Assumption '{}' failed: {}",
+                    assert, msg
+                ))
+                .into()),
+                Err(e) => Err(LimboError::InternalError(format!(
+                    "Assumption '{}' evaluation error: {e}",
+                    assert
+                ))
+                .into()),
+            },
+            _ => unreachable!("execute_assumption only valid for Assumption"),
         }
     }
 
@@ -1049,7 +944,8 @@ impl InteractionType {
                 return Err(err.unwrap());
             }
             let mut rows = rows.unwrap().unwrap();
-            let mut out = Vec::new();
+            let mut out =
+                Relation::new(rows.column_names().iter().map(|s| s.to_string()).collect());
             while let Ok(row) = rows.step() {
                 match row {
                     StepResult::Row => {
@@ -1059,7 +955,7 @@ impl InteractionType {
                             let v = v.into();
                             r.push(v);
                         }
-                        out.push(r);
+                        out.rows.push(r);
                     }
                     StepResult::IO => {
                         let syncing = env.io.syncing();
@@ -1107,7 +1003,8 @@ impl InteractionType {
                 return Err(err.unwrap());
             }
             let mut rows = rows.unwrap().unwrap();
-            let mut out = Vec::new();
+            let mut out =
+                Relation::new(rows.column_names().iter().map(|s| s.to_string()).collect());
             let mut current_prob = 0.05;
             let mut incr = 0.001;
             loop {
@@ -1126,7 +1023,7 @@ impl InteractionType {
                             let v = v.into();
                             r.push(v);
                         }
-                        out.push(r);
+                        out.rows.push(r);
                     }
                     StepResult::IO => {
                         rows.run_once()?;
@@ -1150,6 +1047,40 @@ impl InteractionType {
             Ok(out)
         } else {
             unreachable!("unexpected: this function should only be called on queries")
+        }
+    }
+
+    pub(crate) fn execute_control(
+        &self,
+        env: &mut SimulatorEnv,
+        bindings: &Bindings,
+    ) -> Result<()> {
+        match self {
+            Self::Control(control) => match control {
+                Control::ShadowIfOk {
+                    from,
+                    apply,
+                    conn_index,
+                } => {
+                    let from_result = bindings.get(from).ok_or_else(|| {
+                        LimboError::InternalError(format!("binding '{}' not found", from))
+                    })?;
+                    if from_result.is_ok() {
+                        apply.shadow(&mut env.get_conn_tables_mut(*conn_index));
+                    }
+                    Ok(())
+                }
+                Control::RollbackIfErr { from, conn_index } => {
+                    let from_result = bindings.get(from).ok_or_else(|| {
+                        LimboError::InternalError(format!("binding '{}' not found", from))
+                    })?;
+                    if from_result.is_err() {
+                        env.rollback_conn(*conn_index);
+                    }
+                    Ok(())
+                }
+            },
+            _ => unreachable!("execute_control only valid for Control"),
         }
     }
 }

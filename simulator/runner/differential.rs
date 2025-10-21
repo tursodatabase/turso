@@ -142,13 +142,13 @@ fn compare_results(
     let next = match (turso_res, rusqlite_res) {
         (Ok(v1), Ok(v2)) => {
             assert_eq!(v1, v2);
-            let turso_values = turso_conn_state.stack.last();
-            let rusqlite_values = rusqlite_conn_state.stack.last();
+            let turso_values = turso_conn_state.last_result();
+            let rusqlite_values = rusqlite_conn_state.last_result();
             match (turso_values, rusqlite_values) {
                 (Some(turso_values), Some(rusqlite_values)) => {
                     match (turso_values, rusqlite_values) {
                         (Ok(turso_values), Ok(rusqlite_values)) => {
-                            if !compare_order_insensitive(turso_values, rusqlite_values) {
+                            if !compare_order_insensitive(&turso_values, &rusqlite_values) {
                                 tracing::error!(
                                     "returned values from limbo and rusqlite results do not match"
                                 );

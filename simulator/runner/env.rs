@@ -57,6 +57,15 @@ pub struct ShadowTables<'a> {
     pub(crate) transaction_tables: Option<&'a TransactionTables>,
 }
 
+impl Display for ShadowTables<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tables = self.tables();
+        for table in tables {
+            writeln!(f, "{table}")?;
+        }
+        Ok(())
+    }
+}
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
     pub(crate) commited_tables: &'a mut Vec<Table>,

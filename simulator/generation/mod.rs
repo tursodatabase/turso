@@ -1,5 +1,9 @@
+use turso_core::Value;
+use turso_parser::ast::{Expr, Literal};
+
 use crate::runner::env::ShadowTablesMut;
 
+pub mod assertion;
 pub mod plan;
 pub mod property;
 pub mod query;
@@ -16,4 +20,14 @@ pub mod query;
 pub(crate) trait Shadow {
     type Result;
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result;
+}
+
+pub(crate) fn value_to_literal(value: &Value) -> Literal {
+    match value {
+        Value::Null => Literal::Null,
+        Value::Integer(i) => Literal::Numeric(i.to_string()),
+        Value::Float(f) => Literal::Numeric(format!("{:.15}", f)),
+        Value::Text(t) => Literal::String(t.to_string()),
+        Value::Blob(b) => Literal::Blob(format!("X'{}'", hex::encode(b))),
+    }
 }

@@ -2,6 +2,7 @@
 use anyhow::anyhow;
 use clap::Parser;
 use generation::plan::{InteractionPlan, InteractionPlanState};
+use itertools::Itertools;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
@@ -228,6 +229,24 @@ fn run_simulator(
         }
 
         let bt = Backtrace::force_capture();
+        let bt = format!("{bt}");
+        // Filter out frames that are not relevant
+        let bt = bt
+            .lines()
+            .chunks(2)
+            .into_iter()
+            .filter_map(|mut c| {
+                let l1 = c.next().unwrap_or_default();
+                let l2 = c.next().unwrap_or_default();
+                (l1.contains("simulator") || l1.contains("limbo")).then_some(format!(
+                    "{}\n{}",
+                    l1.trim_end(),
+                    l2.trim_end()
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
         tracing::error!("captured backtrace:\n{}", bt);
     }));
 

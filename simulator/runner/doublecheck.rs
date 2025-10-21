@@ -168,8 +168,8 @@ fn compare_results(
     let next = match (turso_res, doublecheck_res) {
         (Ok(v1), Ok(v2)) => {
             assert_eq!(v1, v2);
-            let turso_values = turso_state.stack.last();
-            let doublecheck_values = doublecheck_state.stack.last();
+            let turso_values = turso_state.last_result();
+            let doublecheck_values = doublecheck_state.last_result();
             match (turso_values, doublecheck_values) {
                 (Some(limbo_values), Some(doublecheck_values)) => {
                     match (limbo_values, doublecheck_values) {
