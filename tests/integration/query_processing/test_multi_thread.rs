@@ -242,8 +242,10 @@ fn test_schema_reprepare_write() {
 }
 
 fn advance(stmt: &mut Statement) -> anyhow::Result<()> {
-    stmt.step()?;
-    stmt.run_once()?;
+    tracing::info!("Advancing statement: {:?}", stmt.get_sql());
+    while matches!(stmt.step()?, StepResult::IO) {
+        stmt.run_once()?;
+    }
     Ok(())
 }
 
@@ -268,9 +270,9 @@ fn test_interleaved_transactions() -> anyhow::Result<()> {
         tmp_db.connect_limbo(),
     ];
 
-    let mut statement2 = conn[2].prepare("BEGIN")?;
     let mut statement0 = conn[0].prepare("BEGIN")?;
     let mut statement1 = conn[1].prepare("BEGIN")?;
+    let mut statement2 = conn[2].prepare("BEGIN")?;
 
     advance(&mut statement2)?;
 
