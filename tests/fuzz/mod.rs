@@ -653,7 +653,6 @@ mod fuzz_tests {
 
     #[test]
     #[allow(unused_assignments)]
-    #[ignore] // ignoring because every error I can find is due to sqlite sub-transaction behavior
     pub fn fk_deferred_constraints_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
