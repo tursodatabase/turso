@@ -177,11 +177,12 @@ fn test_transaction_visibility() {
 }
 
 #[test]
-/// Currently, our default conflict resolution strategy is ROLLBACK, which ends the transaction.
-/// In SQLite, the default is ABORT, which rolls back the current statement but allows the transaction to continue.
-/// We should migrate to default ABORT once we support subtransactions.
-fn test_constraint_error_aborts_transaction() {
-    let tmp_db = TempDatabase::new("test_constraint_error_aborts_transaction.db", true);
+/// A constraint error does not rollback the transaction, it rolls back the statement.
+fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
+    let tmp_db = TempDatabase::new(
+        "test_constraint_error_aborts_only_stmt_not_entire_transaction.db",
+        true,
+    );
     let conn = tmp_db.connect_limbo();
 
     // Create table succeeds
@@ -198,14 +199,23 @@ fn test_constraint_error_aborts_transaction() {
     let result = conn.execute("INSERT INTO t VALUES (2),(3)");
     assert!(matches!(result, Err(LimboError::Constraint(_))));
 
-    // Commit fails because the transaction was aborted by the constraint error
-    let result = conn.execute("COMMIT");
-    assert!(matches!(result, Err(LimboError::TxError(_))));
+    // Third insert is valid again
+    conn.execute("INSERT INTO t VALUES (4)").unwrap();
 
-    // Make sure table is empty
-    let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
-    let row = helper_read_single_row(stmt);
-    assert_eq!(row, vec![Value::Integer(0)]);
+    // Commit succeeds
+    conn.execute("COMMIT").unwrap();
+
+    // Make sure table has 3 rows (a=1, a=2, a=4)
+    let stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(4)]
+        ]
+    );
 }
 
 #[test]
