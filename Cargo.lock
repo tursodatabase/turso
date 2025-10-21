@@ -4897,7 +4897,6 @@ dependencies = [
  "crossbeam-skiplist",
  "env_logger 0.11.7",
  "fallible-iterator",
- "getrandom 0.2.15",
  "hex",
  "intrusive-collections",
  "io-uring",

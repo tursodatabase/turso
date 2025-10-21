@@ -52,7 +52,6 @@ cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-getrandom = { version = "0.2.15" }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",

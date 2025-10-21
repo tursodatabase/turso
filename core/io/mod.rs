@@ -3,6 +3,7 @@ use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 use crate::{BufferPool, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
+use rand::{Rng, RngCore};
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
@@ -147,9 +148,12 @@ pub trait IO: Clock + Send + Sync {
     }
 
     fn generate_random_number(&self) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        i64::from_ne_bytes(buf)
+        rand::rng().random()
+    }
+
+    /// Fill `dest` with random data.
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        rand::rng().fill_bytes(dest);
     }
 
     fn get_memory_io(&self) -> Arc<MemoryIO> {
