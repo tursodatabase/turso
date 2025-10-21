@@ -18,7 +18,7 @@ enum CursorPosition {
     /// We have reached the end of the table.
     End,
 }
-#[derive(Debug)]
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
@@ -27,6 +27,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
     _btree_cursor: Box<dyn CursorTrait>,
+    null_flag: bool,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -50,6 +51,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             table_id,
             reusable_immutable_record: RefCell::new(None),
             _btree_cursor: btree_cursor,
+            null_flag: false,
     }
 
     pub fn current_row(&self) -> Result<Option<Row>> {
@@ -273,12 +275,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         Ok(IOResult::Done(()))
     }
 
-    fn set_null_flag(&mut self, _flag: bool) {
-        todo!()
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
     }
 
     fn get_null_flag(&self) -> bool {
-        todo!()
+        self.null_flag
     }
 
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
