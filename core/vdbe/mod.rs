@@ -1004,6 +1004,10 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Constraint errors do not cause a rollback of the transaction by default;
+                // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
+                // and op_halt.
+                Some(LimboError::Constraint(_)) => {}
                 _ => {
                     if *cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = mv_store {
