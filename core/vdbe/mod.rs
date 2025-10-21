@@ -595,6 +595,10 @@ pub struct Program {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     pub accesses_db: bool,
+    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
+    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
+    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    pub needs_stmt_subtransactions: bool,
 }
 
 impl Program {

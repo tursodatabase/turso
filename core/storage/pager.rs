@@ -765,7 +765,11 @@ impl Pager {
         turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
         let savepoint = Savepoint::new(subjournal_offset);
         let mut savepoints = self.savepoints.write();
-        turso_assert!(savepoints.is_empty(), "savepoints should be empty");
+        turso_assert!(
+            savepoints.is_empty(),
+            "savepoints should be empty, but had {} savepoints open",
+            savepoints.len()
+        );
         savepoints.push(savepoint);
         Ok(())
     }

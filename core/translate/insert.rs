@@ -485,6 +485,8 @@ pub fn translate_insert(
     )?;
 
     emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
+
+    program.set_needs_stmt_subtransactions(true);
     Ok(program)
 }
 

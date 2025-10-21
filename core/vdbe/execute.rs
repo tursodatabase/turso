@@ -2471,7 +2471,7 @@ pub fn op_transaction_inner(
                     }
                 }
 
-                if mv_store.is_none() {
+                if program.needs_stmt_subtransactions && mv_store.is_none() {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     state.begin_statement(&program.connection, &pager, write)?;
                 }
