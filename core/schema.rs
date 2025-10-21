@@ -1358,6 +1358,8 @@ impl BTreeTable {
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
         let mut sql = format!("CREATE TABLE {} (", self.name);
+        let needs_pk_inline = self.primary_key_columns.len() == 1;
+        // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -1384,14 +1386,71 @@ impl BTreeTable {
             if column.unique {
                 sql.push_str(" UNIQUE");
             }
-
-            if column.primary_key {
+            if needs_pk_inline && column.primary_key {
                 sql.push_str(" PRIMARY KEY");
             }
 
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+        }
+
+        let has_table_pk = !self.primary_key_columns.is_empty();
+        // Add table-level PRIMARY KEY constraint if exists
+        if !needs_pk_inline && has_table_pk {
+            sql.push_str(", PRIMARY KEY (");
+            for (i, col) in self.primary_key_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&col.0);
+            }
+            sql.push(')');
+        }
+
+        for fk in &self.foreign_keys {
+            sql.push_str(", FOREIGN KEY (");
+            for (i, col) in fk.child_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push_str(") REFERENCES ");
+            sql.push_str(&fk.parent_table);
+            sql.push('(');
+            for (i, col) in fk.parent_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(col);
+            }
+            sql.push(')');
+
+            // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
+            if fk.on_delete != RefAct::NoAction {
+                sql.push_str(" ON DELETE ");
+                sql.push_str(match fk.on_delete {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.on_update != RefAct::NoAction {
+                sql.push_str(" ON UPDATE ");
+                sql.push_str(match fk.on_update {
+                    RefAct::SetNull => "SET NULL",
+                    RefAct::SetDefault => "SET DEFAULT",
+                    RefAct::Cascade => "CASCADE",
+                    RefAct::Restrict => "RESTRICT",
+                    _ => "",
+                });
+            }
+            if fk.deferred {
+                sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
             }
         }
         sql.push(')');
