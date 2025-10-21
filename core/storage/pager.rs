@@ -15,7 +15,7 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, IOContext};
+use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
