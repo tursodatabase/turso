@@ -1,4 +1,5 @@
 use crate::storage::database::DatabaseFile;
+use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -508,7 +509,8 @@ pub struct Pager {
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
-
+    subjournal: RwLock<Option<Subjournal>>,
+    savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -626,6 +628,8 @@ impl Pager {
             dirty_pages: Arc::new(RwLock::new(HashSet::with_hasher(
                 hash::BuildHasherDefault::new(),
             ))),
+            subjournal: RwLock::new(None),
+            savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 result: None,
                 completions: Vec::new(),
