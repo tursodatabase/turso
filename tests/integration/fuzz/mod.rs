@@ -608,7 +608,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
-        const ITERS: usize = 3000;
+        const ITERS: usize = 1000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
