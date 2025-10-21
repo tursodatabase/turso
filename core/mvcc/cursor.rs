@@ -379,7 +379,21 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek_to_last(&mut self) -> Result<IOResult<()>> {
-        todo!()
+        self.invalidate_record();
+        let max_rowid = RowID {
+            table_id: self.table_id,
+            row_id: i64::MAX,
+        };
+        let bound = Bound::Included(&max_rowid);
+        let lower_bound = false;
+
+        let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
+        if let Some(rowid) = rowid {
+            self.current_pos.replace(CursorPosition::Loaded(rowid));
+        } else {
+            self.current_pos.replace(CursorPosition::End);
+        }
+        Ok(IOResult::Done(()))
     }
 
     fn invalidate_record(&mut self) {
