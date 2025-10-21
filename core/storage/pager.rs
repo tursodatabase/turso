@@ -659,6 +659,13 @@ impl Pager {
             enable_encryption: AtomicBool::new(false),
         })
     }
+
+    pub fn begin_statement(&self) -> Result<()> {
+        self.open_subjournal()?;
+        self.open_savepoint()?;
+        Ok(())
+    }
+
     /// Open the subjournal if not yet open.
     /// The subjournal is a file that is used to store the "before images" of pages for the
     /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
