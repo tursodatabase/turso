@@ -353,7 +353,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
-        self.current_pos.replace(CursorPosition::BeforeFirst);
+        self.invalidate_record();
+        if !matches!(self.get_current_pos(), CursorPosition::BeforeFirst) {
+            self.current_pos.replace(CursorPosition::BeforeFirst);
+        }
+        // Next will set cursor position to a valid position if it exists, otherwise it will set it to one that doesn't exist.
+        let _ = return_if_io!(self.next());
         Ok(IOResult::Done(()))
     }
 
