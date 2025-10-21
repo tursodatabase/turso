@@ -2521,16 +2521,19 @@ impl Pager {
         }
     }
 
-    pub fn update_dirty_loaded_page_in_cache(
+    pub fn upsert_page_in_cache(
         &self,
         id: usize,
         page: PageRef,
+        dirty_page_must_exist: bool,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
-        assert!(page.is_dirty());
+        if dirty_page_must_exist {
+            assert!(page.is_dirty());
+        }
         cache.upsert_page(page_key, page.clone()).map_err(|e| {
             LimboError::InternalError(format!(
                 "Failed to insert loaded page {id} into cache: {e:?}"
