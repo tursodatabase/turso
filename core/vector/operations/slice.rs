@@ -3,7 +3,7 @@ use crate::{
     LimboError, Result,
 };
 
-pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector> {
+pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<'static>> {
     if start > end {
         return Err(LimboError::InvalidArgument(
             "start index must not be greater than end index".into(),
@@ -18,12 +18,14 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
         VectorType::Float32Dense => Ok(Vector {
             vector_type: vector.vector_type,
             dims: end - start,
-            data: vector.data[start * 4..end * 4].to_vec(),
+            owned: Some(vector.bin_data()[start * 4..end * 4].to_vec()),
+            refer: None,
         }),
         VectorType::Float64Dense => Ok(Vector {
             vector_type: vector.vector_type,
             dims: end - start,
-            data: vector.data[start * 8..end * 8].to_vec(),
+            owned: Some(vector.bin_data()[start * 8..end * 8].to_vec()),
+            refer: None,
         }),
         VectorType::Float32Sparse => {
             let mut values = Vec::new();
@@ -41,7 +43,8 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector>
             Ok(Vector {
                 vector_type: vector.vector_type,
                 dims: end - start,
-                data: values,
+                owned: Some(values),
+                refer: None,
             })
         }
     }
@@ -63,7 +66,8 @@ mod tests {
         Vector {
             vector_type: VectorType::Float32Dense,
             dims: slice.len(),
-            data,
+            owned: Some(data),
+            refer: None,
         }
     }
 

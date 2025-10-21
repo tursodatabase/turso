@@ -3,7 +3,7 @@ use crate::{
     LimboError, Result,
 };
 
-pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
+pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
     if v1.vector_type != v2.vector_type {
         return Err(LimboError::ConversionError(
             "Mismatched vector types".into(),
@@ -12,17 +12,17 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
 
     let data = match v1.vector_type {
         VectorType::Float32Dense | VectorType::Float64Dense => {
-            let mut data = Vec::with_capacity(v1.data.len() + v2.data.len());
-            data.extend_from_slice(&v1.data);
-            data.extend_from_slice(&v2.data);
+            let mut data = Vec::with_capacity(v1.bin_len() + v2.bin_len());
+            data.extend_from_slice(&v1.bin_data());
+            data.extend_from_slice(&v2.bin_data());
             data
         }
         VectorType::Float32Sparse => {
-            let mut data = Vec::with_capacity(v1.data.len() + v2.data.len());
-            data.extend_from_slice(&v1.data[..v1.data.len() / 2]);
-            data.extend_from_slice(&v2.data[..v2.data.len() / 2]);
-            data.extend_from_slice(&v1.data[v1.data.len() / 2..]);
-            data.extend_from_slice(&v2.data[v2.data.len() / 2..]);
+            let mut data = Vec::with_capacity(v1.bin_len() + v2.bin_len());
+            data.extend_from_slice(&v1.bin_data()[..v1.bin_len() / 2]);
+            data.extend_from_slice(&v2.bin_data()[..v2.bin_len() / 2]);
+            data.extend_from_slice(&v1.bin_data()[v1.bin_len() / 2..]);
+            data.extend_from_slice(&v2.bin_data()[v2.bin_len() / 2..]);
             data
         }
     };
@@ -30,7 +30,8 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
     Ok(Vector {
         vector_type: v1.vector_type,
         dims: v1.dims + v2.dims,
-        data,
+        owned: Some(data),
+        refer: None,
     })
 }
 
@@ -41,7 +42,7 @@ mod tests {
         vector_types::{Vector, VectorType},
     };
 
-    fn float32_vec_from(slice: &[f32]) -> Vector {
+    fn float32_vec_from(slice: &[f32]) -> Vector<'static> {
         let mut data = Vec::new();
         for &v in slice {
             data.extend_from_slice(&v.to_le_bytes());
@@ -50,7 +51,8 @@ mod tests {
         Vector {
             vector_type: VectorType::Float32Dense,
             dims: slice.len(),
-            data,
+            owned: Some(data),
+            refer: None,
         }
     }
 

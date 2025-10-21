@@ -20,7 +20,7 @@ pub fn parse_vector(value: &Register, type_hint: Option<VectorType>) -> Result<V
                     "Invalid vector value".to_string(),
                 ));
             };
-            Vector::from_blob(blob.to_vec())
+            Vector::from_slice(blob)
         }
         _ => Err(LimboError::ConversionError(
             "Invalid vector type".to_string(),
@@ -81,7 +81,7 @@ pub fn vector_extract(args: &[Register]) -> Result<Value> {
         return Ok(Value::build_text("[]"));
     }
 
-    let vector = Vector::from_blob(blob.to_vec())?;
+    let vector = Vector::from_vec(blob.to_vec())?;
     Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 
