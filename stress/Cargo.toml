@@ -16,7 +16,7 @@ path = "main.rs"
 
 [features]
 default = ["experimental_indexes"]
-antithesis = ["turso/antithesis"]
+antithesis = ["turso/antithesis", "antithesis_sdk/full"]
 experimental_indexes = []
 
 [dependencies]
