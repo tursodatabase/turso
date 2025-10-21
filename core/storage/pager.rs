@@ -717,7 +717,7 @@ impl Pager {
             );
 
             buffer.as_mut_slice()[0..4].copy_from_slice(&page_id.to_be_bytes());
-            buffer.as_mut_slice()[4..4 + page_size].copy_from_slice(&contents_buffer);
+            buffer.as_mut_slice()[4..4 + page_size].copy_from_slice(contents_buffer);
 
             Arc::new(buffer)
         };
@@ -784,7 +784,7 @@ impl Pager {
         // Same reason as in open_savepoint, the start offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
         turso_assert!(start_offset == 0, "start offset should be 0");
-        let c = subjournal.truncate(start_offset as u64)?;
+        let c = subjournal.truncate(start_offset)?;
         assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }

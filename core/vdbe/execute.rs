@@ -2150,7 +2150,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
         // Any non-FK constraint violation causes the statement subtransaction to roll back.
-        state.end_statement(&program.connection, &pager, EndStatement::RollbackSavepoint)?;
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
     }
     match err_code {
         0 => {}
@@ -2187,7 +2187,7 @@ pub fn halt(
             .load(Ordering::Acquire)
             > 0
     {
-        state.end_statement(&program.connection, &pager, EndStatement::RollbackSavepoint)?;
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
         return Err(LimboError::Constraint(
             "foreign key constraint failed".to_string(),
         ));
@@ -2210,14 +2210,14 @@ pub fn halt(
                 ));
             }
         }
-        state.end_statement(&program.connection, &pager, EndStatement::ReleaseSavepoint)?;
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         program
             .commit_txn(pager.clone(), state, mv_store, false)
             .map(Into::into)
     } else {
         // Even if deferred violations are present, the statement subtransaction completes successfully when
         // it is part of an interactive transaction.
-        state.end_statement(&program.connection, &pager, EndStatement::ReleaseSavepoint)?;
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         Ok(InsnFunctionStepResult::Done)
     }
 }
