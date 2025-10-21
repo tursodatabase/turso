@@ -2830,8 +2830,6 @@ impl BTreeCursor {
                                 return Err(e);
                             }
                             Ok((page, c)) => {
-                                // mark as dirty
-                                self.pager.add_dirty(&page)?;
                                 pages_to_balance[i].replace(page);
                                 if let Some(c) = c {
                                     group.add(&c);
@@ -2916,7 +2914,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        turso_assert!(page.is_loaded(), "page should be loaded");
+                        self.pager.add_dirty(page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
