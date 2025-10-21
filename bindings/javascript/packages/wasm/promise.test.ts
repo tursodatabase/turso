@@ -1,6 +1,19 @@
 import { expect, test } from 'vitest'
 import { connect, Database } from './promise-default.js'
 
+test('vector-test', async () => {
+    const db = await connect(":memory:");
+    const v1 = new Array(1024).fill(0).map((_, i) => i);
+    const v2 = new Array(1024).fill(0).map((_, i) => 1024 - i);
+    const result = await db.prepare(`SELECT
+        vector_distance_cos(vector32('${JSON.stringify(v1)}'), vector32('${JSON.stringify(v2)}')) as cosf32,
+        vector_distance_cos(vector64('${JSON.stringify(v1)}'), vector64('${JSON.stringify(v2)}')) as cosf64,
+        vector_distance_l2(vector32('${JSON.stringify(v1)}'), vector32('${JSON.stringify(v2)}')) as l2f32,
+        vector_distance_l2(vector64('${JSON.stringify(v1)}'), vector64('${JSON.stringify(v2)}')) as l2f64
+    `).all();
+    console.info(result);
+})
+
 test('explain', async () => {
     const db = await connect(":memory:");
     const stmt = db.prepare("EXPLAIN SELECT 1");
