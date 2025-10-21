@@ -475,6 +475,62 @@ impl ProgramState {
             .as_mut()
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
+
+    /// Begin a statement subtransaction.
+    pub fn begin_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        write: bool,
+    ) -> Result<()> {
+        // Store the deferred foreign key violations counter at the start of the statement.
+        // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
+        // the deferred FK violations are not lost.
+        self.fk_deferred_violations_when_stmt_started.store(
+            connection.fk_deferred_violations.load(Ordering::Acquire),
+            Ordering::SeqCst,
+        );
+        // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        if write {
+            pager.begin_statement()?;
+        }
+        Ok(())
+    }
+
+    /// End a statement subtransaction.
+    pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        match end_statement {
+            EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+            EndStatement::RollbackSavepoint => {
+                pager.rollback_to_newest_savepoint()?;
+                // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
+                // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Action to take at the end of a statement subtransaction.
+pub enum EndStatement {
+    /// Release (commit) the savepoint -- effectively removing the savepoint as it is no longer needed for undo purposes.
+    ReleaseSavepoint,
+    /// Rollback (abort) to the newest savepoint: read pages from the subjournal and restore them to the page cache.
+    /// This is used to undo the changes made by the statement.
+    RollbackSavepoint,
 }
 
 impl Register {
