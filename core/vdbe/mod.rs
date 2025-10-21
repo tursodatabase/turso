@@ -66,7 +66,7 @@ use std::{
     collections::HashMap,
     num::NonZero,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicIsize, Ordering},
         Arc,
     },
     task::Waker,
@@ -319,7 +319,13 @@ pub struct ProgramState {
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    fk_scope_counter: isize,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -371,7 +377,8 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
-            fk_scope_counter: 0,
+            fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            fk_immediate_violations_during_stmt: AtomicIsize::new(0),
         }
     }
 
@@ -455,6 +462,10 @@ impl ProgramState {
         self.op_row_id_state = OpRowIdState::Start;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        self.fk_deferred_violations_when_stmt_started
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {

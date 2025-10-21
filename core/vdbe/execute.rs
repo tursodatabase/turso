@@ -8592,7 +8592,9 @@ pub fn op_fk_counter(
         insn
     );
     if *is_scope {
-        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+        state
+            .fk_immediate_violations_during_stmt
+            .fetch_add(*increment_value, Ordering::AcqRel);
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
@@ -8632,7 +8634,9 @@ pub fn op_fk_if_zero(
     let v = if !*is_scope {
         program.connection.get_deferred_foreign_key_violations()
     } else {
-        state.fk_scope_counter
+        state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
     };
 
     state.pc = if v == 0 {
