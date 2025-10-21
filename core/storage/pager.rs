@@ -709,6 +709,18 @@ impl Pager {
         Ok(())
     }
 
+    pub fn clear_savepoints(&self) -> Result<()> {
+        *self.savepoints.write() = Vec::new();
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return Ok(());
+        };
+        let c = subjournal.truncate(0)?;
+        assert!(c.succeeded(), "memory IO should complete immediately");
+        Ok(())
+    }
+    }
+
     #[cfg(feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
         PENDING_BYTE.load(Ordering::Relaxed)
