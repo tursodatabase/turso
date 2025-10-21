@@ -659,6 +659,23 @@ impl Pager {
             enable_encryption: AtomicBool::new(false),
         })
     }
+    /// Open the subjournal if not yet open.
+    /// The subjournal is a file that is used to store the "before images" of pages for the
+    /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
+    /// 
+    /// Currently uses MemoryIO, but should eventually be backed by temporary on-disk files.
+    pub fn open_subjournal(&self) -> Result<()> {
+        if self.subjournal.read().is_some() {
+            return Ok(());
+        }
+        use crate::MemoryIO;
+
+        let db_file_io = Arc::new(MemoryIO::new());
+        let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
+        let db_file = Subjournal::new(file);
+        *self.subjournal.write() = Some(db_file);
+        Ok(())
+    }
 
     #[cfg(feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
