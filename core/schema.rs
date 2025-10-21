@@ -414,7 +414,7 @@ impl Schema {
             mv_cursor.is_none(),
             "mvcc not yet supported for make_from_btree"
         );
-        let mut cursor = BTreeCursor::new_table(mv_cursor, Arc::clone(&pager), 1, 10);
+        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
         let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
