@@ -29,6 +29,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     _btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     record_cursor: RefCell<RecordCursor>,
+    next_rowid_lock: Arc<RwLock<()>>,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -54,6 +55,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             _btree_cursor: btree_cursor,
             null_flag: false,
             record_cursor: RefCell::new(RecordCursor::new()),
+            next_rowid_lock: Arc::new(RwLock::new(())),
+        })
     }
 
     pub fn current_row(&self) -> Result<Option<Row>> {
@@ -80,6 +83,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     pub fn get_next_rowid(&mut self) -> i64 {
+        // lock so we don't get same two rowids
+        let lock = self.next_rowid_lock.clone();
+        let _lock = lock.write();
         let _ = self.last();
         match *self.current_pos.borrow() {
             CursorPosition::Loaded(id) => id.row_id + 1,
@@ -147,6 +153,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
             };
         self.current_pos.replace(new_position);
+        self.invalidate_record();
 
         Ok(IOResult::Done(matches!(
             self.get_current_pos(),
