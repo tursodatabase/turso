@@ -1415,6 +1415,8 @@ impl Pager {
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
+            self.clear_savepoints()
+                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             wal.borrow().end_write_tx();
         }
         wal.borrow().end_read_tx();
