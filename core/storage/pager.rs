@@ -16,6 +16,7 @@ use crate::{
 };
 use crate::{io_yield_one, IOContext};
 use parking_lot::RwLock;
+use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
@@ -462,6 +463,33 @@ enum BtreeCreateVacuumFullState {
     Start,
     AllocatePage { root_page_num: u32 },
     PtrMapPut { allocated_page_id: u32 },
+}
+
+pub struct Savepoint {
+    /// Start offset of this savepoint in the subjournal.
+    start_offset: AtomicU64,
+    /// Current write offset in the subjournal.
+    write_offset: AtomicU64,
+    /// Bitmap of page numbers that are dirty in the savepoint.
+    page_bitmap: RwLock<RoaringBitmap>,
+}
+
+impl Savepoint {
+    pub fn new(subjournal_offset: u64) -> Self {
+        Self {
+            start_offset: AtomicU64::new(subjournal_offset),
+            write_offset: AtomicU64::new(subjournal_offset),
+            page_bitmap: RwLock::new(RoaringBitmap::new()),
+        }
+    }
+
+    pub fn add_dirty_page(&self, page_num: u32) {
+        self.page_bitmap.write().insert(page_num);
+    }
+
+    pub fn has_dirty_page(&self, page_num: u32) -> bool {
+        self.page_bitmap.read().contains(page_num)
+    }
 }
 
 /// The pager interface implements the persistence layer by providing access
