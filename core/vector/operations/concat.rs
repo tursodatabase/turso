@@ -13,8 +13,8 @@ pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector<'static>> {
     let data = match v1.vector_type {
         VectorType::Float32Dense | VectorType::Float64Dense => {
             let mut data = Vec::with_capacity(v1.bin_len() + v2.bin_len());
-            data.extend_from_slice(&v1.bin_data());
-            data.extend_from_slice(&v2.bin_data());
+            data.extend_from_slice(v1.bin_data());
+            data.extend_from_slice(v2.bin_data());
             data
         }
         VectorType::Float32Sparse => {

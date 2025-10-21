@@ -118,7 +118,7 @@ impl<'a> Vector<'a> {
         Self::from_data(vector_type, Some(blob), None)
     }
     pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
-        let (vector_type, len) = Self::vector_type(&blob)?;
+        let (vector_type, len) = Self::vector_type(blob)?;
         Self::from_data(vector_type, None, Some(&blob[..len]))
     }
     pub fn from_data(
@@ -126,7 +126,7 @@ impl<'a> Vector<'a> {
         owned: Option<Vec<u8>>,
         refer: Option<&'a [u8]>,
     ) -> Result<Self> {
-        let owned_slice = owned.as_ref().map(|x| x.as_slice());
+        let owned_slice = owned.as_deref();
         let refer_slice = refer.as_ref().map(|&x| x);
         let data = owned_slice.unwrap_or_else(|| refer_slice.unwrap());
         match vector_type {
@@ -191,7 +191,7 @@ impl<'a> Vector<'a> {
     }
 
     pub fn bin_data(&'a self) -> &'a [u8] {
-        let owned = self.owned.as_ref().map(|x| x.as_slice());
+        let owned = self.owned.as_deref();
         let refer = self.refer.as_ref().map(|&x| x);
         owned.unwrap_or_else(|| refer.unwrap())
     }
