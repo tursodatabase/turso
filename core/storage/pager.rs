@@ -117,7 +117,7 @@ impl HeaderRefMut {
                         "incorrect header page id"
                     );
 
-                    pager.add_dirty(&page);
+                    pager.add_dirty(&page)?;
                     *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
@@ -1118,7 +1118,7 @@ impl Pager {
                         ptrmap_page.get().id == ptrmap_pg_no,
                         "ptrmap page has unexpected number"
                     );
-                    self.add_dirty(&ptrmap_page);
+                    self.add_dirty(&ptrmap_page)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
                     break Ok(IOResult::Done(()));
                 }
@@ -1574,11 +1574,13 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
-    pub fn add_dirty(&self, page: &Page) {
+    pub fn add_dirty(&self, page: &Page) -> Result<()> {
+        self.subjournal_page_if_required(page)?;
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id);
         page.set_dirty();
+        Ok(())
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -2235,7 +2237,7 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(&trunk_page);
+                        self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
                             TRUNK_PAGE_LEAF_COUNT_OFFSET,
@@ -2255,7 +2257,7 @@ impl Pager {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
-                    self.add_dirty(page);
+                    self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
@@ -2395,7 +2397,7 @@ impl Pager {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
                             let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
-                            self.add_dirty(&page);
+                            self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
                             cache.insert(page_key, page.clone())?;
@@ -2471,7 +2473,7 @@ impl Pager {
                     // and update the database's first freelist trunk page to the next trunk page.
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    self.add_dirty(trunk_page);
+                    self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
@@ -2503,7 +2505,7 @@ impl Pager {
                         leaf_page.get().id
                     );
                     let page_contents = trunk_page.get_contents();
-                    self.add_dirty(leaf_page);
+                    self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
@@ -2541,7 +2543,7 @@ impl Pager {
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
                     );
-                    self.add_dirty(trunk_page);
+                    self.add_dirty(trunk_page)?;
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     let leaf_page = leaf_page.clone();
@@ -2555,7 +2557,7 @@ impl Pager {
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
                             allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
-                        self.add_dirty(&richard_hipp_special_page);
+                        self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
                             let mut cache = self.page_cache.write();
@@ -2579,7 +2581,7 @@ impl Pager {
                     let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                     {
                         // setup page and add to cache
-                        self.add_dirty(&page);
+                        self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
                         {
