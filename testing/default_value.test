@@ -44,3 +44,320 @@ do_execsql_test_on_specific_db {:memory:} default-value-identifier {
     INSERT INTO t7 (x) VALUES (1);
     SELECT y FROM t7 WHERE x = 1;
 } {asdf}
+
+
+# Test 1: Simple constant literals
+do_execsql_test_on_specific_db {:memory:} default_simple_constants {
+  CREATE TABLE test_constants (
+    id INTEGER PRIMARY KEY,
+    int_default INTEGER DEFAULT 42,
+    text_default TEXT DEFAULT 'hello',
+    float_default REAL DEFAULT 3.14,
+    null_default TEXT DEFAULT NULL
+  );
+  INSERT INTO test_constants(id) VALUES (1);
+  SELECT int_default, text_default, float_default, null_default FROM test_constants;
+} {42|hello|3.14|}
+
+# Test 2: Constant arithmetic expressions
+do_execsql_test_on_specific_db {:memory:} default_const_arithmetic {
+  CREATE TABLE test_math (
+    id INTEGER PRIMARY KEY,
+    simple INTEGER DEFAULT (5 + 3),
+    complex INTEGER DEFAULT (5 + 3 * 2),
+    negative INTEGER DEFAULT (-42),
+    parentheses INTEGER DEFAULT ((10 + 5) * 2)
+  );
+  INSERT INTO test_math(id) VALUES (1);
+  SELECT simple, complex, negative, parentheses FROM test_math;
+} {8|11|-42|30}
+
+# Test 3: String concatenation
+do_execsql_test_on_specific_db {:memory:} default_string_concat {
+  CREATE TABLE test_strings (
+    id INTEGER PRIMARY KEY,
+    concat_val TEXT DEFAULT ('hello' || ' ' || 'world')
+  );
+  INSERT INTO test_strings(id) VALUES (1);
+  SELECT concat_val FROM test_strings;
+} {{hello world}}
+
+# Test 4: datetime('now') - special case allowed
+do_execsql_test_on_specific_db {:memory:} default_datetime_now {
+  CREATE TABLE test_datetime (
+    id INTEGER PRIMARY KEY,
+    created_datetime DATETIME DEFAULT (datetime('now')),
+    created_date DATE DEFAULT (date('now')),
+    created_time TIME DEFAULT (time('now'))
+  );
+  INSERT INTO test_datetime(id) VALUES (1);
+  SELECT id, created_datetime IS NOT NULL, created_date IS NOT NULL, created_time IS NOT NULL 
+  FROM test_datetime;
+} {1|1|1|1}
+
+# Test 5: CURRENT_TIMESTAMP
+do_execsql_test_on_specific_db {:memory:} default_current_timestamp {
+  CREATE TABLE test_timestamp (
+    id INTEGER PRIMARY KEY,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  INSERT INTO test_timestamp(id) VALUES (1);
+  SELECT id, ts IS NOT NULL FROM test_timestamp;
+} {1|1}
+
+# Test 6: Date functions with constant string arguments
+do_execsql_test_on_specific_db {:memory:} default_datetime_const_args {
+  CREATE TABLE test_date_const (
+    id INTEGER PRIMARY KEY,
+    specific_date DATE DEFAULT (date('2024-01-01')),
+    relative_date DATE DEFAULT (date('now', '+1 day')),
+    start_month DATE DEFAULT (date('now', 'start of month'))
+  );
+  INSERT INTO test_date_const(id) VALUES (1);
+  SELECT specific_date FROM test_date_const;
+} {2024-01-01}
+
+# Test 7: String functions with constant arguments
+do_execsql_test_on_specific_db {:memory:} default_string_functions {
+  CREATE TABLE test_str_funcs (
+    id INTEGER PRIMARY KEY,
+    upper_text TEXT DEFAULT (upper('hello')),
+    lower_text TEXT DEFAULT (lower('WORLD')),
+    length_val INTEGER DEFAULT (length('test')),
+    substr_val TEXT DEFAULT (substr('hello world', 1, 5))
+  );
+  INSERT INTO test_str_funcs(id) VALUES (1);
+  SELECT upper_text, lower_text, length_val, substr_val FROM test_str_funcs;
+} {HELLO|world|4|hello}
+
+# Test 8: Math functions with constant arguments
+do_execsql_test_on_specific_db {:memory:} default_math_functions {
+  CREATE TABLE test_math_funcs (
+    id INTEGER PRIMARY KEY,
+    abs_val INTEGER DEFAULT (abs(-42)),
+    round_val REAL DEFAULT (round(3.14159, 2))
+  );
+  INSERT INTO test_math_funcs(id) VALUES (1);
+  SELECT abs_val, round_val FROM test_math_funcs;
+} {42|3.14}
+
+# Test 9: CAST expressions
+do_execsql_test_on_specific_db {:memory:} default_cast {
+  CREATE TABLE test_cast (
+    id INTEGER PRIMARY KEY,
+    cast_int INTEGER DEFAULT (CAST('42' AS INTEGER)),
+    cast_text TEXT DEFAULT (CAST(123 AS TEXT))
+  );
+  INSERT INTO test_cast(id) VALUES (1);
+  SELECT cast_int, cast_text FROM test_cast;
+} {42|123}
+
+# Test 10: CASE with constants only
+do_execsql_test_on_specific_db {:memory:} default_case_const {
+  CREATE TABLE test_case (
+    id INTEGER PRIMARY KEY,
+    checked INTEGER DEFAULT (CASE WHEN 1=1 THEN 42 ELSE 0 END),
+    checked2 INTEGER DEFAULT (CASE WHEN 'a'='a' THEN 100 ELSE 200 END)
+  );
+  INSERT INTO test_case(id) VALUES (1);
+  SELECT checked, checked2 FROM test_case;
+} {42|100}
+
+# Test 11: Nested functions with constants
+do_execsql_test_on_specific_db {:memory:} default_nested_functions {
+  CREATE TABLE test_nested (
+    id INTEGER PRIMARY KEY,
+    nested TEXT DEFAULT (upper(substr('hello world', 1, 5)))
+  );
+  INSERT INTO test_nested(id) VALUES (1);
+  SELECT nested FROM test_nested;
+} {HELLO}
+
+# Test 12: Boolean expressions
+do_execsql_test_on_specific_db {:memory:} default_boolean_expr {
+  CREATE TABLE test_bool (
+    id INTEGER PRIMARY KEY,
+    true_val INTEGER DEFAULT (1=1),
+    false_val INTEGER DEFAULT (1=0),
+    and_val INTEGER DEFAULT (1=1 AND 2=2),
+    or_val INTEGER DEFAULT (1=0 OR 2=2)
+  );
+  INSERT INTO test_bool(id) VALUES (1);
+  SELECT true_val, false_val, and_val, or_val FROM test_bool;
+} {1|0|1|1}
+
+# Test 13: Hex literals
+do_execsql_test_on_specific_db {:memory:} default_hex_literal {
+  CREATE TABLE test_hex (
+    id INTEGER PRIMARY KEY,
+    hex_val BLOB DEFAULT (x'48656c6c6f')
+  );
+  INSERT INTO test_hex(id) VALUES (1);
+  SELECT hex(hex_val) FROM test_hex;
+} {48656C6C6F}
+
+# Test 14: Empty string and zero
+do_execsql_test_on_specific_db {:memory:} default_edge_values {
+  CREATE TABLE test_edge (
+    id INTEGER PRIMARY KEY,
+    empty_string TEXT DEFAULT (''),
+    zero INTEGER DEFAULT (0)
+  );
+  INSERT INTO test_edge(id) VALUES (1);
+  SELECT empty_string, zero FROM test_edge;
+} {|0}
+
+# Test 15: Multiple inserts verify datetime changes
+do_execsql_test_on_specific_db {:memory:} default_datetime_multiple_inserts {
+  CREATE TABLE test_multi (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created DATETIME DEFAULT (datetime('now'))
+  );
+  INSERT INTO test_multi DEFAULT VALUES;
+  INSERT INTO test_multi DEFAULT VALUES;
+  SELECT COUNT(*), COUNT(DISTINCT created) >= 1 FROM test_multi;
+} {2|1}
+
+# ============================================
+# INVALID: These should fail with errors
+# ============================================
+
+# Test 16: Column reference should FAIL
+do_execsql_test_in_memory_error_content default_fail_column_reference {
+    CREATE TABLE test_column_ref (id INTEGER PRIMARY KEY, value INTEGER, doubled INTEGER DEFAULT (value * 2));
+} {default value of column [doubled] is not constant}
+
+# Test 17: Subquery should FAIL
+do_execsql_test_in_memory_any_error default_fail_subquery {
+    CREATE TABLE test_subquery (id INTEGER PRIMARY KEY, max_id INTEGER DEFAULT (SELECT MAX(id) FROM test_constants));
+}
+
+# Test 18: Fail Aggregate
+do_execsql_test_in_memory_error_content default_fail_aggregate {
+    CREATE TABLE test_aggregate (id INTEGER PRIMARY KEY, count_val INTEGER DEFAULT (COUNT(*)));
+    INSERT INTO test_aggregate(id) VALUES (1), (2);
+} {function COUNT(}
+
+# Test 19: CASE with column reference should FAIL
+do_execsql_test_in_memory_error_content default_fail_case_column {
+    CREATE TABLE test_case_column (id INTEGER PRIMARY KEY, value INTEGER, checked INTEGER DEFAULT (CASE WHEN value > 0 THEN 1 ELSE 0 END));
+} {default value of column [checked] is not constant}
+
+# Test 20: Function with non-constant argument should FAIL
+do_execsql_test_in_memory_error_content default_fail_non_const_arg {
+    CREATE TABLE test_non_const (id INTEGER PRIMARY KEY, value INTEGER, abs_value INTEGER DEFAULT (abs(value)));
+} {default value of column [abs_value] is not constant}
+
+# Test 21: Window function should FAIL
+do_execsql_test_in_memory_error_content default_fail_window_function {
+    CREATE TABLE test_window (id INTEGER PRIMARY KEY, row_num INTEGER DEFAULT (ROW_NUMBER() OVER ()));
+} {default value of column [row_num] is not constant}
+
+# ============================================
+# EDGE CASES AND BOUNDARY TESTS
+# ============================================
+
+
+
+# Test 22: Very long constant expression
+do_execsql_test_on_specific_db {:memory:} default_long_expression {
+  CREATE TABLE test_long (
+    id INTEGER PRIMARY KEY,
+    long_calc INTEGER DEFAULT (1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1)
+  );
+  INSERT INTO test_long(id) VALUES (1);
+  SELECT long_calc FROM test_long;
+} {20}
+
+# Test 23: Unicode characters
+do_execsql_test_on_specific_db {:memory:} default_unicode {
+  CREATE TABLE test_unicode (
+    id INTEGER PRIMARY KEY,
+    chinese TEXT DEFAULT ('你好'),
+    emoji TEXT DEFAULT ('👋')
+  );
+  INSERT INTO test_unicode(id) VALUES (1);
+  SELECT chinese, emoji FROM test_unicode;
+} {你好|👋}
+
+# Test 24: char() function for special characters
+do_execsql_test_on_specific_db {:memory:} default_char_function {
+  CREATE TABLE test_char (
+    id INTEGER PRIMARY KEY,
+    newline TEXT DEFAULT ('line1' || char(10) || 'line2'),
+    tab TEXT DEFAULT ('col1' || char(9) || 'col2')
+  );
+  INSERT INTO test_char(id) VALUES (1);
+  SELECT length(newline), length(tab) FROM test_char;
+} {11|9}
+
+# Test 25: NULL in expressions
+do_execsql_test_on_specific_db {:memory:} default_null_expression {
+  CREATE TABLE test_null_expr (
+    id INTEGER PRIMARY KEY,
+    null_concat TEXT DEFAULT ('hello' || NULL),
+    null_math INTEGER DEFAULT (5 + NULL),
+    coalesce_val INTEGER DEFAULT (COALESCE(NULL, 42))
+  );
+  INSERT INTO test_null_expr(id) VALUES (1);
+  SELECT null_concat IS NULL, null_math IS NULL, coalesce_val FROM test_null_expr;
+} {1|1|42}
+
+# Test 26: Multiple defaults in same table
+do_execsql_test_on_specific_db {:memory:} default_multiple_columns {
+  CREATE TABLE test_multiple (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    const_val INTEGER DEFAULT 100,
+    expr_val INTEGER DEFAULT (50 * 2),
+    func_val TEXT DEFAULT (upper('test')),
+    datetime_val DATETIME DEFAULT (datetime('now'))
+  );
+  INSERT INTO test_multiple DEFAULT VALUES;
+  SELECT const_val, expr_val, func_val, datetime_val IS NOT NULL FROM test_multiple;
+} {100|100|TEST|1}
+
+# Test 27: Override default on insert
+do_execsql_test_on_specific_db {:memory:} default_override {
+  CREATE TABLE test_override (
+    id INTEGER PRIMARY KEY,
+    value INTEGER DEFAULT 42
+  );
+  INSERT INTO test_override(id, value) VALUES (1, 99);
+  INSERT INTO test_override(id) VALUES (2);
+  SELECT id, value FROM test_override ORDER BY id;
+} {1|99 2|42}
+
+# Test 28: julianday function
+do_execsql_test_on_specific_db {:memory:} default_julianday {
+  CREATE TABLE test_julian (
+    id INTEGER PRIMARY KEY,
+    jd REAL DEFAULT (julianday('now')),
+    jd_const REAL DEFAULT (julianday('2024-01-01'))
+  );
+  INSERT INTO test_julian(id) VALUES (1);
+  SELECT jd > 2450000, jd_const FROM test_julian;
+} {1|2460310.5}
+
+# Test 29: strftime function
+do_execsql_test_on_specific_db {:memory:} default_strftime {
+  CREATE TABLE test_strftime (
+    id INTEGER PRIMARY KEY,
+    year_const TEXT DEFAULT (strftime('%Y', '2024-06-15')),
+    formatted TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now'))
+  );
+  INSERT INTO test_strftime(id) VALUES (1);
+  SELECT year_const, formatted IS NOT NULL FROM test_strftime;
+} {2024|1}
+
+do_execsql_test_on_specific_db {:memory:} default_single_val_unquoted_with_col_name {
+  CREATE TABLE t (x DEFAULT y, y);
+  INSERT INTO t(y) VALUES (1);
+  SELECT * FROM t;
+} {y|1}
+
+do_execsql_test_on_specific_db {:memory:} default_single_val_grave_quoted_with_col_name {
+  CREATE TABLE t (x DEFAULT `y`, y);
+  INSERT INTO t(y) VALUES (1);
+  SELECT * FROM t;
+} {y|1}
+
