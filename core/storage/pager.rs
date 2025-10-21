@@ -676,6 +676,38 @@ impl Pager {
         *self.subjournal.write() = Some(db_file);
         Ok(())
     }
+    pub fn open_savepoint(&self) -> Result<()> {
+        self.open_subjournal()?;
+        let subjournal_offset = self.subjournal.read().as_ref().unwrap().size()?;
+        // Currently as we only have anonymous savepoints opened at the start of a statement,
+        // the subjournal offset should always be 0 as we should only have max 1 savepoint
+        // opened at any given time.
+        turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
+        let savepoint = Savepoint::new(subjournal_offset);
+        let mut savepoints = self.savepoints.write();
+        turso_assert!(savepoints.is_empty(), "savepoints should be empty");
+        savepoints.push(savepoint);
+        Ok(())
+    }
+
+    /// Release i.e. commit the current savepoint. This basically just means removing it.
+    pub fn release_savepoint(&self) -> Result<()> {
+        let mut savepoints = self.savepoints.write();
+        let Some(savepoint) = savepoints.pop() else {
+            return Ok(());
+        };
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return Ok(());
+        };
+        let start_offset = savepoint.start_offset.load(Ordering::SeqCst);
+        // Same reason as in open_savepoint, the start offset should always be 0 as we should only have max 1 savepoint
+        // opened at any given time.
+        turso_assert!(start_offset == 0, "start offset should be 0");
+        let c = subjournal.truncate(start_offset as u64)?;
+        assert!(c.succeeded(), "memory IO should complete immediately");
+        Ok(())
+    }
 
     #[cfg(feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
