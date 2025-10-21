@@ -470,12 +470,18 @@ impl BugBase {
 }
 
 fn find_git_dir(start_path: impl AsRef<Path>) -> Option<PathBuf> {
-    // HACK ignores stuff like bare repo, worktree, etc.
     let mut current = start_path.as_ref().to_path_buf();
     loop {
         let git_path = current.join(".git");
         if git_path.is_dir() {
             return Some(git_path);
+        } else if git_path.is_file() {
+            // Handle git worktrees - .git is a file containing "gitdir: <path>"
+            if let Ok(contents) = read_to_string(&git_path) {
+                if let Some(gitdir) = contents.strip_prefix("gitdir: ") {
+                    return Some(PathBuf::from(gitdir));
+                }
+            }
         }
         if !current.pop() {
             return None;
