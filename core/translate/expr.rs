@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, As, Expr, UnaryOperator};
+use turso_parser::error::ParseError;
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -3643,11 +3644,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     let table = connection
                         .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
+                            crate::LimboError::ParseError(ParseError::Custom(format!(
                                 "no such table: {}.{}",
                                 db_name.as_str(),
                                 tbl_name.as_str()
-                            ))
+                            )))
                         })?;
 
                     // Find the column in the table
@@ -3660,12 +3661,12 @@ pub fn bind_and_rewrite_expr<'a>(
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
                         })
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
+                            crate::LimboError::ParseError(ParseError::Custom(format!(
                                 "Column: {}.{}.{} not found",
                                 db_name.as_str(),
                                 tbl_name.as_str(),
                                 col_name.as_str()
-                            ))
+                            )))
                         })?;
 
                     let col = table.columns().get(col_idx).unwrap();
@@ -3690,9 +3691,9 @@ pub fn bind_and_rewrite_expr<'a>(
                         };
                         referenced_tables.mark_column_used(tbl_id, col_idx);
                     } else {
-                        return Err(crate::LimboError::ParseError(format!(
-                            "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
-                        )));
+                        return Err(crate::LimboError::ParseError(ParseError::Custom(format!(
+                            "table {normalized_tbl_name} is not in FROM clause - cro)ss-database column references require the table to be explicitly joined"
+                        ))));
                     }
                 }
                 _ => {}

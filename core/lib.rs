@@ -510,8 +510,9 @@ impl Database {
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
                     return Err(LimboError::ParseError(
-                        "Database contains indexes which are not supported when MVCC is enabled."
-                            .to_string(),
+                        turso_parser::error::ParseError::Custom(
+                            "Database contains indexes which are not supported when MVCC is enabled.".to_string(),
+                        ),
                     ));
                 }
 
@@ -608,7 +609,7 @@ impl Database {
             "read_page_size_from_db_header called on uninitialized database"
         );
         turso_assert!(
-            PageSize::MIN % 512 == 0,
+            PageSize::MIN.is_multiple_of(512),
             "header read must be a multiple of 512 for O_DIRECT"
         );
         let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
@@ -626,7 +627,7 @@ impl Database {
             "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
-            PageSize::MIN % 512 == 0,
+            PageSize::MIN.is_multiple_of(512),
             "header read must be a multiple of 512 for O_DIRECT"
         );
         let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));

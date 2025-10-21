@@ -608,7 +608,7 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         exponent -= 1;
     }
 
-    while exponent.is_negative() && significant % 10 == 0 {
+    while exponent.is_negative() && significant.is_multiple_of(10) {
         significant /= 10;
         exponent += 1;
     }

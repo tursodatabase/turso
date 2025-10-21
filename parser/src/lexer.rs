@@ -766,7 +766,7 @@ impl<'a> Lexer<'a> {
                         debug_assert!(end_hex >= start_hex);
                         self.eat_and_assert(|b| b == b'\'');
 
-                        if (end_hex - start_hex) % 2 != 0 {
+                        if !(end_hex - start_hex).is_multiple_of(2) {
                             return Err(Error::UnrecognizedToken(
                                 (start, self.offset - start).into(),
                             ));
