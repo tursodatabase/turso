@@ -1577,6 +1577,11 @@ impl Pager {
     }
 
     pub fn add_dirty(&self, page: &Page) -> Result<()> {
+        turso_assert!(
+            page.is_loaded(),
+            "page {} must be loaded in add_dirty() so its contents can be subjournaled",
+            page.get().id
+        );
         self.subjournal_page_if_required(page)?;
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
