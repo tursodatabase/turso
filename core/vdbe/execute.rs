@@ -2471,6 +2471,9 @@ pub fn op_transaction_inner(
                     }
                 }
 
+                let write = matches!(tx_mode, TransactionMode::Write);
+                state.begin_statement(&program.connection, &pager, write)?;
+
                 state.pc += 1;
                 state.op_transaction_state = OpTransactionState::Start;
                 return Ok(InsnFunctionStepResult::Step);
