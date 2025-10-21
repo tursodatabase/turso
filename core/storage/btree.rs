@@ -2857,7 +2857,7 @@ impl BTreeCursor {
 
                     // load sibling pages
                     // start loading right page first
-                    let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
+                    let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
                     let current_sibling = sibling_pointer;
                     let mut group = CompletionGroup::new(|_| {});
                     for i in (0..=current_sibling).rev() {
