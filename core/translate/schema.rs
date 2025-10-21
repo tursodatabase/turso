@@ -14,6 +14,8 @@ use crate::translate::emitter::emit_cdc_insns;
 use crate::translate::emitter::prepare_cdc_if_necessary;
 use crate::translate::emitter::OperationMode;
 use crate::translate::emitter::Resolver;
+use crate::translate::optimizer::ConstantFlags;
+use crate::translate::optimizer::Optimizable;
 use crate::translate::ProgramBuilder;
 use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
@@ -26,10 +28,14 @@ use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 
-fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> {
+fn validate(
+    body: &ast::CreateTableBody,
+    connection: &Connection,
+    resolver: &Resolver,
+) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options, columns, ..
-    } = &body
+    } = body
     {
         if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
         {
@@ -41,7 +47,7 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
                 // don't silently ignore CHECK constraints, throw parse error for now
-                match constraint.constraint {
+                match &constraint.constraint {
                     ast::ColumnConstraint::Check { .. } => {
                         bail_parse_error!("CHECK constraints are not supported yet");
                     }
@@ -57,6 +63,17 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                         bail_parse_error!(
                             "ON CONFLICT clauses are not supported yet in column definitions"
                         );
+                    }
+                    ast::ColumnConstraint::Default(expr) => {
+                        if !expr.is_constant(
+                            resolver,
+                            ConstantFlags::DefaultConstraint { id_allowed: true },
+                        ) {
+                            bail_parse_error!(
+                                "default value of column [{}] is not constant",
+                                col_i.col_name.as_str()
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -88,7 +105,7 @@ pub fn translate_create_table(
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
-    validate(&body, connection)?;
+    validate(&body, connection, resolver)?;
 
     let opts = ProgramBuilderOpts {
         num_cursors: 1,

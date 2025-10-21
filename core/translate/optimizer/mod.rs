@@ -963,6 +963,15 @@ pub enum AlwaysTrueOrFalse {
     AlwaysFalse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConstantFlags {
+    #[default]
+    Expr,
+    /// Constant Expr and Function
+    /// Used in Create Table with Default validation
+    DefaultConstraint { id_allowed: bool },
+}
+
 /**
   Helper trait for expressions that can be optimized
   Implemented for ast::Expr
@@ -977,7 +986,7 @@ pub trait Optimizable {
     fn is_always_false(&self) -> Result<bool> {
         Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
-    fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
+    fn is_constant(&self, resolver: &Resolver<'_>, constant_flags: ConstantFlags) -> bool;
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
 }
 
@@ -1068,34 +1077,35 @@ impl Optimizable for ast::Expr {
         }
     }
     /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
-    fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
+    fn is_constant(&self, resolver: &Resolver<'_>, flags: ConstantFlags) -> bool {
         match self {
             Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {
-                lhs.is_constant(resolver)
-                    && start.is_constant(resolver)
-                    && end.is_constant(resolver)
+                lhs.is_constant(resolver, flags)
+                    && start.is_constant(resolver, flags)
+                    && end.is_constant(resolver, flags)
             }
             Expr::Binary(expr, _, expr1) => {
-                expr.is_constant(resolver) && expr1.is_constant(resolver)
+                expr.is_constant(resolver, flags) && expr1.is_constant(resolver, flags)
             }
             Expr::Case {
                 base,
                 when_then_pairs,
                 else_expr,
             } => {
-                base.as_ref().is_none_or(|base| base.is_constant(resolver))
+                base.as_ref()
+                    .is_none_or(|base| base.is_constant(resolver, flags))
                     && when_then_pairs.iter().all(|(when, then)| {
-                        when.is_constant(resolver) && then.is_constant(resolver)
+                        when.is_constant(resolver, flags) && then.is_constant(resolver, flags)
                     })
                     && else_expr
                         .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
+                        .is_none_or(|else_expr| else_expr.is_constant(resolver, flags))
             }
-            Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
+            Expr::Cast { expr, .. } => expr.is_constant(resolver, flags),
+            Expr::Collate(expr, _) => expr.is_constant(resolver, flags),
             Expr::DoublyQualified(_, _, _) => {
                 panic!("DoublyQualified should have been rewritten as Column")
             }
@@ -1104,40 +1114,76 @@ impl Optimizable for ast::Expr {
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
                     return false;
                 };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
+                match flags {
+                    ConstantFlags::Expr => {
+                        func.is_deterministic()
+                            && args.iter().all(|arg| arg.is_constant(resolver, flags))
+                    }
+                    ConstantFlags::DefaultConstraint { .. } => {
+                        args.iter().all(|arg| arg.is_constant(resolver, flags))
+                    }
+                }
             }
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
+            Expr::FunctionCallStar { name, .. } => {
+                let Some(func) = resolver.resolve_function(name.as_str(), 0) else {
+                    return false;
+                };
+                match flags {
+                    ConstantFlags::Expr => func.is_deterministic(),
+                    ConstantFlags::DefaultConstraint { .. } => true,
+                }
+            }
+            Expr::Id(..) => {
+                if let ConstantFlags::DefaultConstraint { id_allowed } = flags {
+                    id_allowed
+                } else {
+                    true
+                }
+            }
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver) && rhs.is_empty()
-                    || rhs.iter().all(|v| v.is_constant(resolver))
+                lhs.is_constant(resolver, flags) && rhs.is_empty()
+                    || rhs.iter().all(|v| v.is_constant(resolver, flags))
             }
             Expr::InSelect { .. } => {
                 false // might be constant, too annoying to check subqueries etc. implement later
             }
             Expr::InTable { .. } => false,
-            Expr::IsNull(expr) => expr.is_constant(resolver),
+            Expr::IsNull(expr) => expr.is_constant(resolver, flags),
             Expr::Like {
                 lhs, rhs, escape, ..
             } => {
-                lhs.is_constant(resolver)
-                    && rhs.is_constant(resolver)
+                lhs.is_constant(resolver, flags)
+                    && rhs.is_constant(resolver, flags)
                     && escape
                         .as_ref()
-                        .is_none_or(|escape| escape.is_constant(resolver))
+                        .is_none_or(|escape| escape.is_constant(resolver, flags))
             }
             Expr::Literal(_) => true,
             Expr::Name(_) => false,
-            Expr::NotNull(expr) => expr.is_constant(resolver),
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
+            Expr::NotNull(expr) => expr.is_constant(resolver, flags),
+            Expr::Parenthesized(exprs) => {
+                let new_flag = if matches!(flags, ConstantFlags::DefaultConstraint { .. }) {
+                    ConstantFlags::DefaultConstraint {
+                        // disallow ID inside parametrized
+                        id_allowed: false,
+                    }
+                } else {
+                    flags
+                };
+                exprs
+                    .iter()
+                    .all(|expr| expr.is_constant(resolver, new_flag))
+            }
             Expr::Qualified(_, _) => {
                 panic!("Qualified should have been rewritten as Column")
             }
-            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
+            Expr::Raise(_, expr) => expr
+                .as_ref()
+                .is_none_or(|expr| expr.is_constant(resolver, flags)),
             Expr::Subquery(_) => false,
-            Expr::Unary(_, expr) => expr.is_constant(resolver),
+            Expr::Unary(_, expr) => expr.is_constant(resolver, flags),
             Expr::Variable(_) => false,
             Expr::Register(_) => false, // Register values are not constants
         }

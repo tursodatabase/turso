@@ -9,6 +9,7 @@ use super::{
 };
 use crate::translate::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
+    optimizer::ConstantFlags,
     plan::Aggregate,
 };
 use crate::translate::{
@@ -241,7 +242,7 @@ pub fn is_orderby_agg_or_const(resolver: &Resolver, e: &ast::Expr, aggs: &[Aggre
     {
         return true;
     }
-    e.is_constant(resolver)
+    e.is_constant(resolver, ConstantFlags::default())
 }
 
 /// Computes the traversal order of GROUP BY keys so that the final
