@@ -16,12 +16,12 @@ use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 #[inline]
 pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset) {
     program.emit_insn(Insn::FkIfZero {
-        is_scope: false,
+        deferred: true,
         target_pc: label,
     });
     program.emit_insn(Insn::FkCounter {
         increment_value: -1,
-        is_scope: false,
+        deferred: true,
     });
 }
 
@@ -217,7 +217,7 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
 pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Result<()> {
     program.emit_insn(Insn::FkCounter {
         increment_value: 1,
-        is_scope: !fk.deferred,
+        deferred: fk.deferred,
     });
     Ok(())
 }

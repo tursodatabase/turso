@@ -8587,11 +8587,11 @@ pub fn op_fk_counter(
     load_insn!(
         FkCounter {
             increment_value,
-            is_scope,
+            deferred,
         },
         insn
     );
-    if *is_scope {
+    if !*deferred {
         state
             .fk_immediate_violations_during_stmt
             .fetch_add(*increment_value, Ordering::AcqRel);
@@ -8616,7 +8616,7 @@ pub fn op_fk_if_zero(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         FkIfZero {
-            is_scope,
+            deferred,
             target_pc,
         },
         insn
@@ -8631,7 +8631,7 @@ pub fn op_fk_if_zero(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
-    let v = if !*is_scope {
+    let v = if *deferred {
         program.connection.get_deferred_foreign_key_violations()
     } else {
         state
