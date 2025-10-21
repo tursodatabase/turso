@@ -5,7 +5,7 @@ use crate::{
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
-    storage::btree::{BTreeCursor, CursorTrait},
+    storage::btree::CursorTrait,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
@@ -35,7 +35,7 @@ enum SeekState {
 /// and overlays transaction changes as needed.
 pub struct MaterializedViewCursor {
     // Core components
-    btree_cursor: Box<BTreeCursor>,
+    btree_cursor: Box<dyn CursorTrait>,
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
 
@@ -62,7 +62,7 @@ pub struct MaterializedViewCursor {
 
 impl MaterializedViewCursor {
     pub fn new(
-        btree_cursor: Box<BTreeCursor>,
+        btree_cursor: Box<dyn CursorTrait>,
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         tx_state: Arc<ViewTransactionState>,
@@ -296,6 +296,7 @@ impl MaterializedViewCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::btree::BTreeCursor;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
     use std::sync::Arc;
@@ -359,12 +360,7 @@ mod tests {
 
         // Create a btree cursor
         let pager = conn.get_pager();
-        let btree_cursor = Box::new(BTreeCursor::new(
-            None, // No MvCursor
-            pager.clone(),
-            root_page,
-            num_columns,
-        ));
+        let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
         let tx_state = conn.view_transaction_states.get_or_create("test_view");

@@ -38,6 +38,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
+use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -1046,16 +1047,9 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
-        ));
-        Some(mv_cursor)
-    } else {
+    if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
-        None
-    };
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -1064,16 +1058,33 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store.unwrap().clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    *root_page,
+                    pager.clone(),
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
+
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
+
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                mv_cursor,
                 pager.clone(),
                 *root_page,
                 num_columns,
             ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().unwrap().name().to_string();
@@ -1084,7 +1095,7 @@ pub fn op_open_read(
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                btree_cursor,
+                cursor,
                 view_mutex.clone(),
                 pager.clone(),
                 tx_state,
@@ -1097,24 +1108,29 @@ pub fn op_open_read(
         }
         CursorType::BTreeTable(_) => {
             // Regular table
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                *root_page,
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let cursor = BTreeCursor::new_index(
-                mv_cursor,
+            let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager.clone(),
                 *root_page,
                 index.as_ref(),
                 num_columns,
-            );
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -6549,13 +6565,13 @@ pub fn op_new_rowid(
         },
         insn
     );
-
     if let Some(mv_store) = mv_store {
+        // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
+        // which will make sure we don't collide.
         let rowid = {
             let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut();
-            let mvcc_cursor = cursor.get_mvcc_cursor();
-            let mut mvcc_cursor = mvcc_cursor.write();
+            let cursor = cursor.as_btree_mut() as &mut dyn Any;
+            let mvcc_cursor = cursor.downcast_mut::<MvCursor>().unwrap();
             mvcc_cursor.get_next_rowid()
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
@@ -6832,16 +6848,10 @@ pub fn op_not_exists(
         },
         insn
     );
-    let exists = if let Some(mv_store) = mv_store {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        let mvcc_cursor = cursor.get_mvcc_cursor();
-        false
-    } else {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()))
-    };
+    let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+    let cursor = cursor.as_btree_mut();
+    let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
+
     if exists {
         state.pc += 1;
     } else {
@@ -6949,15 +6959,21 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
-        ));
-        Some(mv_cursor)
-    } else {
-        None
-    };
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store.unwrap().clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    root_page,
+                    pager.clone(),
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
         let schema = conn.schema.read();
@@ -6966,17 +6982,17 @@ pub fn op_open_write(
             .and_then(|table| table.btree());
 
         let num_columns = index.columns.len();
-        let cursor = BTreeCursor::new_index(
-            mv_cursor,
+        let btree_cursor = Box::new(BTreeCursor::new_index(
             pager.clone(),
             root_page,
             index.as_ref(),
             num_columns,
-        );
+        ));
+        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     } else {
         let num_columns = match cursor_type {
             CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -6986,11 +7002,16 @@ pub fn op_open_write(
             ),
         };
 
-        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns);
+        let btree_cursor = Box::new(BTreeCursor::new_table(
+            pager.clone(),
+            root_page,
+            num_columns,
+        ));
+        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7084,7 +7105,7 @@ pub fn op_destroy(
             OpDestroyState::CreateCursor => {
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
-                let cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
+                let cursor = BTreeCursor::new(pager.clone(), *root, 0);
                 state.op_destroy_state =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
@@ -7749,9 +7770,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(None, pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
+                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
@@ -7830,29 +7851,32 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = original_cursor.get_pager();
 
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
-            mv_store,
-            tx_id,
-            root_page,
-            pager.clone(),
-        )?));
-        Some(mv_cursor)
-    } else {
-        None
-    };
-
     let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(table) => {
-            let cursor =
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                root_page,
+                table.columns.len(),
+            ));
+            let cursor: Box<dyn CursorTrait> =
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store.unwrap().clone();
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        pager.clone(),
+                        cursor,
+                    )?)
+                } else {
+                    cursor
+                };
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(table) => {
             // In principle, we could implement OpenDup for BTreeIndex,
