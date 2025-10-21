@@ -90,6 +90,9 @@ if create_composite:
             """)
             con_init.commit()
             print(f"Successfully created composite index: {index_name}")
+        except turso.ProgrammingError as e:
+            print(f"Table/column might have been dropped in parallel: {e}")
+            con.rollback()
         except turso.OperationalError as e:
             print(f"Failed to create composite index: {e}")
             con.rollback()
@@ -137,6 +140,9 @@ else:
             """)
             con_init.commit()
             print(f"Successfully created {idx_type} index: {index_name}")
+        except turso.ProgrammingError as e:
+            print(f"Table/column might have been dropped in parallel: {e}")
+            con.rollback()
         except turso.OperationalError as e:
             print(f"Failed to create index: {e}")
             con.rollback()
