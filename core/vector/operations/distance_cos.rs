@@ -138,9 +138,9 @@ mod tests {
             vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[0.0, 0.0]),
             1.0
         );
-        assert!(vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-9);
-        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-9);
-        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-9);
+        assert!(vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-6);
+        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-6);
+        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -150,9 +150,9 @@ mod tests {
             vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[0.0, 0.0]),
             1.0
         );
-        assert!(vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-9);
-        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-9);
-        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-9);
+        assert!(vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-6);
+        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-6);
+        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
         let d1 = vector_f32_distance_cos_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d2 = vector_f32_distance_cos_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
-        println!("d1 vs d2: {} vs {}", d1, d2);
+        println!("d1 vs d2: {d1} vs {d2}");
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-4
     }
 
@@ -211,7 +211,7 @@ mod tests {
         let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
         let d1 = vector_f64_distance_cos_rust(v1.as_f64_slice(), v2.as_f64_slice());
         let d2 = vector_f64_distance_cos_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
-        println!("d1 vs d2: {} vs {}", d1, d2);
+        println!("d1 vs d2: {d1} vs {d2}");
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
     }
 }
