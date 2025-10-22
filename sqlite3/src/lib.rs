@@ -479,13 +479,50 @@ pub unsafe extern "C" fn sqlite3_exec(
 
 /// Detect if a SQL statement is DQL
 fn is_query_statement(sql: &str) -> bool {
-    let sql_upper = sql.to_uppercase();
-    let first_token = sql_upper.split_whitespace().next().unwrap_or("");
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
 
-    matches!(
-        first_token,
-        "SELECT" | "VALUES" | "WITH" | "PRAGMA" | "EXPLAIN"
-    ) || sql_upper.contains("RETURNING")
+    let starts_with_ignore_case = |keyword: &[u8]| -> bool {
+        if bytes.len() < keyword.len() {
+            return false;
+        }
+        // Check keyword matches
+        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        // Ensure keyword is followed by whitespace or EOF
+        bytes.len() == keyword.len() || bytes[keyword.len()].is_ascii_whitespace()
+    };
+
+    // Check DQL keywords
+    if starts_with_ignore_case(b"SELECT")
+        || starts_with_ignore_case(b"VALUES")
+        || starts_with_ignore_case(b"WITH")
+        || starts_with_ignore_case(b"PRAGMA")
+        || starts_with_ignore_case(b"EXPLAIN")
+    {
+        return true;
+    }
+
+    // Look for RETURNING as a whole word, that's not part of another identifier
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 9 <= bytes.len() && bytes[i..i + 9].eq_ignore_ascii_case(b"RETURNING") {
+            // Check it's a word boundary before and after
+            let is_word_start =
+                i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+            let is_word_end = i + 9 == bytes.len()
+                || !bytes[i + 9].is_ascii_alphanumeric() && bytes[i + 9] != b'_';
+            if is_word_start && is_word_end {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Execute a query statement with callback for each row
