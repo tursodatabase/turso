@@ -7,7 +7,7 @@ public static class TursoBindings
     private const string DllName = "turso_dotnet.dll";
 
     [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr OpenDatabase(string path, IntPtr errorHandle);
+    public static extern IntPtr OpenDatabase(string path, out IntPtr db);
 
     [DllImport(DllName, EntryPoint = "db_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern void CloseDatabase(IntPtr db);
@@ -16,7 +16,7 @@ public static class TursoBindings
     public static extern void FreeError(IntPtr errorPtr);
     
     [DllImport(DllName, EntryPoint = "db_prepare_statement", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr PrepareStatement(IntPtr db, string statement, IntPtr errorHandle);
+    public static extern IntPtr PrepareStatement(DatabaseHandle db, string statement, IntPtr errorHandle);
     
     [DllImport(DllName, EntryPoint = "free_statement", CallingConvention = CallingConvention.Cdecl)]
     public static extern void FreeStatement(IntPtr statement);

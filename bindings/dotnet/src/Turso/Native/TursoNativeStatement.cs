@@ -6,13 +6,11 @@ namespace Turso.Native;
 
 public class TursoNativeStatement : IDisposable
 {
-    private readonly IntPtr _dbPtr;
     private readonly IntPtr _statementPtr;
     private int _isDisposed = 0;
 
-    public TursoNativeStatement(IntPtr dbPtr, IntPtr statementPtr)
+    public TursoNativeStatement(IntPtr statementPtr)
     {
-        _dbPtr = dbPtr;
         _statementPtr = statementPtr;
     }
 

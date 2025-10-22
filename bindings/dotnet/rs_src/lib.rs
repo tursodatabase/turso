@@ -94,18 +94,17 @@ pub fn to_value(value: TursoValue) -> Value {
 }
 
 #[no_mangle]
-pub extern "C" fn db_open(path_ptr: *const c_char, error_handle_ptr: *mut ErrorHandle) -> *const Database {
+pub extern "C" fn db_open(path_ptr: *const c_char, db_ptr: *mut *const Database) -> *const Error {
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
     let path_str = path_cstr.to_str();
-    let error_handle = unsafe {&mut (*error_handle_ptr)};
 
     let connection_result = Connection::from_uri(path_str.unwrap(), true, false, false, false, false);
     match connection_result {
-        Ok((io, val)) => allocate(Database{io, connection: val}),
-        Err(err) => {
-            error_handle.error = allocate_error(format!("Error while opening database: {err}"));
+        Ok((io, val)) => {
+            unsafe { *db_ptr = allocate(Database{io, connection: val}) };
             null()
-        }
+        },
+        Err(err) =>  allocate_error(format!("Error while opening database: {err}"))
     }
 }
 
