@@ -15,7 +15,6 @@ mod json;
 pub mod mvcc;
 mod parameters;
 mod pragma;
-pub mod primitives;
 mod pseudo;
 mod schema;
 #[cfg(feature = "series")]

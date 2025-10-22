@@ -41,7 +41,7 @@ use super::{
 };
 use std::{
     any::Any,
-    cell::Cell,
+    cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
     fmt::Debug,
@@ -49,8 +49,6 @@ use std::{
     pin::Pin,
     sync::Arc,
 };
-
-use crate::primitives::{Ref, RefCell, RefMut};
 
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
@@ -554,7 +552,7 @@ pub trait CursorTrait: Any {
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);
     fn has_rowid(&self) -> bool;
-    fn record_cursor_mut(&self) -> RefMut<'_, RecordCursor>;
+    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor>;
     fn get_pager(&self) -> Arc<Pager>;
     fn get_skip_advance(&self) -> bool;
     // --- end: BTreeCursor specific functions ----
@@ -4795,7 +4793,7 @@ impl BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn get_immutable_record_or_create(&self) -> RefMut<'_, Option<ImmutableRecord>> {
+    fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
         let mut reusable_immutable_record = self.reusable_immutable_record.borrow_mut();
         if reusable_immutable_record.is_none() {
             let page_size = self.pager.get_page_size_unchecked().get();
@@ -4805,7 +4803,7 @@ impl BTreeCursor {
         reusable_immutable_record
     }
 
-    fn get_immutable_record(&self) -> RefMut<'_, Option<ImmutableRecord>> {
+    fn get_immutable_record(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
         self.reusable_immutable_record.borrow_mut()
     }
 
@@ -5613,7 +5611,7 @@ impl CursorTrait for BTreeCursor {
             .invalidate();
         self.record_cursor.borrow_mut().invalidate();
     }
-    fn record_cursor_mut(&self) -> RefMut<'_, RecordCursor> {
+    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor> {
         self.record_cursor.borrow_mut()
     }
 
