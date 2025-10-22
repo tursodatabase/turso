@@ -1028,7 +1028,6 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-
 #[instrument(skip(program), level = Level::DEBUG)]
 fn trace_insn(program: &Program, addr: InsnReference, insn: &Insn) {
     tracing::trace!(
