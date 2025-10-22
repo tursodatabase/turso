@@ -26,6 +26,55 @@ use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 
+fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> {
+    if let ast::CreateTableBody::ColumnsAndConstraints {
+        options, columns, ..
+    } = &body
+    {
+        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
+        {
+            bail_parse_error!(
+                "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
+            );
+        }
+        for i in 0..columns.len() {
+            let col_i = &columns[i];
+            for constraint in &col_i.constraints {
+                // don't silently ignore CHECK constraints, throw parse error for now
+                match constraint.constraint {
+                    ast::ColumnConstraint::Check { .. } => {
+                        bail_parse_error!("CHECK constraints are not supported yet");
+                    }
+                    ast::ColumnConstraint::Generated { .. } => {
+                        bail_parse_error!("GENERATED columns are not supported yet");
+                    }
+                    ast::ColumnConstraint::NotNull {
+                        conflict_clause, ..
+                    }
+                    | ast::ColumnConstraint::PrimaryKey {
+                        conflict_clause, ..
+                    } if conflict_clause.is_some() => {
+                        bail_parse_error!(
+                            "ON CONFLICT clauses are not supported yet in column definitions"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for j in &columns[(i + 1)..] {
+                if col_i
+                    .col_name
+                    .as_str()
+                    .eq_ignore_ascii_case(j.col_name.as_str())
+                {
+                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -39,32 +88,8 @@ pub fn translate_create_table(
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
+    validate(&body, connection)?;
 
-    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
-        for i in 0..columns.len() {
-            let col_i = &columns[i];
-
-            for j in &columns[(i + 1)..] {
-                if col_i
-                    .col_name
-                    .as_str()
-                    .eq_ignore_ascii_case(j.col_name.as_str())
-                {
-                    bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
-                }
-            }
-        }
-    }
-
-    // Check for STRICT mode without experimental flag
-    if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
-        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
-        {
-            bail_parse_error!(
-                "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
-            );
-        }
-    }
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 30,
@@ -745,6 +770,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
         table_name: SQLITE_TABLEID.to_string(),
+        is_part_of_update: false,
     });
 
     program.resolve_label(next_label, program.offset());
@@ -945,6 +971,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: sqlite_schema_cursor_id_1,
             table_name: SQLITE_TABLEID.to_string(),
+            is_part_of_update: false,
         });
         program.emit_insn(Insn::Insert {
             cursor: sqlite_schema_cursor_id_1,
@@ -1005,6 +1032,7 @@ pub fn translate_drop_table(
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
             table_name: "sqlite_sequence".to_string(),
+            is_part_of_update: false,
         });
 
         program.resolve_label(continue_loop_label, program.offset());

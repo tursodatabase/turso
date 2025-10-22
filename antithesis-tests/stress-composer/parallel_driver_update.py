@@ -60,6 +60,10 @@ for i in range(updates):
         cur.execute(f"""
             UPDATE tbl_{selected_tbl} SET {set_clause} WHERE {where_clause}
         """)
+    except turso.ProgrammingError:
+        # Table/column might have been dropped in parallel - this is expected
+        con.rollback()
+        break
     except turso.OperationalError as e:
         if "UNIQUE constraint failed" in str(e):
             # Ignore UNIQUE constraint violations

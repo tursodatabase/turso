@@ -115,6 +115,10 @@ pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &st
     }
 }
 
+pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
+    ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1)
+}
+
 #[test]
 fn test_insert_read() {
     let db = MvccTestDb::new();
@@ -826,18 +830,26 @@ fn test_lazy_scan_cursor_basic() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
     )
     .unwrap();
 
     // Check first row
-    assert!(cursor.forward());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
     let row = cursor.current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 1);
 
     // Iterate through all rows
     let mut count = 1;
-    while cursor.forward() {
+    loop {
+        let res = cursor.next().unwrap();
+        let IOResult::Done(res) = res else {
+            panic!("unexpected next result {res:?}");
+        };
+        if !res {
+            break;
+        }
         count += 1;
         let row = cursor.current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
@@ -847,7 +859,7 @@ fn test_lazy_scan_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(!cursor.forward());
+    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(cursor.is_empty());
 }
 
@@ -861,11 +873,12 @@ fn test_lazy_scan_cursor_with_gaps() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
     )
     .unwrap();
 
     // Check first row
-    assert!(cursor.forward());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
     let row = cursor.current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 5);
@@ -874,12 +887,27 @@ fn test_lazy_scan_cursor_with_gaps() {
     let expected_ids = [5, 10, 15, 20, 30];
     let mut index = 0;
 
-    assert_eq!(cursor.current_row_id().unwrap().row_id, expected_ids[index]);
+    let IOResult::Done(rowid) = cursor.rowid().unwrap() else {
+        unreachable!();
+    };
+    let rowid = rowid.unwrap();
+    assert_eq!(rowid, expected_ids[index]);
 
-    while cursor.forward() {
+    loop {
+        let res = cursor.next().unwrap();
+        let IOResult::Done(res) = res else {
+            panic!("unexpected next result {res:?}");
+        };
+        if !res {
+            break;
+        }
         index += 1;
         if index < expected_ids.len() {
-            assert_eq!(cursor.current_row_id().unwrap().row_id, expected_ids[index]);
+            let IOResult::Done(rowid) = cursor.rowid().unwrap() else {
+                unreachable!();
+            };
+            let rowid = rowid.unwrap();
+            assert_eq!(rowid, expected_ids[index]);
         }
     }
 
@@ -897,10 +925,11 @@ fn test_cursor_basic() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
     )
     .unwrap();
 
-    cursor.forward();
+    let _ = cursor.next().unwrap();
 
     // Check first row
     assert!(!cursor.is_empty());
@@ -909,7 +938,14 @@ fn test_cursor_basic() {
 
     // Iterate through all rows
     let mut count = 1;
-    while cursor.forward() {
+    loop {
+        let res = cursor.next().unwrap();
+        let IOResult::Done(res) = res else {
+            panic!("unexpected next result {res:?}");
+        };
+        if !res {
+            break;
+        }
         count += 1;
         let row = cursor.current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
@@ -919,7 +955,7 @@ fn test_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(!cursor.forward());
+    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(cursor.is_empty());
 }
 
@@ -939,15 +975,17 @@ fn test_cursor_with_empty_table() {
     let table_id = -1; // Empty table
 
     // Test LazyScanCursor with empty table
-    let mut cursor = MvccLazyCursor::new(
+    let cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
     )
     .unwrap();
     assert!(cursor.is_empty());
-    assert!(cursor.current_row_id().is_none());
+    let rowid = cursor.rowid().unwrap();
+    assert!(matches!(rowid, IOResult::Done(None)));
 }
 
 #[test]
@@ -960,19 +998,22 @@ fn test_cursor_modification_during_scan() {
         tx_id,
         table_id,
         db.conn.pager.read().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
     )
     .unwrap();
 
     // Read first row
-    assert!(cursor.forward());
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     let first_row = cursor.current_row().unwrap().unwrap();
     assert_eq!(first_row.id.row_id, 1);
 
     // Insert a new row with ID between existing rows
     let new_row_id = RowID::new(table_id.into(), 3);
-    let new_row = generate_simple_string_row(table_id.into(), new_row_id.row_id, "new_row");
+    let new_row = generate_simple_string_record("new_row");
 
-    cursor.insert(new_row).unwrap();
+    let _ = cursor
+        .insert(&BTreeKey::TableRowId((new_row_id.row_id, Some(&new_row))))
+        .unwrap();
     let row = db.mvcc_store.read(tx_id, new_row_id).unwrap().unwrap();
     let mut record = ImmutableRecord::new(1024);
     record.start_serialization(&row.data);
@@ -986,7 +1027,7 @@ fn test_cursor_modification_during_scan() {
     assert_eq!(row.id.row_id, 3);
 
     // Continue scanning - the cursor should still work correctly
-    cursor.forward(); // Move to 4
+    let _ = cursor.next().unwrap(); // Move to 4
     let row = db
         .mvcc_store
         .read(tx_id, RowID::new(table_id.into(), 4))
@@ -994,14 +1035,14 @@ fn test_cursor_modification_during_scan() {
         .unwrap();
     assert_eq!(row.id.row_id, 4);
 
-    cursor.forward(); // Move to 5 (our new row)
+    let _ = cursor.next().unwrap(); // Move to 5 (our new row)
     let row = db
         .mvcc_store
         .read(tx_id, RowID::new(table_id.into(), 5))
         .unwrap()
         .unwrap();
     assert_eq!(row.id.row_id, 5);
-    assert!(!cursor.forward());
+    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(cursor.is_empty());
 }
 

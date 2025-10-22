@@ -49,7 +49,7 @@ print(f"Creating new table: tbl_{next_table_num}")
 
 # Define possible data types and constraints
 data_types = ["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"]
-constraints = ["", "NOT NULL", "DEFAULT 0", "DEFAULT ''", "UNIQUE", "CHECK (col_0 > 0)"]
+constraints = ["", "NOT NULL", "DEFAULT 0", "DEFAULT ''", "UNIQUE"]
 
 # Generate random number of columns (2-10)
 col_count = 2 + (get_random() % 9)

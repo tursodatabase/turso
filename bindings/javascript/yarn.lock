@@ -1586,7 +1586,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-common@npm:^0.3.0-pre.1, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.3.0-pre.3, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1595,7 +1595,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm-common@npm:^0.3.0-pre.1, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
+"@tursodatabase/database-wasm-common@npm:^0.3.0-pre.3, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm-common@workspace:packages/wasm-common"
   dependencies:
@@ -1609,8 +1609,8 @@ __metadata:
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.3.0-pre.1"
-    "@tursodatabase/database-wasm-common": "npm:^0.3.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.3.0-pre.3"
+    "@tursodatabase/database-wasm-common": "npm:^0.3.0-pre.3"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1624,7 +1624,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.3.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.3.0-pre.3"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -1634,11 +1634,11 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync-common@npm:^0.3.0-pre.1, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.3.0-pre.3, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.3.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.3.0-pre.3"
     typescript: "npm:^5.9.2"
   languageName: unknown
   linkType: soft
@@ -1648,9 +1648,9 @@ __metadata:
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.3.0-pre.1"
-    "@tursodatabase/database-wasm-common": "npm:^0.3.0-pre.1"
-    "@tursodatabase/sync-common": "npm:^0.3.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.3.0-pre.3"
+    "@tursodatabase/database-wasm-common": "npm:^0.3.0-pre.3"
+    "@tursodatabase/sync-common": "npm:^0.3.0-pre.3"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1664,8 +1664,8 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.3.0-pre.1"
-    "@tursodatabase/sync-common": "npm:^0.3.0-pre.1"
+    "@tursodatabase/database-common": "npm:^0.3.0-pre.3"
+    "@tursodatabase/sync-common": "npm:^0.3.0-pre.3"
     "@types/node": "npm:^24.3.1"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
@@ -2573,9 +2573,9 @@ __metadata:
   linkType: hard
 
 "exponential-backoff@npm:^3.1.1":
-  version: 3.1.2
-  resolution: "exponential-backoff@npm:3.1.2"
-  checksum: 10c0/d9d3e1eafa21b78464297df91f1776f7fbaa3d5e3f7f0995648ca5b89c069d17055033817348d9f4a43d1c20b0eab84f75af6991751e839df53e4dfd6f22e844
+  version: 3.1.3
+  resolution: "exponential-backoff@npm:3.1.3"
+  checksum: 10c0/77e3ae682b7b1f4972f563c6dbcd2b0d54ac679e62d5d32f3e5085feba20483cf28bd505543f520e287a56d4d55a28d7874299941faf637e779a1aa5994d1267
   languageName: node
   linkType: hard
 
@@ -3089,8 +3089,8 @@ __metadata:
   linkType: hard
 
 "node-gyp@npm:latest":
-  version: 11.4.2
-  resolution: "node-gyp@npm:11.4.2"
+  version: 11.5.0
+  resolution: "node-gyp@npm:11.5.0"
   dependencies:
     env-paths: "npm:^2.2.0"
     exponential-backoff: "npm:^3.1.1"
@@ -3104,7 +3104,7 @@ __metadata:
     which: "npm:^5.0.0"
   bin:
     node-gyp: bin/node-gyp.js
-  checksum: 10c0/0bfd3e96770ed70f07798d881dd37b4267708966d868a0e585986baac487d9cf5831285579fd629a83dc4e434f53e6416ce301097f2ee464cb74d377e4d8bdbe
+  checksum: 10c0/31ff49586991b38287bb15c3d529dd689cfc32f992eed9e6997b9d712d5d21fe818a8b1bbfe3b76a7e33765c20210c5713212f4aa329306a615b87d8a786da3a
   languageName: node
   linkType: hard
 

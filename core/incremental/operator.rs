@@ -218,7 +218,9 @@ pub enum QueryOperator {
 
 /// Operator DAG (Directed Acyclic Graph)
 /// Base trait for incremental operators
-pub trait IncrementalOperator: Debug {
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+pub trait IncrementalOperator: Debug + Send {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
@@ -391,12 +393,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create an aggregate operator for SUM(age) with no GROUP BY
@@ -511,12 +512,11 @@ mod tests {
         // Create an aggregate operator for SUM(score) GROUP BY team
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -662,12 +662,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create COUNT(*) GROUP BY category
@@ -743,12 +742,11 @@ mod tests {
         // Create SUM(amount) GROUP BY product
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -840,12 +838,11 @@ mod tests {
         // Test the example from DBSP_ROADMAP: COUNT(*) and SUM(amount) GROUP BY user_id
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -932,12 +929,11 @@ mod tests {
         // Test AVG aggregation
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1032,12 +1028,11 @@ mod tests {
         // Test that deletes (negative weights) properly update aggregates
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1119,12 +1114,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1209,12 +1203,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1293,12 +1286,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1362,12 +1354,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1448,12 +1439,11 @@ mod tests {
 
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
@@ -1507,12 +1497,11 @@ mod tests {
     fn test_filter_eval_with_uncommitted() {
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut filter = FilterOperator::new(FilterPredicate::GreaterThan {
@@ -1598,12 +1587,11 @@ mod tests {
         // This is the critical test - aggregations must not modify internal state during eval
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1768,12 +1756,11 @@ mod tests {
         // doesn't pollute the internal state
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1850,12 +1837,11 @@ mod tests {
         // Test eval with both committed delta and uncommitted changes
         // Create a persistent pager for the test
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         // Create index cursor with proper index definition for DBSP state table
         let index_def = create_dbsp_state_index(index_root_page_id);
         // Index has 4 columns: operator_id, zset_id, element_id, rowid
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -1966,10 +1952,9 @@ mod tests {
     fn test_min_max_basic() {
         // Test basic MIN/MAX functionality
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2034,10 +2019,9 @@ mod tests {
     fn test_min_max_deletion_updates_min() {
         // Test that deleting the MIN value updates to the next lowest
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2124,10 +2108,9 @@ mod tests {
     fn test_min_max_deletion_updates_max() {
         // Test that deleting the MAX value updates to the next highest
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2214,10 +2197,9 @@ mod tests {
     fn test_min_max_insertion_updates_min() {
         // Test that inserting a new MIN value updates the aggregate
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2296,10 +2278,9 @@ mod tests {
     fn test_min_max_insertion_updates_max() {
         // Test that inserting a new MAX value updates the aggregate
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2378,10 +2359,9 @@ mod tests {
     fn test_min_max_update_changes_min() {
         // Test that updating a row to become the new MIN updates the aggregate
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2468,10 +2448,9 @@ mod tests {
     fn test_min_max_with_group_by() {
         // Test MIN/MAX with GROUP BY
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2570,10 +2549,9 @@ mod tests {
     fn test_min_max_with_nulls() {
         // Test that NULL values are ignored in MIN/MAX
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2646,10 +2624,9 @@ mod tests {
     fn test_min_max_integer_values() {
         // Test MIN/MAX with integer values instead of floats
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2714,10 +2691,9 @@ mod tests {
     fn test_min_max_text_values() {
         // Test MIN/MAX with text values (alphabetical ordering)
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2753,10 +2729,9 @@ mod tests {
     #[test]
     fn test_min_max_with_other_aggregates() {
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2845,10 +2820,9 @@ mod tests {
     #[test]
     fn test_min_max_multiple_columns() {
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut agg = AggregateOperator::new(
@@ -2924,10 +2898,9 @@ mod tests {
     fn test_join_operator_inner() {
         // Test INNER JOIN with incremental updates
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
         let mut join = JoinOperator::new(
             1, // operator_id
@@ -3021,10 +2994,9 @@ mod tests {
     fn test_join_operator_with_deletions() {
         // Test INNER JOIN with deletions (negative weights)
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut join = JoinOperator::new(
@@ -3112,10 +3084,9 @@ mod tests {
     fn test_join_operator_one_to_many() {
         // Test one-to-many relationship: one customer with multiple orders
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut join = JoinOperator::new(
@@ -3249,10 +3220,9 @@ mod tests {
     fn test_join_operator_many_to_many() {
         // Test many-to-many: multiple rows with same key on both sides
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut join = JoinOperator::new(
@@ -3366,10 +3336,9 @@ mod tests {
     fn test_join_operator_update_in_one_to_many() {
         // Test updates in one-to-many scenarios
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut join = JoinOperator::new(
@@ -3489,10 +3458,9 @@ mod tests {
     fn test_join_operator_weight_accumulation_complex() {
         // Test complex weight accumulation with multiple identical rows
         let (pager, table_page_id, index_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_page_id, 10);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_page_id, 10);
         let index_def = create_dbsp_state_index(index_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_page_id, &index_def, 10);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_page_id, &index_def, 10);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut join = JoinOperator::new(
@@ -3625,9 +3593,9 @@ mod tests {
         let mut state = EvalState::Init { deltas: delta_pair };
 
         let (pager, table_root, index_root) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root, 5);
         let index_def = create_dbsp_state_index(index_root);
-        let index_cursor = BTreeCursor::new_index(None, pager.clone(), index_root, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let result = pager
@@ -3685,10 +3653,10 @@ mod tests {
     #[test]
     fn test_merge_operator_basic() {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
         let index_cursor =
-            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut merge_op = MergeOperator::new(
@@ -3746,10 +3714,10 @@ mod tests {
     #[test]
     fn test_merge_operator_stateful_distinct() {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
         let index_cursor =
-            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that UNION (distinct) properly deduplicates across multiple operations
@@ -3820,10 +3788,10 @@ mod tests {
     #[test]
     fn test_merge_operator_single_sided_inputs_union_all() {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
         let index_cursor =
-            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test UNION ALL with inputs coming from only one side at a time
@@ -3940,10 +3908,10 @@ mod tests {
     #[test]
     fn test_merge_operator_both_sides_empty() {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, _pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
         let index_cursor =
-            BTreeCursor::new_index(None, _pager.clone(), index_root_page_id, &index_def, 4);
+            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that both sides being empty works correctly
@@ -4020,10 +3988,9 @@ mod tests {
         // Test that aggregate state serialization correctly preserves column indices
         // when multiple aggregates operate on different columns
         let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
-        let table_cursor = BTreeCursor::new_table(None, pager.clone(), table_root_page_id, 5);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(None, pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Create first operator with SUM(col1), MIN(col3) GROUP BY col0

@@ -23,18 +23,7 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
                     t.pop();
                     Value::build_text(t)
                 } else {
-                    let mut t = t.chars().map(|c| c as u32).collect::<Vec<_>>();
-                    let index = rng.random_range(0..t.len());
-                    t[index] -= 1;
-                    // Mutate the rest of the string
-                    for val in t.iter_mut().skip(index + 1) {
-                        *val = rng.random_range('a' as u32..='z' as u32);
-                    }
-                    let t = t
-                        .into_iter()
-                        .map(|c| char::from_u32(c).unwrap_or('z'))
-                        .collect::<String>();
-                    Value::build_text(t)
+                    Value::build_text(mutate_string(&t, rng, MutationType::Decrement))
                 }
             }
             Value::Blob(b) => {
@@ -75,21 +64,14 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
                 if rng.random_bool(0.01) {
-                    t.push(rng.random_range(0..=255) as u8 as char);
+                    if rng.random_bool(0.5) {
+                        t.push(rng.random_range(UPPERCASE_A..=UPPERCASE_Z) as u8 as char);
+                    } else {
+                        t.push(rng.random_range(LOWERCASE_A..=LOWERCASE_Z) as u8 as char);
+                    }
                     Value::build_text(t)
                 } else {
-                    let mut t = t.chars().map(|c| c as u32).collect::<Vec<_>>();
-                    let index = rng.random_range(0..t.len());
-                    t[index] += 1;
-                    // Mutate the rest of the string
-                    for val in t.iter_mut().skip(index + 1) {
-                        *val = rng.random_range('a' as u32..='z' as u32);
-                    }
-                    let t = t
-                        .into_iter()
-                        .map(|c| char::from_u32(c).unwrap_or('a'))
-                        .collect::<String>();
-                    Value::build_text(t)
+                    Value::build_text(mutate_string(&t, rng, MutationType::Increment))
                 }
             }
             Value::Blob(b) => {
@@ -114,5 +96,88 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
             }
         };
         Self(SimValue(new_value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MutationType {
+    Decrement,
+    Increment,
+}
+
+const UPPERCASE_A: u32 = 'A' as u32;
+const UPPERCASE_Z: u32 = 'Z' as u32;
+const LOWERCASE_A: u32 = 'a' as u32;
+const LOWERCASE_Z: u32 = 'z' as u32;
+
+fn mutate_string<R: rand::Rng + ?Sized>(
+    t: &str,
+    rng: &mut R,
+    mutation_type: MutationType,
+) -> String {
+    let mut chars = t.chars().map(|c| c as u32).collect::<Vec<_>>();
+    let mut index;
+    let mut max_loops = 100;
+    loop {
+        index = rng.random_range(0..chars.len());
+        if chars[index] > UPPERCASE_A && chars[index] < UPPERCASE_Z
+            || chars[index] > LOWERCASE_A && chars[index] < LOWERCASE_Z
+        {
+            break;
+        }
+        max_loops -= 1;
+        if max_loops == 0 {
+            panic!("Failed to find a printable character to decrement");
+        }
+    }
+
+    if mutation_type == MutationType::Decrement {
+        chars[index] -= 1;
+    } else {
+        chars[index] += 1;
+    }
+
+    // Mutate the rest of the string with printable ASCII characters
+    for val in chars.iter_mut().skip(index + 1) {
+        if rng.random_bool(0.5) {
+            *val = rng.random_range(UPPERCASE_A..=UPPERCASE_Z);
+        } else {
+            *val = rng.random_range(LOWERCASE_A..=LOWERCASE_Z);
+        }
+    }
+
+    chars
+        .into_iter()
+        .map(|c| char::from_u32(c).unwrap())
+        .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use anarchist_readable_name_generator_lib::readable_name;
+
+    use super::*;
+
+    #[test]
+    fn test_mutate_string_fuzz() {
+        let mut rng = rand::rng();
+        for _ in 0..1000 {
+            let mut t = readable_name();
+            while !t.is_ascii() {
+                t = readable_name();
+            }
+            let t2 = mutate_string(&t, &mut rng, MutationType::Decrement);
+            assert!(t2.is_ascii(), "{}", t);
+            assert!(t2 < t);
+        }
+        for _ in 0..1000 {
+            let mut t = readable_name();
+            while !t.is_ascii() {
+                t = readable_name();
+            }
+            let t2 = mutate_string(&t, &mut rng, MutationType::Increment);
+            assert!(t2.is_ascii(), "{}", t);
+            assert!(t2 > t);
+        }
     }
 }

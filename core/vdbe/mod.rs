@@ -69,6 +69,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
+    task::Waker,
 };
 use tracing::{instrument, Level};
 
@@ -271,6 +272,11 @@ pub struct Row {
     count: usize,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Row {}
+unsafe impl Sync for Row {}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
     None,
@@ -322,6 +328,11 @@ pub struct ProgramState {
     pub(crate) auto_txn_cleanup: TxnCleanup,
     fk_scope_counter: isize,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for ProgramState {}
+unsafe impl Sync for ProgramState {}
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
@@ -540,9 +551,10 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         match query_mode {
-            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
         }
@@ -655,6 +667,7 @@ impl Program {
         state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
@@ -672,6 +685,7 @@ impl Program {
             }
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
+                    io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
@@ -704,6 +718,7 @@ impl Program {
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
+                    io.set_waker(waker);
                     state.io_completions = Some(io);
                     return Ok(StepResult::IO);
                 }
@@ -997,6 +1012,7 @@ impl Program {
                             }
                         } else {
                             pager.rollback_tx(&self.connection);
+                            self.connection.auto_commit.store(true, Ordering::SeqCst);
                         }
                         self.connection.set_tx_state(TransactionState::None);
                     }

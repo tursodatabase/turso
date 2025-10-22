@@ -12,7 +12,7 @@ use crate::incremental::operator::{
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
 use crate::schema::Type;
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
@@ -329,6 +329,11 @@ pub struct DbspNode {
     pub executable: Box<dyn IncrementalOperator>,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspNode {}
+unsafe impl Sync for DbspNode {}
+
 impl std::fmt::Debug for DbspNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbspNode")
@@ -394,6 +399,11 @@ pub struct DbspCircuit {
     /// Root page for the DBSP state table's primary key index
     pub(super) internal_state_index_root: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspCircuit {}
+unsafe impl Sync for DbspCircuit {}
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
@@ -480,15 +490,10 @@ impl DbspCircuit {
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
-            let table_cursor = BTreeCursor::new_table(
-                None,
-                pager.clone(),
-                self.internal_state_root,
-                OPERATOR_COLUMNS,
-            );
+            let table_cursor =
+                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
             let index_def = create_dbsp_state_index(self.internal_state_index_root);
             let index_cursor = BTreeCursor::new_index(
-                None,
                 pager.clone(),
                 self.internal_state_index_root,
                 &index_def,
@@ -537,14 +542,12 @@ impl DbspCircuit {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
                     let state_table_cursor = BTreeCursor::new_table(
-                        None,
                         pager.clone(),
                         self.internal_state_root,
                         OPERATOR_COLUMNS,
                     );
                     let index_def = create_dbsp_state_index(self.internal_state_index_root);
                     let state_index_cursor = BTreeCursor::new_index(
-                        None,
                         pager.clone(),
                         self.internal_state_index_root,
                         &index_def,
@@ -575,7 +578,6 @@ impl DbspCircuit {
 
                     // Create view cursor when entering UpdateView state
                     let view_cursor = Box::new(BTreeCursor::new_table(
-                        None,
                         pager.clone(),
                         main_data_root,
                         num_columns,
@@ -605,7 +607,6 @@ impl DbspCircuit {
                         // due to btree cursor state machine limitations
                         if matches!(write_row_state, WriteRowView::GetRecord) {
                             *view_cursor = Box::new(BTreeCursor::new_table(
-                                None,
                                 pager.clone(),
                                 main_data_root,
                                 num_columns,
@@ -633,7 +634,6 @@ impl DbspCircuit {
                         let view_cursor = std::mem::replace(
                             view_cursor,
                             Box::new(BTreeCursor::new_table(
-                                None,
                                 pager.clone(),
                                 main_data_root,
                                 num_columns,
@@ -729,14 +729,12 @@ impl DbspCircuit {
 
                         // Create temporary cursors for the recursive call
                         let temp_table_cursor = BTreeCursor::new_table(
-                            None,
                             pager.clone(),
                             self.internal_state_root,
                             OPERATOR_COLUMNS,
                         );
                         let index_def = create_dbsp_state_index(self.internal_state_index_root);
                         let temp_index_cursor = BTreeCursor::new_index(
-                            None,
                             pager.clone(),
                             self.internal_state_index_root,
                             &index_def,
@@ -2764,8 +2762,7 @@ mod tests {
         let num_columns = circuit.output_schema.columns.len() + 1;
 
         // Create a cursor to read the btree
-        let mut btree_cursor =
-            BTreeCursor::new_table(None, pager.clone(), main_data_root, num_columns);
+        let mut btree_cursor = BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
 
         // Rewind to the beginning
         pager.io.block(|| btree_cursor.rewind())?;

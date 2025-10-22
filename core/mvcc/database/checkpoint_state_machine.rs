@@ -4,7 +4,7 @@ use crate::mvcc::database::{
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
@@ -390,7 +390,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 cursor.clone()
                             } else {
                                 let cursor = BTreeCursor::new_table(
-                                    None,
                                     self.pager.clone(),
                                     known_root_page as i64,
                                     num_columns,
@@ -465,12 +464,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
                     cursor.clone()
                 } else {
-                    let cursor = BTreeCursor::new_table(
-                        None, // Write directly to B-tree
-                        self.pager.clone(),
-                        root_page as i64,
-                        num_columns,
-                    );
+                    let cursor =
+                        BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor

@@ -979,14 +979,14 @@ mod tests {
     }
 
     fn generate_random_hex_key() -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = [0u8; 32];
         rng.fill(&mut bytes);
         hex::encode(bytes)
     }
 
     fn generate_random_hex_key_128() -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut bytes = [0u8; 16];
         rng.fill(&mut bytes);
         hex::encode(bytes)
@@ -995,7 +995,7 @@ mod tests {
     fn create_test_page_1() -> Vec<u8> {
         let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
         page[..SQLITE_HEADER.len()].copy_from_slice(SQLITE_HEADER);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // 48 is the max reserved bytes we might need for metadata with any cipher
         rng.fill(&mut page[SQLITE_HEADER.len()..DEFAULT_ENCRYPTED_PAGE_SIZE - 48]);
         page
@@ -1135,7 +1135,7 @@ mod tests {
 
     #[test]
     fn test_aes128gcm_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aes128Gcm;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1144,7 +1144,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_aes_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aes256Gcm;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1174,7 +1174,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_aegis256_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis256;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1220,7 +1220,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1256,7 +1256,7 @@ mod tests {
 
     #[test]
     fn test_aegis128x2_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis128X2;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1265,7 +1265,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1301,7 +1301,7 @@ mod tests {
 
     #[test]
     fn test_aegis128l_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis128L;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1310,7 +1310,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[test]
     fn test_aegis128x4_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis128X4;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1355,7 +1355,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_aegis256x2_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis256X2;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1400,7 +1400,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 
@@ -1436,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_aegis256x4_encrypt_decrypt_round_trip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let cipher_mode = CipherMode::Aegis256X4;
         let metadata_size = cipher_mode.metadata_size();
         let data_size = DEFAULT_ENCRYPTED_PAGE_SIZE - metadata_size;
@@ -1445,7 +1445,7 @@ mod tests {
             let mut page = vec![0u8; DEFAULT_ENCRYPTED_PAGE_SIZE];
             page.iter_mut()
                 .take(data_size)
-                .for_each(|byte| *byte = rng.gen());
+                .for_each(|byte| *byte = rng.random());
             page
         };
 

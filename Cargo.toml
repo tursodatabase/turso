@@ -39,29 +39,29 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.0-pre.1"
+version = "0.3.0-pre.3"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.3.0-pre.1" }
-turso_node = { path = "bindings/javascript", version = "0.3.0-pre.1" }
-limbo_completion = { path = "extensions/completion", version = "0.3.0-pre.1" }
-turso_core = { path = "core", version = "0.3.0-pre.1" }
-turso_sync_engine = { path = "sync/engine", version = "0.3.0-pre.1" }
-limbo_crypto = { path = "extensions/crypto", version = "0.3.0-pre.1" }
-limbo_csv = { path = "extensions/csv", version = "0.3.0-pre.1" }
-turso_ext = { path = "extensions/core", version = "0.3.0-pre.1" }
-turso_ext_tests = { path = "extensions/tests", version = "0.3.0-pre.1" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.3.0-pre.1" }
-turso_macros = { path = "macros", version = "0.3.0-pre.1" }
-limbo_percentile = { path = "extensions/percentile", version = "0.3.0-pre.1" }
-limbo_regexp = { path = "extensions/regexp", version = "0.3.0-pre.1" }
-limbo_uuid = { path = "extensions/uuid", version = "0.3.0-pre.1" }
-turso_parser = { path = "parser", version = "0.3.0-pre.1" }
-limbo_fuzzy = { path = "extensions/fuzzy", version = "0.3.0-pre.1" }
+turso = { path = "bindings/rust", version = "0.3.0-pre.3" }
+turso_node = { path = "bindings/javascript", version = "0.3.0-pre.3" }
+limbo_completion = { path = "extensions/completion", version = "0.3.0-pre.3" }
+turso_core = { path = "core", version = "0.3.0-pre.3" }
+turso_sync_engine = { path = "sync/engine", version = "0.3.0-pre.3" }
+limbo_crypto = { path = "extensions/crypto", version = "0.3.0-pre.3" }
+limbo_csv = { path = "extensions/csv", version = "0.3.0-pre.3" }
+turso_ext = { path = "extensions/core", version = "0.3.0-pre.3" }
+turso_ext_tests = { path = "extensions/tests", version = "0.3.0-pre.3" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.3.0-pre.3" }
+turso_macros = { path = "macros", version = "0.3.0-pre.3" }
+limbo_percentile = { path = "extensions/percentile", version = "0.3.0-pre.3" }
+limbo_regexp = { path = "extensions/regexp", version = "0.3.0-pre.3" }
+limbo_uuid = { path = "extensions/uuid", version = "0.3.0-pre.3" }
+turso_parser = { path = "parser", version = "0.3.0-pre.3" }
+limbo_fuzzy = { path = "extensions/fuzzy", version = "0.3.0-pre.3" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
@@ -90,7 +90,7 @@ fallible-iterator = "0.3.0"
 criterion = "0.5"
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
-antithesis_sdk = "0.2"
+antithesis_sdk = { version = "0.2", default-features = false }
 cfg-if = "1.0.0"
 tracing-appender = "0.2.3"
 env_logger = { version = "0.11.6", default-features = false }
@@ -99,6 +99,7 @@ regex-syntax = { version = "0.8.5", default-features = false }
 similar = { version = "2.7.0" }
 similar-asserts = { version = "1.7.0" }
 bitmaps = { version = "3.2.1", default-features = false }
+console-subscriber = { version = "0.4.1" }
 
 [profile.dev.package.similar]
 opt-level = 3

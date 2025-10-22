@@ -396,3 +396,105 @@ do_execsql_test_on_specific_db {:memory:} update-alias-visibility-in-where-claus
     select * from t;
 } {1
 5}
+
+# Basic UPDATE tests with indexes
+do_execsql_test_on_specific_db {:memory:} update-non-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET b = 100 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+} {1|10
+2|100
+3|30}
+
+do_execsql_test_on_specific_db {:memory:} update-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET a = 5 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+} {1|10
+3|30
+5|20}
+
+do_execsql_test_on_specific_db {:memory:} update-both-indexed-and-non-indexed {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+    UPDATE t SET a = 5, b = 50, c = 500 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+} {1|10|100
+3|30|300
+5|50|500}
+
+do_execsql_test_on_specific_db {:memory:} update-multiple-indexes {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+    UPDATE t SET a = 5, b = 50 WHERE c = 200;
+    SELECT * FROM t ORDER BY a;
+} {1|10|100
+3|30|300
+5|50|200}
+
+do_execsql_test_on_specific_db {:memory:} update-all-rows-with-index {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE t SET a = a + 10;
+    SELECT * FROM t ORDER BY a;
+} {11|10
+12|20
+13|30}
+
+# Range update tests
+do_execsql_test_on_specific_db {:memory:} update-range-non-indexed {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    UPDATE t SET b = 999 WHERE a >= 2 AND a <= 4;
+    SELECT * FROM t ORDER BY a;
+} {1|10
+2|999
+3|999
+4|999
+5|50}
+
+do_execsql_test_on_specific_db {:memory:} update-range-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    UPDATE t SET a = a + 100 WHERE a >= 2 AND a < 4;
+    SELECT * FROM t ORDER BY a;
+} {1|10
+4|40
+5|50
+102|20
+103|30}
+
+do_execsql_test_on_specific_db {:memory:} update-range-both-columns {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400), (5, 50, 500);
+    UPDATE t SET a = a * 10, b = b * 2 WHERE a > 1 AND a < 5;
+    SELECT * FROM t ORDER BY a;
+} {1|10|100
+5|50|500
+20|40|200
+30|60|300
+40|80|400}
+
+do_execsql_test_on_specific_db {:memory:} update-range-multiple-indexes {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400);
+    UPDATE t SET a = a + 10, b = b + 100 WHERE a BETWEEN 2 AND 3;
+    SELECT * FROM t ORDER BY a;
+} {1|10|100
+4|40|400
+12|120|200
+13|130|300}
+

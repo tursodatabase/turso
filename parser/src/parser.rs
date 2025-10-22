@@ -3120,9 +3120,17 @@ impl<'a> Parser<'a> {
             TK_NULL | TK_BLOB | TK_STRING | TK_FLOAT | TK_INTEGER | TK_CTIME_KW => {
                 Ok(ColumnConstraint::Default(self.parse_term()?))
             }
-            _ => Ok(ColumnConstraint::Default(Box::new(Expr::Id(
-                self.parse_nm()?,
-            )))),
+            _ => {
+                let name = self.parse_nm()?;
+                let expr = if name.as_str().eq_ignore_ascii_case("true") {
+                    Expr::Literal(Literal::Numeric("1".into()))
+                } else if name.as_str().eq_ignore_ascii_case("false") {
+                    Expr::Literal(Literal::Numeric("0".into()))
+                } else {
+                    Expr::Id(name)
+                };
+                Ok(ColumnConstraint::Default(Box::new(expr)))
+            }
         }
     }
 

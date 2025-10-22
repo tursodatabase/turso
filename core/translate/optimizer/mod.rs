@@ -16,15 +16,19 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
-    schema::{Index, IndexColumn, Schema, Table},
+    schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
     translate::{
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
-        plan::{Scan, SeekKeyComponent},
+        plan::{
+            ColumnUsedMask, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent,
+        },
     },
     types::SeekOp,
+    vdbe::builder::{CursorKey, CursorType, ProgramBuilder},
     LimboError, Result,
 };
 
@@ -44,11 +48,11 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub fn optimize_plan(plan: &mut Plan, schema: &Schema) -> Result<()> {
+pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, schema)?,
         Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(plan, schema)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, schema)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
@@ -115,7 +119,11 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     Ok(())
 }
 
-fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
+fn optimize_update_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut UpdatePlan,
+    schema: &Schema,
+) -> Result<()> {
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -132,28 +140,170 @@ fn optimize_update_plan(plan: &mut UpdatePlan, schema: &Schema) -> Result<()> {
         &mut None,
     )?;
 
-    // It is not safe to use an index that is going to be updated as the iteration index for a table.
-    // In these cases, we will fall back to a table scan.
-    // FIXME: this should probably be incorporated into the optimizer itself, but it's a smaller fix this way.
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
 
-    // No index, OK.
-    let Some(index) = table_ref.op.index() else {
-        return Ok(());
+    // An ephemeral table is required if the UPDATE modifies any column that is present in the key of the
+    // btree used to iterate over the table.
+    // For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
+    // For index scans and seeks, this is any column in the index used.
+    let requires_ephemeral_table = 'requires: {
+        let Some(btree_table) = table_ref.table.btree() else {
+            break 'requires false;
+        };
+        let Some(index) = table_ref.op.index() else {
+            let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias)
+            });
+            if rowid_alias_used {
+                break 'requires true;
+            }
+            let direct_rowid_update = plan
+                .set_clauses
+                .iter()
+                .any(|(idx, _)| *idx == ROWID_SENTINEL);
+            if direct_rowid_update {
+                break 'requires true;
+            }
+            break 'requires false;
+        };
+
+        plan.set_clauses
+            .iter()
+            .any(|(idx, _)| index.columns.iter().any(|c| c.pos_in_table == *idx))
     };
-    // Iteration index not affected by update, OK.
-    if !plan.indexes_to_update.iter().any(|i| Arc::ptr_eq(index, i)) {
+
+    if !requires_ephemeral_table {
         return Ok(());
     }
-    // Otherwise, fall back to a table scan.
-    table_ref.op = Operation::Scan(Scan::BTreeTable {
-        iter_dir: IterationDirection::Forwards,
-        index: None,
+
+    add_ephemeral_table_to_update_plan(program, plan)
+}
+
+/// An ephemeral table is required if the UPDATE modifies any column that is present in the key of the
+/// btree used to iterate over the table.
+/// For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
+/// For index scans and seeks, the key is any column in the index used.
+///
+/// The ephemeral table will accumulate all the rowids of the rows that are affected by the UPDATE,
+/// and then the temp table will be iterated over and the actual row updates performed.
+///
+/// This is necessary because an UPDATE is implemented as a DELETE-then-INSERT operation, which could
+/// mess up the iteration order of the rows by changing the keys in the table/index that the iteration
+/// is performed over. The ephemeral table ensures stable iteration because it is not modified during
+/// the UPDATE loop.
+fn add_ephemeral_table_to_update_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut UpdatePlan,
+) -> Result<()> {
+    let internal_id = program.table_reference_counter.next();
+    let ephemeral_table = Arc::new(BTreeTable {
+        root_page: 0, // Not relevant for ephemeral table definition
+        name: "ephemeral_scratch".to_string(),
+        has_rowid: true,
+        has_autoincrement: false,
+        primary_key_columns: vec![],
+        columns: vec![Column {
+            name: Some("rowid".to_string()),
+            ty: Type::Integer,
+            ty_str: "INTEGER".to_string(),
+            primary_key: true,
+            is_rowid_alias: false,
+            notnull: true,
+            default: None,
+            unique: false,
+            collation: None,
+            hidden: false,
+        }],
+        is_strict: false,
+        unique_sets: vec![],
+        foreign_keys: vec![],
     });
-    // Revert the decision to use a WHERE clause term as an index constraint.
-    plan.where_clause
-        .iter_mut()
-        .for_each(|term| term.consumed = false);
+
+    let temp_cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::table(internal_id),
+        CursorType::BTreeTable(ephemeral_table.clone()),
+    );
+
+    // The actual update loop will use the ephemeral table as the single [JoinedTable] which it then loops over.
+    let table_references_update = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(ephemeral_table.clone()),
+            identifier: "ephemeral_scratch".to_string(),
+            internal_id,
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+
+    // Building the ephemeral table will use the TableReferences from the original plan -- i.e. if we chose an index scan originally,
+    // we will build the ephemeral table by using the same index scan and using the same WHERE filters.
+    let table_references_ephemeral_select =
+        std::mem::replace(&mut plan.table_references, table_references_update);
+
+    for table in table_references_ephemeral_select.joined_tables() {
+        // The update loop needs to reference columns from the original source table, so we add it as an outer query reference.
+        plan.table_references
+            .add_outer_query_reference(OuterQueryReference {
+                identifier: table.identifier.clone(),
+                internal_id: table.internal_id,
+                table: table.table.clone(),
+                col_used_mask: table.col_used_mask.clone(),
+            });
+    }
+
+    let join_order = table_references_ephemeral_select
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: t
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        })
+        .collect();
+    let rowid_internal_id = table_references_ephemeral_select
+        .joined_tables()
+        .first()
+        .unwrap()
+        .internal_id;
+
+    let ephemeral_plan = SelectPlan {
+        table_references: table_references_ephemeral_select,
+        result_columns: vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: rowid_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }],
+        where_clause: plan.where_clause.drain(..).collect(),
+        group_by: None,     // N/A
+        order_by: vec![],   // N/A
+        aggregates: vec![], // N/A
+        limit: None,        // N/A
+        query_destination: QueryDestination::EphemeralTable {
+            cursor_id: temp_cursor_id,
+            table: ephemeral_table,
+        },
+        join_order,
+        offset: None,
+        contains_constant_false_condition: false,
+        distinctness: super::plan::Distinctness::NonDistinct,
+        values: vec![],
+        window: None,
+    };
+
+    plan.ephemeral_plan = Some(ephemeral_plan);
 
     Ok(())
 }

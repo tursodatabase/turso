@@ -455,6 +455,7 @@ pub fn order_by_sorter_insert(
         program.emit_insn(Insn::Delete {
             cursor_id: *sort_cursor,
             table_name: "".to_string(),
+            is_part_of_update: false,
         });
 
         program.preassign_label_to_next_insn(insert_label.unwrap());

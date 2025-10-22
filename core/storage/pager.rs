@@ -10,11 +10,11 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
 use crate::{
-    return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
-    Result, TransactionState,
+    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
+    IOResult, LimboError, Result, TransactionState,
 };
+use crate::{io_yield_one, IOContext};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -547,6 +547,11 @@ pub struct Pager {
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Pager {}
+unsafe impl Sync for Pager {}
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -1627,20 +1632,21 @@ impl Pager {
                 CommitState::Checkpoint => {
                     match self.checkpoint()? {
                         IOResult::IO(cmp) => {
-                            let completions = {
+                            let completion = {
                                 let mut commit_info = self.commit_info.write();
                                 match cmp {
                                     IOCompletions::Single(c) => {
                                         commit_info.completions.push(c);
                                     }
-                                    IOCompletions::Many(c) => {
-                                        commit_info.completions.extend(c);
-                                    }
                                 }
-                                std::mem::take(&mut commit_info.completions)
+                                let mut group = CompletionGroup::new(|_| {});
+                                for c in commit_info.completions.drain(..) {
+                                    group.add(&c);
+                                }
+                                group.build()
                             };
                             // TODO: remove serialization of checkpoint path
-                            io_yield_many!(completions);
+                            io_yield_one!(completion);
                         }
                         IOResult::Done(res) => {
                             let mut commit_info = self.commit_info.write();
@@ -1679,21 +1685,25 @@ impl Pager {
                             .unwrap()
                             .as_millis()
                     );
-                    let (should_finish, result, completions) = {
+                    let (should_finish, result, completion) = {
                         let mut commit_info = self.commit_info.write();
                         if commit_info.completions.iter().all(|c| c.succeeded()) {
                             commit_info.completions.clear();
                             commit_info.state = CommitState::PrepareWal;
-                            (true, commit_info.result.take(), Vec::new())
+                            (true, commit_info.result.take(), Completion::new_yield())
                         } else {
-                            (false, None, std::mem::take(&mut commit_info.completions))
+                            let mut group = CompletionGroup::new(|_| {});
+                            for c in commit_info.completions.drain(..) {
+                                group.add(&c);
+                            }
+                            (false, None, group.build())
                         }
                     };
                     if should_finish {
                         wal.borrow_mut().finish_append_frames_commit()?;
                         return Ok(IOResult::Done(result.expect("commit result should be set")));
                     }
-                    io_yield_many!(completions);
+                    io_yield_one!(completion);
                 }
             }
         }

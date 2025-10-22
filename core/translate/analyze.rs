@@ -97,6 +97,7 @@ pub fn translate_analyze(
         program.emit_insn(Insn::Delete {
             cursor_id,
             table_name: "sqlite_stat1".to_string(),
+            is_part_of_update: false,
         });
         program.emit_insn(Insn::Next {
             cursor_id,

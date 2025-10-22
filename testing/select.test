@@ -951,6 +951,63 @@ foreach {testname limit ans} {
     "SELECT id FROM users ORDER BY id LIMIT $limit" $ans
 }
 
+do_execsql_test_on_specific_db {:memory:}  limit-expr-can-be-cast-losslessly-1 {
+  SELECT 1 LIMIT 1.1 + 2.9;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:}  limit-expr-can-be-cast-losslessly-2 {
+  CREATE TABLE T(a);
+  INSERT INTO T VALUES (1),(1),(1),(1);
+  SELECT * FROM T LIMIT 1.6/2 + 3.6/3 + 4*0.25;
+} {1
+1
+1}
+
+# Numeric strings are cast to float. The final evaluation of the expression returns an int losslessly
+do_execsql_test_on_specific_db {:memory:}  limit-expr-can-be-cast-losslessly-3 {
+  CREATE TABLE T(a);
+  INSERT INTO T VALUES (1),(1),(1),(1);
+  SELECT * FROM T LIMIT '0.8' + '1.2' + 4*0.25;
+} {1
+1
+1}
+
+# Invalid strings are cast to 0. So expression is valid
+do_execsql_test_on_specific_db {:memory:} limit-expr-int-and-string {
+  SELECT 1 LIMIT 3/3 + 'test' + 4*'test are best';
+} {1}
+
+do_execsql_test_in_memory_error_content  limit-expr-cannot-be-cast-losslessly-1 {
+  SELECT 1 LIMIT 1.1;
+} {"datatype mismatch"}
+
+do_execsql_test_in_memory_error_content  limit-expr-cannot-be-cast-losslessly-2 {
+  SELECT 1 LIMIT 1.1 + 2.2 + 1.9/8;
+} {"datatype mismatch"}
+
+# Return error as float in the expression cannot be cast losslessly
+do_execsql_test_in_memory_error_content limit-expr-cannot-be-cast-losslessly-3 {
+  SELECT 1 LIMIT 1.1 +'a';
+} {"datatype mismatch"}
+
+do_execsql_test_in_memory_error_content limit-expr-invalid-data-type-1 {
+  SELECT 1 LIMIT 'a';
+} {"datatype mismatch"}
+
+do_execsql_test_in_memory_error_content limit-expr-invalid-data-type-2 {
+  SELECT 1 LIMIT NULL;
+} {"datatype mismatch"}
+
+# The expression below evaluates to NULL as string is cast to 0
+do_execsql_test_in_memory_error_content limit-expr-invalid-data-type-3 {
+  SELECT 1 LIMIT 1/'iwillbezero ;-; ' ;
+} {"datatype mismatch"}
+
+# Expression is evaluated as NULL
+do_execsql_test_in_memory_error_content limit-expr-invalid-data-type-4 { 
+  SELECT 1 LIMIT 4+NULL;
+} {"datatype mismatch"}
+
 do_execsql_test_on_specific_db {:memory:} rowid-references {
   CREATE TABLE test_table (id INTEGER);
   INSERT INTO test_table VALUES (5),(5);
@@ -999,3 +1056,41 @@ do_execsql_test_in_memory_any_error limit-column-reference-error {
   CREATE TABLE t(a);
   SELECT * FROM t LIMIT (t.a);
 }
+
+do_execsql_test select-binary-collation {
+  SELECT 'a' = 'A';
+  SELECT 'a' = 'a';
+} {0 1}
+
+# https://github.com/tursodatabase/turso/issues/3667 regression test
+do_execsql_test_in_memory_error_content rowid-select-from-clause-subquery {
+	CREATE TABLE t(a);
+	SELECT rowid FROM (SELECT * FROM t);
+} {"no such column: rowid"}
+
+do_execsql_test_on_specific_db {:memory:} rowid-select-from-clause-subquery-explicit-works {
+	CREATE TABLE t(a);
+	INSERT INTO t values ('abc');
+	SELECT rowid,a FROM (SELECT rowid,a FROM t);
+} {1|abc}
+
+# https://github.com/tursodatabase/turso/issues/3505 regression test
+do_execsql_test_in_memory_any_error ambiguous-self-join {
+    CREATE TABLE T(a);
+	INSERT INTO t VALUES (1), (2), (3); 
+	SELECT * fROM t JOIN t;
+}
+
+do_execsql_test_on_specific_db {:memory:} unambiguous-self-join {
+    CREATE TABLE T(a);
+	INSERT INTO t VALUES (1), (2), (3); 
+	SELECT * fROM t as ta JOIN t order by ta.a;
+} {1|1
+1|2
+1|3
+2|1
+2|2
+2|3
+3|1
+3|2
+3|3}

@@ -17,6 +17,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
+use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -2369,7 +2370,6 @@ impl Cursor {
 #[must_use]
 pub enum IOCompletions {
     Single(Completion),
-    Many(Vec<Completion>),
 }
 
 impl IOCompletions {
@@ -2377,26 +2377,12 @@ impl IOCompletions {
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
-            IOCompletions::Many(completions) => {
-                let mut completions = completions.into_iter();
-                while let Some(c) = completions.next() {
-                    let res = io.wait_for_completion(c);
-                    if res.is_err() {
-                        for c in completions {
-                            c.abort();
-                        }
-                        return res;
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
     pub fn finished(&self) -> bool {
         match self {
             IOCompletions::Single(c) => c.finished(),
-            IOCompletions::Many(completions) => completions.iter().all(|c| c.finished()),
         }
     }
 
@@ -2404,14 +2390,20 @@ impl IOCompletions {
     pub fn abort(&self) {
         match self {
             IOCompletions::Single(c) => c.abort(),
-            IOCompletions::Many(completions) => completions.iter().for_each(|c| c.abort()),
         }
     }
 
     pub fn get_error(&self) -> Option<CompletionError> {
         match self {
             IOCompletions::Single(c) => c.get_error(),
-            IOCompletions::Many(completions) => completions.iter().find_map(|c| c.get_error()),
+        }
+    }
+
+    pub fn set_waker(&self, waker: Option<&Waker>) {
+        if let Some(waker) = waker {
+            match self {
+                IOCompletions::Single(c) => c.set_waker(waker),
+            }
         }
     }
 }

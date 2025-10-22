@@ -1107,9 +1107,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
-                    Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE)".to_string()
-                    )
+                    Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Integer(0),
@@ -1135,9 +1133,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
-                    Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE)".to_string()
-                    )
+                    Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
                 ])),
                 Value::Blob(record([
                     Value::Text("table".to_string()),
@@ -1145,7 +1141,7 @@ fn test_cdc_schema_changes_alter_table() {
                     Value::Text("t".to_string()),
                     Value::Integer(4),
                     Value::Text(
-                        "CREATE TABLE t (x PRIMARY KEY, y PRIMARY KEY, z UNIQUE, t)".to_string()
+                        "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
                 ])),
                 Value::Blob(record([

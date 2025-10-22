@@ -15,7 +15,7 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "series", "encryption"]
-antithesis = ["dep:antithesis_sdk"]
+antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
@@ -52,14 +52,13 @@ cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-getrandom = { version = "0.2.15" }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",
 ] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 julian_day_converter = "0.4.5"
-rand = "0.8.5"
+rand = { workspace = true }
 libm = "0.2"
 turso_macros = { workspace = true }
 miette = { workspace = true }
@@ -100,10 +99,9 @@ criterion = { workspace = true, features = [
     "async_futures",
 ] }
 rstest = "0.18.2"
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["series"] }
 quickcheck = { version = "1.0", default-features = false }
 quickcheck_macros = { version = "1.0", default-features = false }
-rand = "0.8.5" # Required for quickcheck
 rand_chacha = { workspace = true }
 env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }

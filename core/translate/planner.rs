@@ -317,11 +317,26 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
+            let outer_query_refs_for_subquery = table_references
+                .outer_query_refs()
+                .iter()
+                .cloned()
+                .chain(
+                    ctes.iter()
+                        .cloned()
+                        .map(|t: JoinedTable| OuterQueryReference {
+                            identifier: t.identifier,
+                            internal_id: t.internal_id,
+                            table: t.table,
+                            col_used_mask: ColumnUsedMask::default(),
+                        }),
+                )
+                .collect::<Vec<_>>();
             let Plan::Select(subplan) = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
-                table_references.outer_query_refs(),
+                &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
             )?
@@ -971,9 +986,29 @@ fn parse_join(
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
 
+    // this is called once for each join, so we only need to check the rightmost table
+    // against all previous tables for duplicates
+    let rightmost_table = table_references.joined_tables().last().unwrap();
+    let has_duplicate = table_references
+        .joined_tables()
+        .iter()
+        .take(table_references.joined_tables().len() - 1)
+        .any(|t| t.identifier == rightmost_table.identifier);
+
+    if has_duplicate
+        && !natural
+        && constraint
+            .as_ref()
+            .is_none_or(|c| !matches!(c, ast::JoinConstraint::Using(_)))
+    {
+        // Duplicate table names are only allowed for NATURAL or USING joins
+        crate::bail_parse_error!(
+            "table name {} specified more than once - use an alias to disambiguate",
+            rightmost_table.identifier
+        );
+    }
     let constraint = if natural {
         assert!(table_references.joined_tables().len() >= 2);
-        let rightmost_table = table_references.joined_tables().last().unwrap();
         // NATURAL JOIN is first transformed into a USING join with the common columns
         let mut distinct_names: Vec<ast::Name> = vec![];
         // TODO: O(n^2) maybe not great for large tables or big multiway joins

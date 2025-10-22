@@ -40,6 +40,11 @@ pub enum PopulateState {
     Done,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for PopulateState {}
+unsafe impl Sync for PopulateState {}
+
 /// State machine for merge_delta to handle I/O operations
 impl fmt::Debug for PopulateState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -130,6 +135,11 @@ pub struct AllViewsTxState {
     states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for AllViewsTxState {}
+unsafe impl Sync for AllViewsTxState {}
+
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
@@ -209,6 +219,11 @@ pub struct IncrementalView {
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for IncrementalView {}
+unsafe impl Sync for IncrementalView {}
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit

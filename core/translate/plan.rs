@@ -4,7 +4,10 @@ use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, 
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
-    translate::{collate::get_collseq_from_expr, optimizer::constraints::SeekRangeConstraint},
+    translate::{
+        collate::get_collseq_from_expr, emitter::UpdateRowSource,
+        optimizer::constraints::SeekRangeConstraint,
+    },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -440,7 +443,10 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // If the UPDATE modifies any column that is present in the key of the btree used to iterate over the table (either the table itself or an index),
+    // gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // This ensures the keys of the btree used to iterate cannot be changed during the UPDATE loop itself, ensuring all the intended rows actually get
+    // updated and none are skipped.
     pub ephemeral_plan: Option<SelectPlan>,
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
@@ -611,6 +617,11 @@ impl TableReferences {
     /// Add a new [JoinedTable] to the query plan.
     pub fn add_joined_table(&mut self, joined_table: JoinedTable) {
         self.joined_tables.push(joined_table);
+    }
+
+    /// Add a new [OuterQueryReference] to the query plan.
+    pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
+        self.outer_query_refs.push(outer_query_reference);
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -902,10 +913,28 @@ impl JoinedTable {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
                 let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
-                let table_not_required =
-                    OperationMode::SELECT == mode && use_covering_index && !index_is_ephemeral;
+                let table_not_required = matches!(mode, OperationMode::SELECT)
+                    && use_covering_index
+                    && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {
                     None
+                } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                    target_table,
+                    ..
+                }) = &mode
+                {
+                    // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
+                    // in case it wasn't already allocated when populating the ephemeral table.
+                    Some(program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(target_table.internal_id),
+                        match &target_table.table {
+                            Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
+                            Table::Virtual(virtual_table) => {
+                                CursorType::VirtualTable(virtual_table.clone())
+                            }
+                            _ => unreachable!("target table must be a btree or virtual table"),
+                        },
+                    ))
                 } else {
                     // Check if this is a materialized view
                     let cursor_type =
@@ -919,6 +948,7 @@ impl JoinedTable {
                             .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
                     )
                 };
+
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
                         CursorKey::index(self.internal_id, index.clone()),
@@ -943,9 +973,19 @@ impl JoinedTable {
     pub fn resolve_cursors(
         &self,
         program: &mut ProgramBuilder,
+        mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id = program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id));
+        let table_cursor_id =
+            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                target_table,
+                ..
+            }) = &mode
+            {
+                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+            } else {
+                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+            };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });

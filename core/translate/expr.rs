@@ -1951,7 +1951,12 @@ pub fn translate_expr(
             let table = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
-                .expect("table reference should be found");
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "table reference should be found: {} (referenced_tables: {:?})",
+                        table_ref_id, referenced_tables
+                    )
+                });
 
             let Some(table_column) = table.get_column_at(*column) else {
                 crate::bail_parse_error!("column index out of bounds");
@@ -3446,12 +3451,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     if binding_behavior == BindingBehavior::TryResultColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
@@ -3490,14 +3494,18 @@ pub fn bind_and_rewrite_expr<'a>(
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
-                        } else if let Some(row_id_expr) = parse_row_id(
-                            &normalized_id,
-                            referenced_tables.joined_tables()[0].internal_id,
-                            || referenced_tables.joined_tables().len() != 1,
-                        )? {
-                            *expr = row_id_expr;
-
-                            return Ok(WalkControl::Continue);
+                        } else {
+                            let is_btree_table = matches!(joined_table.table, Table::BTree(_));
+                            if is_btree_table {
+                                if let Some(row_id_expr) = parse_row_id(
+                                    &normalized_id,
+                                    referenced_tables.joined_tables()[0].internal_id,
+                                    || referenced_tables.joined_tables().len() != 1,
+                                )? {
+                                    *expr = row_id_expr;
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
                         }
                     }
 
@@ -3544,12 +3552,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
                         if let Some(result_columns) = result_columns {
                             for result_column in result_columns.iter() {
-                                if result_column
-                                    .name(referenced_tables)
-                                    .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                                {
-                                    *expr = result_column.expr.clone();
-                                    return Ok(WalkControl::Continue);
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
                                 }
                             }
                         }
