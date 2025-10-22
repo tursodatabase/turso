@@ -21,7 +21,7 @@ use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
 };
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::TxnCleanup;
+use crate::vdbe::{registers_to_ref_values, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -3384,11 +3384,13 @@ pub fn op_idx_ge(
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Create the comparison record from registers
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record, // The serialized record from the index
-                &state.registers[*start_reg..*start_reg + *num_regs], // The record built from registers
-                cursor.get_index_info(),                              // Sort order flags
+                &idx_record,             // The serialized record from the index
+                &values,                 // The record built from registers
+                cursor.get_index_info(), // Sort order flags
                 0,
                 tie_breaker,
             )?;
@@ -3450,10 +3452,12 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &state.registers[*start_reg..*start_reg + *num_regs],
+                &values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3499,10 +3503,12 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &state.registers[*start_reg..*start_reg + *num_regs],
+                &values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3548,10 +3554,13 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
+
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &state.registers[*start_reg..*start_reg + *num_regs],
+                &values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
