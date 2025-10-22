@@ -126,6 +126,10 @@ try:
     con.commit()
     con_init.commit()
 
+except turso.ProgrammingError as e:
+    print(f"Table/column might have been dropped in parallel: {e}")
+    con.rollback()
+    con_init.rollback()
 except turso.OperationalError as e:
     print(f"Failed to alter table: {e}")
     con.rollback()

@@ -46,6 +46,10 @@ for i in range(insertions):
             INSERT INTO tbl_{selected_tbl} ({cols})
             VALUES ({", ".join(values)})
         """)
+    except turso.ProgrammingError:
+        # Table/column might have been dropped in parallel - this is expected
+        con.rollback()
+        break
     except turso.OperationalError as e:
         if "UNIQUE constraint failed" in str(e):
             # Ignore UNIQUE constraint violations
