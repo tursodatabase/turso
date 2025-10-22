@@ -21,11 +21,6 @@ pub struct Error {
 }
 
 #[repr(C)]
-pub struct ErrorHandle {
-    error: *const Error,
-}
-
-#[repr(C)]
 pub struct Database {
     io: Arc<dyn IO>,
     connection: Arc<Connection>,
@@ -119,18 +114,17 @@ pub extern "C" fn free_error(error_ptr: *mut Error) {
 }
 
 #[no_mangle]
-pub extern "C" fn db_prepare_statement(db_ptr: *mut Database, sql_ptr: *const c_char,  error_handle_ptr: *mut ErrorHandle) -> *const Statement {
+pub extern "C" fn db_prepare_statement(db_ptr: *mut Database, sql_ptr: *const c_char,  statement_ptr: *mut *const Statement) -> *const Error {
     let sql = unsafe { CStr::from_ptr(sql_ptr) }.to_str();
     let db = unsafe {&mut (*db_ptr)};
-    let error_handle = unsafe {&mut (*error_handle_ptr)};
     
     let prepare_result = db.connection.prepare(sql.unwrap());    
     match prepare_result {
-        Ok(statement) => allocate(statement),
-        Err(e) => {
-            error_handle.error = allocate_error(format!("Unable to prepare statment: {e}"));
+        Ok(statement) => {
+            unsafe { *statement_ptr = allocate(statement) };
             null()
-        },
+        }
+        Err(e) => allocate_error(format!("Unable to prepare statment: {e}")),
     }
 }
 
@@ -167,36 +161,34 @@ pub extern "C" fn db_statement_nchange(statement_ptr: *mut Statement) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn db_statement_execute_step(statement_ptr: *mut Statement, error_handle_ptr: *mut ErrorHandle) -> bool {
+pub extern "C" fn db_statement_execute_step(statement_ptr: *mut Statement, has_data: *mut bool) -> *const Error {
     let statement = unsafe {&mut (*statement_ptr)};
-    let error_handle = unsafe {&mut (*error_handle_ptr)};
 
     loop {
         match statement.step() {
             Ok(step_result) => {
                 match step_result {
-                    StepResult::Row => { return true; }
-                    StepResult::Done => { return false; }
+                    StepResult::Row => {
+                        unsafe { *has_data = true }; 
+                        return null();
+                    }
+                    StepResult::Done => { return null(); }
                     StepResult::IO => {
                         if let Err(err) = statement.run_once() {
-                            error_handle.error = allocate_error(err.to_string());
-                            return false;
+                            return allocate_error(err.to_string());
                         }
                         continue;
                     }
                     StepResult::Interrupt => {
-                        error_handle.error = allocate_error("Interrupted".to_string());
-                        return false; 
+                        return allocate_error("Interrupted".to_string()); 
                     }
                     StepResult::Busy => { 
-                        error_handle.error = allocate_error("Database is busy".to_string());
-                        return false; 
+                        return allocate_error("Database is busy".to_string()); 
                     }
                 }
             },
             Err(err) => {
-                error_handle.error = allocate_error(err.to_string());
-                return false;
+                return allocate_error(err.to_string());
             }
         }
     }

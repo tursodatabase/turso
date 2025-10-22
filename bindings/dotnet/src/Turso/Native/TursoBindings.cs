@@ -16,24 +16,23 @@ public static class TursoBindings
     public static extern void FreeError(IntPtr errorPtr);
     
     [DllImport(DllName, EntryPoint = "db_prepare_statement", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr PrepareStatement(DatabaseHandle db, string statement, IntPtr errorHandle);
+    public static extern IntPtr PrepareStatement(DatabaseHandle db, string statementSql, out IntPtr statement);
     
     [DllImport(DllName, EntryPoint = "free_statement", CallingConvention = CallingConvention.Cdecl)]
     public static extern void FreeStatement(IntPtr statement);
     
     [DllImport(DllName, EntryPoint = "bind_parameter", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void BindParameter(IntPtr statement, int index, IntPtr tursoValue);
+    public static extern void BindParameter(StatementHandle statement, int index, IntPtr tursoValue);
 
     [DllImport(DllName, EntryPoint = "bind_named_parameter", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void BindNamedParameter(IntPtr statement, string parameterName, IntPtr tursoValue);
+    public static extern void BindNamedParameter(StatementHandle statement, string parameterName, IntPtr tursoValue);
 
     [DllImport(DllName, EntryPoint = "db_statement_execute_step", CallingConvention = CallingConvention.Cdecl)]
-    [return: MarshalAs(UnmanagedType.I1)]
-    public static extern bool StatementExecuteStep(IntPtr statement, IntPtr errorHandle);
+    public static extern IntPtr StatementExecuteStep(StatementHandle statement, [MarshalAs(UnmanagedType.I1)] out bool hasData);
     
     [DllImport(DllName, EntryPoint = "db_statement_nchange", CallingConvention = CallingConvention.Cdecl)]
-    public static extern long StatementRowsAffected(IntPtr statement);
+    public static extern long StatementRowsAffected(StatementHandle statement);
 
     [DllImport(DllName, EntryPoint = "db_statement_get_value", CallingConvention = CallingConvention.Cdecl)]
-    public static extern TursoNativeValue GetValueFromStatement(IntPtr statement, int columnIndex);
+    public static extern TursoNativeValue GetValueFromStatement(StatementHandle statement, int columnIndex);
 }
