@@ -1489,30 +1489,37 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut v: u64 = 0;
-    for i in 0..8 {
-        match buf.get(i) {
-            Some(c) => {
-                v = (v << 7) + (c & 0x7f) as u64;
-                if (c & 0x80) == 0 {
-                    return Ok((v, i + 1));
-                }
-            }
-            None => {
-                crate::bail_corrupt_error!("Invalid varint");
-            }
+    let mut i = 0;
+    let chunks = buf.chunks_exact(2);
+    for chunk in chunks {
+        let c1 = chunk[0];
+        v = (v << 7) + (c1 & 0x7f) as u64;
+        i += 1;
+        if (c1 & 0x80) == 0 {
+            return Ok((v, i));
+        }
+        let c2 = chunk[1];
+        v = (v << 7) + (c2 & 0x7f) as u64;
+        i += 1;
+        if (c2 & 0x80) == 0 {
+            return Ok((v, i));
+        }
+        if i == 8 {
+            break;
         }
     }
-    match buf.get(8) {
+    match buf.get(i) {
         Some(&c) => {
-            // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
-            // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
-            // If those are zero, this should be treated as corrupt.
-            // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
-            if (v >> 48) == 0 {
-                bail_corrupt_error!("Invalid varint");
+            if i < 8 && (c & 0x80) == 0 {
+                return Ok(((v << 7) + c as u64, i + 1));
+            } else if i == 8 && (v >> 48) > 0 {
+                // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+                // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+                // If those are zero, this should be treated as corrupt.
+                // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+                return Ok(((v << 8) + c as u64, i + 1));
             }
-            v = (v << 8) + c as u64;
-            Ok((v, 9))
+            bail_corrupt_error!("Invalid varint");
         }
         None => {
             bail_corrupt_error!("Invalid varint");

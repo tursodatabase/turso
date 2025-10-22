@@ -21,7 +21,7 @@ use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
 };
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::{registers_to_ref_values, TxnCleanup};
+use crate::vdbe::TxnCleanup;
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -1486,44 +1486,6 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
-///
-/// This function is a performance-optimized version of `read_varint()` that handles
-/// the most common varint cases inline before falling back to the full implementation.
-/// It follows the same varint encoding as SQLite.
-///
-/// # Optimized Cases
-///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-///
-/// This function is similar to `sqlite3GetVarint32`
-#[inline(always)]
-fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum OpColumnState {
     Start,
@@ -1650,7 +1612,7 @@ pub fn op_column(
                             let mut record_cursor = cursor.record_cursor_mut();
 
                             if record_cursor.offsets.is_empty() {
-                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
+                                let (header_size, header_len_bytes) = read_varint(payload)?;
                                 let header_size = header_size as usize;
 
                                 debug_assert!(header_size <= payload.len() && header_size <= 98307, "header_size: {header_size}, header_len_bytes: {header_len_bytes}, payload.len(): {}", payload.len());
@@ -1672,8 +1634,7 @@ pub fn op_column(
                             while record_cursor.serial_types.len() <= target_column
                                 && parse_pos < record_cursor.header_size
                             {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
+                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
                                 record_cursor.serial_types.push(serial_type);
                                 parse_pos += varint_len;
                                 let data_size = match serial_type {
@@ -1697,17 +1658,14 @@ pub fn op_column(
                                     8 => 0,
                                     // CONST_INT1
                                     9 => 0,
-                                    // BLOB
-                                    n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
-                                    // TEXT
-                                    n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
                                     // Reserved
                                     10 | 11 => {
                                         return Err(LimboError::Corrupt(format!(
                                             "Reserved serial type: {serial_type}"
                                         )))
                                     }
-                                    _ => unreachable!("Invalid serial type: {serial_type}"),
+                                    // BLOB or TEXT
+                                    n => (n - 12) / 2,
                                 } as usize;
                                 data_offset += data_size;
                                 record_cursor.offsets.push(data_offset);
@@ -3422,13 +3380,11 @@ pub fn op_idx_ge(
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Create the comparison record from registers
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record,             // The serialized record from the index
-                &values,                 // The record built from registers
-                cursor.get_index_info(), // Sort order flags
+                &idx_record, // The serialized record from the index
+                &state.registers[*start_reg..*start_reg + *num_regs], // The record built from registers
+                cursor.get_index_info(),                              // Sort order flags
                 0,
                 tie_breaker,
             )?;
@@ -3490,12 +3446,10 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                &state.registers[*start_reg..*start_reg + *num_regs],
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3541,12 +3495,10 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                &state.registers[*start_reg..*start_reg + *num_regs],
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3592,13 +3544,10 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
-
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                &state.registers[*start_reg..*start_reg + *num_regs],
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
