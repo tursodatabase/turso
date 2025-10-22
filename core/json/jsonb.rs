@@ -2960,8 +2960,7 @@ impl Jsonb {
                         let target_path_result =
                             result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
 
-                        if target_path_result.is_ok() {
-                            let target_stack = target_path_result.unwrap();
+                        if let Ok(target_stack) = target_path_result {
                             let target_value_idx = target_stack.last().unwrap().field_value_index;
                             let (target_header, _) = result.read_header(target_value_idx)?;
 

@@ -59,6 +59,7 @@ impl QueryProfile {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, strum::VariantArray)]
 pub enum QueryTypes {
     CreateTable,
