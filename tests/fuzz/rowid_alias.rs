@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
+use core_tester::common::{limbo_exec_rows, TempDatabase};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
