@@ -69,7 +69,7 @@ mod tests {
     fn assert_vectors(v1: &Vector, v2: &Vector) {
         assert_eq!(v1.vector_type, v2.vector_type);
         assert_eq!(v1.dims, v2.dims);
-        assert_eq!(v1.data, v2.data);
+        assert_eq!(v1.bin_data(), v2.bin_data());
     }
 
     #[test]
@@ -77,30 +77,33 @@ mod tests {
         let vf32 = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 3,
-            data: concat(&[
+            owned: Some(concat(&[
                 1.0f32.to_le_bytes(),
                 0.0f32.to_le_bytes(),
                 2.0f32.to_le_bytes(),
-            ]),
+            ])),
+            refer: None,
         };
         let vf64 = Vector {
             vector_type: VectorType::Float64Dense,
             dims: 3,
-            data: concat(&[
+            owned: Some(concat(&[
                 1.0f64.to_le_bytes(),
                 0.0f64.to_le_bytes(),
                 2.0f64.to_le_bytes(),
-            ]),
+            ])),
+            refer: None,
         };
         let vf32_sparse = Vector {
             vector_type: VectorType::Float32Sparse,
             dims: 3,
-            data: concat(&[
+            owned: Some(concat(&[
                 1.0f32.to_le_bytes(),
                 2.0f32.to_le_bytes(),
                 0u32.to_le_bytes(),
                 2u32.to_le_bytes(),
-            ]),
+            ])),
+            refer: None,
         };
 
         let vectors = [vf32, vf64, vf32_sparse];
@@ -110,7 +113,8 @@ mod tests {
                 let v_copy = Vector {
                     vector_type: v1.vector_type,
                     dims: v1.dims,
-                    data: v1.data.clone(),
+                    owned: v1.owned.clone(),
+                    refer: None,
                 };
                 assert_vectors(&vector_convert(v_copy, v2.vector_type).unwrap(), v2);
             }

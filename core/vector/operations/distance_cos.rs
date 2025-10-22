@@ -2,6 +2,7 @@ use crate::{
     vector::vector_types::{Vector, VectorSparse, VectorType},
     LimboError, Result,
 };
+use simsimd::SpatialSimilarity;
 
 pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
     if v1.dims != v2.dims {
@@ -15,11 +16,23 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
         ));
     }
     match v1.vector_type {
-        VectorType::Float32Dense => Ok(vector_f32_distance_cos(
+        #[cfg(not(target_family = "wasm"))]
+        VectorType::Float32Dense => Ok(vector_f32_distance_cos_simsimd(
             v1.as_f32_slice(),
             v2.as_f32_slice(),
         )),
-        VectorType::Float64Dense => Ok(vector_f64_distance_cos(
+        #[cfg(target_family = "wasm")]
+        VectorType::Float32Dense => Ok(vector_f32_distance_cos_rust(
+            v1.as_f32_slice(),
+            v2.as_f32_slice(),
+        )),
+        #[cfg(not(target_family = "wasm"))]
+        VectorType::Float64Dense => Ok(vector_f64_distance_cos_simsimd(
+            v1.as_f64_slice(),
+            v2.as_f64_slice(),
+        )),
+        #[cfg(target_family = "wasm")]
+        VectorType::Float64Dense => Ok(vector_f64_distance_cos_rust(
             v1.as_f64_slice(),
             v2.as_f64_slice(),
         )),
@@ -30,44 +43,44 @@ pub fn vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
     }
 }
 
-fn vector_f32_distance_cos(v1: &[f32], v2: &[f32]) -> f64 {
-    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-
-    let dims = v1.len();
-    for i in 0..dims {
-        let e1 = v1[i];
-        let e2 = v2[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
-    }
-
-    // Check for zero norms to avoid division by zero
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return f64::NAN;
-    }
-
-    1.0 - (dot / (norm1 * norm2).sqrt()) as f64
+#[allow(dead_code)]
+fn vector_f32_distance_cos_simsimd(v1: &[f32], v2: &[f32]) -> f64 {
+    f32::cosine(v1, v2).unwrap_or(f64::NAN)
 }
 
-fn vector_f64_distance_cos(v1: &[f64], v2: &[f64]) -> f64 {
+// SimSIMD do not support WASM for now, so we have alternative implementation: https://github.com/ashvardanian/SimSIMD/issues/189
+#[allow(dead_code)]
+fn vector_f32_distance_cos_rust(v1: &[f32], v2: &[f32]) -> f64 {
     let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-
-    let dims = v1.len();
-    for i in 0..dims {
-        let e1 = v1[i];
-        let e2 = v2[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        dot += a * b;
+        norm1 += a * a;
+        norm2 += b * b;
     }
-
-    // Check for zero norms
     if norm1 == 0.0 || norm2 == 0.0 {
-        return f64::NAN;
+        return 0.0;
     }
+    (1.0 - dot / (norm1 * norm2).sqrt()) as f64
+}
 
-    1.0 - (dot / (norm1 * norm2).sqrt())
+#[allow(dead_code)]
+fn vector_f64_distance_cos_simsimd(v1: &[f64], v2: &[f64]) -> f64 {
+    f64::cosine(v1, v2).unwrap_or(f64::NAN)
+}
+
+// SimSIMD do not support WASM for now, so we have alternative implementation: https://github.com/ashvardanian/SimSIMD/issues/189
+#[allow(dead_code)]
+fn vector_f64_distance_cos_rust(v1: &[f64], v2: &[f64]) -> f64 {
+    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        dot += a * b;
+        norm1 += a * a;
+        norm2 += b * b;
+    }
+    if norm1 == 0.0 || norm2 == 0.0 {
+        return 0.0;
+    }
+    1.0 - dot / (norm1 * norm2).sqrt()
 }
 
 fn vector_f32_sparse_distance_cos(v1: VectorSparse<f32>, v2: VectorSparse<f32>) -> f64 {
@@ -120,20 +133,26 @@ mod tests {
 
     #[test]
     fn test_vector_distance_cos_f32() {
-        assert!(vector_f32_distance_cos(&[], &[]).is_nan());
-        assert!(vector_f32_distance_cos(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
-        assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
-        assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[-1.0, -2.0]), 2.0);
-        assert_eq!(vector_f32_distance_cos(&[1.0, 2.0], &[-2.0, 1.0]), 1.0);
+        assert_eq!(vector_f32_distance_cos_simsimd(&[], &[]), 0.0);
+        assert_eq!(
+            vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[0.0, 0.0]),
+            1.0
+        );
+        assert!(vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-6);
+        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-6);
+        assert!((vector_f32_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_vector_distance_cos_f64() {
-        assert!(vector_f64_distance_cos(&[], &[]).is_nan());
-        assert!(vector_f64_distance_cos(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
-        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
-        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-1.0, -2.0]), 2.0);
-        assert_eq!(vector_f64_distance_cos(&[1.0, 2.0], &[-2.0, 1.0]), 1.0);
+        assert_eq!(vector_f64_distance_cos_simsimd(&[], &[]), 0.0);
+        assert_eq!(
+            vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[0.0, 0.0]),
+            1.0
+        );
+        assert!(vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[1.0, 2.0]).abs() < 1e-6);
+        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-1.0, -2.0]) - 2.0).abs() < 1e-6);
+        assert!((vector_f64_distance_cos_simsimd(&[1.0, 2.0], &[-2.0, 1.0]) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -148,7 +167,7 @@ mod tests {
                     idx: &[1, 2],
                     values: &[1.0, 3.0]
                 },
-            ) - vector_f32_distance_cos(&[1.0, 2.0, 0.0], &[0.0, 1.0, 3.0]))
+            ) - vector_f32_distance_cos_simsimd(&[1.0, 2.0, 0.0], &[0.0, 1.0, 3.0]))
             .abs()
                 < 1e-7
         );
@@ -167,6 +186,32 @@ mod tests {
         let sparse2 = vector_convert(v2, VectorType::Float32Sparse).unwrap();
         let d2 = vector_f32_sparse_distance_cos(sparse1.as_f32_sparse(), sparse2.as_f32_sparse());
 
+        (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
+    }
+
+    #[quickcheck]
+    fn prop_vector_distance_cos_rust_vs_simsimd_f32(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
+        let d1 = vector_f32_distance_cos_rust(v1.as_f32_slice(), v2.as_f32_slice());
+        let d2 = vector_f32_distance_cos_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
+        println!("d1 vs d2: {d1} vs {d2}");
+        (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-4
+    }
+
+    #[quickcheck]
+    fn prop_vector_distance_cos_rust_vs_simsimd_f64(
+        v1: ArbitraryVector<100>,
+        v2: ArbitraryVector<100>,
+    ) -> bool {
+        let v1 = vector_convert(v1.into(), VectorType::Float64Dense).unwrap();
+        let v2 = vector_convert(v2.into(), VectorType::Float64Dense).unwrap();
+        let d1 = vector_f64_distance_cos_rust(v1.as_f64_slice(), v2.as_f64_slice());
+        let d2 = vector_f64_distance_cos_simsimd(v1.as_f64_slice(), v2.as_f64_slice());
+        println!("d1 vs d2: {d1} vs {d2}");
         (d1.is_nan() && d2.is_nan()) || (d1 - d2).abs() < 1e-6
     }
 }

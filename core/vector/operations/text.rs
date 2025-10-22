@@ -56,7 +56,8 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
                 Vector {
                     vector_type,
                     dims: 0,
-                    data: Vec::new(),
+                    owned: Some(Vec::new()),
+                    refer: None,
                 }
             }
         });
@@ -69,7 +70,7 @@ pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
     }
 }
 
-fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector> {
+fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
     let mut data = Vec::new();
     for token in tokens {
         let value = token
@@ -85,11 +86,12 @@ fn vector32_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
     Ok(Vector {
         vector_type: VectorType::Float32Dense,
         dims: data.len() / 4,
-        data,
+        owned: Some(data),
+        refer: None,
     })
 }
 
-fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector> {
+fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
     let mut data = Vec::new();
     for token in tokens {
         let value = token
@@ -105,11 +107,12 @@ fn vector64_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vecto
     Ok(Vector {
         vector_type: VectorType::Float64Dense,
         dims: data.len() / 8,
-        data,
+        owned: Some(data),
+        refer: None,
     })
 }
 
-fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector> {
+fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Result<Vector<'static>> {
     let mut idx = Vec::new();
     let mut values = Vec::new();
     let mut dims = 0u32;
@@ -135,6 +138,7 @@ fn vector32_sparse_from_text<'a>(tokens: impl Iterator<Item = &'a str>) -> Resul
     Ok(Vector {
         vector_type: VectorType::Float32Sparse,
         dims: dims as usize,
-        data: values,
+        owned: Some(values),
+        refer: None,
     })
 }
