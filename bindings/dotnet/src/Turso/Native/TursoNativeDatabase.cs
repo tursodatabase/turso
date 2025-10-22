@@ -26,18 +26,16 @@ public class TursoNativeDatabase : IDisposable
 
     public TursoNativeStatement PrepareStatement(string sql)
     {
-        var errorHandle = new TursoErrorHandle();
-        var statementPtr = TursoBindings.PrepareStatement(_databaseHandle, sql, errorHandle.Ptr());
-        if (errorHandle.ErrorPtr != IntPtr.Zero)
-            TursoHelpers.ThrowException(errorHandle.ErrorPtr);
-        return new TursoNativeStatement(statementPtr);
+        var errorPtr = TursoBindings.PrepareStatement(_databaseHandle, sql, out var statementPtr);
+        if (errorPtr != IntPtr.Zero)
+            TursoHelpers.ThrowException(errorPtr);
+
+        var statementHandle = StatementHandle.FromPtr(statementPtr);
+        return new TursoNativeStatement(statementHandle);
     }
 
     private void Dispose(bool disposing)
     {
-        if (Interlocked.CompareExchange(ref _isDisposed, 1, 0) == 0)
-        {
-            TursoBindings.CloseDatabase(_databaseHandle);
-        }
+        _databaseHandle.Dispose();
     }
 }

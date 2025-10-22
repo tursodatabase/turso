@@ -6,12 +6,12 @@ namespace Turso.Native;
 
 public class TursoNativeStatement : IDisposable
 {
-    private readonly IntPtr _statementPtr;
+    private readonly StatementHandle _statementHandle;
     private int _isDisposed = 0;
 
-    public TursoNativeStatement(IntPtr statementPtr)
+    public TursoNativeStatement(StatementHandle statementHandle)
     {
-        _statementPtr = statementPtr;
+        _statementHandle = statementHandle;
     }
 
     public void BindParameter(int index, TursoParameter parameter)
@@ -23,7 +23,7 @@ public class TursoNativeStatement : IDisposable
             unsafe
             {
                 var ptr = &nativeValue;
-                TursoBindings.BindParameter(_statementPtr, index, (IntPtr)ptr);
+                TursoBindings.BindParameter(_statementHandle, index, (IntPtr)ptr);
             }
         }
         finally
@@ -43,7 +43,7 @@ public class TursoNativeStatement : IDisposable
             unsafe
             {
                 var ptr = &nativeValue;
-                TursoBindings.BindNamedParameter(_statementPtr, parameterName, (IntPtr)ptr);
+                TursoBindings.BindNamedParameter(_statementHandle, parameterName, (IntPtr)ptr);
             }
         }
         finally
@@ -55,22 +55,21 @@ public class TursoNativeStatement : IDisposable
 
     public bool Read()
     {
-        var errorHandle = new TursoErrorHandle();
-        var hasData = TursoBindings.StatementExecuteStep(_statementPtr, errorHandle.Ptr());
-        if (errorHandle.ErrorPtr != IntPtr.Zero)
-            TursoHelpers.ThrowException(errorHandle.ErrorPtr);
+        var errorPtr = TursoBindings.StatementExecuteStep(_statementHandle, out var hasData);
+        if (errorPtr != IntPtr.Zero)
+            TursoHelpers.ThrowException(errorPtr);
         return hasData;
     }
 
     public int RowsAffected()
     {
-        return (int)TursoBindings.StatementRowsAffected(_statementPtr);
+        return (int)TursoBindings.StatementRowsAffected(_statementHandle);
     }
 
 
     public TursoValue GetRow(int columnIndex)
     {
-        var rowValue = TursoBindings.GetValueFromStatement(_statementPtr, columnIndex);
+        var rowValue = TursoBindings.GetValueFromStatement(_statementHandle, columnIndex);
         return rowValue.ValueType switch
         {
             TursoValueType.Empty => TursoValue.Empty(),
@@ -124,10 +123,7 @@ public class TursoNativeStatement : IDisposable
 
     private void Dispose(bool disposing)
     {
-        if (Interlocked.CompareExchange(ref _isDisposed, 1, 0) == 0)
-        {
-            TursoBindings.FreeStatement(_statementPtr);
-        }
+        _statementHandle.Dispose();
     }
 
     public void Dispose()
