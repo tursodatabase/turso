@@ -473,14 +473,19 @@ pub struct Savepoint {
     write_offset: AtomicU64,
     /// Bitmap of page numbers that are dirty in the savepoint.
     page_bitmap: RwLock<RoaringBitmap>,
+    /// Database size at the start of the savepoint.
+    /// If the database grows during the savepoint and a rollback to the savepoint is performed,
+    /// the pages exceeding the database size at the start of the savepoint will be ignored.
+    db_size: AtomicU32,
 }
 
 impl Savepoint {
-    pub fn new(subjournal_offset: u64) -> Self {
+    pub fn new(subjournal_offset: u64, db_size: u32) -> Self {
         Self {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            db_size: AtomicU32::new(db_size),
         }
     }
 
@@ -660,9 +665,9 @@ impl Pager {
         })
     }
 
-    pub fn begin_statement(&self) -> Result<()> {
+    pub fn begin_statement(&self, db_size: u32) -> Result<()> {
         self.open_subjournal()?;
-        self.open_savepoint()?;
+        self.open_savepoint(db_size)?;
         Ok(())
     }
 
@@ -756,14 +761,14 @@ impl Pager {
         Ok(())
     }
 
-    pub fn open_savepoint(&self) -> Result<()> {
+    pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
         self.open_subjournal()?;
         let subjournal_offset = self.subjournal.read().as_ref().unwrap().size()?;
         // Currently as we only have anonymous savepoints opened at the start of a statement,
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
         turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
-        let savepoint = Savepoint::new(subjournal_offset);
+        let savepoint = Savepoint::new(subjournal_offset, db_size);
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
@@ -824,6 +829,9 @@ impl Pager {
         let mut current_offset = journal_start_offset;
         let page_size = self.page_size.load(Ordering::SeqCst) as u64;
         let journal_end_offset = savepoint.write_offset.load(Ordering::SeqCst);
+        let db_size = savepoint.db_size.load(Ordering::SeqCst);
+
+        let mut dirty_pages = self.dirty_pages.write();
 
         while current_offset < journal_end_offset {
             // Read 4 bytes for page id
@@ -833,10 +841,25 @@ impl Pager {
             let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
             current_offset += 4;
 
-            // Check if we've already rolled back this page
-            if rollback_bitset.contains(page_id) {
-                // Skip reading the page, just advance offset
+            // Check if we've already rolled back this page or if the page is beyond the database size at the start of the savepoint
+            let already_rolled_back = rollback_bitset.contains(page_id);
+            if already_rolled_back {
                 current_offset += page_size;
+                continue;
+            }
+            let page_wont_exist_after_rollback = page_id > db_size;
+            if page_wont_exist_after_rollback {
+                dirty_pages.remove(&(page_id as usize));
+                if let Some(page) = self
+                    .page_cache
+                    .write()
+                    .get(&PageCacheKey::new(page_id as usize))?
+                {
+                    page.clear_dirty();
+                    page.try_unpin();
+                }
+                current_offset += page_size;
+                rollback_bitset.insert(page_id);
                 continue;
             }
 
@@ -869,6 +892,8 @@ impl Pager {
             truncate_completion.succeeded(),
             "memory IO should complete immediately"
         );
+
+        self.page_cache.write().truncate(db_size as usize)?;
 
         Ok(())
     }

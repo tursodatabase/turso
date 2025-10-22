@@ -29,6 +29,7 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
+    return_if_io,
     state_machine::StateMachine,
     storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
@@ -177,18 +178,6 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
-}
-
-/// If there is I/O, the instruction is restarted.
-/// Evaluate a Result<IOResult<T>>, if IO return Ok(StepResult::IO).
-#[macro_export]
-macro_rules! return_step_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            IOResult::Ok(v) => v,
-            IOResult::IO => return Ok(StepResult::IO),
-        }
-    };
 }
 
 struct RegexCache {
@@ -482,7 +471,7 @@ impl ProgramState {
         connection: &Connection,
         pager: &Arc<Pager>,
         write: bool,
-    ) -> Result<()> {
+    ) -> Result<IOResult<()>> {
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -494,9 +483,10 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
         if write {
-            pager.begin_statement()?;
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.begin_statement(db_size)?;
         }
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     /// End a statement subtransaction.

@@ -2266,6 +2266,7 @@ pub fn op_halt_if_null(
 pub enum OpTransactionState {
     Start,
     CheckSchemaCookie,
+    BeginStatement,
 }
 
 pub fn op_transaction(
@@ -2471,9 +2472,15 @@ pub fn op_transaction_inner(
                     }
                 }
 
+                state.op_transaction_state = OpTransactionState::BeginStatement;
+            }
+            OpTransactionState::BeginStatement => {
                 if program.needs_stmt_subtransactions && mv_store.is_none() {
                     let write = matches!(tx_mode, TransactionMode::Write);
-                    state.begin_statement(&program.connection, &pager, write)?;
+                    let res = state.begin_statement(&program.connection, &pager, write)?;
+                    if let IOResult::IO(io) = res {
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
                 }
 
                 state.pc += 1;
