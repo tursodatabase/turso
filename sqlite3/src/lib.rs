@@ -424,28 +424,19 @@ pub unsafe extern "C" fn sqlite3_exec(
         Err(_) => return SQLITE_MISUSE,
     };
     trace!("sqlite3_exec(sql={})", sql_str);
+    if !err.is_null() {
+        *err = std::ptr::null_mut();
+    }
     let statements = split_sql_statements(sql_str);
-
     for stmt_sql in statements {
         let trimmed = stmt_sql.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        // check if this is a DQL statement, because we will only allow if there is a callback
         let is_dql = is_query_statement(trimmed);
-        if is_dql && callback.is_none() {
-            if !err.is_null() {
-                let err_msg =
-                    CString::new("queries return results, use callback or sqlite3_prepare")
-                        .unwrap();
-                *err = err_msg.into_raw();
-            }
-            return SQLITE_MISUSE;
-        }
-
-        // For DML/DDL, use normal execute path
         if !is_dql {
+            // For DML/DDL, use normal execute path
             let db_inner = db_ref.inner.lock().unwrap();
             match db_inner.conn.execute(trimmed) {
                 Ok(_) => continue,
@@ -457,23 +448,47 @@ pub unsafe extern "C" fn sqlite3_exec(
                     return SQLITE_ERROR;
                 }
             }
+        } else if callback.is_none() {
+            // DQL without callback provided, still execute but discard any result rows
+            let mut stmt_ptr: *mut sqlite3_stmt = std::ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db,
+                CString::new(trimmed).unwrap().as_ptr(),
+                -1,
+                &mut stmt_ptr,
+                std::ptr::null_mut(),
+            );
+            if rc != SQLITE_OK {
+                if !err.is_null() {
+                    let err_msg = format!("Prepare failed: {rc}");
+                    *err = CString::new(err_msg).unwrap().into_raw();
+                }
+                return rc;
+            }
+            loop {
+                let step_rc = sqlite3_step(stmt_ptr);
+                match step_rc {
+                    SQLITE_ROW => continue,
+                    SQLITE_DONE => break,
+                    _ => {
+                        sqlite3_finalize(stmt_ptr);
+                        if !err.is_null() {
+                            let err_msg = format!("Step failed: {step_rc}");
+                            *err = CString::new(err_msg).unwrap().into_raw();
+                        }
+                        return step_rc;
+                    }
+                }
+            }
+            sqlite3_finalize(stmt_ptr);
         } else {
-            // Handle DQL with callback
+            // DQL with callback
             let rc = execute_query_with_callback(db, trimmed, callback, context, err);
             if rc != SQLITE_OK {
                 return rc;
             }
         }
     }
-
-    /* ^If the 5th parameter to sqlite3_exec() is not NULL and no errors
-     ** occur, then sqlite3_exec() sets the pointer in its 5th parameter to
-     ** NULL before returning.
-     */
-    if !err.is_null() {
-        *err = std::ptr::null_mut();
-    }
-
     SQLITE_OK
 }
 
