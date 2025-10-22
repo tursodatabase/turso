@@ -332,7 +332,7 @@ pub fn order_by_sorter_insert(
         ..
     } = sort_metadata;
 
-    let (insert_label, skip_label) = if *use_heap_sort {
+    let skip_label = if *use_heap_sort {
         // skip records which greater than current top-k maintained in a separate BTreeIndex
         let insert_label = program.allocate_label();
         let skip_label = program.allocate_label();
@@ -353,9 +353,15 @@ pub fn order_by_sorter_insert(
             num_regs: orderby_sorter_column_count,
             target_pc: skip_label,
         });
-        (Some(insert_label), Some(skip_label))
+        program.emit_insn(Insn::Delete {
+            cursor_id: *sort_cursor,
+            table_name: "".to_string(),
+            is_part_of_update: false,
+        });
+        program.preassign_label_to_next_insn(insert_label);
+        Some(skip_label)
     } else {
-        (None, None)
+        None
     };
 
     let mut cur_reg = start_reg + order_by_len;
@@ -452,13 +458,6 @@ pub fn order_by_sorter_insert(
     }
 
     if *use_heap_sort {
-        program.emit_insn(Insn::Delete {
-            cursor_id: *sort_cursor,
-            table_name: "".to_string(),
-            is_part_of_update: false,
-        });
-
-        program.preassign_label_to_next_insn(insert_label.unwrap());
         program.emit_insn(Insn::MakeRecord {
             start_reg,
             count: orderby_sorter_column_count,
