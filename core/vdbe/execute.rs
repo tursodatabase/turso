@@ -75,7 +75,6 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng, RngCore};
 use turso_parser::ast::{self, ForeignKeyClause, Name, SortOrder};
 use turso_parser::parser::Parser;
 
@@ -4821,7 +4820,9 @@ pub fn op_function(
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
-                    ScalarFunc::RandomBlob => Some(reg_value.exec_randomblob()),
+                    ScalarFunc::RandomBlob => {
+                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest)))
+                    }
                     ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()),
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
@@ -4846,7 +4847,8 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest] = Register::Value(Value::exec_random());
+                state.registers[*dest] =
+                    Register::Value(Value::exec_random(|| pager.io.generate_random_number()));
             }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
@@ -6638,8 +6640,7 @@ pub fn op_new_rowid(
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
                 // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
                 // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-                let mut rng = thread_rng();
-                let mut random_rowid: i64 = rng.gen();
+                let mut random_rowid: i64 = pager.io.generate_random_number();
                 random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
                 random_rowid += 1; // Ensure positive
 
@@ -8848,14 +8849,17 @@ impl Value {
         })
     }
 
-    pub fn exec_random() -> Self {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        let random_number = i64::from_ne_bytes(buf);
-        Value::Integer(random_number)
+    pub fn exec_random<F>(generate_random_number: F) -> Self
+    where
+        F: Fn() -> i64,
+    {
+        Value::Integer(generate_random_number())
     }
 
-    pub fn exec_randomblob(&self) -> Value {
+    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    where
+        F: Fn(&mut [u8]),
+    {
         let length = match self {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
@@ -8865,7 +8869,7 @@ impl Value {
         .max(1) as usize;
 
         let mut blob: Vec<u8> = vec![0; length];
-        rand::thread_rng().fill_bytes(&mut blob);
+        fill_bytes(&mut blob);
         Value::Blob(blob)
     }
 
@@ -10222,6 +10226,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rand::{Rng, RngCore};
+
     use super::*;
     use crate::types::Value;
 
@@ -10982,7 +10988,7 @@ mod tests {
 
     #[test]
     fn test_random() {
-        match Value::exec_random() {
+        match Value::exec_random(|| rand::rng().random()) {
             Value::Integer(value) => {
                 // Check that the value is within the range of i64
                 assert!(
@@ -11045,7 +11051,9 @@ mod tests {
         ];
 
         for test_case in &test_cases {
-            let result = test_case.input.exec_randomblob();
+            let result = test_case.input.exec_randomblob(|dest| {
+                rand::rng().fill_bytes(dest);
+            });
             match result {
                 Value::Blob(blob) => {
                     assert_eq!(blob.len(), test_case.expected_len);

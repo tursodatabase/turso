@@ -142,6 +142,11 @@ impl IO for SimulatorIO {
         let mut rng = self.rng.lock().unwrap();
         rng.next_u64() as i64
     }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        let mut rng = self.rng.lock().unwrap();
+        rng.fill_bytes(dest);
+    }
 }
 
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
