@@ -2210,6 +2210,22 @@ mod fuzz_tests {
             }
 
             for _ in 0..INNER_ITERS {
+                // Randomly inject transaction statements -- we don't care if they are legal,
+                // we just care that tursodb/sqlite behave the same way.
+                if rng.random_bool(0.15) {
+                    let tx_stmt = match rng.random_range(0..4) {
+                        0 => "BEGIN",
+                        1 => "BEGIN IMMEDIATE",
+                        2 => "COMMIT",
+                        3 => "ROLLBACK",
+                        _ => unreachable!(),
+                    };
+                    println!("{tx_stmt};");
+                    let sqlite_res = sqlite.execute(tx_stmt, rusqlite::params![]);
+                    let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, tx_stmt);
+                    // Both should succeed or both should fail
+                    assert!(sqlite_res.is_ok() == limbo_res.is_ok());
+                }
                 let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
                 let stmt = match action {
                     // INSERT
