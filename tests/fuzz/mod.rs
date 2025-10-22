@@ -2,7 +2,7 @@ pub mod grammar_generator;
 pub mod rowid_alias;
 
 #[cfg(test)]
-mod tests {
+mod fuzz_tests {
     use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
@@ -10,14 +10,13 @@ mod tests {
     use std::{collections::HashSet, io::Write};
     use turso_core::DatabaseOpts;
 
-    use crate::{
-        common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
-            maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
-            TempDatabase,
-        },
-        fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
+    use core_tester::common::{
+        do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+        maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
+        TempDatabase,
     };
+
+    use super::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator};
 
     use super::grammar_generator::SymbolHandle;
 
@@ -4112,7 +4111,7 @@ mod tests {
     #[test]
     #[cfg(feature = "test_helper")]
     pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
-        use crate::common::rusqlite_integrity_check;
+        use core_tester::common::rusqlite_integrity_check;
 
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
