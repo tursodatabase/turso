@@ -1,5 +1,6 @@
 mod ext;
 extern crate proc_macro;
+mod atomic_enum;
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
 
@@ -463,4 +464,31 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
     ext::match_ignore_ascci_case(input)
+}
+
+/// Derive macro for creating atomic wrappers for enums
+///
+/// Supports:
+/// - Unit variants
+/// - Variants with single bool/u8/i8 fields
+/// - Named or unnamed fields
+///
+/// Algorithm:
+/// - Uses u8 representation, splitting bits for variant discriminant and field data
+/// - For bool fields: high bit for bool, lower 7 bits for discriminant
+/// - For u8/i8 fields: uses u16 internally (8 bits discriminant, 8 bits data)
+///
+/// Example:
+/// ```ignore
+/// #[derive(AtomicEnum)]
+/// enum TransactionState {
+///     Write { schema_did_change: bool },
+///     Read,
+///     PendingUpgrade,
+///     None,
+/// }
+/// ```
+#[proc_macro_derive(AtomicEnum)]
+pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
+    atomic_enum::derive_atomic_enum_inner(input)
 }

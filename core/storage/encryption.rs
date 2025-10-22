@@ -10,7 +10,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes128Gcm, Aes256Gcm, Key, Nonce,
 };
-use turso_macros::match_ignore_ascii_case;
+use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 
 /// Encryption Scheme
 /// We support two major algorithms: AEGIS, AES GCM. These algorithms picked so that they also do
@@ -319,8 +319,9 @@ define_aegis_cipher!(
     "AEGIS-128X4"
 );
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq)]
 pub enum CipherMode {
+    None,
     Aes128Gcm,
     Aes256Gcm,
     Aegis256,
@@ -363,6 +364,7 @@ impl std::fmt::Display for CipherMode {
             CipherMode::Aegis128X4 => write!(f, "aegis128x4"),
             CipherMode::Aegis256X2 => write!(f, "aegis256x2"),
             CipherMode::Aegis256X4 => write!(f, "aegis256x4"),
+            CipherMode::None => write!(f, "None"),
         }
     }
 }
@@ -380,6 +382,7 @@ impl CipherMode {
             CipherMode::Aegis128L => 16,
             CipherMode::Aegis128X2 => 16,
             CipherMode::Aegis128X4 => 16,
+            CipherMode::None => 0,
         }
     }
 
@@ -394,6 +397,7 @@ impl CipherMode {
             CipherMode::Aegis128L => 16,
             CipherMode::Aegis128X2 => 16,
             CipherMode::Aegis128X4 => 16,
+            CipherMode::None => 0,
         }
     }
 
@@ -408,6 +412,7 @@ impl CipherMode {
             CipherMode::Aegis128L => 16,
             CipherMode::Aegis128X2 => 16,
             CipherMode::Aegis128X4 => 16,
+            CipherMode::None => 0,
         }
     }
 
@@ -427,6 +432,7 @@ impl CipherMode {
             CipherMode::Aegis128L => 6,
             CipherMode::Aegis128X2 => 7,
             CipherMode::Aegis128X4 => 8,
+            CipherMode::None => 0,
         }
     }
 
@@ -503,6 +509,11 @@ impl EncryptionContext {
             CipherMode::Aegis128L => Cipher::Aegis128L(Box::new(Aegis128LCipher::new(key))),
             CipherMode::Aegis128X2 => Cipher::Aegis128X2(Box::new(Aegis128X2Cipher::new(key))),
             CipherMode::Aegis128X4 => Cipher::Aegis128X4(Box::new(Aegis128X4Cipher::new(key))),
+            CipherMode::None => {
+                return Err(LimboError::InvalidArgument(
+                    "must select valid CipherMode".into(),
+                ))
+            }
         };
         Ok(Self {
             cipher_mode,

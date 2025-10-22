@@ -11,6 +11,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::HashMap,
     rc::Rc,
