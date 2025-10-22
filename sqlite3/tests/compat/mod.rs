@@ -1034,47 +1034,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_select_without_callback_fails() {
-        unsafe {
-            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
-            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
-            let mut db = ptr::null_mut();
-            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
-
-            sqlite3_exec(
-                db,
-                c"CREATE TABLE test(x INTEGER)".as_ptr(),
-                None,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-
-            // SELECT without callback should fail
-            let mut err_msg = ptr::null_mut();
-            let rc = sqlite3_exec(
-                db,
-                c"SELECT * FROM test".as_ptr(),
-                None,
-                ptr::null_mut(),
-                &mut err_msg,
-            );
-            assert_eq!(rc, SQLITE_MISUSE);
-
-            if !err_msg.is_null() {
-                let msg = std::ffi::CStr::from_ptr(err_msg).to_str().unwrap();
-                println!("Error message: {msg:?}");
-                assert!(msg.contains("callback") || msg.contains("prepare"));
-                // Free the error message
-                sqlite3_free(err_msg as *mut std::ffi::c_void);
-            }
-
-            let rc = sqlite3_close(db);
-            println!("RESULT: {rc}");
-            assert_eq!(rc, SQLITE_OK);
-        }
-    }
-
-    #[test]
     fn test_exec_callback_abort() {
         unsafe {
             // Callback that aborts after first row
@@ -1382,7 +1341,7 @@ mod tests {
             assert_eq!(rc, SQLITE_OK);
             assert!(callback_count > 0); // PRAGMA should return at least one row
 
-            // PRAGMA without callback should fail
+            // PRAGMA without callback should discard row
             let mut err_msg = ptr::null_mut();
             let rc = sqlite3_exec(
                 db,
@@ -1391,7 +1350,7 @@ mod tests {
                 ptr::null_mut(),
                 &mut err_msg,
             );
-            assert_eq!(rc, SQLITE_MISUSE);
+            assert_eq!(rc, SQLITE_OK);
             if !err_msg.is_null() {
                 sqlite3_free(err_msg as *mut std::ffi::c_void);
             }
@@ -1489,7 +1448,7 @@ mod tests {
 
             let mut results: Vec<Vec<String>> = Vec::new();
 
-            // INSERT...RETURNING should be treated as DQL
+            // INSERT...RETURNING with callback should capture the returned values
             let rc = sqlite3_exec(
                 db,
                 c"CREATE TABLE test(id INTEGER PRIMARY KEY, x INTEGER);\
@@ -1503,19 +1462,55 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0][1], "42"); // x value
 
-            // RETURNING without callback should fail
-            let mut err_msg = ptr::null_mut();
-            let rc = sqlite3_exec(
+            // Add another row for testing
+            sqlite3_exec(
                 db,
-                c"DELETE FROM test WHERE x=42 RETURNING id".as_ptr(),
+                c"INSERT INTO test(x) VALUES(99)".as_ptr(),
                 None,
                 ptr::null_mut(),
-                &mut err_msg,
+                ptr::null_mut(),
             );
-            assert_eq!(rc, SQLITE_MISUSE);
-            if !err_msg.is_null() {
-                sqlite3_free(err_msg as *mut std::ffi::c_void);
-            }
+
+            // should still delete the row but discard the RETURNING results
+            let rc = sqlite3_exec(
+                db,
+                c"UPDATE test SET id = 3, x = 41 WHERE x=42 RETURNING id".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify the row was actually updated
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test WHERE x=42".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 0); // Should be 0 rows with x=42
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Verify
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 2);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
