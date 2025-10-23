@@ -1,4 +1,5 @@
 ﻿using AwesomeAssertions;
+using Turso.Raw.Public;
 
 namespace Turso.Tests;
 
@@ -224,4 +225,11 @@ public class TursoTests
         reader2.Read().Should().BeTrue();
         reader2.GetInt32(0).Should().Be(0);
     }
+
+    [Test]
+    public void TestDataReaderEnumerable()
+    {
+        
+    }
+
 }

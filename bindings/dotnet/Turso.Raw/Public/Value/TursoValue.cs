@@ -1,7 +1,4 @@
-using System.Runtime.InteropServices;
-using Turso.Native;
-
-namespace Turso.RowValue;
+namespace Turso.Raw.Public.Value;
 
 public struct TursoValue
 {

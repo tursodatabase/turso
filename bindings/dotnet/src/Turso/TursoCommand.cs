@@ -1,6 +1,7 @@
 ﻿using System.Data;
 using System.Data.Common;
-using Turso.Native;
+using Turso.Raw.Public;
+using Turso.Raw.Public.Handles;
 
 namespace Turso;
 
@@ -10,7 +11,7 @@ public class TursoCommand : DbCommand
     private TursoParameterCollection _parameterCollection = new();
 
     private TursoTransaction? _transaction;
-    private TursoNativeStatement? _statement;
+    private TursoStatementHandle? _statement;
 
     public TursoCommand(TursoConnection connection, TursoTransaction? transaction = null)
     {
@@ -54,9 +55,7 @@ public class TursoCommand : DbCommand
         get => _transaction;
         set => _transaction = value as TursoTransaction ?? throw new ArgumentException();
     }
-
-    internal TursoNativeDatabase Turso => _connection.Turso;
-
+    
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
@@ -84,20 +83,20 @@ public class TursoCommand : DbCommand
 
     public override void Prepare()
     {
-        _statement = _connection.Turso.PrepareStatement(CommandText);
+        _statement = TursoBindings.PrepareStatement(_connection.Turso, CommandText);
         for (var i = 0; i < _parameterCollection.Count; i++)
         {
             var parameter = _parameterCollection[i] as TursoParameter;
             if (parameter == null)
                 throw new ArgumentException("Parameter must be of type TursoParameter");
 
-            if (parameter.ParameterName is not null)
+            if (!string.IsNullOrEmpty(parameter.ParameterName))
             {
-                _statement.BindNamedParameter(parameter);
+                TursoBindings.BindNamedParameter(_statement, parameter.ParameterName, parameter.ToValue());
             }
             else
             {
-                _statement.BindParameter(i + 1, parameter);
+                TursoBindings.BindParameter(_statement, i + 1, parameter.ToValue());
             }
         }
     }

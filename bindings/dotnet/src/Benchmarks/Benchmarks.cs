@@ -1,7 +1,9 @@
 using System.Data;
 using System.Data.SQLite;
+using System.Runtime.CompilerServices;
 using BenchmarkDotNet.Attributes;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 using Turso;
 
 namespace Benchmarks;
@@ -24,7 +26,6 @@ public class Benchmarks
 
         _tursoConnection = new TursoConnection("Data Source=:memory:");
         _tursoConnection.Open();
-
         CreateTable(_systemDataSqliteConnection);
         CreateTable(_microsoftDataSqliteConnection);
         CreateTable(_tursoConnection);
@@ -50,11 +51,16 @@ public class Benchmarks
         insertCommand.ExecuteNonQuery();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Select(IDbConnection connection)
     {
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM t;";
         using var reader = command.ExecuteReader();
-        while (reader.Read());
+        var sum = 0;
+        while (reader.Read()) 
+            sum += reader.GetInt32(0);
+        
+        GC.KeepAlive(sum);
     }
 }

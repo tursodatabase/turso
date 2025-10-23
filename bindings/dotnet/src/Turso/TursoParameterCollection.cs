@@ -76,7 +76,7 @@ public class TursoParameterCollection : DbParameterCollection
     {
         var index = IndexOf(value);
         if (index == -1)
-            throw new TursoException($"Parameter {value} not found");
+            throw new ArgumentException($"Parameter {value} not found");
         _parameters.RemoveAt(index);
     }
 
@@ -89,7 +89,7 @@ public class TursoParameterCollection : DbParameterCollection
     {
         var index = IndexOf(parameterName);
         if (index == -1)
-            throw new TursoException($"Parameter {parameterName} not found");
+            throw new ArgumentException($"Parameter {parameterName} not found");
 
         _parameters.RemoveAt(index);
     }
@@ -102,21 +102,21 @@ public class TursoParameterCollection : DbParameterCollection
     protected override DbParameter GetParameter(string parameterName)
     {
         return _parameters.Find(p => p.ParameterName == parameterName)
-               ?? throw new TursoException($"Parameter {parameterName} not found");
+               ?? throw new ArgumentException($"Parameter {parameterName} not found");
     }
 
     protected override void SetParameter(int index, DbParameter value)
     {
         _parameters[index] = value as TursoParameter
-                             ?? throw new TursoException($"Parameter {value} is not a TursoParameter");
+                             ?? throw new ArgumentException($"Parameter {value} is not a TursoParameter");
     }
 
     protected override void SetParameter(string parameterName, DbParameter value)
     {
         var index = IndexOf(parameterName);
         if (index == -1)
-            throw new TursoException($"Parameter {parameterName} not found");
+            throw new ArgumentException($"Parameter {parameterName} not found");
         _parameters[index] = value as TursoParameter
-                             ?? throw new TursoException($"Parameter {value} is not a TursoParameter");
+                             ?? throw new ArgumentException($"Parameter {value} is not a TursoParameter");
     }
 }
