@@ -819,7 +819,7 @@ fn bench_limbo_mvcc(
                     stmt.reset();
                 }
                 Err(err) => {
-                    if let LimboError::SchemaUpdated = err {
+                    if let LimboError::SchemaUpdated { .. } = err {
                         conn.current_statement = Some(
                             conn.conn
                                 .prepare(conn.current_insert.clone().as_ref().unwrap())

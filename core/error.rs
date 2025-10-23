@@ -57,8 +57,12 @@ pub enum LimboError {
     Busy,
     #[error("Conflict: {0}")]
     Conflict(String),
-    #[error("Database schema changed")]
-    SchemaUpdated,
+    #[error("Database schema changed: new_schema_version={new_schema_version:?}")]
+    SchemaUpdated {
+        // This is optional because MVCC doesn't specify the new schema version currently, since it returns
+        // generic "schema was updated in some way" errors. Remove optionality if/when that changes.
+        new_schema_version: Option<u32>,
+    },
     #[error(
         "Database is empty, header does not exist - page 1 should've been allocated before this"
     )]

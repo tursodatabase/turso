@@ -2438,7 +2438,9 @@ pub fn op_transaction_inner(
                                 header_schema_cookie,
                                 *schema_cookie
                             );
-                            return Err(LimboError::SchemaUpdated);
+                            return Err(LimboError::SchemaUpdated {
+                                new_schema_version: Some(header_schema_cookie),
+                            });
                         }
                     }
                     Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),

@@ -426,7 +426,7 @@ fn perform_work(
                 Ok(result) => matches!(result, turso_core::StepResult::Done),
                 Err(e) => {
                     match e {
-                        turso_core::LimboError::SchemaUpdated => {
+                        turso_core::LimboError::SchemaUpdated { .. } => {
                             trace!("{} Schema changed, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);

@@ -465,7 +465,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     > tx.begin_ts
                 {
                     // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
-                    return Err(LimboError::SchemaUpdated);
+                    return Err(LimboError::SchemaUpdated {
+                        new_schema_version: None,
+                    });
                 }
 
                 tx.state.store(TransactionState::Preparing);

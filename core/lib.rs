@@ -2550,11 +2550,9 @@ impl Statement {
             );
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                let Err(LimboError::SchemaUpdated { new_schema_version }) = res else {
                     break;
-                }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
+                };
                 res = self.program.step(
                     &mut self.state,
                     self.mv_store.as_ref(),
