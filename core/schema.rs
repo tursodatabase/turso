@@ -1,7 +1,6 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
-use crate::index::HIDDEN_BTREE_MODULE_NAME;
-use crate::numeric::Numeric;
+use crate::index::{IndexConfiguration, IndexDescriptor};
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
@@ -488,7 +487,7 @@ impl Schema {
 
         pager.end_read_tx();
 
-        self.populate_indices(from_sql_indexes, automatic_indices)?;
+        self.populate_indices(syms, from_sql_indexes, automatic_indices)?;
 
         self.populate_materialized_views(
             materialized_view_info,
@@ -504,6 +503,7 @@ impl Schema {
     /// automatic_indices: indices created automatically for primary key and unique constraints
     pub fn populate_indices(
         &mut self,
+        syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
     ) -> Result<()> {
@@ -515,6 +515,7 @@ impl Schema {
                     .get_btree_table(&unparsed_sql_from_index.table_name)
                     .unwrap();
                 let index = Index::from_sql(
+                    syms,
                     &unparsed_sql_from_index.sql,
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
@@ -2422,8 +2423,7 @@ pub struct Index {
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
-    pub module_name: Option<String>,
-    pub module_parameters: Option<HashMap<String, Value>>,
+    pub module: Option<Arc<dyn IndexDescriptor>>,
 }
 
 #[allow(dead_code)]
@@ -2442,7 +2442,12 @@ pub struct IndexColumn {
 }
 
 impl Index {
-    pub fn from_sql(sql: &str, root_page: i64, table: &BTreeTable) -> Result<Index> {
+    pub fn from_sql(
+        syms: &SymbolTable,
+        sql: &str,
+        root_page: i64,
+        table: &BTreeTable,
+    ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
@@ -2466,6 +2471,16 @@ impl Index {
                         bail_parse_error!("custom index module do not support UNIQUE indices");
                     }
                     let parameters = resolve_module_parameters(with_clause)?;
+                    let Some(module) = syms.index_modules.get(using.as_str()) else {
+                        bail_parse_error!("unknown module name: '{}'", using);
+                    };
+                    let configuration = IndexConfiguration {
+                        table_name: table.name.clone(),
+                        index_name: index_name.clone(),
+                        columns: index_columns.iter().map(|x| x.name.clone()).collect(),
+                        parameters,
+                    };
+                    let descriptor = module.descriptor(&configuration)?;
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -2475,8 +2490,7 @@ impl Index {
                         ephemeral: false,
                         has_rowid: table.has_rowid,
                         where_clause: None,
-                        module_name: Some(using.as_str().to_string()),
-                        module_parameters: Some(parameters),
+                        module: Some(descriptor),
                     })
                 } else {
                     Ok(Index {
@@ -2488,8 +2502,7 @@ impl Index {
                         ephemeral: false,
                         has_rowid: table.has_rowid,
                         where_clause,
-                        module_name: None,
-                        module_parameters: None,
+                        module: None,
                     })
                 }
             }
@@ -2498,7 +2511,7 @@ impl Index {
     }
 
     pub fn is_hidden_btree_index(&self) -> bool {
-        self.module_name.as_deref() == Some(HIDDEN_BTREE_MODULE_NAME)
+        self.module.as_ref().is_some_and(|x| x.definition().hidden)
     }
 
     pub fn automatic_from_primary_key(
@@ -2540,8 +2553,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
-            module_name: None,
-            module_parameters: None,
+            module: None,
         })
     }
 
@@ -2579,8 +2591,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
-            module_name: None,
-            module_parameters: None,
+            module: None,
         })
     }
 

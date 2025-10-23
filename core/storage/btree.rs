@@ -8547,8 +8547,7 @@ mod tests {
                 unique: false,
                 ephemeral: false,
                 has_rowid: false,
-                module_name: None,
-                module_parameters: None,
+                module: None,
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
@@ -8708,8 +8707,7 @@ mod tests {
                 unique: false,
                 ephemeral: false,
                 has_rowid: false,
-                module_name: None,
-                module_parameters: None,
+                module: None,
             };
             let mut cursor = BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1);
 

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::index::HIDDEN_BTREE_MODULE_NAME;
+use crate::index::{IndexConfiguration, HIDDEN_BTREE_MODULE_NAME};
 use crate::numeric::Numeric;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
@@ -112,11 +112,22 @@ pub fn translate_create_index(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
         );
     }
+    let mut module = None;
     if let Some(using) = &using {
         let index_modules = &resolver.symbol_table.index_modules;
         let using = using.as_str();
-        if !index_modules.contains_key(using) && !btree_module {
+        let index_module = index_modules.get(using);
+        if !index_module.is_none() && !btree_module {
             crate::bail_parse_error!("Error: unknown module name '{}'", using);
+        }
+        if let Some(index_module) = index_module {
+            let parameters = resolve_module_parameters(with_clause)?;
+            module = Some(index_module.descriptor(&IndexConfiguration {
+                table_name: tbl.name.clone(),
+                index_name: idx_name.clone(),
+                columns: columns.iter().map(|x| x.name.clone()).collect(),
+                parameters: parameters.clone(),
+            })?);
         }
     }
     let idx = Arc::new(Index {
@@ -130,12 +141,7 @@ pub fn translate_create_index(
         // store the *original* where clause, because we need to rewrite it
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
-        module_name: using.map(|x| x.as_str().to_string()),
-        module_parameters: if custom_module {
-            Some(resolve_module_parameters(with_clause)?)
-        } else {
-            None
-        },
+        module,
     });
 
     if !idx.validate_where_expr(table) {
@@ -188,7 +194,7 @@ pub fn translate_create_index(
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
-    if idx.module_name.is_some() && idx.module_name.as_ref().unwrap() != HIDDEN_BTREE_MODULE_NAME {
+    if idx.module.as_ref().is_some_and(|m| !m.definition().hidden) {
         program.emit_insn(Insn::IdxCreate {
             db: 0,
             cursor_id: index_cursor_id,
@@ -296,6 +302,9 @@ pub fn translate_create_index(
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
+        if let Some(skip_row_label) = skip_row_label {
+            program.resolve_label(skip_row_label, program.offset());
+        }
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,

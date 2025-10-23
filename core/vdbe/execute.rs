@@ -6963,17 +6963,9 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
 
-    if let (_, CursorType::CustomModule(module, config)) = &program.cursor_ref[*cursor_id] {
-        tracing::info!("OPEN WRITE CUSTOM MODULE");
+    if let (_, CursorType::CustomModule(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
-            let syms = program.connection.syms.read();
-            let (_, cursor_type) = &program.cursor_ref[*cursor_id];
-            let CursorType::CustomModule(module, config) = cursor_type else {
-                return Err(LimboError::InternalError(
-                    "unexpected cursor type".to_string(),
-                ));
-            };
-            let cursor = module.init(&config)?;
+            let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
             *cursor_ref = Some(Cursor::CustomModule(cursor));
         }
@@ -7146,17 +7138,12 @@ pub fn op_idx_create(
     if let Some(mv_store) = mv_store {
         todo!("MVCC is not supported yet");
     }
-    if state.cursors[*cursor_id].is_none() {
-        let syms = program.connection.syms.read();
-        let (_, cursor_type) = &program.cursor_ref[*cursor_id];
-        let CursorType::CustomModule(module, config) = cursor_type else {
-            return Err(LimboError::InternalError(
-                "unexpected cursor type".to_string(),
-            ));
-        };
-        let cursor = module.init(&config)?;
-        let cursor_ref = &mut state.cursors[*cursor_id];
-        *cursor_ref = Some(Cursor::CustomModule(cursor));
+    if let (_, CursorType::CustomModule(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::CustomModule(cursor));
+        }
     }
     let cursor = state.cursors[*cursor_id].as_mut().unwrap();
     let cursor = cursor.as_custom_module_mut();

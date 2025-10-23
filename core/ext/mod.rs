@@ -1,7 +1,10 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
-use crate::index::VectorSparseInvertedIndex;
+use crate::index::{
+    HiddenBtreeIndex, VectorSparseInvertedIndex, HIDDEN_BTREE_MODULE_NAME,
+    VECTOR_SPARSE_IVF_MODULE_NAME,
+};
 use crate::schema::{Schema, Table};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
@@ -166,8 +169,12 @@ impl Database {
         {
             let mut syms = self.builtin_syms.write();
             syms.index_modules.insert(
-                "vector_sparse_ivf".to_string(),
+                VECTOR_SPARSE_IVF_MODULE_NAME.to_string(),
                 Arc::new(VectorSparseInvertedIndex),
+            );
+            syms.index_modules.insert(
+                HIDDEN_BTREE_MODULE_NAME.to_string(),
+                Arc::new(HiddenBtreeIndex),
             );
         }
         let syms = self.builtin_syms.data_ptr();

@@ -3,6 +3,7 @@ use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
     Search, TableReferences, WhereTerm, Window,
 };
+use crate::index::IndexConfiguration;
 use crate::schema::Table;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
@@ -19,6 +20,7 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::Connection;
 use crate::{vdbe::builder::ProgramBuilder, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};

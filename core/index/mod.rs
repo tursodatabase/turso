@@ -9,7 +9,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     vector::vector_types::{Vector, VectorType},
-    Connection, LimboError, MvStore, Result, Statement, Value,
+    Connection, LimboError, Result, Statement, Value,
 };
 
 #[derive(Debug, Clone)]
@@ -17,17 +17,64 @@ pub struct IndexConfiguration {
     pub table_name: String,
     pub index_name: String,
     pub columns: Vec<String>,
-    pub settings: HashMap<String, Value>,
+    pub parameters: HashMap<String, Value>,
 }
 
 pub trait IndexModule: std::fmt::Debug + Send + Sync {
-    fn init(&self, configuration: &IndexConfiguration) -> Result<Box<dyn IndexCursor>>;
+    fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>>;
+}
+
+pub trait IndexDescriptor: std::fmt::Debug + Send + Sync {
+    fn definition<'a>(&'a self) -> IndexDefinition<'a>;
+    fn init(&self) -> Result<Box<dyn IndexCursor>>;
 }
 
 pub const HIDDEN_BTREE_MODULE_NAME: &str = "btree";
+pub const VECTOR_SPARSE_IVF_MODULE_NAME: &str = "vector_sparse_ivf";
+
+#[derive(Debug)]
+pub struct HiddenBtreeIndex;
+
+#[derive(Debug)]
+pub struct HiddenBTreeIndexDescriptor(IndexConfiguration);
+
+impl IndexModule for HiddenBtreeIndex {
+    fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>> {
+        Ok(Arc::new(HiddenBTreeIndexDescriptor(configuration.clone())))
+    }
+}
+
+impl IndexDescriptor for HiddenBTreeIndexDescriptor {
+    fn definition<'a>(&'a self) -> IndexDefinition<'a> {
+        IndexDefinition {
+            module_name: HIDDEN_BTREE_MODULE_NAME,
+            index_name: &self.0.index_name,
+            patterns: &[],
+            hidden: true,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn IndexCursor>> {
+        panic!("hidden 'fake' module which acts as a regular btree")
+    }
+}
+
+#[derive(Debug)]
+pub struct IndexDefinition<'a> {
+    pub module_name: &'a str,
+    pub index_name: &'a str,
+    pub patterns: &'a [String],
+    pub hidden: bool,
+}
 
 #[derive(Debug)]
 pub struct VectorSparseInvertedIndex;
+
+#[derive(Debug)]
+pub struct VectorSparseInvertedIndexDescriptor {
+    configuration: IndexConfiguration,
+    patterns: Vec<String>,
+}
 
 pub enum VectorSparseInvertedIndexCreateState {
     Init,
@@ -79,16 +126,34 @@ pub struct VectorSparseInvertedIndexCursor {
     configuration: IndexConfiguration,
     scratch_btree: String,
     cursor: Option<BTreeCursor>,
-    definition: IndexDefinition,
     create_state: VectorSparseInvertedIndexCreateState,
     insert_state: VectorSparseInvertedIndexInsertState,
     delete_state: VectorSparseInvertedIndexDeleteState,
 }
 
 impl IndexModule for VectorSparseInvertedIndex {
-    fn init(&self, configuration: &IndexConfiguration) -> Result<Box<dyn IndexCursor>> {
+    fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>> {
+        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, :v) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
+        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(:v, {}) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
+        Ok(Arc::new(VectorSparseInvertedIndexDescriptor {
+            configuration: configuration.clone(),
+            patterns: vec![query_pattern1, query_pattern2],
+        }))
+    }
+}
+
+impl IndexDescriptor for VectorSparseInvertedIndexDescriptor {
+    fn definition<'a>(&'a self) -> IndexDefinition<'a> {
+        IndexDefinition {
+            module_name: VECTOR_SPARSE_IVF_MODULE_NAME,
+            index_name: &self.configuration.index_name,
+            patterns: self.patterns.as_slice(),
+            hidden: false,
+        }
+    }
+    fn init(&self) -> Result<Box<dyn IndexCursor>> {
         Ok(Box::new(VectorSparseInvertedIndexCursor::new(
-            configuration.clone(),
+            self.configuration.clone(),
         )))
     }
 }
@@ -96,15 +161,9 @@ impl IndexModule for VectorSparseInvertedIndex {
 impl VectorSparseInvertedIndexCursor {
     pub fn new(configuration: IndexConfiguration) -> Self {
         let scratch_btree = format!("{}_scratch", configuration.index_name);
-        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, :v) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
-        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(:v, {}) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
-        let definition = IndexDefinition {
-            patterns: vec![query_pattern1, query_pattern2],
-        };
         Self {
             configuration,
             scratch_btree,
-            definition,
             cursor: None,
             create_state: VectorSparseInvertedIndexCreateState::Init,
             insert_state: VectorSparseInvertedIndexInsertState::Init,
@@ -114,10 +173,6 @@ impl VectorSparseInvertedIndexCursor {
 }
 
 impl IndexCursor for VectorSparseInvertedIndexCursor {
-    fn definition(&self) -> IndexDefinition {
-        todo!()
-    }
-
     fn create(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
         loop {
             match &mut self.create_state {
@@ -404,13 +459,7 @@ fn open_btree_cursor(
     Ok(cursor)
 }
 
-pub struct IndexDefinition {
-    pub patterns: Vec<String>,
-}
-
 pub trait IndexCursor {
-    fn definition(&self) -> IndexDefinition;
-
     fn create(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
     fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
 

@@ -19,12 +19,12 @@ pub fn insn_to_row(
     let get_table_or_index_name = |cursor_id: usize| {
         let cursor_type = &program.cursor_ref[cursor_id].1;
         match cursor_type {
-            CursorType::BTreeTable(table) => &table.name,
-            CursorType::BTreeIndex(index) => &index.name,
-            CursorType::CustomModule(_, config) => &config.index_name,
+            CursorType::BTreeTable(table) => &table.name.as_str(),
+            CursorType::BTreeIndex(index) => &index.name.as_str(),
+            CursorType::CustomModule(descriptor) => &descriptor.definition().index_name,
             CursorType::Pseudo(_) => "pseudo",
-            CursorType::VirtualTable(virtual_table) => &virtual_table.name,
-            CursorType::MaterializedView(table, _) => &table.name,
+            CursorType::VirtualTable(virtual_table) => &virtual_table.name.as_str(),
+            CursorType::MaterializedView(table, _) => &table.name.as_str(),
             CursorType::Sorter => "sorter",
         }
     };

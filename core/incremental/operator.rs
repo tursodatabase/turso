@@ -70,8 +70,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         ephemeral: false,
         has_rowid: true,
         where_clause: None,
-        module_name: None,
-        module_parameters: None,
+        module: None,
     }
 }
 

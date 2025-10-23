@@ -84,6 +84,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     let best_join_order = optimize_table_access(
         schema,
+        &plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
@@ -109,6 +110,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
 
     let _ = optimize_table_access(
         schema,
+        &plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
@@ -133,6 +135,7 @@ fn optimize_update_plan(
     }
     let _ = optimize_table_access(
         schema,
+        &[],
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
@@ -318,6 +321,34 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     Ok(())
 }
 
+fn optimize_table_access_with_custom_modules(
+    schema: &Schema,
+    result_columns: &[ResultSetColumn],
+    table_references: &mut TableReferences,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    where_clause: &mut [WhereTerm],
+    order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
+    group_by: &mut Option<GroupBy>,
+) -> Result<bool> {
+    let tables = table_references.joined_tables_mut();
+    assert_eq!(tables.len(), 1);
+
+    tracing::info!("available: {:?}", available_indexes);
+    let table = &mut tables[0];
+    let Some(indexes) = available_indexes.get(table.table.get_name()) else {
+        return Ok(false);
+    };
+    for index in indexes {
+        tracing::info!("INDEX!");
+        let Some(module) = &index.module else {
+            continue;
+        };
+        let definition = module.definition();
+        tracing::info!("definition: {:?}", definition);
+    }
+    Ok(false)
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -331,6 +362,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
 fn optimize_table_access(
     schema: &Schema,
+    result_columns: &[ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
@@ -343,6 +375,22 @@ fn optimize_table_access(
             TableReferences::MAX_JOINED_TABLES
         );
     }
+
+    if table_references.joined_tables().len() == 1 {
+        let optimized = optimize_table_access_with_custom_modules(
+            schema,
+            result_columns,
+            table_references,
+            available_indexes,
+            where_clause,
+            order_by,
+            group_by,
+        )?;
+        if optimized {
+            return Ok(None);
+        }
+    }
+
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
     let constraints_per_table =
@@ -1076,8 +1124,7 @@ fn ephemeral_index_build(
             .table
             .btree()
             .is_some_and(|btree| btree.has_rowid),
-        module_name: None,
-        module_parameters: None,
+        module: None,
     };
 
     ephemeral_index

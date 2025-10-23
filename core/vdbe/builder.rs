@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
     sync::{atomic::AtomicI64, Arc},
 };
 
@@ -8,7 +7,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
-    index::{IndexConfiguration, IndexModule, HIDDEN_BTREE_MODULE_NAME},
+    index::IndexDescriptor,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
@@ -18,7 +17,7 @@ use crate::{
         expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, LimboError, Value, VirtualTable,
+    CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
 #[derive(Default)]
@@ -132,7 +131,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
-    CustomModule(Arc<dyn IndexModule>, IndexConfiguration),
+    CustomModule(Arc<dyn IndexDescriptor>),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
@@ -332,27 +331,10 @@ impl ProgramBuilder {
         resolver: &Resolver,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
-        let module_name = index.module_name.as_deref();
-        if module_name.is_some() && module_name != Some(HIDDEN_BTREE_MODULE_NAME) {
-            let module_name = module_name.unwrap();
-            let Some(module) = resolver.symbol_table.index_modules.get(module_name) else {
-                return Err(LimboError::InternalError(format!(
-                    "unknown module '{}'",
-                    module_name
-                )));
-            };
-            let configuration = IndexConfiguration {
-                table_name: index.table_name.clone(),
-                index_name: index.name.clone(),
-                columns: index.columns.iter().map(|x| x.name.clone()).collect(),
-                settings: index
-                    .module_parameters
-                    .clone()
-                    .unwrap_or_else(|| HashMap::new()),
-            };
-            return Ok(
-                self._alloc_cursor_id(key, CursorType::CustomModule(module.clone(), configuration))
-            );
+        let module = index.module.as_ref();
+        if module.is_some_and(|m| !m.definition().hidden) {
+            let module = module.unwrap().clone();
+            return Ok(self._alloc_cursor_id(key, CursorType::CustomModule(module)));
         }
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
