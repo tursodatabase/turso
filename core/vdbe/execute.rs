@@ -2438,12 +2438,16 @@ pub fn op_transaction_inner(
                 let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
-                        if header_schema_cookie != *schema_cookie {
+                        let generation_counter = program
+                            .connection
+                            .with_schema(0, |schema| schema.generation.load(Ordering::SeqCst));
+                        if header_schema_cookie != *schema_cookie
+                            || generation_counter != *schema_generation
+                        {
                             tracing::debug!(
-                                "schema changed, force reprepare: {} != {}",
-                                header_schema_cookie,
-                                *schema_cookie
+                                "schema changed, force reprepare: (header_schema_cookie={header_schema_cookie}, schema_cookie={schema_cookie}, generation_counter={generation_counter}, schema_generation={schema_generation})",
                             );
+                            state.auto_txn_cleanup = TxnCleanup::None;
                             return Err(LimboError::SchemaUpdated {
                                 new_schema_version: Some(header_schema_cookie),
                             });
