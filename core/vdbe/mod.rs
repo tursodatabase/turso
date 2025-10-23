@@ -722,6 +722,9 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
+                    if matches!(err, LimboError::SchemaUpdated { .. }) {
+                        return Err(err);
+                    }
                     self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
