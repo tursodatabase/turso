@@ -1130,7 +1130,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
-        if connection.is_nested_stmt.load(Ordering::SeqCst) {
+        if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
@@ -1160,7 +1160,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
-        if connection.is_nested_stmt.load(Ordering::SeqCst) {
+        if connection.is_nested_stmt() {
             // Parent statement will handle the transaction rollback.
             return;
         }
