@@ -328,14 +328,13 @@ impl ProgramBuilder {
 
     pub fn alloc_cursor_index(
         &mut self,
+        key: Option<CursorKey>,
         resolver: &Resolver,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
         let module_name = index.module_name.as_deref();
-        if module_name.is_some()
-            && module_name != Some(HIDDEN_BTREE_MODULE_NAME)
-        {
-            let module_name = index.module_name.unwrap();
+        if module_name.is_some() && module_name != Some(HIDDEN_BTREE_MODULE_NAME) {
+            let module_name = module_name.unwrap();
             let Some(module) = resolver.symbol_table.index_modules.get(module_name) else {
                 return Err(LimboError::InternalError(format!(
                     "unknown module '{}'",
@@ -352,10 +351,10 @@ impl ProgramBuilder {
                     .unwrap_or_else(|| HashMap::new()),
             };
             return Ok(
-                self.alloc_cursor_id(CursorType::CustomModule(module.clone(), configuration))
+                self._alloc_cursor_id(key, CursorType::CustomModule(module.clone(), configuration))
             );
         }
-        Ok(self.alloc_cursor_id(CursorType::BTreeIndex(index.clone())))
+        Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {

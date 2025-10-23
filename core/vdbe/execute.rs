@@ -6325,6 +6325,12 @@ pub fn op_idx_delete(
         insn
     );
 
+    if let Some(Cursor::CustomModule(cursor)) = &mut state.cursors[*cursor_id] {
+        return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs as usize]));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     loop {
         #[cfg(debug_assertions)]
         tracing::debug!(
@@ -6958,6 +6964,7 @@ pub fn op_open_write(
     let pager = program.get_pager_from_database_index(db);
 
     if let (_, CursorType::CustomModule(module, config)) = &program.cursor_ref[*cursor_id] {
+        tracing::info!("OPEN WRITE CUSTOM MODULE");
         if state.cursors[*cursor_id].is_none() {
             let syms = program.connection.syms.read();
             let (_, cursor_type) = &program.cursor_ref[*cursor_id];

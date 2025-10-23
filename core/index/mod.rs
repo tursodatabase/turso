@@ -6,7 +6,7 @@ use crate::{
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp},
+    types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
     vector::vector_types::{Vector, VectorType},
     Connection, LimboError, MvStore, Result, Statement, Value,
@@ -55,12 +55,34 @@ pub enum VectorSparseInvertedIndexInsertState {
     },
 }
 
+pub enum VectorSparseInvertedIndexDeleteState {
+    Init,
+    Prepare {
+        positions: Option<Vec<u32>>,
+        rowid: i64,
+        idx: usize,
+    },
+    Seek {
+        positions: Option<Vec<u32>>,
+        key: Option<ImmutableRecord>,
+        rowid: i64,
+        idx: usize,
+    },
+    Insert {
+        positions: Option<Vec<u32>>,
+        rowid: i64,
+        idx: usize,
+    },
+}
+
 pub struct VectorSparseInvertedIndexCursor {
     configuration: IndexConfiguration,
     scratch_btree: String,
     cursor: Option<BTreeCursor>,
+    definition: IndexDefinition,
     create_state: VectorSparseInvertedIndexCreateState,
     insert_state: VectorSparseInvertedIndexInsertState,
+    delete_state: VectorSparseInvertedIndexDeleteState,
 }
 
 impl IndexModule for VectorSparseInvertedIndex {
@@ -74,12 +96,19 @@ impl IndexModule for VectorSparseInvertedIndex {
 impl VectorSparseInvertedIndexCursor {
     pub fn new(configuration: IndexConfiguration) -> Self {
         let scratch_btree = format!("{}_scratch", configuration.index_name);
+        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, :v) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
+        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(:v, {}) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
+        let definition = IndexDefinition {
+            patterns: vec![query_pattern1, query_pattern2],
+        };
         Self {
             configuration,
             scratch_btree,
+            definition,
             cursor: None,
             create_state: VectorSparseInvertedIndexCreateState::Init,
             insert_state: VectorSparseInvertedIndexInsertState::Init,
+            delete_state: VectorSparseInvertedIndexDeleteState::Init,
         }
     }
 }
@@ -115,7 +144,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
         }
     }
 
-    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<()> {
+    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
         todo!()
     }
 
@@ -239,15 +268,101 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
         }
     }
 
-    fn delete(&mut self, rowid: i64) -> Result<IOResult<()>> {
-        todo!()
+    fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+        let Some(cursor) = &mut self.cursor else {
+            return Err(LimboError::InternalError(
+                "cursor must be opened".to_string(),
+            ));
+        };
+        tracing::info!("delete: {:?}", values);
+        loop {
+            match &mut self.delete_state {
+                VectorSparseInvertedIndexDeleteState::Init => {
+                    let Some(vector) = values[0].get_value().to_blob() else {
+                        return Err(LimboError::InternalError(
+                            "first value must be sparse vector".to_string(),
+                        ));
+                    };
+                    let Some(rowid) = values[1].get_value().as_int() else {
+                        return Err(LimboError::InternalError(
+                            "second value must be i64 rowid".to_string(),
+                        ));
+                    };
+                    let vector = Vector::from_slice(vector)?;
+                    if !matches!(vector.vector_type, VectorType::Float32Sparse) {
+                        return Err(LimboError::InternalError(
+                            "first value must be sparse vector".to_string(),
+                        ));
+                    }
+                    let sparse = vector.as_f32_sparse();
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
+                        positions: Some(sparse.idx.to_vec()),
+                        rowid,
+                        idx: 0,
+                    }
+                }
+                VectorSparseInvertedIndexDeleteState::Prepare {
+                    positions,
+                    rowid,
+                    idx,
+                } => {
+                    let p = positions.as_ref().unwrap();
+                    if *idx == p.len() {
+                        self.delete_state = VectorSparseInvertedIndexDeleteState::Init;
+                        return Ok(IOResult::Done(()));
+                    }
+                    let position = p[*idx];
+                    let key = ImmutableRecord::from_values(
+                        &[Value::Integer(position as i64), Value::Integer(*rowid)],
+                        2,
+                    );
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::Seek {
+                        idx: *idx,
+                        rowid: *rowid,
+                        positions: positions.take(),
+                        key: Some(key),
+                    };
+                }
+                VectorSparseInvertedIndexDeleteState::Seek {
+                    positions,
+                    rowid,
+                    idx,
+                    key,
+                } => {
+                    let k = key.as_ref().unwrap();
+                    let result = return_if_io!(
+                        cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
+                    );
+                    if !matches!(result, SeekResult::Found) {
+                        return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
+                    }
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::Insert {
+                        idx: *idx,
+                        rowid: *rowid,
+                        positions: positions.take(),
+                    };
+                }
+                VectorSparseInvertedIndexDeleteState::Insert {
+                    positions,
+                    rowid,
+                    idx,
+                } => {
+                    let _ = return_if_io!(cursor.delete());
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
+                        idx: *idx + 1,
+                        rowid: *rowid,
+                        positions: positions.take(),
+                    };
+                }
+            }
+        }
     }
 
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>> {
         todo!()
     }
 
-    fn query_next(&mut self) -> Result<bool> {
+    fn query_next(&mut self) -> Result<IOResult<bool>> {
         todo!()
     }
 
@@ -256,11 +371,13 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn commit(&mut self) -> Result<()> {
-        todo!()
+        // no explicit commit/rollback for vector_sparse_ivf as it fully backed by btree layer
+        Ok(())
     }
 
     fn rollback(&mut self) -> Result<()> {
-        todo!()
+        // no explicit commit/rollback for vector_sparse_ivf as it fully backed by btree layer
+        Ok(())
     }
 }
 
@@ -295,15 +412,15 @@ pub trait IndexCursor {
     fn definition(&self) -> IndexDefinition;
 
     fn create(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
-    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<()>;
+    fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
 
     fn open_read(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
     fn open_write(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>>;
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>>;
-    fn delete(&mut self, rowid: i64) -> Result<IOResult<()>>;
+    fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>>;
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>>;
-    fn query_next(&mut self) -> Result<bool>;
+    fn query_next(&mut self) -> Result<IOResult<bool>>;
     fn query_column(&mut self, position: usize) -> Result<IOResult<&Value>>;
 
     fn commit(&mut self) -> Result<()>;

@@ -244,25 +244,24 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(&btree.name) {
-                        for index in indexes {
-                            if table
-                                .op
-                                .index()
-                                .is_some_and(|table_index| table_index.name == index.name)
-                            {
-                                continue;
-                            }
-                            let cursor_id = program.alloc_cursor_id_keyed(
-                                CursorKey::index(table.internal_id, index.clone()),
-                                CursorType::BTreeIndex(index.clone()),
-                            );
-                            program.emit_insn(Insn::OpenWrite {
-                                cursor_id,
-                                root_page: index.root_page.into(),
-                                db: table.database_id,
-                            });
+                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                        if table
+                            .op
+                            .index()
+                            .is_some_and(|table_index| table_index.name == index.name)
+                        {
+                            continue;
                         }
+                        let cursor_id = program.alloc_cursor_index(
+                            Some(CursorKey::index(table.internal_id, index.clone())),
+                            &t_ctx.resolver,
+                            &index,
+                        )?;
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id,
+                            root_page: index.root_page.into(),
+                            db: table.database_id,
+                        });
                     }
                 }
                 (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
@@ -339,27 +338,24 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            if let Some(indexes) =
-                                t_ctx.resolver.schema.indexes.get(table.table.get_name())
-                            {
-                                for index in indexes {
-                                    if table
-                                        .op
-                                        .index()
-                                        .is_some_and(|table_index| table_index.name == index.name)
-                                    {
-                                        continue;
-                                    }
-                                    let cursor_id = program.alloc_cursor_id_keyed(
-                                        CursorKey::index(table.internal_id, index.clone()),
-                                        CursorType::BTreeIndex(index.clone()),
-                                    );
-                                    program.emit_insn(Insn::OpenWrite {
-                                        cursor_id,
-                                        root_page: index.root_page.into(),
-                                        db: table.database_id,
-                                    });
+                            for index in t_ctx.resolver.schema.get_indices(table.table.get_name()) {
+                                if table
+                                    .op
+                                    .index()
+                                    .is_some_and(|table_index| table_index.name == index.name)
+                                {
+                                    continue;
                                 }
+                                let cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    &t_ctx.resolver,
+                                    index,
+                                )?;
+                                program.emit_insn(Insn::OpenWrite {
+                                    cursor_id,
+                                    root_page: index.root_page.into(),
+                                    db: table.database_id,
+                                });
                             }
                         }
                     }
