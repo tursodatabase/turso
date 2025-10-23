@@ -1131,7 +1131,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
         if connection.is_nested_stmt.load(Ordering::SeqCst) {
-            // Parent statement will handle the transaction rollback.
+            // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
         let Some(wal) = self.wal.as_ref() else {

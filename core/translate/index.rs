@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::numeric::Numeric;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
@@ -15,7 +17,7 @@ use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType},
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
     util::normalize_ident,
     vdbe::{
@@ -23,7 +25,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, Name, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -34,6 +36,7 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<ProgramBuilder> {
+    let sql = stmt.to_string();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -41,13 +44,14 @@ pub fn translate_create_index(
         tbl_name,
         columns,
         where_clause,
-        ..
-    } = &stmt
+        with_clause,
+        using,
+    } = stmt
     else {
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
     let original_idx_name = idx_name;
-    let idx_name = normalize_ident(idx_name.name.as_str());
+    let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -87,7 +91,7 @@ pub fn translate_create_index(
     // the name is globally unique in the schema.
     if !resolver.schema.is_unique_idx_name(&idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
-        if *if_not_exists {
+        if if_not_exists {
             return Ok(program);
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
@@ -98,29 +102,31 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
-    let original_columns = columns;
     let columns = resolve_sorted_columns(&tbl, &columns)?;
-
+    let custom_module = using.is_some();
+    tracing::info!("custom_module: {}", custom_module);
+    if !with_clause.is_empty() && !custom_module {
+        crate::bail_parse_error!(
+            "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
+        );
+    }
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns: columns
-            .iter()
-            .map(|((pos_in_table, col), order)| IndexColumn {
-                name: col.name.as_ref().unwrap().clone(),
-                order: *order,
-                pos_in_table: *pos_in_table,
-                collation: col.collation,
-                default: col.default.clone(),
-            })
-            .collect(),
-        unique: *unique,
+        columns: columns.clone(),
+        unique: unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
         // store the *original* where clause, because we need to rewrite it
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
+        module_name: using.map(|x| x.as_str().to_string()),
+        module_parameters: if custom_module {
+            Some(resolve_module_parameters(with_clause)?)
+        } else {
+            None
+        },
     });
 
     if !idx.validate_where_expr(table) {
@@ -185,7 +191,6 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let sql = stmt.to_string();
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
         &mut program,
@@ -254,8 +259,8 @@ pub fn translate_create_index(
     }
 
     let start_reg = program.alloc_registers(columns.len() + 1);
-    for (i, (col, _)) in columns.iter().enumerate() {
-        program.emit_column_or_rowid(table_cursor_id, col.0, start_reg + i);
+    for (i, col) in columns.iter().enumerate() {
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
     }
     let rowid_reg = start_reg + columns.len();
     program.emit_insn(Insn::RowId {
@@ -303,7 +308,7 @@ pub fn translate_create_index(
 
     let sorted_record_reg = program.alloc_register();
 
-    if *unique {
+    if unique {
         // Since the records to be inserted are sorted, we can compare prev with current and if they are equal,
         // we fall through to Halt with a unique constraint violation error.
         let goto_label = program.allocate_label();
@@ -377,10 +382,10 @@ pub fn translate_create_index(
     Ok(program)
 }
 
-fn resolve_sorted_columns<'a>(
-    table: &'a BTreeTable,
+pub fn resolve_sorted_columns(
+    table: &BTreeTable,
     cols: &[SortedColumn],
-) -> crate::Result<Vec<((usize, &'a Column), SortOrder)>> {
+) -> crate::Result<Vec<IndexColumn>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
         let ident = match sc.expr.as_ref() {
@@ -395,7 +400,47 @@ fn resolve_sorted_columns<'a>(
                 table.name
             );
         };
-        resolved.push((col, sc.order.unwrap_or(SortOrder::Asc)));
+        resolved.push(IndexColumn {
+            name: col.1.name.as_ref().unwrap().clone(),
+            order: sc.order.unwrap_or(SortOrder::Asc),
+            pos_in_table: col.0,
+            collation: col.1.collation,
+            default: col.1.default.clone(),
+        });
+    }
+    Ok(resolved)
+}
+
+pub fn resolve_module_parameters(
+    parameters: Vec<(Name, Box<Expr>)>,
+) -> crate::Result<HashMap<String, crate::Value>> {
+    let mut resolved = HashMap::new();
+    for (key, value) in parameters {
+        let value = match *value {
+            Expr::Literal(literal) => match literal {
+                ast::Literal::Numeric(s) => match Numeric::from(s) {
+                    Numeric::Null => crate::Value::Null,
+                    Numeric::Integer(v) => crate::Value::Integer(v),
+                    Numeric::Float(v) => crate::Value::Float(v.into()),
+                },
+                ast::Literal::Null => crate::Value::Null,
+                ast::Literal::String(s) => crate::Value::Text(s.into()),
+                ast::Literal::Blob(b) => crate::Value::Blob(
+                    b.as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            // We assume that sqlite3-parser has already validated that
+                            // the input is valid hex string, thus unwrap is safe.
+                            let hex_byte = std::str::from_utf8(pair).unwrap();
+                            u8::from_str_radix(hex_byte, 16).unwrap()
+                        })
+                        .collect(),
+                ),
+                _ => bail_parse_error!("parameters must be constant literals"),
+            },
+            _ => bail_parse_error!("parameters must be constant literals"),
+        };
+        resolved.insert(key.as_str().to_string(), value);
     }
     Ok(resolved)
 }
