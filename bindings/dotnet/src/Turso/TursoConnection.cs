@@ -1,12 +1,13 @@
 ﻿using System.Data;
 using System.Data.Common;
-using Turso.Native;
+using Turso.Raw.Public;
+using Turso.Raw.Public.Handles;
 
 namespace Turso;
 
 public class TursoConnection : DbConnection
 {
-    private TursoNativeDatabase? _turso = null;
+    private TursoDatabaseHandle? _turso = null;
 
     private TursoConnectionOptions _connectionOptions;
 
@@ -36,7 +37,7 @@ public class TursoConnection : DbConnection
     public override void Open()
     {
         var filename = _connectionOptions["Data Source"] ?? ":memory:";
-        _turso = new TursoNativeDatabase(filename);
+        _turso = TursoBindings.OpenDatabase(filename);
     }
 
     public override void Close()
@@ -45,7 +46,6 @@ public class TursoConnection : DbConnection
         _turso = null;
     }
 
-    internal TursoNativeDatabase Turso => _turso;
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
@@ -79,4 +79,6 @@ public class TursoConnection : DbConnection
     {
         throw new NotSupportedException();
     }
+    
+    internal TursoDatabaseHandle Turso => _turso;
 }

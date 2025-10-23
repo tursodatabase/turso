@@ -1,9 +1,9 @@
 using System.Runtime.InteropServices;
 
-namespace Turso.Native;
+namespace Turso.Raw.Data;
 
 [StructLayout(LayoutKind.Explicit)]
-public struct TursoNativeRowValueUnion
+internal struct TursoNativeRowValueUnion
 {
     [FieldOffset(0)]
     public Int64 IntValue;

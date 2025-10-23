@@ -1,5 +1,4 @@
 using System.Data.Common;
-using System.Transactions;
 using IsolationLevel = System.Data.IsolationLevel;
 
 namespace Turso;

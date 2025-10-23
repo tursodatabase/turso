@@ -1,4 +1,4 @@
-namespace Turso.RowValue;
+namespace Turso.Raw.Public.Value;
 
 public enum TursoValueType
 {

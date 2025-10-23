@@ -1,17 +1,19 @@
 ﻿using System.Collections;
+using System.ComponentModel;
 using System.Data.Common;
 using System.Runtime.CompilerServices;
-using Turso.Native;
-using Turso.RowValue;
+using Turso.Raw.Public;
+using Turso.Raw.Public.Handles;
+using Turso.Raw.Public.Value;
 
 namespace Turso;
 
 public class TursoDataReader : DbDataReader
 {
     private readonly TursoCommand _command;
-    private readonly TursoNativeStatement _statement;
+    private readonly TursoStatementHandle _statement;
 
-    public TursoDataReader(TursoCommand command, TursoNativeStatement statement)
+    public TursoDataReader(TursoCommand command, TursoStatementHandle statement)
     {
         _command = command;
         _statement = statement;
@@ -19,12 +21,12 @@ public class TursoDataReader : DbDataReader
 
     public override bool GetBoolean(int ordinal)
     {
-        return _statement.GetRow(ordinal).IntValue != 0;
+        return TursoBindings.GetValue(_statement, ordinal).IntValue != 0;
     }
 
     public override byte GetByte(int ordinal)
     {
-        return (byte)_statement.GetRow(ordinal).IntValue;
+        return (byte)TursoBindings.GetValue(_statement, ordinal).IntValue;
     }
 
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
@@ -34,13 +36,13 @@ public class TursoDataReader : DbDataReader
 
     public override char GetChar(int ordinal)
     {
-        var row = _statement.GetRow(ordinal);
-        if (row.ValueType == TursoValueType.Text && row.StringValue.Length == 1)
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        if (value.ValueType == TursoValueType.Text && value.StringValue.Length == 1)
         {
-            return row.StringValue[0];
+            return value.StringValue[0];
         }
 
-        return (char)_statement.GetRow(ordinal).IntValue;
+        return (char)TursoBindings.GetValue(_statement, ordinal).IntValue;
     }
 
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
@@ -50,8 +52,8 @@ public class TursoDataReader : DbDataReader
 
     public override string GetDataTypeName(int ordinal)
     {
-        var row = _statement.GetRow(ordinal);
-        return row.ValueType.GetTypeName();
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        return GetTypeName(value.ValueType);
     }
 
     public override DateTime GetDateTime(int ordinal)
@@ -61,12 +63,12 @@ public class TursoDataReader : DbDataReader
 
     public override decimal GetDecimal(int ordinal)
     {
-        return (decimal)_statement.GetRow(ordinal).RealValue;
+        return (decimal)TursoBindings.GetValue(_statement, ordinal).RealValue;
     }
 
     public override double GetDouble(int ordinal)
     {
-        return _statement.GetRow(ordinal).RealValue;
+        return TursoBindings.GetValue(_statement, ordinal).RealValue;
     }
 
     public override Type GetFieldType(int ordinal)
@@ -76,54 +78,62 @@ public class TursoDataReader : DbDataReader
 
     public override float GetFloat(int ordinal)
     {
-        return (float)_statement.GetRow(ordinal).RealValue;
+        return (float)TursoBindings.GetValue(_statement, ordinal).RealValue;
     }
 
     public override Guid GetGuid(int ordinal)
     {
-        return Guid.Parse(_statement.GetRow(ordinal).StringValue);
+        return Guid.Parse(TursoBindings.GetValue(_statement, ordinal).StringValue);
     }
 
     public override short GetInt16(int ordinal)
     {
-        return (short)_statement.GetRow(ordinal).IntValue;
+        return (short)TursoBindings.GetValue(_statement, ordinal).IntValue;
     }
 
     public override int GetInt32(int ordinal)
     {
-        return (int)_statement.GetRow(ordinal).IntValue;
+        return (int)TursoBindings.GetValue(_statement, ordinal).IntValue;
     }
 
     public override long GetInt64(int ordinal)
     {
-        return _statement.GetRow(ordinal).IntValue;
+        return TursoBindings.GetValue(_statement, ordinal).IntValue;
     }
 
     public override string GetName(int ordinal)
     {
-        return _statement.GetName(ordinal);
+        return TursoBindings.GetName(_statement, ordinal);
     }
 
     public override int GetOrdinal(string name)
     {
-        return _statement.GetOrdinal(name);
+        var fields = TursoBindings.GetFieldCount(_statement);
+        for (var i = 0; i < fields; i++)
+        {
+            var columnName = TursoBindings.GetName(_statement, i);
+            if (columnName == name)
+                return i;
+        }
+
+        throw new IndexOutOfRangeException($"column {name} not found");
     }
 
     public override string GetString(int ordinal)
     {
-        return _statement.GetRow(ordinal).StringValue;
+        return TursoBindings.GetValue(_statement, ordinal).StringValue;
     }
 
     public override object? GetValue(int ordinal)
     {
-        var row = _statement.GetRow(ordinal);
-        return row.ValueType switch
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        return value.ValueType switch
         {
             TursoValueType.Null or TursoValueType.Empty => null,
-            TursoValueType.Integer => row.IntValue,
-            TursoValueType.Real => row.RealValue,
-            TursoValueType.Text => row.StringValue,
-            TursoValueType.Blob => row.BlobValue,
+            TursoValueType.Integer => value.IntValue,
+            TursoValueType.Real => value.RealValue,
+            TursoValueType.Text => value.StringValue,
+            TursoValueType.Blob => value.BlobValue,
             _ => throw new ArgumentOutOfRangeException()
         };
     }
@@ -144,7 +154,7 @@ public class TursoDataReader : DbDataReader
         throw new NotImplementedException();
     }
 
-    public override int FieldCount => _statement.GetFieldCount();
+    public override int FieldCount => TursoBindings.GetFieldCount(_statement);
 
     public override object this[int ordinal] => GetValue(ordinal)!;
 
@@ -157,13 +167,13 @@ public class TursoDataReader : DbDataReader
         }
     }
 
-    public override int RecordsAffected => _statement.RowsAffected();
-    public override bool HasRows => _statement.HasRows();
-    public override bool IsClosed => _statement.IsClosed();
+    public override int RecordsAffected => TursoBindings.RowsAffected(_statement);
+    public override bool HasRows => TursoBindings.HasRows(_statement);
+    public override bool IsClosed => _statement.IsInvalid;
 
     public override bool NextResult()
     {
-        while (_statement.Read()) ;
+        while (TursoBindings.Read(_statement)) ;
         return true;
     }
 
@@ -175,7 +185,7 @@ public class TursoDataReader : DbDataReader
 
     public override bool Read()
     {
-        return _statement.Read();
+        return TursoBindings.Read(_statement);
     }
 
     public override int Depth => 0;
@@ -188,7 +198,7 @@ public class TursoDataReader : DbDataReader
     private long GetArray<T>(int ordinal, long dataOffset, T[]? buffer, int bufferOffset, int length)
         where T : struct
     {
-        var bytes = _statement.GetRow(ordinal).BlobValue;
+        var bytes = TursoBindings.GetValue(_statement, ordinal).BlobValue;
         if (buffer is null)
         {
             return Math.Min(bytes.Length - dataOffset, length);
@@ -204,5 +214,19 @@ public class TursoDataReader : DbDataReader
         }
 
         return position;
+    }
+
+    private static string GetTypeName(TursoValueType valueType)
+    {
+        return valueType switch
+        {
+            TursoValueType.Empty => "",
+            TursoValueType.Null => "NULL",
+            TursoValueType.Integer => "INTEGER",
+            TursoValueType.Real => "REAL",
+            TursoValueType.Text => "TEXT",
+            TursoValueType.Blob => "BLOB",
+            _ => throw new InvalidEnumArgumentException(nameof(valueType))
+        };
     }
 }

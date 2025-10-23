@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr};
 use std::num::NonZero;
 use std::os::raw::c_char;
 use std::ptr::null;

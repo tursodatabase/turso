@@ -1,14 +1,12 @@
 using System.Data;
 using System.Data.Common;
-using System.Diagnostics.CodeAnalysis;
-using System.Text;
-using Turso.RowValue;
+using Turso.Raw.Public.Value;
 
 namespace Turso;
 
 public class TursoParameter : DbParameter
 {
-    private static readonly Dictionary<Type, TursoValueType> _tursoTypeMapping =
+    private static readonly Dictionary<Type, TursoValueType> TursoTypeMapping =
         new()
         {
             { typeof(bool), TursoValueType.Integer },
@@ -81,7 +79,7 @@ public class TursoParameter : DbParameter
             return new TursoValue { ValueType = TursoValueType.Null };
         
         var valueType = Value.GetType();
-        if (!_tursoTypeMapping.TryGetValue(valueType, out var tursoValueType))
+        if (!TursoTypeMapping.TryGetValue(valueType, out var tursoValueType))
         {
             throw new ArgumentException($"Parameter type {valueType} is not supported");
         }
