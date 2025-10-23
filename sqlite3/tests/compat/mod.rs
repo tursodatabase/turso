@@ -413,6 +413,42 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn column_text_is_nul_terminated_and_bytes_match() {
+        unsafe {
+            let mut db = std::ptr::null_mut();
+            assert_eq!(
+                sqlite3_open(c"../testing/testing.db".as_ptr(), &mut db),
+                SQLITE_OK
+            );
+            let mut stmt = std::ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT first_name FROM users ORDER BY rowid ASC LIMIT 1;".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    std::ptr::null_mut()
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let p = sqlite3_column_text(stmt, 0);
+            assert!(!p.is_null());
+            let bytes = sqlite3_column_bytes(stmt, 0) as usize;
+            // NUL at [bytes], and no extra counted
+            let slice = std::slice::from_raw_parts(p, bytes + 1);
+            assert_eq!(slice[bytes], 0);
+            assert_eq!(libc::strlen(p), bytes);
+
+            let s = std::ffi::CStr::from_ptr(p).to_str().unwrap();
+            assert_eq!(s, "Jamie");
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_sqlite3_bind_text() {
         unsafe {
             let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
