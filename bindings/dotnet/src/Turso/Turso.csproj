@@ -10,6 +10,6 @@
   </PropertyGroup>
   
   <ItemGroup>
-    <ProjectReference Include="..\..\Turso.Raw\Turso.Raw.csproj" />
+    <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
   </ItemGroup>
 </Project>

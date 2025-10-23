@@ -1,4 +1,5 @@
-﻿using AwesomeAssertions;
+﻿using System.Data.Common;
+using AwesomeAssertions;
 using Turso.Raw.Public;
 
 namespace Turso.Tests;
@@ -229,7 +230,31 @@ public class TursoTests
     [Test]
     public void TestDataReaderEnumerable()
     {
-        
-    }
+        using var connection = new TursoConnection();
+        connection.Open();
 
+        using var create = new TursoCommand(connection, "CREATE TABLE t(id INTEGER, name TEXT, age INTEGER)");
+        create.ExecuteNonQuery().Should().Be(0);
+
+        using var insert = new TursoCommand(connection, "INSERT INTO t VALUES (1,'alice',30),(2,'bob',40),(3,'charlie',50)");
+        insert.ExecuteNonQuery().Should().Be(3);
+
+        using var select = new TursoCommand(connection, "SELECT id, name, age FROM t ORDER BY id");
+        using var reader = select.ExecuteReader();
+
+        var results = new List<(long id, string name, long age)>();
+        
+        foreach (DbDataRecord record in reader)
+        {
+            var id = record.GetInt64(0);
+            var name = record.GetString(1);
+            var age = record.GetInt64(2);
+            results.Add((id, name, age));
+        }
+
+        results.Should().HaveCount(3);
+        results[0].Should().Be((1, "alice", 30));
+        results[1].Should().Be((2, "bob", 40));
+        results[2].Should().Be((3, "charlie", 50));
+    }
 }

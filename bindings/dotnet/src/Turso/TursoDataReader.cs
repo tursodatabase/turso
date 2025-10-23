@@ -1,6 +1,7 @@
 ﻿using System.Collections;
 using System.ComponentModel;
 using System.Data.Common;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Handles;
@@ -58,7 +59,14 @@ public class TursoDataReader : DbDataReader
 
     public override DateTime GetDateTime(int ordinal)
     {
-        throw new NotImplementedException();
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        switch (value.ValueType)
+        {
+            case TursoValueType.Text:
+                return DateTime.Parse(GetString(ordinal), CultureInfo.InvariantCulture);
+            default:
+                return DateTime.MinValue;
+        }
     }
 
     public override decimal GetDecimal(int ordinal)
@@ -73,7 +81,15 @@ public class TursoDataReader : DbDataReader
 
     public override Type GetFieldType(int ordinal)
     {
-        throw new NotImplementedException();
+        var value = TursoBindings.GetValue(_statement, ordinal);
+        return value.ValueType switch
+        {
+            TursoValueType.Integer => typeof(long),
+            TursoValueType.Real => typeof(double),
+            TursoValueType.Text => typeof(string),
+            TursoValueType.Blob => typeof(byte[]),
+            _ => typeof(object)
+        };
     }
 
     public override float GetFloat(int ordinal)

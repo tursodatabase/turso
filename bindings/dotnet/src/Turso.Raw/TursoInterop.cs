@@ -39,14 +39,11 @@ internal static class TursoInterop
     [DllImport(DllName, EntryPoint = "db_statement_get_value", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoNativeValue GetValueFromStatement(TursoStatementHandle statement, int columnIndex);
     
-    
     [DllImport(DllName, EntryPoint = "db_statement_num_columns", CallingConvention = CallingConvention.Cdecl)]
     public static extern int StatementNumColumns(TursoStatementHandle statement);
-
     
     [DllImport(DllName, EntryPoint = "db_statement_column_name", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr StatementColumnName(TursoStatementHandle statement, int index);
-
     
     [DllImport(DllName, EntryPoint = "db_statement_has_rows", CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.I1)]
