@@ -142,7 +142,7 @@ pub fn translate_create_index(
     // Allocate the necessary cursors:
     //
     // 1. sqlite_schema_cursor_id - sqlite_schema table
-    // 2. btree_cursor_id         - new index btree
+    // 2. index_cursor_id         - new index cursor
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
@@ -150,7 +150,11 @@ pub fn translate_create_index(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
-    let btree_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
+    let index_cursor_id = program.alloc_cursor_id(if idx.module_name.is_none() {
+        CursorType::BTreeIndex(idx.clone())
+    } else {
+        CursorType::CustomModuleIndex(idx.clone())
+    });
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
         CursorType::BTreeTable(tbl.clone()),
@@ -292,7 +296,7 @@ pub fn translate_create_index(
     // Open the index btree we created for writing to insert the
     // newly sorted index records.
     program.emit_insn(Insn::OpenWrite {
-        cursor_id: btree_cursor_id,
+        cursor_id: index_cursor_id,
         root_page: RegisterOrLiteral::Register(root_page_reg),
         db: 0,
     });
@@ -341,11 +345,11 @@ pub fn translate_create_index(
 
     // seek to the end of the index btree to position the cursor for appending
     program.emit_insn(Insn::SeekEnd {
-        cursor_id: btree_cursor_id,
+        cursor_id: index_cursor_id,
     });
     // insert new index record
     program.emit_insn(Insn::IdxInsert {
-        cursor_id: btree_cursor_id,
+        cursor_id: index_cursor_id,
         record_reg: sorted_record_reg,
         unpacked_start: None, // TODO: optimize with these to avoid decoding record twice
         unpacked_count: None,
@@ -360,7 +364,7 @@ pub fn translate_create_index(
     // End of the outer loop
     //
     // Keep schema table open to emit ParseSchema, close the other cursors.
-    program.close_cursors(&[sorter_cursor_id, table_cursor_id, btree_cursor_id]);
+    program.close_cursors(&[sorter_cursor_id, table_cursor_id, index_cursor_id]);
 
     program.emit_insn(Insn::SetCookie {
         db: 0,

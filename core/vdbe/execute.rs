@@ -1137,6 +1137,9 @@ pub fn op_open_read(
         CursorType::Sorter => {
             panic!("OpenRead on sorter cursor");
         }
+        CursorType::CustomModuleIndex(_) => {
+            todo!("sivukhin: custom module index stuff")
+        }
         CursorType::VirtualTable(_) => {
             panic!("OpenRead on virtual table cursor, use Insn:VOpen instead");
         }
@@ -1895,6 +1898,9 @@ pub fn op_column(
                             cursor.get_value(*column)?
                         };
                         state.registers[*dest] = Register::Value(value);
+                    }
+                    CursorType::CustomModuleIndex(_) => {
+                        todo!("sivukhin: custom module index stuff")
                     }
                     CursorType::VirtualTable(_) => {
                         panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
@@ -7822,6 +7828,9 @@ pub fn op_open_ephemeral(
                 }
                 CursorType::VirtualTable(_) => {
                     panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
+                }
+                CursorType::CustomModuleIndex(_) => {
+                    todo!("sivukhin: custom module index stuff")
                 }
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
