@@ -1,6 +1,9 @@
 use std::{
     cmp::Ordering,
-    sync::{atomic::{AtomicI64, Ordering as AtomicOrdering}, Arc},
+    sync::{
+        atomic::{AtomicI64, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 
 use tracing::{instrument, Level};

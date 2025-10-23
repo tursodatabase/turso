@@ -2562,6 +2562,7 @@ impl Statement {
                 let Err(LimboError::SchemaUpdated { new_schema_version }) = res else {
                     break;
                 };
+                self.reprepare(new_schema_version)?;
                 res = self.program.step(
                     &mut self.state,
                     self.mv_store.as_ref(),
@@ -2647,11 +2648,23 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self) -> Result<()> {
-        tracing::trace!("repreparing statement");
+    fn reprepare(&mut self, target_schema_version: Option<u32>) -> Result<()> {
+        tracing::trace!(
+            "repreparing statement, target_schema_version={:?}",
+            target_schema_version
+        );
         let conn = self.program.connection.clone();
-
-        conn.refresh_schema();
+        if let Some(target_schema_version) = target_schema_version {
+            // The connection may already have the required schema version if it is using a prepared statement
+            // that was compiled with an older schema version. So: only update the connection's schema if it is
+            // actually stale.
+            if conn.schema.read().schema_version < target_schema_version {
+                conn.refresh_schema();
+                debug_assert!(conn.schema.read().schema_version == target_schema_version, "Tried to reprepare to schema version {}, but current global schema version is {}", target_schema_version, conn.schema.read().schema_version);
+            }
+        } else {
+            conn.refresh_schema();
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
