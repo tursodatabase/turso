@@ -370,6 +370,7 @@ impl Schema {
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
+            .filter(|i| !i.is_hidden_btree_index())
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -2494,6 +2495,10 @@ impl Index {
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    pub fn is_hidden_btree_index(&self) -> bool {
+        self.module_name.as_deref() == Some(HIDDEN_BTREE_MODULE_NAME)
     }
 
     pub fn automatic_from_primary_key(

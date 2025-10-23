@@ -8,7 +8,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
-    index::{IndexConfiguration, IndexModule},
+    index::{IndexConfiguration, IndexModule, HIDDEN_BTREE_MODULE_NAME},
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
@@ -331,7 +331,11 @@ impl ProgramBuilder {
         resolver: &Resolver,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
-        if let Some(module_name) = &index.module_name {
+        let module_name = index.module_name.as_deref();
+        if module_name.is_some()
+            && module_name != Some(HIDDEN_BTREE_MODULE_NAME)
+        {
+            let module_name = index.module_name.unwrap();
             let Some(module) = resolver.symbol_table.index_modules.get(module_name) else {
                 return Err(LimboError::InternalError(format!(
                     "unknown module '{}'",
@@ -347,10 +351,11 @@ impl ProgramBuilder {
                     .clone()
                     .unwrap_or_else(|| HashMap::new()),
             };
-            Ok(self.alloc_cursor_id(CursorType::CustomModule(module.clone(), configuration)))
-        } else {
-            Ok(self.alloc_cursor_id(CursorType::BTreeIndex(index.clone())))
+            return Ok(
+                self.alloc_cursor_id(CursorType::CustomModule(module.clone(), configuration))
+            );
         }
+        Ok(self.alloc_cursor_id(CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {

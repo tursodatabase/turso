@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::index::{IndexConfiguration, HIDDEN_BTREE_MODULE_NAME};
+use crate::index::HIDDEN_BTREE_MODULE_NAME;
 use crate::numeric::Numeric;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
@@ -106,6 +106,7 @@ pub fn translate_create_index(
     let columns = resolve_sorted_columns(&tbl, &columns)?;
     let custom_module = using.is_some();
     let btree_module = using.as_ref().map(|x| x.as_str()) == Some(HIDDEN_BTREE_MODULE_NAME);
+    tracing::info!("using: {:?} {}", using, btree_module);
     if !with_clause.is_empty() && !custom_module {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
