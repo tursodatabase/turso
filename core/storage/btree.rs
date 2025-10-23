@@ -1049,7 +1049,13 @@ impl BTreeCursor {
                     local_amount = local_size as u32 - offset;
                 }
                 if is_write {
-                    self.write_payload_to_page(offset, local_amount, payload, buffer, page.clone());
+                    self.write_payload_to_page(
+                        offset,
+                        local_amount,
+                        payload,
+                        buffer,
+                        page.clone(),
+                    )?;
                 } else {
                     self.read_payload_from_page(offset, local_amount, payload, buffer);
                 }
@@ -1175,7 +1181,7 @@ impl BTreeCursor {
                             page_payload,
                             buffer,
                             page.clone(),
-                        );
+                        )?;
                     } else {
                         self.read_payload_from_page(
                             payload_offset as u32,
@@ -1247,13 +1253,14 @@ impl BTreeCursor {
         payload: &[u8],
         buffer: &mut [u8],
         page: PageRef,
-    ) {
-        self.pager.add_dirty(&page);
+    ) -> Result<()> {
+        self.pager.add_dirty(&page)?;
         // SAFETY: This is safe as long as the page is not evicted from the cache.
         let payload_mut =
             unsafe { std::slice::from_raw_parts_mut(payload.as_ptr() as *mut u8, payload.len()) };
         payload_mut[payload_offset as usize..payload_offset as usize + num_bytes as usize]
             .copy_from_slice(&buffer[..num_bytes as usize]);
+        Ok(())
     }
 
     /// Check if any ancestor pages still have cells to iterate.
@@ -2275,7 +2282,7 @@ impl BTreeCursor {
 
                     // get page and find cell
                     let cell_idx = {
-                        self.pager.add_dirty(&page);
+                        self.pager.add_dirty(&page)?;
                         self.stack.current_cell_index()
                     };
                     if cell_idx == -1 {
@@ -2643,8 +2650,8 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
-        self.pager.add_dirty(parent);
-        self.pager.add_dirty(&new_rightmost_leaf);
+        self.pager.add_dirty(parent)?;
+        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -2721,7 +2728,7 @@ impl BTreeCursor {
                             overflow_cell.index
                         );
                     }
-                    self.pager.add_dirty(parent_page);
+                    self.pager.add_dirty(parent_page)?;
                     let parent_contents = parent_page.get_contents();
                     let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
@@ -2823,8 +2830,6 @@ impl BTreeCursor {
                                 return Err(e);
                             }
                             Ok((page, c)) => {
-                                // mark as dirty
-                                self.pager.add_dirty(&page);
                                 pages_to_balance[i].replace(page);
                                 if let Some(c) = c {
                                     group.add(&c);
@@ -2909,7 +2914,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        turso_assert!(page.is_loaded(), "page should be loaded");
+                        self.pager.add_dirty(page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
@@ -3482,7 +3487,7 @@ impl BTreeCursor {
                             if *new_id != page.get().id {
                                 page.get().id = *new_id;
                                 self.pager
-                                    .update_dirty_loaded_page_in_cache(*new_id, page.clone())?;
+                                    .upsert_page_in_cache(*new_id, page.clone(), true)?;
                             }
                         }
 
@@ -4678,7 +4683,7 @@ impl BTreeCursor {
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
                         if keep_root {
-                            self.clear_root(&page);
+                            self.clear_root(&page)?;
                         } else {
                             return_if_io!(self.pager.free_page(Some(page), page_id));
                         }
@@ -4693,7 +4698,7 @@ impl BTreeCursor {
         }
     }
 
-    fn clear_root(&mut self, root_page: &PageRef) {
+    fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
         let page_ref = root_page.get();
         let contents = page_ref.contents.as_ref().unwrap();
 
@@ -4702,8 +4707,9 @@ impl BTreeCursor {
             PageType::IndexLeaf | PageType::IndexInterior => PageType::IndexLeaf,
         };
 
-        self.pager.add_dirty(root_page);
+        self.pager.add_dirty(root_page)?;
         btree_init_page(root_page, page_type, 0, self.pager.usable_space());
+        Ok(())
     }
 
     pub fn overwrite_cell(
@@ -5072,7 +5078,7 @@ impl CursorTrait for BTreeCursor {
             match delete_state {
                 DeleteState::Start => {
                     let page = self.stack.top_ref();
-                    self.pager.add_dirty(page);
+                    self.pager.add_dirty(page)?;
                     if matches!(
                         page.get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
@@ -5269,8 +5275,8 @@ impl CursorTrait for BTreeCursor {
 
                     let leaf_page = self.stack.top_ref();
 
-                    self.pager.add_dirty(page);
-                    self.pager.add_dirty(leaf_page);
+                    self.pager.add_dirty(page)?;
+                    self.pager.add_dirty(leaf_page)?;
 
                     // Step 2: Replace the cell in the parent (interior) page.
                     {

@@ -1,10 +1,11 @@
-use crate::common::{self, limbo_exec_rows, maybe_setup_tracing};
+use crate::common::{self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::{
-    CheckpointMode, Connection, Database, LimboError, Row, Statement, StepResult, Value,
+    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, Row, Statement, StepResult,
+    Value,
 };
 
 const WAL_HEADER_SIZE: usize = 32;
@@ -504,6 +505,129 @@ fn test_update_regression() -> anyhow::Result<()> {
     conn.execute("UPDATE imaginative_baroja SET ample_earth = -7099009285992304294, remarkable_lester = 7860481406646607706, blithesome_hall = X'636F6D70657469746976655F736F6369657479', glowing_parissi = 'captivating_dreams', insightful_ryner = X'61646570745F6B6F7A6172656B' WHERE 1")?;
 
     check_integrity_is_ok(tmp_db, conn)?;
+
+    Ok(())
+}
+
+#[test]
+/// Test that a large insert statement containing a UNIQUE constraint violation
+/// is properly rolled back so that the database size is also shrunk to the size
+/// before that statement is executed.
+fn test_rollback_on_unique_constraint_violation() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_with_opts(
+        "big_statement_rollback.db",
+        DatabaseOpts::new().with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(x UNIQUE)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (10000)")?;
+
+    // This should fail due to unique constraint violation
+    let result = conn.execute("INSERT INTO t SELECT value FROM generate_series(1,10000)");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    conn.execute("COMMIT")?;
+
+    // Should have exactly 1 row (the first insert)
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM t", |row| {
+        let count = row.get::<i64>(0).unwrap();
+        assert_eq!(count, 1, "Expected 1 row after rollback");
+    })?;
+
+    // Check page count
+    common::run_query_on_row(&tmp_db, &conn, "PRAGMA page_count", |row| {
+        let page_count = row.get::<i64>(0).unwrap();
+        assert_eq!(page_count, 3, "Expected 3 pages");
+    })?;
+
+    // Checkpoint the WAL
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // Integrity check with rusqlite
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+
+    // Size on disk should be 3 * 4096
+    let db_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    assert_eq!(db_size, 3 * 4096);
+
+    Ok(())
+}
+
+#[test]
+/// Test that a large delete statement containing a foreign key constraint violation
+/// is properly rolled back.
+fn test_rollback_on_foreign_key_constraint_violation() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_with_opts(
+        "big_delete_rollback.db",
+        DatabaseOpts::new().with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    // Create parent and child tables
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )?;
+
+    // Insert 10000 parent rows
+    conn.execute("INSERT INTO parent SELECT value FROM generate_series(1,10000)")?;
+
+    // Insert a child row that references the 10000th parent row
+    conn.execute("INSERT INTO child VALUES (1, 10000)")?;
+
+    conn.execute("BEGIN")?;
+
+    // Delete first parent row (should succeed)
+    conn.execute("DELETE FROM parent WHERE id = 1")?;
+
+    // This should fail due to foreign key constraint violation (trying to delete parent row 10000 which has a child)
+    let result = conn.execute("DELETE FROM parent WHERE id >= 2");
+    assert!(result.is_err(), "Expected foreign key constraint violation");
+
+    conn.execute("COMMIT")?;
+
+    // Should have 9999 parent rows (10000 - 1 that was successfully deleted)
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM parent", |row| {
+        let count = row.get::<i64>(0).unwrap();
+        assert_eq!(count, 9999, "Expected 9999 parent rows after rollback");
+    })?;
+
+    // Verify rows 2-10000 are intact
+    common::run_query_on_row(
+        &tmp_db,
+        &conn,
+        "SELECT min(id), max(id) FROM parent",
+        |row| {
+            let min_id = row.get::<i64>(0).unwrap();
+            let max_id = row.get::<i64>(1).unwrap();
+            assert_eq!(min_id, 2, "Expected min id to be 2");
+            assert_eq!(max_id, 10000, "Expected max id to be 10000");
+        },
+    )?;
+
+    // Child row should still exist
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM child", |row| {
+        let count = row.get::<i64>(0).unwrap();
+        assert_eq!(count, 1, "Expected 1 child row");
+    })?;
+
+    // Checkpoint the WAL
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // Integrity check with rusqlite
+    rusqlite_integrity_check(tmp_db.path.as_path())?;
+
+    // Size on disk should be 21 * 4096
+    let db_size = std::fs::metadata(&tmp_db.path).unwrap().len();
+    assert_eq!(db_size, 21 * 4096);
 
     Ok(())
 }

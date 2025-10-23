@@ -16,12 +16,12 @@ use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 #[inline]
 pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset) {
     program.emit_insn(Insn::FkIfZero {
-        is_scope: false,
+        deferred: true,
         target_pc: label,
     });
     program.emit_insn(Insn::FkCounter {
         increment_value: -1,
-        is_scope: false,
+        deferred: true,
     });
 }
 
@@ -212,19 +212,13 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
         .collect()
 }
 
-/// For deferred FKs: increment the global counter; for immediate FKs: halt with FK error.
+/// Increment a foreign key violation counter; for deferred FKs, this is a global counter
+/// on the connection; for immediate FKs, this is a per-statement counter in the program state.
 pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Result<()> {
-    if fk.deferred {
-        program.emit_insn(Insn::FkCounter {
-            increment_value: 1,
-            is_scope: false,
-        });
-    } else {
-        program.emit_insn(Insn::Halt {
-            err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
-            description: "FOREIGN KEY constraint failed".to_string(),
-        });
-    }
+    program.emit_insn(Insn::FkCounter {
+        increment_value: 1,
+        deferred: fk.deferred,
+    });
     Ok(())
 }
 
@@ -549,16 +543,8 @@ fn emit_fk_parent_key_probe(
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
         match (is_deferred, pass) {
             // OLD key referenced by a child
-            (false, ParentProbePass::Old) => {
-                // Immediate FK: fail now.
-                emit_fk_violation(p, &fk_ref.fk)?; // HALT for immediate
-            }
-            (true, ParentProbePass::Old) => {
-                // Deferred FK: increment counter.
-                p.emit_insn(Insn::FkCounter {
-                    increment_value: 1,
-                    is_scope: false,
-                });
+            (_, ParentProbePass::Old) => {
+                emit_fk_violation(p, &fk_ref.fk)?;
             }
 
             // NEW key referenced by a child (cancel one deferred violation)

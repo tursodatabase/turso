@@ -1,4 +1,5 @@
 use crate::storage::database::DatabaseFile;
+use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -14,8 +15,9 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, IOContext};
+use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::RwLock;
+use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::hash;
@@ -115,7 +117,7 @@ impl HeaderRefMut {
                         "incorrect header page id"
                     );
 
-                    pager.add_dirty(&page);
+                    pager.add_dirty(&page)?;
                     *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
@@ -464,6 +466,38 @@ enum BtreeCreateVacuumFullState {
     PtrMapPut { allocated_page_id: u32 },
 }
 
+pub struct Savepoint {
+    /// Start offset of this savepoint in the subjournal.
+    start_offset: AtomicU64,
+    /// Current write offset in the subjournal.
+    write_offset: AtomicU64,
+    /// Bitmap of page numbers that are dirty in the savepoint.
+    page_bitmap: RwLock<RoaringBitmap>,
+    /// Database size at the start of the savepoint.
+    /// If the database grows during the savepoint and a rollback to the savepoint is performed,
+    /// the pages exceeding the database size at the start of the savepoint will be ignored.
+    db_size: AtomicU32,
+}
+
+impl Savepoint {
+    pub fn new(subjournal_offset: u64, db_size: u32) -> Self {
+        Self {
+            start_offset: AtomicU64::new(subjournal_offset),
+            write_offset: AtomicU64::new(subjournal_offset),
+            page_bitmap: RwLock::new(RoaringBitmap::new()),
+            db_size: AtomicU32::new(db_size),
+        }
+    }
+
+    pub fn add_dirty_page(&self, page_num: u32) {
+        self.page_bitmap.write().insert(page_num);
+    }
+
+    pub fn has_dirty_page(&self, page_num: u32) -> bool {
+        self.page_bitmap.read().contains(page_num)
+    }
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -480,7 +514,8 @@ pub struct Pager {
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
-
+    subjournal: RwLock<Option<Subjournal>>,
+    savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -603,6 +638,8 @@ impl Pager {
             dirty_pages: Arc::new(RwLock::new(HashSet::with_hasher(
                 hash::BuildHasherDefault::new(),
             ))),
+            subjournal: RwLock::new(None),
+            savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 result: None,
                 completions: Vec::new(),
@@ -632,6 +669,239 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
         })
+    }
+
+    pub fn begin_statement(&self, db_size: u32) -> Result<()> {
+        self.open_subjournal()?;
+        self.open_savepoint(db_size)?;
+        Ok(())
+    }
+
+    /// Open the subjournal if not yet open.
+    /// The subjournal is a file that is used to store the "before images" of pages for the
+    /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
+    ///
+    /// Currently uses MemoryIO, but should eventually be backed by temporary on-disk files.
+    pub fn open_subjournal(&self) -> Result<()> {
+        if self.subjournal.read().is_some() {
+            return Ok(());
+        }
+        use crate::MemoryIO;
+
+        let db_file_io = Arc::new(MemoryIO::new());
+        let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
+        let db_file = Subjournal::new(file);
+        *self.subjournal.write() = Some(db_file);
+        Ok(())
+    }
+
+    /// Write page to subjournal if the current savepoint does not currently
+    /// contain an an entry for it. In case of a statement-level rollback,
+    /// the page image can be restored from the subjournal.
+    ///
+    /// A buffer of length page_size + 4 bytes is allocated and the page id
+    /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
+    pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
+        if self.subjournal.read().is_none() {
+            return Ok(());
+        }
+        let write_offset = {
+            let savepoints = self.savepoints.read();
+            let Some(cur_savepoint) = savepoints.last() else {
+                return Ok(());
+            };
+            if cur_savepoint.has_dirty_page(page.get().id as u32) {
+                return Ok(());
+            }
+            cur_savepoint.write_offset.load(Ordering::SeqCst)
+        };
+        let page_id = page.get().id;
+        let page_size = self.page_size.load(Ordering::SeqCst) as usize;
+        let buffer = {
+            let page_id = page.get().id as u32;
+            let contents = page.get_contents();
+            let buffer = self.buffer_pool.allocate(page_size + 4);
+            let contents_buffer = contents.buffer.as_slice();
+            turso_assert!(
+                contents_buffer.len() == page_size,
+                "contents buffer length should be equal to page size"
+            );
+
+            buffer.as_mut_slice()[0..4].copy_from_slice(&page_id.to_be_bytes());
+            buffer.as_mut_slice()[4..4 + page_size].copy_from_slice(contents_buffer);
+
+            Arc::new(buffer)
+        };
+
+        let savepoints = self.savepoints.clone();
+
+        let write_complete = {
+            let buf_copy = buffer.clone();
+            Box::new(move |res: Result<i32, CompletionError>| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                let buf_copy = buf_copy.clone();
+                let buf_len = buf_copy.len();
+
+                turso_assert!(
+                    bytes_written == buf_len as i32,
+                    "wrote({bytes_written}) != expected({buf_len})"
+                );
+
+                let savepoints = savepoints.read();
+                let cur_savepoint = savepoints.last().unwrap();
+                cur_savepoint.add_dirty_page(page_id as u32);
+                cur_savepoint
+                    .write_offset
+                    .fetch_add(page_size as u64 + 4, Ordering::SeqCst);
+            })
+        };
+        let c = Completion::new_write(write_complete);
+
+        let subjournal = self.subjournal.read();
+        let subjournal = subjournal.as_ref().unwrap();
+
+        let c = subjournal.write_page(write_offset, page_size, buffer.clone(), c)?;
+        assert!(c.succeeded(), "memory IO should complete immediately");
+        Ok(())
+    }
+
+    pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
+        self.open_subjournal()?;
+        let subjournal_offset = self.subjournal.read().as_ref().unwrap().size()?;
+        // Currently as we only have anonymous savepoints opened at the start of a statement,
+        // the subjournal offset should always be 0 as we should only have max 1 savepoint
+        // opened at any given time.
+        turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
+        let savepoint = Savepoint::new(subjournal_offset, db_size);
+        let mut savepoints = self.savepoints.write();
+        turso_assert!(
+            savepoints.is_empty(),
+            "savepoints should be empty, but had {} savepoints open",
+            savepoints.len()
+        );
+        savepoints.push(savepoint);
+        Ok(())
+    }
+
+    /// Release i.e. commit the current savepoint. This basically just means removing it.
+    pub fn release_savepoint(&self) -> Result<()> {
+        let mut savepoints = self.savepoints.write();
+        let Some(savepoint) = savepoints.pop() else {
+            return Ok(());
+        };
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return Ok(());
+        };
+        let start_offset = savepoint.start_offset.load(Ordering::SeqCst);
+        // Same reason as in open_savepoint, the start offset should always be 0 as we should only have max 1 savepoint
+        // opened at any given time.
+        turso_assert!(start_offset == 0, "start offset should be 0");
+        let c = subjournal.truncate(start_offset)?;
+        assert!(c.succeeded(), "memory IO should complete immediately");
+        Ok(())
+    }
+
+    pub fn clear_savepoints(&self) -> Result<()> {
+        *self.savepoints.write() = Vec::new();
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return Ok(());
+        };
+        let c = subjournal.truncate(0)?;
+        assert!(c.succeeded(), "memory IO should complete immediately");
+        Ok(())
+    }
+
+    /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
+    /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
+    pub fn rollback_to_newest_savepoint(&self) -> Result<()> {
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return Ok(());
+        };
+        let mut savepoints = self.savepoints.write();
+        let Some(savepoint) = savepoints.pop() else {
+            return Ok(());
+        };
+        let journal_start_offset = savepoint.start_offset.load(Ordering::SeqCst);
+
+        let mut rollback_bitset = RoaringBitmap::new();
+
+        // Read the subjournal starting from start offset, first reading 4 bytes to get page id, then if rollback_bitset already has the page, skip reading the page
+        // and just advance the offset. otherwise read the page and add the page id to the rollback_bitset + put the page image into the page cache
+        let mut current_offset = journal_start_offset;
+        let page_size = self.page_size.load(Ordering::SeqCst) as u64;
+        let journal_end_offset = savepoint.write_offset.load(Ordering::SeqCst);
+        let db_size = savepoint.db_size.load(Ordering::SeqCst);
+
+        let mut dirty_pages = self.dirty_pages.write();
+
+        while current_offset < journal_end_offset {
+            // Read 4 bytes for page id
+            let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
+            let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
+            assert!(c.succeeded(), "memory IO should complete immediately");
+            let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
+            current_offset += 4;
+
+            // Check if we've already rolled back this page or if the page is beyond the database size at the start of the savepoint
+            let already_rolled_back = rollback_bitset.contains(page_id);
+            if already_rolled_back {
+                current_offset += page_size;
+                continue;
+            }
+            let page_wont_exist_after_rollback = page_id > db_size;
+            if page_wont_exist_after_rollback {
+                dirty_pages.remove(&(page_id as usize));
+                if let Some(page) = self
+                    .page_cache
+                    .write()
+                    .get(&PageCacheKey::new(page_id as usize))?
+                {
+                    page.clear_dirty();
+                    page.try_unpin();
+                }
+                current_offset += page_size;
+                rollback_bitset.insert(page_id);
+                continue;
+            }
+
+            // Read the page data
+            let page_buffer = Arc::new(self.buffer_pool.allocate(page_size as usize));
+            let page = Arc::new(Page::new(page_id as i64));
+            let c = subjournal.read_page(
+                current_offset,
+                page_buffer.clone(),
+                page.clone(),
+                page_size as usize,
+            )?;
+            assert!(c.succeeded(), "memory IO should complete immediately");
+            current_offset += page_size;
+
+            // Add page to rollback bitset
+            rollback_bitset.insert(page_id);
+
+            // Put the page image into the page cache
+            self.upsert_page_in_cache(page_id as usize, page, false)?;
+        }
+
+        let truncate_completion = self
+            .subjournal
+            .read()
+            .as_ref()
+            .unwrap()
+            .truncate(journal_start_offset)?;
+        assert!(
+            truncate_completion.succeeded(),
+            "memory IO should complete immediately"
+        );
+
+        self.page_cache.write().truncate(db_size as usize)?;
+
+        Ok(())
     }
 
     #[cfg(feature = "test_helper")]
@@ -883,7 +1153,7 @@ impl Pager {
                         ptrmap_page.get().id == ptrmap_pg_no,
                         "ptrmap page has unexpected number"
                     );
-                    self.add_dirty(&ptrmap_page);
+                    self.add_dirty(&ptrmap_page)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
                     break Ok(IOResult::Done(()));
                 }
@@ -1217,6 +1487,8 @@ impl Pager {
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
+            self.clear_savepoints()
+                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             wal.borrow().end_write_tx();
         }
         wal.borrow().end_read_tx();
@@ -1376,11 +1648,18 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
-    pub fn add_dirty(&self, page: &Page) {
+    pub fn add_dirty(&self, page: &Page) -> Result<()> {
+        turso_assert!(
+            page.is_loaded(),
+            "page {} must be loaded in add_dirty() so its contents can be subjournaled",
+            page.get().id
+        );
+        self.subjournal_page_if_required(page)?;
         // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id);
         page.set_dirty();
+        Ok(())
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -2037,7 +2316,7 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(&trunk_page);
+                        self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
                             TRUNK_PAGE_LEAF_COUNT_OFFSET,
@@ -2057,7 +2336,7 @@ impl Pager {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
-                    self.add_dirty(page);
+                    self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
@@ -2197,7 +2476,7 @@ impl Pager {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
                             let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
-                            self.add_dirty(&page);
+                            self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
                             cache.insert(page_key, page.clone())?;
@@ -2273,7 +2552,7 @@ impl Pager {
                     // and update the database's first freelist trunk page to the next trunk page.
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    self.add_dirty(trunk_page);
+                    self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
@@ -2305,7 +2584,7 @@ impl Pager {
                         leaf_page.get().id
                     );
                     let page_contents = trunk_page.get_contents();
-                    self.add_dirty(leaf_page);
+                    self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
@@ -2343,7 +2622,7 @@ impl Pager {
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
                     );
-                    self.add_dirty(trunk_page);
+                    self.add_dirty(trunk_page)?;
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     let leaf_page = leaf_page.clone();
@@ -2357,7 +2636,7 @@ impl Pager {
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
                             allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
-                        self.add_dirty(&richard_hipp_special_page);
+                        self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
                             let mut cache = self.page_cache.write();
@@ -2381,7 +2660,7 @@ impl Pager {
                     let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                     {
                         // setup page and add to cache
-                        self.add_dirty(&page);
+                        self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
                         {
@@ -2398,16 +2677,19 @@ impl Pager {
         }
     }
 
-    pub fn update_dirty_loaded_page_in_cache(
+    pub fn upsert_page_in_cache(
         &self,
         id: usize,
         page: PageRef,
+        dirty_page_must_exist: bool,
     ) -> Result<(), LimboError> {
         let mut cache = self.page_cache.write();
         let page_key = PageCacheKey::new(id);
 
         // FIXME: use specific page key for writer instead of max frame, this will make readers not conflict
-        assert!(page.is_dirty());
+        if dirty_page_must_exist {
+            assert!(page.is_dirty());
+        }
         cache.upsert_page(page_key, page.clone()).map_err(|e| {
             LimboError::InternalError(format!(
                 "Failed to insert loaded page {id} into cache: {e:?}"

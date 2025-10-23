@@ -232,7 +232,7 @@ pub fn translate_insert(
         &table,
         &mut body,
         connection,
-        on_conflict.unwrap_or(ResolveType::Rollback),
+        on_conflict.unwrap_or(ResolveType::Abort),
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
@@ -485,6 +485,8 @@ pub fn translate_insert(
     )?;
 
     emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
+
+    program.set_needs_stmt_subtransactions(true);
     Ok(program)
 }
 
@@ -976,9 +978,8 @@ fn bind_insert(
                 next: None,
             }));
         }
-        ResolveType::Rollback => {
-            // This is the current default behavior for INSERT in tursodb - the transaction will be rolled back if the insert fails.
-            // In SQLite, the default is ABORT and we should use that one once we support subtransactions.
+        ResolveType::Abort => {
+            // This is the default conflict resolution strategy for INSERT in SQLite.
         }
         _ => {
             crate::bail_parse_error!(

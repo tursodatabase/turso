@@ -653,14 +653,13 @@ mod fuzz_tests {
 
     #[test]
     #[allow(unused_assignments)]
-    #[ignore] // ignoring because every error I can find is due to sqlite sub-transaction behavior
     pub fn fk_deferred_constraints_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_deferred_constraints_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
-        const INNER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
@@ -744,12 +743,12 @@ mod fuzz_tests {
             }
 
             // Transaction-based mutations with mix of deferred and immediate operations
+            let mut in_tx = false;
             for tx_num in 0..INNER_ITERS {
                 // Decide if we're in a transaction
-                let mut in_tx = false;
-                let use_transaction = rng.random_bool(0.7);
+                let start_a_transaction = rng.random_bool(0.7);
 
-                if use_transaction && !in_tx {
+                if start_a_transaction && !in_tx {
                     in_tx = true;
                     let s = log_and_exec("BEGIN");
                     let sres = sqlite.execute(&s, params![]);
@@ -875,7 +874,7 @@ mod fuzz_tests {
                         format!("DELETE FROM child_deferred WHERE id={id}")
                     }
                     // Self-referential deferred insert (create temp violation then fix)
-                    10 if use_transaction => {
+                    10 if start_a_transaction => {
                         let id = rng.random_range(400..=500);
                         let pid = id + 1; // References non-existent yet
                         format!("INSERT INTO child_deferred VALUES ({id}, {pid}, 0)")
@@ -891,7 +890,7 @@ mod fuzz_tests {
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
 
-                if !use_transaction && !in_tx {
+                if !start_a_transaction && !in_tx {
                     match (sres, lres) {
                         (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
                         (s, l) => {
@@ -909,8 +908,8 @@ mod fuzz_tests {
                     }
                 }
 
-                if use_transaction && in_tx {
-                    // Randomly COMMIT or ROLLBACK
+                // Randomly COMMIT or ROLLBACK some of the time
+                if in_tx && rng.random_bool(0.4) {
                     let commit = rng.random_bool(0.7);
                     let s = log_and_exec("COMMIT");
 
@@ -964,7 +963,13 @@ mod fuzz_tests {
                             );
                         }
                     }
+                    in_tx = false;
                 }
+            }
+            // Print all statements
+            if std::env::var("VERBOSE").is_ok() {
+                println!("{}", stmts.join("\n"));
+                println!("--------- ITERATION COMPLETED ---------");
             }
         }
     }
@@ -2205,6 +2210,22 @@ mod fuzz_tests {
             }
 
             for _ in 0..INNER_ITERS {
+                // Randomly inject transaction statements -- we don't care if they are legal,
+                // we just care that tursodb/sqlite behave the same way.
+                if rng.random_bool(0.15) {
+                    let tx_stmt = match rng.random_range(0..4) {
+                        0 => "BEGIN",
+                        1 => "BEGIN IMMEDIATE",
+                        2 => "COMMIT",
+                        3 => "ROLLBACK",
+                        _ => unreachable!(),
+                    };
+                    println!("{tx_stmt};");
+                    let sqlite_res = sqlite.execute(tx_stmt, rusqlite::params![]);
+                    let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, tx_stmt);
+                    // Both should succeed or both should fail
+                    assert!(sqlite_res.is_ok() == limbo_res.is_ok());
+                }
                 let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
                 let stmt = match action {
                     // INSERT

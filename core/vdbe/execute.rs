@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
+use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -21,7 +21,7 @@ use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
 };
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::{registers_to_ref_values, TxnCleanup};
+use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -2149,8 +2149,8 @@ pub fn halt(
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
-        // invalidate page cache in case of error
-        pager.clear_page_cache(false);
+        // Any non-FK constraint violation causes the statement subtransaction to roll back.
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
     }
     match err_code {
         0 => {}
@@ -2169,9 +2169,6 @@ pub fn halt(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
-        SQLITE_CONSTRAINT_FOREIGNKEY => {
-            return Err(LimboError::Constraint(format!("{description} (19)")));
-        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -2181,23 +2178,46 @@ pub fn halt(
 
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
+
+    // Check for immediate foreign key violations.
+    // Any immediate violation causes the statement subtransaction to roll back.
+    if program.connection.foreign_keys_enabled()
+        && state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
+            > 0
+    {
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
+        return Err(LimboError::Constraint(
+            "foreign key constraint failed".to_string(),
+        ));
+    }
+
     if auto_commit {
-        // In autocommit mode, a statement that leaves deferred violations must fail here.
-        if program.connection.foreign_keys_enabled()
-            && program
+        // In autocommit mode, a statement that leaves deferred violations must fail here,
+        // and it also ends the transaction.
+        if program.connection.foreign_keys_enabled() {
+            let deferred_violations = program
                 .connection
                 .fk_deferred_violations
-                .swap(0, Ordering::AcqRel)
-                > 0
-        {
-            return Err(LimboError::Constraint(
-                "foreign key constraint failed".to_string(),
-            ));
+                .swap(0, Ordering::AcqRel);
+            if deferred_violations > 0 {
+                pager.rollback_tx(&program.connection);
+                program.connection.set_tx_state(TransactionState::None);
+                program.connection.auto_commit.store(true, Ordering::SeqCst);
+                return Err(LimboError::Constraint(
+                    "foreign key constraint failed".to_string(),
+                ));
+            }
         }
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         program
             .commit_txn(pager.clone(), state, mv_store, false)
             .map(Into::into)
     } else {
+        // Even if deferred violations are present, the statement subtransaction completes successfully when
+        // it is part of an interactive transaction.
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         Ok(InsnFunctionStepResult::Done)
     }
 }
@@ -2246,6 +2266,7 @@ pub fn op_halt_if_null(
 pub enum OpTransactionState {
     Start,
     CheckSchemaCookie,
+    BeginStatement,
 }
 
 pub fn op_transaction(
@@ -2446,6 +2467,17 @@ pub fn op_transaction_inner(
                     Err(LimboError::Page1NotAlloc) => {}
                     Err(err) => {
                         return Err(err);
+                    }
+                }
+
+                state.op_transaction_state = OpTransactionState::BeginStatement;
+            }
+            OpTransactionState::BeginStatement => {
+                if program.needs_stmt_subtransactions && mv_store.is_none() {
+                    let write = matches!(tx_mode, TransactionMode::Write);
+                    let res = state.begin_statement(&program.connection, &pager, write)?;
+                    if let IOResult::IO(io) = res {
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
 
@@ -8585,12 +8617,14 @@ pub fn op_fk_counter(
     load_insn!(
         FkCounter {
             increment_value,
-            is_scope,
+            deferred,
         },
         insn
     );
-    if *is_scope {
-        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+    if !*deferred {
+        state
+            .fk_immediate_violations_during_stmt
+            .fetch_add(*increment_value, Ordering::AcqRel);
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
@@ -8612,7 +8646,7 @@ pub fn op_fk_if_zero(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         FkIfZero {
-            is_scope,
+            deferred,
             target_pc,
         },
         insn
@@ -8627,10 +8661,12 @@ pub fn op_fk_if_zero(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
-    let v = if !*is_scope {
+    let v = if *deferred {
         program.connection.get_deferred_foreign_key_violations()
     } else {
-        state.fk_scope_counter
+        state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
     };
 
     state.pc = if v == 0 {
