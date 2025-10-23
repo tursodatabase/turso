@@ -963,12 +963,16 @@ pub enum AlwaysTrueOrFalse {
     AlwaysFalse,
 }
 
+/// Flags to change the behaviour of determinining whether the
+/// implementor of the `Optimizable` trait is constant
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConstantFlags {
     #[default]
     Expr,
-    /// Constant Expr and Function
+    /// Constant Expr and Function. Only care if the expression can be determined at Parse Time.
+    /// Does not care about function determinism.
     /// Used in Create Table with Default validation
+    ///
     DefaultConstraint { id_allowed: bool },
 }
 
@@ -1165,6 +1169,8 @@ impl Optimizable for ast::Expr {
             Expr::NotNull(expr) => expr.is_constant(resolver, flags),
             Expr::Parenthesized(exprs) => {
                 let new_flag = if matches!(flags, ConstantFlags::DefaultConstraint { .. }) {
+                    // `CREATE TABLE t(x DEFAULT adfgdfg);` is allowed
+                    // `CREATE TABLE t(x DEFAULT (adfgdfg));` is not allowed
                     ConstantFlags::DefaultConstraint {
                         // disallow ID inside parametrized
                         id_allowed: false,
