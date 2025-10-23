@@ -1563,7 +1563,7 @@ impl Connection {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock().unwrap();
         if matches!(self.get_tx_state(), TransactionState::None)
-            && current_schema_version != schema.schema_version
+            && current_schema_version < schema.schema_version
         {
             *self.schema.write() = schema.clone();
         }
