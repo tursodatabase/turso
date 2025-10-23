@@ -6958,59 +6958,71 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let maybe_promote_to_mvcc_cursor =
-        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store.unwrap().clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    tx_id,
-                    root_page,
-                    pager.clone(),
-                    btree_cursor,
-                )?))
-            } else {
-                Ok(btree_cursor)
-            }
-        };
-    if let Some(index) = maybe_index {
-        let conn = program.connection.clone();
-        let schema = conn.schema.read();
-        let table = schema
-            .get_table(&index.table_name)
-            .and_then(|table| table.btree());
 
-        let num_columns = index.columns.len();
-        let btree_cursor = Box::new(BTreeCursor::new_index(
-            pager.clone(),
-            root_page,
-            index.as_ref(),
-            num_columns,
-        ));
-        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
-        cursors
-            .get_mut(*cursor_id)
-            .unwrap()
-            .replace(Cursor::new_btree(cursor));
+    // Check if we can reuse the existing cursor
+    let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
+    {
+        // Reuse if the root_page matches (same table/index)
+        btree_cursor.root_page() == root_page
     } else {
-        let num_columns = match cursor_type {
-            CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-            CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
-            _ => unreachable!(
-                "Expected BTreeTable or MaterializedView. This should not have happened."
-            ),
-        };
+        false
+    };
 
-        let btree_cursor = Box::new(BTreeCursor::new_table(
-            pager.clone(),
-            root_page,
-            num_columns,
-        ));
-        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
-        cursors
-            .get_mut(*cursor_id)
-            .unwrap()
-            .replace(Cursor::new_btree(cursor));
+    if !can_reuse_cursor {
+        let maybe_promote_to_mvcc_cursor =
+            |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store.unwrap().clone();
+                    Ok(Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        pager.clone(),
+                        btree_cursor,
+                    )?))
+                } else {
+                    Ok(btree_cursor)
+                }
+            };
+        if let Some(index) = maybe_index {
+            let conn = program.connection.clone();
+            let schema = conn.schema.read();
+            let table = schema
+                .get_table(&index.table_name)
+                .and_then(|table| table.btree());
+
+            let num_columns = index.columns.len();
+            let btree_cursor = Box::new(BTreeCursor::new_index(
+                pager.clone(),
+                root_page,
+                index.as_ref(),
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            cursors
+                .get_mut(*cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        } else {
+            let num_columns = match cursor_type {
+                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
+                _ => unreachable!(
+                    "Expected BTreeTable or MaterializedView. This should not have happened."
+                ),
+            };
+
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                root_page,
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            cursors
+                .get_mut(*cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
