@@ -162,7 +162,7 @@ public class TursoTests
 
         using var cmd = new TursoCommand(connection, "SELECT * FROM table_that_does_not_exist");
         cmd.Invoking(x => x.ExecuteReader()).Should().Throw<TursoException>()
-            .WithMessage("Unable to prepare statment: Parse error: no such table: table_that_does_not_exist");
+            .WithMessage("Unable to prepare statement: Parse error: no such table: table_that_does_not_exist");
     }
 
     [Test]

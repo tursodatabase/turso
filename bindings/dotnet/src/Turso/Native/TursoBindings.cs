@@ -7,16 +7,16 @@ public static class TursoBindings
     private const string DllName = "turso_dotnet.dll";
 
     [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr OpenDatabase(string path, out IntPtr db);
+    public static extern IntPtr OpenDatabase(string path, out IntPtr errorPtr);
 
     [DllImport(DllName, EntryPoint = "db_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern void CloseDatabase(IntPtr db);
 
-    [DllImport(DllName, EntryPoint = "free_error", CallingConvention = CallingConvention.Cdecl)]
-    public static extern void FreeError(IntPtr errorPtr);
+    [DllImport(DllName, EntryPoint = "free_string", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void FreeString(IntPtr stringPtr);
     
     [DllImport(DllName, EntryPoint = "db_prepare_statement", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr PrepareStatement(DatabaseHandle db, string statementSql, out IntPtr statement);
+    public static extern IntPtr PrepareStatement(DatabaseHandle db, string statementSql, out IntPtr errorPtr);
     
     [DllImport(DllName, EntryPoint = "free_statement", CallingConvention = CallingConvention.Cdecl)]
     public static extern void FreeStatement(IntPtr statement);
@@ -28,11 +28,26 @@ public static class TursoBindings
     public static extern void BindNamedParameter(StatementHandle statement, string parameterName, IntPtr tursoValue);
 
     [DllImport(DllName, EntryPoint = "db_statement_execute_step", CallingConvention = CallingConvention.Cdecl)]
-    public static extern IntPtr StatementExecuteStep(StatementHandle statement, [MarshalAs(UnmanagedType.I1)] out bool hasData);
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool StatementExecuteStep(StatementHandle statement, out IntPtr errorPtr);
     
     [DllImport(DllName, EntryPoint = "db_statement_nchange", CallingConvention = CallingConvention.Cdecl)]
     public static extern long StatementRowsAffected(StatementHandle statement);
 
     [DllImport(DllName, EntryPoint = "db_statement_get_value", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoNativeValue GetValueFromStatement(StatementHandle statement, int columnIndex);
+    
+    
+    [DllImport(DllName, EntryPoint = "db_statement_num_columns", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int StatementNumColumns(StatementHandle statement);
+
+    
+    [DllImport(DllName, EntryPoint = "db_statement_column_name", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr StatementColumnName(StatementHandle statement, int index);
+
+    
+    [DllImport(DllName, EntryPoint = "db_statement_has_rows", CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool StatementHasRows(StatementHandle statement);
+
 }

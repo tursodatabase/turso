@@ -8,21 +8,6 @@ namespace Turso;
 
 public class TursoDataReader : DbDataReader
 {
-    public class TursoDataEnumerator : IEnumerator
-    {
-        public bool MoveNext()
-        {
-            throw new NotImplementedException();
-        }
-
-        public void Reset()
-        {
-            throw new NotImplementedException();
-        }
-
-        public object? Current { get; }
-    }
-
     private readonly TursoCommand _command;
     private readonly TursoNativeStatement _statement;
 
@@ -116,12 +101,12 @@ public class TursoDataReader : DbDataReader
 
     public override string GetName(int ordinal)
     {
-        throw new NotImplementedException();
+        return _statement.GetName(ordinal);
     }
 
     public override int GetOrdinal(string name)
     {
-        throw new NotImplementedException();
+        return _statement.GetOrdinal(name);
     }
 
     public override string GetString(int ordinal)
@@ -145,7 +130,13 @@ public class TursoDataReader : DbDataReader
 
     public override int GetValues(object[] values)
     {
-        throw new NotImplementedException();
+        var i = 0;
+        for (; i < FieldCount; i++)
+        {
+            values[i] = GetValue(i)!;
+        }
+
+        return i;
     }
 
     public override bool IsDBNull(int ordinal)
@@ -153,7 +144,7 @@ public class TursoDataReader : DbDataReader
         throw new NotImplementedException();
     }
 
-    public override int FieldCount { get; }
+    public override int FieldCount => _statement.GetFieldCount();
 
     public override object this[int ordinal] => GetValue(ordinal)!;
 
@@ -167,12 +158,12 @@ public class TursoDataReader : DbDataReader
     }
 
     public override int RecordsAffected => _statement.RowsAffected();
-    public override bool HasRows { get; }
-    public override bool IsClosed { get; }
+    public override bool HasRows => _statement.HasRows();
+    public override bool IsClosed => _statement.IsClosed();
 
     public override bool NextResult()
     {
-        while (_statement.Read());
+        while (_statement.Read()) ;
         return true;
     }
 
@@ -191,7 +182,7 @@ public class TursoDataReader : DbDataReader
 
     public override IEnumerator GetEnumerator()
     {
-        return new TursoDataEnumerator();
+        return new DbEnumerator(this, closeReader: false);
     }
 
     private long GetArray<T>(int ordinal, long dataOffset, T[]? buffer, int bufferOffset, int length)
