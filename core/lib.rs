@@ -2648,22 +2648,23 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self, target_schema_version: Option<u32>) -> Result<()> {
+    fn reprepare(&mut self, target_schema_version: u32) -> Result<()> {
         tracing::trace!(
             "repreparing statement, target_schema_version={:?}",
             target_schema_version
         );
         let conn = self.program.connection.clone();
-        if let Some(target_schema_version) = target_schema_version {
-            // The connection may already have the required schema version if it is using a prepared statement
-            // that was compiled with an older schema version. So: only update the connection's schema if it is
-            // actually stale.
-            if conn.schema.read().schema_version < target_schema_version {
-                conn.refresh_schema();
-                debug_assert!(conn.schema.read().schema_version == target_schema_version, "Tried to reprepare to schema version {}, but current global schema version is {}", target_schema_version, conn.schema.read().schema_version);
-            }
-        } else {
+        // The connection may already have the required schema version if it is using a prepared statement
+        // that was compiled with an older schema version. So: only update the connection's schema if it is
+        // actually stale.
+        if conn.schema.read().schema_version < target_schema_version {
             conn.refresh_schema();
+            debug_assert!(
+                conn.schema.read().schema_version == target_schema_version,
+                "Tried to reprepare to schema version {}, but current global schema version is {}",
+                target_schema_version,
+                conn.schema.read().schema_version
+            );
         }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());

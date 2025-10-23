@@ -33,6 +33,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::atomic::AtomicI64;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
@@ -459,14 +460,19 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                if mvcc_store
-                    .last_committed_schema_change_ts
-                    .load(Ordering::Acquire)
-                    > tx.begin_ts
-                {
+                let last_committed_schema_change_version = mvcc_store
+                    .last_committed_schema_change
+                    .0
+                    .load(Ordering::Acquire);
+                let last_committed_schema_change_ts = mvcc_store
+                    .last_committed_schema_change
+                    .1
+                    .load(Ordering::Acquire);
+
+                if last_committed_schema_change_ts > tx.begin_ts {
                     // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
                     return Err(LimboError::SchemaUpdated {
-                        new_schema_version: None,
+                        new_schema_version: last_committed_schema_change_version,
                     });
                 }
 
@@ -683,8 +689,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .last_committed_tx_ts
                     .store(*end_ts, Ordering::Release);
                 if self.did_commit_schema_change {
+                    let schema_version =
+                        mvcc_store.global_header.read().unwrap().schema_cookie.get();
                     mvcc_store
-                        .last_committed_schema_change_ts
+                        .last_committed_schema_change
+                        .0
+                        .store(schema_version, Ordering::Release);
+                    mvcc_store
+                        .last_committed_schema_change
+                        .1
                         .store(*end_ts, Ordering::Release);
                 }
 
@@ -954,9 +967,9 @@ pub struct MvStore<Clock: LogicalClock> {
     /// The highest transaction ID that has been checkpointed.
     /// Used to skip checkpointing transactions that have already been checkpointed.
     checkpointed_txid_max: AtomicU64,
-    /// The timestamp of the last committed schema change.
+    /// The schema_version + timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
-    last_committed_schema_change_ts: AtomicU64,
+    last_committed_schema_change: (AtomicU32, AtomicU64),
     /// The timestamp of the last committed transaction.
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
@@ -983,7 +996,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             global_header: Arc::new(RwLock::new(None)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             checkpointed_txid_max: AtomicU64::new(0),
-            last_committed_schema_change_ts: AtomicU64::new(0),
+            last_committed_schema_change: (AtomicU32::new(0), AtomicU64::new(0)),
             last_committed_tx_ts: AtomicU64::new(0),
         }
     }

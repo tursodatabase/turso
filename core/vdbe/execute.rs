@@ -2449,7 +2449,7 @@ pub fn op_transaction_inner(
                             );
                             state.auto_txn_cleanup = TxnCleanup::None;
                             return Err(LimboError::SchemaUpdated {
-                                new_schema_version: Some(header_schema_cookie),
+                                new_schema_version: header_schema_cookie,
                             });
                         }
                     }
