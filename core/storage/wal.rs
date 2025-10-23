@@ -2413,7 +2413,7 @@ impl WalFileShared {
 
     pub fn create(&mut self, file: Arc<dyn File>) -> Result<()> {
         if self.enabled.load(Ordering::SeqCst) {
-            return Err(LimboError::InternalError("WAL already enabled".to_string()));
+            return Ok(());
         }
 
         let magic = if cfg!(target_endian = "big") {
