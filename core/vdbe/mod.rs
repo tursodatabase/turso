@@ -271,6 +271,7 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: Vec<Option<Cursor>>,
+    cursor_seqs: Vec<i64>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
@@ -325,11 +326,13 @@ unsafe impl Sync for ProgramState {}
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
             io_completions: None,
             pc: 0,
             cursors,
+            cursor_seqs,
             registers,
             result_row: None,
             last_compare: None,
@@ -412,6 +415,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_seqs.resize(max_cursors, 0);
         }
         if let Some(max_resgisters) = max_registers {
             self.registers

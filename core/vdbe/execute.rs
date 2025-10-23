@@ -11,7 +11,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
+use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
@@ -1484,44 +1484,6 @@ pub fn op_last(
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
-}
-
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
-///
-/// This function is a performance-optimized version of `read_varint()` that handles
-/// the most common varint cases inline before falling back to the full implementation.
-/// It follows the same varint encoding as SQLite.
-///
-/// # Optimized Cases
-///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-///
-/// This function is similar to `sqlite3GetVarint32`
-#[inline(always)]
-fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5778,8 +5740,9 @@ pub fn op_sequence(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    let seq_num = cursor.next_sequence();
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let seq_num = *cursor_seq;
+    *cursor_seq += 1;
     state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5800,8 +5763,10 @@ pub fn op_sequence_test(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    state.pc = if cursor.seq_beginning() {
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let was_zero = *cursor_seq == 0;
+    *cursor_seq += 1;
+    state.pc = if was_zero {
         target_pc.as_offset_int()
     } else {
         state.pc + 1
