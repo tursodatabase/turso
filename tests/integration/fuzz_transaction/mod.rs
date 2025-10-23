@@ -420,10 +420,54 @@ enum Operation {
     Select,
 }
 
+impl Operation {
+    pub fn as_prepared_statement_string(&self) -> String {
+        match self {
+            Operation::Begin { .. }
+            | Operation::Commit
+            | Operation::Rollback
+            | Operation::AlterTable { .. }
+            | Operation::Checkpoint { .. } => {
+                panic!("Do not call this method for begin, commit, rollback, alter table, or checkpoint operations");
+            }
+            Operation::Insert { other_columns, .. } => {
+                let mut col_names = vec!["id".to_string()];
+                col_names.extend(other_columns.keys().cloned());
+                let mut col_values_placeholders = vec!["?".to_string()];
+                col_values_placeholders.extend(other_columns.keys().map(|_| "?".to_string()));
+                format!(
+                    "INSERT INTO test_table ({}) VALUES ({})",
+                    col_names.join(", "),
+                    col_values_placeholders.join(", ")
+                )
+            }
+            Operation::Update { other_columns, .. } => {
+                let update_set = other_columns
+                    .keys()
+                    .map(|k| format!("{k}=?"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("UPDATE test_table SET {update_set} WHERE id = ?")
+            }
+            Operation::Delete { .. } => "DELETE FROM test_table WHERE id = ?".to_string(),
+            Operation::Select => "SELECT * FROM test_table".to_string(),
+        }
+    }
+}
+
 fn value_to_sql(v: &Value) -> String {
     match v {
         Value::Integer(i) => i.to_string(),
         Value::Text(s) => format!("'{s}'"),
+        Value::Null => "NULL".to_string(),
+        _ => unreachable!(),
+    }
+}
+
+fn value_to_sql_param(v: &Value) -> String {
+    match v {
+        Value::Integer(i) => i.to_string(),
+        Value::Text(s) => s.to_owned(),
         Value::Null => "NULL".to_string(),
         _ => unreachable!(),
     }
@@ -664,6 +708,10 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             panic!("Unexpected error: {e}");
         };
 
+        let mut prepared_statement_caches = (0..num_connections)
+            .map(|_| BTreeMap::new())
+            .collect::<Vec<_>>();
+
         // Interleave operations between all connections
         for op_num in 0..opts.operations_per_connection {
             for (conn, conn_id, current_tx_id) in &mut connections {
@@ -682,7 +730,9 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 });
                 println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx_str}, has_snapshot={has_snapshot}");
 
-                match operation {
+                let use_prepared_statement = rng.random_bool(0.5);
+
+                match &operation {
                     Operation::Begin { concurrent } => {
                         let query = operation.to_string();
 
@@ -690,7 +740,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                         match result {
                             Ok(_) => {
                                 shared_shadow_db.begin_transaction(next_tx_id, false);
-                                if concurrent {
+                                if *concurrent {
                                     // in tursodb, BEGIN CONCURRENT immediately starts a transaction.
                                     shared_shadow_db.take_snapshot_if_not_exists(next_tx_id);
                                 }
@@ -750,19 +800,35 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                         }
                     }
                     Operation::Insert { id, other_columns } => {
-                        let col_names =
-                            other_columns.keys().cloned().collect::<Vec<_>>().join(", ");
                         let col_values = other_columns
                             .values()
-                            .map(value_to_sql)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let query = if col_names.is_empty() {
-                            format!("INSERT INTO test_table (id) VALUES ({id})")
+                            .map(value_to_sql_param)
+                            .collect::<Vec<_>>();
+
+                        let result = if use_prepared_statement {
+                            let prepared_stmt_string = operation.as_prepared_statement_string();
+                            let (stmt, cached) = if let Some(stmt) =
+                                prepared_statement_caches[*conn_id].get_mut(&prepared_stmt_string)
+                            {
+                                (stmt, true)
+                            } else {
+                                let stmt = conn.prepare(&prepared_stmt_string).await.unwrap();
+                                prepared_statement_caches[*conn_id]
+                                    .insert(prepared_stmt_string.clone(), stmt);
+                                (
+                                    prepared_statement_caches[*conn_id]
+                                        .get_mut(&prepared_stmt_string)
+                                        .unwrap(),
+                                    false,
+                                )
+                            };
+                            let mut params = vec![id.to_string()];
+                            params.extend(col_values);
+                            println!("Executing prepared statement: {prepared_stmt_string}, params: {params:?}, cached: {cached}");
+                            stmt.execute(params).await
                         } else {
-                            format!("INSERT INTO test_table (id, {col_names}) VALUES ({id}, {col_values})")
+                            conn.execute(&operation.to_string(), ()).await
                         };
-                        let result = conn.execute(query.as_str(), ()).await;
 
                         // Check if real DB operation succeeded
                         match result {
@@ -772,13 +838,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db
-                                        .insert(tx_id, id, other_columns.clone())
+                                        .insert(tx_id, *id, other_columns.clone())
                                         .unwrap();
                                 } else {
                                     // Auto-commit - update shadow DB committed state
                                     shared_shadow_db.begin_transaction(next_tx_id, true);
                                     shared_shadow_db
-                                        .insert(next_tx_id, id, other_columns.clone())
+                                        .insert(next_tx_id, *id, other_columns.clone())
                                         .unwrap();
                                     shared_shadow_db.commit_transaction(next_tx_id);
                                     next_tx_id += 1;
@@ -794,13 +860,35 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                         }
                     }
                     Operation::Update { id, other_columns } => {
-                        let col_set = other_columns
-                            .iter()
-                            .map(|(k, v)| format!("{k}={}", value_to_sql(v)))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let query = format!("UPDATE test_table SET {col_set} WHERE id = {id}");
-                        let result = conn.execute(query.as_str(), ()).await;
+                        let col_values = other_columns
+                            .values()
+                            .map(value_to_sql_param)
+                            .collect::<Vec<_>>();
+
+                        let result = if use_prepared_statement {
+                            let prepared_stmt_string = operation.as_prepared_statement_string();
+                            let (stmt, cached) = if let Some(stmt) =
+                                prepared_statement_caches[*conn_id].get_mut(&prepared_stmt_string)
+                            {
+                                (stmt, true)
+                            } else {
+                                let stmt = conn.prepare(&prepared_stmt_string).await.unwrap();
+                                prepared_statement_caches[*conn_id]
+                                    .insert(prepared_stmt_string.clone(), stmt);
+                                (
+                                    prepared_statement_caches[*conn_id]
+                                        .get_mut(&prepared_stmt_string)
+                                        .unwrap(),
+                                    false,
+                                )
+                            };
+                            let mut params = col_values.clone();
+                            params.push(id.to_string());
+                            println!("Executing prepared statement: {prepared_stmt_string}, params: {params:?}, cached: {cached}");
+                            stmt.execute(params).await
+                        } else {
+                            conn.execute(&operation.to_string(), ()).await
+                        };
 
                         // Check if real DB operation succeeded
                         match result {
@@ -810,13 +898,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                     shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
                                     shared_shadow_db
-                                        .update(tx_id, id, other_columns.clone())
+                                        .update(tx_id, *id, other_columns.clone())
                                         .unwrap();
                                 } else {
                                     // Auto-commit - update shadow DB committed state
                                     shared_shadow_db.begin_transaction(next_tx_id, true);
                                     shared_shadow_db
-                                        .update(next_tx_id, id, other_columns.clone())
+                                        .update(next_tx_id, *id, other_columns.clone())
                                         .unwrap();
                                     shared_shadow_db.commit_transaction(next_tx_id);
                                     next_tx_id += 1;
@@ -832,12 +920,30 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                         }
                     }
                     Operation::Delete { id } => {
-                        let result = conn
-                            .execute(
-                                format!("DELETE FROM test_table WHERE id = {id}").as_str(),
-                                (),
-                            )
-                            .await;
+                        let result = if use_prepared_statement {
+                            let prepared_stmt_string = operation.as_prepared_statement_string();
+                            let (stmt, cached) = if let Some(stmt) =
+                                prepared_statement_caches[*conn_id].get_mut(&prepared_stmt_string)
+                            {
+                                (stmt, true)
+                            } else {
+                                let stmt = conn.prepare(&prepared_stmt_string).await.unwrap();
+                                prepared_statement_caches[*conn_id]
+                                    .insert(prepared_stmt_string.clone(), stmt);
+                                (
+                                    prepared_statement_caches[*conn_id]
+                                        .get_mut(&prepared_stmt_string)
+                                        .unwrap(),
+                                    false,
+                                )
+                            };
+                            let mut params = Vec::new();
+                            params.push(id.to_string());
+                            println!("Executing prepared statement: {prepared_stmt_string}, params: {params:?}, cached: {cached}");
+                            stmt.execute(params).await
+                        } else {
+                            conn.execute(&operation.to_string(), ()).await
+                        };
 
                         // Check if real DB operation succeeded
                         match result {
@@ -846,11 +952,11 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                 if let Some(tx_id) = *current_tx_id {
                                     shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
-                                    shared_shadow_db.delete(tx_id, id).unwrap();
+                                    shared_shadow_db.delete(tx_id, *id).unwrap();
                                 } else {
                                     // Auto-commit - update shadow DB committed state
                                     shared_shadow_db.begin_transaction(next_tx_id, true);
-                                    shared_shadow_db.delete(next_tx_id, id).unwrap();
+                                    shared_shadow_db.delete(next_tx_id, *id).unwrap();
                                     shared_shadow_db.commit_transaction(next_tx_id);
                                     next_tx_id += 1;
                                 }
@@ -946,7 +1052,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                                 if let Some(tx_id) = *current_tx_id {
                                     shared_shadow_db.take_snapshot_if_not_exists(tx_id);
                                     // In transaction - update transaction's view
-                                    shared_shadow_db.alter_table(tx_id, op).unwrap();
+                                    shared_shadow_db.alter_table(tx_id, op.clone()).unwrap();
                                 } else {
                                     // Auto-commit - update shadow DB committed state
                                     shared_shadow_db.begin_transaction(next_tx_id, true);
