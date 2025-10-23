@@ -8,6 +8,7 @@ mod fast_lock;
 mod function;
 mod functions;
 mod incremental;
+mod index;
 mod info;
 mod io;
 #[cfg(feature = "json")]
@@ -39,6 +40,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::index::IndexModule;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::translate::display::PlanContext;
@@ -2858,6 +2860,7 @@ pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
+    pub index_modules: HashMap<String, Arc<dyn IndexModule>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -2899,6 +2902,7 @@ impl SymbolTable {
             functions: HashMap::new(),
             vtabs: HashMap::new(),
             vtab_modules: HashMap::new(),
+            index_modules: HashMap::new(),
         }
     }
     pub fn resolve_function(
@@ -2918,6 +2922,9 @@ impl SymbolTable {
         }
         for (name, module) in &other.vtab_modules {
             self.vtab_modules.insert(name.clone(), module.clone());
+        }
+        for (name, module) in &other.index_modules {
+            self.index_modules.insert(name.clone(), module.clone());
         }
     }
 }

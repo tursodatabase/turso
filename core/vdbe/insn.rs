@@ -5,6 +5,7 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
+    index::IndexConfiguration,
     schema::{Affinity, BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
@@ -879,6 +880,13 @@ pub enum Insn {
         flags: CreateBTreeFlags,
     },
 
+    /// Custom index with custom module
+    IdxCreate {
+        /// Allocate index in main database if zero or in temp database if non-zero (P1).
+        db: usize,
+        cursor_id: CursorID,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The root page of the table/index to destroy
@@ -1318,6 +1326,7 @@ impl InsnVariants {
             InsnVariants::OpenWrite => execute::op_open_write,
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
+            InsnVariants::IdxCreate => execute::op_idx_create,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,

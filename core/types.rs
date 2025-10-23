@@ -5,6 +5,7 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+use crate::index::IndexCursor;
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
@@ -2271,6 +2272,7 @@ impl Record {
 
 pub enum Cursor {
     BTree(Box<dyn CursorTrait>),
+    CustomModule(Box<dyn IndexCursor>),
     Pseudo(PseudoCursor),
     Sorter(Sorter),
     Virtual(VirtualTableCursor),
@@ -2281,6 +2283,7 @@ impl Debug for Cursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BTree(..) => f.debug_tuple("BTree").finish(),
+            Self::CustomModule(..) => f.debug_tuple("CustomModule").finish(),
             Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
@@ -2342,6 +2345,13 @@ impl Cursor {
         match self {
             Self::MaterializedView(cursor) => cursor,
             _ => panic!("Cursor is not a materialized view cursor"),
+        }
+    }
+
+    pub fn as_custom_module_mut(&mut self) -> &mut dyn IndexCursor {
+        match self {
+            Self::CustomModule(cursor) => cursor.as_mut(),
+            _ => panic!("Cursor is not a custom module cursor"),
         }
     }
 }

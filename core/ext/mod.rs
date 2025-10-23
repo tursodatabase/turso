@@ -1,6 +1,7 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
+use crate::index::TestIndexModule;
 use crate::schema::{Schema, Table};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
@@ -162,6 +163,11 @@ impl Database {
     /// Register any built-in extensions that can be stored on the Database so we do not have
     /// to register these once-per-connection, and the connection can just extend its symbol table
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
+        {
+            let mut syms = self.builtin_syms.write();
+            syms.index_modules
+                .insert("test".to_string(), Arc::new(TestIndexModule));
+        }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
         let schema_mutex_ptr = &self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;

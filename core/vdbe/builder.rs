@@ -7,6 +7,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
+    index::{IndexConfiguration, IndexModule},
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
@@ -130,7 +131,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
-    CustomModuleIndex(Arc<Index>),
+    CustomModuleIndex(Arc<dyn IndexModule>, IndexConfiguration),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),

@@ -1137,7 +1137,7 @@ pub fn op_open_read(
         CursorType::Sorter => {
             panic!("OpenRead on sorter cursor");
         }
-        CursorType::CustomModuleIndex(_) => {
+        CursorType::CustomModuleIndex(..) => {
             todo!("sivukhin: custom module index stuff")
         }
         CursorType::VirtualTable(_) => {
@@ -1899,7 +1899,7 @@ pub fn op_column(
                         };
                         state.registers[*dest] = Register::Value(value);
                     }
-                    CursorType::CustomModuleIndex(_) => {
+                    CursorType::CustomModuleIndex(..) => {
                         todo!("sivukhin: custom module index stuff")
                     }
                     CursorType::VirtualTable(_) => {
@@ -6939,6 +6939,12 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
 
+    if let Some(Cursor::CustomModule(module)) = &mut state.cursors[*cursor_id] {
+        return_if_io!(module.open_write());
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let root_page = match root_page {
         RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
@@ -7081,6 +7087,41 @@ pub fn op_create_btree(
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_idx_create(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IdxCreate { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    if state.cursors[*cursor_id].is_none() {
+        let syms = program.connection.syms.read();
+        let (_, cursor_type) = &program.cursor_ref[*cursor_id];
+        let CursorType::CustomModuleIndex(module, config) = cursor_type else {
+            return Err(LimboError::InternalError(
+                "unexpected cursor type".to_string(),
+            ));
+        };
+        let cursor = module.init(&config)?;
+        let cursor_ref = &mut state.cursors[*cursor_id];
+        *cursor_ref = Some(Cursor::CustomModule(cursor));
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_custom_module_mut();
+    return_if_io!(cursor.create(&program.connection));
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -7828,7 +7869,7 @@ pub fn op_open_ephemeral(
                 CursorType::VirtualTable(_) => {
                     panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
                 }
-                CursorType::CustomModuleIndex(_) => {
+                CursorType::CustomModuleIndex(..) => {
                     todo!("sivukhin: custom module index stuff")
                 }
                 CursorType::MaterializedView(_, _) => {

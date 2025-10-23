@@ -21,7 +21,7 @@ pub fn insn_to_row(
         match cursor_type {
             CursorType::BTreeTable(table) => &table.name,
             CursorType::BTreeIndex(index) => &index.name,
-            CursorType::CustomModuleIndex(index) => &index.name,
+            CursorType::CustomModuleIndex(_, config) => &config.index_name,
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => &virtual_table.name,
             CursorType::MaterializedView(table, _) => &table.name,
@@ -1284,6 +1284,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("r[{}]=root iDb={} flags={}", root, db, flags.get_flags()),
+            ),
+            Insn::IdxCreate { db, cursor_id } => (
+                "IdxCreate",
+                *db as i32,
+                *cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
             ),
             Insn::Destroy {
                 root,
