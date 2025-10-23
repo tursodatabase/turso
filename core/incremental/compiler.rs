@@ -2580,7 +2580,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
 

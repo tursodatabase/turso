@@ -270,7 +270,7 @@ mod tests {
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
 
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         // Allocate page 1 first (database header)
         let _ = pager.io.block(|| pager.allocate_page1());
