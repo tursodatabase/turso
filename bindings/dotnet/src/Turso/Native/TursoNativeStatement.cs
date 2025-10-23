@@ -55,7 +55,7 @@ public class TursoNativeStatement : IDisposable
 
     public bool Read()
     {
-        var errorPtr = TursoBindings.StatementExecuteStep(_statementHandle, out var hasData);
+        var hasData = TursoBindings.StatementExecuteStep(_statementHandle, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             TursoHelpers.ThrowException(errorPtr);
         return hasData;
@@ -118,6 +118,51 @@ public class TursoNativeStatement : IDisposable
             ValueType = value.ValueType,
             RowValueUnion = union,
         };
+    }
+
+    public string GetName(int ordinal)
+    {
+        if (ordinal < 0)
+            throw new ArgumentOutOfRangeException("Ordinal should be >= 0");
+        
+        var cname = TursoBindings.StatementColumnName(_statementHandle, ordinal);
+        try
+        {
+            return Marshal.PtrToStringUTF8(cname) ?? "";
+        }
+        finally
+        {
+            TursoBindings.FreeString(cname);
+        }
+    }
+
+    public int GetFieldCount()
+    {
+        return TursoBindings.StatementNumColumns(_statementHandle);
+    }
+
+    public bool HasRows()
+    {
+        return TursoBindings.StatementHasRows(_statementHandle);
+    }
+
+    public bool IsClosed()
+    {
+        return _statementHandle.IsInvalid;
+    }
+
+
+    public int GetOrdinal(string name)
+    {
+        var fields = GetFieldCount();
+        for (var i = 0; i < fields; i++)
+        {
+            var columnName = GetName(i);
+            if (columnName == name) 
+                return i;
+        }
+
+        throw new IndexOutOfRangeException($"column {name} not found");
     }
 
 

@@ -1,6 +1,6 @@
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::num::NonZero;
-use std::ops::Deref;
 use std::os::raw::c_char;
 use std::ptr::null;
 use std::slice;
@@ -8,17 +8,7 @@ use std::sync::Arc;
 use turso_core::types::Text;
 use turso_core::{self, Connection, Statement, StepResult, Value, IO};
 
-
-#[repr(C)]
-pub enum ErrorCode {
-    Ok = 0,
-    Error = 1,
-}
-
-#[repr(C)]
-pub struct Error {
-    message: CString,
-}
+type Error = *const i8;
 
 #[repr(C)]
 pub struct Database {
@@ -64,10 +54,8 @@ pub fn allocate<T>(value: T) -> *const T {
     Box::into_raw(Box::new(value))
 }
 
-pub fn allocate_error(err: String) -> *const Error {
-    let message = std::ffi::CString::new(err).unwrap();
-    let error = Error{message};
-    Box::into_raw(Box::new(error))
+pub fn allocate_string(str: &str) -> *const i8 {
+    return std::ffi::CString::new(str).unwrap().into_raw();
 }
 
 pub fn to_vec(array: Array) ->  Vec<u8> {
@@ -89,17 +77,19 @@ pub fn to_value(value: TursoValue) -> Value {
 }
 
 #[no_mangle]
-pub extern "C" fn db_open(path_ptr: *const c_char, db_ptr: *mut *const Database) -> *const Error {
+pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *const Database {
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
     let path_str = path_cstr.to_str();
 
     let connection_result = Connection::from_uri(path_str.unwrap(), true, false, false, false, false);
     match connection_result {
         Ok((io, val)) => {
-            unsafe { *db_ptr = allocate(Database{io, connection: val}) };
-            null()
+            return allocate(Database{io, connection: val})
         },
-        Err(err) =>  allocate_error(format!("Error while opening database: {err}"))
+        Err(err) =>  {
+            unsafe { *error_ptr = allocate_string(format!("Error while opening database: {err}").as_str()) }
+            null()
+        }
     }
 }
 
@@ -109,22 +99,22 @@ pub extern "C" fn db_close(db_ptr: *mut Database) {
 }
 
 #[no_mangle]
-pub extern "C" fn free_error(error_ptr: *mut Error) {
-    let _ = unsafe { Box::from_raw(error_ptr) };
+pub extern "C" fn free_string(error_ptr: *mut i8) {
+    unsafe { drop(std::ffi::CString::from_raw(error_ptr)) };
 }
 
 #[no_mangle]
-pub extern "C" fn db_prepare_statement(db_ptr: *mut Database, sql_ptr: *const c_char,  statement_ptr: *mut *const Statement) -> *const Error {
+pub extern "C" fn db_prepare_statement(db_ptr: *mut Database, sql_ptr: *const c_char,  error_ptr: *mut Error) -> *const Statement {
     let sql = unsafe { CStr::from_ptr(sql_ptr) }.to_str();
     let db = unsafe {&mut (*db_ptr)};
     
     let prepare_result = db.connection.prepare(sql.unwrap());    
     match prepare_result {
-        Ok(statement) => {
-            unsafe { *statement_ptr = allocate(statement) };
+        Ok(statement) => { allocate(statement) }
+        Err(e) => {
+            unsafe { *error_ptr = allocate_string(format!("Unable to prepare statement: {e}").as_str()) }
             null()
-        }
-        Err(e) => allocate_error(format!("Unable to prepare statment: {e}")),
+        },
     }
 }
 
@@ -161,34 +151,35 @@ pub extern "C" fn db_statement_nchange(statement_ptr: *mut Statement) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn db_statement_execute_step(statement_ptr: *mut Statement, has_data: *mut bool) -> *const Error {
+pub extern "C" fn db_statement_execute_step(statement_ptr: *mut Statement, error_ptr: *mut Error) -> bool {
     let statement = unsafe {&mut (*statement_ptr)};
 
     loop {
         match statement.step() {
             Ok(step_result) => {
                 match step_result {
-                    StepResult::Row => {
-                        unsafe { *has_data = true }; 
-                        return null();
-                    }
-                    StepResult::Done => { return null(); }
+                    StepResult::Row => { return true; }
+                    StepResult::Done => { return false; }
                     StepResult::IO => {
                         if let Err(err) = statement.run_once() {
-                            return allocate_error(err.to_string());
+                            unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
+                            return false;
                         }
                         continue;
                     }
                     StepResult::Interrupt => {
-                        return allocate_error("Interrupted".to_string()); 
+                        unsafe { *error_ptr = allocate_string("Interrupted") };
+                        return false; 
                     }
                     StepResult::Busy => { 
-                        return allocate_error("Database is busy".to_string()); 
+                        unsafe { *error_ptr = allocate_string("Database is busy") };
+                        return false; 
                     }
                 }
             },
             Err(err) => {
-                return allocate_error(err.to_string());
+                unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
+                return false;
             }
         }
     }
@@ -236,3 +227,27 @@ pub extern "C" fn db_statement_get_value(statement_ptr: *mut Statement, col_idx:
 }
 
 
+#[no_mangle]
+pub extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement) -> i32 {
+    let statement = unsafe {&mut (*statement_ptr)};
+    statement.num_columns().try_into().unwrap()
+}
+
+#[no_mangle]
+pub extern "C" fn db_statement_column_name(statement_ptr: *mut Statement, index: i32) -> *const i8 {
+    let statement = unsafe {&mut (*statement_ptr)};
+    let col_name = statement.get_column_name(index.try_into().unwrap());
+    return match col_name {
+        Cow::Borrowed(value) => allocate_string(value),
+        Cow::Owned(value) => allocate_string(value.as_str())
+    };
+}
+
+#[no_mangle]
+pub extern "C" fn db_statement_has_rows(statement_ptr: *mut Statement) -> bool {
+    let statement = unsafe {&mut (*statement_ptr)};
+    return match statement.row() {
+        Some(_val) => true,
+        None => false
+    };
+}

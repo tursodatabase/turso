@@ -9,7 +9,7 @@ public class TursoNativeDatabase : IDisposable
 
     public TursoNativeDatabase(string path)
     {
-        var errorPtr = TursoBindings.OpenDatabase(path, out var dbPtr);
+        var dbPtr = TursoBindings.OpenDatabase(path, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             TursoHelpers.ThrowException(errorPtr);
 
@@ -26,7 +26,7 @@ public class TursoNativeDatabase : IDisposable
 
     public TursoNativeStatement PrepareStatement(string sql)
     {
-        var errorPtr = TursoBindings.PrepareStatement(_databaseHandle, sql, out var statementPtr);
+        var statementPtr = TursoBindings.PrepareStatement(_databaseHandle, sql, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             TursoHelpers.ThrowException(errorPtr);
 
