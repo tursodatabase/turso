@@ -656,12 +656,12 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Transaction { db, tx_mode, schema_cookie} => (
+            Insn::Transaction { db, tx_mode, schema_cookie, schema_generation} => (
                 "Transaction",
                 *db as i32,
                 *tx_mode as i32,
                 *schema_cookie as i32,
-                Value::build_text(""),
+                Value::build_text(schema_generation.to_string().as_str()),
                 0,
                 format!("iDb={db} tx_mode={tx_mode:?}"),
             ),

@@ -838,9 +838,13 @@ impl Database {
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+    pub(crate) fn clone_schema(&self, current_generation: u32) -> Arc<Schema> {
         let schema = self.schema.lock().unwrap();
-        schema.clone()
+        let cloned = schema.clone();
+        cloned
+            .generation
+            .store(current_generation + 1, Ordering::SeqCst);
+        cloned
     }
 
     pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
@@ -1133,6 +1137,11 @@ impl Connection {
             return self._prepare(sql, None);
         }
         self._prepare(sql, self.db.mv_store.clone())
+    }
+
+    pub fn refresh_schema(self: &Connection) {
+        let current_generation = self.schema.read().generation.load(Ordering::SeqCst);
+        *self.schema.write() = self.db.clone_schema(current_generation);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -2642,7 +2651,7 @@ impl Statement {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
 
-        *conn.schema.write() = conn.db.clone_schema();
+        conn.refresh_schema();
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;

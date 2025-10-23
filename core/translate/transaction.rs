@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crate::schema::Schema;
 use crate::translate::{emitter::TransactionMode, ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
@@ -28,6 +30,7 @@ pub fn translate_tx_begin(
                 db: 0,
                 tx_mode: TransactionMode::Write,
                 schema_cookie: schema.schema_version,
+                schema_generation: schema.generation.load(Ordering::SeqCst),
             });
             // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {
@@ -40,6 +43,7 @@ pub fn translate_tx_begin(
                 db: 0,
                 tx_mode: TransactionMode::Concurrent,
                 schema_cookie: schema.schema_version,
+                schema_generation: schema.generation.load(Ordering::SeqCst),
             });
             // TODO: Emit transaction instruction on temporary tables when we support them.
             program.emit_insn(Insn::AutoCommit {

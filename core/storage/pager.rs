@@ -2434,7 +2434,7 @@ impl Pager {
         // Invalidate cached schema cookie since rollback may have restored the database schema cookie
         self.set_schema_cookie(None);
         if schema_did_change {
-            *connection.schema.write() = connection.db.clone_schema();
+            connection.refresh_schema();
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {

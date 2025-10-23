@@ -86,6 +86,7 @@ use crate::{util::normalize_ident, Result};
 use core::fmt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
@@ -133,6 +134,7 @@ pub struct Schema {
     pub has_indexes: std::collections::HashSet<String>,
     pub indexes_enabled: bool,
     pub schema_version: u32,
+    pub generation: AtomicU32,
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
@@ -173,6 +175,7 @@ impl Schema {
             has_indexes,
             indexes_enabled,
             schema_version: 0,
+            generation: AtomicU32::new(0),
             table_to_materialized_views,
             incompatible_views,
         }
@@ -1207,6 +1210,7 @@ impl Clone for Schema {
             schema_version: self.schema_version,
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
+            generation: AtomicU32::new(self.generation.load(Ordering::SeqCst)),
         }
     }
 }

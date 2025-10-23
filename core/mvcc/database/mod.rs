@@ -1620,7 +1620,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema();
+            connection.refresh_schema();
         }
 
         let tx = tx_unlocked.value();

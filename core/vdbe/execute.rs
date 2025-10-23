@@ -2276,6 +2276,7 @@ pub fn op_transaction_inner(
             db,
             tx_mode,
             schema_cookie,
+            schema_generation,
         },
         insn
     );
