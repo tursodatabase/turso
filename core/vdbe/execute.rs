@@ -1137,7 +1137,7 @@ pub fn op_open_read(
         CursorType::Sorter => {
             panic!("OpenRead on sorter cursor");
         }
-        CursorType::CustomModuleIndex(..) => {
+        CursorType::CustomModule(..) => {
             todo!("sivukhin: custom module index stuff")
         }
         CursorType::VirtualTable(_) => {
@@ -1899,7 +1899,7 @@ pub fn op_column(
                         };
                         state.registers[*dest] = Register::Value(value);
                     }
-                    CursorType::CustomModuleIndex(..) => {
+                    CursorType::CustomModule(..) => {
                         todo!("sivukhin: custom module index stuff")
                     }
                     CursorType::VirtualTable(_) => {
@@ -6431,10 +6431,28 @@ pub fn op_idx_insert(
             cursor_id,
             record_reg,
             flags,
+            unpacked_start,
+            unpacked_count,
             ..
         },
         *insn
     );
+
+    if let Some(Cursor::CustomModule(cursor)) = &mut state.cursors[cursor_id] {
+        let Some(start) = unpacked_start else {
+            return Err(LimboError::InternalError(
+                "custom module must receive unpacked values".to_string(),
+            ));
+        };
+        let Some(count) = unpacked_count else {
+            return Err(LimboError::InternalError(
+                "custom module must receive unpacked values".to_string(),
+            ));
+        };
+        return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
@@ -6939,8 +6957,23 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
 
-    if let Some(Cursor::CustomModule(module)) = &mut state.cursors[*cursor_id] {
-        return_if_io!(module.open_write());
+    if let (_, CursorType::CustomModule(module, config)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let syms = program.connection.syms.read();
+            let (_, cursor_type) = &program.cursor_ref[*cursor_id];
+            let CursorType::CustomModule(module, config) = cursor_type else {
+                return Err(LimboError::InternalError(
+                    "unexpected cursor type".to_string(),
+                ));
+            };
+            let cursor = module.init(&config)?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::CustomModule(cursor));
+        }
+
+        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = cursor.as_custom_module_mut();
+        return_if_io!(cursor.open_write(&program.connection));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -7109,7 +7142,7 @@ pub fn op_idx_create(
     if state.cursors[*cursor_id].is_none() {
         let syms = program.connection.syms.read();
         let (_, cursor_type) = &program.cursor_ref[*cursor_id];
-        let CursorType::CustomModuleIndex(module, config) = cursor_type else {
+        let CursorType::CustomModule(module, config) = cursor_type else {
             return Err(LimboError::InternalError(
                 "unexpected cursor type".to_string(),
             ));
@@ -7869,7 +7902,7 @@ pub fn op_open_ephemeral(
                 CursorType::VirtualTable(_) => {
                     panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
                 }
-                CursorType::CustomModuleIndex(..) => {
+                CursorType::CustomModule(..) => {
                     todo!("sivukhin: custom module index stuff")
                 }
                 CursorType::MaterializedView(_, _) => {

@@ -1,7 +1,7 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
-use crate::index::TestIndexModule;
+use crate::index::VectorSparseInvertedIndex;
 use crate::schema::{Schema, Table};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
@@ -165,8 +165,10 @@ impl Database {
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
         {
             let mut syms = self.builtin_syms.write();
-            syms.index_modules
-                .insert("test".to_string(), Arc::new(TestIndexModule));
+            syms.index_modules.insert(
+                "vector_sparse_ivf".to_string(),
+                Arc::new(VectorSparseInvertedIndex),
+            );
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler

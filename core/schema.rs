@@ -1,5 +1,6 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
+use crate::index::HIDDEN_BTREE_MODULE_NAME;
 use crate::numeric::Numeric;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,

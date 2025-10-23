@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     sync::{atomic::AtomicI64, Arc},
 };
 
@@ -13,11 +14,11 @@ use crate::{
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
     translate::{
         collate::CollationSeq,
-        emitter::TransactionMode,
+        emitter::{Resolver, TransactionMode},
         expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    CaptureDataChangesMode, Connection, LimboError, Value, VirtualTable,
 };
 
 #[derive(Default)]
@@ -131,7 +132,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
-    CustomModuleIndex(Arc<dyn IndexModule>, IndexConfiguration),
+    CustomModule(Arc<dyn IndexModule>, IndexConfiguration),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
@@ -322,6 +323,33 @@ impl ProgramBuilder {
             cursor_id
         } else {
             self._alloc_cursor_id(Some(key), cursor_type)
+        }
+    }
+
+    pub fn alloc_cursor_index(
+        &mut self,
+        resolver: &Resolver,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        if let Some(module_name) = &index.module_name {
+            let Some(module) = resolver.symbol_table.index_modules.get(module_name) else {
+                return Err(LimboError::InternalError(format!(
+                    "unknown module '{}'",
+                    module_name
+                )));
+            };
+            let configuration = IndexConfiguration {
+                table_name: index.table_name.clone(),
+                index_name: index.name.clone(),
+                columns: index.columns.iter().map(|x| x.name.clone()).collect(),
+                settings: index
+                    .module_parameters
+                    .clone()
+                    .unwrap_or_else(|| HashMap::new()),
+            };
+            Ok(self.alloc_cursor_id(CursorType::CustomModule(module.clone(), configuration)))
+        } else {
+            Ok(self.alloc_cursor_id(CursorType::BTreeIndex(index.clone())))
         }
     }
 

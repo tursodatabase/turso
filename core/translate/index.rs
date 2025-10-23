@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::index::{IndexConfiguration, SCRATCH_BTREE_MODULE_NAME};
+use crate::index::{IndexConfiguration, HIDDEN_BTREE_MODULE_NAME};
 use crate::numeric::Numeric;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
@@ -105,7 +105,7 @@ pub fn translate_create_index(
     };
     let columns = resolve_sorted_columns(&tbl, &columns)?;
     let custom_module = using.is_some();
-    let btree_module = using.as_ref().map(|x| x.as_str()) == Some(SCRATCH_BTREE_MODULE_NAME);
+    let btree_module = using.as_ref().map(|x| x.as_str()) == Some(HIDDEN_BTREE_MODULE_NAME);
     if !with_clause.is_empty() && !custom_module {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
@@ -158,26 +158,7 @@ pub fn translate_create_index(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
-    let index_cursor_id = program.alloc_cursor_id(if custom_module && !btree_module {
-        let module_name = idx.module_name.as_ref().unwrap();
-        let Some(module) = resolver.symbol_table.index_modules.get(module_name) else {
-            bail_parse_error!("unknown module name");
-        };
-        CursorType::CustomModuleIndex(
-            module.clone(),
-            IndexConfiguration {
-                table_name: tbl_name.clone(),
-                index_name: idx_name.clone(),
-                columns: columns.iter().map(|c| c.name.clone()).collect(),
-                settings: idx
-                    .module_parameters
-                    .clone()
-                    .unwrap_or_else(|| HashMap::new()),
-            },
-        )
-    } else {
-        CursorType::BTreeIndex(idx.clone())
-    });
+    let index_cursor_id = program.alloc_cursor_index(resolver, &idx)?;
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
         CursorType::BTreeTable(tbl.clone()),
@@ -206,7 +187,7 @@ pub fn translate_create_index(
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
-    if idx.module_name.is_some() && idx.module_name.as_ref().unwrap() != SCRATCH_BTREE_MODULE_NAME {
+    if idx.module_name.is_some() && idx.module_name.as_ref().unwrap() != HIDDEN_BTREE_MODULE_NAME {
         program.emit_insn(Insn::IdxCreate {
             db: 0,
             cursor_id: index_cursor_id,
@@ -240,8 +221,86 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    let skip_index_population = idx.module_name.as_deref() == Some(SCRATCH_BTREE_MODULE_NAME);
-    if !skip_index_population {
+    if custom_module && !btree_module {
+        // open the table we are creating the index on for reading
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: tbl.root_page,
+            db: 0,
+        });
+
+        // Open the index btree we created for writing to insert the
+        // newly sorted index records.
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: RegisterOrLiteral::Register(root_page_reg),
+            db: 0,
+        });
+
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: loop_end_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        // Loop start:
+        // Collect index values into start_reg..rowid_reg
+        // emit MakeRecord (index key + rowid) into record_reg.
+        //
+        // Then insert the record into the sorter
+        let mut skip_row_label = None;
+        if let Some(where_clause) = where_clause {
+            let label = program.allocate_label();
+            translate_condition_expr(
+                &mut program,
+                &table_references,
+                &where_clause,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label,
+                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_null: label,
+                },
+                resolver,
+            )?;
+            skip_row_label = Some(label);
+        }
+
+        let start_reg = program.alloc_registers(columns.len() + 1);
+        for (i, col) in columns.iter().enumerate() {
+            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+        }
+        let rowid_reg = start_reg + columns.len();
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: rowid_reg,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: columns.len() + 1,
+            dest_reg: record_reg,
+            index_name: Some(idx_name.clone()),
+            affinity_str: None,
+        });
+
+        // insert new index record
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: index_cursor_id,
+            record_reg: record_reg,
+            unpacked_start: Some(start_reg),
+            unpacked_count: Some((columns.len() + 1) as u16),
+            flags: IdxInsertFlags::new().use_seek(false),
+        });
+
+        program.emit_insn(Insn::Next {
+            cursor_id: table_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+    } else if !custom_module {
         // determine the order of the columns in the index for the sorter
         let order = idx.columns.iter().map(|c| c.order).collect();
         // open the sorter and the pseudo table

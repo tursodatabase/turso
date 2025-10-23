@@ -21,7 +21,7 @@ pub fn insn_to_row(
         match cursor_type {
             CursorType::BTreeTable(table) => &table.name,
             CursorType::BTreeIndex(index) => &index.name,
-            CursorType::CustomModuleIndex(_, config) => &config.index_name,
+            CursorType::CustomModule(_, config) => &config.index_name,
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => &virtual_table.name,
             CursorType::MaterializedView(table, _) => &table.name,
@@ -552,7 +552,7 @@ pub fn insn_to_row(
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
-                    CursorType::CustomModuleIndex(..) => todo!("sivukhin: custom module index stuff"),
+                    CursorType::CustomModule(..) => todo!("sivukhin: custom module index stuff"),
                     CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
                 };
                 (
