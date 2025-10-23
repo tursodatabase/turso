@@ -1,10 +1,9 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
-use crate::index::{
-    HiddenBtreeIndex, VectorSparseInvertedIndex, HIDDEN_BTREE_MODULE_NAME,
-    VECTOR_SPARSE_IVF_MODULE_NAME,
-};
+use crate::index::hidden_btree::HiddenBtreeIndex;
+use crate::index::vector_sparse_ivf::VectorSparseInvertedIndex;
+use crate::index::{HIDDEN_BTREE_MODULE_NAME, VECTOR_SPARSE_IVF_MODULE_NAME};
 use crate::schema::{Schema, Table};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
