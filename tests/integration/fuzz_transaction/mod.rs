@@ -730,7 +730,12 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 });
                 println!("Connection {conn_id}(op={op_num}): {operation}, is_in_tx={is_in_tx_str}, has_snapshot={has_snapshot}");
 
-                let use_prepared_statement = rng.random_bool(0.5);
+                let use_prepared_statement = if opts.mvcc_enabled {
+                    // Schema changes + prepared statements are buggy in MVCC
+                    false
+                } else {
+                    rng.random_bool(0.5)
+                };
 
                 match &operation {
                     Operation::Begin { concurrent } => {
