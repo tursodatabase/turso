@@ -2430,6 +2430,11 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
+                if program.connection.is_nested_stmt.load(Ordering::SeqCst) {
+                    state.pc += 1;
+                    state.op_transaction_state = OpTransactionState::Start;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
