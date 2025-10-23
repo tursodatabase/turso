@@ -580,7 +580,7 @@ impl Database {
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
-            is_nested_stmt: AtomicBool::new(false),
+            nestedness: AtomicI32::new(0),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
@@ -1096,7 +1096,7 @@ pub struct Connection {
     pub metrics: RwLock<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
-    is_nested_stmt: AtomicBool,
+    nestedness: AtomicI32,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
@@ -1128,6 +1128,15 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn is_nested_stmt(&self) -> bool {
+        self.nestedness.load(Ordering::SeqCst) > 0
+    }
+    pub fn start_nested(&self) {
+        self.nestedness.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn end_nested(&self) {
+        self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
             // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
@@ -2681,12 +2690,7 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self
-            .program
-            .connection
-            .is_nested_stmt
-            .load(Ordering::SeqCst)
-        {
+        if self.program.connection.is_nested_stmt() {
             return res;
         }
         if res.is_err() {
