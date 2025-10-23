@@ -348,30 +348,35 @@ pub fn exec_julianday(values: &[Register]) -> Value {
 }
 
 fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
-    let year = dt.year();
-    let month = dt.month() as i32;
-    let day = dt.day() as i32;
-    let (adjusted_year, adjusted_month) = if month <= 2 {
-        (year - 1, month + 12)
-    } else {
-        (year, month)
-    };
+    // SQLite's computeJD algorithm
+    let mut y = dt.year();
+    let mut m = dt.month() as i32;
+    let d = dt.day() as i32;
 
-    let a = adjusted_year / 100;
-    let b = 2 - a + a / 4;
-    let jd_days = (365.25 * ((adjusted_year + 4716) as f64)).floor()
-        + (30.6001 * ((adjusted_month + 1) as f64)).floor()
-        + (day as f64)
-        + (b as f64)
-        - 1524.5;
+    if m <= 2 {
+        y -= 1;
+        m += 12;
+    }
 
-    let seconds = dt.hour() as f64 * 3600.0
-        + dt.minute() as f64 * 60.0
-        + dt.second() as f64
-        + (dt.nanosecond() as f64) / 1_000_000_000.0;
+    let a = (y + 4800) / 100;
+    let b = 38 - a + (a / 4);
+    let x1 = 36525 * (y + 4716) / 100;
+    let x2 = 306001 * (m + 1) / 10000;
 
-    let jd_fraction = seconds / 86400.0;
-    jd_days + jd_fraction
+    // iJD = (sqlite3_int64)((X1 + X2 + D + B - 1524.5) * 86400000)
+    let jd_days = (x1 + x2 + d + b) as f64 - 1524.5;
+    let mut i_jd = (jd_days * 86400000.0) as i64;
+
+    // Add time component in milliseconds
+    // iJD += h*3600000 + m*60000 + (sqlite3_int64)(s*1000 + 0.5)
+    let h_ms = dt.hour() as i64 * 3600000;
+    let m_ms = dt.minute() as i64 * 60000;
+    let s_ms = (dt.second() as f64 * 1000.0 + dt.nanosecond() as f64 / 1_000_000.0 + 0.5) as i64;
+
+    i_jd += h_ms + m_ms + s_ms;
+
+    // Convert back to floating point JD
+    i_jd as f64 / 86400000.0
 }
 
 pub fn exec_unixepoch(time_value: &Value) -> Result<Value> {
@@ -490,7 +495,58 @@ fn get_date_time_from_time_value_float(value: f64) -> Option<NaiveDateTime> {
     if value.is_infinite() || value.is_nan() || !is_julian_day_value(value) {
         return None;
     }
-    julian_day_converter::julian_day_to_datetime(value).ok()
+    julian_day_to_datetime(value).ok()
+}
+
+/// Convert a Julian Day number (as f64) to a NaiveDateTime
+/// This uses SQLite's algorithm which converts to integer milliseconds first
+/// to preserve precision, then converts back to date/time components.
+fn julian_day_to_datetime(jd: f64) -> Result<NaiveDateTime> {
+    // SQLite approach: Convert JD to integer milliseconds
+    // iJD = (sqlite3_int64)(jd * 86400000.0 + 0.5)
+    let i_jd = (jd * 86400000.0 + 0.5) as i64;
+
+    // Compute the date (Year, Month, Day) from iJD
+    // Z = (int)((iJD + 43200000)/86400000)
+    let z = ((i_jd + 43200000) / 86400000) as i32;
+
+    // SQLite's algorithm from computeYMD
+    let alpha = ((z as f64 + 32044.75) / 36524.25) as i32 - 52;
+    let a = z + 1 + alpha - ((alpha + 100) / 4) + 25;
+    let b = a + 1524;
+    let c = ((b as f64 - 122.1) / 365.25) as i32;
+    let d = (36525 * (c & 32767)) / 100;
+    let e = ((b - d) as f64 / 30.6001) as i32;
+    let x1 = (30.6001 * e as f64) as i32;
+
+    let day = (b - d - x1) as u32;
+    let month = if e < 14 { e - 1 } else { e - 13 } as u32;
+    let year = if month > 2 { c - 4716 } else { c - 4715 };
+
+    // Compute the time (Hour, Minute, Second) from iJD
+    // day_ms = (int)((iJD + 43200000) % 86400000)
+    let day_ms = ((i_jd + 43200000) % 86400000) as i32;
+
+    // s = (day_ms % 60000) / 1000.0
+    let s_millis = day_ms % 60000;
+    let seconds = (s_millis / 1000) as u32;
+    let millis = (s_millis % 1000) as u32;
+
+    // day_min = day_ms / 60000
+    let day_min = day_ms / 60000;
+    let minutes = (day_min % 60) as u32;
+    let hours = (day_min / 60) as u32;
+
+    // Create the date
+    let date = NaiveDate::from_ymd_opt(year, month, day)
+        .ok_or_else(|| crate::LimboError::InternalError("Invalid date".to_string()))?;
+
+    // Create time with millisecond precision converted to nanoseconds
+    let nanos = millis * 1_000_000;
+    let time = NaiveTime::from_hms_nano_opt(hours, minutes, seconds, nanos)
+        .ok_or_else(|| crate::LimboError::InternalError("Invalid time".to_string()))?;
+
+    Ok(NaiveDateTime::new(date, time))
 }
 
 fn is_leap_second(dt: &NaiveDateTime) -> bool {
@@ -1584,17 +1640,15 @@ mod tests {
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
 
-    #[allow(deprecated)]
     #[test]
     fn test_apply_modifier_julianday() {
-        use julian_day_converter::*;
-
         let dt = create_datetime(2000, 1, 1, 12, 0, 0);
-        let julian_day = &dt.to_jd();
-        let mut dt_result = NaiveDateTime::default();
-        if let Some(ndt) = JulianDay::from_jd(*julian_day) {
-            dt_result = ndt;
-        }
+
+        // Convert datetime to julian day using our implementation
+        let julian_day_value = to_julian_day_exact(&dt);
+
+        // Convert back
+        let dt_result = julian_day_to_datetime(julian_day_value).unwrap();
         assert_eq!(dt_result, dt);
     }
 
