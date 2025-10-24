@@ -52,7 +52,7 @@ public class Benchmarks
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void Select(IDbConnection connection)
+    private static void Select(IDbConnection connection)
     {
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM t;";
