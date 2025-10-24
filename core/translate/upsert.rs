@@ -8,7 +8,7 @@ use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_pk_change_checks};
+use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
@@ -497,10 +497,13 @@ pub fn emit_upsert(
                     &changed_cols,
                 )?;
             }
-            emit_parent_pk_change_checks(
+            emit_parent_key_change_checks(
                 program,
                 resolver,
                 &bt,
+                resolver.schema.get_indices(table.get_name()).filter(|idx| {
+                    upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
+                }),
                 ctx.cursor_id,
                 ctx.conflict_rowid_reg,
                 new_start,
