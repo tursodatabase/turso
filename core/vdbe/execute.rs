@@ -2905,8 +2905,12 @@ pub fn op_idx_row_id(
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
     let cursor = cursors.get_mut(*cursor_id).unwrap().as_mut().unwrap();
-    let cursor = cursor.as_btree_mut();
-    let rowid = return_if_io!(cursor.rowid());
+
+    let rowid = match cursor {
+        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+        Cursor::CustomModule(cursor) => return_if_io!(cursor.query_rowid()),
+        _ => panic!("unexpected cursor type"),
+    };
     state.registers[*dest] = match rowid {
         Some(rowid) => Register::Value(Value::Integer(rowid)),
         None => Register::Value(Value::Null),
@@ -5265,12 +5269,11 @@ pub fn op_function(
                     .regex_cache
                     .token_regex()
                     .find_iter(needle_str.as_str());
-                let needle_tokens = needle_matches
-                    .map(|m| m.as_str())
-                    .collect::<HashSet<_>>();
+                let needle_tokens = needle_matches.map(|m| m.as_str()).collect::<HashSet<_>>();
                 let mut haystack_tokens = state
                     .regex_cache
-                    .token_regex().find_iter(haystack_str.as_str());
+                    .token_regex()
+                    .find_iter(haystack_str.as_str());
                 let has_token = haystack_tokens.any(|m| needle_tokens.contains(m.as_str()));
                 state.registers[*dest] =
                     Register::Value(Value::Integer(if has_token { 1 } else { 0 }));
