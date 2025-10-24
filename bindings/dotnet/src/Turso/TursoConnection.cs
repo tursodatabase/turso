@@ -45,7 +45,12 @@ public class TursoConnection : DbConnection
         _turso?.Dispose();
         _turso = null;
     }
-
+    
+    protected override void Dispose(bool disposing)
+    {
+        base.Dispose(disposing);
+        _turso?.Dispose();
+    }
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
