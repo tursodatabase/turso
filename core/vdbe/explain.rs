@@ -552,7 +552,7 @@ pub fn insn_to_row(
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
-                    CursorType::CustomModule(..) => todo!("sivukhin: custom module index stuff"),
+                    CursorType::CustomModule(..) => None,
                     CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
                 };
                 (

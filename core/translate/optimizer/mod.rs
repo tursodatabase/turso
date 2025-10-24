@@ -347,7 +347,7 @@ fn optimize_table_access_with_custom_modules(
         return Ok(false);
     };
     let mut query_aliases = HashMap::new();
-    for column in result_columns {
+    for column in result_columns.iter() {
         if let Some(alias) = &column.alias {
             query_aliases.insert(alias.clone(), Box::new(column.expr.clone()));
         }
@@ -477,11 +477,10 @@ fn optimize_table_access_with_custom_modules(
             let _ = order_by.drain(..);
             let _ = limit.take();
             let _ = offset.take();
-            for (i, column) in result_columns.iter().enumerate() {
-                let original = &column.expr;
+            for (i, column) in result_columns.iter_mut().enumerate() {
                 column.expr = ast::Expr::Column {
                     database: None,
-                    table: TableInternalId::default(),
+                    table: table.internal_id,
                     column: i,
                     is_rowid_alias: false,
                 };

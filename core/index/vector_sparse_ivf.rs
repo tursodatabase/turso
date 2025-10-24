@@ -75,6 +75,7 @@ pub struct VectorSparseInvertedIndexCursor {
     configuration: IndexConfiguration,
     scratch_btree: String,
     cursor: Option<BTreeCursor>,
+    values: [Value; 2],
     create_state: VectorSparseInvertedIndexCreateState,
     insert_state: VectorSparseInvertedIndexInsertState,
     delete_state: VectorSparseInvertedIndexDeleteState,
@@ -114,6 +115,7 @@ impl VectorSparseInvertedIndexCursor {
             configuration,
             scratch_btree,
             cursor: None,
+            values: [Value::Null, Value::Null],
             create_state: VectorSparseInvertedIndexCreateState::Init,
             insert_state: VectorSparseInvertedIndexInsertState::Init,
             delete_state: VectorSparseInvertedIndexDeleteState::Init,
@@ -363,15 +365,16 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        todo!()
+        tracing::info!("values: {:?}", values);
+        Ok(IOResult::Done(()))
     }
 
     fn query_next(&mut self) -> Result<IOResult<bool>> {
-        todo!()
+        Ok(IOResult::Done(false))
     }
 
-    fn query_column(&mut self, position: usize) -> Result<IOResult<&Value>> {
-        todo!()
+    fn query_column(&mut self, position: usize) -> Result<IOResult<Value>> {
+        Ok(IOResult::Done(Value::Float(3.14)))
     }
 
     fn commit(&mut self) -> Result<()> {

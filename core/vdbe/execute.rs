@@ -1045,6 +1045,20 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db);
 
+    if let (_, CursorType::CustomModule(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::CustomModule(cursor));
+        }
+
+        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = cursor.as_custom_module_mut();
+        return_if_io!(cursor.open_read(&program.connection));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
@@ -1900,7 +1914,10 @@ pub fn op_column(
                         state.registers[*dest] = Register::Value(value);
                     }
                     CursorType::CustomModule(..) => {
-                        todo!("sivukhin: custom module index stuff")
+                        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+                        let cursor = cursor.as_custom_module_mut();
+                        let value = return_if_io!(cursor.query_column(*column));
+                        state.registers[*dest] = Register::Value(value);
                     }
                     CursorType::VirtualTable(_) => {
                         panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
@@ -2080,6 +2097,11 @@ pub fn op_next(
             }
             Cursor::MaterializedView(mv_cursor) => {
                 let has_more = return_if_io!(mv_cursor.next());
+                !has_more
+            }
+            Cursor::CustomModule(_) => {
+                let cursor = cursor.as_custom_module_mut();
+                let has_more = return_if_io!(cursor.query_next());
                 !has_more
             }
             _ => panic!("Next on non-btree/materialized-view cursor"),

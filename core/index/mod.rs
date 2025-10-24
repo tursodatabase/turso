@@ -51,7 +51,7 @@ pub trait IndexCursor {
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>>;
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>>;
     fn query_next(&mut self) -> Result<IOResult<bool>>;
-    fn query_column(&mut self, position: usize) -> Result<IOResult<&Value>>;
+    fn query_column(&mut self, position: usize) -> Result<IOResult<Value>>;
 
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;

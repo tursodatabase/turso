@@ -1332,7 +1332,7 @@ impl InsnVariants {
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IdxCreate => execute::op_idx_create,
-            InsnVariants::IdxQuery => execute::op_idx_create,
+            InsnVariants::IdxQuery => execute::op_idx_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
