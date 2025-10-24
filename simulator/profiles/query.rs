@@ -71,5 +71,4 @@ pub enum QueryTypes {
     Update,
     Delete,
     DropTable,
-    pragma_weight,
 }

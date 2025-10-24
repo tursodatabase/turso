@@ -88,7 +88,7 @@ fn random_create_index<R: rand::Rng + ?Sized>(
 fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, _conn_ctx: &impl GenerationContext) -> Query {
     const ALL_MODES: [VacuumMode; 2] = [
         VacuumMode::None,
-        // VacuumMode::Incremental, not implemented yer
+        // VacuumMode::Incremental, not implemented yet
         VacuumMode::Full,
     ];
 
@@ -162,6 +162,8 @@ impl QueryDiscriminants {
     fn weight(&self, remaining: &Remaining) -> u32 {
         match self {
             QueryDiscriminants::Create => remaining.create,
+            // remaining.select / 3 is for the random_expr generation
+            // have a max of 1 so that we always generate at least a non zero weight for `QueryDistribution`
             QueryDiscriminants::Select => (remaining.select + remaining.select / 3).max(1),
             QueryDiscriminants::Insert => remaining.insert,
             QueryDiscriminants::Delete => remaining.delete,

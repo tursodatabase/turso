@@ -24,7 +24,7 @@ impl Display for Pragma {
                     VacuumMode::Full => "full",
                 };
 
-                write!(f, "PRAGMA auto_vacuum={mode} ")?;
+                write!(f, "PRAGMA auto_vacuum={mode}")?;
                 Ok(())
             }
         }
