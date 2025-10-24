@@ -328,7 +328,6 @@ impl ProgramBuilder {
     pub fn alloc_cursor_index(
         &mut self,
         key: Option<CursorKey>,
-        resolver: &Resolver,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
         let module = index.module.as_ref();

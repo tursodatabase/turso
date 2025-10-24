@@ -13,7 +13,7 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder, TableInternalId};
 
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
@@ -23,11 +23,12 @@ use crate::{
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
         plan::{
-            ColumnUsedMask, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent,
+            ColumnUsedMask, CustomModuleQuery, OuterQueryReference, QueryDestination,
+            ResultSetColumn, Scan, SeekKeyComponent,
         },
     },
     types::SeekOp,
+    util::try_capture_parameters,
     vdbe::builder::{CursorKey, CursorType, ProgramBuilder},
     LimboError, Result,
 };
@@ -84,12 +85,14 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     let best_join_order = optimize_table_access(
         schema,
-        &plan.result_columns,
+        &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
     if let Some(best_join_order) = best_join_order {
@@ -110,12 +113,14 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
 
     let _ = optimize_table_access(
         schema,
-        &plan.result_columns,
+        &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
     Ok(())
@@ -135,12 +140,14 @@ fn optimize_update_plan(
     }
     let _ = optimize_table_access(
         schema,
-        &[],
+        &mut [],
         &mut plan.table_references,
         &schema.indexes,
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &mut plan.limit,
+        &mut plan.offset,
     )?;
 
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
@@ -323,28 +330,175 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 
 fn optimize_table_access_with_custom_modules(
     schema: &Schema,
-    result_columns: &[ResultSetColumn],
+    result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
-    group_by: &mut Option<GroupBy>,
+    _group_by: &mut Option<GroupBy>,
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
     let tables = table_references.joined_tables_mut();
     assert_eq!(tables.len(), 1);
 
-    tracing::info!("available: {:?}", available_indexes);
     let table = &mut tables[0];
     let Some(indexes) = available_indexes.get(table.table.get_name()) else {
         return Ok(false);
     };
+    let mut query_aliases = HashMap::new();
+    for column in result_columns {
+        if let Some(alias) = &column.alias {
+            query_aliases.insert(alias.clone(), Box::new(column.expr.clone()));
+        }
+    }
     for index in indexes {
-        tracing::info!("INDEX!");
         let Some(module) = &index.module else {
             continue;
         };
         let definition = module.definition();
-        tracing::info!("definition: {:?}", definition);
+        if definition.hidden {
+            continue;
+        }
+        'pattern: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            assert!(pattern.with.is_none());
+            assert!(pattern.body.compounds.is_empty());
+            let ast::OneSelect::Select {
+                columns,
+                from: Some(ast::FromClause { select, joins }),
+                distinctness: None,
+                where_clause: None,
+                group_by: None,
+                window_clause,
+            } = &pattern.body.select
+            else {
+                panic!("unexpected select pattern body");
+            };
+            assert!(window_clause.is_empty());
+            assert!(joins.is_empty());
+            let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
+                panic!("unexpected from clause");
+            };
+            if name.name.as_str() != table.table.get_name() {
+                continue;
+            }
+            if order_by.len() != pattern.order_by.len() {
+                continue;
+            }
+            // todo: allow where clause
+            if !where_clause.is_empty() {
+                continue;
+            }
+            // todo: allow columns to overlap by rowid only
+            if columns.len() != result_columns.len() {
+                continue;
+            }
+            let mut pattern_aliases = HashMap::new();
+            for column in columns {
+                match column {
+                    ast::ResultColumn::Expr(expr, Some(ast::As::As(alias))) => {
+                        pattern_aliases.insert(alias.as_str().to_string(), expr.clone());
+                    }
+                    _ => continue,
+                }
+            }
+            let mut parameters = HashMap::new();
+            for (pattern_column, query_column) in columns.iter().zip(result_columns.iter()) {
+                match (pattern_column, query_column) {
+                    (ast::ResultColumn::Expr(pattern, _), query) => {
+                        let Some(captured) = try_capture_parameters(
+                            &table.table,
+                            &pattern,
+                            &pattern_aliases,
+                            &query.expr,
+                            &query_aliases,
+                        ) else {
+                            continue 'pattern;
+                        };
+                        parameters.extend(captured);
+                    }
+                    _ => {
+                        continue 'pattern;
+                    }
+                }
+            }
+            for (pattern_column, (query_column, query_order)) in
+                pattern.order_by.iter().zip(order_by.iter())
+            {
+                if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                    continue 'pattern;
+                }
+                let Some(captured) = try_capture_parameters(
+                    &table.table,
+                    &pattern_column.expr,
+                    &pattern_aliases,
+                    &query_column,
+                    &query_aliases,
+                ) else {
+                    continue 'pattern;
+                };
+                parameters.extend(captured);
+            }
+            match (pattern.limit.as_ref().map(|x| &x.expr), &limit) {
+                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(pattern_limit), Some(query_limit)) => {
+                    let Some(captured) = try_capture_parameters(
+                        &table.table,
+                        pattern_limit,
+                        &HashMap::new(),
+                        query_limit,
+                        &HashMap::new(),
+                    ) else {
+                        continue 'pattern;
+                    };
+                    parameters.extend(captured);
+                }
+                (None, None) => {}
+            }
+            match (
+                pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
+                &offset,
+            ) {
+                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(pattern_off), Some(query_off)) => {
+                    let Some(captured) = try_capture_parameters(
+                        &table.table,
+                        pattern_off,
+                        &HashMap::new(),
+                        query_off,
+                        &HashMap::new(),
+                    ) else {
+                        continue 'pattern;
+                    };
+                    parameters.extend(captured);
+                }
+                (None, None) => {}
+            }
+            let _ = order_by.drain(..);
+            let _ = limit.take();
+            let _ = offset.take();
+            for (i, column) in result_columns.iter().enumerate() {
+                let original = &column.expr;
+                column.expr = ast::Expr::Column {
+                    database: None,
+                    table: TableInternalId::default(),
+                    column: i,
+                    is_rowid_alias: false,
+                };
+            }
+            let mut arguments = parameters.iter().collect::<Vec<_>>();
+            arguments.sort_by_key(|(&i, _)| i);
+
+            table.op = Operation::CustomModuleQuery(CustomModuleQuery {
+                index: index.clone(),
+                pattern_idx,
+                arguments: arguments
+                    .iter()
+                    .map(|(_, &ref e)| Box::new(e.clone()))
+                    .collect(),
+            });
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -362,12 +516,14 @@ fn optimize_table_access_with_custom_modules(
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
 fn optimize_table_access(
     schema: &Schema,
-    result_columns: &[ResultSetColumn],
+    result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
+    limit: &mut Option<Box<Expr>>,
+    offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
@@ -385,6 +541,8 @@ fn optimize_table_access(
             where_clause,
             order_by,
             group_by,
+            limit,
+            offset,
         )?;
         if optimized {
             return Ok(None);

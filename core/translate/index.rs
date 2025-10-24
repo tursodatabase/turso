@@ -165,7 +165,7 @@ pub fn translate_create_index(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
-    let index_cursor_id = program.alloc_cursor_index(None, resolver, &idx)?;
+    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
         CursorType::BTreeTable(tbl.clone()),

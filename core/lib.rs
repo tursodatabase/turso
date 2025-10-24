@@ -483,6 +483,9 @@ impl Database {
             n_connections: AtomicUsize::new(0),
         });
 
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
             // parse schema
@@ -505,10 +508,14 @@ impl Database {
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .inspect_err(|_| pager.end_read_tx());
-                if let Err(LimboError::ExtensionError(e)) = result {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    eprintln!("Warning: {e}");
+                match result {
+                    Err(LimboError::ExtensionError(e)) => {
+                        // this means that a vtab exists and we no longer have the module loaded. we print
+                        // a warning to the user to load the module
+                        eprintln!("Warning: {e}");
+                    }
+                    Err(e) => return Err(e),
+                    _ => {}
                 }
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
@@ -527,9 +534,6 @@ impl Database {
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
 
         Ok(db)
     }

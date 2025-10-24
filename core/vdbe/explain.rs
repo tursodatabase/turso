@@ -1294,6 +1294,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::IdxQuery { db, cursor_id, start_reg, count_reg } => (
+                "IdxQuery",
+                *db as i32,
+                *cursor_id as i32,
+                *start_reg as i32,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
             Insn::Destroy {
                 root,
                 former_root_reg,

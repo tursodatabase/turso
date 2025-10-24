@@ -2006,8 +2006,8 @@ pub fn translate_expr(
                                 "index cursor should be opened when use_covering_index=true",
                             );
                             index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
-                                    })
+                                panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
+                            })
                         } else {
                             *column
                         };

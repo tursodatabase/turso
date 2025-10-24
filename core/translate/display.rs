@@ -119,6 +119,15 @@ impl Display for SelectPlan {
                         )?;
                     }
                 },
+                Operation::CustomModuleQuery(query) => {
+                    let module = query.index.module.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().module_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -161,6 +170,15 @@ impl Display for DeletePlan {
                         )?;
                     }
                 },
+                Operation::CustomModuleQuery(query) => {
+                    let module = query.index.module.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().module_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -215,6 +233,15 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                 },
+                Operation::CustomModuleQuery(query) => {
+                    let module = query.index.module.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().module_name
+                    )?;
+                }
             }
         }
         if !self.order_by.is_empty() {

@@ -1,7 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
+use turso_parser::ast;
+
 use crate::{
-    storage::btree::{BTreeCursor, CursorTrait},
+    storage::btree::BTreeCursor,
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -34,7 +36,7 @@ pub const VECTOR_SPARSE_IVF_MODULE_NAME: &str = "vector_sparse_ivf";
 pub struct IndexDefinition<'a> {
     pub module_name: &'a str,
     pub index_name: &'a str,
-    pub patterns: &'a [String],
+    pub patterns: &'a [ast::Select],
     pub hidden: bool,
 }
 
@@ -76,4 +78,26 @@ pub(crate) fn open_btree_cursor(
         key_info: keys,
     });
     Ok(cursor)
+}
+
+pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
+    let mut parsed = Vec::new();
+    for pattern in patterns {
+        let mut parser = turso_parser::parser::Parser::new(pattern.as_bytes());
+        let Some(ast) = parser.next() else {
+            return Err(LimboError::ParseError(format!(
+                "unable to parse pattern statement: {}",
+                pattern
+            )));
+        };
+        let ast = ast?;
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = ast else {
+            return Err(LimboError::ParseError(format!(
+                "only select patterns are allowed: {}",
+                pattern
+            )));
+        };
+        parsed.push(select);
+    }
+    Ok(parsed)
 }

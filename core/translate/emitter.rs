@@ -663,6 +663,9 @@ fn emit_delete_insns(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
+        Operation::CustomModuleQuery(_) => {
+            panic!("custom module is not supported for delete statements")
+        }
     };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
 
@@ -1077,6 +1080,9 @@ fn emit_update_insns(
                 false,
             ),
         },
+        Operation::CustomModuleQuery(_) => {
+            panic!("custom module is not supported for update operations")
+        }
     };
 
     let beg = program.alloc_registers(

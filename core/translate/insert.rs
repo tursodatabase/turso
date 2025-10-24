@@ -147,7 +147,7 @@ impl<'a> InsertEmitCtx<'a> {
             idx_cursors.push((
                 &idx.name,
                 idx.root_page,
-                program.alloc_cursor_index(None, resolver, &idx)?,
+                program.alloc_cursor_index(None, &idx)?,
             ));
         }
         let halt_label = program.allocate_label();

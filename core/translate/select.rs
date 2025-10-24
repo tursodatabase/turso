@@ -3,7 +3,6 @@ use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
     Search, TableReferences, WhereTerm, Window,
 };
-use crate::index::IndexConfiguration;
 use crate::schema::Table;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
@@ -20,7 +19,6 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::Connection;
 use crate::{vdbe::builder::ProgramBuilder, Result};
-use std::collections::HashMap;
 use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
@@ -625,6 +623,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
                 Search::RowidEq { .. } => 1,
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
             }
+            Operation::CustomModuleQuery(_) => 1,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_plan_required_cursors(&from_clause_subquery.plan)
         } else {
@@ -644,6 +643,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
+            Operation::CustomModuleQuery(_) => 15,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             10 + estimate_num_instructions(&from_clause_subquery.plan)
         } else {
@@ -667,6 +667,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
+            Operation::CustomModuleQuery(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             3 + estimate_num_labels(&from_clause_subquery.plan)
         } else {

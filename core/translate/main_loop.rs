@@ -252,7 +252,6 @@ pub fn init_loop(
                         }
                         let cursor_id = program.alloc_cursor_index(
                             Some(CursorKey::index(table.internal_id, index.clone())),
-                            &t_ctx.resolver,
                             &index,
                         )?;
                         program.emit_insn(Insn::OpenWrite {
@@ -346,7 +345,6 @@ pub fn init_loop(
                                 }
                                 let cursor_id = program.alloc_cursor_index(
                                     Some(CursorKey::index(table.internal_id, index.clone())),
-                                    &t_ctx.resolver,
                                     index,
                                 )?;
                                 program.emit_insn(Insn::OpenWrite {
@@ -392,6 +390,17 @@ pub fn init_loop(
                     }
                 }
             }
+            Operation::CustomModuleQuery(query) => match mode {
+                OperationMode::SELECT => {
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().clone().unwrap().root_page,
+                        db: table.database_id,
+                    });
+                }
+                _ => panic!("only SELECT is supported for custom module"),
+            },
         }
     }
 
@@ -661,6 +670,26 @@ pub fn open_loop(
                         }
                     }
                 }
+            }
+            Operation::CustomModuleQuery(query) => {
+                let start_reg = program.alloc_registers(query.arguments.len() + 1);
+                program.emit_int(query.pattern_idx as i64, start_reg);
+                for i in 0..query.arguments.len() {
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        &query.arguments[i],
+                        start_reg + 1 + i,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.emit_insn(Insn::IdxQuery {
+                    db: 0,
+                    cursor_id: index_cursor_id.expect("CustomModuleQuery requires a index cursor"),
+                    start_reg,
+                    count_reg: query.arguments.len() + 1,
+                });
+                program.preassign_label_to_next_insn(loop_start);
             }
         }
 
@@ -1112,6 +1141,14 @@ pub fn close_loop(
                         });
                     }
                 }
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::CustomModuleQuery(_) => {
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Next {
+                    cursor_id: index_cursor_id.unwrap(),
+                    pc_if_next: loop_labels.loop_start,
+                });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
         }

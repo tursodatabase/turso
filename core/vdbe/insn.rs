@@ -881,9 +881,15 @@ pub enum Insn {
 
     /// Custom index with custom module
     IdxCreate {
-        /// Allocate index in main database if zero or in temp database if non-zero (P1).
         db: usize,
         cursor_id: CursorID,
+    },
+    // Custom module query op-code
+    IdxQuery {
+        db: usize,
+        cursor_id: CursorID,
+        start_reg: usize,
+        count_reg: usize,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -1326,6 +1332,7 @@ impl InsnVariants {
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IdxCreate => execute::op_idx_create,
+            InsnVariants::IdxQuery => execute::op_idx_create,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,

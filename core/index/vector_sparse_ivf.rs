@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     index::{
-        open_btree_cursor, IndexConfiguration, IndexCursor, IndexDefinition, IndexDescriptor,
-        IndexModule, HIDDEN_BTREE_MODULE_NAME, VECTOR_SPARSE_IVF_MODULE_NAME,
+        open_btree_cursor, parse_patterns, IndexConfiguration, IndexCursor, IndexDefinition,
+        IndexDescriptor, IndexModule, HIDDEN_BTREE_MODULE_NAME, VECTOR_SPARSE_IVF_MODULE_NAME,
     },
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
@@ -22,7 +22,7 @@ pub struct VectorSparseInvertedIndex;
 #[derive(Debug)]
 pub struct VectorSparseInvertedIndexDescriptor {
     configuration: IndexConfiguration,
-    patterns: Vec<String>,
+    patterns: Vec<ast::Select>,
 }
 
 pub enum VectorSparseInvertedIndexCreateState {
@@ -82,11 +82,11 @@ pub struct VectorSparseInvertedIndexCursor {
 
 impl IndexModule for VectorSparseInvertedIndex {
     fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>> {
-        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, :v) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
-        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(:v, {}) as distance FROM {} ORDER BY distance LIMIT :k", configuration.columns[0], configuration.table_name);
+        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0], configuration.table_name);
+        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0], configuration.table_name);
         Ok(Arc::new(VectorSparseInvertedIndexDescriptor {
             configuration: configuration.clone(),
-            patterns: vec![query_pattern1, query_pattern2],
+            patterns: parse_patterns(&[&query_pattern1, &query_pattern2])?,
         }))
     }
 }

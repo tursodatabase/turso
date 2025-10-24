@@ -5,7 +5,8 @@ use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
-        collate::get_collseq_from_expr, emitter::UpdateRowSource,
+        collate::get_collseq_from_expr,
+        emitter::{Resolver, UpdateRowSource},
         optimizer::constraints::SeekRangeConstraint,
     },
     vdbe::{
@@ -800,6 +801,7 @@ pub enum Operation {
     // This operation is used to search for a row in a table using an index
     // (i.e. a primary key or a secondary index)
     Search(Search),
+    CustomModuleQuery(CustomModuleQuery),
 }
 
 impl Operation {
@@ -821,9 +823,10 @@ impl Operation {
     pub fn index(&self) -> Option<&Arc<Index>> {
         match self {
             Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
+            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
+            Operation::CustomModuleQuery(CustomModuleQuery { index, .. }) => Some(&index),
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
-            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
         }
     }
 }
@@ -949,12 +952,14 @@ impl JoinedTable {
                     )
                 };
 
-                let index_cursor_id = index.map(|index| {
-                    program.alloc_cursor_id_keyed(
-                        CursorKey::index(self.internal_id, index.clone()),
-                        CursorType::BTreeIndex(index.clone()),
-                    )
-                });
+                let index_cursor_id = index
+                    .map(|index| {
+                        program.alloc_cursor_index(
+                            Some(CursorKey::index(self.internal_id, index.clone())),
+                            index,
+                        )
+                    })
+                    .transpose()?;
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
@@ -1168,6 +1173,14 @@ pub enum Search {
         index: Option<Arc<Index>>,
         seek_def: SeekDef,
     },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub struct CustomModuleQuery {
+    pub index: Arc<Index>,
+    pub pattern_idx: usize,
+    pub arguments: Vec<Box<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

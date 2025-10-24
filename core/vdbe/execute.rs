@@ -7153,6 +7153,36 @@ pub fn op_idx_create(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_idx_query(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        IdxQuery {
+            db,
+            cursor_id,
+            start_reg,
+            count_reg
+        },
+        insn
+    );
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_custom_module_mut();
+    return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub enum OpDestroyState {
     CreateCursor,
     DestroyBtree(Arc<RwLock<BTreeCursor>>),
