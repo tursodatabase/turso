@@ -54,6 +54,10 @@ pub fn emit_subqueries(
                         )
                     }
                 },
+                Operation::CustomModuleQuery(query) => {
+                    let module = query.index.module.as_ref().unwrap();
+                    format!("QUERY MODULE {}", module.definition().module_name)
+                }
             }
         );
 

@@ -182,7 +182,7 @@ pub fn parse_schema_rows(
         }
     }
 
-    schema.populate_indices(from_sql_indexes, automatic_indices)?;
+    schema.populate_indices(syms, from_sql_indexes, automatic_indices)?;
     schema.populate_materialized_views(
         materialized_view_info,
         dbsp_state_roots,
@@ -315,6 +315,83 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
         (Literal::CurrentTime, Literal::CurrentTime) => true,
         (Literal::CurrentTimestamp, Literal::CurrentTimestamp) => true,
         _ => false,
+    }
+}
+
+pub fn try_capture_parameters(
+    table: &Table,
+    pattern: &Expr,
+    pattern_alias: &HashMap<String, Box<Expr>>,
+    query: &Expr,
+    query_alias: &HashMap<String, Box<Expr>>,
+) -> Option<HashMap<i32, Expr>> {
+    let mut captured = HashMap::new();
+    let mut pattern_aliased = pattern;
+    if let ast::Expr::Id(name) = &pattern {
+        if let Some(alias) = pattern_alias.get(name.as_str()) {
+            pattern_aliased = alias;
+        }
+    }
+    let mut query_aliased = query;
+    if let ast::Expr::Id(name) = &query {
+        if let Some(alias) = query_alias.get(name.as_str()) {
+            query_aliased = alias;
+        }
+    }
+    match (pattern_aliased, query_aliased) {
+        (
+            Expr::FunctionCall {
+                name: name1,
+                distinctness: distinct1,
+                args: args1,
+                order_by: order1,
+                filter_over: filter1,
+            },
+            Expr::FunctionCall {
+                name: name2,
+                distinctness: distinct2,
+                args: args2,
+                order_by: order2,
+                filter_over: filter2,
+            },
+        ) => {
+            if !name1.as_str().eq_ignore_ascii_case(name2.as_str()) {
+                return None;
+            }
+            if distinct1.is_some() || distinct2.is_some() {
+                return None;
+            }
+            if !order1.is_empty() || !order2.is_empty() {
+                return None;
+            }
+            if filter1.filter_clause.is_some() || filter1.over_clause.is_some() {
+                return None;
+            }
+            if filter2.filter_clause.is_some() || filter2.over_clause.is_some() {
+                return None;
+            }
+            for (arg1, arg2) in args1.iter().zip(args2.iter()) {
+                let result = try_capture_parameters(table, arg1, pattern_alias, arg2, query_alias)?;
+                captured.extend(result);
+            }
+            Some(captured)
+        }
+        (Expr::Variable(var), expr) => {
+            let Ok(var) = var.parse::<i32>() else {
+                return None;
+            };
+            captured.insert(var, expr.clone());
+            Some(captured)
+        }
+        (Expr::Id(name), Expr::Column { column, .. })
+            if table
+                .get_column_at(*column)
+                .is_some_and(|c| c.name.as_deref() == Some(name.as_str())) =>
+        {
+            Some(captured)
+        }
+        (Expr::Id(name), Expr::RowId { .. }) if name.as_str() == "rowid" => Some(captured),
+        (a, b) => None,
     }
 }
 

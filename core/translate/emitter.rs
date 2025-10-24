@@ -664,6 +664,9 @@ fn emit_delete_insns(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
+        Operation::CustomModuleQuery(_) => {
+            panic!("custom module is not supported for delete statements")
+        }
     };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
 
@@ -719,30 +722,24 @@ fn emit_delete_insns(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let indexes = t_ctx.resolver.schema.indexes.get(table_name);
+        let indexes = t_ctx.resolver.schema.get_indices(table_name);
 
         // Get the index that is being used to iterate the deletion loop, if there is one.
         let iteration_index = unsafe { &*table_reference }.op.index();
         // Get all indexes that are not the iteration index.
         let other_indexes = indexes
-            .map(|indexes| {
-                indexes
-                    .iter()
-                    .filter(|index| {
-                        iteration_index
-                            .as_ref()
-                            .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
-                    })
-                    .map(|index| {
-                        (
-                            index.clone(),
-                            program
-                                .resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+            .filter(|index| {
+                iteration_index
+                    .as_ref()
+                    .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
             })
-            .unwrap_or_default();
+            .map(|index| {
+                (
+                    index.clone(),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+                )
+            })
+            .collect::<Vec<_>>();
 
         for (index, index_cursor_id) in other_indexes {
             let skip_delete_label = if index.where_clause.is_some() {
@@ -1084,6 +1081,9 @@ fn emit_update_insns(
                 false,
             ),
         },
+        Operation::CustomModuleQuery(_) => {
+            panic!("custom module is not supported for update operations")
+        }
     };
 
     let beg = program.alloc_registers(

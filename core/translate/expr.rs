@@ -1947,6 +1947,7 @@ pub fn translate_expr(
                     (None, false)
                 }
             };
+            let use_custom_module = index.is_some_and(|i| i.module.is_some());
 
             let table = referenced_tables
                 .unwrap()
@@ -1958,18 +1959,20 @@ pub fn translate_expr(
                     )
                 });
 
-            let Some(table_column) = table.get_column_at(*column) else {
-                crate::bail_parse_error!("column index out of bounds");
-            };
-            // Counter intuitive but a column always needs to have a collation
-            program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            if !use_custom_module {
+                let Some(table_column) = table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+                // Counter intuitive but a column always needs to have a collation
+                program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
             // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
             match &table {
                 Table::BTree(_) => {
-                    let table_cursor_id = if use_covering_index {
+                    let table_cursor_id = if use_covering_index || use_custom_module {
                         None
                     } else {
                         Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
@@ -1977,47 +1980,55 @@ pub fn translate_expr(
                     let index_cursor_id = index.map(|index| {
                         program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
                     });
-                    if *is_rowid_alias {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::IdxRowId {
-                                cursor_id: index_cursor_id,
-                                dest: target_register,
-                            });
-                        } else if let Some(table_cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::RowId {
-                                cursor_id: table_cursor_id,
-                                dest: target_register,
-                            });
-                        } else {
-                            unreachable!("Either index or table cursor must be opened");
-                        }
+                    if use_custom_module {
+                        program.emit_column_or_rowid(
+                            index_cursor_id.unwrap(),
+                            *column,
+                            target_register,
+                        );
                     } else {
-                        let read_cursor = if use_covering_index {
-                            index_cursor_id.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            )
+                        if *is_rowid_alias {
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                program.emit_insn(Insn::IdxRowId {
+                                    cursor_id: index_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else if let Some(table_cursor_id) = table_cursor_id {
+                                program.emit_insn(Insn::RowId {
+                                    cursor_id: table_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else {
+                                unreachable!("Either index or table cursor must be opened");
+                            }
                         } else {
-                            table_cursor_id.expect(
-                                "table cursor should be opened when use_covering_index=false",
-                            )
-                        };
-                        let column = if use_covering_index {
-                            let index = index.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            );
-                            index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
-                                    })
-                        } else {
-                            *column
-                        };
+                            let read_cursor = if use_covering_index {
+                                index_cursor_id.expect(
+                                    "index cursor should be opened when use_covering_index=true",
+                                )
+                            } else {
+                                table_cursor_id.expect(
+                                    "table cursor should be opened when use_covering_index=false",
+                                )
+                            };
+                            let column = if use_covering_index {
+                                let index = index.expect(
+                                    "index cursor should be opened when use_covering_index=true",
+                                );
+                                index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
+                                panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
+                            })
+                            } else {
+                                *column
+                            };
 
-                        program.emit_column_or_rowid(read_cursor, column, target_register);
+                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                        }
+                        let Some(column) = table.get_column_at(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        maybe_apply_affinity(column.ty, target_register, program);
                     }
-                    let Some(column) = table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
-                    };
-                    maybe_apply_affinity(column.ty, target_register, program);
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {

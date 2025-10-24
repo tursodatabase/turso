@@ -7,12 +7,13 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
+    index::IndexDescriptor,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
     translate::{
         collate::CollationSeq,
-        emitter::TransactionMode,
+        emitter::{Resolver, TransactionMode},
         expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
@@ -134,6 +135,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
+    CustomModule(Arc<dyn IndexDescriptor>),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
@@ -330,6 +332,19 @@ impl ProgramBuilder {
         } else {
             self._alloc_cursor_id(Some(key), cursor_type)
         }
+    }
+
+    pub fn alloc_cursor_index(
+        &mut self,
+        key: Option<CursorKey>,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        let module = index.module.as_ref();
+        if module.is_some_and(|m| !m.definition().hidden) {
+            let module = module.unwrap().clone();
+            return Ok(self._alloc_cursor_id(key, CursorType::CustomModule(module)));
+        }
+        Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {

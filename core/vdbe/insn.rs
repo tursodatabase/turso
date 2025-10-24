@@ -879,6 +879,19 @@ pub enum Insn {
         flags: CreateBTreeFlags,
     },
 
+    /// Custom index with custom module
+    IdxCreate {
+        db: usize,
+        cursor_id: CursorID,
+    },
+    // Custom module query op-code
+    IdxQuery {
+        db: usize,
+        cursor_id: CursorID,
+        start_reg: usize,
+        count_reg: usize,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The root page of the table/index to destroy
@@ -1318,6 +1331,8 @@ impl InsnVariants {
             InsnVariants::OpenWrite => execute::op_open_write,
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
+            InsnVariants::IdxCreate => execute::op_idx_create,
+            InsnVariants::IdxQuery => execute::op_idx_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,

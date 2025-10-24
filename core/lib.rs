@@ -8,6 +8,7 @@ mod fast_lock;
 mod function;
 mod functions;
 mod incremental;
+mod index;
 mod info;
 mod io;
 #[cfg(feature = "json")]
@@ -39,6 +40,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::index::IndexModule;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::translate::display::PlanContext;
@@ -481,6 +483,9 @@ impl Database {
             n_connections: AtomicUsize::new(0),
         });
 
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
             // parse schema
@@ -503,10 +508,14 @@ impl Database {
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .inspect_err(|_| pager.end_read_tx());
-                if let Err(LimboError::ExtensionError(e)) = result {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    eprintln!("Warning: {e}");
+                match result {
+                    Err(LimboError::ExtensionError(e)) => {
+                        // this means that a vtab exists and we no longer have the module loaded. we print
+                        // a warning to the user to load the module
+                        eprintln!("Warning: {e}");
+                    }
+                    Err(e) => return Err(e),
+                    _ => {}
                 }
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
@@ -525,9 +534,6 @@ impl Database {
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
 
         Ok(db)
     }
@@ -579,7 +585,7 @@ impl Database {
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
-            is_nested_stmt: AtomicBool::new(false),
+            nestedness: AtomicI32::new(0),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
@@ -1095,7 +1101,7 @@ pub struct Connection {
     pub metrics: RwLock<ConnectionMetrics>,
     /// Whether the connection is executing a statement initiated by another statement.
     /// Generally this is only true for ParseSchema.
-    is_nested_stmt: AtomicBool,
+    nestedness: AtomicI32,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
@@ -1127,6 +1133,15 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    pub fn is_nested_stmt(&self) -> bool {
+        self.nestedness.load(Ordering::SeqCst) > 0
+    }
+    pub fn start_nested(&self) {
+        self.nestedness.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn end_nested(&self) {
+        self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
             // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
@@ -2680,12 +2695,7 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self
-            .program
-            .connection
-            .is_nested_stmt
-            .load(Ordering::SeqCst)
-        {
+        if self.program.connection.is_nested_stmt() {
             return res;
         }
         if res.is_err() {
@@ -2854,6 +2864,7 @@ pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
+    pub index_modules: HashMap<String, Arc<dyn IndexModule>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -2895,6 +2906,7 @@ impl SymbolTable {
             functions: HashMap::new(),
             vtabs: HashMap::new(),
             vtab_modules: HashMap::new(),
+            index_modules: HashMap::new(),
         }
     }
     pub fn resolve_function(
@@ -2914,6 +2926,9 @@ impl SymbolTable {
         }
         for (name, module) in &other.vtab_modules {
             self.vtab_modules.insert(name.clone(), module.clone());
+        }
+        for (name, module) in &other.index_modules {
+            self.index_modules.insert(name.clone(), module.clone());
         }
     }
 }

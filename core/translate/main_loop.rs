@@ -99,6 +99,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
         unique: false,
         has_rowid: false,
         where_clause: None,
+        module: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     let ctx = DistinctCtx {
@@ -173,6 +174,7 @@ pub fn init_loop(
             has_rowid: false,
             unique: false,
             where_clause: None,
+            module: None,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
@@ -240,25 +242,23 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(&btree.name) {
-                        for index in indexes {
-                            if table
-                                .op
-                                .index()
-                                .is_some_and(|table_index| table_index.name == index.name)
-                            {
-                                continue;
-                            }
-                            let cursor_id = program.alloc_cursor_id_keyed(
-                                CursorKey::index(table.internal_id, index.clone()),
-                                CursorType::BTreeIndex(index.clone()),
-                            );
-                            program.emit_insn(Insn::OpenWrite {
-                                cursor_id,
-                                root_page: index.root_page.into(),
-                                db: table.database_id,
-                            });
+                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                        if table
+                            .op
+                            .index()
+                            .is_some_and(|table_index| table_index.name == index.name)
+                        {
+                            continue;
                         }
+                        let cursor_id = program.alloc_cursor_index(
+                            Some(CursorKey::index(table.internal_id, index.clone())),
+                            &index,
+                        )?;
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id,
+                            root_page: index.root_page.into(),
+                            db: table.database_id,
+                        });
                     }
                 }
                 (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
@@ -335,27 +335,23 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            if let Some(indexes) =
-                                t_ctx.resolver.schema.indexes.get(table.table.get_name())
-                            {
-                                for index in indexes {
-                                    if table
-                                        .op
-                                        .index()
-                                        .is_some_and(|table_index| table_index.name == index.name)
-                                    {
-                                        continue;
-                                    }
-                                    let cursor_id = program.alloc_cursor_id_keyed(
-                                        CursorKey::index(table.internal_id, index.clone()),
-                                        CursorType::BTreeIndex(index.clone()),
-                                    );
-                                    program.emit_insn(Insn::OpenWrite {
-                                        cursor_id,
-                                        root_page: index.root_page.into(),
-                                        db: table.database_id,
-                                    });
+                            for index in t_ctx.resolver.schema.get_indices(table.table.get_name()) {
+                                if table
+                                    .op
+                                    .index()
+                                    .is_some_and(|table_index| table_index.name == index.name)
+                                {
+                                    continue;
                                 }
+                                let cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    index,
+                                )?;
+                                program.emit_insn(Insn::OpenWrite {
+                                    cursor_id,
+                                    root_page: index.root_page.into(),
+                                    db: table.database_id,
+                                });
                             }
                         }
                     }
@@ -394,6 +390,17 @@ pub fn init_loop(
                     }
                 }
             }
+            Operation::CustomModuleQuery(query) => match mode {
+                OperationMode::SELECT => {
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().clone().unwrap().root_page,
+                        db: table.database_id,
+                    });
+                }
+                _ => panic!("only SELECT is supported for custom module"),
+            },
         }
     }
 
@@ -663,6 +670,26 @@ pub fn open_loop(
                         }
                     }
                 }
+            }
+            Operation::CustomModuleQuery(query) => {
+                let start_reg = program.alloc_registers(query.arguments.len() + 1);
+                program.emit_int(query.pattern_idx as i64, start_reg);
+                for i in 0..query.arguments.len() {
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        &query.arguments[i],
+                        start_reg + 1 + i,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.emit_insn(Insn::IdxQuery {
+                    db: 0,
+                    cursor_id: index_cursor_id.expect("CustomModuleQuery requires a index cursor"),
+                    start_reg,
+                    count_reg: query.arguments.len() + 1,
+                });
+                program.preassign_label_to_next_insn(loop_start);
             }
         }
 
@@ -1114,6 +1141,14 @@ pub fn close_loop(
                         });
                     }
                 }
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::CustomModuleQuery(_) => {
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Next {
+                    cursor_id: index_cursor_id.unwrap(),
+                    pc_if_next: loop_labels.loop_start,
+                });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
         }
