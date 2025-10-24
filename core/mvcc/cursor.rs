@@ -131,6 +131,52 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     fn get_current_pos(&self) -> CursorPosition {
         *self.current_pos.borrow()
     }
+
+    /// Returns the new position of the cursor based on the new position in MVCC and the current rowid in BTree.
+    /// If the new position in MVCC is less than the current rowid in BTree, the cursor will be set to the new position in MVCC.
+    fn get_new_position_from_mvcc_and_btree(
+        &mut self,
+        new_position_in_mvcc: &Option<i64>,
+        current_rowid_in_btree: &Option<i64>,
+    ) -> CursorPosition {
+        let new_position = match (new_position_in_mvcc, current_rowid_in_btree) {
+            (Some(mvcc_rowid), Some(btree_rowid)) => {
+                if mvcc_rowid < btree_rowid {
+                    CursorPosition::Loaded {
+                        row_id: RowID {
+                            table_id: self.table_id,
+                            row_id: *mvcc_rowid,
+                        },
+                        in_btree: false,
+                    }
+                } else {
+                    CursorPosition::Loaded {
+                        row_id: RowID {
+                            table_id: self.table_id,
+                            row_id: *btree_rowid,
+                        },
+                        in_btree: true,
+                    }
+                }
+            }
+            (None, Some(btree_rowid)) => CursorPosition::Loaded {
+                row_id: RowID {
+                    table_id: self.table_id,
+                    row_id: *btree_rowid,
+                },
+                in_btree: true,
+            },
+            (Some(mvcc_rowid), None) => CursorPosition::Loaded {
+                row_id: RowID {
+                    table_id: self.table_id,
+                    row_id: *mvcc_rowid,
+                },
+                in_btree: false,
+            },
+            (None, None) => CursorPosition::End,
+        };
+        new_position
+    }
 }
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
@@ -220,42 +266,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         } else {
             None
         };
-        let new_position = match (new_position_in_mvcc, current_rowid_in_btree) {
-            (Some(mvcc_rowid), Some(btree_rowid)) => {
-                if mvcc_rowid < btree_rowid {
-                    CursorPosition::Loaded {
-                        row_id: RowID {
-                            table_id: self.table_id,
-                            row_id: mvcc_rowid,
-                        },
-                        in_btree: false,
-                    }
-                } else {
-                    CursorPosition::Loaded {
-                        row_id: RowID {
-                            table_id: self.table_id,
-                            row_id: btree_rowid,
-                        },
-                        in_btree: true,
-                    }
-                }
-            }
-            (None, Some(btree_rowid)) => CursorPosition::Loaded {
-                row_id: RowID {
-                    table_id: self.table_id,
-                    row_id: btree_rowid,
-                },
-                in_btree: true,
-            },
-            (Some(mvcc_rowid), None) => CursorPosition::Loaded {
-                row_id: RowID {
-                    table_id: self.table_id,
-                    row_id: mvcc_rowid,
-                },
-                in_btree: false,
-            },
-            (None, None) => CursorPosition::End,
-        };
+        let new_position = self
+            .get_new_position_from_mvcc_and_btree(&new_position_in_mvcc, &current_rowid_in_btree);
         self.current_pos.replace(new_position);
         self.invalidate_record();
         self.state.replace(None);
@@ -473,12 +485,25 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
+        // First run btree_cursor rewind so that we don't need a explicit state machine.
+        return_if_io!(self.btree_cursor.rewind());
+
         self.invalidate_record();
         if !matches!(self.get_current_pos(), CursorPosition::BeforeFirst) {
             self.current_pos.replace(CursorPosition::BeforeFirst);
         }
-        // Next will set cursor position to a valid position if it exists, otherwise it will set it to one that doesn't exist.
-        let _ = return_if_io!(self.next());
+
+        let new_position_in_mvcc = self
+            .db
+            .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id)
+            .map(|id| id.row_id);
+
+        let IOResult::Done(maybe_rowid_in_btree) = self.btree_cursor.rowid()? else {
+            panic!("BTree should have returned rowid after next");
+        };
+        let new_position =
+            self.get_new_position_from_mvcc_and_btree(&new_position_in_mvcc, &maybe_rowid_in_btree);
+        self.current_pos.replace(new_position);
         Ok(IOResult::Done(()))
     }
 
