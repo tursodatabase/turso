@@ -1165,6 +1165,14 @@ impl AggregateState {
     }
 
     /// Convert aggregate state to output values
+    ///
+    /// Note: SQLite returns INTEGER for SUM when all inputs are integers, and REAL when any input is REAL.
+    /// However, in an incremental system like DBSP, we cannot track whether all current values are integers
+    /// after deletions. For example:
+    /// - Initial: SUM(10, 20, 30.5) = 60.5 (REAL)
+    /// - After DELETE 30.5: SUM(10, 20) = 30 (SQLite returns INTEGER, but we only know the sum is 30.0)
+    ///
+    /// Therefore, we always return REAL for SUM operations.
     pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
         let mut result = Vec::new();
 
@@ -1180,21 +1188,12 @@ impl AggregateState {
                 }
                 AggregateFunction::Sum(col_idx) => {
                     let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    // Return as integer if it's a whole number, otherwise as float
-                    if sum.fract() == 0.0 {
-                        result.push(Value::Integer(sum as i64));
-                    } else {
-                        result.push(Value::Float(sum));
-                    }
+                    result.push(Value::Float(sum));
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Return the computed SUM(DISTINCT)
                     let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    if sum.fract() == 0.0 {
-                        result.push(Value::Integer(sum as i64));
-                    } else {
-                        result.push(Value::Float(sum));
-                    }
+                    result.push(Value::Float(sum));
                 }
                 AggregateFunction::Avg(col_idx) => {
                     if let Some((sum, count)) = self.avgs.get(col_idx) {
