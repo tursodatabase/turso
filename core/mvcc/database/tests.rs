@@ -1590,3 +1590,25 @@ fn test_select_empty_table() {
     let rows = get_rows(&conn, "SELECT * FROM t where x > 100");
     assert!(rows.is_empty());
 }
+
+#[test]
+fn test_cursor_with_btree_and_mvcc() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Value::Integer(1)]);
+    assert_eq!(rows[1], vec![Value::Integer(2)]);
+}
