@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
 
 use crate::{
@@ -37,7 +37,13 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let joined_table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                if let Operation::CustomModuleQuery(module) = &joined_table_ref.op {
+                    if module.covered_columns.contains_key(column) {
+                        return None;
+                    }
+                }
+                let table_ref = &joined_table_ref.table;
                 table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
@@ -1181,6 +1187,7 @@ pub struct CustomModuleQuery {
     pub index: Arc<Index>,
     pub pattern_idx: usize,
     pub arguments: Vec<Box<Expr>>,
+    pub covered_columns: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

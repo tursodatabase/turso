@@ -2,7 +2,9 @@
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::translate::emitter::TransactionMode;
-use crate::translate::expr::WalkControl;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::plan::JoinedTable;
+use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::{
     schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
@@ -318,27 +320,98 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     }
 }
 
+pub fn simple_bind_expr<'a>(
+    schema: &Schema,
+    joined_table: &JoinedTable,
+    result_columns: &[ast::ResultColumn],
+    expr: &mut ast::Expr,
+) -> Result<()> {
+    let internal_id = joined_table.internal_id;
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Id(id) => {
+                let normalized_id = normalize_ident(id.as_str());
+
+                for result_column in result_columns.iter() {
+                    if let ast::ResultColumn::Expr(result, Some(ast::As::As(alias))) = result_column
+                    {
+                        if alias.as_str().eq_ignore_ascii_case(&normalized_id) {
+                            *expr = *result.clone();
+                            return Ok(WalkControl::Continue);
+                        }
+                    }
+                }
+                let col_idx = joined_table.columns().iter().position(|c| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                });
+                if let Some(col_idx) = col_idx {
+                    let col = joined_table.table.columns().get(col_idx).unwrap();
+                    *expr = ast::Expr::Column {
+                        database: None,
+                        table: internal_id,
+                        column: col_idx,
+                        is_rowid_alias: col.is_rowid_alias,
+                    };
+                } else {
+                    // only if we haven't found a match, check for explicit rowid reference
+                    let is_btree_table = matches!(joined_table.table, Table::BTree(_));
+                    if is_btree_table {
+                        if let Some(rowid) = parse_row_id(&normalized_id, internal_id, || false)? {
+                            *expr = rowid;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    Ok(())
+}
+
+pub fn try_substitute_parameters(
+    pattern: &Expr,
+    parameters: &HashMap<i32, Expr>,
+) -> Option<Box<Expr>> {
+    match pattern {
+        Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            filter_over,
+        } => {
+            let mut substituted = Vec::new();
+            for arg in args {
+                substituted.push(try_substitute_parameters(&arg, parameters)?);
+            }
+            Some(Box::new(Expr::FunctionCall {
+                args: substituted,
+                distinctness: *distinctness,
+                name: name.clone(),
+                order_by: order_by.clone(),
+                filter_over: filter_over.clone(),
+            }))
+        }
+        Expr::Variable(var) => {
+            let Ok(var) = var.parse::<i32>() else {
+                return None;
+            };
+            Some(Box::new(parameters.get(&var)?.clone()))
+        }
+        _ => Some(Box::new(pattern.clone())),
+    }
+}
+
 pub fn try_capture_parameters(
     table: &Table,
     pattern: &Expr,
-    pattern_alias: &HashMap<String, Box<Expr>>,
     query: &Expr,
-    query_alias: &HashMap<String, Box<Expr>>,
 ) -> Option<HashMap<i32, Expr>> {
     let mut captured = HashMap::new();
-    let mut pattern_aliased = pattern;
-    if let ast::Expr::Id(name) = &pattern {
-        if let Some(alias) = pattern_alias.get(name.as_str()) {
-            pattern_aliased = alias;
-        }
-    }
-    let mut query_aliased = query;
-    if let ast::Expr::Id(name) = &query {
-        if let Some(alias) = query_alias.get(name.as_str()) {
-            query_aliased = alias;
-        }
-    }
-    match (pattern_aliased, query_aliased) {
+    match (pattern, query) {
         (
             Expr::FunctionCall {
                 name: name1,
@@ -371,7 +444,7 @@ pub fn try_capture_parameters(
                 return None;
             }
             for (arg1, arg2) in args1.iter().zip(args2.iter()) {
-                let result = try_capture_parameters(table, arg1, pattern_alias, arg2, query_alias)?;
+                let result = try_capture_parameters(table, arg1, arg2)?;
                 captured.extend(result);
             }
             Some(captured)
@@ -383,15 +456,17 @@ pub fn try_capture_parameters(
             captured.insert(var, expr.clone());
             Some(captured)
         }
-        (Expr::Id(name), Expr::Column { column, .. })
-            if table
-                .get_column_at(*column)
-                .is_some_and(|c| c.name.as_deref() == Some(name.as_str())) =>
-        {
-            Some(captured)
+        (
+            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
+            Expr::Id(_) | Expr::Name(_) | Expr::Column { .. },
+        ) => {
+            if pattern == query {
+                Some(captured)
+            } else {
+                None
+            }
         }
-        (Expr::Id(name), Expr::RowId { .. }) if name.as_str() == "rowid" => Some(captured),
-        (a, b) => None,
+        (_, _) => None,
     }
 }
 

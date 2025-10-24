@@ -18,6 +18,7 @@ use turso_parser::ast::{self, Expr, SortOrder, TableInternalId};
 use crate::{
     schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
     translate::{
+        expr::bind_and_rewrite_expr,
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
@@ -28,7 +29,9 @@ use crate::{
         },
     },
     types::SeekOp,
-    util::try_capture_parameters,
+    util::{
+        exprs_are_equivalent, simple_bind_expr, try_capture_parameters, try_substitute_parameters,
+    },
     vdbe::builder::{CursorKey, CursorType, ProgramBuilder},
     LimboError, Result,
 };
@@ -333,25 +336,24 @@ fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    where_clause: &mut [WhereTerm],
+    where_query: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
-    _group_by: &mut Option<GroupBy>,
+    group_by: &mut Option<GroupBy>,
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
     let tables = table_references.joined_tables_mut();
     assert_eq!(tables.len(), 1);
 
+    // group by is not supported for now
+    if group_by.is_some() {
+        return Ok(false);
+    }
+
     let table = &mut tables[0];
     let Some(indexes) = available_indexes.get(table.table.get_name()) else {
         return Ok(false);
     };
-    let mut query_aliases = HashMap::new();
-    for column in result_columns.iter() {
-        if let Some(alias) = &column.alias {
-            query_aliases.insert(alias.clone(), Box::new(column.expr.clone()));
-        }
-    }
     for index in indexes {
         let Some(module) = &index.module else {
             continue;
@@ -361,16 +363,17 @@ fn optimize_table_access_with_custom_modules(
             continue;
         }
         'pattern: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+            let mut pattern = pattern.clone();
             assert!(pattern.with.is_none());
             assert!(pattern.body.compounds.is_empty());
             let ast::OneSelect::Select {
                 columns,
                 from: Some(ast::FromClause { select, joins }),
                 distinctness: None,
-                where_clause: None,
+                ref mut where_clause,
                 group_by: None,
                 window_clause,
-            } = &pattern.body.select
+            } = &mut pattern.body.select
             else {
                 panic!("unexpected select pattern body");
             };
@@ -379,62 +382,38 @@ fn optimize_table_access_with_custom_modules(
             let ast::SelectTable::Table(name, _, _) = select.as_ref() else {
                 panic!("unexpected from clause");
             };
+
+            for column in columns.iter_mut() {
+                if let ast::ResultColumn::Expr(e, _) = column {
+                    simple_bind_expr(schema, table, &[], e)?;
+                }
+            }
+            for column in pattern.order_by.iter_mut() {
+                simple_bind_expr(schema, table, &columns, &mut column.expr)?;
+            }
+            if let Some(pattern_where) = where_clause {
+                simple_bind_expr(schema, table, &columns, pattern_where)?;
+            }
+
             if name.name.as_str() != table.table.get_name() {
                 continue;
             }
             if order_by.len() != pattern.order_by.len() {
                 continue;
             }
-            // todo: allow where clause
-            if !where_clause.is_empty() {
-                continue;
-            }
-            // todo: allow columns to overlap by rowid only
-            if columns.len() != result_columns.len() {
-                continue;
-            }
-            let mut pattern_aliases = HashMap::new();
-            for column in columns {
-                match column {
-                    ast::ResultColumn::Expr(expr, Some(ast::As::As(alias))) => {
-                        pattern_aliases.insert(alias.as_str().to_string(), expr.clone());
-                    }
-                    _ => continue,
-                }
-            }
+
+            let mut where_query_covered = None;
             let mut parameters = HashMap::new();
-            for (pattern_column, query_column) in columns.iter().zip(result_columns.iter()) {
-                match (pattern_column, query_column) {
-                    (ast::ResultColumn::Expr(pattern, _), query) => {
-                        let Some(captured) = try_capture_parameters(
-                            &table.table,
-                            &pattern,
-                            &pattern_aliases,
-                            &query.expr,
-                            &query_aliases,
-                        ) else {
-                            continue 'pattern;
-                        };
-                        parameters.extend(captured);
-                    }
-                    _ => {
-                        continue 'pattern;
-                    }
-                }
-            }
+
             for (pattern_column, (query_column, query_order)) in
                 pattern.order_by.iter().zip(order_by.iter())
             {
                 if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
                     continue 'pattern;
                 }
-                let Some(captured) = try_capture_parameters(
-                    &table.table,
-                    &pattern_column.expr,
-                    &pattern_aliases,
-                    &query_column,
-                    &query_aliases,
-                ) else {
+                let Some(captured) =
+                    try_capture_parameters(&table.table, &pattern_column.expr, &query_column)
+                else {
                     continue 'pattern;
                 };
                 parameters.extend(captured);
@@ -442,13 +421,9 @@ fn optimize_table_access_with_custom_modules(
             match (pattern.limit.as_ref().map(|x| &x.expr), &limit) {
                 (None, Some(_)) | (Some(_), None) => continue,
                 (Some(pattern_limit), Some(query_limit)) => {
-                    let Some(captured) = try_capture_parameters(
-                        &table.table,
-                        pattern_limit,
-                        &HashMap::new(),
-                        query_limit,
-                        &HashMap::new(),
-                    ) else {
+                    let Some(captured) =
+                        try_capture_parameters(&table.table, pattern_limit, query_limit)
+                    else {
                         continue 'pattern;
                     };
                     parameters.extend(captured);
@@ -461,36 +436,79 @@ fn optimize_table_access_with_custom_modules(
             ) {
                 (None, Some(_)) | (Some(_), None) => continue,
                 (Some(pattern_off), Some(query_off)) => {
-                    let Some(captured) = try_capture_parameters(
-                        &table.table,
-                        pattern_off,
-                        &HashMap::new(),
-                        query_off,
-                        &HashMap::new(),
-                    ) else {
+                    let Some(captured) =
+                        try_capture_parameters(&table.table, pattern_off, query_off)
+                    else {
                         continue 'pattern;
                     };
                     parameters.extend(captured);
                 }
                 (None, None) => {}
             }
+            if let Some(pattern_where) = where_clause {
+                for (i, query_where) in where_query.iter().enumerate() {
+                    let captured =
+                        try_capture_parameters(&table.table, &pattern_where, &query_where.expr);
+                    let Some(captured) = captured else {
+                        continue;
+                    };
+                    parameters.extend(captured);
+                    where_query_covered = Some(i);
+                    break;
+                }
+            }
+
+            if where_clause.is_some() && where_query_covered.is_none() {
+                continue;
+            }
+
+            let where_covered_completely =
+                where_query.len() == 0 || where_query_covered.is_some() && where_query.len() == 1;
+
+            if !where_covered_completely
+                && (!order_by.is_empty() || limit.is_some() || offset.is_some())
+            {
+                continue;
+            }
+
+            if let Some(where_covered) = where_query_covered {
+                where_query[where_covered].consumed = true;
+            }
+
+            // todo: fix this
+            let mut covered_column_id = 1_000_000;
+            let mut covered_columns = HashMap::new();
+            for (patter_column_id, pattern_column) in columns.iter().enumerate() {
+                let ast::ResultColumn::Expr(pattern, _) = pattern_column else {
+                    continue;
+                };
+                let Some(pattern) = try_substitute_parameters(pattern, &parameters) else {
+                    continue;
+                };
+                for query_column in result_columns.iter_mut() {
+                    if !exprs_are_equivalent(&query_column.expr, &pattern) {
+                        continue;
+                    }
+                    query_column.expr = ast::Expr::Column {
+                        database: None,
+                        table: table.internal_id,
+                        column: covered_column_id,
+                        is_rowid_alias: false,
+                    };
+                    covered_columns.insert(covered_column_id, patter_column_id);
+                    covered_column_id += 1;
+                }
+            }
             let _ = order_by.drain(..);
             let _ = limit.take();
             let _ = offset.take();
-            for (i, column) in result_columns.iter_mut().enumerate() {
-                column.expr = ast::Expr::Column {
-                    database: None,
-                    table: table.internal_id,
-                    column: i,
-                    is_rowid_alias: false,
-                };
-            }
             let mut arguments = parameters.iter().collect::<Vec<_>>();
             arguments.sort_by_key(|(&i, _)| i);
 
             table.op = Operation::CustomModuleQuery(CustomModuleQuery {
                 index: index.clone(),
                 pattern_idx,
+                covered_columns,
                 arguments: arguments
                     .iter()
                     .map(|(_, &ref e)| Box::new(e.clone()))

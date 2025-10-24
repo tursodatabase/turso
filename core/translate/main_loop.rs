@@ -392,6 +392,13 @@ pub fn init_loop(
             }
             Operation::CustomModuleQuery(_) => match mode {
                 OperationMode::SELECT => {
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: table_cursor_id,
+                            root_page: table.table.get_root_page(),
+                            db: table.database_id,
+                        });
+                    }
                     let index_cursor_id = index_cursor_id.unwrap();
                     program.emit_insn(Insn::OpenRead {
                         cursor_id: index_cursor_id,
@@ -691,6 +698,14 @@ pub fn open_loop(
                     pc_if_empty: loop_end,
                 });
                 program.preassign_label_to_next_insn(loop_start);
+                if let Some(table_cursor_id) = table_cursor_id {
+                    if let Some(index_cursor_id) = index_cursor_id {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
+                }
             }
         }
 

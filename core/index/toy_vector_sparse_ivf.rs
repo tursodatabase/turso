@@ -9,7 +9,7 @@ use crate::{
     index::{
         open_index_cursor, open_table_cursor, parse_patterns, IndexConfiguration, IndexCursor,
         IndexDefinition, IndexDescriptor, IndexModule, HIDDEN_BTREE_MODULE_NAME,
-        VECTOR_SPARSE_IVF_MODULE_NAME,
+        TOY_VECTOR_SPARSE_IVF_MODULE_NAME,
     },
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
@@ -145,8 +145,14 @@ pub struct VectorSparseInvertedIndexCursor {
 
 impl IndexModule for VectorSparseInvertedIndex {
     fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>> {
-        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0].name, configuration.table_name);
-        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0].name, configuration.table_name);
+        let query_pattern1 = format!(
+            "SELECT vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?",
+            configuration.columns[0].name, configuration.table_name
+        );
+        let query_pattern2 = format!(
+            "SELECT vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?",
+            configuration.columns[0].name, configuration.table_name
+        );
         Ok(Arc::new(VectorSparseInvertedIndexDescriptor {
             configuration: configuration.clone(),
             patterns: parse_patterns(&[&query_pattern1, &query_pattern2])?,
@@ -157,7 +163,7 @@ impl IndexModule for VectorSparseInvertedIndex {
 impl IndexDescriptor for VectorSparseInvertedIndexDescriptor {
     fn definition<'a>(&'a self) -> IndexDefinition<'a> {
         IndexDefinition {
-            module_name: VECTOR_SPARSE_IVF_MODULE_NAME,
+            module_name: TOY_VECTOR_SPARSE_IVF_MODULE_NAME,
             index_name: &self.configuration.index_name,
             patterns: self.patterns.as_slice(),
             hidden: false,
@@ -218,7 +224,6 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
 
     fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
         let columns = &self.configuration.columns;
-        let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
         let sql = format!("DROP INDEX {}", self.scratch_btree);
         let mut stmt = connection.prepare(&sql)?;
         connection.start_nested();
@@ -681,18 +686,19 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
         }
     }
 
+    fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
+        let result = self.search_result.front().unwrap();
+        Ok(IOResult::Done(Some(result.0)))
+    }
+
+    fn query_column(&mut self, _: usize) -> Result<IOResult<Value>> {
+        let result = self.search_result.front().unwrap();
+        Ok(IOResult::Done(Value::Float(result.1)))
+    }
+
     fn query_next(&mut self) -> Result<IOResult<bool>> {
         let _ = self.search_result.pop_front();
         Ok(IOResult::Done(!self.search_result.is_empty()))
-    }
-
-    fn query_column(&mut self, position: usize) -> Result<IOResult<Value>> {
-        let result = self.search_result.front().unwrap();
-        if position == 0 {
-            Ok(IOResult::Done(Value::Integer(result.0)))
-        } else {
-            Ok(IOResult::Done(Value::Float(result.1)))
-        }
     }
 
     fn commit(&mut self) -> Result<()> {

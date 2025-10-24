@@ -12,7 +12,7 @@ use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::ResultSetColumn;
+use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
@@ -1794,6 +1794,35 @@ pub fn translate_expr(
 
                             Ok(target_register)
                         }
+                        ScalarFunc::FtsHasAnyToken => {
+                            if args.len() != 2 {
+                                crate::bail_parse_error!(
+                                    "FtsHasAnyToken function must have exactly 2 argument",
+                                );
+                            }
+                            let start_reg = program.alloc_registers(2);
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                start_reg,
+                                resolver,
+                            )?;
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                start_reg + 1,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+                            Ok(target_register)
+                        }
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
@@ -1934,20 +1963,25 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            let (index, use_covering_index) = {
+            let (index, custom_module, use_covering_index) = {
                 if let Some(table_reference) = referenced_tables
                     .unwrap()
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
+                        if let Operation::CustomModuleQuery(module) = &table_reference.op {
+                            Some(module)
+                        } else {
+                            None
+                        },
                         table_reference.utilizes_covering_index(),
                     )
                 } else {
-                    (None, false)
+                    (None, None, false)
                 }
             };
-            let use_custom_module = index.is_some_and(|i| i.module.is_some());
+            let use_custom_module = custom_module.and_then(|m| m.covered_columns.get(column));
 
             let table = referenced_tables
                 .unwrap()
@@ -1959,7 +1993,7 @@ pub fn translate_expr(
                     )
                 });
 
-            if !use_custom_module {
+            if use_custom_module.is_none() {
                 let Some(table_column) = table.get_column_at(*column) else {
                     crate::bail_parse_error!("column index out of bounds");
                 };
@@ -1972,7 +2006,7 @@ pub fn translate_expr(
             // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
             match &table {
                 Table::BTree(_) => {
-                    let table_cursor_id = if use_covering_index || use_custom_module {
+                    let table_cursor_id = if use_covering_index || use_custom_module.is_some() {
                         None
                     } else {
                         Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
@@ -1980,10 +2014,10 @@ pub fn translate_expr(
                     let index_cursor_id = index.map(|index| {
                         program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
                     });
-                    if use_custom_module {
+                    if let Some(custom_module_column) = use_custom_module {
                         program.emit_column_or_rowid(
                             index_cursor_id.unwrap(),
-                            *column,
+                            *custom_module_column,
                             target_register,
                         );
                     } else {
@@ -3412,7 +3446,7 @@ pub fn bind_and_rewrite_expr<'a>(
     connection: &'a Arc<crate::Connection>,
     param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
-) -> Result<WalkControl> {
+) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -3710,7 +3744,8 @@ pub fn bind_and_rewrite_expr<'a>(
             }
             Ok(WalkControl::Continue)
         },
-    )
+    );
+    Ok(())
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.

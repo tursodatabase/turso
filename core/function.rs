@@ -335,6 +335,7 @@ pub enum ScalarFunc {
     Attach,
     Detach,
     Unlikely,
+    FtsHasAnyToken,
 }
 
 impl ScalarFunc {
@@ -399,6 +400,7 @@ impl ScalarFunc {
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
+            ScalarFunc::FtsHasAnyToken => true,
         }
     }
 }
@@ -465,6 +467,7 @@ impl Display for ScalarFunc {
             Self::Attach => "attach".to_string(),
             Self::Detach => "detach".to_string(),
             Self::Unlikely => "unlikely".to_string(),
+            Self::FtsHasAnyToken => "fts_has_any_token".to_string(),
         };
         write!(f, "{str}")
     }
@@ -881,6 +884,7 @@ impl Func {
             "vector_distance_jaccard" => Ok(Self::Vector(VectorFunc::VectorDistanceJaccard)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
+            "fts_has_any_token" => Ok(Self::Scalar(ScalarFunc::FtsHasAnyToken)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

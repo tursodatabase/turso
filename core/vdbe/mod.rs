@@ -61,7 +61,7 @@ use execute::{
 };
 
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -191,17 +191,25 @@ macro_rules! return_step_if_io {
     };
 }
 
-struct RegexCache {
+pub struct RegexCache {
     like: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
+    token: Option<Regex>,
 }
 
 impl RegexCache {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             like: HashMap::new(),
             glob: HashMap::new(),
+            token: None,
         }
+    }
+    pub fn token_regex(&mut self) -> &Regex {
+        if self.token.is_none() {
+            self.token = Some(RegexBuilder::new(r"\b\w+\b").build().unwrap());
+        }
+        self.token.as_ref().unwrap()
     }
 }
 

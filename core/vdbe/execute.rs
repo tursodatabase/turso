@@ -83,7 +83,7 @@ use super::{
     sorter::Sorter,
 };
 use regex::{Regex, RegexBuilder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "json")]
 use crate::{
@@ -1591,8 +1591,11 @@ pub fn op_column(
             } => {
                 let Some(rowid) = ({
                     let index_cursor = state.get_cursor(index_cursor_id);
-                    let index_cursor = index_cursor.as_btree_mut();
-                    return_if_io!(index_cursor.rowid())
+                    match index_cursor {
+                        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+                        Cursor::CustomModule(cursor) => return_if_io!(cursor.query_rowid()),
+                        _ => panic!("unexpected cursor type"),
+                    }
                 }) else {
                     state.registers[*dest] = Register::Value(Value::Null);
                     break 'outer;
@@ -2809,15 +2812,20 @@ pub fn op_row_id(
             } => {
                 let rowid = {
                     let index_cursor = state.get_cursor(index_cursor_id);
-                    let index_cursor = index_cursor.as_btree_mut();
-                    let record = return_if_io!(index_cursor.record());
-                    let record = record.as_ref().unwrap();
-                    let mut record_cursor_ref = index_cursor.record_cursor_mut();
-                    let record_cursor = record_cursor_ref.deref_mut();
-                    let rowid = record.last_value(record_cursor).unwrap();
-                    match rowid {
-                        Ok(ValueRef::Integer(rowid)) => rowid,
-                        _ => unreachable!(),
+                    if let Cursor::BTree(index_cursor) = index_cursor {
+                        let record = return_if_io!(index_cursor.record());
+                        let record = record.as_ref().unwrap();
+                        let mut record_cursor_ref = index_cursor.record_cursor_mut();
+                        let record_cursor = record_cursor_ref.deref_mut();
+                        let rowid = record.last_value(record_cursor).unwrap();
+                        match rowid {
+                            Ok(ValueRef::Integer(rowid)) => rowid,
+                            _ => unreachable!(),
+                        }
+                    } else if let Cursor::CustomModule(index_cursor) = index_cursor {
+                        return_if_io!(index_cursor.query_rowid()).unwrap()
+                    } else {
+                        panic!("unexpected cursor type")
                     }
                 };
                 state.op_row_id_state = OpRowIdState::Seek {
@@ -2859,6 +2867,14 @@ pub fn op_row_id(
                     cursors.get_mut(*cursor_id).unwrap()
                 {
                     if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
+                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
+                } else if let Some(Cursor::CustomModule(cursor)) =
+                    cursors.get_mut(*cursor_id).unwrap()
+                {
+                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest] = Register::Value(Value::Integer(rowid));
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
@@ -5228,6 +5244,36 @@ pub fn op_function(
 
                 // Set result to NULL (detach doesn't return a value)
                 state.registers[*dest] = Register::Value(Value::Null);
+            }
+            ScalarFunc::FtsHasAnyToken => {
+                assert_eq!(arg_count, 2);
+                let haystack = state.registers[*start_reg].get_value();
+                let needle = state.registers[*start_reg + 1].get_value();
+
+                let Value::Text(haystack_str) = haystack else {
+                    return Err(LimboError::InvalidArgument(
+                        "haystack argument must be text".to_string(),
+                    ));
+                };
+                let Value::Text(needle_str) = needle else {
+                    return Err(LimboError::InvalidArgument(
+                        "needle argument must be text".to_string(),
+                    ));
+                };
+
+                let needle_matches = state
+                    .regex_cache
+                    .token_regex()
+                    .find_iter(needle_str.as_str());
+                let needle_tokens = needle_matches
+                    .map(|m| m.as_str())
+                    .collect::<HashSet<_>>();
+                let mut haystack_tokens = state
+                    .regex_cache
+                    .token_regex().find_iter(haystack_str.as_str());
+                let has_token = haystack_tokens.any(|m| needle_tokens.contains(m.as_str()));
+                state.registers[*dest] =
+                    Register::Value(Value::Integer(if has_token { 1 } else { 0 }));
             }
             ScalarFunc::Unlikely | ScalarFunc::Likely | ScalarFunc::Likelihood => {
                 panic!(

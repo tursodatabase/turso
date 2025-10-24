@@ -11,7 +11,8 @@ use crate::{
 };
 
 pub mod hidden_btree;
-pub mod vector_sparse_ivf;
+pub mod toy_text_ivf;
+pub mod toy_vector_sparse_ivf;
 
 #[derive(Debug, Clone)]
 pub struct IndexConfiguration {
@@ -31,7 +32,8 @@ pub trait IndexDescriptor: std::fmt::Debug + Send + Sync {
 }
 
 pub const HIDDEN_BTREE_MODULE_NAME: &str = "btree";
-pub const VECTOR_SPARSE_IVF_MODULE_NAME: &str = "vector_sparse_ivf";
+pub const TOY_VECTOR_SPARSE_IVF_MODULE_NAME: &str = "toy_vector_sparse_ivf";
+pub const TOY_TEXT_IVF_MODULE_NAME: &str = "toy_text_ivf";
 
 #[derive(Debug)]
 pub struct IndexDefinition<'a> {
@@ -53,6 +55,7 @@ pub trait IndexCursor {
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>>;
     fn query_next(&mut self) -> Result<IOResult<bool>>;
     fn query_column(&mut self, position: usize) -> Result<IOResult<Value>>;
+    fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
 
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self) -> Result<()>;
