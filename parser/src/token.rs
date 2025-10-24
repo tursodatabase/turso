@@ -548,4 +548,47 @@ impl TokenType {
             _ => self,
         }
     }
+
+    /// Get user-friendly display name for error messages
+    pub fn user_friendly_name(&self) -> &'static str {
+        match self.as_str() {
+            Some(s) => s,
+            None => match self {
+                TokenType::TK_ID => "identifier",
+                TokenType::TK_STRING => "string",
+                TokenType::TK_INTEGER => "integer",
+                TokenType::TK_FLOAT => "float",
+                TokenType::TK_BLOB => "blob",
+                TokenType::TK_VARIABLE => "variable",
+                TokenType::TK_ILLEGAL => "illegal token",
+                TokenType::TK_EOF => "end of file",
+                TokenType::TK_LIKE_KW => "LIKE",
+                TokenType::TK_JOIN_KW => "JOIN",
+                TokenType::TK_CTIME_KW => "datetime function",
+                TokenType::TK_ISNOT => "IS NOT",
+                TokenType::TK_ISNULL => "ISNULL",
+                TokenType::TK_NOTNULL => "NOTNULL",
+                TokenType::TK_PTR => "->",
+                _ => "unknown token",
+            },
+        }
+    }
+
+    /// Format multiple tokens for error messages
+    pub fn format_expected_tokens(tokens: &[TokenType]) -> String {
+        if tokens.is_empty() {
+            return "nothing".to_string();
+        }
+        if tokens.len() == 1 {
+            return tokens[0].user_friendly_name().to_string();
+        }
+
+        let names: Vec<&str> = tokens.iter().map(|t| t.user_friendly_name()).collect();
+        if names.len() == 2 {
+            format!("{} or {}", names[0], names[1])
+        } else {
+            let (last, rest) = names.split_last().unwrap();
+            format!("{}, or {}", rest.join(", "), last)
+        }
+    }
 }

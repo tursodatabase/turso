@@ -94,15 +94,25 @@ pub struct sqlite3_stmt {
         *mut ffi::c_void,
     )>,
     pub(crate) next: *mut sqlite3_stmt,
+    pub(crate) text_cache: Vec<Vec<u8>>,
 }
 
 impl sqlite3_stmt {
     pub fn new(db: *mut sqlite3, stmt: turso_core::Statement) -> Self {
+        let n_cols = stmt.num_columns();
         Self {
             db,
             stmt,
             destructors: Vec::new(),
             next: std::ptr::null_mut(),
+            text_cache: vec![vec![]; n_cols],
+        }
+    }
+    #[inline]
+    fn clear_text_cache(&mut self) {
+        // Drop per-column buffers for the previous row
+        for r in &mut self.text_cache {
+            r.clear();
         }
     }
 }
@@ -323,7 +333,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
             destructor_fn(ptr);
         }
     }
-
+    stmt_ref.clear_text_cache();
     let _ = Box::from_raw(stmt);
     SQLITE_OK
 }
@@ -340,9 +350,15 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
                     stmt.stmt.run_once().unwrap();
                     continue;
                 }
-                turso_core::StepResult::Done => return SQLITE_DONE,
+                turso_core::StepResult::Done => {
+                    stmt.clear_text_cache();
+                    return SQLITE_DONE;
+                }
                 turso_core::StepResult::Interrupt => return SQLITE_INTERRUPT,
-                turso_core::StepResult::Row => return SQLITE_ROW,
+                turso_core::StepResult::Row => {
+                    stmt.clear_text_cache();
+                    return SQLITE_ROW;
+                }
                 turso_core::StepResult::Busy => return SQLITE_BUSY,
             }
         } else {
@@ -389,6 +405,7 @@ pub unsafe extern "C" fn sqlite3_exec(
 pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     stmt.stmt.reset();
+    stmt.clear_text_cache();
     SQLITE_OK
 }
 
@@ -1048,14 +1065,30 @@ pub unsafe extern "C" fn sqlite3_column_text(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_uchar {
+    if stmt.is_null() || idx < 0 {
+        return std::ptr::null();
+    }
     let stmt = &mut *stmt;
     let row = stmt.stmt.row();
     let row = match row.as_ref() {
         Some(row) => row,
         None => return std::ptr::null(),
     };
-    match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Text(text)) => text.as_str().as_ptr(),
+    let i = idx as usize;
+    if i >= stmt.text_cache.len() {
+        return std::ptr::null();
+    }
+    if !stmt.text_cache[i].is_empty() {
+        // we have already cached this value
+        return stmt.text_cache[i].as_ptr() as *const ffi::c_uchar;
+    }
+    match row.get::<&Value>(i) {
+        Ok(turso_core::Value::Text(text)) => {
+            let buf = &mut stmt.text_cache[i];
+            buf.extend(text.as_str().as_bytes());
+            buf.push(0);
+            buf.as_ptr() as *const ffi::c_uchar
+        }
         _ => std::ptr::null(),
     }
 }

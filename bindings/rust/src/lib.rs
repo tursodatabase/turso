@@ -153,14 +153,14 @@ impl Builder {
         match vfs_choice {
             "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
             "syscall" => {
-                #[cfg(target_family = "unix")]
+                #[cfg(all(target_family = "unix", not(miri)))]
                 {
                     Ok(Arc::new(
                         turso_core::UnixIO::new()
                             .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
                     ))
                 }
-                #[cfg(not(target_family = "unix"))]
+                #[cfg(any(not(target_family = "unix"), miri))]
                 {
                     Ok(Arc::new(
                         turso_core::PlatformIO::new()
@@ -168,12 +168,12 @@ impl Builder {
                     ))
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(miri)))]
             "io_uring" => Ok(Arc::new(
                 turso_core::UringIO::new()
                     .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
             )),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(any(not(target_os = "linux"), miri))]
             "io_uring" => Err(Error::SqlExecutionFailure(
                 "io_uring is only available on Linux targets".to_string(),
             )),

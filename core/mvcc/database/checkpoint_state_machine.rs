@@ -325,9 +325,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 result?;
                 if self.update_transaction_state {
-                    *self.connection.transaction_state.write() = TransactionState::Write {
+                    self.connection.set_tx_state(TransactionState::Write {
                         schema_did_change: false,
-                    }; // TODO: schema_did_change??
+                    }); // TODO: schema_did_change??
                 }
                 self.lock_states.pager_write_tx = true;
                 self.state = CheckpointState::WriteRow {
@@ -390,7 +390,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 cursor.clone()
                             } else {
                                 let cursor = BTreeCursor::new_table(
-                                    None,
                                     self.pager.clone(),
                                     known_root_page as i64,
                                     num_columns,
@@ -465,12 +464,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
                     cursor.clone()
                 } else {
-                    let cursor = BTreeCursor::new_table(
-                        None, // Write directly to B-tree
-                        self.pager.clone(),
-                        root_page as i64,
-                        num_columns,
-                    );
+                    let cursor =
+                        BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor
@@ -539,7 +534,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
                         if self.update_transaction_state {
-                            *self.connection.transaction_state.write() = TransactionState::None;
+                            self.connection.set_tx_state(TransactionState::None);
                         }
                         let header = self
                             .pager
@@ -628,12 +623,12 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
                 if self.lock_states.pager_write_tx {
                     self.pager.rollback_tx(self.connection.as_ref());
                     if self.update_transaction_state {
-                        *self.connection.transaction_state.write() = TransactionState::None;
+                        self.connection.set_tx_state(TransactionState::None);
                     }
                 } else if self.lock_states.pager_read_tx {
                     self.pager.end_read_tx();
                     if self.update_transaction_state {
-                        *self.connection.transaction_state.write() = TransactionState::None;
+                        self.connection.set_tx_state(TransactionState::None);
                     }
                 }
                 if self.lock_states.blocking_checkpoint_lock_held {

@@ -1,9 +1,12 @@
+use parking_lot::RwLock;
+
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{MVTableId, MvStore, Row, RowID};
-use crate::storage::btree::{BTreeKey, CursorTrait};
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
-use crate::Result;
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult};
+use crate::{return_if_io, Result};
 use crate::{Pager, Value};
+use std::any::Any;
 use std::cell::{Ref, RefCell};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -18,7 +21,7 @@ enum CursorPosition {
     /// We have reached the end of the table.
     End,
 }
-#[derive(Debug)]
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
@@ -26,6 +29,10 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
+    _btree_cursor: Box<dyn CursorTrait>,
+    null_flag: bool,
+    record_cursor: RefCell<RecordCursor>,
+    next_rowid_lock: Arc<RwLock<()>>,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -34,17 +41,25 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         tx_id: u64,
         root_page_or_table_id: i64,
         pager: Arc<Pager>,
+        btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
+        assert!(
+            (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
+            "BTreeCursor expected for mvcc cursor"
+        );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
         db.maybe_initialize_table(table_id, pager)?;
-        let cursor = Self {
+        Ok(Self {
             db,
             tx_id,
             current_pos: RefCell::new(CursorPosition::BeforeFirst),
             table_id,
             reusable_immutable_record: RefCell::new(None),
-        };
-        Ok(cursor)
+            _btree_cursor: btree_cursor,
+            null_flag: false,
+            record_cursor: RefCell::new(RecordCursor::new()),
+            next_rowid_lock: Arc::new(RwLock::new(())),
+        })
     }
 
     pub fn current_row(&self) -> Result<Option<Row>> {
@@ -71,6 +86,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     pub fn get_next_rowid(&mut self) -> i64 {
+        // lock so we don't get same two rowids
+        let lock = self.next_rowid_lock.clone();
+        let _lock = lock.write();
         let _ = self.last();
         match *self.current_pos.borrow() {
             CursorPosition::Loaded(id) => id.row_id + 1,
@@ -104,6 +122,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         } else {
             self.current_pos.replace(CursorPosition::BeforeFirst);
         }
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -137,6 +156,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
             };
         self.current_pos.replace(new_position);
+        self.invalidate_record();
 
         Ok(IOResult::Done(matches!(
             self.get_current_pos(),
@@ -209,6 +229,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             SeekOp::LT => (Bound::Excluded(&rowid), false),
             SeekOp::LE { eq_only: _ } => (Bound::Included(&rowid), false),
         };
+        self.invalidate_record();
         let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
         if let Some(rowid) = rowid {
             self.current_pos.replace(CursorPosition::Loaded(rowid));
@@ -256,6 +277,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.current_pos.replace(CursorPosition::BeforeFirst);
             })?;
         }
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
@@ -265,33 +287,38 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         };
         let rowid = RowID::new(self.table_id, rowid);
         self.db.delete(self.tx_id, rowid)?;
+        self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
-    fn set_null_flag(&mut self, _flag: bool) {
-        todo!()
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
     }
 
     fn get_null_flag(&self) -> bool {
-        todo!()
+        self.null_flag
     }
 
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
+        self.invalidate_record();
         let int_key = match key {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let exists = self
-            .db
-            .seek_rowid(
-                Bound::Included(&RowID {
-                    table_id: self.table_id,
-                    row_id: *int_key,
-                }),
-                true,
-                self.tx_id,
-            )
-            .is_some();
+        let rowid = self.db.seek_rowid(
+            Bound::Included(&RowID {
+                table_id: self.table_id,
+                row_id: *int_key,
+            }),
+            true,
+            self.tx_id,
+        );
+        tracing::trace!("found {rowid:?}");
+        let exists = if let Some(rowid) = rowid {
+            rowid.row_id == *int_key
+        } else {
+            false
+        };
         if exists {
             self.current_pos.replace(CursorPosition::Loaded(RowID {
                 table_id: self.table_id,
@@ -329,7 +356,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
-        self.current_pos.replace(CursorPosition::BeforeFirst);
+        self.invalidate_record();
+        if !matches!(self.get_current_pos(), CursorPosition::BeforeFirst) {
+            self.current_pos.replace(CursorPosition::BeforeFirst);
+        }
+        // Next will set cursor position to a valid position if it exists, otherwise it will set it to one that doesn't exist.
+        let _ = return_if_io!(self.next());
         Ok(IOResult::Done(()))
     }
 
@@ -350,7 +382,21 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek_to_last(&mut self) -> Result<IOResult<()>> {
-        todo!()
+        self.invalidate_record();
+        let max_rowid = RowID {
+            table_id: self.table_id,
+            row_id: i64::MAX,
+        };
+        let bound = Bound::Included(&max_rowid);
+        let lower_bound = false;
+
+        let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
+        if let Some(rowid) = rowid {
+            self.current_pos.replace(CursorPosition::Loaded(rowid));
+        } else {
+            self.current_pos.replace(CursorPosition::End);
+        }
+        Ok(IOResult::Done(()))
     }
 
     fn invalidate_record(&mut self) {
@@ -358,6 +404,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             .as_mut()
             .unwrap()
             .invalidate();
+        self.record_cursor.borrow_mut().invalidate();
     }
 
     fn has_rowid(&self) -> bool {
@@ -365,7 +412,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn record_cursor_mut(&self) -> std::cell::RefMut<'_, crate::types::RecordCursor> {
-        todo!()
+        self.record_cursor.borrow_mut()
     }
 
     fn get_pager(&self) -> Arc<Pager> {
@@ -375,8 +422,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn get_skip_advance(&self) -> bool {
         todo!()
     }
+}
 
-    fn get_mvcc_cursor(&self) -> Arc<parking_lot::RwLock<crate::MvCursor>> {
-        todo!()
+impl<Clock: LogicalClock> Debug for MvccLazyCursor<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvccLazyCursor")
+            .field("current_pos", &self.current_pos)
+            .field("table_id", &self.table_id)
+            .field("tx_id", &self.tx_id)
+            .field("reusable_immutable_record", &self.reusable_immutable_record)
+            .field("btree_cursor", &())
+            .finish()
     }
 }

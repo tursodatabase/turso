@@ -29,6 +29,7 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
+    return_if_io,
     state_machine::StateMachine,
     storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
@@ -66,7 +67,7 @@ use std::{
     collections::HashMap,
     num::NonZero,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicIsize, Ordering},
         Arc,
     },
     task::Waker,
@@ -179,18 +180,6 @@ pub enum StepResult {
     Busy,
 }
 
-/// If there is I/O, the instruction is restarted.
-/// Evaluate a Result<IOResult<T>>, if IO return Ok(StepResult::IO).
-#[macro_export]
-macro_rules! return_step_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            IOResult::Ok(v) => v,
-            IOResult::IO => return Ok(StepResult::IO),
-        }
-    };
-}
-
 struct RegexCache {
     like: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
@@ -282,6 +271,7 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: Vec<Option<Cursor>>,
+    cursor_seqs: Vec<i64>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
@@ -319,7 +309,13 @@ pub struct ProgramState {
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
-    fk_scope_counter: isize,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -330,11 +326,13 @@ unsafe impl Sync for ProgramState {}
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
             io_completions: None,
             pc: 0,
             cursors,
+            cursor_seqs,
             registers,
             result_row: None,
             last_compare: None,
@@ -371,7 +369,8 @@ impl ProgramState {
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
-            fk_scope_counter: 0,
+            fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            fk_immediate_violations_during_stmt: AtomicIsize::new(0),
         }
     }
 
@@ -416,6 +415,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_seqs.resize(max_cursors, 0);
         }
         if let Some(max_resgisters) = max_registers {
             self.registers
@@ -455,6 +455,10 @@ impl ProgramState {
         self.op_row_id_state = OpRowIdState::Start;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        self.fk_deferred_violations_when_stmt_started
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -464,6 +468,63 @@ impl ProgramState {
             .as_mut()
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
+
+    /// Begin a statement subtransaction.
+    pub fn begin_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        write: bool,
+    ) -> Result<IOResult<()>> {
+        // Store the deferred foreign key violations counter at the start of the statement.
+        // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
+        // the deferred FK violations are not lost.
+        self.fk_deferred_violations_when_stmt_started.store(
+            connection.fk_deferred_violations.load(Ordering::Acquire),
+            Ordering::SeqCst,
+        );
+        // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        if write {
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.begin_statement(db_size)?;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// End a statement subtransaction.
+    pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        match end_statement {
+            EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+            EndStatement::RollbackSavepoint => {
+                pager.rollback_to_newest_savepoint()?;
+                // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
+                // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Action to take at the end of a statement subtransaction.
+pub enum EndStatement {
+    /// Release (commit) the savepoint -- effectively removing the savepoint as it is no longer needed for undo purposes.
+    ReleaseSavepoint,
+    /// Rollback (abort) to the newest savepoint: read pages from the subjournal and restore them to the page cache.
+    /// This is used to undo the changes made by the statement.
+    RollbackSavepoint,
 }
 
 impl Register {
@@ -528,6 +589,10 @@ pub struct Program {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     pub accesses_db: bool,
+    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
+    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
+    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    pub needs_stmt_subtransactions: bool,
 }
 
 impl Program {
@@ -993,6 +1058,10 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Constraint errors do not cause a rollback of the transaction by default;
+                // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
+                // and op_halt.
+                Some(LimboError::Constraint(_)) => {}
                 _ => {
                     if *cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = mv_store {

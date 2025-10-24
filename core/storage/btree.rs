@@ -24,7 +24,7 @@ use crate::{
         RecordCursor, SeekResult,
     },
     util::IOExt,
-    Completion, MvCursor, Page,
+    Completion, Page,
 };
 
 use crate::{
@@ -39,7 +39,6 @@ use super::{
         write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
     },
 };
-use parking_lot::RwLock;
 use std::{
     any::Any,
     cell::{Cell, Ref, RefCell},
@@ -556,15 +555,10 @@ pub trait CursorTrait: Any {
     fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor>;
     fn get_pager(&self) -> Arc<Pager>;
     fn get_skip_advance(&self) -> bool;
-
-    // FIXME: remove once we implement trait for mvcc
-    fn get_mvcc_cursor(&self) -> Arc<RwLock<MvCursor>>;
     // --- end: BTreeCursor specific functions ----
 }
 
 pub struct BTreeCursor {
-    /// The multi-version cursor that is used to read and write to the database file.
-    mv_cursor: Option<Arc<RwLock<MvCursor>>>,
     /// The pager that is used to read and write to the database file.
     pub pager: Arc<Pager>,
     /// Cached value of the usable space of a BTree page, since it is very expensive to call in a hot loop via pager.usable_space().
@@ -667,20 +661,14 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
-    pub fn new(
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
-        root_page: i64,
-        num_columns: usize,
-    ) -> Self {
-        let valid_state = if root_page == 1 && !pager.db_state.is_initialized() {
+    pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
+        let valid_state = if root_page == 1 && !pager.db_state.get().is_initialized() {
             CursorValidState::Invalid
         } else {
             CursorValidState::Valid
         };
         let usable_space = pager.usable_space();
         Self {
-            mv_cursor,
             pager,
             root_page,
             usable_space_cached: usable_space,
@@ -718,23 +706,12 @@ impl BTreeCursor {
         }
     }
 
-    pub fn new_table(
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
-        root_page: i64,
-        num_columns: usize,
-    ) -> Self {
-        Self::new(mv_cursor, pager, root_page, num_columns)
+    pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
+        Self::new(pager, root_page, num_columns)
     }
 
-    pub fn new_index(
-        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
-        root_page: i64,
-        index: &Index,
-        num_columns: usize,
-    ) -> Self {
-        let mut cursor = Self::new(mv_cursor, pager, root_page, num_columns);
+    pub fn new_index(pager: Arc<Pager>, root_page: i64, index: &Index, num_columns: usize) -> Self {
+        let mut cursor = Self::new(pager, root_page, num_columns);
         cursor.index_info = Some(IndexInfo::new_from_index(index));
         cursor
     }
@@ -767,10 +744,6 @@ impl BTreeCursor {
             let state = self.is_empty_table_state.borrow().clone();
             match state {
                 EmptyTableState::Start => {
-                    if let Some(mv_cursor) = &self.mv_cursor {
-                        let mv_cursor = mv_cursor.read();
-                        return Ok(IOResult::Done(mv_cursor.is_empty()));
-                    }
                     let (page, c) = self.pager.read_page(self.root_page)?;
                     *self.is_empty_table_state.borrow_mut() = EmptyTableState::ReadPage { page };
                     if let Some(c) = c {
@@ -1076,7 +1049,13 @@ impl BTreeCursor {
                     local_amount = local_size as u32 - offset;
                 }
                 if is_write {
-                    self.write_payload_to_page(offset, local_amount, payload, buffer, page.clone());
+                    self.write_payload_to_page(
+                        offset,
+                        local_amount,
+                        payload,
+                        buffer,
+                        page.clone(),
+                    )?;
                 } else {
                     self.read_payload_from_page(offset, local_amount, payload, buffer);
                 }
@@ -1202,7 +1181,7 @@ impl BTreeCursor {
                             page_payload,
                             buffer,
                             page.clone(),
-                        );
+                        )?;
                     } else {
                         self.read_payload_from_page(
                             payload_offset as u32,
@@ -1274,13 +1253,14 @@ impl BTreeCursor {
         payload: &[u8],
         buffer: &mut [u8],
         page: PageRef,
-    ) {
-        self.pager.add_dirty(&page);
+    ) -> Result<()> {
+        self.pager.add_dirty(&page)?;
         // SAFETY: This is safe as long as the page is not evicted from the cache.
         let payload_mut =
             unsafe { std::slice::from_raw_parts_mut(payload.as_ptr() as *mut u8, payload.len()) };
         payload_mut[payload_offset as usize..payload_offset as usize + num_bytes as usize]
             .copy_from_slice(&buffer[..num_bytes as usize]);
+        Ok(())
     }
 
     /// Check if any ancestor pages still have cells to iterate.
@@ -1296,19 +1276,7 @@ impl BTreeCursor {
     /// Used in forwards iteration, which is the default.
     #[instrument(skip(self), level = Level::DEBUG, name = "next")]
     pub fn get_next_record(&mut self) -> Result<IOResult<bool>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
-            assert!(matches!(mv_cursor.next()?, IOResult::Done(_)));
-            let IOResult::Done(rowid) = mv_cursor.rowid()? else {
-                todo!()
-            };
-            match rowid {
-                Some(_rowid) => {
-                    return Ok(IOResult::Done(true));
-                }
-                None => return Ok(IOResult::Done(false)),
-            }
-        } else if self.stack.current_page == -1 {
+        if self.stack.current_page == -1 {
             // This can happen in nested left joins. See:
             // https://github.com/tursodatabase/turso/issues/2924
             return Ok(IOResult::Done(false));
@@ -1883,10 +1851,6 @@ impl BTreeCursor {
     /// of iterating cells in order.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<IOResult<SeekResult>> {
-        turso_assert!(
-            self.mv_cursor.is_none(),
-            "attempting to seek with MV cursor"
-        );
         let iter_dir = seek_op.iteration_direction();
 
         if matches!(
@@ -2239,10 +2203,6 @@ impl BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<IOResult<()>> {
-        turso_assert!(
-            self.mv_cursor.is_none(),
-            "attempting to move with MV cursor"
-        );
         tracing::trace!(?key, ?cmp);
         // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
         // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
@@ -2322,7 +2282,7 @@ impl BTreeCursor {
 
                     // get page and find cell
                     let cell_idx = {
-                        self.pager.add_dirty(&page);
+                        self.pager.add_dirty(&page)?;
                         self.stack.current_cell_index()
                     };
                     if cell_idx == -1 {
@@ -2690,8 +2650,8 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
-        self.pager.add_dirty(parent);
-        self.pager.add_dirty(&new_rightmost_leaf);
+        self.pager.add_dirty(parent)?;
+        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -2768,7 +2728,7 @@ impl BTreeCursor {
                             overflow_cell.index
                         );
                     }
-                    self.pager.add_dirty(parent_page);
+                    self.pager.add_dirty(parent_page)?;
                     let parent_contents = parent_page.get_contents();
                     let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
@@ -2857,7 +2817,8 @@ impl BTreeCursor {
 
                     // load sibling pages
                     // start loading right page first
-                    let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read().swap_bytes() };
+                    let mut pgno: u32 =
+                        unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
                     let current_sibling = sibling_pointer;
                     let mut group = CompletionGroup::new(|_| {});
                     for i in (0..=current_sibling).rev() {
@@ -2869,8 +2830,6 @@ impl BTreeCursor {
                                 return Err(e);
                             }
                             Ok((page, c)) => {
-                                // mark as dirty
-                                self.pager.add_dirty(&page);
                                 pages_to_balance[i].replace(page);
                                 if let Some(c) = c {
                                     group.add(&c);
@@ -2955,7 +2914,7 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                     {
                         let page = page.as_ref().unwrap();
-                        turso_assert!(page.is_loaded(), "page should be loaded");
+                        self.pager.add_dirty(page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
@@ -3528,7 +3487,7 @@ impl BTreeCursor {
                             if *new_id != page.get().id {
                                 page.get().id = *new_id;
                                 self.pager
-                                    .update_dirty_loaded_page_in_cache(*new_id, page.clone())?;
+                                    .upsert_page_in_cache(*new_id, page.clone(), true)?;
                             }
                         }
 
@@ -4724,7 +4683,7 @@ impl BTreeCursor {
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
                         if keep_root {
-                            self.clear_root(&page);
+                            self.clear_root(&page)?;
                         } else {
                             return_if_io!(self.pager.free_page(Some(page), page_id));
                         }
@@ -4739,7 +4698,7 @@ impl BTreeCursor {
         }
     }
 
-    fn clear_root(&mut self, root_page: &PageRef) {
+    fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
         let page_ref = root_page.get();
         let contents = page_ref.contents.as_ref().unwrap();
 
@@ -4748,8 +4707,9 @@ impl BTreeCursor {
             PageType::IndexLeaf | PageType::IndexInterior => PageType::IndexLeaf,
         };
 
-        self.pager.add_dirty(root_page);
+        self.pager.add_dirty(root_page)?;
         btree_init_page(root_page, page_type, 0, self.pager.usable_space());
+        Ok(())
     }
 
     pub fn overwrite_cell(
@@ -4956,7 +4916,6 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn last(&mut self) -> Result<IOResult<()>> {
-        assert!(self.mv_cursor.is_none());
         let cursor_has_record = return_if_io!(self.move_to_rightmost());
         self.has_record.replace(cursor_has_record);
         self.invalidate_record();
@@ -4965,7 +4924,6 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn prev(&mut self) -> Result<IOResult<bool>> {
-        assert!(self.mv_cursor.is_none());
         loop {
             match self.advance_state {
                 AdvanceState::Start => {
@@ -4984,16 +4942,6 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip(self), level = Level::DEBUG)]
     fn rowid(&self) -> Result<IOResult<Option<i64>>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mv_cursor = mv_cursor.write();
-            let IOResult::Done(rowid) = mv_cursor.rowid()? else {
-                todo!();
-            };
-            let Some(rowid) = rowid else {
-                return Ok(IOResult::Done(None));
-            };
-            return Ok(IOResult::Done(Some(rowid)));
-        }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -5016,10 +4964,6 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip(self, key), level = Level::DEBUG)]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mut mv_cursor = mv_cursor.write();
-            return mv_cursor.seek(key, op);
-        }
         self.skip_advance.set(false);
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -5037,7 +4981,7 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip(self), level = Level::DEBUG)]
     fn record(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>> {
-        if !self.has_record.get() && self.mv_cursor.is_none() {
+        if !self.has_record.get() {
             return Ok(IOResult::Done(None));
         }
         let invalidated = self
@@ -5046,25 +4990,6 @@ impl CursorTrait for BTreeCursor {
             .as_ref()
             .is_none_or(|record| record.is_invalidated());
         if !invalidated {
-            let record_ref =
-                Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
-                    .unwrap();
-            return Ok(IOResult::Done(Some(record_ref)));
-        }
-        if let Some(mv_cursor) = &self.mv_cursor {
-            let mv_cursor = mv_cursor.write();
-            let Some(row) = mv_cursor.current_row()? else {
-                return Ok(IOResult::Done(None));
-            };
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            self.get_immutable_record_or_create()
-                .as_mut()
-                .unwrap()
-                .start_serialization(&row.data);
-            self.record_cursor.borrow_mut().invalidate();
             let record_ref =
                 Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
                     .unwrap();
@@ -5117,17 +5042,10 @@ impl CursorTrait for BTreeCursor {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
-        match &self.mv_cursor {
-            Some(mv_cursor) => {
-                return_if_io!(mv_cursor.write().insert(key));
-            }
-            None => {
-                return_if_io!(self.insert_into_page(key));
-                if key.maybe_rowid().is_some() {
-                    self.has_record.replace(true);
-                }
-            }
-        };
+        return_if_io!(self.insert_into_page(key));
+        if key.maybe_rowid().is_some() {
+            self.has_record.replace(true);
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -5145,11 +5063,6 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> Result<IOResult<()>> {
-        if let Some(mv_cursor) = &self.mv_cursor {
-            return_if_io!(mv_cursor.write().delete());
-            return Ok(IOResult::Done(()));
-        }
-
         if let CursorState::None = &self.state {
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -5165,7 +5078,7 @@ impl CursorTrait for BTreeCursor {
             match delete_state {
                 DeleteState::Start => {
                     let page = self.stack.top_ref();
-                    self.pager.add_dirty(page);
+                    self.pager.add_dirty(page)?;
                     if matches!(
                         page.get_contents().page_type(),
                         PageType::TableLeaf | PageType::TableInterior
@@ -5362,8 +5275,8 @@ impl CursorTrait for BTreeCursor {
 
                     let leaf_page = self.stack.top_ref();
 
-                    self.pager.add_dirty(page);
-                    self.pager.add_dirty(leaf_page);
+                    self.pager.add_dirty(page)?;
+                    self.pager.add_dirty(leaf_page)?;
 
                     // Step 2: Replace the cell in the parent (interior) page.
                     {
@@ -5523,7 +5436,6 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
-        assert!(self.mv_cursor.is_none());
         let int_key = match key {
             Value::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
@@ -5560,10 +5472,6 @@ impl CursorTrait for BTreeCursor {
     ///
     /// Only supposed to be used in the context of a simple Count Select Statement
     fn count(&mut self) -> Result<IOResult<usize>> {
-        if let Some(_mv_cursor) = &self.mv_cursor {
-            todo!("Implement count for mvcc");
-        }
-
         let mut mem_page;
         let mut contents;
 
@@ -5683,14 +5591,9 @@ impl CursorTrait for BTreeCursor {
             match self.rewind_state {
                 RewindState::Start => {
                     self.rewind_state = RewindState::NextRecord;
-                    if let Some(mv_cursor) = &self.mv_cursor {
-                        let mut mv_cursor = mv_cursor.write();
-                        return_if_io!(mv_cursor.rewind());
-                    } else {
-                        let c = self.move_to_root()?;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
+                    let c = self.move_to_root()?;
+                    if let Some(c) = c {
+                        io_yield_one!(c);
                     }
                 }
                 RewindState::NextRecord => {
@@ -5743,7 +5646,6 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
-        assert!(self.mv_cursor.is_none()); // unsure about this -_-
         loop {
             match self.seek_end_state {
                 SeekEndState::Start => {
@@ -5779,16 +5681,11 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    fn get_mvcc_cursor(&self) -> Arc<RwLock<MvCursor>> {
-        self.mv_cursor.as_ref().unwrap().clone()
-    }
-
     #[instrument(skip_all, level = Level::DEBUG)]
     fn seek_to_last(&mut self) -> Result<IOResult<()>> {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
-                    assert!(self.mv_cursor.is_none());
                     let has_record = return_if_io!(self.move_to_rightmost());
                     self.invalidate_record();
                     self.has_record.replace(has_record);
@@ -7875,7 +7772,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use rand::{thread_rng, Rng};
+    use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -8076,7 +7973,7 @@ mod tests {
 
     fn validate_btree(pager: Arc<Pager>, page_idx: i64) -> (usize, bool) {
         let num_columns = 5;
-        let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
+        let cursor = BTreeCursor::new_table(pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
         while page.is_locked() {
             pager.io.step().unwrap();
@@ -8187,7 +8084,7 @@ mod tests {
     fn format_btree(pager: Arc<Pager>, page_idx: i64, depth: usize) -> String {
         let num_columns = 5;
 
-        let cursor = BTreeCursor::new_table(None, pager.clone(), page_idx, num_columns);
+        let cursor = BTreeCursor::new_table(pager.clone(), page_idx, num_columns);
         let (page, _c) = cursor.read_page(page_idx).unwrap();
         while page.is_locked() {
             pager.io.step().unwrap();
@@ -8269,7 +8166,7 @@ mod tests {
         let conn = db.connect().unwrap();
         let pager = conn.pager.read().clone();
 
-        let mut cursor = BTreeCursor::new(None, pager, 1, 5);
+        let mut cursor = BTreeCursor::new(pager, 1, 5);
         let result = cursor.rewind()?;
         assert!(matches!(result, IOResult::Done(_)));
         let result = cursor.next()?;
@@ -8299,7 +8196,7 @@ mod tests {
         let large_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Create cursor for the table
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         let initial_pagecount = pager
             .io
@@ -8451,7 +8348,7 @@ mod tests {
             let (pager, root_page, _, _) = empty_btree();
             let num_columns = 5;
 
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             for (key, size) in sequence.iter() {
                 run_until_done(
                     || {
@@ -8517,7 +8414,7 @@ mod tests {
 
         for _ in 0..attempts {
             let (pager, root_page, _db, conn) = empty_btree();
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for insert_id in 0..inserts {
@@ -8659,13 +8556,8 @@ mod tests {
                 has_rowid: false,
             };
             let num_columns = index_def.columns.len();
-            let mut cursor = BTreeCursor::new_index(
-                None,
-                pager.clone(),
-                index_root_page,
-                &index_def,
-                num_columns,
-            );
+            let mut cursor =
+                BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, num_columns);
             let mut keys = SortedVec::new();
             tracing::info!("seed: {seed}");
             for i in 0..inserts {
@@ -8822,8 +8714,7 @@ mod tests {
                 ephemeral: false,
                 has_rowid: false,
             };
-            let mut cursor =
-                BTreeCursor::new_index(None, pager.clone(), index_root_page, &index_def, 1);
+            let mut cursor = BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1);
 
             // Track expected keys that should be present in the tree
             let mut expected_keys = Vec::new();
@@ -9214,7 +9105,7 @@ mod tests {
         let pager = setup_test_env(5);
         let num_columns = 5;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), 1, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, num_columns);
 
         let max_local = payload_overflow_threshold_max(PageType::TableLeaf, 4096);
         let usable_size = cursor.usable_space();
@@ -9325,7 +9216,7 @@ mod tests {
         let pager = setup_test_env(5);
         let num_columns = 5;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), 1, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, num_columns);
 
         let small_payload = vec![b'A'; 10];
 
@@ -9374,7 +9265,7 @@ mod tests {
         let pager = setup_test_env(initial_size);
         let num_columns = 5;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), 2, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 2, num_columns);
 
         // Initialize page 2 as a root page (interior)
         let root_page = run_until_done(
@@ -9467,7 +9358,7 @@ mod tests {
         let num_columns = 5;
         let record_count = 10;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         for rowid in 1..=record_count {
             insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
@@ -9492,7 +9383,7 @@ mod tests {
         let num_columns = 5;
         let record_count = 1000;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         for rowid in 1..=record_count {
             insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
@@ -9518,7 +9409,7 @@ mod tests {
         let num_columns = 5;
         let record_count = 1000;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         for rowid in 1..=record_count {
             insert_record(&mut cursor, &pager, rowid, Value::Integer(rowid))?;
@@ -9558,8 +9449,8 @@ mod tests {
         let num_columns = 5;
         let record_count = 1000;
 
-        let mut cursor1 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
-        let mut cursor2 = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor1 = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+        let mut cursor2 = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         // Use cursor1 to insert records
         for rowid in 1..=record_count {
@@ -9592,7 +9483,7 @@ mod tests {
         let num_columns = 5;
         let record_count = 100;
 
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
 
         let initial_page_count = pager
             .io
@@ -9719,7 +9610,7 @@ mod tests {
         let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 100000;
-        let seed = thread_rng().gen();
+        let seed = rng().random();
         tracing::info!("seed {}", seed);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         while i > 0 {
@@ -10228,7 +10119,7 @@ mod tests {
         let num_columns = 5;
 
         for i in 0..10000 {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
             let regs = &[Register::Value(Value::Integer(i))];
             let value = ImmutableRecord::from_registers(regs, regs.len());
@@ -10256,7 +10147,7 @@ mod tests {
             format_btree(pager.clone(), root_page, 0)
         );
         for key in keys.iter() {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let key = Value::Integer(*key);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(exists, "key not found {key}");
@@ -10315,7 +10206,7 @@ mod tests {
 
         // Insert 10,000 records in to the BTree.
         for i in 1..=10000 {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let regs = &[Register::Value(Value::Text(Text::new("hello world")))];
             let value = ImmutableRecord::from_registers(regs, regs.len());
 
@@ -10342,7 +10233,7 @@ mod tests {
 
         // Delete records with 500 <= key <= 3500
         for i in 500..=3500 {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let seek_key = SeekKey::TableRowId(i);
 
             let seek_result = run_until_done(
@@ -10362,7 +10253,7 @@ mod tests {
                 continue;
             }
 
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let key = Value::Integer(i);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(exists, "Key {i} should exist but doesn't");
@@ -10370,7 +10261,7 @@ mod tests {
 
         // Verify the deleted records don't exist.
         for i in 500..=3500 {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             let key = Value::Integer(i);
             let exists = run_until_done(|| cursor.exists(&key), pager.deref()).unwrap();
             assert!(!exists, "Deleted key {i} still exists");
@@ -10393,7 +10284,7 @@ mod tests {
         let num_columns = 5;
 
         for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
-            let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+            let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
             let regs = &[Register::Value(Value::Text(Text {
                 value: huge_text.as_bytes().to_vec(),
@@ -10423,7 +10314,7 @@ mod tests {
                 format_btree(pager.clone(), root_page, 0)
             );
         }
-        let mut cursor = BTreeCursor::new_table(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
         let _c = cursor.move_to_root().unwrap();
         for i in 0..iterations {
             let has_next = run_until_done(|| cursor.next(), pager.deref()).unwrap();
@@ -10441,7 +10332,7 @@ mod tests {
     pub fn test_read_write_payload_with_offset() {
         let (pager, root_page, _, _) = empty_btree();
         let num_columns = 5;
-        let mut cursor = BTreeCursor::new(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new(pager.clone(), root_page, num_columns);
         let offset = 2; // blobs data starts at offset 2
         let initial_text = "hello world";
         let initial_blob = initial_text.as_bytes().to_vec();
@@ -10518,7 +10409,7 @@ mod tests {
     pub fn test_read_write_payload_with_overflow_page() {
         let (pager, root_page, _, _) = empty_btree();
         let num_columns = 5;
-        let mut cursor = BTreeCursor::new(None, pager.clone(), root_page, num_columns);
+        let mut cursor = BTreeCursor::new(pager.clone(), root_page, num_columns);
         let mut large_blob = vec![b'A'; 40960 - 11]; // insert large blob. 40960 = 10 page long.
         let hello_world = b"hello world";
         large_blob.extend_from_slice(hello_world);

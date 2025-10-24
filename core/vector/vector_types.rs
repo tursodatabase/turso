@@ -8,10 +8,11 @@ pub enum VectorType {
 }
 
 #[derive(Debug)]
-pub struct Vector {
+pub struct Vector<'a> {
     pub vector_type: VectorType,
     pub dims: usize,
-    pub data: Vec<u8>,
+    pub owned: Option<Vec<u8>>,
+    pub refer: Option<&'a [u8]>,
 }
 
 #[derive(Debug)]
@@ -20,14 +21,14 @@ pub struct VectorSparse<'a, T: std::fmt::Debug> {
     pub values: &'a [T],
 }
 
-impl Vector {
-    pub fn vector_type(mut blob: Vec<u8>) -> Result<(VectorType, Vec<u8>)> {
+impl<'a> Vector<'a> {
+    pub fn vector_type(blob: &[u8]) -> Result<(VectorType, usize)> {
         // Even-sized blobs are always float32.
         if blob.len() % 2 == 0 {
-            return Ok((VectorType::Float32Dense, blob));
+            return Ok((VectorType::Float32Dense, blob.len()));
         }
         // Odd-sized blobs have type byte at the end
-        let vector_type = blob.pop().unwrap();
+        let vector_type = blob[blob.len() - 1];
         /*
         vector types used by LibSQL:
         (see https://github.com/tursodatabase/libsql/blob/a55bf61192bdb89e97568de593c4af5b70d24bde/libsql-sqlite3/src/vectorInt.h#L52)
@@ -39,12 +40,12 @@ impl Vector {
             #define VECTOR_TYPE_FLOATB16  6
         */
         match vector_type {
-            1 => Ok((VectorType::Float32Dense, blob)),
-            2 => Ok((VectorType::Float64Dense, blob)),
+            1 => Ok((VectorType::Float32Dense, blob.len() - 1)),
+            2 => Ok((VectorType::Float64Dense, blob.len() - 1)),
             3..=6 => Err(LimboError::ConversionError(
                 "unsupported vector type from LibSQL".to_string(),
             )),
-            9 => Ok((VectorType::Float32Sparse, blob)),
+            9 => Ok((VectorType::Float32Sparse, blob.len() - 1)),
             _ => Err(LimboError::ConversionError(format!(
                 "unknown vector type: {vector_type}"
             ))),
@@ -63,7 +64,8 @@ impl Vector {
         Self {
             vector_type: VectorType::Float32Dense,
             dims,
-            data: values,
+            owned: Some(values),
+            refer: None,
         }
     }
     pub fn from_f64(mut values_f64: Vec<f64>) -> Self {
@@ -79,7 +81,8 @@ impl Vector {
         Self {
             vector_type: VectorType::Float64Dense,
             dims,
-            data: values,
+            owned: Some(values),
+            refer: None,
         }
     }
     pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
@@ -105,14 +108,27 @@ impl Vector {
         Self {
             vector_type: VectorType::Float32Sparse,
             dims,
-            data: values,
+            owned: Some(values),
+            refer: None,
         }
     }
-    pub fn from_blob(blob: Vec<u8>) -> Result<Self> {
-        let (vector_type, data) = Self::vector_type(blob)?;
-        Self::from_data(vector_type, data)
+    pub fn from_vec(mut blob: Vec<u8>) -> Result<Self> {
+        let (vector_type, len) = Self::vector_type(&blob)?;
+        blob.truncate(len);
+        Self::from_data(vector_type, Some(blob), None)
     }
-    pub fn from_data(vector_type: VectorType, mut data: Vec<u8>) -> Result<Self> {
+    pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
+        let (vector_type, len) = Self::vector_type(blob)?;
+        Self::from_data(vector_type, None, Some(&blob[..len]))
+    }
+    pub fn from_data(
+        vector_type: VectorType,
+        owned: Option<Vec<u8>>,
+        refer: Option<&'a [u8]>,
+    ) -> Result<Self> {
+        let owned_slice = owned.as_deref();
+        let refer_slice = refer.as_ref().map(|&x| x);
+        let data = owned_slice.unwrap_or_else(|| refer_slice.unwrap());
         match vector_type {
             VectorType::Float32Dense => {
                 if data.len() % 4 != 0 {
@@ -124,7 +140,8 @@ impl Vector {
                 Ok(Vector {
                     vector_type,
                     dims: data.len() / 4,
-                    data,
+                    owned,
+                    refer,
                 })
             }
             VectorType::Float64Dense => {
@@ -137,7 +154,8 @@ impl Vector {
                 Ok(Vector {
                     vector_type,
                     dims: data.len() / 8,
-                    data,
+                    owned,
+                    refer,
                 })
             }
             VectorType::Float32Sparse => {
@@ -147,17 +165,41 @@ impl Vector {
                         data.len(),
                     )));
                 }
-                let dims_bytes = data.split_off(data.len() - 4);
+                let original_len = data.len();
+                let dims_bytes = &data[original_len - 4..];
                 let dims = u32::from_le_bytes(dims_bytes.try_into().unwrap()) as usize;
+                let owned = owned.map(|mut x| {
+                    x.truncate(original_len - 4);
+                    x
+                });
+                let refer = refer.map(|x| &x[0..original_len - 4]);
                 let vector = Vector {
                     vector_type,
                     dims,
-                    data,
+                    owned,
+                    refer,
                 };
                 Ok(vector)
             }
         }
     }
+
+    pub fn bin_len(&self) -> usize {
+        let owned = self.owned.as_ref().map(|x| x.len());
+        let refer = self.refer.as_ref().map(|x| x.len());
+        owned.unwrap_or_else(|| refer.unwrap())
+    }
+
+    pub fn bin_data(&'a self) -> &'a [u8] {
+        let owned = self.owned.as_deref();
+        let refer = self.refer.as_ref().map(|&x| x);
+        owned.unwrap_or_else(|| refer.unwrap())
+    }
+
+    pub fn bin_eject(self) -> Vec<u8> {
+        self.owned.unwrap_or_else(|| self.refer.unwrap().to_vec())
+    }
+
     /// # Safety
     ///
     /// This method is used to reinterpret the underlying `Vec<u8>` data
@@ -171,12 +213,12 @@ impl Vector {
         }
 
         assert_eq!(
-            self.data.len(),
+            self.bin_len(),
             self.dims * std::mem::size_of::<f32>(),
             "data length must equal dims * size_of::<f32>()"
         );
 
-        let ptr = self.data.as_ptr();
+        let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f32>();
         assert_eq!(
             ptr.align_offset(align),
@@ -200,12 +242,12 @@ impl Vector {
         }
 
         assert_eq!(
-            self.data.len(),
+            self.bin_len(),
             self.dims * std::mem::size_of::<f64>(),
             "data length must equal dims * size_of::<f64>()"
         );
 
-        let ptr = self.data.as_ptr();
+        let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f64>();
         assert_eq!(
             ptr.align_offset(align),
@@ -218,14 +260,14 @@ impl Vector {
 
     pub fn as_f32_sparse(&self) -> VectorSparse<'_, f32> {
         debug_assert!(self.vector_type == VectorType::Float32Sparse);
-        let ptr = self.data.as_ptr();
+        let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f32>();
         assert_eq!(
             ptr.align_offset(align),
             0,
             "data pointer must be aligned to {align} bytes for f32 access"
         );
-        let length = self.data.len() / 4 / 2;
+        let length = self.bin_data().len() / 4 / 2;
         let values = unsafe { std::slice::from_raw_parts(ptr as *const f32, length) };
         let idx = unsafe { std::slice::from_raw_parts((ptr as *const u32).add(length), length) };
         debug_assert!(idx.is_sorted());
@@ -292,12 +334,13 @@ pub(crate) mod tests {
     }
 
     /// Convert an ArbitraryVector to a Vector.
-    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector {
+    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector<'static> {
         fn from(v: ArbitraryVector<DIMS>) -> Self {
             Vector {
                 vector_type: v.vector_type,
                 dims: DIMS,
-                data: v.data,
+                owned: Some(v.data),
+                refer: None,
             }
         }
     }
@@ -357,7 +400,7 @@ pub(crate) mod tests {
         let vtype = v.vector_type;
         let value = operations::serialize::vector_serialize(v);
         let blob = value.to_blob().unwrap().to_vec();
-        match Vector::vector_type(blob) {
+        match Vector::vector_type(&blob) {
             Ok((detected_type, _)) => detected_type == vtype,
             Err(_) => false,
         }
@@ -396,12 +439,12 @@ pub(crate) mod tests {
             VectorType::Float32Dense => {
                 let slice = v.as_f32_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (4 bytes per float)
-                slice.len() == DIMS && (slice.len() * 4 == v.data.len())
+                slice.len() == DIMS && (slice.len() * 4 == v.bin_len())
             }
             VectorType::Float64Dense => {
                 let slice = v.as_f64_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
-                slice.len() == DIMS && (slice.len() * 8 == v.data.len())
+                slice.len() == DIMS && (slice.len() * 8 == v.bin_len())
             }
             _ => unreachable!(),
         }
@@ -454,12 +497,14 @@ pub(crate) mod tests {
         let a = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            data: vec![0, 0, 0, 0, 52, 208, 106, 63],
+            owned: Some(vec![0, 0, 0, 0, 52, 208, 106, 63]),
+            refer: None,
         };
         let b = Vector {
             vector_type: VectorType::Float32Dense,
             dims: 2,
-            data: vec![0, 0, 0, 0, 58, 100, 45, 192],
+            owned: Some(vec![0, 0, 0, 0, 58, 100, 45, 192]),
+            refer: None,
         };
         assert!(
             (operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6

@@ -11,6 +11,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -1329,6 +1330,39 @@ pub fn extract_view_columns(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+pub fn rewrite_fk_parent_cols_if_self_ref(
+    clause: &mut ast::ForeignKeyClause,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(table) {
+        for c in &mut clause.columns {
+            if normalize_ident(c.col_name.as_str()) == normalize_ident(from) {
+                c.col_name = ast::Name::exact(to.to_owned());
+            }
+        }
+    }
+}
+
+/// Update a column-level REFERENCES <tbl>(col,...) constraint
+pub fn rewrite_column_references_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::NamedColumnConstraint {
+            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
+            ..
+        } = cc
+        {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1184,13 +1184,13 @@ pub enum Insn {
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
         increment_value: isize,
-        is_scope: bool,
+        deferred: bool,
     },
     // This opcode tests if a foreign key constraint-counter is currently zero. If so, jump to instruction P2. Otherwise, fall through to the next instruction.
     // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).
     // If P1 is zero, the jump is taken if the statement constraint-counter is zero (immediate foreign key constraint violations).
     FkIfZero {
-        is_scope: bool,
+        deferred: bool,
         target_pc: BranchOffset,
     },
 }

@@ -89,6 +89,12 @@ struct GrammarGeneratorInner {
     symbols: HashMap<SymbolHandle, SymbolType>,
 }
 
+impl Default for GrammarGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrammarGenerator {
     pub fn new() -> Self {
         GrammarGenerator(Rc::new(RefCell::new(GrammarGeneratorInner {

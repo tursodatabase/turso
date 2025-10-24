@@ -48,7 +48,7 @@ jobs:
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-        run: cargo test --verbose --features checksum
+        run: cargo test --verbose --features checksum --test integration_tests
         timeout-minutes: 20
 
   clippy:

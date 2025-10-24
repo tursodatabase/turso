@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::error::{SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_UNIQUE};
+use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::numeric::{NullableInteger, Numeric};
@@ -11,15 +11,17 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize};
+use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
     SeekResult, Text,
 };
-use crate::util::normalize_ident;
+use crate::util::{
+    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+};
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::{registers_to_ref_values, TxnCleanup};
+use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -36,6 +38,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
+use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
@@ -72,8 +75,7 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
-use turso_parser::ast::{self, Name, SortOrder};
+use turso_parser::ast::{self, ForeignKeyClause, Name, SortOrder};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -1044,16 +1046,9 @@ pub fn op_open_read(
     let pager = program.get_pager_from_database_index(db);
 
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store, tx_id, *root_page, pager.clone()).unwrap(),
-        ));
-        Some(mv_cursor)
-    } else {
+    if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
-        None
-    };
+    }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -1062,16 +1057,33 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store.unwrap().clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    *root_page,
+                    pager.clone(),
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
+
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
+
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                mv_cursor,
                 pager.clone(),
                 *root_page,
                 num_columns,
             ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().unwrap().name().to_string();
@@ -1082,7 +1094,7 @@ pub fn op_open_read(
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
-                btree_cursor,
+                cursor,
                 view_mutex.clone(),
                 pager.clone(),
                 tx_state,
@@ -1095,24 +1107,29 @@ pub fn op_open_read(
         }
         CursorType::BTreeTable(_) => {
             // Regular table
-            let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), *root_page, num_columns);
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                *root_page,
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let cursor = BTreeCursor::new_index(
-                mv_cursor,
+            let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager.clone(),
                 *root_page,
                 index.as_ref(),
                 num_columns,
-            );
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
@@ -1467,44 +1484,6 @@ pub fn op_last(
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
-}
-
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
-///
-/// This function is a performance-optimized version of `read_varint()` that handles
-/// the most common varint cases inline before falling back to the full implementation.
-/// It follows the same varint encoding as SQLite.
-///
-/// # Optimized Cases
-///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-///
-/// This function is similar to `sqlite3GetVarint32`
-#[inline(always)]
-fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2132,8 +2111,8 @@ pub fn halt(
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
-        // invalidate page cache in case of error
-        pager.clear_page_cache(false);
+        // Any non-FK constraint violation causes the statement subtransaction to roll back.
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
     }
     match err_code {
         0 => {}
@@ -2152,9 +2131,6 @@ pub fn halt(
                 "UNIQUE constraint failed: {description} (19)"
             )));
         }
-        SQLITE_CONSTRAINT_FOREIGNKEY => {
-            return Err(LimboError::Constraint(format!("{description} (19)")));
-        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "undocumented halt error code {description}"
@@ -2164,23 +2140,46 @@ pub fn halt(
 
     let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
     tracing::trace!("halt(auto_commit={})", auto_commit);
+
+    // Check for immediate foreign key violations.
+    // Any immediate violation causes the statement subtransaction to roll back.
+    if program.connection.foreign_keys_enabled()
+        && state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
+            > 0
+    {
+        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
+        return Err(LimboError::Constraint(
+            "foreign key constraint failed".to_string(),
+        ));
+    }
+
     if auto_commit {
-        let res = program.commit_txn(pager.clone(), state, mv_store, false);
-        if res.is_ok()
-            && program.connection.foreign_keys_enabled()
-            && program
+        // In autocommit mode, a statement that leaves deferred violations must fail here,
+        // and it also ends the transaction.
+        if program.connection.foreign_keys_enabled() {
+            let deferred_violations = program
                 .connection
                 .fk_deferred_violations
-                .swap(0, Ordering::AcqRel)
-                > 0
-        {
-            // In autocommit mode, a statement that leaves deferred violations must fail here.
-            return Err(LimboError::Constraint(
-                "foreign key constraint failed".to_string(),
-            ));
+                .swap(0, Ordering::AcqRel);
+            if deferred_violations > 0 {
+                pager.rollback_tx(&program.connection);
+                program.connection.set_tx_state(TransactionState::None);
+                program.connection.auto_commit.store(true, Ordering::SeqCst);
+                return Err(LimboError::Constraint(
+                    "foreign key constraint failed".to_string(),
+                ));
+            }
         }
-        res.map(Into::into)
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        program
+            .commit_txn(pager.clone(), state, mv_store, false)
+            .map(Into::into)
     } else {
+        // Even if deferred violations are present, the statement subtransaction completes successfully when
+        // it is part of an interactive transaction.
+        state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         Ok(InsnFunctionStepResult::Done)
     }
 }
@@ -2229,6 +2228,7 @@ pub fn op_halt_if_null(
 pub enum OpTransactionState {
     Start,
     CheckSchemaCookie,
+    BeginStatement,
 }
 
 pub fn op_transaction(
@@ -2412,9 +2412,7 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
-                let res = with_header(&pager, mv_store, program, |header| {
-                    header.schema_cookie.get()
-                });
+                let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
                         if header_schema_cookie != *schema_cookie {
@@ -2431,6 +2429,17 @@ pub fn op_transaction_inner(
                     Err(LimboError::Page1NotAlloc) => {}
                     Err(err) => {
                         return Err(err);
+                    }
+                }
+
+                state.op_transaction_state = OpTransactionState::BeginStatement;
+            }
+            OpTransactionState::BeginStatement => {
+                if program.needs_stmt_subtransactions && mv_store.is_none() {
+                    let write = matches!(tx_mode, TransactionMode::Write);
+                    let res = state.begin_statement(&program.connection, &pager, write)?;
+                    if let IOResult::IO(io) = res {
+                        return Ok(InsnFunctionStepResult::IO(io));
                     }
                 }
 
@@ -4803,7 +4812,9 @@ pub fn op_function(
                     ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
-                    ScalarFunc::RandomBlob => Some(reg_value.exec_randomblob()),
+                    ScalarFunc::RandomBlob => {
+                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest)))
+                    }
                     ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()),
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
@@ -4828,7 +4839,8 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest] = Register::Value(Value::exec_random());
+                state.registers[*dest] =
+                    Register::Value(Value::exec_random(|| pager.io.generate_random_number()));
             }
             ScalarFunc::Trim => {
                 let reg_value = &state.registers[*start_reg];
@@ -5463,11 +5475,9 @@ pub fn op_function(
                         .parse_column_definition(true)
                         .unwrap();
 
-                    let new_sql = 'sql: {
-                        if table != tbl_name {
-                            break 'sql None;
-                        }
+                    let rename_to = normalize_ident(column_def.col_name.as_str());
 
+                    let new_sql = 'sql: {
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
@@ -5521,34 +5531,160 @@ pub fn op_function(
                                 temporary,
                                 if_not_exists,
                             } => {
-                                if table != normalize_ident(tbl_name.name.as_str()) {
-                                    break 'sql None;
-                                }
-
                                 let ast::CreateTableBody::ColumnsAndConstraints {
                                     mut columns,
-                                    constraints,
+                                    mut constraints,
                                     options,
                                 } = body
                                 else {
                                     todo!()
                                 };
 
-                                let column = columns
-                                    .iter_mut()
-                                    .find(|column| {
-                                        column.col_name.as_str() == original_rename_from.as_str()
-                                    })
-                                    .expect("column being renamed should be present");
+                                let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
 
-                                match alter_func {
-                                    AlterTableFunc::AlterColumn => *column = column_def,
-                                    AlterTableFunc::RenameColumn => {
-                                        column.col_name = column_def.col_name
+                                if normalized_tbl_name == table {
+                                    // This is the table being altered - update its column
+                                    let column = columns
+                                        .iter_mut()
+                                        .find(|column| {
+                                            column.col_name.as_str()
+                                                == original_rename_from.as_str()
+                                        })
+                                        .expect("column being renamed should be present");
+
+                                    match alter_func {
+                                        AlterTableFunc::AlterColumn => *column = column_def.clone(),
+                                        AlterTableFunc::RenameColumn => {
+                                            column.col_name = column_def.col_name.clone()
+                                        }
+                                        _ => unreachable!(),
                                     }
-                                    _ => unreachable!(),
-                                }
 
+                                    // Update table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY)
+                                    for constraint in &mut constraints {
+                                        match &mut constraint.constraint {
+                                            ast::TableConstraint::PrimaryKey {
+                                                columns: pk_cols,
+                                                ..
+                                            } => {
+                                                for col in pk_cols {
+                                                    let (ast::Expr::Name(ref name)
+                                                    | ast::Expr::Id(ref name)) = *col.expr
+                                                    else {
+                                                        return Err(LimboError::ParseError("Unexpected expression in PRIMARY KEY constraint".to_string()));
+                                                    };
+                                                    if normalize_ident(name.as_str()) == rename_from
+                                                    {
+                                                        *col.expr = ast::Expr::Name(Name::exact(
+                                                            column_def.col_name.as_str().to_owned(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            ast::TableConstraint::Unique {
+                                                columns: uniq_cols,
+                                                ..
+                                            } => {
+                                                for col in uniq_cols {
+                                                    let (ast::Expr::Name(ref name)
+                                                    | ast::Expr::Id(ref name)) = *col.expr
+                                                    else {
+                                                        return Err(LimboError::ParseError("Unexpected expression in UNIQUE constraint".to_string()));
+                                                    };
+                                                    if normalize_ident(name.as_str()) == rename_from
+                                                    {
+                                                        *col.expr = ast::Expr::Name(Name::exact(
+                                                            column_def.col_name.as_str().to_owned(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            ast::TableConstraint::ForeignKey {
+                                                columns: child_cols,
+                                                clause,
+                                                ..
+                                            } => {
+                                                // Update child columns in this table's FK definitions
+                                                for child_col in child_cols {
+                                                    if normalize_ident(child_col.col_name.as_str())
+                                                        == rename_from
+                                                    {
+                                                        child_col.col_name = Name::exact(
+                                                            column_def.col_name.as_str().to_owned(),
+                                                        );
+                                                    }
+                                                }
+                                                rewrite_fk_parent_cols_if_self_ref(
+                                                    clause,
+                                                    &normalized_tbl_name,
+                                                    &rename_from,
+                                                    column_def.col_name.as_str(),
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+
+                                        for col in &mut columns {
+                                            rewrite_column_references_if_needed(
+                                                col,
+                                                &normalized_tbl_name,
+                                                &rename_from,
+                                                column_def.col_name.as_str(),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // This is a different table, check if it has FKs referencing the renamed column
+                                    let mut fk_updated = false;
+
+                                    for constraint in &mut constraints {
+                                        if let ast::TableConstraint::ForeignKey {
+                                            columns: _,
+                                            clause:
+                                                ForeignKeyClause {
+                                                    tbl_name,
+                                                    columns: parent_cols,
+                                                    ..
+                                                },
+                                            ..
+                                        } = &mut constraint.constraint
+                                        {
+                                            // Check if this FK references the table being altered
+                                            if normalize_ident(tbl_name.as_str()) == table {
+                                                // Update parent column references if they match the renamed column
+                                                for parent_col in parent_cols {
+                                                    if normalize_ident(parent_col.col_name.as_str())
+                                                        == rename_from
+                                                    {
+                                                        parent_col.col_name = Name::exact(
+                                                            column_def.col_name.as_str().to_owned(),
+                                                        );
+                                                        fk_updated = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    for col in &mut columns {
+                                        let before = fk_updated;
+                                        let mut local_col = col.clone();
+                                        rewrite_column_references_if_needed(
+                                            &mut local_col,
+                                            &table,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
+                                        if local_col != *col {
+                                            *col = local_col;
+                                            fk_updated = true;
+                                        }
+                                    }
+
+                                    // Only return updated SQL if we actually changed something
+                                    if !fk_updated {
+                                        break 'sql None;
+                                    }
+                                }
                                 Some(
                                     ast::Stmt::CreateTable {
                                         tbl_name,
@@ -5563,7 +5699,7 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
-                            _ => todo!(),
+                            _ => None,
                         }
                     };
 
@@ -5604,8 +5740,9 @@ pub fn op_sequence(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    let seq_num = cursor.next_sequence();
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let seq_num = *cursor_seq;
+    *cursor_seq += 1;
     state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5626,8 +5763,10 @@ pub fn op_sequence_test(
         },
         insn
     );
-    let cursor = state.get_cursor(*cursor_id).as_sorter_mut();
-    state.pc = if cursor.seq_beginning() {
+    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let was_zero = *cursor_seq == 0;
+    *cursor_seq += 1;
+    state.pc = if was_zero {
         target_pc.as_offset_int()
     } else {
         state.pc + 1
@@ -6423,13 +6562,13 @@ pub fn op_new_rowid(
         },
         insn
     );
-
     if let Some(mv_store) = mv_store {
+        // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
+        // which will make sure we don't collide.
         let rowid = {
             let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut();
-            let mvcc_cursor = cursor.get_mvcc_cursor();
-            let mut mvcc_cursor = mvcc_cursor.write();
+            let cursor = cursor.as_btree_mut() as &mut dyn Any;
+            let mvcc_cursor = cursor.downcast_mut::<MvCursor>().unwrap();
             mvcc_cursor.get_next_rowid()
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
@@ -6496,8 +6635,7 @@ pub fn op_new_rowid(
                 // Generate a random i64 and constrain it to the lower half of the rowid range.
                 // We use the lower half (1 to MAX_ROWID/2) because we're in random mode only
                 // when sequential allocation reached MAX_ROWID, meaning the upper range is full.
-                let mut rng = thread_rng();
-                let mut random_rowid: i64 = rng.gen();
+                let mut random_rowid: i64 = pager.io.generate_random_number();
                 random_rowid &= MAX_ROWID >> 1; // Mask to keep value in range [0, MAX_ROWID/2]
                 random_rowid += 1; // Ensure positive
 
@@ -6706,16 +6844,10 @@ pub fn op_not_exists(
         },
         insn
     );
-    let exists = if let Some(mv_store) = mv_store {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        let mvcc_cursor = cursor.get_mvcc_cursor();
-        false
-    } else {
-        let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()))
-    };
+    let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
+    let cursor = cursor.as_btree_mut();
+    let exists = return_if_io!(cursor.exists(state.registers[*rowid_reg].get_value()));
+
     if exists {
         state.pc += 1;
     } else {
@@ -6823,15 +6955,21 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(
-            MvCursor::new(mv_store.clone(), tx_id, root_page, pager.clone()).unwrap(),
-        ));
-        Some(mv_cursor)
-    } else {
-        None
-    };
+    let maybe_promote_to_mvcc_cursor =
+        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store.unwrap().clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    root_page,
+                    pager.clone(),
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
     if let Some(index) = maybe_index {
         let conn = program.connection.clone();
         let schema = conn.schema.read();
@@ -6840,17 +6978,17 @@ pub fn op_open_write(
             .and_then(|table| table.btree());
 
         let num_columns = index.columns.len();
-        let cursor = BTreeCursor::new_index(
-            mv_cursor,
+        let btree_cursor = Box::new(BTreeCursor::new_index(
             pager.clone(),
             root_page,
             index.as_ref(),
             num_columns,
-        );
+        ));
+        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     } else {
         let num_columns = match cursor_type {
             CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -6860,11 +6998,16 @@ pub fn op_open_write(
             ),
         };
 
-        let cursor = BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, num_columns);
+        let btree_cursor = Box::new(BTreeCursor::new_table(
+            pager.clone(),
+            root_page,
+            num_columns,
+        ));
+        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
         cursors
             .get_mut(*cursor_id)
             .unwrap()
-            .replace(Cursor::new_btree(Box::new(cursor)));
+            .replace(Cursor::new_btree(cursor));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6958,7 +7101,7 @@ pub fn op_destroy(
             OpDestroyState::CreateCursor => {
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
-                let cursor = BTreeCursor::new(None, pager.clone(), *root, 0);
+                let cursor = BTreeCursor::new(pager.clone(), *root, 0);
                 state.op_destroy_state =
                     OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
             }
@@ -7623,9 +7766,9 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(None, pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
             } else {
-                BTreeCursor::new_table(None, pager.clone(), root_page, num_columns)
+                BTreeCursor::new_table(pager.clone(), root_page, num_columns)
             };
             state.op_open_ephemeral_state = OpOpenEphemeralState::Rewind {
                 cursor: Box::new(cursor),
@@ -7704,29 +7847,32 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = original_cursor.get_pager();
 
-    let mv_cursor = if let Some(tx_id) = program.connection.get_mv_tx_id() {
-        let mv_store = mv_store.unwrap().clone();
-        let mv_cursor = Arc::new(RwLock::new(MvCursor::new(
-            mv_store,
-            tx_id,
-            root_page,
-            pager.clone(),
-        )?));
-        Some(mv_cursor)
-    } else {
-        None
-    };
-
     let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
     match cursor_type {
         CursorType::BTreeTable(table) => {
-            let cursor =
-                BTreeCursor::new_table(mv_cursor, pager.clone(), root_page, table.columns.len());
+            let cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                root_page,
+                table.columns.len(),
+            ));
+            let cursor: Box<dyn CursorTrait> =
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store.unwrap().clone();
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        pager.clone(),
+                        cursor,
+                    )?)
+                } else {
+                    cursor
+                };
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
                 .unwrap()
-                .replace(Cursor::new_btree(Box::new(cursor)));
+                .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(table) => {
             // In principle, we could implement OpenDup for BTreeIndex,
@@ -8263,43 +8409,94 @@ pub fn op_alter_column(
             .clone()
     };
     let new_column = crate::schema::Column::from(definition);
+    let new_name = definition.col_name.as_str().to_owned();
 
     conn.with_schema_mut(|schema| {
-        let table = schema
+        let table_arc = schema
             .tables
             .get_mut(&normalized_table_name)
-            .expect("table being renamed should be in schema");
+            .expect("table being ALTERed should be in schema");
+        let table = Arc::make_mut(table_arc);
 
-        let table = Arc::make_mut(table);
-
-        let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
+        let Table::BTree(ref mut btree_arc) = table else {
+            panic!("only btree tables can be altered");
         };
-
-        let btree = Arc::make_mut(btree);
-
-        let column = btree
+        let btree = Arc::make_mut(btree_arc);
+        let col = btree
             .columns
             .get_mut(*column_index)
-            .expect("renamed column should be in schema");
+            .expect("column being ALTERed should be in schema");
 
-        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
-            for index in indexes {
-                let index = Arc::make_mut(index);
-                for index_column in &mut index.columns {
-                    if index_column.name
-                        == *column.name.as_ref().expect("btree column should be named")
-                    {
-                        index_column.name = definition.col_name.as_str().to_owned();
+        // Update indexes on THIS table that name the old column (you already had this)
+        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            for idx in idxs {
+                let idx = Arc::make_mut(idx);
+                for ic in &mut idx.columns {
+                    if ic.name.eq_ignore_ascii_case(
+                        col.name.as_ref().expect("btree column should be named"),
+                    ) {
+                        ic.name = new_name.clone();
+                    }
+                }
+            }
+        }
+        if *rename {
+            col.name = Some(new_name.clone());
+        } else {
+            *col = new_column.clone();
+        }
+
+        // Keep primary_key_columns consistent (names may change on rename)
+        for (pk_name, _ord) in &mut btree.primary_key_columns {
+            if pk_name.eq_ignore_ascii_case(&old_column_name) {
+                *pk_name = new_name.clone();
+            }
+        }
+
+        // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
+        if !*rename {
+            // recompute alias from `new_column`
+            btree.columns[*column_index].is_rowid_alias = new_column.is_rowid_alias;
+        }
+
+        // Update this table’s OWN foreign keys
+        for fk_arc in &mut btree.foreign_keys {
+            let fk = Arc::make_mut(fk_arc);
+            // child side: rename child column if it matches
+            for cc in &mut fk.child_columns {
+                if cc.eq_ignore_ascii_case(&old_column_name) {
+                    *cc = new_name.clone();
+                }
+            }
+            // parent side: if self-referencing, rename parent column too
+            if normalize_ident(&fk.parent_table) == normalized_table_name {
+                for pc in &mut fk.parent_columns {
+                    if pc.eq_ignore_ascii_case(&old_column_name) {
+                        *pc = new_name.clone();
                     }
                 }
             }
         }
 
-        if *rename {
-            column.name = new_column.name;
-        } else {
-            *column = new_column;
+        // fix OTHER tables that reference this table as parent
+        for (tname, t_arc) in schema.tables.iter_mut() {
+            if normalize_ident(tname) == normalized_table_name {
+                continue;
+            }
+            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
+                let child_btree = Arc::make_mut(child_btree_arc);
+                for fk_arc in &mut child_btree.foreign_keys {
+                    if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
+                        continue;
+                    }
+                    let fk = Arc::make_mut(fk_arc);
+                    for pc in &mut fk.parent_columns {
+                        if pc.eq_ignore_ascii_case(&old_column_name) {
+                            *pc = new_name.clone();
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -8410,12 +8607,14 @@ pub fn op_fk_counter(
     load_insn!(
         FkCounter {
             increment_value,
-            is_scope,
+            deferred,
         },
         insn
     );
-    if *is_scope {
-        state.fk_scope_counter = state.fk_scope_counter.saturating_add(*increment_value);
+    if !*deferred {
+        state
+            .fk_immediate_violations_during_stmt
+            .fetch_add(*increment_value, Ordering::AcqRel);
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
@@ -8437,7 +8636,7 @@ pub fn op_fk_if_zero(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         FkIfZero {
-            is_scope,
+            deferred,
             target_pc,
         },
         insn
@@ -8452,10 +8651,12 @@ pub fn op_fk_if_zero(
         state.pc = target_pc.as_offset_int();
         return Ok(InsnFunctionStepResult::Step);
     }
-    let v = if !*is_scope {
+    let v = if *deferred {
         program.connection.get_deferred_foreign_key_violations()
     } else {
-        state.fk_scope_counter
+        state
+            .fk_immediate_violations_during_stmt
+            .load(Ordering::Acquire)
     };
 
     state.pc = if v == 0 {
@@ -8672,14 +8873,17 @@ impl Value {
         })
     }
 
-    pub fn exec_random() -> Self {
-        let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).unwrap();
-        let random_number = i64::from_ne_bytes(buf);
-        Value::Integer(random_number)
+    pub fn exec_random<F>(generate_random_number: F) -> Self
+    where
+        F: Fn() -> i64,
+    {
+        Value::Integer(generate_random_number())
     }
 
-    pub fn exec_randomblob(&self) -> Value {
+    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    where
+        F: Fn(&mut [u8]),
+    {
         let length = match self {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
@@ -8689,7 +8893,7 @@ impl Value {
         .max(1) as usize;
 
         let mut blob: Vec<u8> = vec![0; length];
-        getrandom::getrandom(&mut blob).expect("Failed to generate random blob");
+        fill_bytes(&mut blob);
         Value::Blob(blob)
     }
 
@@ -10044,8 +10248,25 @@ where
     }
 }
 
+fn get_schema_cookie(
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+    program: &Program,
+) -> Result<IOResult<u32>> {
+    if let Some(mv_store) = mv_store {
+        let tx_id = program.connection.get_mv_tx_id();
+        mv_store
+            .with_header(|header| header.schema_cookie.get(), tx_id.as_ref())
+            .map(IOResult::Done)
+    } else {
+        pager.get_schema_cookie()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use rand::{Rng, RngCore};
+
     use super::*;
     use crate::types::Value;
 
@@ -10806,7 +11027,7 @@ mod tests {
 
     #[test]
     fn test_random() {
-        match Value::exec_random() {
+        match Value::exec_random(|| rand::rng().random()) {
             Value::Integer(value) => {
                 // Check that the value is within the range of i64
                 assert!(
@@ -10869,7 +11090,9 @@ mod tests {
         ];
 
         for test_case in &test_cases {
-            let result = test_case.input.exec_randomblob();
+            let result = test_case.input.exec_randomblob(|dest| {
+                rand::rng().fill_bytes(dest);
+            });
             match result {
                 Value::Blob(blob) => {
                     assert_eq!(blob.len(), test_case.expected_len);

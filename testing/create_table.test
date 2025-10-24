@@ -101,3 +101,17 @@ do_execsql_test_in_memory_any_error create_view_index_collision-1 {
     CREATE INDEX ix_same ON t4(w);
     CREATE VIEW ix_same AS SELECT 1;
 }
+
+# https://github.com/tursodatabase/turso/issues/3796
+do_execsql_test_on_specific_db {:memory:} col-default-true {
+  create table t(id integer primary key, a default true);
+  insert into t (id) values (1);
+  SELECT a from t;
+} {1}
+
+# https://github.com/tursodatabase/turso/issues/3796
+do_execsql_test_on_specific_db {:memory:} col-default-false {
+  create table t(id integer primary key, a default false);
+  insert into t (id) values (1);
+  SELECT a from t;
+} {0}

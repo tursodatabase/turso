@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
 
@@ -269,7 +269,11 @@ impl IO for MemorySimIO {
     }
 
     fn generate_random_number(&self) -> i64 {
-        self.rng.borrow_mut().next_u64() as i64
+        self.rng.borrow_mut().random()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.rng.borrow_mut().fill_bytes(dest);
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {

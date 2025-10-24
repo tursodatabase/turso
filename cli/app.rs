@@ -106,44 +106,65 @@ macro_rules! row_step_result_query {
             return Ok(());
         }
 
-        let start = Instant::now();
+        let start = if $stats.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         match $rows.step() {
             Ok(StepResult::Row) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
 
                 $row_handle
             }
             Ok(StepResult::IO) => {
-                let start = Instant::now();
+                if let Some(ref mut stats) = $stats {
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
+                }
+                let start = if $stats.is_some() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 $rows.run_once()?;
                 if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.elapsed());
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
                 }
             }
             Ok(StepResult::Interrupt) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Done) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Busy) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let _ = $app.writeln("database is busy");
                 break;
             }
             Err(err) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let report = miette::Error::from(err).with_source_code($sql.to_owned());
                 let _ = $app.writeln_fmt(format_args!("{report:?}"));

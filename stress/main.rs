@@ -642,9 +642,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Done. SQL statements written to {}", opts.log_file);
     println!("Database file: {db_file}");
 
-    println!("Running SQLite Integrity check");
-
-    integrity_check(std::path::Path::new(&db_file))?;
+    #[cfg(not(miri))]
+    {
+        println!("Running SQLite Integrity check");
+        integrity_check(std::path::Path::new(&db_file))?;
+    }
 
     Ok(())
 }

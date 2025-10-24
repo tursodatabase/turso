@@ -48,6 +48,10 @@ for i in range(deletions):
         cur.execute(f"""
             DELETE FROM tbl_{selected_tbl} WHERE {where_clause}
         """)
+    except turso.ProgrammingError:
+        # Table/column might have been dropped in parallel - this is expected
+        con.rollback()
+        break
     except turso.OperationalError:
         con.rollback()
         # Re-raise other operational errors

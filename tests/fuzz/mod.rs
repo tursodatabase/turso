@@ -2,7 +2,7 @@ pub mod grammar_generator;
 pub mod rowid_alias;
 
 #[cfg(test)]
-mod tests {
+mod fuzz_tests {
     use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
@@ -10,14 +10,13 @@ mod tests {
     use std::{collections::HashSet, io::Write};
     use turso_core::DatabaseOpts;
 
-    use crate::{
-        common::{
-            do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
-            maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
-            TempDatabase,
-        },
-        fuzz::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator},
+    use core_tester::common::{
+        do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
+        maybe_setup_tracing, rng_from_time_or_env, rusqlite_integrity_check, sqlite_exec_rows,
+        TempDatabase,
     };
+
+    use super::grammar_generator::{const_str, rand_int, rand_str, GrammarGenerator};
 
     use super::grammar_generator::SymbolHandle;
 
@@ -608,7 +607,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
 
-        const ITERS: usize = 3000;
+        const ITERS: usize = 1000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("collation_fuzz: iteration {}/{}", iter + 1, ITERS);
@@ -654,14 +653,13 @@ mod tests {
 
     #[test]
     #[allow(unused_assignments)]
-    #[ignore] // ignoring because every error I can find is due to sqlite sub-transaction behavior
     pub fn fk_deferred_constraints_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_deferred_constraints_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
-        const INNER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
@@ -681,30 +679,47 @@ mod tests {
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let get_constraint_type = |rng: &mut ChaCha8Rng| match rng.random_range(0..3) {
+                0 => "INTEGER PRIMARY KEY",
+                1 => "UNIQUE",
+                2 => "PRIMARY KEY",
+                _ => unreachable!(),
+            };
+
             // Mix of immediate and deferred FK constraints
-            let s = log_and_exec("CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT)");
+            let s = log_and_exec(&format!(
+                "CREATE TABLE parent(id {}, a INT, b INT)",
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with DEFERRABLE INITIALLY DEFERRED FK
-            let s = log_and_exec(
-                "CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, x INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_deferred(id {}, pid INT, x INT, \
              FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with immediate FK (default)
-            let s = log_and_exec(
-                "CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, y INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_immediate(id {}, pid INT, y INT, \
              FOREIGN KEY(pid) REFERENCES parent(id))",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let composite_constraint = match rng.random_range(0..2) {
+                0 => "PRIMARY KEY",
+                1 => "UNIQUE",
+                _ => unreachable!(),
+            };
             // Composite key parent for deferred testing
             let s = log_and_exec(
-                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))",
+                &format!("CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_constraint}(a,b))"),
             );
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
@@ -745,12 +760,12 @@ mod tests {
             }
 
             // Transaction-based mutations with mix of deferred and immediate operations
+            let mut in_tx = false;
             for tx_num in 0..INNER_ITERS {
                 // Decide if we're in a transaction
-                let mut in_tx = false;
-                let use_transaction = rng.random_bool(0.7);
+                let start_a_transaction = rng.random_bool(0.7);
 
-                if use_transaction && !in_tx {
+                if start_a_transaction && !in_tx {
                     in_tx = true;
                     let s = log_and_exec("BEGIN");
                     let sres = sqlite.execute(&s, params![]);
@@ -876,7 +891,7 @@ mod tests {
                         format!("DELETE FROM child_deferred WHERE id={id}")
                     }
                     // Self-referential deferred insert (create temp violation then fix)
-                    10 if use_transaction => {
+                    10 if start_a_transaction => {
                         let id = rng.random_range(400..=500);
                         let pid = id + 1; // References non-existent yet
                         format!("INSERT INTO child_deferred VALUES ({id}, {pid}, 0)")
@@ -892,7 +907,7 @@ mod tests {
                 let sres = sqlite.execute(&stmt, params![]);
                 let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
 
-                if !use_transaction && !in_tx {
+                if !start_a_transaction && !in_tx {
                     match (sres, lres) {
                         (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
                         (s, l) => {
@@ -910,8 +925,8 @@ mod tests {
                     }
                 }
 
-                if use_transaction && in_tx {
-                    // Randomly COMMIT or ROLLBACK
+                // Randomly COMMIT or ROLLBACK some of the time
+                if in_tx && rng.random_bool(0.4) {
                     let commit = rng.random_bool(0.7);
                     let s = log_and_exec("COMMIT");
 
@@ -965,7 +980,13 @@ mod tests {
                             );
                         }
                     }
+                    in_tx = false;
                 }
+            }
+            // Print all statements
+            if std::env::var("VERBOSE").is_ok() {
+                println!("{}", stmts.join("\n"));
+                println!("--------- ITERATION COMPLETED ---------");
             }
         }
     }
@@ -2206,6 +2227,22 @@ mod tests {
             }
 
             for _ in 0..INNER_ITERS {
+                // Randomly inject transaction statements -- we don't care if they are legal,
+                // we just care that tursodb/sqlite behave the same way.
+                if rng.random_bool(0.15) {
+                    let tx_stmt = match rng.random_range(0..4) {
+                        0 => "BEGIN",
+                        1 => "BEGIN IMMEDIATE",
+                        2 => "COMMIT",
+                        3 => "ROLLBACK",
+                        _ => unreachable!(),
+                    };
+                    println!("{tx_stmt};");
+                    let sqlite_res = sqlite.execute(tx_stmt, rusqlite::params![]);
+                    let limbo_res = limbo_exec_rows_fallible(&limbo_db, &limbo_conn, tx_stmt);
+                    // Both should succeed or both should fail
+                    assert!(sqlite_res.is_ok() == limbo_res.is_ok());
+                }
                 let action = rng.random_range(0..4); // 0: INSERT, 1: UPDATE, 2: DELETE, 3: UPSERT (catch-all)
                 let stmt = match action {
                     // INSERT
@@ -4112,7 +4149,7 @@ mod tests {
     #[test]
     #[cfg(feature = "test_helper")]
     pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
-        use crate::common::rusqlite_integrity_check;
+        use core_tester::common::rusqlite_integrity_check;
 
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();

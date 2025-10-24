@@ -12,7 +12,27 @@ on:
       - main
 
 jobs:
-  run-long-tests:
+  run-fuzz-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v3
+    - uses: useblacksmith/rust-cache@v3
+      with:
+        prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+    - name: Set up Python 3.10
+      uses: useblacksmith/setup-python@v6
+      with:
+        python-version: "3.10"
+    - name: Build
+      run: cargo build --verbose
+    - name: Run ignored long tests
+      run: cargo test --test fuzz_tests
+      env:
+        RUST_BACKTRACE: 1
+
+  run-long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30 
     

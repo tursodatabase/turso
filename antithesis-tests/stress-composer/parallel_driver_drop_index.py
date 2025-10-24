@@ -55,11 +55,13 @@ try:
     con_init.commit()
 
     print(f"Successfully dropped index: {index_name}")
+except turso.ProgrammingError as e:
+    print(f"Index {index_name} already dropped in parallel: {e}")
+    con.rollback()
 except turso.OperationalError as e:
     print(f"Failed to drop index: {e}")
     con.rollback()
 except Exception as e:
-    # Handle case where index might not exist in indexes table
     print(f"Warning: Could not remove index from metadata: {e}")
 
 con.commit()
