@@ -8121,31 +8121,32 @@ pub fn op_integrity_check(
                     });
                 }
 
-                 #[cfg(not(feature = "omit_autovacuum"))]{
-                let auto_vacuum_mode = pager.get_auto_vacuum_mode();
-                if !matches!(
-                    auto_vacuum_mode,
-                    crate::storage::pager::AutoVacuumMode::None
-                ) {
-                    tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
-                    let page_size = pager.get_page_size_unchecked().get() as usize;
+                #[cfg(not(feature = "omit_autovacuum"))]
+                {
+                    let auto_vacuum_mode = pager.get_auto_vacuum_mode();
+                    if !matches!(
+                        auto_vacuum_mode,
+                        crate::storage::pager::AutoVacuumMode::None
+                    ) {
+                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
+                        let page_size = pager.get_page_size_unchecked().get() as usize;
 
-                    for page_number in 2..=integrity_check_state.db_size {
-                        if crate::storage::pager::ptrmap::is_ptrmap_page(
-                            page_number as u32,
-                            page_size,
-                        ) {
-                            tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
+                        for page_number in 2..=integrity_check_state.db_size {
+                            if crate::storage::pager::ptrmap::is_ptrmap_page(
+                                page_number as u32,
+                                page_size,
+                            ) {
+                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
 
-                            integrity_check_state.start(
-                                page_number as i64,
-                                PageCategory::PointerMap,
-                                errors,
-                            );
+                                integrity_check_state.start(
+                                    page_number as i64,
+                                    PageCategory::PointerMap,
+                                    errors,
+                                );
+                            }
                         }
                     }
                 }
-            }
                 for page_number in 2..=integrity_check_state.db_size {
                     if !integrity_check_state
                         .page_reference
