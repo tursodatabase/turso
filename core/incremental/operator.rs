@@ -4092,4 +4092,518 @@ mod tests {
             "MIN(col1) should be 20 (new data only)"
         );
     }
+
+    #[test]
+    fn test_distinct_removes_duplicates() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Create a DISTINCT operator that groups by all columns
+        let mut operator = AggregateOperator::new(
+            0,       // operator_id
+            vec![0], // group by column 0 (value)
+            vec![],  // Empty aggregates for plain DISTINCT
+            vec!["value".to_string()],
+        );
+
+        // Create input with duplicates
+        let mut input = Delta::new();
+        input.insert(1, vec![Value::Integer(100)]); // First 100
+        input.insert(2, vec![Value::Integer(200)]); // First 200
+        input.insert(3, vec![Value::Integer(100)]); // Duplicate 100
+        input.insert(4, vec![Value::Integer(300)]); // First 300
+        input.insert(5, vec![Value::Integer(200)]); // Duplicate 200
+        input.insert(6, vec![Value::Integer(100)]); // Another duplicate 100
+
+        // Execute commit (for materialized views) instead of eval
+        let result = pager
+            .io
+            .block(|| operator.commit((&input).into(), &mut cursors))
+            .unwrap();
+
+        // Should have exactly 3 distinct values (100, 200, 300)
+        let distinct_values: std::collections::HashSet<i64> = result
+            .changes
+            .iter()
+            .map(|(row, _weight)| match &row.values[0] {
+                Value::Integer(i) => *i,
+                _ => panic!("Expected integer value"),
+            })
+            .collect();
+
+        assert_eq!(
+            distinct_values.len(),
+            3,
+            "Should have exactly 3 distinct values"
+        );
+        assert!(distinct_values.contains(&100));
+        assert!(distinct_values.contains(&200));
+        assert!(distinct_values.contains(&300));
+
+        // All weights should be 1 (distinct normalizes weights)
+        for (_row, weight) in &result.changes {
+            assert_eq!(*weight, 1, "DISTINCT should output weight 1 for all groups");
+        }
+    }
+
+    #[test]
+    fn test_distinct_incremental_updates() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut operator = AggregateOperator::new(
+            0,
+            vec![0, 1], // group by both columns
+            vec![],     // Empty aggregates for plain DISTINCT
+            vec!["category".to_string(), "value".to_string()],
+        );
+
+        // First batch: insert some values
+        let mut delta1 = Delta::new();
+        delta1.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta1.insert(2, vec![Value::Text("B".into()), Value::Integer(200)]);
+        delta1.insert(3, vec![Value::Text("A".into()), Value::Integer(100)]); // Duplicate
+
+        // Commit first batch
+        let result1 = pager
+            .io
+            .block(|| operator.commit((&delta1).into(), &mut cursors))
+            .unwrap();
+
+        // Should have 2 distinct groups: (A,100) and (B,200)
+        assert_eq!(
+            result1.changes.len(),
+            2,
+            "First commit should output 2 distinct groups"
+        );
+
+        // Verify each group appears with weight +1
+        for (_row, weight) in &result1.changes {
+            assert_eq!(*weight, 1, "New groups should have weight +1");
+        }
+
+        // Second batch: delete one instance of (A,100) and add new group
+        let mut delta2 = Delta::new();
+        delta2.delete(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta2.insert(4, vec![Value::Text("C".into()), Value::Integer(300)]);
+
+        let result2 = pager
+            .io
+            .block(|| operator.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        // Should only output the new group (C,300) with weight +1
+        // (A,100) still exists (weight went from 2 to 1), so no output for it
+        assert_eq!(
+            result2.changes.len(),
+            1,
+            "Second commit should only output new group"
+        );
+
+        let (row, weight) = &result2.changes[0];
+        assert_eq!(*weight, 1);
+        assert_eq!(row.values[0], Value::Text("C".into()));
+        assert_eq!(row.values[1], Value::Integer(300));
+
+        // Third batch: delete last instance of (A,100)
+        let mut delta3 = Delta::new();
+        delta3.delete(3, vec![Value::Text("A".into()), Value::Integer(100)]);
+
+        let result3 = pager
+            .io
+            .block(|| operator.commit((&delta3).into(), &mut cursors))
+            .unwrap();
+
+        // Should output (A,100) with weight -1 (group disappeared)
+        assert_eq!(
+            result3.changes.len(),
+            1,
+            "Third commit should output disappeared group"
+        );
+
+        let (row, weight) = &result3.changes[0];
+        assert_eq!(*weight, -1, "Disappeared group should have weight -1");
+        assert_eq!(row.values[0], Value::Text("A".into()));
+        assert_eq!(row.values[1], Value::Integer(100))
+    }
+
+    #[test]
+    fn test_distinct_state_transitions() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Test that DISTINCT correctly tracks state transitions (0 ↔ positive)
+        let mut operator = AggregateOperator::new(
+            0,
+            vec![0],
+            vec![], // Empty aggregates for plain DISTINCT
+            vec!["value".to_string()],
+        );
+
+        // Insert value with weight 3
+        let mut delta1 = Delta::new();
+        for i in 1..=3 {
+            delta1.insert(i, vec![Value::Integer(100)]);
+        }
+
+        let result1 = pager
+            .io
+            .block(|| operator.commit((&delta1).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result1.changes.len(), 1);
+        assert_eq!(result1.changes[0].1, 1, "First appearance should output +1");
+
+        // Remove 2 instances (weight goes from 3 to 1, still positive)
+        let mut delta2 = Delta::new();
+        for i in 1..=2 {
+            delta2.delete(i, vec![Value::Integer(100)]);
+        }
+
+        let result2 = pager
+            .io
+            .block(|| operator.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result2.changes.len(), 0, "No transition, no output");
+
+        // Remove last instance (weight goes from 1 to 0)
+        let mut delta3 = Delta::new();
+        delta3.delete(3, vec![Value::Integer(100)]);
+
+        let result3 = pager
+            .io
+            .block(|| operator.commit((&delta3).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result3.changes.len(), 1);
+        assert_eq!(result3.changes[0].1, -1, "Disappearance should output -1");
+
+        // Re-add the value (weight goes from 0 to 1)
+        let mut delta4 = Delta::new();
+        delta4.insert(4, vec![Value::Integer(100)]);
+
+        let result4 = pager
+            .io
+            .block(|| operator.commit((&delta4).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result4.changes.len(), 1);
+        assert_eq!(result4.changes[0].1, 1, "Reappearance should output +1")
+    }
+
+    #[test]
+    fn test_distinct_persistence() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // First operator instance
+        let mut operator1 = AggregateOperator::new(
+            0,
+            vec![0],
+            vec![], // Empty aggregates for plain DISTINCT
+            vec!["value".to_string()],
+        );
+
+        // Insert some values
+        let mut delta1 = Delta::new();
+        delta1.insert(1, vec![Value::Integer(100)]);
+        delta1.insert(2, vec![Value::Integer(100)]); // Duplicate
+        delta1.insert(3, vec![Value::Integer(200)]);
+
+        let result1 = pager
+            .io
+            .block(|| operator1.commit((&delta1).into(), &mut cursors))
+            .unwrap();
+
+        // Should have 2 distinct values
+        assert_eq!(result1.changes.len(), 2, "Should output 2 distinct values");
+
+        // Create new operator instance with same ID (simulates restart)
+        // Create new cursors for the second operator
+        let table_cursor2 = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_cursor2 =
+            BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors2 = DbspStateCursors::new(table_cursor2, index_cursor2);
+
+        let mut operator2 = AggregateOperator::new(
+            0, // Same operator_id
+            vec![0],
+            vec![], // Empty aggregates for plain DISTINCT
+            vec!["value".to_string()],
+        );
+
+        // Add new value and delete existing (100 has weight 2, so it stays)
+        let mut delta2 = Delta::new();
+        delta2.insert(4, vec![Value::Integer(300)]);
+        delta2.delete(1, vec![Value::Integer(100)]); // Remove one of the 100s
+
+        let result2 = pager
+            .io
+            .block(|| operator2.commit((&delta2).into(), &mut cursors2))
+            .unwrap();
+
+        // Should only output the new value (300)
+        // 100 still exists (went from weight 2 to 1)
+        assert_eq!(result2.changes.len(), 1, "Should only output new value");
+        assert_eq!(result2.changes[0].1, 1, "Should be insertion");
+        assert_eq!(result2.changes[0].0.values[0], Value::Integer(300));
+
+        // Now delete the last instance of 100
+        let mut delta3 = Delta::new();
+        delta3.delete(2, vec![Value::Integer(100)]);
+
+        let result3 = pager
+            .io
+            .block(|| operator2.commit((&delta3).into(), &mut cursors2))
+            .unwrap();
+
+        // Should output deletion of 100
+        assert_eq!(result3.changes.len(), 1, "Should output deletion");
+        assert_eq!(result3.changes[0].1, -1, "Should be deletion");
+        assert_eq!(result3.changes[0].0.values[0], Value::Integer(100));
+    }
+
+    #[test]
+    fn test_distinct_batch_with_multiple_groups() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut operator = AggregateOperator::new(
+            0,
+            vec![0, 1], // group by category and value
+            vec![],     // Empty aggregates for plain DISTINCT
+            vec!["category".to_string(), "value".to_string()],
+        );
+
+        // Create a complex batch with multiple groups and duplicates within each group
+        let mut delta = Delta::new();
+
+        // Group (A, 100): 3 instances
+        delta.insert(1, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta.insert(2, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta.insert(3, vec![Value::Text("A".into()), Value::Integer(100)]);
+
+        // Group (B, 200): 2 instances
+        delta.insert(4, vec![Value::Text("B".into()), Value::Integer(200)]);
+        delta.insert(5, vec![Value::Text("B".into()), Value::Integer(200)]);
+
+        // Group (A, 200): 1 instance
+        delta.insert(6, vec![Value::Text("A".into()), Value::Integer(200)]);
+
+        // Group (C, 100): 2 instances
+        delta.insert(7, vec![Value::Text("C".into()), Value::Integer(100)]);
+        delta.insert(8, vec![Value::Text("C".into()), Value::Integer(100)]);
+
+        // More instances of Group (A, 100)
+        delta.insert(9, vec![Value::Text("A".into()), Value::Integer(100)]);
+        delta.insert(10, vec![Value::Text("A".into()), Value::Integer(100)]);
+
+        // Group (B, 100): 1 instance
+        delta.insert(11, vec![Value::Text("B".into()), Value::Integer(100)]);
+
+        let result = pager
+            .io
+            .block(|| operator.commit((&delta).into(), &mut cursors))
+            .unwrap();
+
+        // Should have exactly 5 distinct groups:
+        // (A, 100), (A, 200), (B, 100), (B, 200), (C, 100)
+        assert_eq!(
+            result.changes.len(),
+            5,
+            "Should have exactly 5 distinct groups"
+        );
+
+        // All should have weight +1 (new groups appearing)
+        for (_row, weight) in &result.changes {
+            assert_eq!(*weight, 1, "All groups should have weight +1");
+        }
+
+        // Verify the distinct groups
+        let groups: std::collections::HashSet<(String, i64)> = result
+            .changes
+            .iter()
+            .map(|(row, _)| {
+                let category = match &row.values[0] {
+                    Value::Text(s) => String::from_utf8(s.value.clone()).unwrap(),
+                    _ => panic!("Expected text for category"),
+                };
+                let value = match &row.values[1] {
+                    Value::Integer(i) => *i,
+                    _ => panic!("Expected integer for value"),
+                };
+                (category, value)
+            })
+            .collect();
+
+        assert!(groups.contains(&("A".to_string(), 100)));
+        assert!(groups.contains(&("A".to_string(), 200)));
+        assert!(groups.contains(&("B".to_string(), 100)));
+        assert!(groups.contains(&("B".to_string(), 200)));
+        assert!(groups.contains(&("C".to_string(), 100)));
+    }
+
+    #[test]
+    fn test_multiple_distinct_aggregates_same_column() {
+        // Test that multiple DISTINCT aggregates on the same column don't interfere
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        // Create operator with COUNT(DISTINCT value), SUM(DISTINCT value), AVG(DISTINCT value)
+        // all on the same column
+        let mut operator = AggregateOperator::new(
+            0,
+            vec![], // No group by - single group
+            vec![
+                AggregateFunction::CountDistinct(0), // COUNT(DISTINCT value)
+                AggregateFunction::SumDistinct(0),   // SUM(DISTINCT value)
+                AggregateFunction::AvgDistinct(0),   // AVG(DISTINCT value)
+            ],
+            vec!["value".to_string()],
+        );
+
+        // Insert distinct values: 10, 20, 30 (each appearing multiple times)
+        let mut input = Delta::new();
+        input.insert(1, vec![Value::Integer(10)]);
+        input.insert(2, vec![Value::Integer(10)]); // duplicate
+        input.insert(3, vec![Value::Integer(20)]);
+        input.insert(4, vec![Value::Integer(20)]); // duplicate
+        input.insert(5, vec![Value::Integer(30)]);
+        input.insert(6, vec![Value::Integer(10)]); // duplicate
+
+        let output = pager
+            .io
+            .block(|| operator.commit((&input).into(), &mut cursors))
+            .unwrap();
+
+        // Should have exactly one output row (no group by)
+        assert_eq!(output.changes.len(), 1);
+        let (row, weight) = &output.changes[0];
+        assert_eq!(*weight, 1);
+
+        // Extract the aggregate values
+        let values = &row.values;
+        assert_eq!(values.len(), 3); // 3 aggregate values
+
+        // COUNT(DISTINCT value) should be 3 (distinct values: 10, 20, 30)
+        assert_eq!(values[0], Value::Integer(3));
+
+        // SUM(DISTINCT value) should be 60 (10 + 20 + 30)
+        assert_eq!(values[1], Value::Integer(60));
+
+        // AVG(DISTINCT value) should be 20.0 (60 / 3)
+        assert_eq!(values[2], Value::Float(20.0));
+    }
+
+    #[test]
+    fn test_count_distinct_with_deletions() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut operator = AggregateOperator::new(
+            1,
+            vec![], // No GROUP BY
+            vec![AggregateFunction::CountDistinct(1)],
+            vec!["id".to_string(), "value".to_string()],
+        );
+
+        // Insert 3 distinct values
+        let mut delta1 = Delta::new();
+        delta1.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
+        delta1.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
+        delta1.insert(3, vec![Value::Integer(3), Value::Integer(300)]);
+
+        let result1 = pager
+            .io
+            .block(|| operator.commit((&delta1).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result1.changes.len(), 1);
+        assert_eq!(result1.changes[0].1, 1);
+        assert_eq!(result1.changes[0].0.values[0], Value::Integer(3));
+
+        // Delete one value
+        let mut delta2 = Delta::new();
+        delta2.delete(2, vec![Value::Integer(2), Value::Integer(200)]);
+
+        let result2 = pager
+            .io
+            .block(|| operator.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result2.changes.len(), 2);
+        let new_row = result2.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_row.0.values[0], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_sum_distinct_with_deletions() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let mut operator = AggregateOperator::new(
+            1,
+            vec![],
+            vec![AggregateFunction::SumDistinct(1)],
+            vec!["id".to_string(), "value".to_string()],
+        );
+
+        // Insert values including a duplicate
+        let mut delta1 = Delta::new();
+        delta1.insert(1, vec![Value::Integer(1), Value::Integer(100)]);
+        delta1.insert(2, vec![Value::Integer(2), Value::Integer(200)]);
+        delta1.insert(3, vec![Value::Integer(3), Value::Integer(100)]); // Duplicate
+        delta1.insert(4, vec![Value::Integer(4), Value::Integer(300)]);
+
+        let result1 = pager
+            .io
+            .block(|| operator.commit((&delta1).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result1.changes.len(), 1);
+        assert_eq!(result1.changes[0].1, 1);
+        assert_eq!(result1.changes[0].0.values[0], Value::Float(600.0)); // 100 + 200 + 300
+
+        // Delete value 200
+        let mut delta2 = Delta::new();
+        delta2.delete(2, vec![Value::Integer(2), Value::Integer(200)]);
+
+        let result2 = pager
+            .io
+            .block(|| operator.commit((&delta2).into(), &mut cursors))
+            .unwrap();
+
+        assert_eq!(result2.changes.len(), 2);
+        let new_row = result2.changes.iter().find(|(_, w)| *w == 1).unwrap();
+        assert_eq!(new_row.0.values[0], Value::Float(400.0)); // 100 + 300
+    }
 }

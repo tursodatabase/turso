@@ -8,7 +8,7 @@ pub enum ReadRecord {
     #[default]
     GetRecord,
     Done {
-        state: Option<AggregateState>,
+        state: Box<Option<AggregateState>>,
     },
 }
 
@@ -27,7 +27,9 @@ impl ReadRecord {
                 ReadRecord::GetRecord => {
                     let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
                     if !matches!(res, SeekResult::Found) {
-                        *self = ReadRecord::Done { state: None };
+                        *self = ReadRecord::Done {
+                            state: Box::new(None),
+                        };
                     } else {
                         let record = return_if_io!(cursor.record());
                         let r = record.ok_or_else(|| {
@@ -41,14 +43,21 @@ impl ReadRecord {
 
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
+                            Value::Null => {
+                                // For plain DISTINCT, we store null value and just track weight
+                                // Return a minimal state indicating existence
+                                Ok((AggregateState::default(), vec![]))
+                            }
                             _ => Err(LimboError::ParseError(
-                                "Value in aggregator not blob".to_string(),
+                                "Value in aggregator not blob or null".to_string(),
                             )),
                         }?;
-                        *self = ReadRecord::Done { state: Some(state) }
+                        *self = ReadRecord::Done {
+                            state: Box::new(Some(state)),
+                        }
                     }
                 }
-                ReadRecord::Done { state } => return Ok(IOResult::Done(state.clone())),
+                ReadRecord::Done { state } => return Ok(IOResult::Done((**state).clone())),
             }
         }
     }
