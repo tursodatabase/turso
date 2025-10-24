@@ -376,35 +376,6 @@ type exec_callback = Option<
     ) -> ffi::c_int,
 >;
 
-/* sqlite.h 365
-** The sqlite3_exec() interface is a convenience wrapper around
-** [sqlite3_prepare_v2()], [sqlite3_step()], and [sqlite3_finalize()],
-** that allows an application to run multiple statements of SQL
-** without having to use a lot of C code.
-**
-** ^The sqlite3_exec() interface runs zero or more UTF-8 encoded,
-** semicolon-separate SQL statements passed into its 2nd argument,
-** in the context of the [database connection] passed in as its 1st
-** argument.  ^If the callback function of the 3rd argument to
-** sqlite3_exec() is not NULL, then it is invoked for each result row
-** coming out of the evaluated SQL statements.  ^The 4th argument to
-** sqlite3_exec() is relayed through to the 1st argument of each
-** callback invocation.  ^If the callback pointer to sqlite3_exec()
-** is NULL, then no callback is ever invoked and result rows are
-** ignored.
-**
-** ^If an error occurs while evaluating the SQL statements passed into
-** sqlite3_exec(), then execution of the current statement stops and
-** subsequent statements are skipped.  ^If the 5th parameter to sqlite3_exec()
-** is not NULL then any error message is written into memory obtained
-** from [sqlite3_malloc()] and passed back through the 5th parameter.
-** To avoid memory leaks, the application should invoke [sqlite3_free()]
-** on error message strings returned through the 5th parameter of
-** sqlite3_exec() after the error message string is no longer needed.
-** ^If the 5th parameter to sqlite3_exec() is not NULL and no errors
-** occur, then sqlite3_exec() sets the pointer in its 5th parameter to
-** NULL before returning.
-*/
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_exec(
     db: *mut sqlite3,
