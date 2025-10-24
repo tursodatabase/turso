@@ -8121,6 +8121,7 @@ pub fn op_integrity_check(
                     });
                 }
 
+                 #[cfg(not(feature = "omit_autovacuum"))]{
                 let auto_vacuum_mode = pager.get_auto_vacuum_mode();
                 if !matches!(
                     auto_vacuum_mode,
@@ -8144,7 +8145,7 @@ pub fn op_integrity_check(
                         }
                     }
                 }
-
+            }
                 for page_number in 2..=integrity_check_state.db_size {
                     if !integrity_check_state
                         .page_reference

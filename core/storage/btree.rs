@@ -5784,6 +5784,7 @@ pub(crate) enum PageCategory {
     Overflow,
     FreeListTrunk,
     FreePage,
+     #[cfg(not(feature = "omit_autovacuum"))]
     PointerMap,
 }
 
