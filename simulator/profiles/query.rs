@@ -43,7 +43,7 @@ impl Default for QueryProfile {
             drop_table_weight: 2,
             alter_table_weight: 2,
             drop_index: 2,
-            pragma_weight: 100, //TODO change this back to 2
+            pragma_weight: 2
         }
     }
 }
@@ -59,6 +59,7 @@ impl QueryProfile {
             + self.delete_weight
             + self.drop_table_weight
             + self.alter_table_weight
+            + self.pragma_weight
     }
 }
 
@@ -70,4 +71,5 @@ pub enum QueryTypes {
     Update,
     Delete,
     DropTable,
+    pragma_weight,
 }
