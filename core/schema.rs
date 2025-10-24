@@ -2477,7 +2477,7 @@ impl Index {
                     let configuration = IndexConfiguration {
                         table_name: table.name.clone(),
                         index_name: index_name.clone(),
-                        columns: index_columns.iter().map(|x| x.name.clone()).collect(),
+                        columns: index_columns.clone(),
                         parameters,
                     };
                     let descriptor = module.descriptor(&configuration)?;

@@ -1294,7 +1294,16 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::IdxQuery { db, cursor_id, start_reg, count_reg } => (
+            Insn::IdxDestroy { db, cursor_id } => (
+                "IdxDestroy",
+                *db as i32,
+                *cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
+            Insn::IdxQuery { db, cursor_id, start_reg, .. } => (
                 "IdxQuery",
                 *db as i32,
                 *cursor_id as i32,

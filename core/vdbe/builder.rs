@@ -797,6 +797,9 @@ impl ProgramBuilder {
                 Insn::SeekLT { target_pc, .. } => {
                     resolve(target_pc, "SeekLT");
                 }
+                Insn::IdxQuery { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "IdxQuery");
+                }
                 Insn::IdxGE { target_pc, .. } => {
                     resolve(target_pc, "IdxGE");
                 }

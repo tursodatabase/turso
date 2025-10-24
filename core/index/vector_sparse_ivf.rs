@@ -145,8 +145,8 @@ pub struct VectorSparseInvertedIndexCursor {
 
 impl IndexModule for VectorSparseInvertedIndex {
     fn descriptor(&self, configuration: &IndexConfiguration) -> Result<Arc<dyn IndexDescriptor>> {
-        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0], configuration.table_name);
-        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0], configuration.table_name);
+        let query_pattern1 = format!("SELECT rowid, vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0].name, configuration.table_name);
+        let query_pattern2 = format!("SELECT rowid, vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?", configuration.columns[0].name, configuration.table_name);
         Ok(Arc::new(VectorSparseInvertedIndexDescriptor {
             configuration: configuration.clone(),
             patterns: parse_patterns(&[&query_pattern1, &query_pattern2])?,
@@ -192,12 +192,14 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
         loop {
             match &mut self.create_state {
                 VectorSparseInvertedIndexCreateState::Init => {
+                    let columns = &self.configuration.columns;
+                    let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
                     let sql = format!(
                         "CREATE INDEX {} ON {} USING {} ({})",
                         self.scratch_btree,
                         self.configuration.table_name,
                         HIDDEN_BTREE_MODULE_NAME,
-                        self.configuration.columns.join(", ")
+                        columns.join(", ")
                     );
                     let stmt = connection.prepare(&sql)?;
                     connection.start_nested();
@@ -215,7 +217,15 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
-        todo!()
+        let columns = &self.configuration.columns;
+        let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
+        let sql = format!("DROP INDEX {}", self.scratch_btree);
+        let mut stmt = connection.prepare(&sql)?;
+        connection.start_nested();
+        let result = stmt.run_ignore_rows();
+        connection.end_nested();
+        result?;
+        return Ok(IOResult::Done(()));
     }
 
     fn open_read(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
@@ -428,7 +438,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
         }
     }
 
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>> {
         let Some(scratch) = &mut self.scratch_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
@@ -440,7 +450,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
             ));
         };
         loop {
-            tracing::info!("state: {:?}", self.search_state);
+            tracing::debug!("state: {:?}", self.search_state);
             match &mut self.search_state {
                 VectorSparseInvertedIndexSearchState::Init => {
                     let Some(vector) = values[1].get_value().to_blob() else {
@@ -553,7 +563,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                                 "second value of index record must be int"
                             )));
                         };
-                        tracing::info!("position/rowid: {}/{}", position, rowid);
+                        tracing::debug!("position/rowid: {}/{}", position, rowid);
                         if position == positions.as_ref().unwrap()[*idx] as i64 {
                             collected.as_mut().unwrap().insert(rowid);
                             self.search_state = VectorSparseInvertedIndexSearchState::Next {
@@ -606,7 +616,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                     let Some(rowid) = rowids.as_ref().unwrap().last() else {
                         let distances = distances.take().unwrap();
                         self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
-                        return Ok(IOResult::Done(()));
+                        return Ok(IOResult::Done(!self.search_result.is_empty()));
                     };
                     let result = return_if_io!(
                         main.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })
@@ -630,7 +640,8 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                     let record = return_if_io!(main.record());
                     let rowid = rowids.as_mut().unwrap().pop().unwrap();
                     if let Some(record) = record {
-                        let ValueRef::Blob(data) = record.get_value(0)? else {
+                        let column_idx = self.configuration.columns[0].pos_in_table;
+                        let ValueRef::Blob(data) = record.get_value(column_idx)? else {
                             return Err(LimboError::InternalError(
                                 "table column value must be sparse vector".to_string(),
                             ));

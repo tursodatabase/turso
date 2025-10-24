@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::ast;
 
 use crate::{
+    schema::IndexColumn,
     storage::btree::BTreeCursor,
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
@@ -16,7 +17,7 @@ pub mod vector_sparse_ivf;
 pub struct IndexConfiguration {
     pub table_name: String,
     pub index_name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<IndexColumn>,
     pub parameters: HashMap<String, Value>,
 }
 
@@ -49,7 +50,7 @@ pub trait IndexCursor {
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>>;
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>>;
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>>;
     fn query_next(&mut self) -> Result<IOResult<bool>>;
     fn query_column(&mut self, position: usize) -> Result<IOResult<Value>>;
 
@@ -66,7 +67,7 @@ pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<
             table
         )));
     };
-    let mut cursor = BTreeCursor::new_table(pager, table.get_root_page(), table.columns().len());
+    let cursor = BTreeCursor::new_table(pager, table.get_root_page(), table.columns().len());
     Ok(cursor)
 }
 

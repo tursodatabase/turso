@@ -884,12 +884,18 @@ pub enum Insn {
         db: usize,
         cursor_id: CursorID,
     },
+    /// Custom index with custom module
+    IdxDestroy {
+        db: usize,
+        cursor_id: CursorID,
+    },
     // Custom module query op-code
     IdxQuery {
         db: usize,
         cursor_id: CursorID,
         start_reg: usize,
         count_reg: usize,
+        pc_if_empty: BranchOffset,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -1332,6 +1338,7 @@ impl InsnVariants {
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IdxCreate => execute::op_idx_create,
+            InsnVariants::IdxDestroy => execute::op_idx_destroy,
             InsnVariants::IdxQuery => execute::op_idx_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,

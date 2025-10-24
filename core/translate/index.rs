@@ -124,7 +124,7 @@ pub fn translate_create_index(
             module = Some(index_module.descriptor(&IndexConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
-                columns: columns.iter().map(|x| x.name.clone()).collect(),
+                columns: columns.clone(),
                 parameters: parameters.clone(),
             })?);
         }
@@ -725,20 +725,31 @@ pub fn translate_drop_index(
         p5: 0,
     });
 
-    // Destroy index btree
-    program.emit_insn(Insn::Destroy {
-        root: maybe_index.unwrap().root_page,
-        former_root_reg: 0,
-        is_temp: 0,
-    });
-
-    // Remove from the Schema any mention of the index
-    if let Some(idx) = maybe_index {
-        program.emit_insn(Insn::DropIndex {
-            index: idx.clone(),
+    let index = maybe_index.unwrap();
+    if index
+        .module
+        .as_ref()
+        .is_some_and(|i| !i.definition().hidden)
+    {
+        let cursor_id = program.alloc_cursor_index(None, index)?;
+        program.emit_insn(Insn::IdxDestroy {
             db: 0,
+            cursor_id: cursor_id,
+        });
+    } else {
+        // Destroy index btree
+        program.emit_insn(Insn::Destroy {
+            root: index.root_page,
+            former_root_reg: 0,
+            is_temp: 0,
         });
     }
+
+    // Remove from the Schema any mention of the index
+    program.emit_insn(Insn::DropIndex {
+        index: index.clone(),
+        db: 0,
+    });
 
     Ok(program)
 }

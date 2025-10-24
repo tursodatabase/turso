@@ -7175,6 +7175,36 @@ pub fn op_idx_create(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_idx_destroy(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IdxDestroy { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    if let (_, CursorType::CustomModule(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::CustomModule(cursor));
+        }
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_custom_module_mut();
+    return_if_io!(cursor.destroy(&program.connection));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_idx_query(
     program: &Program,
     state: &mut ProgramState,
@@ -7187,7 +7217,8 @@ pub fn op_idx_query(
             db,
             cursor_id,
             start_reg,
-            count_reg
+            count_reg,
+            pc_if_empty,
         },
         insn
     );
@@ -7200,8 +7231,13 @@ pub fn op_idx_query(
     }
     let cursor = state.cursors[*cursor_id].as_mut().unwrap();
     let cursor = cursor.as_custom_module_mut();
-    return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
-    state.pc += 1;
+    let has_more =
+        return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    if !has_more {
+        state.pc = pc_if_empty.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
