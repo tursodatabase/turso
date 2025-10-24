@@ -57,7 +57,6 @@ regex-syntax = { workspace = true, default-features = false, features = [
     "unicode",
 ] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
-julian_day_converter = "0.4.5"
 rand = { workspace = true }
 libm = "0.2"
 turso_macros = { workspace = true }

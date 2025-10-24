@@ -2411,15 +2411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "julian_day_converter"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2987f71b89b85c812c8484cbf0c5d7912589e77bfdc66fd3e52f760e7859f16"
-dependencies = [
- "chrono",
-]
-
-[[package]]
 name = "kqueue"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4916,7 +4907,6 @@ dependencies = [
  "hex",
  "intrusive-collections",
  "io-uring",
- "julian_day_converter",
  "libc",
  "libloading",
  "libm",
