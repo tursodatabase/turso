@@ -679,30 +679,47 @@ mod fuzz_tests {
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let get_constraint_type = |rng: &mut ChaCha8Rng| match rng.random_range(0..3) {
+                0 => "INTEGER PRIMARY KEY",
+                1 => "UNIQUE",
+                2 => "PRIMARY KEY",
+                _ => unreachable!(),
+            };
+
             // Mix of immediate and deferred FK constraints
-            let s = log_and_exec("CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT)");
+            let s = log_and_exec(&format!(
+                "CREATE TABLE parent(id {}, a INT, b INT)",
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with DEFERRABLE INITIALLY DEFERRED FK
-            let s = log_and_exec(
-                "CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, x INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_deferred(id {}, pid INT, x INT, \
              FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with immediate FK (default)
-            let s = log_and_exec(
-                "CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, y INT, \
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_immediate(id {}, pid INT, y INT, \
              FOREIGN KEY(pid) REFERENCES parent(id))",
-            );
+                get_constraint_type(&mut rng)
+            ));
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
+            let composite_constraint = match rng.random_range(0..2) {
+                0 => "PRIMARY KEY",
+                1 => "UNIQUE",
+                _ => unreachable!(),
+            };
             // Composite key parent for deferred testing
             let s = log_and_exec(
-                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))",
+                &format!("CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_constraint}(a,b))"),
             );
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();

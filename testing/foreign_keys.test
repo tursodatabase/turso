@@ -1104,3 +1104,106 @@ do_execsql_test_on_specific_db {:memory:} fk-delete-composite-bounds {
   -- This should be a no-op (no row (5,3)), and MUST NOT error.
   DELETE FROM p WHERE a=5 AND b=3;
 } {}
+
+# Single column unique index on parent, FK referenced by child
+do_execsql_test_in_memory_any_error fk-update-parent-unique-single-col {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id UNIQUE);
+  CREATE TABLE child(pid REFERENCES parent(id));
+  INSERT INTO parent VALUES(1);
+  INSERT INTO child VALUES(1);
+  UPDATE parent SET id = 2 WHERE id = 1;
+}
+
+# Single column with explicit CREATE UNIQUE INDEX
+do_execsql_test_in_memory_any_error fk-update-parent-explicit-unique-single-col {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id);
+  CREATE UNIQUE INDEX parent_id_idx ON parent(id);
+  CREATE TABLE child(pid REFERENCES parent(id));
+  INSERT INTO parent VALUES(1);
+  INSERT INTO child VALUES(1);
+  UPDATE parent SET id = 2 WHERE id = 1;
+}
+
+# Multi-column unique index on parent, FK referenced by multi-column FK in child
+do_execsql_test_in_memory_any_error fk-update-parent-unique-multi-col {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b, UNIQUE(a, b));
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+
+# Multi-column unique index on parent, FK referenced by multi-column FK in child
+do_execsql_test_in_memory_any_error fk-update-parent-unique-multi-col-2 {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b, UNIQUE(a, b));
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}
+
+# Multi-column index defined explicitly as CREATE UNIQUE INDEX
+do_execsql_test_in_memory_any_error fk-update-parent-explicit-unique-multi-col {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b);
+  CREATE UNIQUE INDEX parent_ab_idx ON parent(a, b);
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+
+# Multi-column index defined explicitly as CREATE UNIQUE INDEX
+do_execsql_test_in_memory_any_error fk-update-parent-explicit-unique-multi-col-2 {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b);
+  CREATE UNIQUE INDEX parent_ab_idx ON parent(a, b);
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}
+
+# Single column INTEGER PRIMARY KEY
+do_execsql_test_in_memory_any_error fk-update-parent-int-pk {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id INTEGER PRIMARY KEY);
+  CREATE TABLE child(pid REFERENCES parent(id));
+  INSERT INTO parent VALUES(1);
+  INSERT INTO child VALUES(1);
+  UPDATE parent SET id = 2 WHERE id = 1;
+}
+
+# Single column TEXT PRIMARY KEY
+do_execsql_test_in_memory_any_error fk-update-parent-text-pk {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(id PRIMARY KEY);
+  CREATE TABLE child(pid REFERENCES parent(id));
+  INSERT INTO parent VALUES('key1');
+  INSERT INTO child VALUES('key1');
+  UPDATE parent SET id = 'key2' WHERE id = 'key1';
+}
+
+# Multi-column PRIMARY KEY
+do_execsql_test_in_memory_any_error fk-update-parent-multi-col-pk {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+
+# Multi-column PRIMARY KEY
+do_execsql_test_in_memory_any_error fk-update-parent-multi-col-pk-2 {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
+  CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+  INSERT INTO parent VALUES(1, 2);
+  INSERT INTO child VALUES(1, 2);
+  UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}

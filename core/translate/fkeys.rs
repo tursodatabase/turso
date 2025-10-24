@@ -264,14 +264,15 @@ pub fn stabilize_new_row_for_fk(
     Ok(())
 }
 
-/// Parent-side checks when the parent PK might change (UPDATE on parent):
+/// Parent-side checks when the parent key might change (UPDATE on parent):
 /// Detect if any child references the OLD key (potential violation), and if any references the NEW key
-/// (which cancels one potential violation). For composite PKs this builds OLD/NEW vectors first.
+/// (which cancels one potential violation). For composite keys this builds OLD/NEW vectors first.
 #[allow(clippy::too_many_arguments)]
-pub fn emit_parent_pk_change_checks(
+pub fn emit_parent_key_change_checks(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_btree: &BTreeTable,
+    indexes_to_update: impl Iterator<Item = impl AsRef<Index>>,
     cursor_id: usize,
     old_rowid_reg: usize,
     start: usize,
@@ -290,34 +291,32 @@ pub fn emit_parent_pk_change_checks(
         return Ok(());
     }
 
-    match table_btree.primary_key_columns.len() {
-        0 => emit_rowid_pk_change_check(
+    let primary_key_is_rowid_alias = table_btree.get_rowid_alias_column().is_some();
+
+    if primary_key_is_rowid_alias || table_btree.primary_key_columns.is_empty() {
+        emit_rowid_pk_change_check(
             program,
             &incoming,
             resolver,
             old_rowid_reg,
             rowid_set_clause_reg.unwrap_or(old_rowid_reg),
-        ),
-        1 => emit_single_pk_change_check(
-            program,
-            &incoming,
-            resolver,
-            table_btree,
-            cursor_id,
-            start,
-            rowid_new_reg,
-        ),
-        _ => emit_composite_pk_change_check(
-            program,
-            &incoming,
-            resolver,
-            table_btree,
-            cursor_id,
-            old_rowid_reg,
-            start,
-            rowid_new_reg,
-        ),
+        )?;
     }
+
+    for index in indexes_to_update {
+        emit_parent_index_key_change_checks(
+            program,
+            cursor_id,
+            start,
+            old_rowid_reg,
+            rowid_new_reg,
+            &incoming,
+            resolver,
+            table_btree,
+            index.as_ref(),
+        )?;
+    }
+    Ok(())
 }
 
 /// Rowid-table parent PK change: compare rowid OLD vs NEW; if changed, run two-pass counters.
@@ -355,124 +354,82 @@ pub fn emit_rowid_pk_change_check(
     Ok(())
 }
 
-/// Single-column PK parent change: load OLD and NEW; if changed, run two-pass counters.
-pub fn emit_single_pk_change_check(
-    program: &mut ProgramBuilder,
-    incoming: &[ResolvedFkRef],
-    resolver: &Resolver,
-    table_btree: &BTreeTable,
-    cursor_id: usize,
-    start: usize,
-    rowid_new_reg: usize,
-) -> Result<()> {
-    let (pk_name, _) = &table_btree.primary_key_columns[0];
-    let (pos, col) = table_btree.get_column(pk_name).unwrap();
-
-    let old_reg = program.alloc_register();
-    if col.is_rowid_alias {
-        program.emit_insn(Insn::RowId {
-            cursor_id,
-            dest: old_reg,
-        });
-    } else {
-        program.emit_insn(Insn::Column {
-            cursor_id,
-            column: pos,
-            dest: old_reg,
-            default: None,
-        });
-    }
-    let new_reg = if col.is_rowid_alias {
-        rowid_new_reg
-    } else {
-        start + pos
-    };
-
-    let skip = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: old_reg,
-        rhs: new_reg,
-        target_pc: skip,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-
-    let old_pk = program.alloc_register();
-    let new_pk = program.alloc_register();
-    program.emit_insn(Insn::Copy {
-        src_reg: old_reg,
-        dst_reg: old_pk,
-        extra_amount: 0,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: new_reg,
-        dst_reg: new_pk,
-        extra_amount: 0,
-    });
-
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, 1)?;
-    program.preassign_label_to_next_insn(skip);
-    Ok(())
-}
-
-/// Composite-PK parent change: build OLD/NEW vectors; if any component differs, run two-pass counters.
+/// Foreign keys are only legal if the referenced parent key is:
+/// 1. The rowid alias (no separate index)
+/// 2. Part of a primary key / unique index (there is no practical difference between the two)
+///
+/// If the foreign key references a composite key, all of the columns in the key must be referenced.
+/// E.g.
+/// CREATE TABLE parent (a, b, c, PRIMARY KEY (a, b, c));
+/// CREATE TABLE child (a, b, c, FOREIGN KEY (a, b, c) REFERENCES parent (a, b, c));
+///
+/// Whereas this is not allowed:
+/// CREATE TABLE parent (a, b, c, PRIMARY KEY (a, b, c));
+/// CREATE TABLE child (a, b, c, FOREIGN KEY (a, b) REFERENCES parent (a, b, c));
+///
+/// This function checks if the parent key has changed by comparing the OLD and NEW values.
+/// If the parent key has changed, it emits the counters for the foreign keys.
+/// If the parent key has not changed, it does nothing.
 #[allow(clippy::too_many_arguments)]
-pub fn emit_composite_pk_change_check(
+pub fn emit_parent_index_key_change_checks(
     program: &mut ProgramBuilder,
+    cursor_id: usize,
+    new_values_start: usize,
+    old_rowid_reg: usize,
+    new_rowid_reg: usize,
     incoming: &[ResolvedFkRef],
     resolver: &Resolver,
     table_btree: &BTreeTable,
-    cursor_id: usize,
-    old_rowid_reg: usize,
-    start: usize,
-    rowid_new_reg: usize,
+    index: &Index,
 ) -> Result<()> {
-    let pk_len = table_btree.primary_key_columns.len();
+    let idx_len = index.columns.len();
 
-    let old_pk = program.alloc_registers(pk_len);
-    for (i, (pk_name, _)) in table_btree.primary_key_columns.iter().enumerate() {
-        let (pos, col) = table_btree.get_column(pk_name).unwrap();
-        if col.is_rowid_alias {
+    let old_key = program.alloc_registers(idx_len);
+    for (i, index_col) in index.columns.iter().enumerate() {
+        let pos_in_table = index_col.pos_in_table;
+        let column = &table_btree.columns[pos_in_table];
+        if column.is_rowid_alias {
             program.emit_insn(Insn::Copy {
                 src_reg: old_rowid_reg,
-                dst_reg: old_pk + i,
+                dst_reg: old_key + i,
                 extra_amount: 0,
             });
         } else {
             program.emit_insn(Insn::Column {
                 cursor_id,
-                column: pos,
-                dest: old_pk + i,
+                column: pos_in_table,
+                dest: old_key + i,
                 default: None,
             });
         }
     }
-    let new_pk = program.alloc_registers(pk_len);
-    for (i, (pk_name, _)) in table_btree.primary_key_columns.iter().enumerate() {
-        let (pos, col) = table_btree.get_column(pk_name).unwrap();
-        let src = if col.is_rowid_alias {
-            rowid_new_reg
+    let new_key = program.alloc_registers(idx_len);
+    for (i, index_col) in index.columns.iter().enumerate() {
+        let pos_in_table = index_col.pos_in_table;
+        let column = &table_btree.columns[pos_in_table];
+        let src = if column.is_rowid_alias {
+            new_rowid_reg
         } else {
-            start + pos
+            new_values_start + pos_in_table
         };
         program.emit_insn(Insn::Copy {
             src_reg: src,
-            dst_reg: new_pk + i,
+            dst_reg: new_key + i,
             extra_amount: 0,
         });
     }
 
     let skip = program.allocate_label();
     let changed = program.allocate_label();
-    for i in 0..pk_len {
-        let next = if i + 1 == pk_len {
+    for i in 0..idx_len {
+        let next = if i + 1 == idx_len {
             None
         } else {
             Some(program.allocate_label())
         };
         program.emit_insn(Insn::Eq {
-            lhs: old_pk + i,
-            rhs: new_pk + i,
+            lhs: old_key + i,
+            rhs: new_key + i,
             target_pc: next.unwrap_or(skip),
             flags: CmpInsFlags::default(),
             collation: None,
@@ -484,7 +441,7 @@ pub fn emit_composite_pk_change_check(
     }
 
     program.preassign_label_to_next_insn(changed);
-    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_pk, new_pk, pk_len)?;
+    emit_fk_parent_pk_change_counters(program, incoming, resolver, old_key, new_key, idx_len)?;
     program.preassign_label_to_next_insn(skip);
     Ok(())
 }

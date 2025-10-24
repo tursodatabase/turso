@@ -33,7 +33,7 @@ use crate::translate::expr::{
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters,
     emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
-    emit_parent_pk_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
+    emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
@@ -1346,10 +1346,11 @@ fn emit_update_insns(
                 .schema
                 .any_resolved_fks_referencing(table_name)
             {
-                emit_parent_pk_change_checks(
+                emit_parent_key_change_checks(
                     program,
                     &t_ctx.resolver,
                     &table_btree,
+                    plan.indexes_to_update.iter(),
                     target_table_cursor_id,
                     beg,
                     start,
