@@ -1,19 +1,26 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     index::{
-        open_btree_cursor, parse_patterns, IndexConfiguration, IndexCursor, IndexDefinition,
-        IndexDescriptor, IndexModule, HIDDEN_BTREE_MODULE_NAME, VECTOR_SPARSE_IVF_MODULE_NAME,
+        open_index_cursor, open_table_cursor, parse_patterns, IndexConfiguration, IndexCursor,
+        IndexDefinition, IndexDescriptor, IndexModule, HIDDEN_BTREE_MODULE_NAME,
+        VECTOR_SPARSE_IVF_MODULE_NAME,
     },
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
-    vector::vector_types::{Vector, VectorType},
-    Connection, LimboError, Result, Statement, Value,
+    vector::{
+        operations,
+        vector_types::{Vector, VectorType},
+    },
+    Connection, LimboError, Result, Statement, Value, ValueRef,
 };
 
 #[derive(Debug)]
@@ -71,14 +78,69 @@ pub enum VectorSparseInvertedIndexDeleteState {
     },
 }
 
+#[derive(Debug, PartialEq, PartialOrd)]
+struct FloatOrd(f64);
+
+impl Eq for FloatOrd {}
+
+impl Ord for FloatOrd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Debug)]
+pub enum VectorSparseInvertedIndexSearchState {
+    Init,
+    Prepare {
+        collected: Option<HashSet<i64>>,
+        positions: Option<Vec<u32>>,
+        idx: usize,
+        limit: i64,
+    },
+    Seek {
+        collected: Option<HashSet<i64>>,
+        positions: Option<Vec<u32>>,
+        key: Option<ImmutableRecord>,
+        idx: usize,
+        limit: i64,
+    },
+    Read {
+        collected: Option<HashSet<i64>>,
+        positions: Option<Vec<u32>>,
+        key: Option<ImmutableRecord>,
+        idx: usize,
+        limit: i64,
+    },
+    Next {
+        collected: Option<HashSet<i64>>,
+        positions: Option<Vec<u32>>,
+        key: Option<ImmutableRecord>,
+        idx: usize,
+        limit: i64,
+    },
+    EvaluateSeek {
+        rowids: Option<Vec<i64>>,
+        distances: Option<BTreeSet<(FloatOrd, i64)>>,
+        limit: i64,
+    },
+    EvaluateRead {
+        rowids: Option<Vec<i64>>,
+        distances: Option<BTreeSet<(FloatOrd, i64)>>,
+        limit: i64,
+    },
+}
+
 pub struct VectorSparseInvertedIndexCursor {
     configuration: IndexConfiguration,
     scratch_btree: String,
-    cursor: Option<BTreeCursor>,
-    values: [Value; 2],
+    scratch_cursor: Option<BTreeCursor>,
+    main_btree: Option<BTreeCursor>,
     create_state: VectorSparseInvertedIndexCreateState,
     insert_state: VectorSparseInvertedIndexInsertState,
     delete_state: VectorSparseInvertedIndexDeleteState,
+    search_state: VectorSparseInvertedIndexSearchState,
+    search_result: VecDeque<(i64, f64)>,
 }
 
 impl IndexModule for VectorSparseInvertedIndex {
@@ -114,11 +176,13 @@ impl VectorSparseInvertedIndexCursor {
         Self {
             configuration,
             scratch_btree,
-            cursor: None,
-            values: [Value::Null, Value::Null],
+            scratch_cursor: None,
+            main_btree: None,
+            search_result: VecDeque::new(),
             create_state: VectorSparseInvertedIndexCreateState::Init,
             insert_state: VectorSparseInvertedIndexInsertState::Init,
             delete_state: VectorSparseInvertedIndexDeleteState::Init,
+            search_state: VectorSparseInvertedIndexSearchState::Init,
         }
     }
 }
@@ -159,11 +223,15 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
             collation: CollationSeq::Binary,
             sort_order: SortOrder::Asc,
         };
-        self.cursor = Some(open_btree_cursor(
+        self.scratch_cursor = Some(open_index_cursor(
             connection,
             &self.configuration.table_name,
             &self.scratch_btree,
             vec![key_info.clone(), key_info],
+        )?);
+        self.main_btree = Some(open_table_cursor(
+            connection,
+            &self.configuration.table_name,
         )?);
         Ok(IOResult::Done(()))
     }
@@ -173,7 +241,7 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
             collation: CollationSeq::Binary,
             sort_order: SortOrder::Asc,
         };
-        self.cursor = Some(open_btree_cursor(
+        self.scratch_cursor = Some(open_index_cursor(
             connection,
             &self.configuration.table_name,
             &self.scratch_btree,
@@ -183,12 +251,11 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        let Some(cursor) = &mut self.cursor else {
+        let Some(cursor) = &mut self.scratch_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
             ));
         };
-        tracing::info!("insert: {:?}", values);
         loop {
             match &mut self.insert_state {
                 VectorSparseInvertedIndexInsertState::Init => {
@@ -197,17 +264,17 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let Some(rowid) = values[1].get_value().as_int() else {
-                        return Err(LimboError::InternalError(
-                            "second value must be i64 rowid".to_string(),
-                        ));
-                    };
                     let vector = Vector::from_slice(vector)?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
                         ));
                     }
+                    let Some(rowid) = values[1].get_value().as_int() else {
+                        return Err(LimboError::InternalError(
+                            "second value must be i64 rowid".to_string(),
+                        ));
+                    };
                     let sparse = vector.as_f32_sparse();
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         positions: Some(sparse.idx.to_vec()),
@@ -226,7 +293,6 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                         return Ok(IOResult::Done(()));
                     }
                     let position = p[*idx];
-                    tracing::info!("position: {}", position);
                     let key = ImmutableRecord::from_values(
                         &[Value::Integer(position as i64), Value::Integer(*rowid)],
                         2,
@@ -262,7 +328,6 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                     key,
                 } => {
                     let k = key.as_ref().unwrap();
-                    tracing::info!("insert_key: {:?}", k);
                     let _ = return_if_io!(cursor.insert(&BTreeKey::IndexKey(k)));
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
                         idx: *idx + 1,
@@ -275,12 +340,11 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        let Some(cursor) = &mut self.cursor else {
+        let Some(cursor) = &mut self.scratch_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
             ));
         };
-        tracing::info!("delete: {:?}", values);
         loop {
             match &mut self.delete_state {
                 VectorSparseInvertedIndexDeleteState::Init => {
@@ -289,17 +353,17 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
                             "first value must be sparse vector".to_string(),
                         ));
                     };
-                    let Some(rowid) = values[1].get_value().as_int() else {
-                        return Err(LimboError::InternalError(
-                            "second value must be i64 rowid".to_string(),
-                        ));
-                    };
                     let vector = Vector::from_slice(vector)?;
                     if !matches!(vector.vector_type, VectorType::Float32Sparse) {
                         return Err(LimboError::InternalError(
                             "first value must be sparse vector".to_string(),
                         ));
                     }
+                    let Some(rowid) = values[1].get_value().as_int() else {
+                        return Err(LimboError::InternalError(
+                            "second value must be i64 rowid".to_string(),
+                        ));
+                    };
                     let sparse = vector.as_f32_sparse();
                     self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
                         positions: Some(sparse.idx.to_vec()),
@@ -365,16 +429,259 @@ impl IndexCursor for VectorSparseInvertedIndexCursor {
     }
 
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        tracing::info!("values: {:?}", values);
-        Ok(IOResult::Done(()))
+        let Some(scratch) = &mut self.scratch_cursor else {
+            return Err(LimboError::InternalError(
+                "cursor must be opened".to_string(),
+            ));
+        };
+        let Some(main) = &mut self.main_btree else {
+            return Err(LimboError::InternalError(
+                "cursor must be opened".to_string(),
+            ));
+        };
+        loop {
+            tracing::info!("state: {:?}", self.search_state);
+            match &mut self.search_state {
+                VectorSparseInvertedIndexSearchState::Init => {
+                    let Some(vector) = values[1].get_value().to_blob() else {
+                        return Err(LimboError::InternalError(
+                            "first value must be sparse vector".to_string(),
+                        ));
+                    };
+                    let Some(limit) = values[2].get_value().as_int() else {
+                        return Err(LimboError::InternalError(
+                            "second value must be i64 limit parameter".to_string(),
+                        ));
+                    };
+                    let vector = Vector::from_slice(vector)?;
+                    if !matches!(vector.vector_type, VectorType::Float32Sparse) {
+                        return Err(LimboError::InternalError(
+                            "first value must be sparse vector".to_string(),
+                        ));
+                    }
+                    let sparse = vector.as_f32_sparse();
+                    self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
+                        collected: Some(HashSet::new()),
+                        positions: Some(sparse.idx.to_vec()),
+                        idx: 0,
+                        limit,
+                    };
+                }
+                VectorSparseInvertedIndexSearchState::Prepare {
+                    collected,
+                    positions,
+                    idx,
+                    limit,
+                } => {
+                    let p = positions.as_ref().unwrap();
+                    if *idx == p.len() {
+                        let mut rowids = collected
+                            .take()
+                            .unwrap()
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        rowids.sort();
+                        self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
+                            rowids: Some(rowids),
+                            distances: Some(BTreeSet::new()),
+                            limit: *limit,
+                        };
+                        continue;
+                    }
+                    let position = p[*idx];
+                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 2);
+                    self.search_state = VectorSparseInvertedIndexSearchState::Seek {
+                        collected: collected.take(),
+                        positions: positions.take(),
+                        key: Some(key),
+                        idx: *idx,
+                        limit: *limit,
+                    };
+                }
+                VectorSparseInvertedIndexSearchState::Seek {
+                    collected,
+                    positions,
+                    key,
+                    idx,
+                    limit,
+                } => {
+                    let k = key.as_ref().unwrap();
+                    let result = return_if_io!(
+                        scratch.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
+                    );
+                    match result {
+                        SeekResult::Found => {
+                            self.search_state = VectorSparseInvertedIndexSearchState::Read {
+                                collected: collected.take(),
+                                positions: positions.take(),
+                                key: key.take(),
+                                idx: *idx,
+                                limit: *limit,
+                            };
+                        }
+                        SeekResult::TryAdvance => {
+                            self.search_state = VectorSparseInvertedIndexSearchState::Next {
+                                collected: collected.take(),
+                                positions: positions.take(),
+                                key: key.take(),
+                                idx: *idx,
+                                limit: *limit,
+                            };
+                        }
+                        SeekResult::NotFound => {
+                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
+                        }
+                    }
+                }
+                VectorSparseInvertedIndexSearchState::Read {
+                    collected,
+                    positions,
+                    key,
+                    idx,
+                    limit,
+                } => {
+                    let record = return_if_io!(scratch.record());
+                    if let Some(record) = record {
+                        let ValueRef::Integer(position) = record.get_value(0)? else {
+                            return Err(LimboError::InternalError(format!(
+                                "first value of index record must be int"
+                            )));
+                        };
+                        let ValueRef::Integer(rowid) = record.get_value(1)? else {
+                            return Err(LimboError::InternalError(format!(
+                                "second value of index record must be int"
+                            )));
+                        };
+                        tracing::info!("position/rowid: {}/{}", position, rowid);
+                        if position == positions.as_ref().unwrap()[*idx] as i64 {
+                            collected.as_mut().unwrap().insert(rowid);
+                            self.search_state = VectorSparseInvertedIndexSearchState::Next {
+                                collected: collected.take(),
+                                positions: positions.take(),
+                                key: key.take(),
+                                idx: *idx,
+                                limit: *limit,
+                            };
+                            continue;
+                        }
+                    }
+                    self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
+                        collected: collected.take(),
+                        positions: positions.take(),
+                        idx: *idx + 1,
+                        limit: *limit,
+                    };
+                }
+                VectorSparseInvertedIndexSearchState::Next {
+                    collected,
+                    positions,
+                    key,
+                    idx,
+                    limit,
+                } => {
+                    let result = return_if_io!(scratch.next());
+                    if !result {
+                        self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
+                            collected: collected.take(),
+                            positions: positions.take(),
+                            idx: *idx + 1,
+                            limit: *limit,
+                        };
+                    } else {
+                        self.search_state = VectorSparseInvertedIndexSearchState::Read {
+                            collected: collected.take(),
+                            positions: positions.take(),
+                            key: key.take(),
+                            idx: *idx,
+                            limit: *limit,
+                        };
+                    }
+                }
+                VectorSparseInvertedIndexSearchState::EvaluateSeek {
+                    rowids,
+                    distances,
+                    limit,
+                } => {
+                    let Some(rowid) = rowids.as_ref().unwrap().last() else {
+                        let distances = distances.take().unwrap();
+                        self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
+                        return Ok(IOResult::Done(()));
+                    };
+                    let result = return_if_io!(
+                        main.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })
+                    );
+                    if !matches!(result, SeekResult::Found) {
+                        return Err(LimboError::Corrupt(format!(
+                            "vector_sparse_ivf corrupted: unable to find rowid in main table"
+                        )));
+                    };
+                    self.search_state = VectorSparseInvertedIndexSearchState::EvaluateRead {
+                        rowids: rowids.take(),
+                        distances: distances.take(),
+                        limit: *limit,
+                    };
+                }
+                VectorSparseInvertedIndexSearchState::EvaluateRead {
+                    rowids,
+                    distances,
+                    limit,
+                } => {
+                    let record = return_if_io!(main.record());
+                    let rowid = rowids.as_mut().unwrap().pop().unwrap();
+                    if let Some(record) = record {
+                        let ValueRef::Blob(data) = record.get_value(0)? else {
+                            return Err(LimboError::InternalError(
+                                "table column value must be sparse vector".to_string(),
+                            ));
+                        };
+                        let data = Vector::from_vec(data.to_vec())?;
+                        if !matches!(data.vector_type, VectorType::Float32Sparse) {
+                            return Err(LimboError::InternalError(
+                                "table column value must be sparse vector".to_string(),
+                            ));
+                        }
+                        let Some(arg) = values[1].get_value().to_blob() else {
+                            return Err(LimboError::InternalError(
+                                "first value must be sparse vector".to_string(),
+                            ));
+                        };
+                        let arg = Vector::from_vec(arg.to_vec())?;
+                        if !matches!(arg.vector_type, VectorType::Float32Sparse) {
+                            return Err(LimboError::InternalError(
+                                "first value must be sparse vector".to_string(),
+                            ));
+                        }
+                        let distance = operations::jaccard::vector_distance_jaccard(&data, &arg)?;
+                        let mut distances = distances.as_mut().unwrap();
+                        distances.insert((FloatOrd(distance), rowid));
+                        if distances.len() > *limit as usize {
+                            let _ = distances.pop_last();
+                        }
+                    }
+
+                    self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
+                        rowids: rowids.take(),
+                        distances: distances.take(),
+                        limit: *limit,
+                    };
+                }
+            }
+        }
     }
 
     fn query_next(&mut self) -> Result<IOResult<bool>> {
-        Ok(IOResult::Done(false))
+        let _ = self.search_result.pop_front();
+        Ok(IOResult::Done(!self.search_result.is_empty()))
     }
 
     fn query_column(&mut self, position: usize) -> Result<IOResult<Value>> {
-        Ok(IOResult::Done(Value::Float(3.14)))
+        let result = self.search_result.front().unwrap();
+        if position == 0 {
+            Ok(IOResult::Done(Value::Integer(result.0)))
+        } else {
+            Ok(IOResult::Done(Value::Float(result.1)))
+        }
     }
 
     fn commit(&mut self) -> Result<()> {

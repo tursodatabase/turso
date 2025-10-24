@@ -106,7 +106,6 @@ pub fn translate_create_index(
     let columns = resolve_sorted_columns(&tbl, &columns)?;
     let custom_module = using.is_some();
     let btree_module = using.as_ref().map(|x| x.as_str()) == Some(HIDDEN_BTREE_MODULE_NAME);
-    tracing::info!("using: {:?} {}", using, btree_module);
     if !with_clause.is_empty() && !custom_module {
         crate::bail_parse_error!(
             "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
@@ -117,7 +116,7 @@ pub fn translate_create_index(
         let index_modules = &resolver.symbol_table.index_modules;
         let using = using.as_str();
         let index_module = index_modules.get(using);
-        if !index_module.is_none() && !btree_module {
+        if index_module.is_none() && !btree_module {
             crate::bail_parse_error!("Error: unknown module name '{}'", using);
         }
         if let Some(index_module) = index_module {

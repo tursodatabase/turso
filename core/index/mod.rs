@@ -57,7 +57,20 @@ pub trait IndexCursor {
     fn rollback(&mut self) -> Result<()>;
 }
 
-pub(crate) fn open_btree_cursor(
+pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<BTreeCursor> {
+    let pager = connection.pager.read().clone();
+    let schema = connection.schema.read();
+    let Some(table) = schema.get_table(table) else {
+        return Err(LimboError::InternalError(format!(
+            "table {} not found",
+            table
+        )));
+    };
+    let mut cursor = BTreeCursor::new_table(pager, table.get_root_page(), table.columns().len());
+    Ok(cursor)
+}
+
+pub(crate) fn open_index_cursor(
     connection: &Connection,
     table: &str,
     index: &str,
