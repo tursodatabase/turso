@@ -1601,7 +1601,7 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
         return 9;
     }
 
-    let mut encoded: [u8; 10] = [0; 10];
+    let mut encoded: [u8; 9] = [0; 9];
     let mut bytes = value;
     let mut n = 0;
     while bytes != 0 {
