@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    generation::plan::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
+    model::interactions::{ConnectionState, InteractionPlanIterator, InteractionPlanState},
     runner::execution::ExecutionContinuation,
 };
 
