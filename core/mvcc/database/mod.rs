@@ -404,7 +404,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
     ) -> Self {
-        let pager = connection.pager.read().clone();
+        let pager = connection.pager.load().clone();
         Self {
             state,
             is_finalized: false,
@@ -1047,7 +1047,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.insert_table_id_to_rootpage(root_page_as_table_id, Some(*root_page));
         }
 
-        if !self.maybe_recover_logical_log(bootstrap_conn.pager.read().clone())? {
+        if !self.maybe_recover_logical_log(bootstrap_conn.pager.load().clone())? {
             // There was no logical log to recover, so we're done.
             return Ok(());
         }
