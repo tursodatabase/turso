@@ -1,6 +1,6 @@
 use crate::{
     generation::WeightedDistribution,
-    model::{Query, QueryDiscriminants},
+    model::{Query, QueryDiscriminants, metrics::Remaining},
 };
 use rand::{
     Rng,
@@ -16,8 +16,6 @@ use sql_generation::{
         table::Table,
     },
 };
-
-use super::property::Remaining;
 
 fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     let mut create = Create::arbitrary(rng, conn_ctx);
