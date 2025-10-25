@@ -11,7 +11,7 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{affinity, Affinity, Table, Type};
-use crate::translate::optimizer::TakeOwnership;
+use crate::translate::optimizer::{ConstantFlags, TakeOwnership};
 use crate::translate::plan::ResultSetColumn;
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -569,7 +569,7 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
+    let constant_span = if expr.is_constant(resolver, ConstantFlags::default()) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
         } else {
