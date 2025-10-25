@@ -15,7 +15,7 @@ use crate::{
     read_state_machine::ReadState,
     HISTORY_FILE,
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
@@ -772,6 +772,11 @@ impl Limbo {
                     let w = self.writer.as_mut().unwrap();
                     if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
                         let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Dbtotxt => {
+                    if let Err(e) = self.dump_database_as_text() {
+                        let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
                     }
                 }
             },
@@ -1808,6 +1813,100 @@ impl Limbo {
             let _ = rl.save_history(HISTORY_FILE.as_path());
         }
     }
+
+    fn dump_database_as_text(&mut self) -> anyhow::Result<()> {
+        tracing::debug!("Executing .dbtotxt command");
+        let page_size: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_size")? {
+            fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_size")?
+        } else {
+            anyhow::bail!("Failed to prepare PRAGMA page_size");
+        };
+        tracing::debug!(page_size, "Fetched page size");
+
+        let page_count: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_count")? {
+            fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_count")?
+        } else {
+            anyhow::bail!("Failed to prepare PRAGMA page_count");
+        };
+        tracing::debug!(page_count, "Fetched page count");
+
+        let db_filename = PathBuf::from(self.opts.db_file.clone())
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        writeln!(
+            self,
+            "| size {} pagesize {} filename {}",
+            page_count * page_size,
+            page_size,
+            db_filename
+        )?;
+
+        let dump_sql = "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno";
+        if let Some(mut rows) = self.conn.query(dump_sql)? {
+            loop {
+                match rows.step()? {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        let pgno: i64 = row.get(0)?;
+
+                        let value: &Value = row.get(1)?;
+                        let data: &[u8] = match value {
+                            Value::Blob(bytes) => bytes,
+                            _ => &[],
+                        };
+
+                        let mut seen_page_label = false;
+
+                        for (i, chunk) in data.chunks(16).enumerate() {
+                            if chunk.iter().all(|&b| b == 0) {
+                                continue;
+                            }
+
+                            if !seen_page_label {
+                                writeln!(
+                                    self,
+                                    "| page {} offset {}",
+                                    pgno,
+                                    (pgno - 1) * page_size
+                                )?;
+                                seen_page_label = true;
+                            }
+
+                            write!(self, "|  {:5}:", i * 16)?;
+
+                            for byte in chunk {
+                                write!(self, " {:02x}", byte)?;
+                            }
+                            for _ in 0..(16 - chunk.len()) {
+                                write!(self, "   ")?;
+                            }
+
+                            write!(self, "   ")?;
+
+                            for &byte in chunk {
+                                let char_to_print = match byte {
+                                    b' '..=b'~' if ![b'{', b'}', b'"', b'\\'].contains(&byte) => {
+                                        byte as char
+                                    }
+                                    _ => '.',
+                                };
+                                write!(self, "{}", char_to_print)?;
+                            }
+                            writeln!(self)?;
+                        }
+                    }
+                    StepResult::IO => rows.run_once()?,
+                    StepResult::Done | StepResult::Interrupt => break,
+                    StepResult::Busy => anyhow::bail!("database is busy"),
+                }
+            }
+        }
+        writeln!(self, "| end {}", db_filename)?;
+        Ok(())
+    }
 }
 
 fn quote_ident(s: &str) -> String {
@@ -1840,6 +1939,25 @@ impl Drop for Limbo {
         self.save_history();
         unsafe {
             ManuallyDrop::drop(&mut self.input_buff);
+        }
+    }
+}
+
+fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
+    loop {
+        match rows.step()? {
+            StepResult::Row => {
+                return Ok(rows.row().unwrap().get(0)?);
+            }
+            StepResult::IO => {
+                rows.run_once()?;
+            }
+            StepResult::Busy => {
+                return Err(anyhow!("database is busy..."));
+            }
+            StepResult::Done | StepResult::Interrupt => {
+                return Err(anyhow!("query did not return a row"));
+            }
         }
     }
 }
