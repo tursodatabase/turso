@@ -104,6 +104,8 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
 
+pub mod dbpage;
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseOpts {
