@@ -13,6 +13,7 @@ pub mod delete;
 pub mod drop;
 pub mod drop_index;
 pub mod insert;
+pub mod pragma;
 pub mod predicate;
 pub mod select;
 pub mod transaction;

@@ -1222,6 +1222,21 @@ impl Pager {
                                     BtreePageAllocMode::Exact(root_page_num),
                                 ));
                                 let allocated_page_id = page.get().id as u32;
+
+                                return_if_io!(self.with_header_mut(|header| {
+                                    if allocated_page_id
+                                        > header.vacuum_mode_largest_root_page.get()
+                                    {
+                                        tracing::debug!(
+                                            "Updating largest root page in header from {} to {}",
+                                            header.vacuum_mode_largest_root_page.get(),
+                                            allocated_page_id
+                                        );
+                                        header.vacuum_mode_largest_root_page =
+                                            allocated_page_id.into();
+                                    }
+                                }));
+
                                 if allocated_page_id != root_page_num {
                                     //  TODO(Zaid): Handle swapping the allocated page with the desired root page
                                 }
@@ -2886,7 +2901,7 @@ impl CreateBTreeFlags {
 **               identifies the parent page in the btree.
 */
 #[cfg(not(feature = "omit_autovacuum"))]
-mod ptrmap {
+pub(crate) mod ptrmap {
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
 
     // Constants
