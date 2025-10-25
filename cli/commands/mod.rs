@@ -97,6 +97,8 @@ pub enum Command {
     /// Display manual pages for features
     #[command(name = "manual", display_name = ".manual", alias = "man")]
     Manual(ManualArgs),
+    #[command(name = "dbtotxt", display_name = ".dbtotxt")]
+    Dbtotxt,
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

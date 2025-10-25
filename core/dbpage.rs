@@ -5,7 +5,9 @@ use crate::{Connection, Result, Value};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::debug;
-use turso_ext::{ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode};
+use turso_ext::{
+    ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
+};
 
 #[derive(Debug)]
 pub struct DbPageTable;
@@ -23,7 +25,9 @@ impl InternalVirtualTable for DbPageTable {
     }
 
     fn sql(&self) -> String {
-        let schema = "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)".to_string();
+        let schema =
+            "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)"
+                .to_string();
         debug!(schema = schema, "DbPageTable::sql - declaring schema");
         schema
     }
@@ -109,29 +113,23 @@ impl DbPageCursor {
 }
 
 impl InternalVirtualTableCursor for DbPageCursor {
-    fn filter(
-        &mut self,
-        args: &[Value],
-        _idx_str: Option<String>,
-        idx_num: i32,
-    ) -> Result<bool> {
+    fn filter(&mut self, args: &[Value], _idx_str: Option<String>, idx_num: i32) -> Result<bool> {
         debug!(idx_num, args = ?args, "DbPageCursor::filter - initializing scan");
 
-        let db_size = self.pager.io.block(|| {
-            self.pager.with_header(|header| header.database_size.get())
-        })?;
+        let db_size = self
+            .pager
+            .io
+            .block(|| self.pager.with_header(|header| header.database_size.get()))?;
 
         self.mx_pgno = db_size as i64;
-        
-        if (idx_num & 1) != 0 {
 
+        if (idx_num & 1) != 0 {
             let pgno = if let Some(Value::Integer(val)) = args.get(0) {
                 *val
-
             } else {
                 0
             };
-            
+
             debug!(pgno, "DbPageCursor::filter - point query for specific page");
             if pgno > 0 && pgno <= self.mx_pgno {
                 self.pgno = pgno;
@@ -140,7 +138,10 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 self.mx_pgno = 0;
             }
         } else {
-            debug!(max_page = self.mx_pgno, "DbPageCursor::filter - full table scan");
+            debug!(
+                max_page = self.mx_pgno,
+                "DbPageCursor::filter - full table scan"
+            );
             self.pgno = 1;
         }
 
@@ -148,18 +149,23 @@ impl InternalVirtualTableCursor for DbPageCursor {
     }
 
     fn next(&mut self) -> Result<bool> {
-        debug!(current_pgno = self.pgno, max_pgno = self.mx_pgno, "DbPageCursor::next - advancing cursor");
+        debug!(
+            current_pgno = self.pgno,
+            max_pgno = self.mx_pgno,
+            "DbPageCursor::next - advancing cursor"
+        );
         self.pgno += 1;
         Ok(self.pgno <= self.mx_pgno)
     }
 
     fn column(&self, column: usize) -> Result<Value> {
-        debug!(column_idx = column, pgno = self.pgno, "DbPageCursor::column - fetching data");
+        debug!(
+            column_idx = column,
+            pgno = self.pgno,
+            "DbPageCursor::column - fetching data"
+        );
         match column {
-            0 => {
-
-                Ok(Value::Integer(self.pgno))
-            },
+            0 => Ok(Value::Integer(self.pgno)),
             1 => {
                 let (page_ref, completion) = self.pager.read_page(self.pgno)?;
                 if let Some(c) = completion {
@@ -176,7 +182,10 @@ impl InternalVirtualTableCursor for DbPageCursor {
     }
 
     fn rowid(&self) -> i64 {
-        debug!(pgno = self.pgno, "DbPageCursor::rowid - returning current page number");
+        debug!(
+            pgno = self.pgno,
+            "DbPageCursor::rowid - returning current page number"
+        );
         self.pgno
     }
 }
