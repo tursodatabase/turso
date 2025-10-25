@@ -39,6 +39,19 @@ impl VirtualTable {
         }
     }
 
+
+    fn dbpage_virtual_tables() -> Vec<Arc<VirtualTable>> {
+    let dbpage_table = crate::dbpage::DbPageTable::new();
+    let dbpage_vtab = VirtualTable {
+        name: dbpage_table.name(),
+        columns: Self::resolve_columns(dbpage_table.sql())
+            .expect("sqlite_dbpage schema resolution should not fail"),
+        kind: VTabKind::TableValuedFunction,
+        vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
+    };
+    vec![Arc::new(dbpage_vtab)]
+}
+
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
@@ -55,8 +68,12 @@ impl VirtualTable {
             })
             .collect();
 
+
+            
         #[cfg(feature = "json")]
         vtables.extend(Self::json_virtual_tables());
+
+          vtables.extend(Self::dbpage_virtual_tables());
 
         vtables
     }
