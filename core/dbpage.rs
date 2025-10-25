@@ -12,6 +12,12 @@ use turso_ext::{
 #[derive(Debug)]
 pub struct DbPageTable;
 
+impl Default for DbPageTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DbPageTable {
     pub fn new() -> Self {
         debug!("DbPageTable::new - creating new sqlite_dbpage virtual table module");
@@ -49,8 +55,7 @@ impl InternalVirtualTable for DbPageTable {
 
         let constraint_usages = constraints
             .iter()
-            .enumerate()
-            .map(|(i, constraint)| {
+            .map(|constraint| {
                 let mut usage = ConstraintUsage {
                     argv_index: None,
                     omit: false,
@@ -83,7 +88,6 @@ impl InternalVirtualTable for DbPageTable {
             estimated_cost,
             estimated_rows: if (idx_num & 1) != 0 { 1 } else { 1_000_000 },
             constraint_usages,
-            ..Default::default()
         };
 
         debug!(
@@ -124,7 +128,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
         self.mx_pgno = db_size as i64;
 
         if (idx_num & 1) != 0 {
-            let pgno = if let Some(Value::Integer(val)) = args.get(0) {
+            let pgno = if let Some(Value::Integer(val)) = args.first() {
                 *val
             } else {
                 0
