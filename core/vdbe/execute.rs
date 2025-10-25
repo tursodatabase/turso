@@ -2259,6 +2259,7 @@ pub fn op_transaction_inner(
             db,
             tx_mode,
             schema_cookie,
+            schema_generation,
         },
         insn
     );
@@ -2412,16 +2413,27 @@ pub fn op_transaction_inner(
             // Can only read header if page 1 has been allocated already
             // begin_write_tx that happens, but not begin_read_tx
             OpTransactionState::CheckSchemaCookie => {
+                if program.connection.is_nested_stmt.load(Ordering::SeqCst) {
+                    state.pc += 1;
+                    state.op_transaction_state = OpTransactionState::Start;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 let res = get_schema_cookie(&pager, mv_store, program);
                 match res {
                     Ok(IOResult::Done(header_schema_cookie)) => {
-                        if header_schema_cookie != *schema_cookie {
+                        let generation_counter = program
+                            .connection
+                            .with_schema(0, |schema| schema.generation.load(Ordering::SeqCst));
+                        if header_schema_cookie != *schema_cookie
+                            || generation_counter != *schema_generation
+                        {
                             tracing::debug!(
-                                "schema changed, force reprepare: {} != {}",
-                                header_schema_cookie,
-                                *schema_cookie
+                                "schema changed, force reprepare: (header_schema_cookie={header_schema_cookie}, schema_cookie={schema_cookie}, generation_counter={generation_counter}, schema_generation={schema_generation})",
                             );
-                            return Err(LimboError::SchemaUpdated);
+                            state.auto_txn_cleanup = TxnCleanup::None;
+                            return Err(LimboError::SchemaUpdated {
+                                new_schema_version: header_schema_cookie,
+                            });
                         }
                     }
                     Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),

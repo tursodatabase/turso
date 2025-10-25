@@ -492,6 +492,7 @@ pub enum Insn {
         db: usize,                // p1
         tx_mode: TransactionMode, // p2
         schema_cookie: u32,       // p3
+        schema_generation: u32,   // p4
     },
 
     /// Set database auto-commit mode and potentially rollback.
