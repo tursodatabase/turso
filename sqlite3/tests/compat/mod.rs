@@ -20,6 +20,21 @@ extern "C" {
     fn sqlite3_close(db: *mut sqlite3) -> i32;
     fn sqlite3_open(filename: *const libc::c_char, db: *mut *mut sqlite3) -> i32;
     fn sqlite3_db_filename(db: *mut sqlite3, db_name: *const libc::c_char) -> *const libc::c_char;
+    fn sqlite3_exec(
+        db: *mut sqlite3,
+        sql: *const libc::c_char,
+        callback: Option<
+            unsafe extern "C" fn(
+                arg1: *mut libc::c_void,
+                arg2: libc::c_int,
+                arg3: *mut *mut libc::c_char,
+                arg4: *mut *mut libc::c_char,
+            ) -> libc::c_int,
+        >,
+        arg: *mut libc::c_void,
+        errmsg: *mut *mut libc::c_char,
+    ) -> i32;
+    fn sqlite3_free(ptr: *mut libc::c_void);
     fn sqlite3_prepare_v2(
         db: *mut sqlite3,
         sql: *const libc::c_char,
@@ -106,6 +121,7 @@ const SQLITE_CHECKPOINT_RESTART: i32 = 2;
 const SQLITE_CHECKPOINT_TRUNCATE: i32 = 3;
 const SQLITE_INTEGER: i32 = 1;
 const SQLITE_FLOAT: i32 = 2;
+const SQLITE_ABORT: i32 = 4;
 const SQLITE_TEXT: i32 = 3;
 const SQLITE3_TEXT: i32 = 3;
 const SQLITE_BLOB: i32 = 4;
@@ -758,6 +774,744 @@ mod tests {
             }
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_multi_statement_dml() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Multiple DML statements in one exec call
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE bind_text(x TEXT);\
+              INSERT INTO bind_text(x) VALUES('TEXT1');\
+              INSERT INTO bind_text(x) VALUES('TEXT2');"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify the data was inserted
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM bind_text".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 2);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_multi_statement_with_semicolons_in_strings() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Semicolons inside strings should not split statements
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test_semicolon(x TEXT);\
+              INSERT INTO test_semicolon(x) VALUES('value;with;semicolons');\
+              INSERT INTO test_semicolon(x) VALUES(\"another;value\");"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify the values contain semicolons
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT x FROM test_semicolon ORDER BY rowid".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val1 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val1, "value;with;semicolons");
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val2 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val2, "another;value");
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_multi_statement_with_escaped_quotes() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Test escaped quotes
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test_quotes(x TEXT);\
+              INSERT INTO test_quotes(x) VALUES('it''s working');\
+              INSERT INTO test_quotes(x) VALUES(\"quote\"\"test\"\"\");"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT x FROM test_quotes ORDER BY rowid".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val1 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val1, "it's working");
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val2 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val2, "quote\"test\"");
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_with_select_callback() {
+        unsafe {
+            // Callback that collects results
+            unsafe extern "C" fn exec_callback(
+                context: *mut std::ffi::c_void,
+                n_cols: std::ffi::c_int,
+                values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let results = &mut *(context as *mut Vec<Vec<String>>);
+                let mut row = Vec::new();
+
+                for i in 0..n_cols as isize {
+                    let value_ptr = *values.offset(i);
+                    let value = if value_ptr.is_null() {
+                        String::from("NULL")
+                    } else {
+                        std::ffi::CStr::from_ptr(value_ptr)
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    row.push(value);
+                }
+                results.push(row);
+                0 // Continue
+            }
+
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Setup data
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test_select(id INTEGER, name TEXT);\
+              INSERT INTO test_select VALUES(1, 'Alice');\
+              INSERT INTO test_select VALUES(2, 'Bob');"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Execute SELECT with callback
+            let mut results: Vec<Vec<String>> = Vec::new();
+            let rc = sqlite3_exec(
+                db,
+                c"SELECT id, name FROM test_select ORDER BY id".as_ptr(),
+                Some(exec_callback),
+                &mut results as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0], vec!["1", "Alice"]);
+            assert_eq!(results[1], vec!["2", "Bob"]);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_multi_statement_mixed_dml_select() {
+        unsafe {
+            // Callback that counts invocations
+            unsafe extern "C" fn count_callback(
+                context: *mut std::ffi::c_void,
+                _n_cols: std::ffi::c_int,
+                _values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let count = &mut *(context as *mut i32);
+                *count += 1;
+                0
+            }
+
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut callback_count = 0;
+
+            // Mix of DDL/DML/DQL
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE mixed(x INTEGER);\
+              INSERT INTO mixed VALUES(1);\
+              INSERT INTO mixed VALUES(2);\
+              SELECT x FROM mixed;\
+              INSERT INTO mixed VALUES(3);\
+              SELECT COUNT(*) FROM mixed;"
+                    .as_ptr(),
+                Some(count_callback),
+                &mut callback_count as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Callback should be called 3 times total:
+            // 2 times for first SELECT (2 rows)
+            // 1 time for second SELECT (1 row with COUNT)
+            assert_eq!(callback_count, 3);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_callback_abort() {
+        unsafe {
+            // Callback that aborts after first row
+            unsafe extern "C" fn abort_callback(
+                context: *mut std::ffi::c_void,
+                _n_cols: std::ffi::c_int,
+                _values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let count = &mut *(context as *mut i32);
+                *count += 1;
+                if *count >= 1 {
+                    return 1; // Abort
+                }
+                0
+            }
+
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);\
+              INSERT INTO test VALUES(1),(2),(3);"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+
+            let mut count = 0;
+            let rc = sqlite3_exec(
+                db,
+                c"SELECT x FROM test".as_ptr(),
+                Some(abort_callback),
+                &mut count as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+
+            assert_eq!(rc, SQLITE_ABORT);
+            assert_eq!(count, 1); // Only processed one row before aborting
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_error_stops_execution() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut err_msg = ptr::null_mut();
+
+            // Second statement has error, third should not execute
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);\
+              INSERT INTO nonexistent VALUES(1);\
+              CREATE TABLE should_not_exist(y INTEGER);"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                &mut err_msg,
+            );
+
+            assert_eq!(rc, SQLITE_ERROR);
+
+            // Verify third statement didn't execute
+            let mut stmt = ptr::null_mut();
+            let check_rc = sqlite3_prepare_v2(
+                db,
+                c"SELECT name FROM sqlite_master WHERE type='table' AND name='should_not_exist'"
+                    .as_ptr(),
+                -1,
+                &mut stmt,
+                ptr::null_mut(),
+            );
+            assert_eq!(check_rc, SQLITE_OK);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE); // No rows = table doesn't exist
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            if !err_msg.is_null() {
+                sqlite3_free(err_msg as *mut std::ffi::c_void);
+            }
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_empty_statements() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Multiple semicolons and whitespace should be handled gracefully
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);;;\n\n;\t;INSERT INTO test VALUES(1);;;".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify both statements executed
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT x FROM test".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 1);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+    #[test]
+    fn test_exec_with_comments() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // SQL comments shouldn't affect statement splitting
+            let rc = sqlite3_exec(
+                db,
+                c"-- This is a comment\n\
+              CREATE TABLE test(x INTEGER); -- inline comment\n\
+              INSERT INTO test VALUES(1); -- semicolon in comment ;\n\
+              INSERT INTO test VALUES(2) -- end with comment"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify both inserts worked
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 2);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_nested_quotes() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Mix of quote types and nesting
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x TEXT);\
+              INSERT INTO test VALUES('single \"double\" inside');\
+              INSERT INTO test VALUES(\"double 'single' inside\");\
+              INSERT INTO test VALUES('mix;\"quote\";types');"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify values
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT x FROM test ORDER BY rowid".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val1 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val1, "single \"double\" inside");
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val2 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val2, "double 'single' inside");
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val3 = std::ffi::CStr::from_ptr(sqlite3_column_text(stmt, 0))
+                .to_str()
+                .unwrap();
+            assert_eq!(val3, "mix;\"quote\";types");
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_transaction_rollback() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Test transaction rollback in multi-statement
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);\
+              BEGIN TRANSACTION;\
+              INSERT INTO test VALUES(1);\
+              INSERT INTO test VALUES(2);\
+              ROLLBACK;"
+                    .as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Table should exist but be empty due to rollback
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 0); // No rows due to rollback
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_with_pragma() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // Callback to capture pragma results
+            unsafe extern "C" fn pragma_callback(
+                context: *mut std::ffi::c_void,
+                _n_cols: std::ffi::c_int,
+                _values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let count = &mut *(context as *mut i32);
+                *count += 1;
+                0
+            }
+
+            let mut callback_count = 0;
+
+            // PRAGMA should be treated as DQL when it returns results
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);\
+              PRAGMA table_info(test);"
+                    .as_ptr(),
+                Some(pragma_callback),
+                &mut callback_count as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert!(callback_count > 0); // PRAGMA should return at least one row
+
+            // PRAGMA without callback should discard row
+            let mut err_msg = ptr::null_mut();
+            let rc = sqlite3_exec(
+                db,
+                c"PRAGMA table_info(test)".as_ptr(),
+                None,
+                ptr::null_mut(),
+                &mut err_msg,
+            );
+            assert_eq!(rc, SQLITE_OK);
+            if !err_msg.is_null() {
+                sqlite3_free(err_msg as *mut std::ffi::c_void);
+            }
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_with_cte() {
+        unsafe {
+            // Callback that collects results
+            unsafe extern "C" fn exec_callback(
+                context: *mut std::ffi::c_void,
+                n_cols: std::ffi::c_int,
+                values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let results = &mut *(context as *mut Vec<Vec<String>>);
+                let mut row = Vec::new();
+                for i in 0..n_cols as isize {
+                    let value_ptr = *values.offset(i);
+                    let value = if value_ptr.is_null() {
+                        String::from("NULL")
+                    } else {
+                        std::ffi::CStr::from_ptr(value_ptr)
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    row.push(value);
+                }
+                results.push(row);
+                0
+            }
+
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            // CTE should be recognized as DQL
+            let mut results: Vec<Vec<String>> = Vec::new();
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(x INTEGER);\
+              INSERT INTO test VALUES(1),(2),(3);\
+              WITH cte AS (SELECT x FROM test WHERE x > 1) SELECT * FROM cte;"
+                    .as_ptr(),
+                Some(exec_callback),
+                &mut results as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(results.len(), 2); // Should get 2 and 3
+            assert_eq!(results[0], vec!["2"]);
+            assert_eq!(results[1], vec!["3"]);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_exec_with_returning_clause() {
+        unsafe {
+            // Callback for RETURNING results
+            unsafe extern "C" fn exec_callback(
+                context: *mut std::ffi::c_void,
+                n_cols: std::ffi::c_int,
+                values: *mut *mut std::ffi::c_char,
+                _cols: *mut *mut std::ffi::c_char,
+            ) -> std::ffi::c_int {
+                let results = &mut *(context as *mut Vec<Vec<String>>);
+                let mut row = Vec::new();
+                for i in 0..n_cols as isize {
+                    let value_ptr = *values.offset(i);
+                    let value = if value_ptr.is_null() {
+                        String::from("NULL")
+                    } else {
+                        std::ffi::CStr::from_ptr(value_ptr)
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    };
+                    row.push(value);
+                }
+                results.push(row);
+                0
+            }
+
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut results: Vec<Vec<String>> = Vec::new();
+
+            // INSERT...RETURNING with callback should capture the returned values
+            let rc = sqlite3_exec(
+                db,
+                c"CREATE TABLE test(id INTEGER PRIMARY KEY, x INTEGER);\
+              INSERT INTO test(x) VALUES(42) RETURNING id, x;"
+                    .as_ptr(),
+                Some(exec_callback),
+                &mut results as *mut _ as *mut std::ffi::c_void,
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0][1], "42"); // x value
+
+            // Add another row for testing
+            sqlite3_exec(
+                db,
+                c"INSERT INTO test(x) VALUES(99)".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+
+            // should still delete the row but discard the RETURNING results
+            let rc = sqlite3_exec(
+                db,
+                c"UPDATE test SET id = 3, x = 41 WHERE x=42 RETURNING id".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, SQLITE_OK);
+
+            // Verify the row was actually updated
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test WHERE x=42".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 0); // Should be 0 rows with x=42
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Verify
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT COUNT(*) FROM test".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int(stmt, 0), 2);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
