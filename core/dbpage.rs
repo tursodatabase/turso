@@ -4,7 +4,6 @@ use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, Result, Value};
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::debug;
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };
@@ -20,7 +19,6 @@ impl Default for DbPageTable {
 
 impl DbPageTable {
     pub fn new() -> Self {
-        debug!("DbPageTable::new - creating new sqlite_dbpage virtual table module");
         Self
     }
 }
@@ -34,12 +32,10 @@ impl InternalVirtualTable for DbPageTable {
         let schema =
             "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)"
                 .to_string();
-        debug!(schema = schema, "DbPageTable::sql - declaring schema");
         schema
     }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        debug!("DbPageTable::open - creating a new cursor");
         let pager = conn.get_pager();
         let cursor = DbPageCursor::new(pager);
         Ok(Arc::new(RwLock::new(cursor)))
@@ -90,11 +86,6 @@ impl InternalVirtualTable for DbPageTable {
             constraint_usages,
         };
 
-        debug!(
-            constraints = ?constraints,
-            plan = ?index_info,
-            "DbPageTable::best_index - determined query plan"
-        );
         Ok(index_info)
     }
 }
@@ -107,7 +98,6 @@ pub struct DbPageCursor {
 
 impl DbPageCursor {
     fn new(pager: Arc<Pager>) -> Self {
-        debug!("DbPageCursor::new - initializing cursor state");
         Self {
             pager,
             pgno: 1,
@@ -118,8 +108,6 @@ impl DbPageCursor {
 
 impl InternalVirtualTableCursor for DbPageCursor {
     fn filter(&mut self, args: &[Value], _idx_str: Option<String>, idx_num: i32) -> Result<bool> {
-        debug!(idx_num, args = ?args, "DbPageCursor::filter - initializing scan");
-
         let db_size = self
             .pager
             .io
@@ -134,7 +122,6 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 0
             };
 
-            debug!(pgno, "DbPageCursor::filter - point query for specific page");
             if pgno > 0 && pgno <= self.mx_pgno {
                 self.pgno = pgno;
                 self.mx_pgno = pgno;
@@ -142,10 +129,6 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 self.mx_pgno = 0;
             }
         } else {
-            debug!(
-                max_page = self.mx_pgno,
-                "DbPageCursor::filter - full table scan"
-            );
             self.pgno = 1;
         }
 
@@ -153,21 +136,11 @@ impl InternalVirtualTableCursor for DbPageCursor {
     }
 
     fn next(&mut self) -> Result<bool> {
-        debug!(
-            current_pgno = self.pgno,
-            max_pgno = self.mx_pgno,
-            "DbPageCursor::next - advancing cursor"
-        );
         self.pgno += 1;
         Ok(self.pgno <= self.mx_pgno)
     }
 
     fn column(&self, column: usize) -> Result<Value> {
-        debug!(
-            column_idx = column,
-            pgno = self.pgno,
-            "DbPageCursor::column - fetching data"
-        );
         match column {
             0 => Ok(Value::Integer(self.pgno)),
             1 => {
@@ -186,10 +159,6 @@ impl InternalVirtualTableCursor for DbPageCursor {
     }
 
     fn rowid(&self) -> i64 {
-        debug!(
-            pgno = self.pgno,
-            "DbPageCursor::rowid - returning current page number"
-        );
         self.pgno
     }
 }
