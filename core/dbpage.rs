@@ -29,10 +29,7 @@ impl InternalVirtualTable for DbPageTable {
     }
 
     fn sql(&self) -> String {
-        let schema =
-            "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)"
-                .to_string();
-        schema
+        "CREATE TABLE sqlite_dbpage(pgno INTEGER PRIMARY KEY, data BLOB, schema HIDDEN)".to_string()
     }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
