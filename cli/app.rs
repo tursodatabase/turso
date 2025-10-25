@@ -178,6 +178,18 @@ impl<'a> RowStepper<'a> {
     }
 }
 
+/// metadata from db, fetched from pragmas
+struct DbMetadata {
+    page_size: i64,
+    page_count: i64,
+    filename: String,
+}
+
+struct DbPage<'a> {
+    pgno: i64,
+    data: &'a [u8],
+}
+
 impl Limbo {
     pub fn new() -> anyhow::Result<(Self, WorkerGuard)> {
         let mut opts = Opts::parse();
@@ -1814,97 +1826,106 @@ impl Limbo {
         }
     }
 
-    fn dump_database_as_text(&mut self) -> anyhow::Result<()> {
-        tracing::debug!("Executing .dbtotxt command");
+    fn fetch_db_metadata(&mut self) -> anyhow::Result<DbMetadata> {
         let page_size: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_size")? {
             fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_size")?
         } else {
             anyhow::bail!("Failed to prepare PRAGMA page_size");
         };
-        tracing::debug!(page_size, "Fetched page size");
 
         let page_count: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_count")? {
             fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_count")?
         } else {
             anyhow::bail!("Failed to prepare PRAGMA page_count");
         };
-        tracing::debug!(page_count, "Fetched page count");
 
-        let db_filename = PathBuf::from(self.opts.db_file.clone())
+        let filename = PathBuf::from(self.opts.db_file.clone())
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
+        Ok(DbMetadata {
+            page_size,
+            page_count,
+            filename,
+        })
+    }
+
+
+    fn write_page_hexdump(&mut self, page: &DbPage, page_size: i64) -> anyhow::Result<()> {
+        let mut seen_page_label = false;
+
+        for (i, chunk) in page.data.chunks(16).enumerate() {
+            if chunk.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            if !seen_page_label {
+                writeln!(self, "| page {} offset {}", page.pgno, (page.pgno - 1) * page_size)?;
+                seen_page_label = true;
+            }
+
+            // Line offset
+            write!(self, "|  {:5}:", i * 16)?;
+
+            // Hex bytes
+            for byte in chunk {
+                write!(self, " {:02x}", byte)?;
+            }
+            for _ in 0..(16 - chunk.len()) {
+                write!(self, "   ")?; // Pad partial lines
+            }
+
+            write!(self, "   ")?;
+
+            // ASCII
+            for &byte in chunk {
+                let ch = match byte {
+                    b' '..=b'~' if ![b'{', b'}', b'"', b'\\'].contains(&byte) => byte as char,
+                    _ => '.',
+                };
+                write!(self, "{}", ch)?;
+            }
+            writeln!(self)?;
+        }
+        Ok(())
+    }
+
+    fn dump_database_as_text(&mut self) -> anyhow::Result<()> {
+
+        let metadata = self.fetch_db_metadata()?;
+        tracing::debug!(page_size = metadata.page_size, page_count = metadata.page_count, "Fetched metadata");
+
         writeln!(
             self,
             "| size {} pagesize {} filename {}",
-            page_count * page_size,
-            page_size,
-            db_filename
+            metadata.page_count * metadata.page_size,
+            metadata.page_size,
+            &metadata.filename
         )?;
 
         let dump_sql = "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno";
         if let Some(mut rows) = self.conn.query(dump_sql)? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let pgno: i64 = row.get(0)?;
 
-                        let value: &Value = row.get(1)?;
-                        let data: &[u8] = match value {
-                            Value::Blob(bytes) => bytes,
-                            _ => &[],
-                        };
+            step_rows::<_, ()>(&mut rows, |rows| {
+                let row = rows.row().unwrap();
+                let pgno: i64 = row.get(0)?;
+                let value: &Value = row.get(1)?;
+                let data: &[u8] = match value {
+                    Value::Blob(bytes) => bytes,
+                    _ => &[],
+                };
+                
+                let page = DbPage { pgno, data };
+                self.write_page_hexdump(&page, metadata.page_size)?;
 
-                        let mut seen_page_label = false;
-
-                        for (i, chunk) in data.chunks(16).enumerate() {
-                            if chunk.iter().all(|&b| b == 0) {
-                                continue;
-                            }
-
-                            if !seen_page_label {
-                                writeln!(
-                                    self,
-                                    "| page {} offset {}",
-                                    pgno,
-                                    (pgno - 1) * page_size
-                                )?;
-                                seen_page_label = true;
-                            }
-
-                            write!(self, "|  {:5}:", i * 16)?;
-
-                            for byte in chunk {
-                                write!(self, " {:02x}", byte)?;
-                            }
-                            for _ in 0..(16 - chunk.len()) {
-                                write!(self, "   ")?;
-                            }
-
-                            write!(self, "   ")?;
-
-                            for &byte in chunk {
-                                let char_to_print = match byte {
-                                    b' '..=b'~' if ![b'{', b'}', b'"', b'\\'].contains(&byte) => {
-                                        byte as char
-                                    }
-                                    _ => '.',
-                                };
-                                write!(self, "{}", char_to_print)?;
-                            }
-                            writeln!(self)?;
-                        }
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
-                }
-            }
+                Ok(StepControl::Continue)
+            })?;
         }
-        writeln!(self, "| end {}", db_filename)?;
+
+        writeln!(self, "| end {}", &metadata.filename)?;
+
         Ok(())
     }
 }
@@ -1928,7 +1949,7 @@ fn sql_quote_string(s: &str) -> String {
     for ch in s.chars() {
         if ch == '\'' {
             out.push('\'');
-        } // escape as ''
+        }
         out.push(ch);
     }
     out.push('\'');
@@ -1943,21 +1964,35 @@ impl Drop for Limbo {
     }
 }
 
-fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
+enum StepControl<T> {
+    Continue,
+    Break(T),
+}
+
+fn step_rows<F, T>(rows: &mut turso_core::Statement, mut callback: F) -> anyhow::Result<Option<T>>
+where
+    F: FnMut(&turso_core::Statement) -> anyhow::Result<StepControl<T>>,
+{
     loop {
         match rows.step()? {
             StepResult::Row => {
-                return Ok(rows.row().unwrap().get(0)?);
+                if let StepControl::Break(val) = callback(rows)? {
+                    return Ok(Some(val));
+                }
             }
-            StepResult::IO => {
-                rows.run_once()?;
-            }
-            StepResult::Busy => {
-                return Err(anyhow!("database is busy..."));
-            }
-            StepResult::Done | StepResult::Interrupt => {
-                return Err(anyhow!("query did not return a row"));
-            }
+            StepResult::IO => rows.run_once()?,
+            StepResult::Done | StepResult::Interrupt => break,
+            StepResult::Busy => anyhow::bail!("database is busy"),
         }
     }
+    Ok(None)
+}
+
+fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
+    let result = step_rows(rows, |rows| {
+        let row_val: i64 = rows.row().unwrap().get(0)?;
+        Ok(StepControl::Break(row_val))
+    })?;
+
+    result.ok_or_else(|| anyhow!("query did not return a row"))
 }
