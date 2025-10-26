@@ -240,59 +240,56 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   }
 
   @Override
+  @Nullable
   public String getString(String columnLabel) throws SQLException {
-    final Object result = this.resultSet.get(columnLabel);
-    if (result == null) {
-      return "";
-    }
-
-    return wrapTypeConversion(() -> (String) result);
+    return getString(findColumn(columnLabel));
   }
 
   @Override
   public boolean getBoolean(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBoolean(findColumn(columnLabel));
   }
 
   @Override
   public byte getByte(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getByte(findColumn(columnLabel));
   }
 
   @Override
   public short getShort(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getShort(findColumn(columnLabel));
   }
 
   @Override
   public int getInt(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getInt(findColumn(columnLabel));
   }
 
   @Override
   public long getLong(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getLong(findColumn(columnLabel));
   }
 
   @Override
   public float getFloat(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getFloat(findColumn(columnLabel));
   }
 
   @Override
   public double getDouble(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getDouble(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public BigDecimal getBigDecimal(String columnLabel, int scale) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBigDecimal(findColumn(columnLabel), scale);
   }
 
   @Override
+  @Nullable
   public byte[] getBytes(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBytes(findColumn(columnLabel));
   }
 
   @Override
@@ -323,7 +320,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public Time getTime(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getTime(findColumn(columnLabel));
   }
 
   @Override
