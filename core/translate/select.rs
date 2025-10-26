@@ -11,7 +11,7 @@ use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    resolve_window_and_aggregate_functions,
+    resolve_window_and_aggregate_functions, SUBQUERY_PREFIX,
 };
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
@@ -324,6 +324,12 @@ fn prepare_one_select_plan(
                     }
                     ResultColumn::TableStar(name) => {
                         let name_normalized = normalize_ident(name.as_str());
+                        if name_normalized.starts_with(SUBQUERY_PREFIX) {
+                            crate::bail_parse_error!(
+                                "Table names starting with '{}' are reserved for internal use",
+                                SUBQUERY_PREFIX
+                            );
+                        }
                         let referenced_table = plan
                             .table_references
                             .joined_tables_mut()
@@ -368,11 +374,22 @@ fn prepare_one_select_plan(
                             &mut aggregate_expressions,
                             Some(&mut windows),
                         )?;
+                        let alias = match maybe_alias {
+                            Some(ast::As::Elided(alias) | ast::As::As(alias))
+                                if alias.as_str().starts_with(SUBQUERY_PREFIX) =>
+                            {
+                                crate::bail_parse_error!(
+                                    "Aliases starting with '{}' are reserved for internal use",
+                                    SUBQUERY_PREFIX
+                                );
+                            }
+                            Some(ast::As::Elided(alias) | ast::As::As(alias)) => {
+                                Some(alias.as_str().to_string())
+                            }
+                            None => None,
+                        };
                         plan.result_columns.push(ResultSetColumn {
-                            alias: maybe_alias.as_ref().map(|alias| match alias {
-                                ast::As::Elided(alias) => alias.as_str().to_string(),
-                                ast::As::As(alias) => alias.as_str().to_string(),
-                            }),
+                            alias,
                             expr: expr.as_ref().clone(),
                             contains_aggregates,
                         });

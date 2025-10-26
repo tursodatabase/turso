@@ -1094,3 +1094,8 @@ do_execsql_test_on_specific_db {:memory:} unambiguous-self-join {
 3|1
 3|2
 3|3}
+
+# https://github.com/tursodatabase/turso/issues/3620 regression test
+do_execsql_test subquery-disambiguation {
+	select subquery_0.* from (values (1)) inner join (values (2)) subquery_0;
+} {2}
