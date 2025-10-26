@@ -408,7 +408,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .write()
+                    .load()
                     .wal_checkpoint_start(*checkpoint_mode);
                 match step_result {
                     Ok(IOResult::Done(result)) => {
@@ -429,7 +429,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .write()
+                    .load()
                     .wal_checkpoint_finish(result.as_mut().unwrap());
                 match step_result {
                     Ok(IOResult::Done(())) => {
@@ -7689,7 +7689,7 @@ pub fn op_open_ephemeral(
             let page_size =
                 return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
-            let io = conn.pager.read().io.clone();
+            let io = conn.pager.load().io.clone();
             let rand_num = io.generate_random_number();
             let db_file;
             let db_file_io: Arc<dyn crate::IO>;

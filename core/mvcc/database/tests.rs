@@ -125,7 +125,7 @@ fn test_insert_read() {
 
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -145,7 +145,7 @@ fn test_insert_read() {
 
     let tx2 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row = db
         .mvcc_store
@@ -166,7 +166,7 @@ fn test_read_nonexistent() {
     let db = MvccTestDb::new();
     let tx = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row = db.mvcc_store.read(
         tx,
@@ -184,7 +184,7 @@ fn test_delete() {
 
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -224,7 +224,7 @@ fn test_delete() {
 
     let tx2 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row = db
         .mvcc_store
@@ -244,7 +244,7 @@ fn test_delete_nonexistent() {
     let db = MvccTestDb::new();
     let tx = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     assert!(!db
         .mvcc_store
@@ -263,7 +263,7 @@ fn test_commit() {
     let db = MvccTestDb::new();
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -297,7 +297,7 @@ fn test_commit() {
 
     let tx2 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row = db
         .mvcc_store
@@ -320,7 +320,7 @@ fn test_rollback() {
     let db = MvccTestDb::new();
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row1 = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, row1.clone()).unwrap();
@@ -351,10 +351,10 @@ fn test_rollback() {
         .unwrap();
     assert_eq!(row3, row4);
     db.mvcc_store
-        .rollback_tx(tx1, db.conn.pager.read().clone(), &db.conn);
+        .rollback_tx(tx1, db.conn.pager.load().clone(), &db.conn);
     let tx2 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row5 = db
         .mvcc_store
@@ -376,7 +376,7 @@ fn test_dirty_write() {
     // T1 inserts a row with ID 1, but does not commit.
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -395,7 +395,7 @@ fn test_dirty_write() {
 
     let conn2 = db.db.connect().unwrap();
     // T2 attempts to delete row with ID 1, but fails because T1 has not committed.
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "World");
     assert!(!db.mvcc_store.update(tx2, tx2_row).unwrap());
 
@@ -420,14 +420,14 @@ fn test_dirty_read() {
     // T1 inserts a row with ID 1, but does not commit.
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let row1 = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, row1).unwrap();
 
     // T2 attempts to read row with ID 1, but doesn't see one because T1 has not committed.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let row2 = db
         .mvcc_store
         .read(
@@ -448,7 +448,7 @@ fn test_dirty_read_deleted() {
     // T1 inserts a row with ID 1 and commits.
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -456,7 +456,7 @@ fn test_dirty_read_deleted() {
 
     // T2 deletes row with ID 1, but does not commit.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     assert!(db
         .mvcc_store
         .delete(
@@ -470,7 +470,7 @@ fn test_dirty_read_deleted() {
 
     // T3 reads row with ID 1, but doesn't see the delete because T2 hasn't committed.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.read().clone()).unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -492,7 +492,7 @@ fn test_fuzzy_read() {
     // T1 inserts a row with ID 1 and commits.
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "First");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -512,7 +512,7 @@ fn test_fuzzy_read() {
 
     // T2 reads the row with ID 1 within an active transaction.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -528,7 +528,7 @@ fn test_fuzzy_read() {
 
     // T3 updates the row and commits.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.read().clone()).unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let tx3_row = generate_simple_string_row((-2).into(), 1, "Second");
     db.mvcc_store.update(tx3, tx3_row).unwrap();
     commit_tx(db.mvcc_store.clone(), &conn3, tx3).unwrap();
@@ -561,7 +561,7 @@ fn test_lost_update() {
     // T1 inserts a row with ID 1 and commits.
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -581,13 +581,13 @@ fn test_lost_update() {
 
     // T2 attempts to update row ID 1 within an active transaction.
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "World");
     assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
 
     // T3 also attempts to update row ID 1 within an active transaction.
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.read().clone()).unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let tx3_row = generate_simple_string_row((-2).into(), 1, "Hello, world!");
     assert!(matches!(
         db.mvcc_store.update(tx3, tx3_row),
@@ -595,7 +595,7 @@ fn test_lost_update() {
     ));
     // hack: in the actual tursodb database we rollback the mvcc tx ourselves, so manually roll it back here
     db.mvcc_store
-        .rollback_tx(tx3, conn3.pager.read().clone(), &conn3);
+        .rollback_tx(tx3, conn3.pager.load().clone(), &conn3);
 
     commit_tx(db.mvcc_store.clone(), &conn2, tx2).unwrap();
     assert!(matches!(
@@ -604,7 +604,7 @@ fn test_lost_update() {
     ));
 
     let conn4 = db.db.connect().unwrap();
-    let tx4 = db.mvcc_store.begin_tx(conn4.pager.read().clone()).unwrap();
+    let tx4 = db.mvcc_store.begin_tx(conn4.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -628,7 +628,7 @@ fn test_committed_visibility() {
     // let's add $10 to my account since I like money
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let tx1_row = generate_simple_string_row((-2).into(), 1, "10");
     db.mvcc_store.insert(tx1, tx1_row.clone()).unwrap();
@@ -636,7 +636,7 @@ fn test_committed_visibility() {
 
     // but I like more money, so let me try adding $10 more
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "20");
     assert!(db.mvcc_store.update(tx2, tx2_row.clone()).unwrap());
     let row = db
@@ -654,7 +654,7 @@ fn test_committed_visibility() {
 
     // can I check how much money I have?
     let conn3 = db.db.connect().unwrap();
-    let tx3 = db.mvcc_store.begin_tx(conn3.pager.read().clone()).unwrap();
+    let tx3 = db.mvcc_store.begin_tx(conn3.pager.load().clone()).unwrap();
     let row = db
         .mvcc_store
         .read(
@@ -676,11 +676,11 @@ fn test_future_row() {
 
     let tx1 = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
 
     let conn2 = db.db.connect().unwrap();
-    let tx2 = db.mvcc_store.begin_tx(conn2.pager.read().clone()).unwrap();
+    let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
     let tx2_row = generate_simple_string_row((-2).into(), 1, "Hello");
     db.mvcc_store.insert(tx2, tx2_row).unwrap();
 
@@ -726,7 +726,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
     let db = MvccTestDb::new();
     let tx_id = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
 
     let table_id = MVTableId::new(-1);
@@ -749,7 +749,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
 
     let tx_id = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     (db, tx_id)
 }
@@ -758,7 +758,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
     let db = MvccTestDb::new();
     let tx_id = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
 
     let table_id = -1;
@@ -774,7 +774,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
 
     let tx_id = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     (db, tx_id)
 }
@@ -829,8 +829,8 @@ fn test_lazy_scan_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.read().clone(),
-        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
+        db.conn.pager.load().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
 
@@ -872,8 +872,8 @@ fn test_lazy_scan_cursor_with_gaps() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.read().clone(),
-        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
+        db.conn.pager.load().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
 
@@ -924,8 +924,8 @@ fn test_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.read().clone(),
-        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
+        db.conn.pager.load().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
 
@@ -964,13 +964,13 @@ fn test_cursor_with_empty_table() {
     let db = MvccTestDb::new();
     {
         // FIXME: force page 1 initialization
-        let pager = db.conn.pager.read().clone();
+        let pager = db.conn.pager.load().clone();
         let tx_id = db.mvcc_store.begin_tx(pager.clone()).unwrap();
         commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
     }
     let tx_id = db
         .mvcc_store
-        .begin_tx(db.conn.pager.read().clone())
+        .begin_tx(db.conn.pager.load().clone())
         .unwrap();
     let table_id = -1; // Empty table
 
@@ -979,8 +979,8 @@ fn test_cursor_with_empty_table() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.read().clone(),
-        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
+        db.conn.pager.load().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
     assert!(cursor.is_empty());
@@ -997,8 +997,8 @@ fn test_cursor_modification_during_scan() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.read().clone(),
-        Box::new(BTreeCursor::new(db.conn.pager.read().clone(), table_id, 1)),
+        db.conn.pager.load().clone(),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
 
@@ -1202,7 +1202,7 @@ fn test_restart() {
     {
         let conn = db.connect();
         let mvcc_store = db.get_mvcc_store();
-        let tx_id = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
         // insert table id -2 into sqlite_schema table (table_id -1)
         let data = ImmutableRecord::from_values(
             &[
@@ -1240,13 +1240,13 @@ fn test_restart() {
     {
         let conn = db.connect();
         let mvcc_store = db.get_mvcc_store();
-        let tx_id = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
         let row = generate_simple_string_row((-2).into(), 2, "bar");
 
         mvcc_store.insert(tx_id, row).unwrap();
         commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
 
-        let tx_id = mvcc_store.begin_tx(conn.pager.read().clone()).unwrap();
+        let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
         let row = mvcc_store
             .read(tx_id, RowID::new((-2).into(), 2))
             .unwrap()
