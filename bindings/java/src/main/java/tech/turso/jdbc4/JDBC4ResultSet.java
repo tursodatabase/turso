@@ -1,5 +1,6 @@
 package tech.turso.jdbc4;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.Reader;
 import java.io.StringReader;
@@ -49,7 +50,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public boolean wasNull() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return wasNull;
   }
 
   @Override
@@ -224,19 +225,53 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public InputStream getAsciiStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(() -> {
+      if (result instanceof String) {
+        return new ByteArrayInputStream(((String) result).getBytes("US-ASCII"));
+      } else if (result instanceof byte[]) {
+        return new ByteArrayInputStream((byte[]) result);
+      }
+      throw new SQLException("Cannot convert to ASCII stream: " + result.getClass());
+    });
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getUnicodeStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(() -> {
+      if (result instanceof String) {
+        return new ByteArrayInputStream(((String) result).getBytes("UTF-8"));
+      } else if (result instanceof byte[]) {
+        return new ByteArrayInputStream((byte[]) result);
+      }
+      throw new SQLException("Cannot convert to Unicode stream: " + result.getClass());
+    });
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getBinaryStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(() -> {
+      if (result instanceof byte[]) {
+        return new ByteArrayInputStream((byte[]) result);
+      }
+      throw new SQLException("Cannot convert to binary stream: " + result.getClass());
+    });
   }
 
   @Override
@@ -332,19 +367,19 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public InputStream getAsciiStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getAsciiStream(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getUnicodeStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getUnicodeStream(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getBinaryStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBinaryStream(findColumn(columnLabel));
   }
 
   @Override
