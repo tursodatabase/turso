@@ -786,9 +786,9 @@ impl Limbo {
                         let _ = self.writeln(e.to_string());
                     }
                 }
-                Command::Dbtotxt => {
-                    if let Err(e) = self.dump_database_as_text() {
-                        let _ = self.writeln_fmt(format_args!("/****** ERROR: {e} ******/"));
+                Command::Dbtotxt(args) => {
+                    if let Err(e) = self.dump_database_as_text(args.page_no) {
+                        let _ = self.writeln_fmt(format_args!("ERROR:{e}"));
                     }
                 }
             },
@@ -1896,7 +1896,7 @@ impl Limbo {
         Ok(())
     }
 
-    fn dump_database_as_text(&mut self) -> anyhow::Result<()> {
+    fn dump_database_as_text(&mut self, page_no: Option<i64>) -> anyhow::Result<()> {
         let metadata = self.fetch_db_metadata()?;
         tracing::debug!(
             page_size = metadata.page_size,
@@ -1912,8 +1912,13 @@ impl Limbo {
             &metadata.filename
         )?;
 
-        let dump_sql = "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno";
-        if let Some(mut rows) = self.conn.query(dump_sql)? {
+        let dump_sql = if let Some(pgno) = page_no {
+            format!("SELECT pgno, data FROM sqlite_dbpage WHERE pgno = {pgno}")
+        } else {
+            "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno".to_string()
+        };
+
+        if let Some(mut rows) = self.conn.query(&dump_sql)? {
             step_rows::<_, ()>(&mut rows, |rows| {
                 let row = rows.row().unwrap();
                 let pgno: i64 = row.get(0)?;
