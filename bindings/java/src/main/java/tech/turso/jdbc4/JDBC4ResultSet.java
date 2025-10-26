@@ -31,6 +31,7 @@ import tech.turso.core.TursoResultSet;
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;
+  private boolean wasNull = false;
 
   public JDBC4ResultSet(TursoResultSet resultSet) {
     this.resultSet = resultSet;
@@ -55,6 +56,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public String getString(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -64,6 +66,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public boolean getBoolean(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return false;
     }
@@ -73,6 +76,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public byte getByte(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -82,6 +86,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public short getShort(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -91,6 +96,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public int getInt(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -100,6 +106,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public long getLong(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -109,6 +116,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public float getFloat(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -118,6 +126,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public double getDouble(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -129,6 +138,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public BigDecimal getBigDecimal(int columnIndex, int scale) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -141,6 +151,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public byte[] getBytes(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -151,6 +162,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public Date getDate(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -171,6 +183,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Time getTime(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -191,6 +204,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Timestamp getTimestamp(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -285,6 +299,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public Date getDate(String columnLabel) throws SQLException {
     final Object result = resultSet.get(columnLabel);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -386,6 +401,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Reader getCharacterStream(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -402,6 +418,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public BigDecimal getBigDecimal(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
