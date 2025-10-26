@@ -899,19 +899,19 @@ class JDBC4ResultSetTest {
   @Test
   void test_columnLabel_getters() throws Exception {
     stmt.executeUpdate(
-        "CREATE TABLE test_column_label (" +
-            "bool_col INTEGER, " +
-            "byte_col INTEGER, " +
-            "short_col INTEGER, " +
-            "int_col INTEGER, " +
-            "long_col BIGINT, " +
-            "float_col REAL, " +
-            "double_col REAL, " +
-            "bytes_col BLOB);");
+        "CREATE TABLE test_column_label ("
+            + "bool_col INTEGER, "
+            + "byte_col INTEGER, "
+            + "short_col INTEGER, "
+            + "int_col INTEGER, "
+            + "long_col BIGINT, "
+            + "float_col REAL, "
+            + "double_col REAL, "
+            + "bytes_col BLOB);");
 
     stmt.executeUpdate(
-        "INSERT INTO test_column_label VALUES (" +
-            "1, 127, 32767, 2147483647, 9223372036854775807, 3.14, 2.718281828, X'48656C6C6F');");
+        "INSERT INTO test_column_label VALUES ("
+            + "1, 127, 32767, 2147483647, 9223372036854775807, 3.14, 2.718281828, X'48656C6C6F');");
 
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_column_label");
     assertTrue(resultSet.next());
@@ -1122,11 +1122,11 @@ class JDBC4ResultSetTest {
   @Test
   void test_wasNull_consistency_across_types() throws Exception {
     stmt.executeUpdate(
-        "CREATE TABLE test_null_types (" +
-            "int_col INTEGER, " +
-            "text_col TEXT, " +
-            "real_col REAL, " +
-            "blob_col BLOB);");
+        "CREATE TABLE test_null_types ("
+            + "int_col INTEGER, "
+            + "text_col TEXT, "
+            + "real_col REAL, "
+            + "blob_col BLOB);");
     stmt.executeUpdate("INSERT INTO test_null_types VALUES (NULL, NULL, NULL, NULL);");
 
     ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_null_types");

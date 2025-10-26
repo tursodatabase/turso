@@ -236,14 +236,15 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (result == null) {
       return null;
     }
-    return wrapTypeConversion(() -> {
-      if (result instanceof String) {
-        return new ByteArrayInputStream(((String) result).getBytes("US-ASCII"));
-      } else if (result instanceof byte[]) {
-        return new ByteArrayInputStream((byte[]) result);
-      }
-      throw new SQLException("Cannot convert to ASCII stream: " + result.getClass());
-    });
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof String) {
+            return new ByteArrayInputStream(((String) result).getBytes("US-ASCII"));
+          } else if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to ASCII stream: " + result.getClass());
+        });
   }
 
   @Override
@@ -254,14 +255,15 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (result == null) {
       return null;
     }
-    return wrapTypeConversion(() -> {
-      if (result instanceof String) {
-        return new ByteArrayInputStream(((String) result).getBytes("UTF-8"));
-      } else if (result instanceof byte[]) {
-        return new ByteArrayInputStream((byte[]) result);
-      }
-      throw new SQLException("Cannot convert to Unicode stream: " + result.getClass());
-    });
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof String) {
+            return new ByteArrayInputStream(((String) result).getBytes("UTF-8"));
+          } else if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to Unicode stream: " + result.getClass());
+        });
   }
 
   @Override
@@ -272,12 +274,13 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (result == null) {
       return null;
     }
-    return wrapTypeConversion(() -> {
-      if (result instanceof byte[]) {
-        return new ByteArrayInputStream((byte[]) result);
-      }
-      throw new SQLException("Cannot convert to binary stream: " + result.getClass());
-    });
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to binary stream: " + result.getClass());
+        });
   }
 
   @Override
