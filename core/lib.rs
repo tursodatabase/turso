@@ -64,6 +64,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use schema::Schema;
 use std::task::Waker;
 use std::{
@@ -562,7 +563,7 @@ impl Database {
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().unwrap().clone()),
-            database_schemas: RwLock::new(std::collections::HashMap::new()),
+            database_schemas: RwLock::new(FxHashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
@@ -1066,7 +1067,7 @@ pub struct Connection {
     schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
+    database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
     transaction_state: AtomicTransactionState,

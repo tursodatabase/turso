@@ -1,8 +1,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -679,7 +680,7 @@ pub struct WalFileShared {
     // One difference between SQLite and limbo is that we will never support multi process, meaning
     // we don't need WAL's index file. So we can do stuff like this without shared memory.
     // TODO: this will need refactoring because this is incredible memory inefficient.
-    pub frame_cache: Arc<SpinLock<HashMap<u64, Vec<u64>>>>,
+    pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub file: Option<Arc<dyn File>>,
     /// Read locks advertise the maximum WAL frame a reader may access.
@@ -1394,7 +1395,7 @@ impl Wal for WalFile {
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
         let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
-        let mut seen = HashSet::new();
+        let mut seen = FxHashSet::default();
         turso_assert!(
             frame_count >= frame_watermark,
             "frame_count must be not less than frame_watermark: {} vs {}",
@@ -2353,7 +2354,7 @@ impl WalFileShared {
             max_frame: AtomicU64::new(0),
             nbackfills: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(HashMap::new())),
+            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
             last_checksum: (0, 0),
             file: None,
             read_locks,
@@ -2398,7 +2399,7 @@ impl WalFileShared {
             max_frame: AtomicU64::new(0),
             nbackfills: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(HashMap::new())),
+            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
             last_checksum: (0, 0),
             file: Some(file),
             read_locks,

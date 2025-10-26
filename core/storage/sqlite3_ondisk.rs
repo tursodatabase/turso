@@ -66,7 +66,8 @@ use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1646,7 +1647,7 @@ pub fn build_shared_wal(
         max_frame: AtomicU64::new(0),
         nbackfills: AtomicU64::new(0),
         transaction_count: AtomicU64::new(0),
-        frame_cache: Arc::new(SpinLock::new(HashMap::new())),
+        frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
         last_checksum: (0, 0),
         file: Some(file.clone()),
         read_locks,
@@ -1711,7 +1712,7 @@ struct StreamingState {
     frame_idx: u64,
     cumulative_checksum: (u32, u32),
     last_valid_frame: u64,
-    pending_frames: HashMap<u64, Vec<u64>>,
+    pending_frames: FxHashMap<u64, Vec<u64>>,
     page_size: usize,
     use_native_endian: bool,
     header_valid: bool,
@@ -1736,7 +1737,7 @@ impl StreamingWalReader {
                 frame_idx: 1,
                 cumulative_checksum: (0, 0),
                 last_valid_frame: 0,
-                pending_frames: HashMap::new(),
+                pending_frames: FxHashMap::default(),
                 page_size: 0,
                 use_native_endian: false,
                 header_valid: false,
