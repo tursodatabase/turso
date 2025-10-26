@@ -2,7 +2,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{likeop::exec_glob, numeric::Numeric, types, Value};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -249,21 +249,21 @@ impl SimValue {
         }
     }
 
-    // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+        escape: Option<&Value>,
+    ) -> bool {
+        let lhs = self.0.to_string();
+        let rhs = other.0.to_string();
+
         match operator {
-            ast::LikeOperator::Glob => todo!(),
+            ast::LikeOperator::Glob => exec_glob(None, lhs.as_str(), rhs.as_str()),
             ast::LikeOperator::Like => {
-                // TODO: support ESCAPE `expr` option in AST
-                // TODO: regex cache
-                types::Value::exec_like(
-                    None,
-                    other.0.to_string().as_str(),
-                    self.0.to_string().as_str(),
-                )
+                types::Value::exec_like(None, rhs.as_str(), rhs.as_str(), escape).unwrap()
             }
-            ast::LikeOperator::Match => todo!(),
-            ast::LikeOperator::Regexp => todo!(),
+            ast::LikeOperator::Match | ast::LikeOperator::Regexp => todo!(),
         }
     }
 

@@ -1,6 +1,5 @@
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use turso_parser::ast::{
     self,
     fmt::{BlankContext, ToTokens},
@@ -122,13 +121,17 @@ pub fn expr_to_value<T: TableContext>(
             not,
             op,
             rhs,
-            escape: _, // TODO: support escape
+            escape,
         } => {
             let lhs = expr_to_value(lhs, row, table)?;
             let rhs = expr_to_value(rhs, row, table)?;
-            let res = lhs.like_compare(&rhs, *op);
-            let value: SimValue = if *not { !res } else { res }.into();
-            Some(value)
+            let escape = if let Some(e) = escape {
+                expr_to_value(e, row, table).map(|v| v.0)
+            } else {
+                None
+            };
+            let result = lhs.like_compare(&rhs, *op, escape.as_ref());
+            Some(if *not { !result } else { result }.into())
         }
         ast::Expr::Unary(op, expr) => {
             let value = expr_to_value(expr, row, table)?;
