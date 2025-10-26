@@ -94,6 +94,7 @@ fn setup_database(db_path: &str) -> Result<Connection> {
 
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "fullfsync", "true")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_table (
@@ -114,15 +115,18 @@ fn worker_thread(
     start_barrier: Arc<Barrier>,
     compute_usec: u64,
 ) -> Result<u64> {
-    let conn = Connection::open(&db_path)?;
-
-    conn.busy_timeout(std::time::Duration::from_secs(30))?;
-
     start_barrier.wait();
 
     let mut total_inserts = 0;
 
     for iteration in 0..iterations {
+        let conn = Connection::open(&db_path)?;
+
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "fullfsync", "true")?;
+
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+
         let mut stmt = conn.prepare("INSERT INTO test_table (id, data) VALUES (?, ?)")?;
 
         conn.execute("BEGIN", [])?;

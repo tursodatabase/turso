@@ -95,6 +95,20 @@ fn update_pragma(
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
+        if let Expr::Literal(Literal::Numeric(n)) = expr {
+            return !matches!(n.as_str(), "0");
+        };
+        let name_bytes = match expr {
+            Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+            Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+            _ => "".as_bytes(),
+        };
+        match_ignore_ascii_case!(match name_bytes {
+            b"ON" | b"TRUE" | b"YES" | b"1" => true,
+            _ => false,
+        })
+    };
     match pragma {
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
@@ -343,39 +357,32 @@ fn update_pragma(
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
-
-            let mode = match value {
-                Expr::Name(name) => {
-                    let name_bytes = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name_bytes {
-                        b"OFF" | b"FALSE" | b"NO" | b"0" => SyncMode::Off,
-                        _ => SyncMode::Full,
-                    })
-                }
-                Expr::Literal(Literal::Numeric(n)) => match n.as_str() {
-                    "0" => SyncMode::Off,
-                    _ => SyncMode::Full,
-                },
-                _ => SyncMode::Full,
+            let mode = match parse_pragma_enabled(&value) {
+                true => SyncMode::Full,
+                false => SyncMode::Off,
             };
-
             connection.set_sync_mode(mode);
             Ok((program, TransactionMode::None))
         }
         PragmaName::DataSyncRetry => {
-            let retry_enabled = match value {
-                Expr::Name(name) => {
-                    let name_bytes = name.as_str().as_bytes();
-                    match_ignore_ascii_case!(match name_bytes {
-                        b"ON" | b"TRUE" | b"YES" | b"1" => true,
-                        _ => false,
-                    })
-                }
-                Expr::Literal(Literal::Numeric(n)) => !matches!(n.as_str(), "0"),
-                _ => false,
+            let retry_enabled = parse_pragma_enabled(&value);
+            connection.set_data_sync_retry(retry_enabled);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::MvccCheckpointThreshold => {
+            let threshold = match parse_signed_number(&value)? {
+                Value::Integer(size) if size >= -1 => size,
+                _ => bail_parse_error!(
+                    "mvcc_checkpoint_threshold must be -1, 0, or a positive integer"
+                ),
             };
 
-            connection.set_data_sync_retry(retry_enabled);
+            connection.set_mvcc_checkpoint_threshold(threshold)?;
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::ForeignKeys => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
     }
@@ -683,6 +690,22 @@ fn query_pragma(
             let retry_enabled = connection.get_data_sync_retry();
             let register = program.alloc_register();
             program.emit_int(retry_enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::MvccCheckpointThreshold => {
+            let threshold = connection.mvcc_checkpoint_threshold()?;
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::ForeignKeys => {
+            let enabled = connection.foreign_keys_enabled();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

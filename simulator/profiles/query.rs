@@ -22,6 +22,10 @@ pub struct QueryProfile {
     pub delete_weight: u32,
     #[garde(skip)]
     pub drop_table_weight: u32,
+    #[garde(skip)]
+    pub alter_table_weight: u32,
+    #[garde(skip)]
+    pub drop_index: u32,
 }
 
 impl Default for QueryProfile {
@@ -35,7 +39,23 @@ impl Default for QueryProfile {
             update_weight: 20,
             delete_weight: 20,
             drop_table_weight: 2,
+            alter_table_weight: 2,
+            drop_index: 2,
         }
+    }
+}
+
+impl QueryProfile {
+    /// Attention: edit this function when another weight is added
+    pub fn total_weight(&self) -> u32 {
+        self.select_weight
+            + self.create_table_weight
+            + self.create_index_weight
+            + self.insert_weight
+            + self.update_weight
+            + self.delete_weight
+            + self.drop_table_weight
+            + self.alter_table_weight
     }
 }
 

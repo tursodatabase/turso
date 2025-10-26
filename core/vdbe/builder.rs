@@ -124,6 +124,10 @@ pub struct ProgramBuilder {
     current_parent_explain_idx: Option<usize>,
     pub param_ctx: ParamState,
     pub(crate) reg_result_cols_start: Option<usize>,
+    /// Whether the program needs to use statement subtransactions,
+    /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
+    /// instead of the entire transaction.
+    needs_stmt_subtransactions: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +215,12 @@ impl ProgramBuilder {
             current_parent_explain_idx: None,
             param_ctx: ParamState::default(),
             reg_result_cols_start: None,
+            needs_stmt_subtransactions: false,
         }
+    }
+
+    pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
+        self.needs_stmt_subtransactions = needs_stmt_subtransactions;
     }
 
     pub fn capture_data_changes_mode(&self) -> &CaptureDataChangesMode {
@@ -311,6 +320,18 @@ impl ProgramBuilder {
         self._alloc_cursor_id(Some(key), cursor_type)
     }
 
+    pub fn alloc_cursor_id_keyed_if_not_exists(
+        &mut self,
+        key: CursorKey,
+        cursor_type: CursorType,
+    ) -> usize {
+        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
+            cursor_id
+        } else {
+            self._alloc_cursor_id(Some(key), cursor_type)
+        }
+    }
+
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
     }
@@ -339,6 +360,14 @@ impl ProgramBuilder {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emit an instruction that is guaranteed not to be in any constant span.
+    /// This ensures the instruction won't be hoisted when emit_constant_insns is called.
+    #[instrument(skip(self), level = Level::DEBUG)]
+    pub fn emit_no_constant_insn(&mut self, insn: Insn) {
+        self.constant_span_end_all();
+        self.emit_insn(insn);
     }
 
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
@@ -792,6 +821,9 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => {
                     resolve(target_pc, "NotFound");
                 }
+                Insn::FkIfZero { target_pc, .. } => {
+                    resolve(target_pc, "FkIfZero");
+                }
                 _ => {}
             }
         }
@@ -1006,6 +1038,11 @@ impl ProgramBuilder {
         self.resolve_labels();
 
         self.parameters.list.dedup();
+
+        if !self.table_references.is_empty() && matches!(self.txn_mode, TransactionMode::Write) {
+            self.needs_stmt_subtransactions = true;
+        }
+
         Program {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -1019,6 +1056,7 @@ impl ProgramBuilder {
             table_references: self.table_references,
             sql: sql.to_string(),
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
+            needs_stmt_subtransactions: self.needs_stmt_subtransactions,
         }
     }
 }

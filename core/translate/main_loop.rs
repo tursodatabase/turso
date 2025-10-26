@@ -18,12 +18,14 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
-use crate::translate::{collate::get_collseq_from_expr, window::emit_window_loop_source};
+use crate::translate::{
+    collate::get_collseq_from_expr, emitter::UpdateRowSource, window::emit_window_loop_source,
+};
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         emitter::prepare_cdc_if_necessary,
-        plan::{DistinctCtx, Distinctness, Scan},
+        plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
         result_row::emit_select_result,
     },
     types::SeekOp,
@@ -129,8 +131,8 @@ pub fn init_loop(
     );
 
     if matches!(
-        mode,
-        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+        &mode,
+        OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
     ) {
         assert!(tables.joined_tables().len() == 1);
         let changed_table = &tables.joined_tables()[0].table;
@@ -202,9 +204,9 @@ pub fn init_loop(
             }
         }
         let (table_cursor_id, index_cursor_id) =
-            table.open_cursors(program, mode, t_ctx.resolver.schema)?;
+            table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
         match &table.op {
-            Operation::Scan(Scan::BTreeTable { index, .. }) => match (mode, &table.table) {
+            Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                 (OperationMode::SELECT, Table::BTree(btree)) => {
                     let root_page = btree.root_page;
                     if let Some(cursor_id) = table_cursor_id {
@@ -259,14 +261,28 @@ pub fn init_loop(
                         }
                     }
                 }
-                (OperationMode::UPDATE, Table::BTree(btree)) => {
+                (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
                     let root_page = btree.root_page;
-                    program.emit_insn(Insn::OpenWrite {
-                        cursor_id: table_cursor_id
-                            .expect("table cursor is always opened in OperationMode::UPDATE"),
-                        root_page: root_page.into(),
-                        db: table.database_id,
-                    });
+                    match &update_mode {
+                        UpdateRowSource::Normal => {
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: table_cursor_id.expect(
+                                    "table cursor is always opened in OperationMode::UPDATE",
+                                ),
+                                root_page: root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                        UpdateRowSource::PrebuiltEphemeralTable { target_table, .. } => {
+                            let target_table_cursor_id = program
+                                .resolve_cursor_id(&CursorKey::table(target_table.internal_id));
+                            program.emit_insn(Insn::OpenWrite {
+                                cursor_id: target_table_cursor_id,
+                                root_page: target_table.btree().unwrap().root_page.into(),
+                                db: table.database_id,
+                            });
+                        }
+                    }
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
@@ -281,7 +297,9 @@ pub fn init_loop(
                 if let Table::Virtual(tbl) = &table.table {
                     let is_write = matches!(
                         mode,
-                        OperationMode::INSERT | OperationMode::UPDATE | OperationMode::DELETE
+                        OperationMode::INSERT
+                            | OperationMode::UPDATE { .. }
+                            | OperationMode::DELETE
                     );
                     if is_write && tbl.readonly() {
                         return Err(crate::LimboError::ReadOnly);
@@ -303,7 +321,7 @@ pub fn init_loop(
                             });
                         }
                     }
-                    OperationMode::DELETE | OperationMode::UPDATE => {
+                    OperationMode::DELETE | OperationMode::UPDATE { .. } => {
                         let table_cursor_id = table_cursor_id.expect(
                                         "table cursor is always opened in OperationMode::DELETE or OperationMode::UPDATE",
                                     );
@@ -316,7 +334,7 @@ pub fn init_loop(
 
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
-                        if mode == OperationMode::DELETE {
+                        if matches!(mode, OperationMode::DELETE) {
                             if let Some(indexes) =
                                 t_ctx.resolver.schema.indexes.get(table.table.get_name())
                             {
@@ -361,7 +379,7 @@ pub fn init_loop(
                                     db: table.database_id,
                                 });
                             }
-                            OperationMode::UPDATE | OperationMode::DELETE => {
+                            OperationMode::UPDATE { .. } | OperationMode::DELETE => {
                                 program.emit_insn(Insn::OpenWrite {
                                     cursor_id: index_cursor_id
                                         .expect("index cursor is always opened in Seek with index"),
@@ -388,6 +406,7 @@ pub fn init_loop(
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
+            jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -406,6 +425,7 @@ pub fn open_loop(
     join_order: &[JoinOrderMember],
     predicates: &[WhereTerm],
     temp_cursor_id: Option<CursorID>,
+    mode: OperationMode,
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
@@ -432,7 +452,7 @@ pub fn open_loop(
             }
         }
 
-        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
+        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
 
         match &table.op {
             Operation::Scan(scan) => {
@@ -606,7 +626,10 @@ pub fn open_loop(
                             );
                         };
 
-                        let start_reg = program.alloc_registers(seek_def.key.len());
+                        let max_registers = seek_def
+                            .size(&seek_def.start)
+                            .max(seek_def.size(&seek_def.end));
+                        let start_reg = program.alloc_registers(max_registers);
                         emit_seek(
                             program,
                             table_references,
@@ -710,6 +733,7 @@ fn emit_conditions(
             jump_if_condition_is_true: false,
             jump_target_when_true,
             jump_target_when_false: next,
+            jump_target_when_null: next,
         };
         translate_condition_expr(
             program,
@@ -724,7 +748,7 @@ fn emit_conditions(
     Ok(())
 }
 
-/// SQLite (and so Limbo) processes joins as a nested loop.
+/// SQLite (and so Turso) processes joins as a nested loop.
 /// The loop may emit rows to various destinations depending on the query:
 /// - a GROUP BY sorter (grouping is done by sorting based on the GROUP BY keys and aggregating while the GROUP BY keys match)
 /// - a GROUP BY phase with no sorting (when the rows are already in the order required by the GROUP BY keys)
@@ -982,7 +1006,7 @@ pub fn close_loop(
     t_ctx: &mut TranslateCtx,
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
-    temp_cursor_id: Option<CursorID>,
+    mode: OperationMode,
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
     // OPEN t1
@@ -1000,20 +1024,28 @@ pub fn close_loop(
             .get(table_index)
             .expect("source has no loop labels");
 
-        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program)?;
+        let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
 
         match &table.op {
             Operation::Scan(scan) => {
                 program.resolve_label(loop_labels.next, program.offset());
                 match scan {
                     Scan::BTreeTable { iter_dir, .. } => {
-                        let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
+                        let iteration_cursor_id = if let OperationMode::UPDATE(
+                            UpdateRowSource::PrebuiltEphemeralTable {
+                                ephemeral_table_cursor_id,
+                                ..
+                            },
+                        ) = &mode
+                        {
+                            *ephemeral_table_cursor_id
+                        } else {
                             index_cursor_id.unwrap_or_else(|| {
                                 table_cursor_id.expect(
                                     "Either ephemeral or index or table cursor must be opened",
                                 )
                             })
-                        });
+                        };
                         if *iter_dir == IterationDirection::Backwards {
                             program.emit_insn(Insn::Prev {
                                 cursor_id: iteration_cursor_id,
@@ -1050,12 +1082,19 @@ pub fn close_loop(
                     "Subqueries do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
-                let iteration_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                    index_cursor_id.unwrap_or_else(|| {
-                        table_cursor_id
-                            .expect("Either ephemeral or index or table cursor must be opened")
-                    })
-                });
+                let iteration_cursor_id =
+                    if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                        ephemeral_table_cursor_id,
+                        ..
+                    }) = &mode
+                    {
+                        *ephemeral_table_cursor_id
+                    } else {
+                        index_cursor_id.unwrap_or_else(|| {
+                            table_cursor_id
+                                .expect("Either ephemeral or index or table cursor must be opened")
+                        })
+                    };
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, so there is no need to emit a Next instruction.
                 if !matches!(search, Search::RowidEq { .. }) {
                     let iter_dir = match search {
@@ -1146,7 +1185,8 @@ fn emit_seek(
     seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
     let is_index = seek_index.is_some();
-    let Some(seek) = seek_def.seek.as_ref() else {
+    if seek_def.prefix.is_empty() && matches!(seek_def.start.last_component, SeekKeyComponent::None)
+    {
         // If there is no seek key, we start from the first or last row of the index,
         // depending on the iteration direction.
         //
@@ -1196,43 +1236,34 @@ fn emit_seek(
     };
     // We allocated registers for the full index key, but our seek key might not use the full index key.
     // See [crate::translate::optimizer::build_seek_def] for more details about in which cases we do and don't use the full index key.
-    for i in 0..seek_def.key.len() {
+    for (i, key) in seek_def.iter(&seek_def.start).enumerate() {
         let reg = start_reg + i;
-        if i >= seek.len {
-            if seek.null_pad {
-                program.emit_insn(Insn::Null {
-                    dest: reg,
-                    dest_end: None,
-                });
-            }
-        } else {
-            let expr = &seek_def.key[i].0;
-            translate_expr_no_constant_opt(
-                program,
-                Some(tables),
-                expr,
-                reg,
-                &t_ctx.resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            // If the seek key column is not verifiably non-NULL, we need check whether it is NULL,
-            // and if so, jump to the loop end.
-            // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,
-            // which would erroneously return all rows from t, as NULL is lower than any non-NULL value in index key comparisons.
-            if !expr.is_nonnull(tables) {
-                program.emit_insn(Insn::IsNull {
+        match key {
+            SeekKeyComponent::Expr(expr) => {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(tables),
+                    expr,
                     reg,
-                    target_pc: loop_end,
-                });
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                // If the seek key column is not verifiably non-NULL, we need check whether it is NULL,
+                // and if so, jump to the loop end.
+                // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,
+                // which would erroneously return all rows from t, as NULL is lower than any non-NULL value in index key comparisons.
+                if !expr.is_nonnull(tables) {
+                    program.emit_insn(Insn::IsNull {
+                        reg,
+                        target_pc: loop_end,
+                    });
+                }
             }
+            SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
         }
     }
-    let num_regs = if seek.null_pad {
-        seek_def.key.len()
-    } else {
-        seek.len
-    };
-    match seek.op {
+    let num_regs = seek_def.size(&seek_def.start);
+    match seek_def.start.op {
         SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
             cursor_id: seek_cursor_id,
@@ -1289,7 +1320,7 @@ fn emit_seek_termination(
     seek_index: Option<&Arc<Index>>,
 ) -> Result<()> {
     let is_index = seek_index.is_some();
-    let Some(termination) = seek_def.termination.as_ref() else {
+    if seek_def.prefix.is_empty() && matches!(seek_def.end.last_component, SeekKeyComponent::None) {
         program.preassign_label_to_next_insn(loop_start);
         // If we will encounter NULLs in the index at the end of iteration (Forward + Desc OR Backward + Asc)
         // then, we must explicitly stop before them as seek always has some bound condition over indexed column (e.g. c < ?, c >= ?, ...)
@@ -1320,46 +1351,23 @@ fn emit_seek_termination(
         return Ok(());
     };
 
-    // How many non-NULL values were used for seeking.
-    let seek_len = seek_def.seek.as_ref().map_or(0, |seek| seek.len);
+    // For all index key values apart from the last one, we are guaranteed to use the same values
+    // as these values were emited from common prefix, so we don't need to emit them again.
 
-    // How many values will be used for the termination condition.
-    let num_regs = if termination.null_pad {
-        seek_def.key.len()
-    } else {
-        termination.len
-    };
-    for i in 0..seek_def.key.len() {
-        let reg = start_reg + i;
-        let is_last = i == seek_def.key.len() - 1;
-
-        // For all index key values apart from the last one, we are guaranteed to use the same values
-        // as were used for the seek, so we don't need to emit them again.
-        if i < seek_len && !is_last {
-            continue;
-        }
-        // For the last index key value, we need to emit a NULL if the termination condition is NULL-padded.
-        // See [SeekKey::null_pad] and [crate::translate::optimizer::build_seek_def] for why this is the case.
-        if i >= termination.len && !termination.null_pad {
-            continue;
-        }
-        if is_last && termination.null_pad {
-            program.emit_insn(Insn::Null {
-                dest: reg,
-                dest_end: None,
-            });
-        // if the seek key is shorter than the termination key, we need to translate the remaining suffix of the termination key.
-        // if not, we just reuse what was emitted for the seek.
-        } else if seek_len < termination.len {
+    let num_regs = seek_def.size(&seek_def.end);
+    let last_reg = start_reg + seek_def.prefix.len();
+    match &seek_def.end.last_component {
+        SeekKeyComponent::Expr(expr) => {
             translate_expr_no_constant_opt(
                 program,
                 Some(tables),
-                &seek_def.key[i].0,
-                reg,
+                expr,
+                last_reg,
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
         }
+        SeekKeyComponent::None => {}
     }
     program.preassign_label_to_next_insn(loop_start);
     let mut rowid_reg = None;
@@ -1385,7 +1393,7 @@ fn emit_seek_termination(
             Some(Affinity::Numeric)
         };
     }
-    match (is_index, termination.op) {
+    match (is_index, seek_def.end.op) {
         (true, SeekOp::GE { .. }) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,
             start_reg,

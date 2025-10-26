@@ -17,6 +17,7 @@ pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
+pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -283,17 +284,21 @@ pub fn translate_inner(
             columns,
             body,
             returning,
-        } => translate_insert(
-            with,
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            program,
-            connection,
-        )?,
+        } => {
+            if with.is_some() {
+                crate::bail_parse_error!("WITH clause is not supported");
+            }
+            translate_insert(
+                resolver,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+                program,
+                connection,
+            )?
+        }
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction

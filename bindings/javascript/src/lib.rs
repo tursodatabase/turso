@@ -178,7 +178,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     let io = &db.io;
     let file = io
         .open_file(&db.path, flags, false)
-        .map_err(|e| to_generic_error("failed to open file", e))?;
+        .map_err(|e| to_generic_error(&format!("failed to open file {}", db.path), e))?;
 
     let db_file = DatabaseFile::new(file);
     let db_core = turso_core::Database::open_with_flags(
@@ -191,7 +191,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
             .with_indexes(true),
         None,
     )
-    .map_err(|e| to_generic_error("failed to open database", e))?;
+    .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 
     let conn = db_core
         .connect()

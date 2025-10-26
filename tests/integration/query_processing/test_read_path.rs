@@ -1,5 +1,5 @@
-use crate::common::TempDatabase;
-use turso_core::{StepResult, Value};
+use crate::common::{limbo_exec_rows, TempDatabase};
+use turso_core::{LimboError, StepResult, Value};
 
 #[test]
 fn test_statement_reset_bind() -> anyhow::Result<()> {
@@ -875,4 +875,119 @@ fn test_upsert_parameters_order() -> anyhow::Result<()> {
         ]
     );
     Ok(())
+}
+
+#[test]
+fn test_multiple_connections_visibility() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite(
+        "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);",
+        false,
+    );
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN")?;
+    conn1.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
+    let mut stmt = conn2.prepare("SELECT COUNT(*) FROM test").unwrap();
+    let _ = stmt.step().unwrap();
+    // intentionally drop not-fully-consumed statement in order to check that on Drop statement will execute reset with proper cleanup
+    drop(stmt);
+    conn1.execute("COMMIT")?;
+
+    let rows = limbo_exec_rows(&tmp_db, &conn2, "SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+    Ok(())
+}
+
+#[test]
+/// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
+fn test_max_joined_tables_limit() {
+    let tmp_db = TempDatabase::new("test_max_joined_tables_limit", false);
+    let conn = tmp_db.connect_limbo();
+
+    // Create 64 tables
+    for i in 0..64 {
+        conn.execute(format!("CREATE TABLE t{i} (id INTEGER)"))
+            .unwrap();
+    }
+
+    // Try to join 64 tables - should fail
+    let mut sql = String::from("SELECT * FROM t0");
+    for i in 1..64 {
+        sql.push_str(&format!(" JOIN t{i} ON t{i}.id = t0.id"));
+    }
+
+    let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
+        panic!("Expected an error but got no error");
+    };
+    assert!(result.contains("Only up to 63 tables can be joined"));
+}
+
+#[test]
+/// Test that we can create and select from a table with 1000 columns.
+fn test_many_columns() {
+    let mut create_sql = String::from("CREATE TABLE test (");
+    for i in 0..1000 {
+        if i > 0 {
+            create_sql.push_str(", ");
+        }
+        create_sql.push_str(&format!("col{i} INTEGER"));
+    }
+    create_sql.push(')');
+
+    let tmp_db = TempDatabase::new("test_many_columns", false);
+    let conn = tmp_db.connect_limbo();
+    conn.execute(&create_sql).unwrap();
+
+    // Insert a row with values 0-999
+    let mut insert_sql = String::from("INSERT INTO test VALUES (");
+    for i in 0..1000 {
+        if i > 0 {
+            insert_sql.push_str(", ");
+        }
+        insert_sql.push_str(&i.to_string());
+    }
+    insert_sql.push(')');
+    conn.execute(&insert_sql).unwrap();
+
+    // Select every 100th column
+    let mut select_sql = String::from("SELECT ");
+    let mut first = true;
+    for i in (0..1000).step_by(100) {
+        if !first {
+            select_sql.push_str(", ");
+        }
+        select_sql.push_str(&format!("col{i}"));
+        first = false;
+    }
+    select_sql.push_str(" FROM test");
+
+    let mut rows = Vec::new();
+    let mut stmt = conn.prepare(&select_sql).unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::IO => stmt.run_once().unwrap(),
+            _ => break,
+        }
+    }
+
+    // Verify we got values 0,100,200,...,900
+    assert_eq!(
+        rows,
+        vec![vec![
+            turso_core::Value::Integer(0),
+            turso_core::Value::Integer(100),
+            turso_core::Value::Integer(200),
+            turso_core::Value::Integer(300),
+            turso_core::Value::Integer(400),
+            turso_core::Value::Integer(500),
+            turso_core::Value::Integer(600),
+            turso_core::Value::Integer(700),
+            turso_core::Value::Integer(800),
+            turso_core::Value::Integer(900),
+        ]]
+    );
 }

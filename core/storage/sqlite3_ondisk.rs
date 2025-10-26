@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
+use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
@@ -1320,22 +1320,22 @@ impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
-pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usize)> {
+pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRef<'a>, usize)> {
     match serial_type.kind() {
-        SerialTypeKind::Null => Ok((RefValue::Null, 0)),
+        SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
             if buf.is_empty() {
                 crate::bail_corrupt_error!("Invalid UInt8 value");
             }
             let val = buf[0] as i8;
-            Ok((RefValue::Integer(val as i64), 1))
+            Ok((ValueRef::Integer(val as i64), 1))
         }
         SerialTypeKind::I16 => {
             if buf.len() < 2 {
                 crate::bail_corrupt_error!("Invalid BEInt16 value");
             }
             Ok((
-                RefValue::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                 2,
             ))
         }
@@ -1345,7 +1345,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(
+                ValueRef::Integer(
                     i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
                 ),
                 3,
@@ -1356,7 +1356,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt32 value");
             }
             Ok((
-                RefValue::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+                ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
                 4,
             ))
         }
@@ -1366,7 +1366,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
             let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     buf[0],
@@ -1384,7 +1384,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEInt64 value");
             }
             Ok((
-                RefValue::Integer(i64::from_be_bytes([
+                ValueRef::Integer(i64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
@@ -1395,26 +1395,20 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
                 crate::bail_corrupt_error!("Invalid BEFloat64 value");
             }
             Ok((
-                RefValue::Float(f64::from_be_bytes([
+                ValueRef::Float(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
             ))
         }
-        SerialTypeKind::ConstInt0 => Ok((RefValue::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((RefValue::Integer(1), 0)),
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
             if buf.len() < content_size {
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
-            if content_size == 0 {
-                Ok((RefValue::Blob(RawSlice::new(std::ptr::null(), 0)), 0))
-            } else {
-                let ptr = &buf[0] as *const u8;
-                let slice = RawSlice::new(ptr, content_size);
-                Ok((RefValue::Blob(slice), content_size))
-            }
+            Ok((ValueRef::Blob(&buf[..content_size]), content_size))
         }
         SerialTypeKind::Text => {
             let content_size = serial_type.size();
@@ -1427,10 +1421,7 @@ pub fn read_value(buf: &[u8], serial_type: SerialType) -> Result<(RefValue, usiz
             }
 
             Ok((
-                RefValue::Text(TextRef::create_from(
-                    &buf[..content_size],
-                    TextSubtype::Text,
-                )),
+                ValueRef::Text(&buf[..content_size], TextSubtype::Text),
                 content_size,
             ))
         }
@@ -1493,6 +1484,44 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
         9 => Ok(1),
         _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
+}
+
+/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
+///
+/// This function is a performance-optimized version of `read_varint()` that handles
+/// the most common varint cases inline before falling back to the full implementation.
+/// It follows the same varint encoding as SQLite.
+///
+/// # Optimized Cases
+///
+/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
+/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
+/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
+///
+/// This function is similar to `sqlite3GetVarint32`
+#[inline(always)]
+pub fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
+    // Fast path: Single-byte varint
+    if let Some(&first_byte) = buf.first() {
+        if first_byte & 0x80 == 0 {
+            return Ok((first_byte as u64, 1));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    // Fast path: Two-byte varint
+    if let Some(&second_byte) = buf.get(1) {
+        if second_byte & 0x80 == 0 {
+            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
+            return Ok((v, 2));
+        }
+    } else {
+        crate::bail_corrupt_error!("Invalid varint");
+    }
+
+    //Fallback: Multi-byte varint
+    read_varint(buf)
 }
 
 #[inline(always)]
@@ -1572,7 +1601,7 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
         return 9;
     }
 
-    let mut encoded: [u8; 10] = [0; 10];
+    let mut encoded: [u8; 9] = [0; 9];
     let mut bytes = value;
     let mut n = 0;
     while bytes != 0 {
@@ -1746,7 +1775,7 @@ impl StreamingWalReader {
             .min((self.file_size - offset) as usize);
         if read_size == 0 {
             // end-of-file; let caller finalize
-            return Ok((0, Completion::new_dummy()));
+            return Ok((0, Completion::new_yield()));
         }
 
         let buf = Arc::new(Buffer::new_temporary(read_size));
@@ -1921,7 +1950,7 @@ impl StreamingWalReader {
         wfs.loaded.store(true, Ordering::SeqCst);
 
         self.done.store(true, Ordering::Release);
-        tracing::info!(
+        tracing::debug!(
             "WAL loading complete: {} frames processed, last commit at frame {}",
             st.frame_idx - 1,
             max_frame

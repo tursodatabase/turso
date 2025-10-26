@@ -153,10 +153,12 @@ impl Display for JsonFunc {
 pub enum VectorFunc {
     Vector,
     Vector32,
+    Vector32Sparse,
     Vector64,
     VectorExtract,
     VectorDistanceCos,
-    VectorDistanceEuclidean,
+    VectorDistanceL2,
+    VectorDistanceJaccard,
     VectorConcat,
     VectorSlice,
 }
@@ -172,11 +174,12 @@ impl Display for VectorFunc {
         let str = match self {
             Self::Vector => "vector".to_string(),
             Self::Vector32 => "vector32".to_string(),
+            Self::Vector32Sparse => "vector32_sparse".to_string(),
             Self::Vector64 => "vector64".to_string(),
             Self::VectorExtract => "vector_extract".to_string(),
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
-            // We use `distance_l2` to reduce user input
-            Self::VectorDistanceEuclidean => "vector_distance_l2".to_string(),
+            Self::VectorDistanceL2 => "vector_distance_l2".to_string(),
+            Self::VectorDistanceJaccard => "vector_distance_jaccard".to_string(),
             Self::VectorConcat => "vector_concat".to_string(),
             Self::VectorSlice => "vector_slice".to_string(),
         };
@@ -310,6 +313,7 @@ pub enum ScalarFunc {
     Unicode,
     Quote,
     SqliteVersion,
+    TursoVersion,
     SqliteSourceId,
     UnixEpoch,
     JulianDay,
@@ -373,6 +377,7 @@ impl ScalarFunc {
             ScalarFunc::Unicode => true,
             ScalarFunc::Quote => true,
             ScalarFunc::SqliteVersion => true,
+            ScalarFunc::TursoVersion => true,
             ScalarFunc::SqliteSourceId => true,
             ScalarFunc::UnixEpoch => false,
             ScalarFunc::JulianDay => false,
@@ -437,6 +442,7 @@ impl Display for ScalarFunc {
             Self::Unicode => "unicode".to_string(),
             Self::Quote => "quote".to_string(),
             Self::SqliteVersion => "sqlite_version".to_string(),
+            Self::TursoVersion => "turso_version".to_string(),
             Self::SqliteSourceId => "sqlite_source_id".to_string(),
             Self::JulianDay => "julianday".to_string(),
             Self::UnixEpoch => "unixepoch".to_string(),
@@ -642,6 +648,29 @@ impl Func {
             Self::AlterTable(_) => true,
         }
     }
+
+    pub fn supports_star_syntax(&self) -> bool {
+        match self {
+            Self::Scalar(scalar_func) => {
+                matches!(
+                    scalar_func,
+                    ScalarFunc::Changes
+                        | ScalarFunc::Random
+                        | ScalarFunc::TotalChanges
+                        | ScalarFunc::SqliteVersion
+                        | ScalarFunc::TursoVersion
+                        | ScalarFunc::SqliteSourceId
+                        | ScalarFunc::LastInsertRowid
+                )
+            }
+            Self::Math(math_func) => {
+                matches!(math_func.arity(), MathFuncArity::Nullary)
+            }
+            // Aggregate functions with (*) syntax are handled separately in the planner
+            Self::Agg(_) => false,
+            _ => false,
+        }
+    }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);
         match normalized_name.as_str() {
@@ -723,7 +752,7 @@ impl Func {
             "total_changes" => Ok(Self::Scalar(ScalarFunc::TotalChanges)),
             "glob" => Ok(Self::Scalar(ScalarFunc::Glob)),
             "ifnull" => Ok(Self::Scalar(ScalarFunc::IfNull)),
-            "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
+            "if" | "iif" => Ok(Self::Scalar(ScalarFunc::Iif)),
             "instr" => Ok(Self::Scalar(ScalarFunc::Instr)),
             "like" => Ok(Self::Scalar(ScalarFunc::Like)),
             "abs" => Ok(Self::Scalar(ScalarFunc::Abs)),
@@ -748,6 +777,7 @@ impl Func {
             "unicode" => Ok(Self::Scalar(ScalarFunc::Unicode)),
             "quote" => Ok(Self::Scalar(ScalarFunc::Quote)),
             "sqlite_version" => Ok(Self::Scalar(ScalarFunc::SqliteVersion)),
+            "turso_version" => Ok(Self::Scalar(ScalarFunc::TursoVersion)),
             "sqlite_source_id" => Ok(Self::Scalar(ScalarFunc::SqliteSourceId)),
             "replace" => Ok(Self::Scalar(ScalarFunc::Replace)),
             "likely" => Ok(Self::Scalar(ScalarFunc::Likely)),
@@ -843,10 +873,12 @@ impl Func {
             "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
             "vector" => Ok(Self::Vector(VectorFunc::Vector)),
             "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
+            "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
             "vector64" => Ok(Self::Vector(VectorFunc::Vector64)),
             "vector_extract" => Ok(Self::Vector(VectorFunc::VectorExtract)),
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
-            "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceEuclidean)),
+            "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceL2)),
+            "vector_distance_jaccard" => Ok(Self::Vector(VectorFunc::VectorDistanceJaccard)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             _ => crate::bail_parse_error!("no such function: {}", name),

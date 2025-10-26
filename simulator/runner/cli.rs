@@ -30,7 +30,7 @@ pub struct SimulatorCLI {
         short = 'n',
         long,
         help = "change the maximum size of the randomly generated sequence of interactions",
-        default_value_t = 5000,
+        default_value_t = normal_or_miri(5000, 50),
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub maximum_tests: u32,
@@ -38,7 +38,7 @@ pub struct SimulatorCLI {
         short = 'k',
         long,
         help = "change the minimum size of the randomly generated sequence of interactions",
-        default_value_t = 1000,
+        default_value_t = normal_or_miri(1000, 10),
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub minimum_tests: u32,
@@ -147,6 +147,12 @@ pub struct SimulatorCLI {
         default_value_t = false
     )]
     pub keep_files: bool,
+    #[clap(
+        long,
+        help = "Disable the SQLite integrity check at the end of a simulation",
+        default_value_t = normal_or_miri(false, true)
+    )]
+    pub disable_integrity_check: bool,
     #[clap(
         long,
         help = "Use memory IO for complex simulations",
@@ -273,4 +279,8 @@ impl ValueParserFactory for ProfileType {
     fn value_parser() -> Self::Parser {
         ProfileTypeParser
     }
+}
+
+const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
+    if cfg!(miri) { miri_val } else { normal_val }
 }

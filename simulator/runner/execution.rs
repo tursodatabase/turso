@@ -46,6 +46,7 @@ impl ExecutionHistory {
 }
 
 pub struct ExecutionResult {
+    #[expect(dead_code)]
     pub history: ExecutionHistory,
     pub error: Option<LimboError>,
 }
@@ -282,16 +283,13 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip(env, interaction, stack), fields(conn_index = interaction.connection_index, interaction = %interaction))]
 fn execute_interaction_rusqlite(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> turso_core::Result<ExecutionContinuation> {
-    tracing::trace!(
-        "execute_interaction_rusqlite(connection_index={}, interaction={})",
-        interaction.connection_index,
-        interaction
-    );
+    tracing::info!("");
     let SimConnection::SQLiteConnection(conn) = &mut env.connections[interaction.connection_index]
     else {
         unreachable!()
@@ -343,14 +341,25 @@ fn execute_query_rusqlite(
     connection: &rusqlite::Connection,
     query: &Query,
 ) -> rusqlite::Result<Vec<Vec<SimValue>>> {
+    // https://sqlite.org/forum/forumpost/9fe5d047f0
+    // Due to a bug in sqlite, we need to execute this query to clear the internal stmt cache so that schema changes become visible always to other connections
+    connection.query_one("SELECT * FROM pragma_user_version()", (), |_| Ok(()))?;
     match query {
         Query::Select(select) => {
             let mut stmt = connection.prepare(select.to_string().as_str())?;
-            let columns = stmt.column_count();
             let rows = stmt.query_map([], |row| {
                 let mut values = vec![];
-                for i in 0..columns {
-                    let value = row.get_unwrap(i);
+                for i in 0.. {
+                    let value = match row.get(i) {
+                        Ok(value) => value,
+                        Err(err) => match err {
+                            rusqlite::Error::InvalidColumnIndex(_) => break,
+                            _ => {
+                                tracing::error!(?err);
+                                panic!("{err}")
+                            }
+                        },
+                    };
                     let value = match value {
                         rusqlite::types::Value::Null => Value::Null,
                         rusqlite::types::Value::Integer(i) => Value::Integer(i),
@@ -367,6 +376,9 @@ fn execute_query_rusqlite(
                 result.push(row?);
             }
             Ok(result)
+        }
+        Query::Placeholder => {
+            unreachable!("simulation cannot have a placeholder Query for execution")
         }
         _ => {
             connection.execute(query.to_string().as_str(), ())?;

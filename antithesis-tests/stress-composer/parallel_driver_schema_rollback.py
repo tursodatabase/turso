@@ -35,25 +35,36 @@ except Exception as e:
     exit(0)
 
 cur = con.cursor()
-cur.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '" + tbl_name + "'")
 
-result = cur.fetchone()
+try:
+    cur.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '" + tbl_name + "'")
 
-if result is None:
-    print(f"Table {tbl_name} not found")
+    result = cur.fetchone()
+
+    if result is None:
+        print(f"Table {tbl_name} not found")
+        exit(0)
+    else:
+        schema_before = result[0]
+
+    cur.execute("BEGIN TRANSACTION")
+
+    cur.execute("ALTER TABLE " + tbl_name + " RENAME TO " + tbl_name + "_old")
+
+    con.rollback()
+
+    cur = con.cursor()
+    cur.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '" + tbl_name + "'")
+
+    result_after = cur.fetchone()
+    if result_after is None:
+        print(f"Table {tbl_name} dropped in parallel after rollback")
+        exit(0)
+
+    schema_after = result_after[0]
+
+    always(schema_before == schema_after, "schema should be the same after rollback", {})
+except turso.ProgrammingError as e:
+    print(f"Table {tbl_name} dropped in parallel: {e}")
+    con.rollback()
     exit(0)
-else:
-    schema_before = result[0]
-
-cur.execute("BEGIN TRANSACTION")
-
-cur.execute("ALTER TABLE " + tbl_name + " RENAME TO " + tbl_name + "_old")
-
-con.rollback()
-
-cur = con.cursor()
-cur.execute("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = '" + tbl_name + "'")
-
-schema_after = cur.fetchone()[0]
-
-always(schema_before == schema_after, "schema should be the same after rollback", {})

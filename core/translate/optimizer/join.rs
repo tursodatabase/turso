@@ -49,7 +49,7 @@ pub fn join_lhs_and_rhs<'a>(
     rhs_constraints: &'a TableConstraints,
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
-    access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
+    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     cost_upper_bound: Cost,
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
@@ -125,7 +125,7 @@ pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
-    access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
+    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -403,7 +403,7 @@ pub fn compute_best_join_order<'a>(
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
-    access_methods_arena: &'a RefCell<Vec<AccessMethod<'a>>>,
+    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     constraints: &'a [TableConstraints],
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
@@ -509,9 +509,9 @@ mod tests {
     use crate::{
         schema::{BTreeTable, Column, Index, IndexColumn, Table, Type},
         translate::{
-            optimizer::access_method::AccessMethodParams,
-            optimizer::constraints::{
-                constraints_from_where_clause, BinaryExprSide, ConstraintRef,
+            optimizer::{
+                access_method::AccessMethodParams,
+                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
@@ -632,8 +632,7 @@ mod tests {
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos]
-                .where_clause_pos
+            table_constraints[0].constraints[constraint_refs[0].eq.unwrap()].where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
     }
@@ -701,8 +700,7 @@ mod tests {
         assert!(index.as_ref().unwrap().name == "sqlite_autoindex_test_table_1");
         assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos]
-                .where_clause_pos
+            table_constraints[0].constraints[constraint_refs[0].eq.unwrap()].where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
     }
@@ -784,8 +782,7 @@ mod tests {
         assert!(index.as_ref().unwrap().name == "index1");
         assert!(constraint_refs.len() == 1);
         assert!(
-            table_constraints[TABLE1].constraints[constraint_refs[0].constraint_vec_pos]
-                .where_clause_pos
+            table_constraints[TABLE1].constraints[constraint_refs[0].eq.unwrap()].where_clause_pos
                 == (0, BinaryExprSide::Rhs)
         );
     }
@@ -960,8 +957,8 @@ mod tests {
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.as_ref().unwrap().name == "sqlite_autoindex_customers_1");
         assert!(constraint_refs.len() == 1);
-        let constraint = &table_constraints[TABLE_NO_CUSTOMERS].constraints
-            [constraint_refs[0].constraint_vec_pos];
+        let constraint =
+            &table_constraints[TABLE_NO_CUSTOMERS].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.lhs_mask.is_empty());
 
         let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
@@ -970,7 +967,7 @@ mod tests {
         assert!(index.as_ref().unwrap().name == "orders_customer_id_idx");
         assert!(constraint_refs.len() == 1);
         let constraint =
-            &table_constraints[TABLE_NO_ORDERS].constraints[constraint_refs[0].constraint_vec_pos];
+            &table_constraints[TABLE_NO_ORDERS].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.lhs_mask.contains_table(TABLE_NO_CUSTOMERS));
 
         let access_method = &access_methods_arena.borrow()[best_plan.data[2].1];
@@ -978,8 +975,8 @@ mod tests {
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.as_ref().unwrap().name == "order_items_order_id_idx");
         assert!(constraint_refs.len() == 1);
-        let constraint = &table_constraints[TABLE_NO_ORDER_ITEMS].constraints
-            [constraint_refs[0].constraint_vec_pos];
+        let constraint =
+            &table_constraints[TABLE_NO_ORDER_ITEMS].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.lhs_mask.contains_table(TABLE_NO_ORDERS));
     }
 
@@ -1187,8 +1184,8 @@ mod tests {
             assert!(iter_dir == IterationDirection::Forwards);
             assert!(index.is_none());
             assert!(constraint_refs.len() == 1);
-            let constraint = &table_constraints[*table_number].constraints
-                [constraint_refs[0].constraint_vec_pos];
+            let constraint =
+                &table_constraints[*table_number].constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(FACT_TABLE_IDX));
             assert!(constraint.operator == ast::Operator::Equals);
         }
@@ -1280,7 +1277,7 @@ mod tests {
             assert!(iter_dir == IterationDirection::Forwards);
             assert!(index.is_none());
             assert!(constraint_refs.len() == 1);
-            let constraint = &table_constraints.constraints[constraint_refs[0].constraint_vec_pos];
+            let constraint = &table_constraints.constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(i - 1));
             assert!(constraint.operator == ast::Operator::Equals);
         }
@@ -1481,7 +1478,7 @@ mod tests {
         let (_, index, constraint_refs) = _as_btree(access_method);
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 1);
-        let constraint = &table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos];
+        let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
         assert!(constraint.table_col_pos == 0); // c1
     }
@@ -1608,10 +1605,10 @@ mod tests {
         let (_, index, constraint_refs) = _as_btree(access_method);
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 2);
-        let constraint = &table_constraints[0].constraints[constraint_refs[0].constraint_vec_pos];
+        let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
         assert!(constraint.table_col_pos == 0); // c1
-        let constraint = &table_constraints[0].constraints[constraint_refs[1].constraint_vec_pos];
+        let constraint = &table_constraints[0].constraints[constraint_refs[1].lower_bound.unwrap()];
         assert!(constraint.operator == ast::Operator::Greater);
         assert!(constraint.table_col_pos == 1); // c2
     }
@@ -1664,6 +1661,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
         })
     }
 
@@ -1710,9 +1708,13 @@ mod tests {
         Expr::Literal(ast::Literal::Numeric(value.to_string()))
     }
 
-    fn _as_btree<'a>(
-        access_method: &AccessMethod<'a>,
-    ) -> (IterationDirection, Option<Arc<Index>>, &'a [ConstraintRef]) {
+    fn _as_btree(
+        access_method: &AccessMethod,
+    ) -> (
+        IterationDirection,
+        Option<Arc<Index>>,
+        &'_ [RangeConstraintRef],
+    ) {
         match &access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir,

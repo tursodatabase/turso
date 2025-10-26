@@ -5,10 +5,14 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::ast::{self, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::schema::ROWID_SENTINEL;
+use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::insert::format_unique_violation_desc;
+use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
+use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
+use crate::Connection;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -28,7 +32,6 @@ use crate::{
     vdbe::{
         builder::ProgramBuilder,
         insn::{IdxInsertFlags, InsertFlags, Insn},
-        BranchOffset,
     },
 };
 
@@ -336,34 +339,31 @@ pub fn resolve_upsert_target(
 pub fn emit_upsert(
     program: &mut ProgramBuilder,
     table: &Table,
+    ctx: &InsertEmitCtx,
     insertion: &Insertion,
-    tbl_cursor_id: usize,
-    conflict_rowid_reg: usize,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &Resolver,
-    idx_cursors: &[(&String, i64, usize)],
     returning: &mut [ResultSetColumn],
-    cdc_cursor_id: Option<usize>,
-    row_done_label: BranchOffset,
+    connection: &Arc<Connection>,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
-        cursor_id: tbl_cursor_id,
-        src_reg: conflict_rowid_reg,
-        target_pc: row_done_label,
+        cursor_id: ctx.cursor_id,
+        src_reg: ctx.conflict_rowid_reg,
+        target_pc: ctx.row_done_label,
     });
-    let num_cols = table.columns().len();
+    let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
-    for (i, col) in table.columns().iter().enumerate() {
+    for (i, col) in ctx.table.columns.iter().enumerate() {
         if col.is_rowid_alias {
             program.emit_insn(Insn::RowId {
-                cursor_id: tbl_cursor_id,
+                cursor_id: ctx.cursor_id,
                 dest: current_start + i,
             });
         } else {
             program.emit_insn(Insn::Column {
-                cursor_id: tbl_cursor_id,
+                cursor_id: ctx.cursor_id,
                 column: i,
                 dest: current_start + i,
                 default: None,
@@ -372,7 +372,7 @@ pub fn emit_upsert(
     }
 
     // BEFORE for index maintenance / CDC
-    let before_start = if cdc_cursor_id.is_some() || !idx_cursors.is_empty() {
+    let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
         let s = program.alloc_registers(num_cols);
         program.emit_insn(Insn::Copy {
             src_reg: current_start,
@@ -398,7 +398,7 @@ pub fn emit_upsert(
             pred,
             table,
             current_start,
-            conflict_rowid_reg,
+            ctx.conflict_rowid_reg,
             Some(table.get_name()),
             Some(insertion),
             true,
@@ -407,7 +407,7 @@ pub fn emit_upsert(
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
-            target_pc: row_done_label,
+            target_pc: ctx.row_done_label,
             jump_if_null: true,
         });
     }
@@ -419,7 +419,7 @@ pub fn emit_upsert(
             expr,
             table,
             current_start,
-            conflict_rowid_reg,
+            ctx.conflict_rowid_reg,
             Some(table.get_name()),
             Some(insertion),
             true,
@@ -464,11 +464,59 @@ pub fn emit_upsert(
         }
     }
 
+    let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias);
+    let has_direct_rowid_update = set_pairs
+        .iter()
+        .any(|(idx, _)| *idx == rowid_alias_idx.unwrap_or(ROWID_SENTINEL));
+    let has_user_provided_rowid = if let Some(i) = rowid_alias_idx {
+        set_pairs.iter().any(|(idx, _)| *idx == i) || has_direct_rowid_update
+    } else {
+        has_direct_rowid_update
+    };
+
+    let rowid_set_clause_reg = if has_user_provided_rowid {
+        Some(new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg))
+    } else {
+        None
+    };
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled() {
+            let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+
+            // Child-side checks
+            if resolver.schema.has_child_fks(bt.name.as_str()) {
+                emit_fk_child_update_counters(
+                    program,
+                    resolver,
+                    &bt,
+                    table.get_name(),
+                    ctx.cursor_id,
+                    new_start,
+                    rowid_new_reg,
+                    &changed_cols,
+                )?;
+            }
+            emit_parent_key_change_checks(
+                program,
+                resolver,
+                &bt,
+                resolver.schema.get_indices(table.get_name()).filter(|idx| {
+                    upsert_index_is_affected(table, idx, &changed_cols, rowid_changed)
+                }),
+                ctx.cursor_id,
+                ctx.conflict_rowid_reg,
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                rowid_set_clause_reg,
+                set_pairs,
+            )?;
+        }
+    }
+
     // Index rebuild (DELETE old, INSERT new), honoring partial-index WHEREs
     if let Some(before) = before_start {
-        let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-
-        for (idx_name, _root, idx_cid) in idx_cursors {
+        for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
                 .schema
                 .get_index(table.get_name(), idx_name)
@@ -484,10 +532,10 @@ pub fn emit_upsert(
                 table,
                 idx_meta,
                 before,
-                conflict_rowid_reg,
+                ctx.conflict_rowid_reg,
                 resolver,
             );
-            let new_rowid = new_rowid_reg.unwrap_or(conflict_rowid_reg);
+            let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_pred_reg = eval_partial_pred_for_row_image(
                 program, table, idx_meta, new_start, new_rowid, resolver,
             );
@@ -514,7 +562,7 @@ pub fn emit_upsert(
                 });
             }
             program.emit_insn(Insn::Copy {
-                src_reg: conflict_rowid_reg,
+                src_reg: ctx.conflict_rowid_reg,
                 dst_reg: del + k,
                 extra_amount: 0,
             });
@@ -645,7 +693,7 @@ pub fn emit_upsert(
         // If equal to old rowid, skip uniqueness probe
         program.emit_insn(Insn::Eq {
             lhs: rnew,
-            rhs: conflict_rowid_reg,
+            rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
@@ -653,7 +701,7 @@ pub fn emit_upsert(
 
         // If another row already has rnew -> constraint
         program.emit_insn(Insn::NotExists {
-            cursor: tbl_cursor_id,
+            cursor: ctx.cursor_id,
             rowid_reg: rnew,
             target_pc: ok,
         });
@@ -674,11 +722,12 @@ pub fn emit_upsert(
 
         // Now replace the row
         program.emit_insn(Insn::Delete {
-            cursor_id: tbl_cursor_id,
+            cursor_id: ctx.cursor_id,
             table_name: table.get_name().to_string(),
+            is_part_of_update: true,
         });
         program.emit_insn(Insn::Insert {
-            cursor: tbl_cursor_id,
+            cursor: ctx.cursor_id,
             key_reg: rnew,
             record_reg: rec,
             flag: InsertFlags::new().require_seek().update_rowid_change(),
@@ -686,8 +735,8 @@ pub fn emit_upsert(
         });
     } else {
         program.emit_insn(Insn::Insert {
-            cursor: tbl_cursor_id,
-            key_reg: conflict_rowid_reg,
+            cursor: ctx.cursor_id,
+            key_reg: ctx.conflict_rowid_reg,
             record_reg: rec,
             flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
@@ -695,16 +744,16 @@ pub fn emit_upsert(
     }
 
     // emit CDC instructions
-    if let Some(cdc_id) = cdc_cursor_id {
-        let new_rowid = new_rowid_reg.unwrap_or(conflict_rowid_reg);
+    if let Some((cdc_id, _)) = ctx.cdc_table {
+        let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
             // DELETE (before)
             let before_rec = if program.capture_data_changes_mode().has_before() {
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),
-                    tbl_cursor_id,
-                    conflict_rowid_reg,
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
                 ))
             } else {
                 None
@@ -714,7 +763,7 @@ pub fn emit_upsert(
                 resolver,
                 OperationMode::DELETE,
                 cdc_id,
-                conflict_rowid_reg,
+                ctx.conflict_rowid_reg,
                 before_rec,
                 None,
                 None,
@@ -747,7 +796,7 @@ pub fn emit_upsert(
                     table,
                     new_start,
                     rec,
-                    conflict_rowid_reg,
+                    ctx.conflict_rowid_reg,
                 ))
             } else {
                 None
@@ -756,8 +805,8 @@ pub fn emit_upsert(
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),
-                    tbl_cursor_id,
-                    conflict_rowid_reg,
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
                 ))
             } else {
                 None
@@ -765,9 +814,9 @@ pub fn emit_upsert(
             emit_cdc_insns(
                 program,
                 resolver,
-                OperationMode::UPDATE,
+                OperationMode::UPDATE(UpdateRowSource::Normal),
                 cdc_id,
-                conflict_rowid_reg,
+                ctx.conflict_rowid_reg,
                 before_rec,
                 after_rec,
                 None,
@@ -779,7 +828,7 @@ pub fn emit_upsert(
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
         let regs = ReturningValueRegisters {
-            rowid_register: new_rowid_reg.unwrap_or(conflict_rowid_reg),
+            rowid_register: new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             columns_start_register: new_start,
             num_columns: num_cols,
         };
@@ -787,7 +836,7 @@ pub fn emit_upsert(
     }
 
     program.emit_insn(Insn::Goto {
-        target_pc: row_done_label,
+        target_pc: ctx.row_done_label,
     });
     Ok(())
 }

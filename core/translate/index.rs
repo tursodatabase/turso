@@ -245,6 +245,7 @@ pub fn translate_create_index(
                 jump_if_condition_is_true: false,
                 jump_target_when_false: label,
                 jump_target_when_true: BranchOffset::Placeholder,
+                jump_target_when_null: label,
             },
             resolver,
         )?;
@@ -594,6 +595,7 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
         table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
     });
 
     program.resolve_label(next_label, program.offset());

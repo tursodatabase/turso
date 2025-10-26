@@ -36,8 +36,7 @@ fn bench(c: &mut Criterion) {
             let conn = db.conn.clone();
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
             db.mvcc_store
-                .rollback_tx(tx_id, conn.get_pager().clone(), &conn)
-                .unwrap();
+                .rollback_tx(tx_id, conn.get_pager().clone(), &conn);
         })
     });
 

@@ -31,9 +31,14 @@ except Exception as e:
 
 cur = con.cursor()
 
-cur.execute(f"DROP TABLE tbl_{selected_tbl}")
-
-con.commit()
+try:
+    cur.execute(f"DROP TABLE tbl_{selected_tbl}")
+    con.commit()
+    print(f"Successfully dropped table tbl_{selected_tbl}")
+except turso.ProgrammingError as e:
+    # Table might have been dropped in parallel - this is expected
+    print(f"Table tbl_{selected_tbl} already dropped in parallel: {e}")
+    con.rollback()
 
 con.close()
 

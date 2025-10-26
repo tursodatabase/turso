@@ -14,7 +14,7 @@ impl<T> Arbitrary for Box<T>
 where
     T: Arbitrary,
 {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         Box::from(T::arbitrary(rng, context))
     }
 }
@@ -23,7 +23,7 @@ impl<T> ArbitrarySized for Box<T>
 where
     T: ArbitrarySized,
 {
-    fn arbitrary_sized<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_sized<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         size: usize,
@@ -36,7 +36,7 @@ impl<A, T> ArbitrarySizedFrom<A> for Box<T>
 where
     T: ArbitrarySizedFrom<A>,
 {
-    fn arbitrary_sized_from<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_sized_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: A,
@@ -50,7 +50,7 @@ impl<T> Arbitrary for Option<T>
 where
     T: Arbitrary,
 {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         rng.random_bool(0.5).then_some(T::arbitrary(rng, context))
     }
 }
@@ -59,7 +59,7 @@ impl<A, T> ArbitrarySizedFrom<A> for Option<T>
 where
     T: ArbitrarySizedFrom<A>,
 {
-    fn arbitrary_sized_from<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_sized_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: A,
@@ -74,7 +74,11 @@ impl<A: Copy, T> ArbitraryFrom<A> for Vec<T>
 where
     T: ArbitraryFrom<A>,
 {
-    fn arbitrary_from<R: rand::Rng, C: GenerationContext>(rng: &mut R, context: &C, t: A) -> Self {
+    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: A,
+    ) -> Self {
         let size = rng.random_range(0..5);
         (0..size)
             .map(|_| T::arbitrary_from(rng, context, t))
@@ -84,7 +88,7 @@ where
 
 // Freestyling generation
 impl ArbitrarySized for Expr {
-    fn arbitrary_sized<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_sized<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         size: usize,
@@ -188,7 +192,7 @@ impl ArbitrarySized for Expr {
 }
 
 impl Arbitrary for Operator {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         let choices = [
             Operator::Add,
             Operator::And,
@@ -219,7 +223,7 @@ impl Arbitrary for Operator {
 }
 
 impl Arbitrary for Type {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         let name = pick(&["INT", "INTEGER", "REAL", "TEXT", "BLOB", "ANY"], rng).to_string();
         Self {
             name,
@@ -229,7 +233,7 @@ impl Arbitrary for Type {
 }
 
 impl Arbitrary for QualifiedName {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         // TODO: for now just generate table name
         let table_idx = pick_index(context.tables().len(), rng);
         let table = &context.tables()[table_idx];
@@ -243,7 +247,7 @@ impl Arbitrary for QualifiedName {
 }
 
 impl Arbitrary for LikeOperator {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
         let choice = rng.random_range(0..4);
         match choice {
             0 => LikeOperator::Glob,
@@ -257,7 +261,7 @@ impl Arbitrary for LikeOperator {
 
 // Current implementation does not take into account the columns affinity nor if table is Strict
 impl Arbitrary for ast::Literal {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
         loop {
             let choice = rng.random_range(0..5);
             let lit = match choice {
@@ -284,7 +288,7 @@ impl Arbitrary for ast::Literal {
 
 // Creates a litreal value
 impl ArbitraryFrom<&Vec<&SimValue>> for ast::Expr {
-    fn arbitrary_from<R: rand::Rng, C: GenerationContext>(
+    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         values: &Vec<&SimValue>,
@@ -299,7 +303,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for ast::Expr {
 }
 
 impl Arbitrary for UnaryOperator {
-    fn arbitrary<R: rand::Rng, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
+    fn arbitrary<R: rand::Rng + ?Sized, C: GenerationContext>(rng: &mut R, _t: &C) -> Self {
         let choice = rng.random_range(0..4);
         match choice {
             0 => Self::BitwiseNot,

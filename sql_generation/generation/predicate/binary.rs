@@ -6,7 +6,7 @@ use crate::{
     generation::{
         backtrack, one_of, pick,
         predicate::{CompoundPredicate, SimplePredicate},
-        table::{GTValue, LTValue, LikeValue},
+        value::{GTValue, LTValue, LikeValue},
         ArbitraryFrom, ArbitraryFromMaybe as _, GenerationContext,
     },
     model::{
@@ -16,46 +16,8 @@ use crate::{
 };
 
 impl Predicate {
-    /// Generate an [ast::Expr::Binary] [Predicate] from a column and [SimValue]
-    pub fn from_column_binary<R: rand::Rng, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        column_name: &str,
-        value: &SimValue,
-    ) -> Predicate {
-        let expr = one_of(
-            vec![
-                Box::new(|_| {
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Equals,
-                        Box::new(Expr::Literal(value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Greater,
-                        Box::new(Expr::Literal(gt_value.into())),
-                    )
-                }),
-                Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
-                    Expr::Binary(
-                        Box::new(Expr::Id(ast::Name::exact(column_name.to_string()))),
-                        ast::Operator::Less,
-                        Box::new(Expr::Literal(lt_value.into())),
-                    )
-                }),
-            ],
-            rng,
-        );
-        Predicate(expr)
-    }
-
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
-    pub fn true_binary<R: rand::Rng, C: GenerationContext>(
+    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -117,7 +79,8 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let lt_value = LTValue::arbitrary_from(rng, context, value).0;
+                        let lt_value =
+                            LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
                                 ast::Name::from_string(&table_name),
@@ -131,7 +94,8 @@ impl Predicate {
                 (
                     1,
                     Box::new(|rng| {
-                        let gt_value = GTValue::arbitrary_from(rng, context, value).0;
+                        let gt_value =
+                            GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                         Some(Expr::Binary(
                             Box::new(ast::Expr::Qualified(
                                 ast::Name::from_string(&table_name),
@@ -168,7 +132,7 @@ impl Predicate {
     }
 
     /// Produces an [ast::Expr::Binary] [Predicate] that is false for the provided row in the given table
-    pub fn false_binary<R: rand::Rng, C: GenerationContext>(
+    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -223,7 +187,8 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, value).0;
+                    let gt_value =
+                        GTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(&table_name),
@@ -234,7 +199,8 @@ impl Predicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, value).0;
+                    let lt_value =
+                        LTValue::arbitrary_from(rng, context, (value, column.column_type)).0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(&table_name),
@@ -253,7 +219,7 @@ impl Predicate {
 
 impl SimplePredicate {
     /// Generates a true [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn true_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -283,7 +249,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -294,7 +265,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -311,7 +287,7 @@ impl SimplePredicate {
     }
 
     /// Generates a false [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn false_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -341,7 +317,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let gt_value = GTValue::arbitrary_from(rng, context, column_value).0;
+                    let gt_value = GTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -352,7 +333,12 @@ impl SimplePredicate {
                     )
                 }),
                 Box::new(|rng| {
-                    let lt_value = LTValue::arbitrary_from(rng, context, column_value).0;
+                    let lt_value = LTValue::arbitrary_from(
+                        rng,
+                        context,
+                        (column_value, column.column.column_type),
+                    )
+                    .0;
                     Expr::Binary(
                         Box::new(ast::Expr::Qualified(
                             ast::Name::from_string(table_name),
@@ -373,7 +359,7 @@ impl CompoundPredicate {
     /// Decide if you want to create an AND or an OR
     ///
     /// Creates a Compound Predicate that is TRUE or FALSE for at least a single row
-    pub fn from_table_binary<R: rand::Rng, C: GenerationContext, T: TableContext>(
+    pub fn from_table_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,

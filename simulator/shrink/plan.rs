@@ -101,12 +101,6 @@ impl InteractionPlan {
         // Remove all properties that do not use the failing tables
         self.retain_mut(|interactions| {
             let retain = if idx == failing_interaction_index {
-                if let InteractionsType::Property(
-                    Property::FsyncNoWait { tables, .. } | Property::FaultyQuery { tables, .. },
-                ) = &mut interactions.interactions
-                {
-                    tables.retain(|table| depending_tables.contains(table));
-                }
                 true
             } else {
                 let mut has_table = interactions
@@ -126,16 +120,14 @@ impl InteractionPlan {
                             | Property::DeleteSelect { queries, .. }
                             | Property::DropSelect { queries, .. }
                             | Property::Queries { queries } => {
+                                // Remove placeholder queries
+                                queries.retain(|query| !matches!(query, Query::Placeholder));
                                 extensional_queries.append(queries);
                             }
-                            Property::FsyncNoWait { tables, query }
-                            | Property::FaultyQuery { tables, query } => {
-                                if !query.uses().iter().any(|t| depending_tables.contains(t)) {
-                                    tables.clear();
-                                } else {
-                                    tables.retain(|table| depending_tables.contains(table));
-                                }
+                            Property::AllTableHaveExpectedContent { tables } => {
+                                tables.retain(|table| depending_tables.contains(table));
                             }
+                            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {}
                             Property::SelectLimit { .. }
                             | Property::SelectSelectOptimizer { .. }
                             | Property::WhereTrueFalseNull { .. }
@@ -350,7 +342,8 @@ impl InteractionPlan {
                     | Property::FaultyQuery { .. }
                     | Property::FsyncNoWait { .. }
                     | Property::ReadYourUpdatesBack { .. }
-                    | Property::TableHasExpectedContent { .. } => {}
+                    | Property::TableHasExpectedContent { .. }
+                    | Property::AllTableHaveExpectedContent { .. } => {}
                 }
             }
         }

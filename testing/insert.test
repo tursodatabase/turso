@@ -529,6 +529,13 @@ do_execsql_test_on_specific_db {:memory:} null-value-insert-null-type-column {
     SELECT * FROM test;
 } {1|}
 
+# https://github.com/tursodatabase/turso/issues/1710
+do_execsql_test_in_memory_error_content uniq_constraint {
+    CREATE TABLE test (id INTEGER unique);
+    insert into test values (1);
+    insert into test values (1);
+} {UNIQUE constraint failed: test.id (19)}
+
 do_execsql_test_in_memory_error_content insert-explicit-rowid-conflict {
     create table t (x);
     insert into t(rowid, x) values (1, 1);
@@ -679,3 +686,92 @@ do_execsql_test_on_specific_db {:memory:} insert-rowid-select-rowid-success {
     SELECT * FROM t;
 } {2
 1}
+
+
+# Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+# SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+# Issue: https://github.com/tursodatabase/turso/issues/3665
+do_execsql_test_on_specific_db {:memory:} insert-rowid-backwards-compability {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC);
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+} {1|123}
+
+do_execsql_test_on_specific_db {:memory:} insert-rowid-backwards-compability-2 {
+    CREATE TABLE t(a INTEGER, PRIMARY KEY (a DESC));
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+} {123|123}
+
+
+do_execsql_test_on_specific_db {:memory:} ignore-pk-conflict {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1),(2),(3);
+    INSERT OR IGNORE INTO t VALUES (2);
+    SELECT a FROM t ORDER BY a;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} ignore-unique-conflict {
+    CREATE TABLE t(a INTEGER, b TEXT UNIQUE);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR IGNORE INTO t VALUES (3,'y');
+    SELECT a,b FROM t ORDER BY a;
+} {1|x
+2|y}
+
+do_execsql_test_on_specific_db {:memory:} ignore-multi-unique-conflict {
+    CREATE TABLE t(a UNIQUE, b UNIQUE, c);
+    INSERT INTO t VALUES (1,10,100),(2,20,200);
+    INSERT OR IGNORE INTO t VALUES (1,30,300);  -- conflicts on a
+    INSERT OR IGNORE INTO t VALUES (3,20,300);  -- conflicts on b
+    INSERT OR IGNORE INTO t VALUES (1,20,300);  -- conflicts on both
+    SELECT a,b,c FROM t ORDER BY a;
+} {1|10|100
+2|20|200}
+
+do_execsql_test_on_specific_db {:memory:} ignore-some-conflicts-multirow {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (2),(4);
+    INSERT OR IGNORE INTO t VALUES (1),(2),(3),(4),(5);
+    SELECT a FROM t ORDER BY a;
+} {1
+2
+3
+4
+5}
+
+do_execsql_test_on_specific_db {:memory:} ignore-from-select {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(2),(2),(3);
+    CREATE TABLE dst(a INTEGER UNIQUE);
+    INSERT INTO dst VALUES (2);
+    INSERT OR IGNORE INTO dst SELECT x FROM src;
+    SELECT a FROM dst ORDER BY a;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} ignore-null-in-unique {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (1),(NULL),(NULL);
+    INSERT OR IGNORE INTO t VALUES (1),(NULL);
+    SELECT COUNT(*) FROM t WHERE a IS NULL;
+} {3}
+
+do_execsql_test_on_specific_db {:memory:} ignore-preserves-rowid {
+    CREATE TABLE t(data TEXT UNIQUE);
+    INSERT INTO t VALUES ('x'),('y'),('z');
+    SELECT rowid, data FROM t WHERE data='y';
+    INSERT OR IGNORE INTO t VALUES ('y');
+    SELECT rowid, data FROM t WHERE data='y';
+} {2|y
+2|y}
+
+do_execsql_test_on_specific_db {:memory:} ignore-intra-statement-dups {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT OR IGNORE INTO t VALUES (5,'first'),(6,'x'),(5,'second'),(5,'third');
+    SELECT a,b FROM t ORDER BY a;
+} {5|first
+6|x}

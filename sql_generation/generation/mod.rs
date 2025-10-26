@@ -8,6 +8,7 @@ pub mod opts;
 pub mod predicate;
 pub mod query;
 pub mod table;
+pub mod value;
 
 pub use opts::*;
 
@@ -19,7 +20,7 @@ type Choice<'a, R, T> = (usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>);
 /// the possible values of the type, with a bias towards smaller values for
 /// practicality.
 pub trait Arbitrary {
-    fn arbitrary<R: Rng, C: GenerationContext>(rng: &mut R, context: &C) -> Self;
+    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self;
 }
 
 /// ArbitrarySized trait for generating random values of a specific size
@@ -29,8 +30,11 @@ pub trait Arbitrary {
 /// must fit in the given size. This is useful for generating values that are
 /// constrained by a specific size, such as integers or strings.
 pub trait ArbitrarySized {
-    fn arbitrary_sized<R: Rng, C: GenerationContext>(rng: &mut R, context: &C, size: usize)
-        -> Self;
+    fn arbitrary_sized<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        size: usize,
+    ) -> Self;
 }
 
 /// ArbitraryFrom trait for generating random values from a given value
@@ -39,7 +43,11 @@ pub trait ArbitrarySized {
 /// such as generating an integer within an interval, or a value that fits in a table,
 /// or a predicate satisfying a given table row.
 pub trait ArbitraryFrom<T> {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(rng: &mut R, context: &C, t: T) -> Self;
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        t: T,
+    ) -> Self;
 }
 
 /// ArbitrarySizedFrom trait for generating random values from a given value
@@ -51,7 +59,7 @@ pub trait ArbitraryFrom<T> {
 /// This is useful for generating values that are constrained by a specific size,
 /// such as integers or strings, while still being dependent on the given value.
 pub trait ArbitrarySizedFrom<T> {
-    fn arbitrary_sized_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_sized_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: T,
@@ -61,7 +69,7 @@ pub trait ArbitrarySizedFrom<T> {
 
 /// ArbitraryFromMaybe trait for fallibally generating random values from a given value
 pub trait ArbitraryFromMaybe<T> {
-    fn arbitrary_from_maybe<R: Rng, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: T,
@@ -77,7 +85,11 @@ pub trait ArbitraryFromMaybe<T> {
 /// the operations we require for the implementation.
 // todo: switch to a simpler type signature that can accommodate all integer and float types, which
 //       should be enough for our purposes.
-pub fn frequency<T, R: Rng, N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign>(
+pub fn frequency<
+    T,
+    R: Rng + ?Sized,
+    N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign,
+>(
     choices: Vec<(N, ArbitraryFromFunc<R, T>)>,
     rng: &mut R,
 ) -> T {
@@ -95,7 +107,7 @@ pub fn frequency<T, R: Rng, N: Sum + PartialOrd + Copy + Default + SampleUniform
 }
 
 /// one_of is a helper function for composing different generators with equal probability of occurrence.
-pub fn one_of<T, R: Rng>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> T {
+pub fn one_of<T, R: Rng + ?Sized>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> T {
     let index = rng.random_range(0..choices.len());
     choices[index](rng)
 }
@@ -103,7 +115,7 @@ pub fn one_of<T, R: Rng>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> 
 /// backtrack is a helper function for composing different "failable" generators.
 /// The function takes a list of functions that return an Option<T>, along with number of retries
 /// to make before giving up.
-pub fn backtrack<T, R: Rng>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
+pub fn backtrack<T, R: Rng + ?Sized>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
     loop {
         // If there are no more choices left, we give up
         let choices_ = choices
@@ -129,20 +141,20 @@ pub fn backtrack<T, R: Rng>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Opti
 }
 
 /// pick is a helper function for uniformly picking a random element from a slice
-pub fn pick<'a, T, R: Rng>(choices: &'a [T], rng: &mut R) -> &'a T {
+pub fn pick<'a, T, R: Rng + ?Sized>(choices: &'a [T], rng: &mut R) -> &'a T {
     let index = rng.random_range(0..choices.len());
     &choices[index]
 }
 
 /// pick_index is typically used for picking an index from a slice to later refer to the element
 /// at that index.
-pub fn pick_index<R: Rng>(choices: usize, rng: &mut R) -> usize {
+pub fn pick_index<R: Rng + ?Sized>(choices: usize, rng: &mut R) -> usize {
     rng.random_range(0..choices)
 }
 
 /// pick_n_unique is a helper function for uniformly picking N unique elements from a range.
 /// The elements themselves are usize, typically representing indices.
-pub fn pick_n_unique<R: Rng>(
+pub fn pick_n_unique<R: Rng + ?Sized>(
     range: std::ops::Range<usize>,
     n: usize,
     rng: &mut R,
@@ -155,7 +167,7 @@ pub fn pick_n_unique<R: Rng>(
 
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
-pub fn gen_random_text<T: Rng>(rng: &mut T) -> String {
+pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
     let big_text = rng.random_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;
@@ -172,10 +184,10 @@ pub fn gen_random_text<T: Rng>(rng: &mut T) -> String {
     }
 }
 
-pub fn pick_unique<'a, T: PartialEq>(
+pub fn pick_unique<'a, T: PartialEq, R: Rng + ?Sized>(
     items: &'a [T],
     count: usize,
-    rng: &mut impl rand::Rng,
+    rng: &mut R,
 ) -> impl Iterator<Item = &'a T> {
     let mut picked: Vec<&T> = Vec::new();
     while picked.len() < count {

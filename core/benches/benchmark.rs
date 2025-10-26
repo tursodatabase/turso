@@ -2,6 +2,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use pprof::criterion::{Output, PProfProfiler};
 use regex::Regex;
 use std::{sync::Arc, time::Instant};
+use tempfile::TempDir;
 use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
@@ -13,6 +14,36 @@ fn rusqlite_open() -> rusqlite::Connection {
     sqlite_conn
         .pragma_update(None, "locking_mode", "EXCLUSIVE")
         .unwrap();
+    sqlite_conn
+}
+
+fn setup_rusqlite(temp_dir: &TempDir, query: &str) -> rusqlite::Connection {
+    let db_path = temp_dir.path().join("bench.db");
+    let sqlite_conn = rusqlite::Connection::open(db_path).unwrap();
+    sqlite_conn
+        .pragma_update(None, "synchronous", "FULL")
+        .unwrap();
+    sqlite_conn
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    sqlite_conn
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .unwrap();
+    let journal_mode = sqlite_conn
+        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_lowercase(), "wal");
+    let synchronous = sqlite_conn
+        .pragma_query_value(None, "synchronous", |row| row.get::<_, usize>(0))
+        .unwrap();
+    const FULL: usize = 2;
+    assert_eq!(synchronous, FULL);
+
+    // load the generate_series extension
+    rusqlite::vtab::series::load_module(&sqlite_conn).unwrap();
+
+    // Create test table
+    sqlite_conn.execute(query, []).unwrap();
     sqlite_conn
 }
 
@@ -896,9 +927,90 @@ fn bench_concurrent_writes(criterion: &mut Criterion) {
     });
 }
 
+fn bench_insert_randomblob(criterion: &mut Criterion) {
+    // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
+    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+
+    let mut group = criterion.benchmark_group("Insert rows in batches");
+
+    // Test different batch sizes
+    for batch_size in [1, 10, 100] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("bench.db");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io.clone(), db_path.to_str().unwrap(), false, false).unwrap();
+        let limbo_conn = db.connect().unwrap();
+
+        let mut stmt = limbo_conn.query("CREATE TABLE test(x)").unwrap().unwrap();
+
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::IO => {
+                    stmt.run_once().unwrap();
+                }
+                turso_core::StepResult::Done => {
+                    break;
+                }
+                turso_core::StepResult::Row => {
+                    unreachable!();
+                }
+                turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                    unreachable!();
+                }
+            }
+        }
+
+        let random_blob = format!(
+            "INSERT INTO test select randomblob(1024 * 100) from generate_series(1, {batch_size});"
+        );
+
+        group.bench_function(format!("limbo_insert_{batch_size}_randomblob"), |b| {
+            let mut stmt = limbo_conn.prepare(&random_blob).unwrap();
+            b.iter(|| {
+                loop {
+                    match stmt.step().unwrap() {
+                        turso_core::StepResult::IO => {
+                            stmt.run_once().unwrap();
+                        }
+                        turso_core::StepResult::Done => {
+                            break;
+                        }
+                        turso_core::StepResult::Row => {
+                            unreachable!();
+                        }
+                        turso_core::StepResult::Interrupt | turso_core::StepResult::Busy => {
+                            unreachable!();
+                        }
+                    }
+                }
+                stmt.reset();
+            });
+        });
+
+        if enable_rusqlite {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test(x)");
+
+            group.bench_function(format!("sqlite_insert_{batch_size}_randomblob"), |b| {
+                let mut stmt = sqlite_conn.prepare(&random_blob).unwrap();
+                b.iter(|| {
+                    let mut rows = stmt.raw_query();
+                    while let Some(row) = rows.next().unwrap() {
+                        black_box(row);
+                    }
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
 criterion_main!(benches);

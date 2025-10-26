@@ -1,15 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::schema::{BTreeTable, Column, Type, ROWID_SENTINEL};
+use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
-use crate::translate::optimizer::optimize_select_plan;
-use crate::translate::plan::{Operation, QueryDestination, Scan, Search, SelectPlan};
+use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
-use crate::vdbe::builder::CursorType;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -22,8 +20,7 @@ use super::emitter::emit_program;
 use super::expr::process_returning_clause;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Plan, ResultSetColumn, TableReferences,
-    UpdatePlan,
+    ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
 use super::planner::parse_where;
 /*
@@ -62,7 +59,7 @@ pub fn translate_update(
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -89,7 +86,7 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -185,7 +182,10 @@ pub fn prepare_update_plan(
             Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
             _ => unreachable!(),
         },
-        identifier: table_name.to_string(),
+        identifier: body.tbl_name.alias.as_ref().map_or_else(
+            || table_name.to_string(),
+            |alias| alias.as_str().to_string(),
+        ),
         internal_id: program.table_reference_counter.next(),
         op: build_scan_op(&table, iter_dir),
         join_info: None,
@@ -298,119 +298,16 @@ pub fn prepare_update_plan(
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L395
     // https://github.com/sqlite/sqlite/blob/master/src/update.c#L670
     let columns = table.columns();
-
-    let rowid_alias_used = set_clauses.iter().fold(false, |accum, (idx, _)| {
-        accum || (*idx != ROWID_SENTINEL && columns[*idx].is_rowid_alias)
-    });
-    let direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
-
-    let (ephemeral_plan, mut where_clause) = if rowid_alias_used || direct_rowid_update {
-        let mut where_clause = vec![];
-        let internal_id = program.table_reference_counter.next();
-
-        let joined_tables = vec![JoinedTable {
-            table: match table.as_ref() {
-                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-                _ => unreachable!(),
-            },
-            identifier: table_name.to_string(),
-            internal_id,
-            op: build_scan_op(&table, iter_dir),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            database_id: 0,
-        }];
-        let mut table_references = TableReferences::new(joined_tables, vec![]);
-
-        // Parse the WHERE clause
-        parse_where(
-            body.where_clause.as_deref(),
-            &mut table_references,
-            Some(&result_columns),
-            &mut where_clause,
-            connection,
-            &mut program.param_ctx,
-        )?;
-
-        let table = Arc::new(BTreeTable {
-            root_page: 0, // Not relevant for ephemeral table definition
-            name: "ephemeral_scratch".to_string(),
-            has_rowid: true,
-            has_autoincrement: false,
-            primary_key_columns: vec![],
-            columns: vec![Column {
-                name: Some("rowid".to_string()),
-                ty: Type::Integer,
-                ty_str: "INTEGER".to_string(),
-                primary_key: true,
-                is_rowid_alias: false,
-                notnull: true,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
-            is_strict: false,
-            unique_sets: vec![],
-        });
-
-        let temp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-
-        let mut ephemeral_plan = SelectPlan {
-            table_references,
-            result_columns: vec![ResultSetColumn {
-                expr: Expr::RowId {
-                    database: None,
-                    table: internal_id,
-                },
-                alias: None,
-                contains_aggregates: false,
-            }],
-            where_clause,       // original WHERE terms from the UPDATE clause
-            group_by: None,     // N/A
-            order_by: vec![],   // N/A
-            aggregates: vec![], // N/A
-            limit: None,        // N/A
-            query_destination: QueryDestination::EphemeralTable {
-                cursor_id: temp_cursor_id,
-                table,
-            },
-            join_order: vec![],
-            offset: None,
-            contains_constant_false_condition: false,
-            distinctness: super::plan::Distinctness::NonDistinct,
-            values: vec![],
-            window: None,
-        };
-
-        optimize_select_plan(&mut ephemeral_plan, schema)?;
-        let table = ephemeral_plan
-            .table_references
-            .joined_tables()
-            .first()
-            .unwrap();
-        // We do not need to emit an ephemeral plan if we are not going to loop over the table values
-        if matches!(table.op, Operation::Search(Search::RowidEq { .. })) {
-            (None, vec![])
-        } else {
-            (Some(ephemeral_plan), vec![])
-        }
-    } else {
-        (None, vec![])
-    };
-
-    if ephemeral_plan.is_none() {
-        // Parse the WHERE clause
-        parse_where(
-            body.where_clause.as_deref(),
-            &mut table_references,
-            Some(&result_columns),
-            &mut where_clause,
-            connection,
-            &mut program.param_ctx,
-        )?;
-    };
+    let mut where_clause = vec![];
+    // Parse the WHERE clause
+    parse_where(
+        body.where_clause.as_deref(),
+        &mut table_references,
+        Some(&result_columns),
+        &mut where_clause,
+        connection,
+        &mut program.param_ctx,
+    )?;
 
     // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
@@ -481,7 +378,7 @@ pub fn prepare_update_plan(
         offset,
         contains_constant_false_condition: false,
         indexes_to_update,
-        ephemeral_plan,
+        ephemeral_plan: None,
         cdc_update_alter_statement: None,
     }))
 }

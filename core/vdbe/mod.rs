@@ -29,19 +29,20 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
+    return_if_io,
     state_machine::StateMachine,
-    storage::sqlite3_ondisk::SmallVec,
+    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOCompletions, IOResult, RawSlice, TextRef},
+    types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpRowIdState,
-            OpSeekState, OpTransactionState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
+            OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
-    IOExt, RefValue,
+    ValueRef,
 };
 
 use crate::{
@@ -66,9 +67,10 @@ use std::{
     collections::HashMap,
     num::NonZero,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicIsize, Ordering},
         Arc,
     },
+    task::Waker,
 };
 use tracing::{instrument, Level};
 
@@ -178,18 +180,6 @@ pub enum StepResult {
     Busy,
 }
 
-/// If there is I/O, the instruction is restarted.
-/// Evaluate a Result<IOResult<T>>, if IO return Ok(StepResult::IO).
-#[macro_export]
-macro_rules! return_step_if_io {
-    ($expr:expr) => {
-        match $expr? {
-            IOResult::Ok(v) => v,
-            IOResult::IO => return Ok(StepResult::IO),
-        }
-    };
-}
-
 struct RegexCache {
     like: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
@@ -265,11 +255,23 @@ pub struct Row {
     count: usize,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for Row {}
+unsafe impl Sync for Row {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TxnCleanup {
+    None,
+    RollbackTxn,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     cursors: Vec<Option<Cursor>>,
+    cursor_seqs: Vec<i64>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
@@ -284,6 +286,7 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     op_delete_state: OpDeleteState,
+    op_destroy_state: OpDestroyState,
     op_idx_delete_state: Option<OpIdxDeleteState>,
     op_integrity_check_state: OpIntegrityCheckState,
     /// Metrics collected during statement execution
@@ -302,16 +305,34 @@ pub struct ProgramState {
     op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
+    /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
+    /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
+    pub(crate) auto_txn_cleanup: TxnCleanup,
+    /// Number of deferred foreign key violations when the statement started.
+    /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
+    /// is reset to this value.
+    fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
+    /// the statement subtransactionwill roll back.
+    fk_immediate_violations_during_stmt: AtomicIsize,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for ProgramState {}
+unsafe impl Sync for ProgramState {}
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers];
         Self {
             io_completions: None,
             pc: 0,
             cursors,
+            cursor_seqs,
             registers,
             result_row: None,
             last_compare: None,
@@ -328,6 +349,7 @@ impl ProgramState {
                 sub_state: OpDeleteSubState::MaybeCaptureRecord,
                 deleted_record: None,
             },
+            op_destroy_state: OpDestroyState::CreateCursor,
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
@@ -346,6 +368,9 @@ impl ProgramState {
             op_transaction_state: OpTransactionState::Start,
             op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            auto_txn_cleanup: TxnCleanup::None,
+            fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            fk_immediate_violations_during_stmt: AtomicIsize::new(0),
         }
     }
 
@@ -390,6 +415,7 @@ impl ProgramState {
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_seqs.resize(max_cursors, 0);
         }
         if let Some(max_resgisters) = max_registers {
             self.registers
@@ -428,6 +454,11 @@ impl ProgramState {
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.auto_txn_cleanup = TxnCleanup::None;
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        self.fk_deferred_violations_when_stmt_started
+            .store(0, Ordering::SeqCst);
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -437,6 +468,63 @@ impl ProgramState {
             .as_mut()
             .unwrap_or_else(|| panic!("cursor id {cursor_id} is None"))
     }
+
+    /// Begin a statement subtransaction.
+    pub fn begin_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        write: bool,
+    ) -> Result<IOResult<()>> {
+        // Store the deferred foreign key violations counter at the start of the statement.
+        // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
+        // the deferred FK violations are not lost.
+        self.fk_deferred_violations_when_stmt_started.store(
+            connection.fk_deferred_violations.load(Ordering::Acquire),
+            Ordering::SeqCst,
+        );
+        // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
+        self.fk_immediate_violations_during_stmt
+            .store(0, Ordering::SeqCst);
+        if write {
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.begin_statement(db_size)?;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// End a statement subtransaction.
+    pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        match end_statement {
+            EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+            EndStatement::RollbackSavepoint => {
+                pager.rollback_to_newest_savepoint()?;
+                // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
+                // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
+                connection.fk_deferred_violations.store(
+                    self.fk_deferred_violations_when_stmt_started
+                        .load(Ordering::Acquire),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Action to take at the end of a statement subtransaction.
+pub enum EndStatement {
+    /// Release (commit) the savepoint -- effectively removing the savepoint as it is no longer needed for undo purposes.
+    ReleaseSavepoint,
+    /// Rollback (abort) to the newest savepoint: read pages from the subjournal and restore them to the page cache.
+    /// This is used to undo the changes made by the statement.
+    RollbackSavepoint,
 }
 
 impl Register {
@@ -501,6 +589,10 @@ pub struct Program {
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
     pub accesses_db: bool,
+    /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
+    /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
+    /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
+    pub needs_stmt_subtransactions: bool,
 }
 
 impl Program {
@@ -514,9 +606,10 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         match query_mode {
-            QueryMode::Normal => self.normal_step(state, mv_store, pager),
+            QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
         }
@@ -533,7 +626,7 @@ impl Program {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
             if let TransactionState::Write { .. } = state {
-                pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                pager.rollback_tx(&self.connection);
             }
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -588,7 +681,7 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
@@ -629,6 +722,7 @@ impl Program {
         state: &mut ProgramState,
         mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
+        waker: Option<&Waker>,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {
@@ -636,20 +730,22 @@ impl Program {
                 // Connection is closed for whatever reason, rollback the transaction.
                 let state = self.connection.get_tx_state();
                 if let TransactionState::Write { .. } = state {
-                    pager.io.block(|| pager.end_tx(true, &self.connection))?;
+                    pager.rollback_tx(&self.connection);
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
+                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
+                    io.set_waker(waker);
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -672,10 +768,12 @@ impl Program {
                 Ok(InsnFunctionStepResult::Done) => {
                     // Instruction completed execution
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
+                    state.auto_txn_cleanup = TxnCleanup::None;
                     return Ok(StepResult::Done);
                 }
                 Ok(InsnFunctionStepResult::IO(io)) => {
                     // Instruction not complete - waiting for I/O, will resume at same PC
+                    io.set_waker(waker);
                     state.io_completions = Some(io);
                     return Ok(StepResult::IO);
                 }
@@ -684,16 +782,12 @@ impl Program {
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
                     return Ok(StepResult::Row);
                 }
-                Ok(InsnFunctionStepResult::Interrupt) => {
-                    // Instruction interrupted - may resume at same PC
-                    return Ok(StepResult::Interrupt);
-                }
                 Err(LimboError::Busy) => {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    handle_program_error(&pager, &self.connection, &err, mv_store)?;
+                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
                     return Err(err);
                 }
             }
@@ -818,7 +912,6 @@ impl Program {
 
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
-
         if self.connection.get_tx_state() == TransactionState::None {
             // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
             // hence the mv_store.is_none() check.
@@ -888,7 +981,7 @@ impl Program {
                     ),
                     TransactionState::Read => {
                         connection.set_tx_state(TransactionState::None);
-                        pager.end_read_tx()?;
+                        pager.end_read_tx();
                         Ok(IOResult::Done(()))
                     }
                     TransactionState::None => Ok(IOResult::Done(())),
@@ -914,7 +1007,12 @@ impl Program {
         connection: &Connection,
         rollback: bool,
     ) -> Result<IOResult<()>> {
-        let cacheflush_status = pager.end_tx(rollback, connection)?;
+        let cacheflush_status = if !rollback {
+            pager.commit_tx(connection)?
+        } else {
+            pager.rollback_tx(connection);
+            IOResult::Done(PagerCommitResult::Rollback)
+        };
         match cacheflush_status {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
@@ -941,6 +1039,47 @@ impl Program {
     ) -> Result<IOResult<()>> {
         commit_state.step(mv_store)
     }
+
+    /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
+    /// This method is no-op if program was already finished (either aborted or executed to completion)
+    pub fn abort(
+        &self,
+        mv_store: Option<&Arc<MvStore>>,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+        cleanup: &mut TxnCleanup,
+    ) {
+        // Errors from nested statements are handled by the parent statement.
+        if !self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+            match err {
+                // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
+                Some(LimboError::TxError(_)) => {}
+                // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
+                Some(LimboError::TableLocked) => {}
+                // Busy errors do not cause a rollback.
+                Some(LimboError::Busy) => {}
+                // Constraint errors do not cause a rollback of the transaction by default;
+                // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
+                // and op_halt.
+                Some(LimboError::Constraint(_)) => {}
+                _ => {
+                    if *cleanup != TxnCleanup::None || err.is_some() {
+                        if let Some(mv_store) = mv_store {
+                            if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                                self.connection.auto_commit.store(true, Ordering::SeqCst);
+                                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+                            }
+                        } else {
+                            pager.rollback_tx(&self.connection);
+                            self.connection.auto_commit.store(true, Ordering::SeqCst);
+                        }
+                        self.connection.set_tx_state(TransactionState::None);
+                    }
+                }
+            }
+        }
+        *cleanup = TxnCleanup::None;
+    }
 }
 
 fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
@@ -948,22 +1087,10 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-pub fn registers_to_ref_values(registers: &[Register]) -> Vec<RefValue> {
+pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
     registers
         .iter()
-        .map(|reg| {
-            let value = reg.get_value();
-            match value {
-                Value::Null => RefValue::Null,
-                Value::Integer(i) => RefValue::Integer(*i),
-                Value::Float(f) => RefValue::Float(*f),
-                Value::Text(t) => RefValue::Text(TextRef {
-                    value: RawSlice::new(t.value.as_ptr(), t.value.len()),
-                    subtype: t.subtype,
-                }),
-                Value::Blob(b) => RefValue::Blob(RawSlice::new(b.as_ptr(), b.len())),
-            }
-        })
+        .map(|reg| reg.get_value().as_ref())
         .collect()
 }
 
@@ -1062,43 +1189,4 @@ impl Row {
     pub fn len(&self) -> usize {
         self.count
     }
-}
-
-/// Handle a program error by rolling back the transaction
-pub fn handle_program_error(
-    pager: &Arc<Pager>,
-    connection: &Connection,
-    err: &LimboError,
-    mv_store: Option<&Arc<MvStore>>,
-) -> Result<()> {
-    if connection.is_nested_stmt.load(Ordering::SeqCst) {
-        // Errors from nested statements are handled by the parent statement.
-        return Ok(());
-    }
-    match err {
-        // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
-        LimboError::TxError(_) => {}
-        // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.
-        LimboError::TableLocked => {}
-        // Busy errors do not cause a rollback.
-        LimboError::Busy => {}
-        _ => {
-            if let Some(mv_store) = mv_store {
-                if let Some(tx_id) = connection.get_mv_tx_id() {
-                    connection.set_tx_state(TransactionState::None);
-                    connection.auto_commit.store(true, Ordering::SeqCst);
-                    mv_store.rollback_tx(tx_id, pager.clone(), connection)?;
-                }
-            } else {
-                pager
-                    .io
-                    .block(|| pager.end_tx(true, connection))
-                    .inspect_err(|e| {
-                        tracing::error!("end_tx failed: {e}");
-                    })?;
-            }
-            connection.set_tx_state(TransactionState::None);
-        }
-    }
-    Ok(())
 }

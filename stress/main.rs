@@ -450,6 +450,31 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
     Ok(guard)
 }
 
+fn integrity_check(
+    db_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    assert!(db_path.exists());
+    let conn = rusqlite::Connection::open(db_path)?;
+    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
+    let mut rows = stmt.query(())?;
+    let mut result: Vec<String> = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        result.push(row.get(0)?);
+    }
+    if result.is_empty() {
+        return Err(
+            "simulation failed: integrity_check should return `ok` or a list of problems".into(),
+        );
+    }
+    if !result[0].eq_ignore_ascii_case("ok") {
+        // Build a list of problems
+        result.iter_mut().for_each(|row| *row = format!("- {row}"));
+        return Err(format!("simulation failed: {}", result.join("\n")).into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _g = init_tracing()?;
@@ -493,6 +518,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
+        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+
         conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         // Apply each DDL statement individually
@@ -525,6 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
+            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
             println!("\rExecuting queries...");
@@ -542,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
+                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
                 } else if gen_bool(0.0) {
                     // disabled
                     // Reconnect to the database
@@ -550,6 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     let db_guard = db.lock().await;
                     conn = db_guard.connect()?;
+                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
                 }
                 let sql = &plan.queries_per_thread[thread][query_index];
                 if !opts.silent {
@@ -598,6 +629,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
+            // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
+            let _ = conn.execute("COMMIT", ()).await;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);
@@ -608,5 +641,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     println!("Done. SQL statements written to {}", opts.log_file);
     println!("Database file: {db_file}");
+
+    #[cfg(not(miri))]
+    {
+        println!("Running SQLite Integrity check");
+        integrity_check(std::path::Path::new(&db_file))?;
+    }
+
     Ok(())
 }

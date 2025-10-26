@@ -30,6 +30,7 @@ pub struct ConditionMetadata {
     pub jump_if_condition_is_true: bool,
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
+    pub jump_target_when_null: BranchOffset,
 }
 
 /// Container for register locations of values that can be referenced in RETURNING expressions
@@ -154,127 +155,126 @@ macro_rules! expect_arguments_even {
 ///
 /// This is extracted from the original conditional implementation to be reusable.
 /// The logic exactly matches the original conditional InList implementation.
+///
+/// An IN expression has one of the following formats:
+///  ```sql
+///      x IN (y1, y2,...,yN)
+///      x IN (subquery) (Not yet implemented)
+///  ```
+/// The result of an IN operator is one of TRUE, FALSE, or NULL.  A NULL result
+/// means that it cannot be determined if the LHS is contained in the RHS due
+/// to the presence of NULL values.
+///
+/// Currently, we do a simple full-scan, yet it's not ideal when there are many rows
+/// on RHS. (Check sqlite's in-operator.md)
+///
+/// Algorithm:
+/// 1. Set the null-flag to false
+/// 2. For each row in the RHS:
+///     - Compare LHS and RHS
+///     - If LHS matches RHS, returns TRUE
+///     - If the comparison results in NULL, set the null-flag to true
+/// 3. If the null-flag is true, return NULL
+/// 4. Return FALSE
+///
+/// A "NOT IN" operator is computed by first computing the equivalent IN
+/// operator, then interchanging the TRUE and FALSE results.
+// todo: Check right affinities
 #[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
 fn translate_in_list(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
     lhs: &ast::Expr,
     rhs: &[Box<ast::Expr>],
-    not: bool,
     condition_metadata: ConditionMetadata,
+    // dest if null should be in ConditionMetadata
     resolver: &Resolver,
 ) -> Result<()> {
-    // lhs is e.g. a column reference
-    // rhs is an Option<Vec<Expr>>
-    // If rhs is None, it means the IN expression is always false, i.e. tbl.id IN ().
-    // If rhs is Some, it means the IN expression has a list of values to compare against, e.g. tbl.id IN (1, 2, 3).
-    //
-    // The IN expression is equivalent to a series of OR expressions.
-    // For example, `a IN (1, 2, 3)` is equivalent to `a = 1 OR a = 2 OR a = 3`.
-    // The NOT IN expression is equivalent to a series of AND expressions.
-    // For example, `a NOT IN (1, 2, 3)` is equivalent to `a != 1 AND a != 2 AND a != 3`.
-    //
-    // SQLite typically optimizes IN expressions to use a binary search on an ephemeral index if there are many values.
-    // For now we don't have the plumbing to do that, so we'll just emit a series of comparisons,
-    // which is what SQLite also does for small lists of values.
-    // TODO: Let's refactor this later to use a more efficient implementation conditionally based on the number of values.
+    let lhs_reg = if let Expr::Parenthesized(v) = lhs {
+        program.alloc_registers(v.len())
+    } else {
+        program.alloc_register()
+    };
+    let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    let mut check_null_reg = 0;
+    let label_ok = program.allocate_label();
 
-    if rhs.is_empty() {
-        // If rhs is None, IN expressions are always false and NOT IN expressions are always true.
-        if not {
-            // On a trivially true NOT IN () expression we can only jump to the 'jump_target_when_true' label if 'jump_if_condition_is_true'; otherwise me must fall through.
-            // This is because in a more complex condition we might need to evaluate the rest of the condition.
-            // Note that we are already breaking up our WHERE clauses into a series of terms at "AND" boundaries, so right now we won't be running into cases where jumping on true would be incorrect,
-            // but once we have e.g. parenthesization and more complex conditions, not having this 'if' here would introduce a bug.
-            if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::Goto {
-                    target_pc: condition_metadata.jump_target_when_true,
-                });
-            }
-        } else {
-            program.emit_insn(Insn::Goto {
-                target_pc: condition_metadata.jump_target_when_false,
-            });
-        }
-        return Ok(());
+    if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
+        check_null_reg = program.alloc_register();
+        program.emit_insn(Insn::BitAnd {
+            lhs: lhs_reg,
+            rhs: lhs_reg,
+            dest: check_null_reg,
+        });
     }
 
-    // The left hand side only needs to be evaluated once we have a list of values to compare against.
-    let lhs_reg = program.alloc_register();
-    let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    for (i, expr) in rhs.iter().enumerate() {
+        let last_condition = i == rhs.len() - 1;
+        let rhs_reg = program.alloc_register();
+        let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
 
-    // The difference between a local jump and an "upper level" jump is that for example in this case:
-    // WHERE foo IN (1,2,3) OR bar = 5,
-    // we can immediately jump to the 'jump_target_when_true' label of the ENTIRE CONDITION if foo = 1, foo = 2, or foo = 3 without evaluating the bar = 5 condition.
-    // This is why in Binary-OR expressions we set jump_if_condition_is_true to true for the first condition.
-    // However, in this example:
-    // WHERE foo IN (1,2,3) AND bar = 5,
-    // we can't jump to the 'jump_target_when_true' label of the entire condition foo = 1, foo = 2, or foo = 3, because we still need to evaluate the bar = 5 condition later.
-    // This is why in that case we just jump over the rest of the IN conditions in this "local" branch which evaluates the IN condition.
-    let jump_target_when_true = if condition_metadata.jump_if_condition_is_true {
-        condition_metadata.jump_target_when_true
-    } else {
-        program.allocate_label()
-    };
+        if check_null_reg != 0 && expr.can_be_null() {
+            program.emit_insn(Insn::BitAnd {
+                lhs: check_null_reg,
+                rhs: rhs_reg,
+                dest: check_null_reg,
+            });
+        }
 
-    if !not {
-        // If it's an IN expression, we need to jump to the 'jump_target_when_true' label if any of the conditions are true.
-        for (i, expr) in rhs.iter().enumerate() {
-            let rhs_reg = program.alloc_register();
-            let last_condition = i == rhs.len() - 1;
-            let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
-            // If this is not the last condition, we need to jump to the 'jump_target_when_true' label if the condition is true.
-            if !last_condition {
+        if !last_condition
+            || condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null
+        {
+            if lhs_reg != rhs_reg {
                 program.emit_insn(Insn::Eq {
                     lhs: lhs_reg,
                     rhs: rhs_reg,
-                    target_pc: jump_target_when_true,
+                    target_pc: label_ok,
+                    // Use affinity instead
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
             } else {
-                // If this is the last condition, we need to jump to the 'jump_target_when_false' label if there is no match.
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_reg,
-                    rhs: rhs_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: program.curr_collation(),
+                program.emit_insn(Insn::NotNull {
+                    reg: lhs_reg,
+                    target_pc: label_ok,
                 });
             }
-        }
-        // If we got here, then the last condition was a match, so we jump to the 'jump_target_when_true' label if 'jump_if_condition_is_true'.
-        // If not, we can just fall through without emitting an unnecessary instruction.
-        if condition_metadata.jump_if_condition_is_true {
-            program.emit_insn(Insn::Goto {
-                target_pc: condition_metadata.jump_target_when_true,
-            });
-        }
-    } else {
-        // If it's a NOT IN expression, we need to jump to the 'jump_target_when_false' label if any of the conditions are true.
-        for expr in rhs.iter() {
-            let rhs_reg = program.alloc_register();
-            let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
-            program.emit_insn(Insn::Eq {
+            // sqlite3VdbeChangeP5(v, zAff[0]);
+        } else if lhs_reg != rhs_reg {
+            program.emit_insn(Insn::Ne {
                 lhs: lhs_reg,
                 rhs: rhs_reg,
                 target_pc: condition_metadata.jump_target_when_false,
-                flags: CmpInsFlags::default().jump_if_null(),
+                flags: CmpInsFlags::default(),
                 collation: program.curr_collation(),
             });
-        }
-        // If we got here, then none of the conditions were a match, so we jump to the 'jump_target_when_true' label if 'jump_if_condition_is_true'.
-        // If not, we can just fall through without emitting an unnecessary instruction.
-        if condition_metadata.jump_if_condition_is_true {
-            program.emit_insn(Insn::Goto {
-                target_pc: condition_metadata.jump_target_when_true,
+        } else {
+            program.emit_insn(Insn::IsNull {
+                reg: lhs_reg,
+                target_pc: condition_metadata.jump_target_when_false,
             });
         }
     }
 
-    if !condition_metadata.jump_if_condition_is_true {
-        program.preassign_label_to_next_insn(jump_target_when_true);
+    if check_null_reg != 0 {
+        program.emit_insn(Insn::IsNull {
+            reg: check_null_reg,
+            target_pc: condition_metadata.jump_target_when_null,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_false,
+        });
     }
+
+    program.resolve_label(label_ok, program.offset());
+
+    // by default if IN expression is true we just continue to the next instruction
+    if condition_metadata.jump_if_condition_is_true {
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_true,
+        });
+    }
+    // todo: deallocate check_null_reg
 
     Ok(())
 }
@@ -402,16 +402,55 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
         }
+
         ast::Expr::InList { lhs, not, rhs } => {
+            let ConditionMetadata {
+                jump_if_condition_is_true,
+                jump_target_when_true,
+                jump_target_when_false,
+                jump_target_when_null,
+            } = condition_metadata;
+
+            // Adjust targets if `NOT IN`
+            let (adjusted_metadata, not_true_label, not_false_label) = if *not {
+                let not_true_label = program.allocate_label();
+                let not_false_label = program.allocate_label();
+                (
+                    ConditionMetadata {
+                        jump_if_condition_is_true,
+                        jump_target_when_true: not_true_label,
+                        jump_target_when_false: not_false_label,
+                        jump_target_when_null,
+                    },
+                    Some(not_true_label),
+                    Some(not_false_label),
+                )
+            } else {
+                (condition_metadata, None, None)
+            };
+
             translate_in_list(
                 program,
                 Some(referenced_tables),
                 lhs,
                 rhs,
-                *not,
-                condition_metadata,
+                adjusted_metadata,
                 resolver,
             )?;
+
+            if *not {
+                // When IN is TRUE (match found), NOT IN should be FALSE
+                program.resolve_label(not_true_label.unwrap(), program.offset());
+                program.emit_insn(Insn::Goto {
+                    target_pc: jump_target_when_false,
+                });
+
+                // When IN is FALSE (no match), NOT IN should be TRUE
+                program.resolve_label(not_false_label.unwrap(), program.offset());
+                program.emit_insn(Insn::Goto {
+                    target_pc: jump_target_when_true,
+                });
+            }
         }
         ast::Expr::Like { not, .. } => {
             let cur_reg = program.alloc_register();
@@ -879,6 +918,14 @@ pub fn translate_expr(
                         emit_function_call(program, func_ctx, &[start_reg], target_register)?;
                         Ok(target_register)
                     }
+                    VectorFunc::Vector32Sparse => {
+                        let args = expect_arguments_exact!(args, 1, vector_func);
+                        let start_reg = program.alloc_register();
+                        translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
+
+                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        Ok(target_register)
+                    }
                     VectorFunc::Vector64 => {
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();
@@ -904,7 +951,16 @@ pub fn translate_expr(
                         emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
                         Ok(target_register)
                     }
-                    VectorFunc::VectorDistanceEuclidean => {
+                    VectorFunc::VectorDistanceL2 => {
+                        let args = expect_arguments_exact!(args, 2, vector_func);
+                        let regs = program.alloc_registers(2);
+                        translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
+
+                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        Ok(target_register)
+                    }
+                    VectorFunc::VectorDistanceJaccard => {
                         let args = expect_arguments_exact!(args, 2, vector_func);
                         let regs = program.alloc_registers(2);
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
@@ -1087,51 +1143,66 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Iif => {
-                            if args.len() != 3 {
-                                crate::bail_parse_error!(
-                                    "{} requires exactly 3 arguments",
-                                    srf.to_string()
-                                );
+                            let args = expect_arguments_min!(args, 2, srf);
+
+                            let iif_end_label = program.allocate_label();
+                            let condition_reg = program.alloc_register();
+
+                            for pair in args.chunks_exact(2) {
+                                let condition_expr = &pair[0];
+                                let value_expr = &pair[1];
+                                let next_check_label = program.allocate_label();
+
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    condition_expr,
+                                    condition_reg,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+
+                                program.emit_insn(Insn::IfNot {
+                                    reg: condition_reg,
+                                    target_pc: next_check_label,
+                                    jump_if_null: true,
+                                });
+
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    value_expr,
+                                    target_register,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                                program.emit_insn(Insn::Goto {
+                                    target_pc: iif_end_label,
+                                });
+
+                                program.preassign_label_to_next_insn(next_check_label);
                             }
-                            let temp_reg = program.alloc_register();
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[0],
-                                temp_reg,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            let jump_target_when_false = program.allocate_label();
-                            program.emit_insn(Insn::IfNot {
-                                reg: temp_reg,
-                                target_pc: jump_target_when_false,
-                                jump_if_null: true,
-                            });
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[1],
-                                target_register,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            let jump_target_result = program.allocate_label();
-                            program.emit_insn(Insn::Goto {
-                                target_pc: jump_target_result,
-                            });
-                            program.preassign_label_to_next_insn(jump_target_when_false);
-                            translate_expr_no_constant_opt(
-                                program,
-                                referenced_tables,
-                                &args[2],
-                                target_register,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            program.preassign_label_to_next_insn(jump_target_result);
+
+                            if args.len() % 2 != 0 {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    referenced_tables,
+                                    args.last().unwrap(),
+                                    target_register,
+                                    resolver,
+                                    NoConstantOptReason::RegisterReuse,
+                                )?;
+                            } else {
+                                program.emit_insn(Insn::Null {
+                                    dest: target_register,
+                                    dest_end: None,
+                                });
+                            }
+
+                            program.preassign_label_to_next_insn(iif_end_label);
                             Ok(target_register)
                         }
+
                         ScalarFunc::Glob | ScalarFunc::Like => {
                             if args.len() < 2 {
                                 crate::bail_parse_error!(
@@ -1499,31 +1570,11 @@ pub fn translate_expr(
 
                             Ok(target_register)
                         }
-                        ScalarFunc::SqliteVersion => {
+                        ScalarFunc::SqliteVersion
+                        | ScalarFunc::TursoVersion
+                        | ScalarFunc::SqliteSourceId => {
                             if !args.is_empty() {
                                 crate::bail_parse_error!("sqlite_version function with arguments");
-                            }
-
-                            let output_register = program.alloc_register();
-                            program.emit_insn(Insn::Function {
-                                constant_mask: 0,
-                                start_reg: output_register,
-                                dest: output_register,
-                                func: func_ctx,
-                            });
-
-                            program.emit_insn(Insn::Copy {
-                                src_reg: output_register,
-                                dst_reg: target_register,
-                                extra_amount: 0,
-                            });
-                            Ok(target_register)
-                        }
-                        ScalarFunc::SqliteSourceId => {
-                            if !args.is_empty() {
-                                crate::bail_parse_error!(
-                                    "sqlite_source_id function with arguments"
-                                );
                             }
 
                             let output_register = program.alloc_register();
@@ -1819,8 +1870,55 @@ pub fn translate_expr(
                 Func::AlterTable(_) => unreachable!(),
             }
         }
-        ast::Expr::FunctionCallStar { .. } => {
-            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported")
+        ast::Expr::FunctionCallStar { name, filter_over } => {
+            // Handle func(*) syntax as a function call with 0 arguments
+            // This is equivalent to func() for functions that accept 0 arguments
+            let args_count = 0;
+            let func_type = resolver.resolve_function(name.as_str(), args_count);
+
+            if func_type.is_none() {
+                crate::bail_parse_error!("unknown function {}", name.as_str());
+            }
+
+            let func_ctx = FuncCtx {
+                func: func_type.unwrap(),
+                arg_count: args_count,
+            };
+
+            // Check if this function supports the (*) syntax by verifying it can be called with 0 args
+            match &func_ctx.func {
+                Func::Agg(_) => {
+                    crate::bail_parse_error!(
+                        "misuse of {} function {}(*)",
+                        if filter_over.over_clause.is_some() {
+                            "window"
+                        } else {
+                            "aggregate"
+                        },
+                        name.as_str()
+                    )
+                }
+                // For supported functions, delegate to the existing FunctionCall logic
+                // by creating a synthetic FunctionCall with empty args
+                _ => {
+                    let synthetic_call = ast::Expr::FunctionCall {
+                        name: name.clone(),
+                        distinctness: None,
+                        args: vec![], // Empty args for func(*)
+                        filter_over: filter_over.clone(),
+                        order_by: vec![], // Empty order_by for func(*)
+                    };
+
+                    // Recursively call translate_expr with the synthetic function call
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        &synthetic_call,
+                        target_register,
+                        resolver,
+                    )
+                }
+            }
         }
         ast::Expr::Id(id) => {
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
@@ -1853,7 +1951,12 @@ pub fn translate_expr(
             let table = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
-                .expect("table reference should be found");
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "table reference should be found: {} (referenced_tables: {:?})",
+                        table_ref_id, referenced_tables
+                    )
+                });
 
             let Some(table_column) = table.get_column_at(*column) else {
                 crate::bail_parse_error!("column index out of bounds");
@@ -1982,26 +2085,29 @@ pub fn translate_expr(
             // but wrap it with appropriate expression context handling
             let result_reg = target_register;
 
-            // Set result to NULL initially (matches SQLite behavior)
-            program.emit_insn(Insn::Null {
-                dest: result_reg,
+            let dest_if_false = program.allocate_label();
+            let dest_if_null = program.allocate_label();
+            let dest_if_true = program.allocate_label();
+
+            // Ideally we wouldn't need a tmp register, but currently if an IN expression
+            // is used inside an aggregator the target_register is cleared on every iteration,
+            // losing the state of the aggregator.
+            let tmp = program.alloc_register();
+            program.emit_no_constant_insn(Insn::Null {
+                dest: tmp,
                 dest_end: None,
             });
 
-            let dest_if_false = program.allocate_label();
-            let label_integer_conversion = program.allocate_label();
-
-            // Call the core InList logic with expression-appropriate condition metadata
             translate_in_list(
                 program,
                 referenced_tables,
                 lhs,
                 rhs,
-                *not,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
-                    jump_target_when_true: label_integer_conversion, // will be resolved below
+                    jump_target_when_true: dest_if_true,
                     jump_target_when_false: dest_if_false,
+                    jump_target_when_null: dest_if_null,
                 },
                 resolver,
             )?;
@@ -2009,27 +2115,30 @@ pub fn translate_expr(
             // condition true: set result to 1
             program.emit_insn(Insn::Integer {
                 value: 1,
-                dest: result_reg,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: label_integer_conversion,
+                dest: tmp,
             });
 
             // False path: set result to 0
             program.resolve_label(dest_if_false, program.offset());
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: result_reg,
-            });
-
-            program.resolve_label(label_integer_conversion, program.offset());
 
             // Force integer conversion with AddImm 0
             program.emit_insn(Insn::AddImm {
-                register: result_reg,
+                register: tmp,
                 value: 0,
             });
 
+            if *not {
+                program.emit_insn(Insn::Not {
+                    reg: tmp,
+                    dest: tmp,
+                });
+            }
+            program.resolve_label(dest_if_null, program.offset());
+            program.emit_insn(Insn::Copy {
+                src_reg: tmp,
+                dst_reg: result_reg,
+                extra_amount: 0,
+            });
             Ok(result_reg)
         }
         ast::Expr::InSelect { .. } => {
@@ -3272,11 +3381,14 @@ impl ParamState {
 /// TryCanonicalColumnsFirst means that canonical columns take precedence over result columns. This is used for e.g. WHERE clauses.
 ///
 /// ResultColumnsNotAllowed means that referring to result columns is not allowed. This is used e.g. for DML statements.
+///
+/// AllowUnboundIdentifiers means that unbound identifiers are allowed. This is used for INSERT ... ON CONFLICT DO UPDATE SET ... where binding is handled later than this phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingBehavior {
     TryResultColumnsFirst,
     TryCanonicalColumnsFirst,
     ResultColumnsNotAllowed,
+    AllowUnboundIdentifiers,
 }
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
@@ -3326,242 +3438,264 @@ pub fn bind_and_rewrite_expr<'a>(
                 }
                 _ => {}
             }
-            if let Some(referenced_tables) = &mut referenced_tables {
-                match expr {
-                    Expr::Id(id) => {
-                        let normalized_id = normalize_ident(id.as_str());
+            match expr {
+                Expr::Id(id) => {
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                    };
+                    let normalized_id = normalize_ident(id.as_str());
 
-                        if binding_behavior == BindingBehavior::TryResultColumnsFirst {
-                            if let Some(result_columns) = result_columns {
-                                for result_column in result_columns.iter() {
-                                    if result_column.name(referenced_tables).is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
-                                    }) {
+                    if binding_behavior == BindingBehavior::TryResultColumnsFirst {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
                                 }
                             }
                         }
-                        let mut match_result = None;
+                    }
+                    let mut match_result = None;
 
-                        // First check joined tables
-                        for joined_table in referenced_tables.joined_tables().iter() {
-                            let col_idx = joined_table.table.columns().iter().position(|c| {
+                    // First check joined tables
+                    for joined_table in referenced_tables.joined_tables().iter() {
+                        let col_idx = joined_table.table.columns().iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                        });
+                        if col_idx.is_some() {
+                            if match_result.is_some() {
+                                let mut ok = false;
+                                // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
+                                // and the left table is used.
+                                if let Some(join_info) = &joined_table.join_info {
+                                    if join_info.using.iter().any(|using_col| {
+                                        using_col.as_str().eq_ignore_ascii_case(&normalized_id)
+                                    }) {
+                                        ok = true;
+                                    }
+                                }
+                                if !ok {
+                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
+                                }
+                            } else {
+                                let col =
+                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                                match_result = Some((
+                                    joined_table.internal_id,
+                                    col_idx.unwrap(),
+                                    col.is_rowid_alias,
+                                ));
+                            }
+                        // only if we haven't found a match, check for explicit rowid reference
+                        } else {
+                            let is_btree_table = matches!(joined_table.table, Table::BTree(_));
+                            if is_btree_table {
+                                if let Some(row_id_expr) = parse_row_id(
+                                    &normalized_id,
+                                    referenced_tables.joined_tables()[0].internal_id,
+                                    || referenced_tables.joined_tables().len() != 1,
+                                )? {
+                                    *expr = row_id_expr;
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
+                        }
+                    }
+
+                    // Then check outer query references, if we still didn't find something.
+                    // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
+                    // but in the case of subqueries, the inner query takes precedence.
+                    // For example:
+                    // SELECT * FROM t WHERE x = (SELECT x FROM t2)
+                    // In this case, there is no ambiguity:
+                    // - x in the outer query refers to t.x,
+                    // - x in the inner query refers to t2.x.
+                    if match_result.is_none() {
+                        for outer_ref in referenced_tables.outer_query_refs().iter() {
+                            let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
                                     .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                             });
                             if col_idx.is_some() {
                                 if match_result.is_some() {
-                                    let mut ok = false;
-                                    // Column name ambiguity is ok if it is in the USING clause because then it is deduplicated
-                                    // and the left table is used.
-                                    if let Some(join_info) = &joined_table.join_info {
-                                        if join_info.using.iter().any(|using_col| {
-                                            using_col.as_str().eq_ignore_ascii_case(&normalized_id)
-                                        }) {
-                                            ok = true;
-                                        }
-                                    }
-                                    if !ok {
-                                        crate::bail_parse_error!(
-                                            "Column {} is ambiguous",
-                                            id.as_str()
-                                        );
-                                    }
-                                } else {
-                                    let col =
-                                        joined_table.table.columns().get(col_idx.unwrap()).unwrap();
-                                    match_result = Some((
-                                        joined_table.internal_id,
-                                        col_idx.unwrap(),
-                                        col.is_rowid_alias,
-                                    ));
+                                    crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
-                            // only if we haven't found a match, check for explicit rowid reference
-                            } else if let Some(row_id_expr) = parse_row_id(
-                                &normalized_id,
-                                referenced_tables.joined_tables()[0].internal_id,
-                                || referenced_tables.joined_tables().len() != 1,
-                            )? {
-                                *expr = row_id_expr;
-
-                                return Ok(WalkControl::Continue);
+                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
+                                match_result = Some((
+                                    outer_ref.internal_id,
+                                    col_idx.unwrap(),
+                                    col.is_rowid_alias,
+                                ));
                             }
                         }
+                    }
 
-                        // Then check outer query references, if we still didn't find something.
-                        // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
-                        // but in the case of subqueries, the inner query takes precedence.
-                        // For example:
-                        // SELECT * FROM t WHERE x = (SELECT x FROM t2)
-                        // In this case, there is no ambiguity:
-                        // - x in the outer query refers to t.x,
-                        // - x in the inner query refers to t2.x.
-                        if match_result.is_none() {
-                            for outer_ref in referenced_tables.outer_query_refs().iter() {
-                                let col_idx = outer_ref.table.columns().iter().position(|c| {
-                                    c.name.as_ref().is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
-                                    })
-                                });
-                                if col_idx.is_some() {
-                                    if match_result.is_some() {
-                                        crate::bail_parse_error!(
-                                            "Column {} is ambiguous",
-                                            id.as_str()
-                                        );
-                                    }
-                                    let col =
-                                        outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
-                                    match_result = Some((
-                                        outer_ref.internal_id,
-                                        col_idx.unwrap(),
-                                        col.is_rowid_alias,
-                                    ));
-                                }
-                            }
-                        }
+                    if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
+                        *expr = Expr::Column {
+                            database: None, // TODO: support different databases
+                            table: table_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        };
+                        referenced_tables.mark_column_used(table_id, col_idx);
+                        return Ok(WalkControl::Continue);
+                    }
 
-                        if let Some((table_id, col_idx, is_rowid_alias)) = match_result {
-                            *expr = Expr::Column {
-                                database: None, // TODO: support different databases
-                                table: table_id,
-                                column: col_idx,
-                                is_rowid_alias,
-                            };
-                            referenced_tables.mark_column_used(table_id, col_idx);
-                            return Ok(WalkControl::Continue);
-                        }
-
-                        if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                            if let Some(result_columns) = result_columns {
-                                for result_column in result_columns.iter() {
-                                    if result_column.name(referenced_tables).is_some_and(|name| {
-                                        name.eq_ignore_ascii_case(&normalized_id)
-                                    }) {
+                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
                                         *expr = result_column.expr.clone();
                                         return Ok(WalkControl::Continue);
                                     }
                                 }
                             }
                         }
-
-                        // SQLite behavior: Only double-quoted identifiers get fallback to string literals
-                        // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
-                        if id.quoted_with('"') {
-                            // Convert failed double-quoted identifier to string literal
-                            *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
-                            return Ok(WalkControl::Continue);
-                        } else {
-                            // Unquoted identifiers must resolve to columns - no fallback
-                            crate::bail_parse_error!("no such column: {}", id.as_str())
-                        }
                     }
-                    Expr::Qualified(tbl, id) => {
-                        tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
-                        let normalized_table_name = normalize_ident(tbl.as_str());
-                        let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_table_name);
-                        if matching_tbl.is_none() {
-                            crate::bail_parse_error!("no such table: {}", normalized_table_name);
-                        }
-                        let (tbl_id, tbl) = matching_tbl.unwrap();
-                        let normalized_id = normalize_ident(id.as_str());
-                        let col_idx = tbl.columns().iter().position(|c| {
-                            c.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
-                        });
-                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                            *expr = row_id_expr;
 
+                    // SQLite behavior: Only double-quoted identifiers get fallback to string literals
+                    // Single quotes are handled as literals earlier, unquoted identifiers must resolve to columns
+                    if id.quoted_with('"') {
+                        // Convert failed double-quoted identifier to string literal
+                        *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
+                        return Ok(WalkControl::Continue);
+                    } else {
+                        // Unquoted identifiers must resolve to columns - no fallback
+                        crate::bail_parse_error!("no such column: {}", id.as_str())
+                    }
+                }
+                Expr::Qualified(tbl, id) => {
+                    tracing::debug!("bind_and_rewrite_expr({:?}, {:?})", tbl, id);
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
-                        let Some(col_idx) = col_idx else {
-                            crate::bail_parse_error!("no such column: {}", normalized_id);
-                        };
-                        let col = tbl.columns().get(col_idx).unwrap();
-                        *expr = Expr::Column {
-                            database: None, // TODO: support different databases
-                            table: tbl_id,
-                            column: col_idx,
-                            is_rowid_alias: col.is_rowid_alias,
-                        };
-                        tracing::debug!("rewritten to column");
-                        referenced_tables.mark_column_used(tbl_id, col_idx);
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}",
+                            tbl.as_str(),
+                            id.as_str()
+                        );
+                    };
+                    let normalized_table_name = normalize_ident(tbl.as_str());
+                    let matching_tbl = referenced_tables
+                        .find_table_and_internal_id_by_identifier(&normalized_table_name);
+                    if matching_tbl.is_none() {
+                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                    }
+                    let (tbl_id, tbl) = matching_tbl.unwrap();
+                    let normalized_id = normalize_ident(id.as_str());
+                    let col_idx = tbl.columns().iter().position(|c| {
+                        c.name
+                            .as_ref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
+                    });
+                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                        *expr = row_id_expr;
+
                         return Ok(WalkControl::Continue);
                     }
-                    Expr::DoublyQualified(db_name, tbl_name, col_name) => {
-                        let normalized_col_name = normalize_ident(col_name.as_str());
+                    let Some(col_idx) = col_idx else {
+                        crate::bail_parse_error!("no such column: {}", normalized_id);
+                    };
+                    let col = tbl.columns().get(col_idx).unwrap();
+                    *expr = Expr::Column {
+                        database: None, // TODO: support different databases
+                        table: tbl_id,
+                        column: col_idx,
+                        is_rowid_alias: col.is_rowid_alias,
+                    };
+                    tracing::debug!("rewritten to column");
+                    referenced_tables.mark_column_used(tbl_id, col_idx);
+                    return Ok(WalkControl::Continue);
+                }
+                Expr::DoublyQualified(db_name, tbl_name, col_name) => {
+                    let Some(referenced_tables) = &mut referenced_tables else {
+                        if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
+                            return Ok(WalkControl::Continue);
+                        }
+                        crate::bail_parse_error!(
+                            "no such column: {}.{}.{}",
+                            db_name.as_str(),
+                            tbl_name.as_str(),
+                            col_name.as_str()
+                        );
+                    };
+                    let normalized_col_name = normalize_ident(col_name.as_str());
 
-                        // Create a QualifiedName and use existing resolve_database_id method
-                        let qualified_name = ast::QualifiedName {
-                            db_name: Some(db_name.clone()),
-                            name: tbl_name.clone(),
-                            alias: None,
+                    // Create a QualifiedName and use existing resolve_database_id method
+                    let qualified_name = ast::QualifiedName {
+                        db_name: Some(db_name.clone()),
+                        name: tbl_name.clone(),
+                        alias: None,
+                    };
+                    let database_id = connection.resolve_database_id(&qualified_name)?;
+
+                    // Get the table from the specified database
+                    let table = connection
+                        .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "no such table: {}.{}",
+                                db_name.as_str(),
+                                tbl_name.as_str()
+                            ))
+                        })?;
+
+                    // Find the column in the table
+                    let col_idx = table
+                        .columns()
+                        .iter()
+                        .position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_col_name))
+                        })
+                        .ok_or_else(|| {
+                            crate::LimboError::ParseError(format!(
+                                "Column: {}.{}.{} not found",
+                                db_name.as_str(),
+                                tbl_name.as_str(),
+                                col_name.as_str()
+                            ))
+                        })?;
+
+                    let col = table.columns().get(col_idx).unwrap();
+
+                    // Check if this is a rowid alias
+                    let is_rowid_alias = col.is_rowid_alias;
+
+                    // Convert to Column expression - since this is a cross-database reference,
+                    // we need to create a synthetic table reference for it
+                    // For now, we'll error if the table isn't already in the referenced tables
+                    let normalized_tbl_name = normalize_ident(tbl_name.as_str());
+                    let matching_tbl = referenced_tables
+                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+
+                    if let Some((tbl_id, _)) = matching_tbl {
+                        // Table is already in referenced tables, use existing internal ID
+                        *expr = Expr::Column {
+                            database: Some(database_id),
+                            table: tbl_id,
+                            column: col_idx,
+                            is_rowid_alias,
                         };
-                        let database_id = connection.resolve_database_id(&qualified_name)?;
-
-                        // Get the table from the specified database
-                        let table = connection
-                            .with_schema(database_id, |schema| schema.get_table(tbl_name.as_str()))
-                            .ok_or_else(|| {
-                                crate::LimboError::ParseError(format!(
-                                    "no such table: {}.{}",
-                                    db_name.as_str(),
-                                    tbl_name.as_str()
-                                ))
-                            })?;
-
-                        // Find the column in the table
-                        let col_idx = table
-                            .columns()
-                            .iter()
-                            .position(|c| {
-                                c.name.as_ref().is_some_and(|name| {
-                                    name.eq_ignore_ascii_case(&normalized_col_name)
-                                })
-                            })
-                            .ok_or_else(|| {
-                                crate::LimboError::ParseError(format!(
-                                    "Column: {}.{}.{} not found",
-                                    db_name.as_str(),
-                                    tbl_name.as_str(),
-                                    col_name.as_str()
-                                ))
-                            })?;
-
-                        let col = table.columns().get(col_idx).unwrap();
-
-                        // Check if this is a rowid alias
-                        let is_rowid_alias = col.is_rowid_alias;
-
-                        // Convert to Column expression - since this is a cross-database reference,
-                        // we need to create a synthetic table reference for it
-                        // For now, we'll error if the table isn't already in the referenced tables
-                        let normalized_tbl_name = normalize_ident(tbl_name.as_str());
-                        let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-
-                        if let Some((tbl_id, _)) = matching_tbl {
-                            // Table is already in referenced tables, use existing internal ID
-                            *expr = Expr::Column {
-                                database: Some(database_id),
-                                table: tbl_id,
-                                column: col_idx,
-                                is_rowid_alias,
-                            };
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
-                        } else {
-                            return Err(crate::LimboError::ParseError(format!(
+                        referenced_tables.mark_column_used(tbl_id, col_idx);
+                    } else {
+                        return Err(crate::LimboError::ParseError(format!(
                             "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
                         )));
-                        }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
             Ok(WalkControl::Continue)
         },

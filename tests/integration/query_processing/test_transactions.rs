@@ -95,6 +95,7 @@ fn test_deferred_transaction_no_restart() {
         .execute("INSERT INTO test (id, value) VALUES (2, 'second')")
         .unwrap();
     conn2.execute("COMMIT").unwrap();
+    drop(stmt);
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
@@ -173,6 +174,79 @@ fn test_transaction_visibility() {
             StepResult::Interrupt => panic!("interrupted"),
         }
     }
+}
+
+#[test]
+/// A constraint error does not rollback the transaction, it rolls back the statement.
+fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
+    let tmp_db = TempDatabase::new(
+        "test_constraint_error_aborts_only_stmt_not_entire_transaction.db",
+        true,
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table succeeds
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // Begin succeeds
+    conn.execute("BEGIN").unwrap();
+
+    // First insert succeeds
+    conn.execute("INSERT INTO t VALUES (1),(2)").unwrap();
+
+    // Second insert fails due to UNIQUE constraint
+    let result = conn.execute("INSERT INTO t VALUES (2),(3)");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Third insert is valid again
+    conn.execute("INSERT INTO t VALUES (4)").unwrap();
+
+    // Commit succeeds
+    conn.execute("COMMIT").unwrap();
+
+    // Make sure table has 3 rows (a=1, a=2, a=4)
+    let stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(4)]
+        ]
+    );
+}
+
+#[test]
+/// Regression test for https://github.com/tursodatabase/turso/issues/3784 where dirty pages
+/// were flushed to WAL _before_ deferred FK violations were checked. This resulted in the
+/// violations being persisted to the database, even though the transaction was aborted.
+/// This test ensures that dirty pages are not flushed to WAL until after deferred violations are checked.
+fn test_deferred_fk_violation_rollback_in_autocommit() {
+    let tmp_db = TempDatabase::new("test_deferred_fk_violation_rollback.db", true);
+    let conn = tmp_db.connect_limbo();
+
+    // Enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+    // Create parent and child tables with deferred FK constraint
+    conn.execute("CREATE TABLE parent(a PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE child(a, b, FOREIGN KEY(b) REFERENCES parent(a) DEFERRABLE INITIALLY DEFERRED)")
+        .unwrap();
+
+    // This insert should fail because parent(1) doesn't exist
+    // and the deferred FK violation should be caught at statement end in autocommit mode
+    let result = conn.execute("INSERT INTO child VALUES(1,1)");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Do a truncating checkpoint
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Verify that the child table is empty (the insert was rolled back)
+    let stmt = conn.query("SELECT COUNT(*) FROM child").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::Integer(0)]);
 }
 
 #[test]

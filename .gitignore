@@ -43,6 +43,7 @@ simulator.log
 **/*.txt
 profile.json.gz
 simulator-output/
+tests/*.sql
 
 &1
 bisected.sql

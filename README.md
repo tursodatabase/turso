@@ -38,7 +38,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
 * **Change data capture (CDC)** for real-time tracking of database changes.
-* **Language support** for
+* **Multi-language support** for
   * [Go](https://github.com/tursodatabase/turso-go)
   * [JavaScript](bindings/javascript)
   * [Java](bindings/java)

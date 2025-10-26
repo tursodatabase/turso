@@ -4,11 +4,13 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
-    model::query::{
-        create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
-        insert::Insert, select::Select, update::Update,
+    model::{
+        query::{
+            create::Create, create_index::CreateIndex, delete::Delete, drop_index::DropIndex,
+            insert::Insert, select::Select, update::Update,
+        },
+        table::{Column, ColumnType, Index, Table},
     },
-    model::table::{Column, ColumnType, Table},
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,7 +20,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use turso_core::{
     CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
 };
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod io;
 use crate::io::FILE_SIZE_SOFT_LIMIT;
@@ -66,7 +68,7 @@ struct SimulatorFiber {
 struct SimulatorContext {
     fibers: Vec<SimulatorFiber>,
     tables: Vec<Table>,
-    indexes: Vec<String>,
+    indexes: Vec<(String, String)>,
     opts: Opts,
     stats: Stats,
     disable_indexes: bool,
@@ -208,7 +210,10 @@ fn main() -> anyhow::Result<()> {
     let mut context = SimulatorContext {
         fibers,
         tables,
-        indexes: indexes.iter().map(|idx| idx.index_name.clone()).collect(),
+        indexes: indexes
+            .iter()
+            .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
+            .collect(),
         opts: Opts::default(),
         stats: Stats::default(),
         disable_indexes: args.disable_indexes,
@@ -306,9 +311,11 @@ fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateI
                 if !selected_columns.is_empty() {
                     let index_name = format!("idx_{}_{}", table.name, i);
                     let create_index = CreateIndex {
-                        index_name,
-                        table_name: table.name.clone(),
-                        columns: selected_columns,
+                        index: Index {
+                            index_name,
+                            table_name: table.name.clone(),
+                            columns: selected_columns,
+                        },
                     };
                     indexes.push(create_index);
                 }
@@ -332,12 +339,18 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
         let num_columns = rng.random_range(2..=8);
         let mut columns = Vec::new();
 
+        // TODO: there is no proper unique generation yet in whopper, so disable primary keys for now
+
+        // let primary = ColumnConstraint::PrimaryKey {
+        //     order: None,
+        //     conflict_clause: None,
+        //     auto_increment: false,
+        // };
         // Always add an id column as primary key
         columns.push(Column {
             name: "id".to_string(),
             column_type: ColumnType::Integer,
-            primary: true,
-            unique: false,
+            constraints: vec![],
         });
 
         // Add random columns
@@ -348,11 +361,19 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
                 _ => ColumnType::Float,
             };
 
+            // FIXME: before sql_generation did not incorporate ColumnConstraint into the sql string
+            // now it does and it the simulation here fails `whopper` with UNIQUE CONSTRAINT ERROR
+            // 20% chance of unique
+            let constraints = if rng.random_bool(0.0) {
+                vec![ColumnConstraint::Unique(None)]
+            } else {
+                Vec::new()
+            };
+
             columns.push(Column {
                 name: format!("col_{j}"),
                 column_type: col_type,
-                primary: false,
-                unique: rng.random_bool(0.2), // 20% chance of unique
+                constraints,
             });
         }
 
@@ -365,7 +386,6 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
 
         schema.push(Create { table });
     }
-
     schema
 }
 
@@ -550,7 +570,10 @@ fn perform_work(
                         let sql = create_index.to_string();
                         if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
                             context.fibers[fiber_idx].statement.replace(Some(stmt));
-                            context.indexes.push(create_index.index_name.clone());
+                            context.indexes.push((
+                                create_index.index.table_name.clone(),
+                                create_index.index_name.clone(),
+                            ));
                         }
                         trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
@@ -559,8 +582,11 @@ fn perform_work(
                     // DROP INDEX (2%)
                     if !context.disable_indexes && !context.indexes.is_empty() {
                         let index_idx = rng.random_range(0..context.indexes.len());
-                        let index_name = context.indexes.remove(index_idx);
-                        let drop_index = DropIndex { index_name };
+                        let (table_name, index_name) = context.indexes.remove(index_idx);
+                        let drop_index = DropIndex {
+                            table_name,
+                            index_name,
+                        };
                         let sql = drop_index.to_string();
                         if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
                             context.fibers[fiber_idx].statement.replace(Some(stmt));

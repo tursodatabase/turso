@@ -46,12 +46,18 @@ pub use params::params_from_iter;
 pub use params::IntoParams;
 
 use std::fmt::Debug;
+use std::future::Future;
 use std::num::NonZero;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 pub use turso_core::EncryptionOpts;
 use turso_core::OpenFlags;
+
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
+use crate::transaction::DropBehavior;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -147,14 +153,14 @@ impl Builder {
         match vfs_choice {
             "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
             "syscall" => {
-                #[cfg(target_family = "unix")]
+                #[cfg(all(target_family = "unix", not(miri)))]
                 {
                     Ok(Arc::new(
                         turso_core::UnixIO::new()
                             .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
                     ))
                 }
-                #[cfg(not(target_family = "unix"))]
+                #[cfg(any(not(target_family = "unix"), miri))]
                 {
                     Ok(Arc::new(
                         turso_core::PlatformIO::new()
@@ -162,12 +168,12 @@ impl Builder {
                     ))
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(miri)))]
             "io_uring" => Ok(Arc::new(
                 turso_core::UringIO::new()
                     .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
             )),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(any(not(target_os = "linux"), miri))]
             "io_uring" => Err(Error::SqlExecutionFailure(
                 "io_uring is only available on Linux targets".to_string(),
             )),
@@ -215,10 +221,39 @@ impl Database {
     }
 }
 
+/// Atomic wrapper for [DropBehavior]
+struct AtomicDropBehavior {
+    inner: AtomicU8,
+}
+
+impl AtomicDropBehavior {
+    fn new(behavior: DropBehavior) -> Self {
+        Self {
+            inner: AtomicU8::new(behavior.into()),
+        }
+    }
+
+    fn load(&self, ordering: Ordering) -> DropBehavior {
+        self.inner.load(ordering).into()
+    }
+
+    fn store(&self, behavior: DropBehavior, ordering: Ordering) {
+        self.inner.store(behavior.into(), ordering);
+    }
+}
+
 /// A database connection.
 pub struct Connection {
     inner: Arc<Mutex<Arc<turso_core::Connection>>>,
     transaction_behavior: TransactionBehavior,
+    /// If there is a dangling transaction after it was dropped without being finished,
+    /// [Connection::dangling_tx] will be set to the [DropBehavior] of the dangling transaction,
+    /// and the corresponding action will be taken when a new transaction is requested
+    /// or the connection queries/executes.
+    /// We cannot do this eagerly on Drop because drop is not async.
+    ///
+    /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
+    dangling_tx: AtomicDropBehavior,
 }
 
 impl Clone for Connection {
@@ -226,6 +261,7 @@ impl Clone for Connection {
         Self {
             inner: Arc::clone(&self.inner),
             transaction_behavior: self.transaction_behavior,
+            dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
         }
     }
 }
@@ -239,17 +275,43 @@ impl Connection {
         let connection = Connection {
             inner: Arc::new(Mutex::new(conn)),
             transaction_behavior: TransactionBehavior::Deferred,
+            dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
         };
         connection
     }
+
+    async fn maybe_handle_dangling_tx(&self) -> Result<()> {
+        match self.dangling_tx.load(Ordering::SeqCst) {
+            DropBehavior::Rollback => {
+                let mut stmt = self.prepare("ROLLBACK").await?;
+                stmt.execute(()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Commit => {
+                let mut stmt = self.prepare("COMMIT").await?;
+                stmt.execute(()).await?;
+                self.dangling_tx
+                    .store(DropBehavior::Ignore, Ordering::SeqCst);
+            }
+            DropBehavior::Ignore => {}
+            DropBehavior::Panic => {
+                panic!("Transaction dropped unexpectedly.");
+            }
+        }
+        Ok(())
+    }
+
     /// Query the database with SQL.
     pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
+        self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.query(params).await
     }
 
     /// Execute SQL statement on the database.
     pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
+        self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
     }
@@ -334,6 +396,7 @@ impl Connection {
 
     /// Execute a batch of SQL statements on the database.
     pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.maybe_handle_dangling_tx().await?;
         self.prepare_execute_batch(sql).await?;
         Ok(())
     }
@@ -355,6 +418,7 @@ impl Connection {
     }
 
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
+        self.maybe_handle_dangling_tx().await?;
         let conn = self
             .inner
             .lock()
@@ -464,6 +528,45 @@ impl Clone for Statement {
 unsafe impl Send for Statement {}
 unsafe impl Sync for Statement {}
 
+struct Execute {
+    stmt: Arc<Mutex<turso_core::Statement>>,
+}
+
+unsafe impl Send for Execute {}
+unsafe impl Sync for Execute {}
+
+impl Future for Execute {
+    type Output = Result<u64>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut stmt = self.stmt.lock().unwrap();
+        match stmt.step_with_waker(cx.waker()) {
+            Ok(turso_core::StepResult::Row) => Poll::Ready(Err(Error::SqlExecutionFailure(
+                "unexpected row during execution".to_string(),
+            ))),
+            Ok(turso_core::StepResult::Done) => {
+                let changes = stmt.n_change();
+                assert!(changes >= 0);
+                Poll::Ready(Ok(changes as u64))
+            }
+            Ok(turso_core::StepResult::IO) => {
+                stmt.run_once()?;
+                Poll::Pending
+            }
+            Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(
+                "database is locked".to_string(),
+            ))),
+            Ok(turso_core::StepResult::Interrupt) => {
+                Poll::Ready(Err(Error::SqlExecutionFailure("interrupted".to_string())))
+            }
+            Err(err) => Poll::Ready(Err(err.into())),
+        }
+    }
+}
+
 impl Statement {
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
@@ -514,33 +617,11 @@ impl Statement {
                 }
             }
         }
-        loop {
-            let mut stmt = self.inner.lock().unwrap();
-            match stmt.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    return Err(Error::SqlExecutionFailure(
-                        "unexpected row during execution".to_string(),
-                    ));
-                }
-                Ok(turso_core::StepResult::Done) => {
-                    let changes = stmt.n_change();
-                    assert!(changes >= 0);
-                    return Ok(changes as u64);
-                }
-                Ok(turso_core::StepResult::IO) => {
-                    stmt.run_once()?;
-                }
-                Ok(turso_core::StepResult::Busy) => {
-                    return Err(Error::SqlExecutionFailure("database is locked".to_string()));
-                }
-                Ok(turso_core::StepResult::Interrupt) => {
-                    return Err(Error::SqlExecutionFailure("interrupted".to_string()));
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            }
-        }
+
+        let execute = Execute {
+            stmt: self.inner.clone(),
+        };
+        execute.await
     }
 
     /// Returns columns of the result of this prepared statement.
@@ -576,7 +657,11 @@ impl Statement {
     pub async fn query_row(&mut self, params: impl IntoParams) -> Result<Row> {
         let mut rows = self.query(params).await?;
 
-        rows.next().await?.ok_or(Error::QueryReturnedNoRows)
+        let first_row = rows.next().await?.ok_or(Error::QueryReturnedNoRows)?;
+        // Discard remaining rows so that the statement is executed to completion
+        // Otherwise Drop of the statement will cause transaction rollback
+        while rows.next().await?.is_some() {}
+        Ok(first_row)
     }
 }
 

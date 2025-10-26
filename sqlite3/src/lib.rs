@@ -94,15 +94,25 @@ pub struct sqlite3_stmt {
         *mut ffi::c_void,
     )>,
     pub(crate) next: *mut sqlite3_stmt,
+    pub(crate) text_cache: Vec<Vec<u8>>,
 }
 
 impl sqlite3_stmt {
     pub fn new(db: *mut sqlite3, stmt: turso_core::Statement) -> Self {
+        let n_cols = stmt.num_columns();
         Self {
             db,
             stmt,
             destructors: Vec::new(),
             next: std::ptr::null_mut(),
+            text_cache: vec![vec![]; n_cols],
+        }
+    }
+    #[inline]
+    fn clear_text_cache(&mut self) {
+        // Drop per-column buffers for the previous row
+        for r in &mut self.text_cache {
+            r.clear();
         }
     }
 }
@@ -323,7 +333,7 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
             destructor_fn(ptr);
         }
     }
-
+    stmt_ref.clear_text_cache();
     let _ = Box::from_raw(stmt);
     SQLITE_OK
 }
@@ -340,9 +350,15 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
                     stmt.stmt.run_once().unwrap();
                     continue;
                 }
-                turso_core::StepResult::Done => return SQLITE_DONE,
+                turso_core::StepResult::Done => {
+                    stmt.clear_text_cache();
+                    return SQLITE_DONE;
+                }
                 turso_core::StepResult::Interrupt => return SQLITE_INTERRUPT,
-                turso_core::StepResult::Row => return SQLITE_ROW,
+                turso_core::StepResult::Row => {
+                    stmt.clear_text_cache();
+                    return SQLITE_ROW;
+                }
                 turso_core::StepResult::Busy => return SQLITE_BUSY,
             }
         } else {
@@ -364,31 +380,279 @@ type exec_callback = Option<
 pub unsafe extern "C" fn sqlite3_exec(
     db: *mut sqlite3,
     sql: *const ffi::c_char,
-    _callback: exec_callback,
-    _context: *mut ffi::c_void,
-    _err: *mut *mut ffi::c_char,
+    callback: exec_callback,
+    context: *mut ffi::c_void,
+    err: *mut *mut ffi::c_char,
 ) -> ffi::c_int {
     if db.is_null() || sql.is_null() {
         return SQLITE_MISUSE;
     }
-    let db: &mut sqlite3 = &mut *db;
-    let db = db.inner.lock().unwrap();
-    let sql = CStr::from_ptr(sql);
-    let sql = match sql.to_str() {
+
+    let db_ref: &mut sqlite3 = &mut *db;
+    let sql_cstr = CStr::from_ptr(sql);
+    let sql_str = match sql_cstr.to_str() {
         Ok(s) => s,
         Err(_) => return SQLITE_MISUSE,
     };
-    trace!("sqlite3_exec(sql={})", sql);
-    match db.conn.execute(sql) {
-        Ok(_) => SQLITE_OK,
-        Err(_) => SQLITE_ERROR,
+    trace!("sqlite3_exec(sql={})", sql_str);
+    if !err.is_null() {
+        *err = std::ptr::null_mut();
     }
+    let statements = split_sql_statements(sql_str);
+    for stmt_sql in statements {
+        let trimmed = stmt_sql.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let is_dql = is_query_statement(trimmed);
+        if !is_dql {
+            // For DML/DDL, use normal execute path
+            let db_inner = db_ref.inner.lock().unwrap();
+            match db_inner.conn.execute(trimmed) {
+                Ok(_) => continue,
+                Err(e) => {
+                    if !err.is_null() {
+                        let err_msg = format!("SQL error: {e:?}");
+                        *err = CString::new(err_msg).unwrap().into_raw();
+                    }
+                    return SQLITE_ERROR;
+                }
+            }
+        } else if callback.is_none() {
+            // DQL without callback provided, still execute but discard any result rows
+            let mut stmt_ptr: *mut sqlite3_stmt = std::ptr::null_mut();
+            let rc = sqlite3_prepare_v2(
+                db,
+                CString::new(trimmed).unwrap().as_ptr(),
+                -1,
+                &mut stmt_ptr,
+                std::ptr::null_mut(),
+            );
+            if rc != SQLITE_OK {
+                if !err.is_null() {
+                    let err_msg = format!("Prepare failed: {rc}");
+                    *err = CString::new(err_msg).unwrap().into_raw();
+                }
+                return rc;
+            }
+            loop {
+                let step_rc = sqlite3_step(stmt_ptr);
+                match step_rc {
+                    SQLITE_ROW => continue,
+                    SQLITE_DONE => break,
+                    _ => {
+                        sqlite3_finalize(stmt_ptr);
+                        if !err.is_null() {
+                            let err_msg = format!("Step failed: {step_rc}");
+                            *err = CString::new(err_msg).unwrap().into_raw();
+                        }
+                        return step_rc;
+                    }
+                }
+            }
+            sqlite3_finalize(stmt_ptr);
+        } else {
+            // DQL with callback
+            let rc = execute_query_with_callback(db, trimmed, callback, context, err);
+            if rc != SQLITE_OK {
+                return rc;
+            }
+        }
+    }
+    SQLITE_OK
+}
+
+/// Detect if a SQL statement is DQL
+fn is_query_statement(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+
+    let starts_with_ignore_case = |keyword: &[u8]| -> bool {
+        if bytes.len() < keyword.len() {
+            return false;
+        }
+        // Check keyword matches
+        if !bytes[..keyword.len()].eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        // Ensure keyword is followed by whitespace or EOF
+        bytes.len() == keyword.len() || bytes[keyword.len()].is_ascii_whitespace()
+    };
+
+    // Check DQL keywords
+    if starts_with_ignore_case(b"SELECT")
+        || starts_with_ignore_case(b"VALUES")
+        || starts_with_ignore_case(b"WITH")
+        || starts_with_ignore_case(b"PRAGMA")
+        || starts_with_ignore_case(b"EXPLAIN")
+    {
+        return true;
+    }
+
+    // Look for RETURNING as a whole word, that's not part of another identifier
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 9 <= bytes.len() && bytes[i..i + 9].eq_ignore_ascii_case(b"RETURNING") {
+            // Check it's a word boundary before and after
+            let is_word_start =
+                i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+            let is_word_end = i + 9 == bytes.len()
+                || !bytes[i + 9].is_ascii_alphanumeric() && bytes[i + 9] != b'_';
+            if is_word_start && is_word_end {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Execute a query statement with callback for each row
+/// Only called when we know callback is Some
+unsafe fn execute_query_with_callback(
+    db: *mut sqlite3,
+    sql: &str,
+    callback: exec_callback,
+    context: *mut ffi::c_void,
+    err: *mut *mut ffi::c_char,
+) -> ffi::c_int {
+    let sql_cstring = match CString::new(sql) {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    let mut stmt_ptr: *mut sqlite3_stmt = std::ptr::null_mut();
+    let rc = sqlite3_prepare_v2(
+        db,
+        sql_cstring.as_ptr(),
+        -1,
+        &mut stmt_ptr,
+        std::ptr::null_mut(),
+    );
+
+    if rc != SQLITE_OK {
+        if !err.is_null() {
+            let err_msg = format!("Prepare failed: {rc}");
+            *err = CString::new(err_msg).unwrap().into_raw();
+        }
+        return rc;
+    }
+
+    let stmt_ref = &*stmt_ptr;
+    let n_cols = stmt_ref.stmt.num_columns() as ffi::c_int;
+    let mut column_names: Vec<CString> = Vec::with_capacity(n_cols as usize);
+
+    for i in 0..n_cols {
+        let name = stmt_ref.stmt.get_column_name(i as usize);
+        column_names.push(CString::new(name.as_bytes()).unwrap());
+    }
+
+    loop {
+        let step_rc = sqlite3_step(stmt_ptr);
+
+        match step_rc {
+            SQLITE_ROW => {
+                // Safety: checked earlier
+                let callback = callback.unwrap();
+
+                let mut values: Vec<CString> = Vec::with_capacity(n_cols as usize);
+                let mut value_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
+                let mut col_ptrs: Vec<*mut ffi::c_char> = Vec::with_capacity(n_cols as usize);
+
+                for i in 0..n_cols {
+                    let val = stmt_ref.stmt.row().unwrap().get_value(i as usize);
+                    values.push(CString::new(val.to_string().as_bytes()).unwrap());
+                }
+
+                for value in &values {
+                    value_ptrs.push(value.as_ptr() as *mut ffi::c_char);
+                }
+                for name in &column_names {
+                    col_ptrs.push(name.as_ptr() as *mut ffi::c_char);
+                }
+
+                let cb_rc = callback(
+                    context,
+                    n_cols,
+                    value_ptrs.as_mut_ptr(),
+                    col_ptrs.as_mut_ptr(),
+                );
+
+                if cb_rc != 0 {
+                    sqlite3_finalize(stmt_ptr);
+                    return SQLITE_ABORT;
+                }
+            }
+            SQLITE_DONE => {
+                break;
+            }
+            _ => {
+                sqlite3_finalize(stmt_ptr);
+                if !err.is_null() {
+                    let err_msg = format!("Step failed: {step_rc}");
+                    *err = CString::new(err_msg).unwrap().into_raw();
+                }
+                return step_rc;
+            }
+        }
+    }
+
+    sqlite3_finalize(stmt_ptr)
+}
+
+/// Split SQL string into individual statements
+/// Handles quoted strings properly and skips comments
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let mut current_start = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Check for escaped quotes first
+            b'\'' if !in_double_quote => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = !in_single_quote;
+            }
+            b'"' if !in_single_quote => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = !in_double_quote;
+            }
+            b';' if !in_single_quote && !in_double_quote => {
+                // we found the statement boundary
+                statements.push(&sql[current_start..i]);
+                current_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if current_start < sql.len() {
+        statements.push(&sql[current_start..]);
+    }
+
+    statements
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     stmt.stmt.reset();
+    stmt.clear_text_cache();
     SQLITE_OK
 }
 
@@ -1048,14 +1312,30 @@ pub unsafe extern "C" fn sqlite3_column_text(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_uchar {
+    if stmt.is_null() || idx < 0 {
+        return std::ptr::null();
+    }
     let stmt = &mut *stmt;
     let row = stmt.stmt.row();
     let row = match row.as_ref() {
         Some(row) => row,
         None => return std::ptr::null(),
     };
-    match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Text(text)) => text.as_str().as_ptr(),
+    let i = idx as usize;
+    if i >= stmt.text_cache.len() {
+        return std::ptr::null();
+    }
+    if !stmt.text_cache[i].is_empty() {
+        // we have already cached this value
+        return stmt.text_cache[i].as_ptr() as *const ffi::c_uchar;
+    }
+    match row.get::<&Value>(i) {
+        Ok(turso_core::Value::Text(text)) => {
+            let buf = &mut stmt.text_cache[i];
+            buf.extend(text.as_str().as_bytes());
+            buf.push(0);
+            buf.as_ptr() as *const ffi::c_uchar
+        }
         _ => std::ptr::null(),
     }
 }

@@ -1,30 +1,205 @@
-use crate::types::{Value, ValueType};
-use crate::vdbe::Register;
 use crate::{LimboError, Result};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
-    Float32,
-    Float64,
-}
-
-impl VectorType {
-    pub fn size_to_dims(&self, size: usize) -> usize {
-        match self {
-            VectorType::Float32 => size / 4,
-            VectorType::Float64 => size / 8,
-        }
-    }
+    Float32Dense,
+    Float64Dense,
+    Float32Sparse,
 }
 
 #[derive(Debug)]
-pub struct Vector {
+pub struct Vector<'a> {
     pub vector_type: VectorType,
     pub dims: usize,
-    pub data: Vec<u8>,
+    pub owned: Option<Vec<u8>>,
+    pub refer: Option<&'a [u8]>,
 }
 
-impl Vector {
+#[derive(Debug)]
+pub struct VectorSparse<'a, T: std::fmt::Debug> {
+    pub idx: &'a [u32],
+    pub values: &'a [T],
+}
+
+impl<'a> Vector<'a> {
+    pub fn vector_type(blob: &[u8]) -> Result<(VectorType, usize)> {
+        // Even-sized blobs are always float32.
+        if blob.len() % 2 == 0 {
+            return Ok((VectorType::Float32Dense, blob.len()));
+        }
+        // Odd-sized blobs have type byte at the end
+        let vector_type = blob[blob.len() - 1];
+        /*
+        vector types used by LibSQL:
+        (see https://github.com/tursodatabase/libsql/blob/a55bf61192bdb89e97568de593c4af5b70d24bde/libsql-sqlite3/src/vectorInt.h#L52)
+            #define VECTOR_TYPE_FLOAT32   1
+            #define VECTOR_TYPE_FLOAT64   2
+            #define VECTOR_TYPE_FLOAT1BIT 3
+            #define VECTOR_TYPE_FLOAT8    4
+            #define VECTOR_TYPE_FLOAT16   5
+            #define VECTOR_TYPE_FLOATB16  6
+        */
+        match vector_type {
+            1 => Ok((VectorType::Float32Dense, blob.len() - 1)),
+            2 => Ok((VectorType::Float64Dense, blob.len() - 1)),
+            3..=6 => Err(LimboError::ConversionError(
+                "unsupported vector type from LibSQL".to_string(),
+            )),
+            9 => Ok((VectorType::Float32Sparse, blob.len() - 1)),
+            _ => Err(LimboError::ConversionError(format!(
+                "unknown vector type: {vector_type}"
+            ))),
+        }
+    }
+    pub fn from_f32(mut values_f32: Vec<f32>) -> Self {
+        let dims = values_f32.len();
+        let values = unsafe {
+            Vec::from_raw_parts(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+            )
+        };
+        std::mem::forget(values_f32);
+        Self {
+            vector_type: VectorType::Float32Dense,
+            dims,
+            owned: Some(values),
+            refer: None,
+        }
+    }
+    pub fn from_f64(mut values_f64: Vec<f64>) -> Self {
+        let dims = values_f64.len();
+        let values = unsafe {
+            Vec::from_raw_parts(
+                values_f64.as_mut_ptr() as *mut u8,
+                values_f64.len() * 8,
+                values_f64.capacity() * 8,
+            )
+        };
+        std::mem::forget(values_f64);
+        Self {
+            vector_type: VectorType::Float64Dense,
+            dims,
+            owned: Some(values),
+            refer: None,
+        }
+    }
+    pub fn from_f32_sparse(dims: usize, mut values_f32: Vec<f32>, mut idx_u32: Vec<u32>) -> Self {
+        let mut values = unsafe {
+            Vec::from_raw_parts(
+                values_f32.as_mut_ptr() as *mut u8,
+                values_f32.len() * 4,
+                values_f32.capacity() * 4,
+            )
+        };
+        std::mem::forget(values_f32);
+
+        let idx = unsafe {
+            Vec::from_raw_parts(
+                idx_u32.as_mut_ptr() as *mut u8,
+                idx_u32.len() * 4,
+                idx_u32.capacity() * 4,
+            )
+        };
+        std::mem::forget(idx_u32);
+
+        values.extend_from_slice(&idx);
+        Self {
+            vector_type: VectorType::Float32Sparse,
+            dims,
+            owned: Some(values),
+            refer: None,
+        }
+    }
+    pub fn from_vec(mut blob: Vec<u8>) -> Result<Self> {
+        let (vector_type, len) = Self::vector_type(&blob)?;
+        blob.truncate(len);
+        Self::from_data(vector_type, Some(blob), None)
+    }
+    pub fn from_slice(blob: &'a [u8]) -> Result<Self> {
+        let (vector_type, len) = Self::vector_type(blob)?;
+        Self::from_data(vector_type, None, Some(&blob[..len]))
+    }
+    pub fn from_data(
+        vector_type: VectorType,
+        owned: Option<Vec<u8>>,
+        refer: Option<&'a [u8]>,
+    ) -> Result<Self> {
+        let owned_slice = owned.as_deref();
+        let refer_slice = refer.as_ref().map(|&x| x);
+        let data = owned_slice.unwrap_or_else(|| refer_slice.unwrap());
+        match vector_type {
+            VectorType::Float32Dense => {
+                if data.len() % 4 != 0 {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f32 dense vector unexpected data length: {}",
+                        data.len(),
+                    )));
+                }
+                Ok(Vector {
+                    vector_type,
+                    dims: data.len() / 4,
+                    owned,
+                    refer,
+                })
+            }
+            VectorType::Float64Dense => {
+                if data.len() % 8 != 0 {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f64 dense vector unexpected data length: {}",
+                        data.len(),
+                    )));
+                }
+                Ok(Vector {
+                    vector_type,
+                    dims: data.len() / 8,
+                    owned,
+                    refer,
+                })
+            }
+            VectorType::Float32Sparse => {
+                if data.is_empty() || data.len() % 4 != 0 || (data.len() - 4) % 8 != 0 {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "f32 sparse vector unexpected data length: {}",
+                        data.len(),
+                    )));
+                }
+                let original_len = data.len();
+                let dims_bytes = &data[original_len - 4..];
+                let dims = u32::from_le_bytes(dims_bytes.try_into().unwrap()) as usize;
+                let owned = owned.map(|mut x| {
+                    x.truncate(original_len - 4);
+                    x
+                });
+                let refer = refer.map(|x| &x[0..original_len - 4]);
+                let vector = Vector {
+                    vector_type,
+                    dims,
+                    owned,
+                    refer,
+                };
+                Ok(vector)
+            }
+        }
+    }
+
+    pub fn bin_len(&self) -> usize {
+        let owned = self.owned.as_ref().map(|x| x.len());
+        let refer = self.refer.as_ref().map(|x| x.len());
+        owned.unwrap_or_else(|| refer.unwrap())
+    }
+
+    pub fn bin_data(&'a self) -> &'a [u8] {
+        let owned = self.owned.as_deref();
+        let refer = self.refer.as_ref().map(|&x| x);
+        owned.unwrap_or_else(|| refer.unwrap())
+    }
+
+    pub fn bin_eject(self) -> Vec<u8> {
+        self.owned.unwrap_or_else(|| self.refer.unwrap().to_vec())
+    }
+
     /// # Safety
     ///
     /// This method is used to reinterpret the underlying `Vec<u8>` data
@@ -32,17 +207,18 @@ impl Vector {
     /// - The buffer is correctly aligned for `f32`
     /// - The length of the buffer is exactly `dims * size_of::<f32>()`
     pub fn as_f32_slice(&self) -> &[f32] {
+        debug_assert!(self.vector_type == VectorType::Float32Dense);
         if self.dims == 0 {
             return &[];
         }
 
         assert_eq!(
-            self.data.len(),
+            self.bin_len(),
             self.dims * std::mem::size_of::<f32>(),
             "data length must equal dims * size_of::<f32>()"
         );
 
-        let ptr = self.data.as_ptr();
+        let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f32>();
         assert_eq!(
             ptr.align_offset(align),
@@ -60,17 +236,18 @@ impl Vector {
     /// - The buffer is correctly aligned for `f64`
     /// - The length of the buffer is exactly `dims * size_of::<f64>()`
     pub fn as_f64_slice(&self) -> &[f64] {
+        debug_assert!(self.vector_type == VectorType::Float64Dense);
         if self.dims == 0 {
             return &[];
         }
 
         assert_eq!(
-            self.data.len(),
+            self.bin_len(),
             self.dims * std::mem::size_of::<f64>(),
             "data length must equal dims * size_of::<f64>()"
         );
 
-        let ptr = self.data.as_ptr();
+        let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f64>();
         assert_eq!(
             ptr.align_offset(align),
@@ -78,360 +255,37 @@ impl Vector {
             "data pointer must be aligned to {align} bytes for f64 access"
         );
 
-        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const f64, self.dims) }
-    }
-}
-
-/// Parse a vector in text representation into a Vector.
-///
-/// The format of a vector in text representation looks as follows:
-///
-/// ```console
-/// [1.0, 2.0, 3.0]
-/// ```
-pub fn parse_string_vector(vector_type: VectorType, value: &Value) -> Result<Vector> {
-    let Some(text) = value.to_text() else {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    };
-    let text = text.trim();
-    let mut chars = text.chars();
-    if chars.next() != Some('[') || chars.last() != Some(']') {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-    let mut data: Vec<u8> = Vec::new();
-    let text = &text[1..text.len() - 1];
-    if text.trim().is_empty() {
-        return Ok(Vector {
-            vector_type,
-            dims: 0,
-            data,
-        });
-    }
-    let xs = text.split(',');
-    for x in xs {
-        let x = x.trim();
-        if x.is_empty() {
-            return Err(LimboError::ConversionError(
-                "Invalid vector value".to_string(),
-            ));
-        }
-        match vector_type {
-            VectorType::Float32 => {
-                let x = x
-                    .parse::<f32>()
-                    .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
-                if !x.is_finite() {
-                    return Err(LimboError::ConversionError(
-                        "Invalid vector value".to_string(),
-                    ));
-                }
-                data.extend_from_slice(&x.to_le_bytes());
-            }
-            VectorType::Float64 => {
-                let x = x
-                    .parse::<f64>()
-                    .map_err(|_| LimboError::ConversionError("Invalid vector value".to_string()))?;
-                if !x.is_finite() {
-                    return Err(LimboError::ConversionError(
-                        "Invalid vector value".to_string(),
-                    ));
-                }
-                data.extend_from_slice(&x.to_le_bytes());
-            }
-        };
-    }
-    let dims = vector_type.size_to_dims(data.len());
-    Ok(Vector {
-        vector_type,
-        dims,
-        data,
-    })
-}
-
-pub fn parse_vector(value: &Register, vec_ty: Option<VectorType>) -> Result<Vector> {
-    match value.get_value().value_type() {
-        ValueType::Text => {
-            parse_string_vector(vec_ty.unwrap_or(VectorType::Float32), value.get_value())
-        }
-        ValueType::Blob => {
-            let Some(blob) = value.get_value().to_blob() else {
-                return Err(LimboError::ConversionError(
-                    "Invalid vector value".to_string(),
-                ));
-            };
-            let vector_type = vector_type(blob)?;
-            if let Some(vec_ty) = vec_ty {
-                if vec_ty != vector_type {
-                    return Err(LimboError::ConversionError(
-                        "Invalid vector type".to_string(),
-                    ));
-                }
-            }
-            vector_deserialize(vector_type, blob)
-        }
-        _ => Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        )),
-    }
-}
-
-pub fn vector_to_text(vector: &Vector) -> String {
-    let mut text = String::new();
-    text.push('[');
-    match vector.vector_type {
-        VectorType::Float32 => {
-            let data = vector.as_f32_slice();
-            for (i, value) in data.iter().enumerate().take(vector.dims) {
-                text.push_str(&value.to_string());
-                if i < vector.dims - 1 {
-                    text.push(',');
-                }
-            }
-        }
-        VectorType::Float64 => {
-            let data = vector.as_f64_slice();
-            for (i, value) in data.iter().enumerate().take(vector.dims) {
-                text.push_str(&value.to_string());
-                if i < vector.dims - 1 {
-                    text.push(',');
-                }
-            }
-        }
-    }
-    text.push(']');
-    text
-}
-
-pub fn vector_deserialize(vector_type: VectorType, blob: &[u8]) -> Result<Vector> {
-    match vector_type {
-        VectorType::Float32 => vector_deserialize_f32(blob),
-        VectorType::Float64 => vector_deserialize_f64(blob),
-    }
-}
-
-pub fn vector_serialize_f64(x: Vector) -> Value {
-    let mut blob = Vec::with_capacity(x.dims * 8 + 1);
-    blob.extend_from_slice(&x.data);
-    blob.push(2);
-    Value::from_blob(blob)
-}
-
-pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
-    Ok(Vector {
-        vector_type: VectorType::Float64,
-        dims: (blob.len() - 1) / 8,
-        data: blob[..blob.len() - 1].to_vec(),
-    })
-}
-
-pub fn vector_serialize_f32(x: Vector) -> Value {
-    Value::from_blob(x.data)
-}
-
-pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {
-    Ok(Vector {
-        vector_type: VectorType::Float32,
-        dims: blob.len() / 4,
-        data: blob.to_vec(),
-    })
-}
-
-pub fn do_vector_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    match v1.vector_type {
-        VectorType::Float32 => vector_f32_distance_cos(v1, v2),
-        VectorType::Float64 => vector_f64_distance_cos(v1, v2),
-    }
-}
-
-pub fn vector_f32_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
-            "Invalid vector dimensions".to_string(),
-        ));
-    }
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        ));
-    }
-    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f32_slice();
-    let v2_data = v2.as_f32_slice();
-
-    // Check for non-finite values
-    if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
+        unsafe { std::slice::from_raw_parts(ptr as *const f64, self.dims) }
     }
 
-    for i in 0..v1.dims {
-        let e1 = v1_data[i];
-        let e2 = v2_data[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
+    pub fn as_f32_sparse(&self) -> VectorSparse<'_, f32> {
+        debug_assert!(self.vector_type == VectorType::Float32Sparse);
+        let ptr = self.bin_data().as_ptr();
+        let align = std::mem::align_of::<f32>();
+        assert_eq!(
+            ptr.align_offset(align),
+            0,
+            "data pointer must be aligned to {align} bytes for f32 access"
+        );
+        let length = self.bin_data().len() / 4 / 2;
+        let values = unsafe { std::slice::from_raw_parts(ptr as *const f32, length) };
+        let idx = unsafe { std::slice::from_raw_parts((ptr as *const u32).add(length), length) };
+        debug_assert!(idx.is_sorted());
+        VectorSparse { idx, values }
     }
-
-    // Check for zero norms to avoid division by zero
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    Ok(1.0 - (dot / (norm1 * norm2).sqrt()) as f64)
-}
-
-pub fn vector_f64_distance_cos(v1: &Vector, v2: &Vector) -> Result<f64> {
-    if v1.dims != v2.dims {
-        return Err(LimboError::ConversionError(
-            "Invalid vector dimensions".to_string(),
-        ));
-    }
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        ));
-    }
-    let (mut dot, mut norm1, mut norm2) = (0.0, 0.0, 0.0);
-    let v1_data = v1.as_f64_slice();
-    let v2_data = v2.as_f64_slice();
-
-    // Check for non-finite values
-    if v1_data.iter().any(|x| !x.is_finite()) || v2_data.iter().any(|x| !x.is_finite()) {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    for i in 0..v1.dims {
-        let e1 = v1_data[i];
-        let e2 = v2_data[i];
-        dot += e1 * e2;
-        norm1 += e1 * e1;
-        norm2 += e2 * e2;
-    }
-
-    // Check for zero norms
-    if norm1 == 0.0 || norm2 == 0.0 {
-        return Err(LimboError::ConversionError(
-            "Invalid vector value".to_string(),
-        ));
-    }
-
-    Ok(1.0 - (dot / (norm1 * norm2).sqrt()))
-}
-
-pub fn vector_type(blob: &[u8]) -> Result<VectorType> {
-    // Even-sized blobs are always float32.
-    if blob.len() % 2 == 0 {
-        return Ok(VectorType::Float32);
-    }
-    // Odd-sized blobs have type byte at the end
-    let (data_blob, type_byte) = blob.split_at(blob.len() - 1);
-    let vector_type = type_byte[0];
-    match vector_type {
-        1 => {
-            if data_blob.len() % 4 != 0 {
-                return Err(LimboError::ConversionError(
-                    "Invalid vector value".to_string(),
-                ));
-            }
-            Ok(VectorType::Float32)
-        }
-        2 => {
-            if data_blob.len() % 8 != 0 {
-                return Err(LimboError::ConversionError(
-                    "Invalid vector value".to_string(),
-                ));
-            }
-            Ok(VectorType::Float64)
-        }
-        _ => Err(LimboError::ConversionError(
-            "Invalid vector type".to_string(),
-        )),
-    }
-}
-
-pub fn vector_concat(v1: &Vector, v2: &Vector) -> Result<Vector> {
-    if v1.vector_type != v2.vector_type {
-        return Err(LimboError::ConversionError(
-            "Mismatched vector types".into(),
-        ));
-    }
-
-    let mut data = Vec::with_capacity(v1.data.len() + v2.data.len());
-    data.extend_from_slice(&v1.data);
-    data.extend_from_slice(&v2.data);
-
-    Ok(Vector {
-        vector_type: v1.vector_type,
-        dims: v1.dims + v2.dims,
-        data,
-    })
-}
-
-pub fn vector_slice(vector: &Vector, start_idx: usize, end_idx: usize) -> Result<Vector> {
-    fn extract_bytes<T, const N: usize>(
-        slice: &[T],
-        start: usize,
-        end: usize,
-        to_bytes: impl Fn(&T) -> [u8; N],
-    ) -> Result<Vec<u8>> {
-        if start > end {
-            return Err(LimboError::InvalidArgument(
-                "start index must not be greater than end index".into(),
-            ));
-        }
-        if end > slice.len() || end < start {
-            return Err(LimboError::ConversionError(
-                "vector_slice range out of bounds".into(),
-            ));
-        }
-
-        let mut buf = Vec::with_capacity((end - start) * N);
-        for item in &slice[start..end] {
-            buf.extend_from_slice(&to_bytes(item));
-        }
-        Ok(buf)
-    }
-
-    let (vector_type, data) = match vector.vector_type {
-        VectorType::Float32 => (
-            VectorType::Float32,
-            extract_bytes::<f32, 4>(vector.as_f32_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-        VectorType::Float64 => (
-            VectorType::Float64,
-            extract_bytes::<f64, 8>(vector.as_f64_slice(), start_idx, end_idx, |v| {
-                v.to_le_bytes()
-            })?,
-        ),
-    };
-
-    Ok(Vector {
-        vector_type,
-        dims: end_idx - start_idx,
-        data,
-    })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use crate::vector::operations;
+
     use super::*;
     use quickcheck::{Arbitrary, Gen};
     use quickcheck_macros::quickcheck;
 
     // Helper to generate arbitrary vectors of specific type and dimensions
     #[derive(Debug, Clone)]
-    struct ArbitraryVector<const DIMS: usize> {
+    pub struct ArbitraryVector<const DIMS: usize> {
         vector_type: VectorType,
         data: Vec<u8>,
     }
@@ -442,6 +296,10 @@ mod tests {
             (0..DIMS)
                 .map(|_| {
                     loop {
+                        // generate zeroes with some probability since we have support for sparse vectors
+                        if bool::arbitrary(g) {
+                            return 0.0;
+                        }
                         let f = f32::arbitrary(g);
                         // f32::arbitrary() can generate "problem values" like NaN, infinity, and very small values
                         // Skip these values
@@ -458,6 +316,10 @@ mod tests {
             (0..DIMS)
                 .map(|_| {
                     loop {
+                        // generate zeroes with some probability since we have support for sparse vectors
+                        if bool::arbitrary(g) {
+                            return 0.0;
+                        }
                         let f = f64::arbitrary(g);
                         // f64::arbitrary() can generate "problem values" like NaN, infinity, and very small values
                         // Skip these values
@@ -472,12 +334,13 @@ mod tests {
     }
 
     /// Convert an ArbitraryVector to a Vector.
-    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector {
+    impl<const DIMS: usize> From<ArbitraryVector<DIMS>> for Vector<'static> {
         fn from(v: ArbitraryVector<DIMS>) -> Self {
             Vector {
                 vector_type: v.vector_type,
                 dims: DIMS,
-                data: v.data,
+                owned: Some(v.data),
+                refer: None,
             }
         }
     }
@@ -486,20 +349,21 @@ mod tests {
     impl<const DIMS: usize> Arbitrary for ArbitraryVector<DIMS> {
         fn arbitrary(g: &mut Gen) -> Self {
             let vector_type = if bool::arbitrary(g) {
-                VectorType::Float32
+                VectorType::Float32Dense
             } else {
-                VectorType::Float64
+                VectorType::Float64Dense
             };
 
             let data = match vector_type {
-                VectorType::Float32 => {
+                VectorType::Float32Dense => {
                     let floats = Self::generate_f32_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
-                VectorType::Float64 => {
+                VectorType::Float64Dense => {
                     let floats = Self::generate_f64_vector(g);
                     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
                 }
+                _ => unreachable!(),
             };
 
             ArbitraryVector { vector_type, data }
@@ -534,14 +398,10 @@ mod tests {
     /// Test if the vector type identification is correct for a given vector.
     fn test_vector_type<const DIMS: usize>(v: Vector) -> bool {
         let vtype = v.vector_type;
-        let value = match &vtype {
-            VectorType::Float32 => vector_serialize_f32(v),
-            VectorType::Float64 => vector_serialize_f64(v),
-        };
-
-        let blob = value.to_blob().unwrap();
-        match vector_type(blob) {
-            Ok(detected_type) => detected_type == vtype,
+        let value = operations::serialize::vector_serialize(v);
+        let blob = value.to_blob().unwrap().to_vec();
+        match Vector::vector_type(&blob) {
+            Ok((detected_type, _)) => detected_type == vtype,
             Err(_) => false,
         }
     }
@@ -576,50 +436,18 @@ mod tests {
     /// - The data length is correct (4 bytes per float for f32, 8 bytes per float for f64)
     fn test_slice_conversion<const DIMS: usize>(v: Vector) -> bool {
         match v.vector_type {
-            VectorType::Float32 => {
+            VectorType::Float32Dense => {
                 let slice = v.as_f32_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (4 bytes per float)
-                slice.len() == DIMS && (slice.len() * 4 == v.data.len())
+                slice.len() == DIMS && (slice.len() * 4 == v.bin_len())
             }
-            VectorType::Float64 => {
+            VectorType::Float64Dense => {
                 let slice = v.as_f64_slice();
                 // Check if the slice length matches the dimensions and the data length is correct (8 bytes per float)
-                slice.len() == DIMS && (slice.len() * 8 == v.data.len())
+                slice.len() == DIMS && (slice.len() * 8 == v.bin_len())
             }
+            _ => unreachable!(),
         }
-    }
-
-    // Test size_to_dims calculation with different dimensions
-    #[quickcheck]
-    fn prop_size_to_dims_calculation_2d(v: ArbitraryVector<2>) -> bool {
-        test_size_to_dims::<2>(v.into())
-    }
-
-    #[quickcheck]
-    fn prop_size_to_dims_calculation_3d(v: ArbitraryVector<3>) -> bool {
-        test_size_to_dims::<3>(v.into())
-    }
-
-    #[quickcheck]
-    fn prop_size_to_dims_calculation_4d(v: ArbitraryVector<4>) -> bool {
-        test_size_to_dims::<4>(v.into())
-    }
-
-    #[quickcheck]
-    fn prop_size_to_dims_calculation_100d(v: ArbitraryVector<100>) -> bool {
-        test_size_to_dims::<100>(v.into())
-    }
-
-    #[quickcheck]
-    fn prop_size_to_dims_calculation_1536d(v: ArbitraryVector<1536>) -> bool {
-        test_size_to_dims::<1536>(v.into())
-    }
-
-    /// Test if the size_to_dims calculation is correct for a given vector.
-    fn test_size_to_dims<const DIMS: usize>(v: Vector) -> bool {
-        let size = v.data.len();
-        let calculated_dims = v.vector_type.size_to_dims(size);
-        calculated_dims == DIMS
     }
 
     #[quickcheck]
@@ -658,171 +486,56 @@ mod tests {
     /// - Assumes vectors are well-formed (same type and dimension)
     /// - The distance must be between 0 and 2
     fn test_vector_distance<const DIMS: usize>(v1: &Vector, v2: &Vector) -> bool {
-        match do_vector_distance_cos(v1, v2) {
-            Ok(distance) => (0.0..=2.0).contains(&distance),
+        match operations::distance_cos::vector_distance_cos(v1, v2) {
+            Ok(distance) => distance.is_nan() || (0.0 - 1e-6..=2.0 + 1e-6).contains(&distance),
             Err(_) => true,
         }
     }
 
     #[test]
-    fn parse_string_vector_zero_length() {
-        let value = Value::from_text("[]");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
-        assert_eq!(vector.dims, 0);
-        assert_eq!(vector.vector_type, VectorType::Float32);
-    }
-
-    #[test]
-    fn test_parse_string_vector_valid_whitespace() {
-        let value = Value::from_text("  [  1.0  ,  2.0  ,  3.0  ]  ");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
-        assert_eq!(vector.dims, 3);
-        assert_eq!(vector.vector_type, VectorType::Float32);
-    }
-
-    #[test]
-    fn test_parse_string_vector_valid() {
-        let value = Value::from_text("[1.0, 2.0, 3.0]");
-        let vector = parse_string_vector(VectorType::Float32, &value).unwrap();
-        assert_eq!(vector.dims, 3);
-        assert_eq!(vector.vector_type, VectorType::Float32);
-    }
-
-    fn float32_vec_from(slice: &[f32]) -> Vector {
-        let mut data = Vec::new();
-        for &v in slice {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-
-        Vector {
-            vector_type: VectorType::Float32,
-            dims: slice.len(),
-            data,
-        }
-    }
-
-    fn f32_slice_from_vector(vector: &Vector) -> Vec<f32> {
-        vector.as_f32_slice().to_vec()
-    }
-
-    #[test]
-    fn test_vector_concat_normal_case() {
-        let v1 = float32_vec_from(&[1.0, 2.0, 3.0]);
-        let v2 = float32_vec_from(&[4.0, 5.0, 6.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 6);
-        assert_eq!(result.vector_type, VectorType::Float32);
-        assert_eq!(
-            f32_slice_from_vector(&result),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    fn test_vector_some_cosine_dist() {
+        let a = Vector {
+            vector_type: VectorType::Float32Dense,
+            dims: 2,
+            owned: Some(vec![0, 0, 0, 0, 52, 208, 106, 63]),
+            refer: None,
+        };
+        let b = Vector {
+            vector_type: VectorType::Float32Dense,
+            dims: 2,
+            owned: Some(vec![0, 0, 0, 0, 58, 100, 45, 192]),
+            refer: None,
+        };
+        assert!(
+            (operations::distance_cos::vector_distance_cos(&a, &b).unwrap() - 2.0).abs() <= 1e-6
         );
     }
 
     #[test]
-    fn test_vector_concat_empty_left() {
-        let v1 = float32_vec_from(&[]);
-        let v2 = float32_vec_from(&[4.0, 5.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 2);
-        assert_eq!(f32_slice_from_vector(&result), vec![4.0, 5.0]);
+    fn parse_string_vector_zero_length() {
+        let vector = operations::text::vector_from_text(VectorType::Float32Dense, "[]").unwrap();
+        assert_eq!(vector.dims, 0);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     #[test]
-    fn test_vector_concat_empty_right() {
-        let v1 = float32_vec_from(&[1.0, 2.0]);
-        let v2 = float32_vec_from(&[]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 2);
-        assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0]);
+    fn test_parse_string_vector_valid_whitespace() {
+        let vector = operations::text::vector_from_text(
+            VectorType::Float32Dense,
+            "  [  1.0  ,  2.0  ,  3.0  ]  ",
+        )
+        .unwrap();
+        assert_eq!(vector.dims, 3);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     #[test]
-    fn test_vector_concat_both_empty() {
-        let v1 = float32_vec_from(&[]);
-        let v2 = float32_vec_from(&[]);
-        let result = vector_concat(&v1, &v2).unwrap();
-        assert_eq!(result.dims, 0);
-        assert_eq!(f32_slice_from_vector(&result), Vec::<f32>::new());
-    }
-
-    #[test]
-    fn test_vector_concat_different_lengths() {
-        let v1 = float32_vec_from(&[1.0]);
-        let v2 = float32_vec_from(&[2.0, 3.0, 4.0]);
-
-        let result = vector_concat(&v1, &v2).unwrap();
-
-        assert_eq!(result.dims, 4);
-        assert_eq!(f32_slice_from_vector(&result), vec![1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_normal_case() {
-        let input_vec = float32_vec_from(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-        let result = vector_slice(&input_vec, 1, 4).unwrap();
-
-        assert_eq!(result.dims, 3);
-        assert_eq!(f32_slice_from_vector(&result), vec![2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_full_range() {
-        let input_vec = float32_vec_from(&[10.0, 20.0, 30.0]);
-        let result = vector_slice(&input_vec, 0, 3).unwrap();
-
-        assert_eq!(result.dims, 3);
-        assert_eq!(f32_slice_from_vector(&result), vec![10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn test_vector_slice_single_element() {
-        let input_vec = float32_vec_from(&[4.40, 2.71]);
-        let result = vector_slice(&input_vec, 1, 2).unwrap();
-
-        assert_eq!(result.dims, 1);
-        assert_eq!(f32_slice_from_vector(&result), vec![2.71]);
-    }
-
-    #[test]
-    fn test_vector_slice_empty_list() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let result = vector_slice(&input_vec, 2, 2).unwrap();
-
-        assert_eq!(result.dims, 0);
-    }
-
-    #[test]
-    fn test_vector_slice_zero_length() {
-        let input_vec = float32_vec_from(&[1.0, 2.0, 3.0]);
-        let err = vector_slice(&input_vec, 2, 1);
-        assert!(err.is_err(), "Expected error on zero-length range");
-    }
-
-    #[test]
-    fn test_vector_slice_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 0, 5);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_vector_slice_start_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 5, 5);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_vector_slice_end_out_of_bounds() {
-        let input_vec = float32_vec_from(&[1.0, 2.0]);
-        let err = vector_slice(&input_vec, 1, 3);
-        assert!(err.is_err());
+    fn test_parse_string_vector_valid() {
+        let vector =
+            operations::text::vector_from_text(VectorType::Float32Dense, "[1.0, 2.0, 3.0]")
+                .unwrap();
+        assert_eq!(vector.dims, 3);
+        assert_eq!(vector.vector_type, VectorType::Float32Dense);
     }
 
     #[quickcheck]
@@ -853,11 +566,10 @@ mod tests {
     /// Test that a vector can be converted to text and back without loss of precision
     fn test_vector_text_roundtrip(v: Vector) -> bool {
         // Convert to text
-        let text = vector_to_text(&v);
+        let text = operations::text::vector_to_text(&v);
 
         // Parse back from text
-        let value = Value::from_text(&text);
-        let parsed = parse_string_vector(v.vector_type, &value);
+        let parsed = operations::text::vector_from_text(v.vector_type, &text);
 
         match parsed {
             Ok(parsed_vector) => {
@@ -867,16 +579,17 @@ mod tests {
                 }
 
                 match v.vector_type {
-                    VectorType::Float32 => {
+                    VectorType::Float32Dense => {
                         let original = v.as_f32_slice();
                         let parsed = parsed_vector.as_f32_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
-                    VectorType::Float64 => {
+                    VectorType::Float64Dense => {
                         let original = v.as_f64_slice();
                         let parsed = parsed_vector.as_f64_slice();
                         original.iter().zip(parsed.iter()).all(|(a, b)| a == b)
                     }
+                    _ => unreachable!(),
                 }
             }
             Err(_) => false,

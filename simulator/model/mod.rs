@@ -1,24 +1,26 @@
 use std::fmt::Display;
 
 use anyhow::Context;
+use bitflags::bitflags;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::{
     query::{
-        Create, CreateIndex, Delete, Drop, Insert, Select,
+        Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
+        alter_table::{AlterTable, AlterTableType},
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
         update::Update,
     },
-    table::{JoinTable, JoinType, SimValue, Table, TableContext},
+    table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
 use turso_parser::ast::Distinctness;
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 // This type represents the potential queries on the database.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
 pub enum Query {
     Create(Create),
     Select(Select),
@@ -27,12 +29,38 @@ pub enum Query {
     Update(Update),
     Drop(Drop),
     CreateIndex(CreateIndex),
+    AlterTable(AlterTable),
+    DropIndex(DropIndex),
     Begin(Begin),
     Commit(Commit),
     Rollback(Rollback),
+    /// Placeholder query that still needs to be generated
+    Placeholder,
 }
 
 impl Query {
+    pub fn as_create(&self) -> &Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn unwrap_create(self) -> Create {
+        match self {
+            Self::Create(create) => create,
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn unwrap_insert(self) -> Insert {
+        match self {
+            Self::Insert(insert) => insert,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn dependencies(&self) -> IndexSet<String> {
         match self {
             Query::Select(select) => select.dependencies(),
@@ -41,11 +69,20 @@ impl Query {
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => IndexSet::from_iter([table.clone()]),
-            Query::CreateIndex(CreateIndex { table_name, .. }) => {
-                IndexSet::from_iter([table_name.clone()])
-            }
+            | Query::Drop(Drop { table, .. })
+            | Query::CreateIndex(CreateIndex {
+                index: Index {
+                    table_name: table, ..
+                },
+            })
+            | Query::AlterTable(AlterTable {
+                table_name: table, ..
+            })
+            | Query::DropIndex(DropIndex {
+                table_name: table, ..
+            }) => IndexSet::from_iter([table.clone()]),
             Query::Begin(_) | Query::Commit(_) | Query::Rollback(_) => IndexSet::new(),
+            Query::Placeholder => IndexSet::new(),
         }
     }
     pub fn uses(&self) -> Vec<String> {
@@ -56,9 +93,20 @@ impl Query {
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
-            | Query::Drop(Drop { table, .. }) => vec![table.clone()],
-            Query::CreateIndex(CreateIndex { table_name, .. }) => vec![table_name.clone()],
+            | Query::Drop(Drop { table, .. })
+            | Query::CreateIndex(CreateIndex {
+                index: Index {
+                    table_name: table, ..
+                },
+            })
+            | Query::AlterTable(AlterTable {
+                table_name: table, ..
+            })
+            | Query::DropIndex(DropIndex {
+                table_name: table, ..
+            }) => vec![table.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
+            Query::Placeholder => vec![],
         }
     }
 
@@ -74,7 +122,11 @@ impl Query {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self,
-            Self::Create(..) | Self::CreateIndex(..) | Self::Drop(..)
+            Self::Create(..)
+                | Self::CreateIndex(..)
+                | Self::Drop(..)
+                | Self::AlterTable(..)
+                | Self::DropIndex(..)
         )
     }
 }
@@ -89,9 +141,12 @@ impl Display for Query {
             Self::Update(update) => write!(f, "{update}"),
             Self::Drop(drop) => write!(f, "{drop}"),
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
+            Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
+            Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
             Self::Begin(begin) => write!(f, "{begin}"),
             Self::Commit(commit) => write!(f, "{commit}"),
             Self::Rollback(rollback) => write!(f, "{rollback}"),
+            Self::Placeholder => Ok(()),
         }
     }
 }
@@ -108,11 +163,81 @@ impl Shadow for Query {
             Query::Update(update) => update.shadow(env),
             Query::Drop(drop) => drop.shadow(env),
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
+            Query::AlterTable(alter_table) => alter_table.shadow(env),
+            Query::DropIndex(drop_index) => drop_index.shadow(env),
             Query::Begin(begin) => Ok(begin.shadow(env)),
             Query::Commit(commit) => Ok(commit.shadow(env)),
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
+            Query::Placeholder => Ok(vec![]),
         }
     }
+}
+
+bitflags! {
+    pub struct QueryCapabilities: u32 {
+        const CREATE = 1 << 0;
+        const SELECT = 1 << 1;
+        const INSERT = 1 << 2;
+        const DELETE = 1 << 3;
+        const UPDATE = 1 << 4;
+        const DROP = 1 << 5;
+        const CREATE_INDEX = 1 << 6;
+        const ALTER_TABLE = 1 << 7;
+        const DROP_INDEX = 1 << 8;
+    }
+}
+
+impl QueryCapabilities {
+    // TODO: can be const fn in the future
+    pub fn from_list_queries(queries: &[QueryDiscriminants]) -> Self {
+        queries
+            .iter()
+            .fold(Self::empty(), |accum, q| accum.union(q.into()))
+    }
+}
+
+impl From<&QueryDiscriminants> for QueryCapabilities {
+    fn from(value: &QueryDiscriminants) -> Self {
+        (*value).into()
+    }
+}
+
+impl From<QueryDiscriminants> for QueryCapabilities {
+    fn from(value: QueryDiscriminants) -> Self {
+        match value {
+            QueryDiscriminants::Create => Self::CREATE,
+            QueryDiscriminants::Select => Self::SELECT,
+            QueryDiscriminants::Insert => Self::INSERT,
+            QueryDiscriminants::Delete => Self::DELETE,
+            QueryDiscriminants::Update => Self::UPDATE,
+            QueryDiscriminants::Drop => Self::DROP,
+            QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
+            QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
+            QueryDiscriminants::DropIndex => Self::DROP_INDEX,
+            QueryDiscriminants::Begin
+            | QueryDiscriminants::Commit
+            | QueryDiscriminants::Rollback => {
+                unreachable!("QueryCapabilities do not apply to transaction queries")
+            }
+            QueryDiscriminants::Placeholder => {
+                unreachable!("QueryCapabilities do not apply to query Placeholder")
+            }
+        }
+    }
+}
+
+impl QueryDiscriminants {
+    pub const ALL_NO_TRANSACTION: &[QueryDiscriminants] = &[
+        QueryDiscriminants::Select,
+        QueryDiscriminants::Create,
+        QueryDiscriminants::Insert,
+        QueryDiscriminants::Update,
+        QueryDiscriminants::Delete,
+        QueryDiscriminants::Drop,
+        QueryDiscriminants::CreateIndex,
+        QueryDiscriminants::AlterTable,
+        QueryDiscriminants::DropIndex,
+    ];
 }
 
 impl Shadow for Create {
@@ -138,7 +263,7 @@ impl Shadow for CreateIndex {
             .find(|t| t.name == self.table_name)
             .unwrap()
             .indexes
-            .push(self.index_name.clone());
+            .push(self.index.clone());
         vec![]
     }
 }
@@ -169,6 +294,7 @@ impl Shadow for Drop {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
+        tracing::info!("dropping {:?}", self);
         if !tables.iter().any(|t| t.name == self.table) {
             // If the table does not exist, we return an error
             return Err(anyhow::anyhow!(
@@ -427,6 +553,79 @@ impl Shadow for Update {
             }
         }
 
+        Ok(vec![])
+    }
+}
+
+impl Shadow for AlterTable {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let table = tables
+            .iter_mut()
+            .find(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", self.table_name))?;
+
+        match &self.alter_table_type {
+            AlterTableType::RenameTo { new_name } => {
+                table.name = new_name.clone();
+            }
+            AlterTableType::AddColumn { column } => {
+                table.columns.push(column.clone());
+                table.rows.iter_mut().for_each(|row| {
+                    row.push(SimValue(turso_core::Value::Null));
+                });
+            }
+            AlterTableType::AlterColumn { old, new } => {
+                let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
+                *col = new.clone();
+                table.indexes.iter_mut().for_each(|index| {
+                    index.columns.iter_mut().for_each(|(col_name, _)| {
+                        if col_name == old {
+                            *col_name = new.name.clone();
+                        }
+                    });
+                });
+            }
+            AlterTableType::RenameColumn { old, new } => {
+                let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
+                col.name = new.clone();
+                table.indexes.iter_mut().for_each(|index| {
+                    index.columns.iter_mut().for_each(|(col_name, _)| {
+                        if col_name == old {
+                            *col_name = new.clone();
+                        }
+                    });
+                });
+            }
+            AlterTableType::DropColumn { column_name } => {
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *column_name)
+                    .unwrap();
+                table.columns.remove(col_idx);
+                table.rows.iter_mut().for_each(|row| {
+                    row.remove(col_idx);
+                });
+            }
+        };
+        Ok(vec![])
+    }
+}
+
+impl Shadow for DropIndex {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let table = tables
+            .iter_mut()
+            .find(|t| t.name == self.table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", self.table_name))?;
+
+        table
+            .indexes
+            .retain(|index| index.index_name != self.index_name);
         Ok(vec![])
     }
 }

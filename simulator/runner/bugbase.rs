@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
-    io::{self, Write},
-    path::PathBuf,
-    process::Command,
+    env::current_dir,
+    fs::File,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -49,6 +50,7 @@ pub(crate) struct BugRun {
 }
 
 impl Bug {
+    #[expect(dead_code)]
     /// Check if the bug is loaded.
     pub(crate) fn is_loaded(&self) -> bool {
         match self {
@@ -130,6 +132,7 @@ impl BugBase {
         Err(anyhow!("failed to create bug base"))
     }
 
+    #[expect(dead_code)]
     /// Load the bug base from one of the potential paths.
     pub(crate) fn interactive_load() -> anyhow::Result<Self> {
         let potential_paths = vec![
@@ -291,22 +294,23 @@ impl BugBase {
             None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.json"))
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
                         .with_context(|| {
                             format!(
                                 "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("test.json").display()
+                                self.path.join(seed.to_string()).join("plan.json").display()
                             )
                         })?;
                 let plan: InteractionPlan = serde_json::from_str(&plan)
                     .with_context(|| "should be able to deserialize plan")?;
 
-                let shrunk_plan: Option<String> = std::fs::read_to_string(
-                    self.path.join(seed.to_string()).join("shrunk_test.json"),
-                )
-                .with_context(|| "should be able to read shrunk plan file")
-                .and_then(|shrunk| serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e)))
-                .ok();
+                let shrunk_plan: Option<String> =
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("shrunk.json"))
+                        .with_context(|| "should be able to read shrunk plan file")
+                        .and_then(|shrunk| {
+                            serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e))
+                        })
+                        .ok();
 
                 let shrunk_plan: Option<InteractionPlan> =
                     shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
@@ -338,6 +342,7 @@ impl BugBase {
         }
     }
 
+    #[expect(dead_code)]
     pub(crate) fn mark_successful_run(
         &mut self,
         seed: u64,
@@ -434,6 +439,7 @@ impl BugBase {
 }
 
 impl BugBase {
+    #[expect(dead_code)]
     /// Get the path to the bug base directory.
     pub(crate) fn path(&self) -> &PathBuf {
         &self.path
@@ -448,28 +454,56 @@ impl BugBase {
 
 impl BugBase {
     pub(crate) fn get_current_commit_hash() -> anyhow::Result<String> {
-        let output = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .with_context(|| "should be able to get the commit hash")?;
-        let commit_hash = String::from_utf8(output.stdout)
-            .with_context(|| "commit hash should be valid utf8")?
-            .trim()
-            .to_string();
-        Ok(commit_hash)
+        let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
+        let hash =
+            resolve_head(&git_dir).with_context(|| "should be able to get the commit hash")?;
+        Ok(hash)
     }
 
     pub(crate) fn get_limbo_project_dir() -> anyhow::Result<PathBuf> {
-        Ok(PathBuf::from(
-            String::from_utf8(
-                Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .output()
-                    .with_context(|| "should be able to get the git path")?
-                    .stdout,
-            )
-            .with_context(|| "commit hash should be valid utf8")?
-            .trim(),
-        ))
+        let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
+        let workdir = git_dir
+            .parent()
+            .with_context(|| "work tree should be parent of .git")?;
+        Ok(workdir.to_path_buf())
     }
+}
+
+fn find_git_dir(start_path: impl AsRef<Path>) -> Option<PathBuf> {
+    let mut current = start_path.as_ref().to_path_buf();
+    loop {
+        let git_path = current.join(".git");
+        if git_path.is_dir() {
+            return Some(git_path);
+        } else if git_path.is_file() {
+            // Handle git worktrees - .git is a file containing "gitdir: <path>"
+            if let Ok(contents) = read_to_string(&git_path) {
+                if let Some(gitdir) = contents.strip_prefix("gitdir: ") {
+                    return Some(PathBuf::from(gitdir));
+                }
+            }
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_head(git_dir: impl AsRef<Path>) -> anyhow::Result<String> {
+    // HACK ignores stuff like packed-refs
+    let head_path = git_dir.as_ref().join("HEAD");
+    let head_contents = read_to_string(&head_path)?;
+    if let Some(ref_path) = head_contents.strip_prefix("ref: ") {
+        let ref_file = git_dir.as_ref().join(ref_path);
+        read_to_string(&ref_file)
+    } else {
+        Ok(head_contents)
+    }
+}
+
+fn read_to_string(path: impl AsRef<Path>) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents.trim().to_string())
 }

@@ -163,7 +163,7 @@ impl TempDatabase {
     }
 }
 
-pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
+pub fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
     let completions = conn.cacheflush()?;
     for c in completions {
         tmp_db.io.wait_for_completion(c)?;
@@ -171,7 +171,7 @@ pub(crate) fn do_flush(conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow:
     Ok(())
 }
 
-pub(crate) fn compare_string(a: impl AsRef<str>, b: impl AsRef<str>) {
+pub fn compare_string(a: impl AsRef<str>, b: impl AsRef<str>) {
     let a = a.as_ref();
     let b = b.as_ref();
 
@@ -204,7 +204,7 @@ pub fn maybe_setup_tracing() {
         .try_init();
 }
 
-pub(crate) fn sqlite_exec_rows(
+pub fn sqlite_exec_rows(
     conn: &rusqlite::Connection,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
@@ -227,7 +227,7 @@ pub(crate) fn sqlite_exec_rows(
     results
 }
 
-pub(crate) fn limbo_exec_rows(
+pub fn limbo_exec_rows(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
@@ -266,7 +266,8 @@ pub(crate) fn limbo_exec_rows(
     rows
 }
 
-pub(crate) fn limbo_stmt_get_column_names(
+#[allow(dead_code)]
+pub fn limbo_stmt_get_column_names(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
@@ -280,7 +281,7 @@ pub(crate) fn limbo_stmt_get_column_names(
     names
 }
 
-pub(crate) fn limbo_exec_rows_fallible(
+pub fn limbo_exec_rows_fallible(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
@@ -319,7 +320,7 @@ pub(crate) fn limbo_exec_rows_fallible(
     Ok(rows)
 }
 
-pub(crate) fn limbo_exec_rows_error(
+pub fn limbo_exec_rows_error(
     _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
@@ -338,7 +339,7 @@ pub(crate) fn limbo_exec_rows_error(
     }
 }
 
-pub(crate) fn rng_from_time() -> (ChaCha8Rng, u64) {
+pub fn rng_from_time() -> (ChaCha8Rng, u64) {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -401,6 +402,7 @@ pub fn run_query_core(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;

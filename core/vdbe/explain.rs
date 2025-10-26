@@ -6,7 +6,11 @@ use super::{Insn, InsnReference, Program, Value};
 use crate::function::{Func, ScalarFunc};
 
 pub const EXPLAIN_COLUMNS: [&str; 8] = ["addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment"];
+pub const EXPLAIN_COLUMNS_TYPE: [&str; 8] = [
+    "INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "TEXT",
+];
 pub const EXPLAIN_QUERY_PLAN_COLUMNS: [&str; 4] = ["id", "parent", "notused", "detail"];
+pub const EXPLAIN_QUERY_PLAN_COLUMNS_TYPE: [&str; 4] = ["INTEGER", "INTEGER", "INTEGER", "TEXT"];
 
 pub fn insn_to_row(
     program: &Program,
@@ -1137,7 +1141,7 @@ pub fn insn_to_row(
                 flag.0 as u16,
                 format!("intkey=r[{key_reg}] data=r[{record_reg}]"),
             ),
-            Insn::Delete { cursor_id, table_name } => (
+            Insn::Delete { cursor_id, table_name, .. } => (
                 "Delete",
                 *cursor_id as i32,
                 0,
@@ -1800,7 +1804,25 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        }
+        Insn::FkCounter{increment_value, deferred } => (
+        "FkCounter",
+            *increment_value as i32,
+            *deferred as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::FkIfZero{target_pc, deferred } => (
+        "FkIfZero",
+            target_pc.as_debug_int(),
+            *deferred as i32,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+    }
 }
 
 pub fn insn_to_row_with_comment(

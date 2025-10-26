@@ -5,7 +5,7 @@ pub mod differential;
 pub mod doublecheck;
 pub mod env;
 pub mod execution;
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub mod file;
 pub mod io;
 pub mod memory;
@@ -20,4 +20,6 @@ pub trait SimIO: turso_core::IO {
     fn syncing(&self) -> bool;
 
     fn close_files(&self);
+
+    fn persist_files(&self) -> anyhow::Result<()>;
 }

@@ -106,44 +106,65 @@ macro_rules! row_step_result_query {
             return Ok(());
         }
 
-        let start = Instant::now();
+        let start = if $stats.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         match $rows.step() {
             Ok(StepResult::Row) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
 
                 $row_handle
             }
             Ok(StepResult::IO) => {
-                let start = Instant::now();
+                if let Some(ref mut stats) = $stats {
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
+                }
+                let start = if $stats.is_some() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 $rows.run_once()?;
                 if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.elapsed());
+                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
                 }
             }
             Ok(StepResult::Interrupt) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Done) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 break;
             }
             Ok(StepResult::Busy) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let _ = $app.writeln("database is busy");
                 break;
             }
             Err(err) => {
                 if let Some(ref mut stats) = $stats {
-                    stats.execute_time_elapsed_samples.push(start.elapsed());
+                    stats
+                        .execute_time_elapsed_samples
+                        .push(start.unwrap().elapsed());
                 }
                 let report = miette::Error::from(err).with_source_code($sql.to_owned());
                 let _ = $app.writeln_fmt(format_args!("{report:?}"));
@@ -1239,26 +1260,33 @@ impl Limbo {
     }
 
     fn display_indexes(&mut self, maybe_table: Option<String>) -> anyhow::Result<()> {
-        let sql = match maybe_table {
-            Some(ref tbl_name) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
-            ),
-            None => String::from("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY 1"),
-        };
-
         let mut indexes = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
-                indexes.push_str(idx.as_str());
-                indexes.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(err) = self.handle_row(&sql, handler) {
-            if err.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", err));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match maybe_table {
+                Some(ref tbl_name) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
+                ),
+                None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        indexes.push_str(prefix);
+                        indexes.push('.');
+                    }
+                    indexes.push_str(idx.as_str());
+                    indexes.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(err) = self.handle_row(&sql, handler) {
+                if err.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", err));
+                }
             }
         }
         if !indexes.is_empty() {
@@ -1268,28 +1296,35 @@ impl Limbo {
     }
 
     fn display_tables(&mut self, pattern: Option<&str>) -> anyhow::Result<()> {
-        let sql = match pattern {
-            Some(pattern) => format!(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
-            ),
-            None => String::from(
-                "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
-            ),
-        };
-
         let mut tables = String::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
-            if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
-                tables.push_str(table.as_str());
-                tables.push(' ');
-            }
-            Ok(())
-        };
-        if let Err(e) = self.handle_row(&sql, handler) {
-            if e.to_string().contains("no such table: sqlite_schema") {
-                return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
-            } else {
-                return Err(anyhow::anyhow!("Error querying schema: {}", e));
+
+        for name in self.database_names()? {
+            let prefix = (name != "main").then_some(&name);
+            let sql = match pattern {
+                Some(pattern) => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name LIKE '{pattern}' ORDER BY 1"
+                ),
+                None => format!(
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                ),
+            };
+            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+                if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
+                    if let Some(prefix) = prefix {
+                        tables.push_str(prefix);
+                        tables.push('.');
+                    }
+                    tables.push_str(table.as_str());
+                    tables.push(' ');
+                }
+                Ok(())
+            };
+            if let Err(e) = self.handle_row(&sql, handler) {
+                if e.to_string().contains("no such table: sqlite_schema") {
+                    return Err(anyhow::anyhow!("Unable to access database schema. The database may be using an older SQLite version or may not be properly initialized."));
+                } else {
+                    return Err(anyhow::anyhow!("Error querying schema: {}", e));
+                }
             }
         }
         if !tables.is_empty() {
@@ -1302,6 +1337,21 @@ impl Limbo {
             let _ = self.writeln(b"No tables found in the database.");
         }
         Ok(())
+    }
+
+    fn database_names(&mut self) -> anyhow::Result<Vec<String>> {
+        let sql = "PRAGMA database_list";
+        let mut db_names: Vec<String> = Vec::new();
+        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            if let Ok(Value::Text(name)) = row.get::<&Value>(1) {
+                db_names.push(name.to_string());
+            }
+            Ok(())
+        };
+        match self.handle_row(sql, handler) {
+            Ok(_) => Ok(db_names),
+            Err(e) => Err(anyhow::anyhow!("Error in database list: {}", e)),
+        }
     }
 
     fn handle_row<F>(&mut self, sql: &str, mut handler: F) -> anyhow::Result<()>
@@ -1453,6 +1503,10 @@ impl Limbo {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let name: &str = row.get::<&str>(0)?;
+                        // Skip sqlite_sequence table
+                        if name == "sqlite_sequence" {
+                            continue;
+                        }
                         let ddl: &str = row.get::<&str>(1)?;
                         writeln!(out, "{ddl};")?;
                         Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
@@ -1567,7 +1621,6 @@ impl Limbo {
         if !has_seq {
             return Ok(());
         }
-
         writeln!(out, "DELETE FROM sqlite_sequence;")?;
         if let Some(mut rows) = conn.query("SELECT name, seq FROM sqlite_sequence")? {
             loop {

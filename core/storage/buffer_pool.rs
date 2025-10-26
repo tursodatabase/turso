@@ -239,13 +239,13 @@ impl PoolInner {
                 .wal_frame_arena
                 .as_ref()
                 .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-                .unwrap_or(Buffer::new_temporary(len));
+                .unwrap_or_else(|| Buffer::new_temporary(len));
         }
         // For all other sizes, use regular arena
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, len))
-            .unwrap_or(Buffer::new_temporary(len))
+            .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
     fn get_db_page_buffer(&mut self) -> Buffer {
@@ -253,7 +253,7 @@ impl PoolInner {
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
-            .unwrap_or(Buffer::new_temporary(db_page_size))
+            .unwrap_or_else(|| Buffer::new_temporary(db_page_size))
     }
 
     fn get_wal_frame_buffer(&mut self) -> Buffer {
@@ -261,7 +261,7 @@ impl PoolInner {
         self.wal_frame_arena
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
-            .unwrap_or(Buffer::new_temporary(len))
+            .unwrap_or_else(|| Buffer::new_temporary(len))
     }
 
     /// Allocate a new arena for the pool to use
@@ -427,11 +427,8 @@ impl Arena {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 mod arena {
-    #[cfg(target_vendor = "apple")]
-    use libc::MAP_ANON as MAP_ANONYMOUS;
-    #[cfg(target_os = "linux")]
     use libc::MAP_ANONYMOUS;
     use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
     use std::ffi::c_void;
@@ -463,11 +460,11 @@ mod arena {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), miri))]
 mod arena {
     pub fn alloc(len: usize) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
-        unsafe { std::alloc::alloc(layout) }
+        unsafe { std::alloc::alloc_zeroed(layout) }
     }
     pub fn dealloc(ptr: *mut u8, len: usize) {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();

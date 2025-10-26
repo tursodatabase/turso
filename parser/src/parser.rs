@@ -28,12 +28,17 @@ macro_rules! peek_expect {
                     match (TK_ID, tt.fallback_id_if_ok()) {
                         $(($x, TK_ID) => token,)*
                         _ => {
+                            let token_text = String::from_utf8_lossy(token.value).to_string();
+                            let offset = $parser.offset();
                             return Err(Error::ParseUnexpectedToken {
                                 parsed_offset: ($parser.offset(), token_len).into(),
                                 expected: &[
                                     $($x,)*
                                 ],
                                 got: tt,
+                                token_text: token_text.clone(),
+                                offset,
+                                expected_display: crate::token::TokenType::format_expected_tokens(&[$($x,)*]),
                             })
                         }
                     }
@@ -242,10 +247,17 @@ impl<'a> Parser<'a> {
                 Some(token) => {
                     if !found_semi {
                         let tt = token.token_type.unwrap();
+                        let token_text = String::from_utf8_lossy(token.value).to_string();
+                        let offset = self.offset();
                         return Err(Error::ParseUnexpectedToken {
-                            parsed_offset: (self.offset(), 1).into(),
+                            parsed_offset: (offset, 1).into(),
                             expected: &[TK_SEMI],
                             got: tt,
+                            token_text: token_text.clone(),
+                            offset,
+                            expected_display: crate::token::TokenType::format_expected_tokens(&[
+                                TK_SEMI,
+                            ]),
                         });
                     }
 
@@ -1495,10 +1507,18 @@ impl<'a> Parser<'a> {
                         Some(self.parse_nm()?)
                     } else if tok.token_type == Some(TK_LP) {
                         if can_be_lit_str {
+                            let token = self.peek_no_eof()?;
+                            let token_text = String::from_utf8_lossy(token.value).to_string();
+                            let offset = self.offset();
                             return Err(Error::ParseUnexpectedToken {
                                 parsed_offset: (self.offset() - name.len(), name.len()).into(),
                                 got: TK_STRING,
                                 expected: &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+                                token_text: token_text.clone(),
+                                offset,
+                                expected_display: crate::token::TokenType::format_expected_tokens(
+                                    &[TK_ID, TK_INDEXED, TK_JOIN_KW],
+                                ),
                             });
                         } // can not be literal string in function name
 
@@ -1723,11 +1743,23 @@ impl<'a> Parser<'a> {
                                 _ => {
                                     let exprs = self.parse_expr_list()?;
                                     eat_expect!(self, TK_RP);
-                                    Box::new(Expr::InList {
-                                        lhs: result,
-                                        not,
-                                        rhs: exprs,
-                                    })
+                                    // Expressions in the form:
+                                    // lhs IN ()
+                                    // lhs NOT IN ()
+                                    // can be simplified to constants 0 (false) and 1 (true), respectively.
+                                    //
+                                    // todo: should check if lhs has a function. If so, this optimization cannot
+                                    // be done.
+                                    if exprs.is_empty() {
+                                        let name = if not { "1" } else { "0" };
+                                        Box::new(Expr::Literal(Literal::Numeric(name.into())))
+                                    } else {
+                                        Box::new(Expr::InList {
+                                            lhs: result,
+                                            rhs: exprs,
+                                            not,
+                                        })
+                                    }
                                 }
                             }
                         }
@@ -3108,9 +3140,17 @@ impl<'a> Parser<'a> {
             TK_NULL | TK_BLOB | TK_STRING | TK_FLOAT | TK_INTEGER | TK_CTIME_KW => {
                 Ok(ColumnConstraint::Default(self.parse_term()?))
             }
-            _ => Ok(ColumnConstraint::Default(Box::new(Expr::Id(
-                self.parse_nm()?,
-            )))),
+            _ => {
+                let name = self.parse_nm()?;
+                let expr = if name.as_str().eq_ignore_ascii_case("true") {
+                    Expr::Literal(Literal::Numeric("1".into()))
+                } else if name.as_str().eq_ignore_ascii_case("false") {
+                    Expr::Literal(Literal::Numeric("0".into()))
+                } else {
+                    Expr::Id(name)
+                };
+                Ok(ColumnConstraint::Default(Box::new(expr)))
+            }
         }
     }
 

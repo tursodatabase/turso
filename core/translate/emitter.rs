@@ -1,11 +1,12 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, Literal};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -29,15 +30,18 @@ use crate::translate::expr::{
     emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
     ReturningValueRegisters, WalkControl,
 };
+use crate::translate::fkeys::{
+    build_index_affinity_string, emit_fk_child_update_counters,
+    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
+    emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
+};
 use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::result_row::try_fold_expr_to_i64;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
@@ -184,13 +188,30 @@ impl<'a> TranslateCtx<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Update row source for UPDATE statements
+/// `Normal` is the default mode, it will iterate either the table itself or an index on the table.
+/// `PrebuiltEphemeralTable` is used when an ephemeral table containing the target rowids to update has
+/// been built and it is being used for iteration.
+pub enum UpdateRowSource {
+    /// Iterate over the table itself or an index on the table
+    Normal,
+    /// Iterate over an ephemeral table containing the target rowids to update
+    PrebuiltEphemeralTable {
+        /// The cursor id of the ephemeral table that is being used to iterate the target rowids to update.
+        ephemeral_table_cursor_id: usize,
+        /// The table that is being updated.
+        target_table: Arc<JoinedTable>,
+    },
+}
+
 /// Used to distinguish database operations
 #[allow(clippy::upper_case_acronyms, dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum OperationMode {
     SELECT,
     INSERT,
-    UPDATE,
+    UPDATE(UpdateRowSource),
     DELETE,
 }
 
@@ -251,7 +272,7 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset);
+    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
 
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
@@ -298,6 +319,7 @@ pub fn emit_query<'a>(
             &plan.order_by,
             &plan.table_references,
             plan.group_by.is_some(),
+            plan.distinctness != Distinctness::NonDistinct,
             &plan.aggregates,
         )?;
     }
@@ -357,6 +379,7 @@ pub fn emit_query<'a>(
         &plan.join_order,
         &plan.where_clause,
         None,
+        OperationMode::SELECT,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -368,7 +391,7 @@ pub fn emit_query<'a>(
         t_ctx,
         &plan.table_references,
         &plan.join_order,
-        None,
+        OperationMode::SELECT,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -422,7 +445,7 @@ fn emit_program_for_delete(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, &mut t_ctx, &plan.limit, &None);
+    init_limit(program, &mut t_ctx, &plan.limit, &None)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -450,6 +473,7 @@ fn emit_program_for_delete(
         &[JoinOrderMember::default()],
         &plan.where_clause,
         None,
+        OperationMode::DELETE,
     )?;
 
     emit_delete_insns(
@@ -466,13 +490,149 @@ fn emit_program_for_delete(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        None,
+        OperationMode::DELETE,
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
-
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+pub fn emit_fk_child_decrement_on_delete(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_tbl: &BTreeTable,
+    child_table_name: &str,
+    child_cursor_id: usize,
+    child_rowid_reg: usize,
+) -> crate::Result<()> {
+    for fk_ref in resolver.schema.resolved_fks_for_child(child_table_name)? {
+        if !fk_ref.fk.deferred {
+            continue;
+        }
+        // Fast path: if any FK column is NULL can't be a violation
+        let null_skip = program.allocate_label();
+        for cname in &fk_ref.child_cols {
+            let (pos, col) = child_tbl.get_column(cname).unwrap();
+            let src = if col.is_rowid_alias {
+                child_rowid_reg
+            } else {
+                let tmp = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: child_cursor_id,
+                    column: pos,
+                    dest: tmp,
+                    default: None,
+                });
+                tmp
+            };
+            program.emit_insn(Insn::IsNull {
+                reg: src,
+                target_pc: null_skip,
+            });
+        }
+
+        if fk_ref.parent_uses_rowid {
+            // Probe parent table by rowid
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let pcur = open_read_table(program, &parent_tbl);
+
+            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let val = if col.is_rowid_alias {
+                child_rowid_reg
+            } else {
+                let tmp = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id: child_cursor_id,
+                    column: pos,
+                    dest: tmp,
+                    default: None,
+                });
+                tmp
+            };
+            let tmpi = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: val,
+                dst_reg: tmpi,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::MustBeInt { reg: tmpi });
+
+            // NotExists jumps when the parent key is missing, so we decrement there
+            let missing = program.allocate_label();
+            let done = program.allocate_label();
+
+            program.emit_insn(Insn::NotExists {
+                cursor: pcur,
+                rowid_reg: tmpi,
+                target_pc: missing,
+            });
+
+            // Parent FOUND, no decrement
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+            program.emit_insn(Insn::Goto { target_pc: done });
+
+            // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
+            program.preassign_label_to_next_insn(missing);
+            program.emit_insn(Insn::Close { cursor_id: pcur });
+            emit_guarded_fk_decrement(program, done);
+            program.preassign_label_to_next_insn(done);
+        } else {
+            // Probe parent unique index
+            let parent_tbl = resolver
+                .schema
+                .get_btree_table(&fk_ref.fk.parent_table)
+                .expect("parent btree");
+            let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
+            let icur = open_read_index(program, idx);
+
+            // Build probe from current child row
+            let n = fk_ref.child_cols.len();
+            let probe = program.alloc_registers(n);
+            for (i, cname) in fk_ref.child_cols.iter().enumerate() {
+                let (pos, col) = child_tbl.get_column(cname).unwrap();
+                let src = if col.is_rowid_alias {
+                    child_rowid_reg
+                } else {
+                    let r = program.alloc_register();
+                    program.emit_insn(Insn::Column {
+                        cursor_id: child_cursor_id,
+                        column: pos,
+                        dest: r,
+                        default: None,
+                    });
+                    r
+                };
+                program.emit_insn(Insn::Copy {
+                    src_reg: src,
+                    dst_reg: probe + i,
+                    extra_amount: 0,
+                });
+            }
+            program.emit_insn(Insn::Affinity {
+                start_reg: probe,
+                count: std::num::NonZeroUsize::new(n).unwrap(),
+                affinities: build_index_affinity_string(idx, &parent_tbl),
+            });
+
+            let ok = program.allocate_label();
+            program.emit_insn(Insn::Found {
+                cursor_id: icur,
+                target_pc: ok,
+                record_reg: probe,
+                num_regs: n,
+            });
+            program.emit_insn(Insn::Close { cursor_id: icur });
+            emit_guarded_fk_decrement(program, ok);
+            program.preassign_label_to_next_insn(ok);
+            program.emit_insn(Insn::Close { cursor_id: icur });
+        }
+        program.preassign_label_to_next_insn(null_skip);
+    }
     Ok(())
 }
 
@@ -513,6 +673,34 @@ fn emit_delete_insns(
         cursor_id: main_table_cursor_id,
         dest: key_reg,
     });
+
+    if connection.foreign_keys_enabled() {
+        if let Some(table) = unsafe { &*table_reference }.btree() {
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
+                emit_fk_delete_parent_existence_checks(
+                    program,
+                    &t_ctx.resolver,
+                    table_name,
+                    main_table_cursor_id,
+                    key_reg,
+                )?;
+            }
+            if t_ctx.resolver.schema.has_child_fks(table_name) {
+                emit_fk_child_decrement_on_delete(
+                    program,
+                    &t_ctx.resolver,
+                    &table,
+                    table_name,
+                    main_table_cursor_id,
+                    key_reg,
+                )?;
+            }
+        }
+    }
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
@@ -671,6 +859,7 @@ fn emit_delete_insns(
         program.emit_insn(Insn::Delete {
             cursor_id: main_table_cursor_id,
             table_name: table_name.to_string(),
+            is_part_of_update: false,
         });
 
         if let Some(index) = iteration_index {
@@ -679,6 +868,7 @@ fn emit_delete_insns(
             program.emit_insn(Insn::Delete {
                 cursor_id: iteration_index_cursor,
                 table_name: index.name.clone(),
+                is_part_of_update: false,
             });
         }
     }
@@ -710,7 +900,7 @@ fn emit_program_for_update(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset);
+    init_limit(program, &mut t_ctx, &plan.limit, &plan.offset)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     if plan.contains_constant_false_condition {
@@ -726,7 +916,15 @@ fn emit_program_for_update(
         };
         *cursor_id
     });
-    if let Some(ephemeral_plan) = ephemeral_plan {
+    let has_ephemeral_table = ephemeral_plan.is_some();
+
+    let target_table = if let Some(ephemeral_plan) = ephemeral_plan {
+        let table = ephemeral_plan
+            .table_references
+            .joined_tables()
+            .first()
+            .unwrap()
+            .clone();
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
@@ -734,7 +932,27 @@ fn emit_program_for_update(
         program.incr_nesting();
         emit_program_for_select(program, resolver, ephemeral_plan)?;
         program.decr_nesting();
-    }
+        Arc::new(table)
+    } else {
+        Arc::new(
+            plan.table_references
+                .joined_tables()
+                .first()
+                .unwrap()
+                .clone(),
+        )
+    };
+
+    let mode = OperationMode::UPDATE(if has_ephemeral_table {
+        UpdateRowSource::PrebuiltEphemeralTable {
+            ephemeral_table_cursor_id: temp_cursor_id.expect(
+                "ephemeral table cursor id is always allocated if has_ephemeral_table is true",
+            ),
+            target_table: target_table.clone(),
+        }
+    } else {
+        UpdateRowSource::Normal
+    });
 
     // Initialize the main loop
     init_loop(
@@ -743,7 +961,7 @@ fn emit_program_for_update(
         &plan.table_references,
         &mut [],
         None,
-        OperationMode::UPDATE,
+        mode.clone(),
         &plan.where_clause,
     )?;
 
@@ -780,7 +998,17 @@ fn emit_program_for_update(
         &[JoinOrderMember::default()],
         &plan.where_clause,
         temp_cursor_id,
+        mode.clone(),
     )?;
+
+    let target_table_cursor_id =
+        program.resolve_cursor_id(&CursorKey::table(target_table.internal_id));
+
+    let iteration_cursor_id = if has_ephemeral_table {
+        temp_cursor_id.unwrap()
+    } else {
+        target_table_cursor_id
+    };
 
     // Emit update instructions
     emit_update_insns(
@@ -789,7 +1017,9 @@ fn emit_program_for_update(
         &t_ctx,
         program,
         index_cursors,
-        temp_cursor_id,
+        iteration_cursor_id,
+        target_table_cursor_id,
+        target_table,
     )?;
 
     // Close the main loop
@@ -798,11 +1028,10 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &[JoinOrderMember::default()],
-        temp_cursor_id,
+        mode.clone(),
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-
     after(program);
 
     program.result_columns = plan.returning.unwrap_or_default();
@@ -811,20 +1040,28 @@ fn emit_program_for_update(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
+#[allow(clippy::too_many_arguments)]
+/// Emits the instructions for the UPDATE loop.
+///
+/// `iteration_cursor_id` is the cursor id of the table that is being iterated over. This can be either the table itself, an index, or an ephemeral table (see [crate::translate::plan::UpdatePlan]).
+///
+/// `target_table_cursor_id` is the cursor id of the table that is being updated.
+///
+/// `target_table` is the table that is being updated.
 fn emit_update_insns(
     connection: &Arc<Connection>,
     plan: &mut UpdatePlan,
     t_ctx: &TranslateCtx,
     program: &mut ProgramBuilder,
     index_cursors: Vec<(usize, usize)>,
-    temp_cursor_id: Option<CursorID>,
+    iteration_cursor_id: usize,
+    target_table_cursor_id: usize,
+    target_table: Arc<JoinedTable>,
 ) -> crate::Result<()> {
-    // we can either use this obviously safe raw pointer or we can clone it
-    let table_ref: *const JoinedTable = plan.table_references.joined_tables().first().unwrap();
-    let internal_id = unsafe { (*table_ref).internal_id };
+    let internal_id = target_table.internal_id;
     let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
-    let (index, is_virtual) = match &unsafe { &*table_ref }.op {
+    let source_table = plan.table_references.joined_tables().first().unwrap();
+    let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
                 (
@@ -834,7 +1071,7 @@ fn emit_update_insns(
             }),
             false,
         ),
-        Operation::Scan(_) => (None, unsafe { &*table_ref }.virtual_table().is_some()),
+        Operation::Scan(_) => (None, target_table.virtual_table().is_some()),
         Operation::Search(search) => match search {
             &Search::RowidEq { .. } | Search::Seek { index: None, .. } => (None, false),
             Search::Seek {
@@ -850,7 +1087,7 @@ fn emit_update_insns(
     };
 
     let beg = program.alloc_registers(
-        unsafe { &*table_ref }.table.columns().len()
+        target_table.table.columns().len()
             + if is_virtual {
                 2 // two args before the relevant columns for VUpdate
             } else {
@@ -858,12 +1095,13 @@ fn emit_update_insns(
             },
     );
     program.emit_insn(Insn::RowId {
-        cursor_id: temp_cursor_id.unwrap_or(cursor_id),
+        cursor_id: iteration_cursor_id,
         dest: beg,
     });
 
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
-    let rowid_alias_index = unsafe { &*table_ref }
+    let rowid_alias_index = target_table
+        .table
         .columns()
         .iter()
         .position(|c| c.is_rowid_alias);
@@ -885,15 +1123,18 @@ fn emit_update_insns(
         None
     };
 
-    let check_rowid_not_exists_label = if has_user_provided_rowid {
+    let not_exists_check_required =
+        has_user_provided_rowid || iteration_cursor_id != target_table_cursor_id;
+
+    let check_rowid_not_exists_label = if not_exists_check_required {
         Some(program.allocate_label())
     } else {
         None
     };
 
-    if has_user_provided_rowid {
+    if not_exists_check_required {
         program.emit_insn(Insn::NotExists {
-            cursor: cursor_id,
+            cursor: target_table_cursor_id,
             rowid_reg: beg,
             target_pc: check_rowid_not_exists_label.unwrap(),
         });
@@ -920,7 +1161,7 @@ fn emit_update_insns(
             decrement_by: 1,
         });
     }
-    let col_len = unsafe { &*table_ref }.columns().len();
+    let col_len = target_table.table.columns().len();
 
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
@@ -932,7 +1173,7 @@ fn emit_update_insns(
     } else {
         None
     };
-    let table_name = unsafe { &*table_ref }.table.get_name();
+    let table_name = target_table.table.get_name();
 
     let start = if is_virtual { beg + 2 } else { beg + 1 };
 
@@ -951,7 +1192,7 @@ fn emit_update_insns(
             });
         }
     }
-    for (idx, table_column) in unsafe { &*table_ref }.columns().iter().enumerate() {
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         let target_reg = start + idx;
         if let Some((col_idx, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
             // Skip if this is the sentinel value
@@ -1034,7 +1275,7 @@ fn emit_update_insns(
                 program.emit_null(target_reg, None);
             } else if is_virtual {
                 program.emit_insn(Insn::VColumn {
-                    cursor_id,
+                    cursor_id: target_table_cursor_id,
                     column: idx,
                     dest: target_reg,
                 });
@@ -1048,7 +1289,7 @@ fn emit_update_insns(
                             None
                         }
                     })
-                    .unwrap_or(&cursor_id);
+                    .unwrap_or(&target_table_cursor_id);
                 program.emit_column_or_rowid(
                     cursor_id,
                     column_idx_in_index.unwrap_or(idx),
@@ -1063,6 +1304,60 @@ fn emit_update_insns(
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
                 program.mark_last_insn_constant();
+            }
+        }
+    }
+
+    if connection.foreign_keys_enabled() {
+        let rowid_new_reg = rowid_set_clause_reg.unwrap_or(beg);
+        if let Some(table_btree) = target_table.table.btree() {
+            stabilize_new_row_for_fk(
+                program,
+                &table_btree,
+                &plan.set_clauses,
+                target_table_cursor_id,
+                start,
+                rowid_new_reg,
+            )?;
+            if t_ctx.resolver.schema.has_child_fks(table_name) {
+                // Child-side checks:
+                // this ensures updated row still satisfies child FKs that point OUT from this table
+                emit_fk_child_update_counters(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    table_name,
+                    target_table_cursor_id,
+                    start,
+                    rowid_new_reg,
+                    &plan
+                        .set_clauses
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .collect::<HashSet<_>>(),
+                )?;
+            }
+            // Parent-side checks:
+            // We only need to do work if the referenced key (the parent key) might change.
+            // we detect that by comparing OLD vs NEW primary key representation
+            // then run parent FK checks only when it actually changes.
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
+                emit_parent_key_change_checks(
+                    program,
+                    &t_ctx.resolver,
+                    &table_btree,
+                    plan.indexes_to_update.iter(),
+                    target_table_cursor_id,
+                    beg,
+                    start,
+                    rowid_new_reg,
+                    rowid_set_clause_reg,
+                    &plan.set_clauses,
+                )?;
             }
         }
     }
@@ -1098,7 +1393,7 @@ fn emit_update_insns(
             // to refer to the new values, which are already loaded into registers starting at `start`.
             rewrite_where_for_update_registers(
                 &mut new_where,
-                unsafe { &*table_ref }.columns(),
+                target_table.table.columns(),
                 start,
                 rowid_set_clause_reg.unwrap_or(beg),
             )?;
@@ -1140,13 +1435,13 @@ fn emit_update_insns(
         let delete_start_reg = program.alloc_registers(num_regs);
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
             program.emit_column_or_rowid(
-                cursor_id,
+                target_table_cursor_id,
                 column_index.pos_in_table,
                 delete_start_reg + reg_offset,
             );
         }
         program.emit_insn(Insn::RowId {
-            cursor_id,
+            cursor_id: target_table_cursor_id,
             dest: delete_start_reg + num_regs - 1,
         });
         program.emit_insn(Insn::IdxDelete {
@@ -1178,7 +1473,8 @@ fn emit_update_insns(
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
         for (i, col) in index.columns.iter().enumerate() {
-            let col_in_table = unsafe { &*table_ref }
+            let col_in_table = target_table
+                .table
                 .columns()
                 .get(col.pos_in_table)
                 .expect("column index out of bounds");
@@ -1213,7 +1509,7 @@ fn emit_update_insns(
                 .columns
                 .iter()
                 .map(|ic| {
-                    unsafe { &*table_ref }.columns()[ic.pos_in_table]
+                    target_table.table.columns()[ic.pos_in_table]
                         .affinity()
                         .aff_mask()
                 })
@@ -1283,7 +1579,7 @@ fn emit_update_insns(
         }
     }
 
-    if let Some(btree_table) = unsafe { &*table_ref }.btree() {
+    if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
@@ -1306,7 +1602,7 @@ fn emit_update_insns(
             });
 
             program.emit_insn(Insn::NotExists {
-                cursor: cursor_id,
+                cursor: target_table_cursor_id,
                 rowid_reg: target_reg,
                 target_pc: record_label,
             });
@@ -1314,7 +1610,8 @@ fn emit_update_insns(
             let description = if let Some(idx) = rowid_alias_index {
                 String::from(table_name)
                     + "."
-                    + unsafe { &*table_ref }
+                    + target_table
+                        .table
                         .columns()
                         .get(idx)
                         .unwrap()
@@ -1335,7 +1632,8 @@ fn emit_update_insns(
 
         let record_reg = program.alloc_register();
 
-        let affinity_str = unsafe { &*table_ref }
+        let affinity_str = target_table
+            .table
             .columns()
             .iter()
             .map(|col| col.affinity().aff_mask())
@@ -1349,9 +1647,9 @@ fn emit_update_insns(
             affinity_str: Some(affinity_str),
         });
 
-        if has_user_provided_rowid {
+        if not_exists_check_required {
             program.emit_insn(Insn::NotExists {
-                cursor: cursor_id,
+                cursor: target_table_cursor_id,
                 rowid_reg: beg,
                 target_pc: check_rowid_not_exists_label.unwrap(),
             });
@@ -1365,7 +1663,7 @@ fn emit_update_insns(
             let cdc_rowid_before_reg = program.alloc_register();
             if has_user_provided_rowid {
                 program.emit_insn(Insn::RowId {
-                    cursor_id,
+                    cursor_id: target_table_cursor_id,
                     dest: cdc_rowid_before_reg,
                 });
                 Some(cdc_rowid_before_reg)
@@ -1380,8 +1678,8 @@ fn emit_update_insns(
         let cdc_before_reg = if program.capture_data_changes_mode().has_before() {
             Some(emit_cdc_full_record(
                 program,
-                unsafe { &*table_ref }.table.columns(),
-                cursor_id,
+                target_table.table.columns(),
+                target_table_cursor_id,
                 cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
             ))
         } else {
@@ -1391,25 +1689,26 @@ fn emit_update_insns(
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
         // and later insert the updated record
-        if has_user_provided_rowid {
+        if not_exists_check_required {
             program.emit_insn(Insn::Delete {
-                cursor_id,
+                cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
+                is_part_of_update: true,
             });
         }
 
         program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
+            cursor: target_table_cursor_id,
             key_reg: rowid_set_clause_reg.unwrap_or(beg),
             record_reg,
-            flag: if has_user_provided_rowid {
+            flag: if not_exists_check_required {
                 // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
                 // so to insert a new user-provided rowid, we need to seek to the correct place.
                 InsertFlags::new().require_seek().update_rowid_change()
             } else {
                 InsertFlags::new()
             },
-            table_name: unsafe { &*table_ref }.identifier.clone(),
+            table_name: target_table.identifier.clone(),
         });
 
         // Emit RETURNING results if specified
@@ -1429,7 +1728,7 @@ fn emit_update_insns(
         let cdc_after_reg = if program.capture_data_changes_mode().has_after() {
             Some(emit_cdc_patch_record(
                 program,
-                &unsafe { &*table_ref }.table,
+                &target_table.table,
                 start,
                 record_reg,
                 cdc_rowid_after_reg,
@@ -1483,7 +1782,14 @@ fn emit_update_insns(
                 emit_cdc_insns(
                     program,
                     &t_ctx.resolver,
-                    OperationMode::UPDATE,
+                    OperationMode::UPDATE(if plan.ephemeral_plan.is_some() {
+                        UpdateRowSource::PrebuiltEphemeralTable {
+                            ephemeral_table_cursor_id: iteration_cursor_id,
+                            target_table: target_table.clone(),
+                        }
+                    } else {
+                        UpdateRowSource::Normal
+                    }),
                     cdc_cursor_id,
                     cdc_rowid_before_reg,
                     cdc_before_reg,
@@ -1493,10 +1799,10 @@ fn emit_update_insns(
                 )?;
             }
         }
-    } else if unsafe { &*table_ref }.virtual_table().is_some() {
+    } else if target_table.virtual_table().is_some() {
         let arg_count = col_len + 2;
         program.emit_insn(Insn::VUpdate {
-            cursor_id,
+            cursor_id: target_table_cursor_id,
             arg_count,
             start_reg: beg,
             conflict_action: 0u16,
@@ -1651,7 +1957,7 @@ pub fn emit_cdc_insns(
 
     let change_type = match operation_mode {
         OperationMode::INSERT => 1,
-        OperationMode::UPDATE | OperationMode::SELECT => 0,
+        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0,
         OperationMode::DELETE => -1,
     };
     program.emit_int(change_type, turso_cdc_registers + 2);
@@ -1732,62 +2038,82 @@ fn init_limit(
     t_ctx: &mut TranslateCtx,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
-) {
+) -> Result<()> {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));
     }
     let Some(limit_ctx) = &t_ctx.limit_ctx else {
-        return;
+        return Ok(());
     };
 
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
-            if let Some(value) = try_fold_expr_to_i64(expr) {
-                program.emit_insn(Insn::Integer {
-                    value,
-                    dest: limit_ctx.reg_limit,
-                });
-            } else {
-                let r = limit_ctx.reg_limit;
-                program.add_comment(program.offset(), "OFFSET expr");
-                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
-                program.emit_insn(Insn::MustBeInt { reg: r });
+            match expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::Integer {
+                            value,
+                            dest: limit_ctx.reg_limit,
+                        });
+                    } else {
+                        program.emit_insn(Insn::Real {
+                            value: n.parse::<f64>().unwrap(),
+                            dest: limit_ctx.reg_limit,
+                        });
+                        program.add_comment(program.offset(), "LIMIT counter");
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: limit_ctx.reg_limit,
+                        });
+                    }
+                }
+                _ => {
+                    let r = limit_ctx.reg_limit;
+
+                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
+                    program.emit_insn(Insn::MustBeInt { reg: r });
+                }
             }
         }
     }
 
     if t_ctx.reg_offset.is_none() {
         if let Some(expr) = offset {
-            if let Some(value) = try_fold_expr_to_i64(expr) {
-                if value != 0 {
-                    let reg = program.alloc_register();
-                    t_ctx.reg_offset = Some(reg);
-                    program.emit_insn(Insn::Integer { value, dest: reg });
-                    let combined_reg = program.alloc_register();
-                    t_ctx.reg_limit_offset_sum = Some(combined_reg);
-                    program.emit_insn(Insn::OffsetLimit {
-                        limit_reg: limit_ctx.reg_limit,
-                        offset_reg: reg,
-                        combined_reg,
-                    });
+            let offset_reg = program.alloc_register();
+            t_ctx.reg_offset = Some(offset_reg);
+            match expr.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) => {
+                    if let Ok(value) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer {
+                            value,
+                            dest: offset_reg,
+                        });
+                    } else {
+                        let value = n.parse::<f64>()?;
+                        program.emit_insn(Insn::Real {
+                            value,
+                            dest: limit_ctx.reg_limit,
+                        });
+                        program.emit_insn(Insn::MustBeInt {
+                            reg: limit_ctx.reg_limit,
+                        });
+                    }
                 }
-            } else {
-                let reg = program.alloc_register();
-                t_ctx.reg_offset = Some(reg);
-                let r = reg;
-
-                program.add_comment(program.offset(), "OFFSET expr");
-                _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
-                program.emit_insn(Insn::MustBeInt { reg: r });
-
-                let combined_reg = program.alloc_register();
-                t_ctx.reg_limit_offset_sum = Some(combined_reg);
-                program.emit_insn(Insn::OffsetLimit {
-                    limit_reg: limit_ctx.reg_limit,
-                    offset_reg: reg,
-                    combined_reg,
-                });
+                _ => {
+                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver);
+                }
             }
+            program.add_comment(program.offset(), "OFFSET counter");
+            program.emit_insn(Insn::MustBeInt { reg: offset_reg });
+
+            let combined_reg = program.alloc_register();
+            t_ctx.reg_limit_offset_sum = Some(combined_reg);
+            program.add_comment(program.offset(), "OFFSET + LIMIT");
+            program.emit_insn(Insn::OffsetLimit {
+                limit_reg: limit_ctx.reg_limit,
+                offset_reg,
+                combined_reg,
+            });
         }
     }
 
@@ -1800,6 +2126,8 @@ fn init_limit(
         target_pc: main_loop_end,
         jump_if_null: false,
     });
+
+    Ok(())
 }
 
 /// We have `Expr`s which have *not* had column references bound to them,

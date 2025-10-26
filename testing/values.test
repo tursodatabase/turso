@@ -48,3 +48,16 @@ do_execsql_test_skip_lines_on_specific_db 1 {:memory:} values-double-quotes-subq
     .dbconfig dqs_dml on
     SELECT * FROM (VALUES ("subquery_string"));
 } {subquery_string}
+
+# regression test for: https://github.com/tursodatabase/turso/issues/2158
+do_execsql_test_on_specific_db {:memory:} values-between {
+    CREATE TABLE t0 (c0);
+    INSERT INTO t0 VALUES ((0 BETWEEN 0 AND 0)), (0);
+    SELECT * FROM t0;
+} {1
+0}
+
+do_execsql_test_in_memory_any_error values-illegal-column-ref {
+  CREATE TABLE t0 (c0);
+  INSERT INTO t0 VALUES (c0);
+}

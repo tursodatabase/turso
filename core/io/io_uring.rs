@@ -1,7 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
-use crate::io::clock::{Clock, Instant};
+use crate::io::clock::{Clock, DefaultClock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, CompletionError, LimboError, Result};
 use parking_lot::Mutex;
@@ -697,11 +697,7 @@ impl IO for UringIO {
 
 impl Clock for UringIO {
     fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+        DefaultClock.now()
     }
 }
 
@@ -709,14 +705,16 @@ impl Clock for UringIO {
 /// use the callback pointer as the user_data for the operation as is
 /// common practice for io_uring to prevent more indirection
 fn get_key(c: Completion) -> u64 {
-    Arc::into_raw(c.inner.clone()) as u64
+    Arc::into_raw(c.get_inner().clone()) as u64
 }
 
 #[inline(always)]
 /// convert the user_data back to an Completion pointer
 fn completion_from_key(key: u64) -> Completion {
     let c_inner = unsafe { Arc::from_raw(key as *const CompletionInner) };
-    Completion { inner: c_inner }
+    Completion {
+        inner: Some(c_inner),
+    }
 }
 
 pub struct UringFile {

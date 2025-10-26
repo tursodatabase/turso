@@ -4,7 +4,10 @@ use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, 
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
-    translate::collate::get_collseq_from_expr,
+    translate::{
+        collate::get_collseq_from_expr, emitter::UpdateRowSource,
+        optimizer::constraints::SeekRangeConstraint,
+    },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -440,7 +443,10 @@ pub struct UpdatePlan {
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
-    // If the table's rowid alias is used, gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // If the UPDATE modifies any column that is present in the key of the btree used to iterate over the table (either the table itself or an index),
+    // gather all the target rowids into an ephemeral table, and then use that table as the single JoinedTable for the actual UPDATE loop.
+    // This ensures the keys of the btree used to iterate cannot be changed during the UPDATE loop itself, ensuring all the intended rows actually get
+    // updated and none are skipped.
     pub ephemeral_plan: Option<SelectPlan>,
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
@@ -583,6 +589,11 @@ pub struct TableReferences {
 }
 
 impl TableReferences {
+    /// The maximum number of tables that can be joined together in a query.
+    /// This limit is arbitrary, although we currently use a u128 to represent the [crate::translate::planner::TableMask],
+    /// which can represent up to 128 tables.
+    /// Even at 63 tables we currently cannot handle the optimization performantly, hence the arbitrary cap.
+    pub const MAX_JOINED_TABLES: usize = 63;
     pub fn new(
         joined_tables: Vec<JoinedTable>,
         outer_query_refs: Vec<OuterQueryReference>,
@@ -606,6 +617,11 @@ impl TableReferences {
     /// Add a new [JoinedTable] to the query plan.
     pub fn add_joined_table(&mut self, joined_table: JoinedTable) {
         self.joined_tables.push(joined_table);
+    }
+
+    /// Add a new [OuterQueryReference] to the query plan.
+    pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
+        self.outer_query_refs.push(outer_query_reference);
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -752,33 +768,25 @@ impl TableReferences {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[repr(transparent)]
-pub struct ColumnUsedMask(u128);
+pub struct ColumnUsedMask(roaring::RoaringBitmap);
 
 impl ColumnUsedMask {
     pub fn set(&mut self, index: usize) {
-        assert!(
-            index < 128,
-            "ColumnUsedMask only supports up to 128 columns"
-        );
-        self.0 |= 1 << index;
+        self.0.insert(index as u32);
     }
 
     pub fn get(&self, index: usize) -> bool {
-        assert!(
-            index < 128,
-            "ColumnUsedMask only supports up to 128 columns"
-        );
-        self.0 & (1 << index) != 0
+        self.0.contains(index as u32)
     }
 
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
-        self.0 & other.0 == other.0
+        other.0.is_subset(&self.0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0 == 0
+        self.0.is_empty()
     }
 }
 
@@ -905,10 +913,28 @@ impl JoinedTable {
             Table::BTree(btree) => {
                 let use_covering_index = self.utilizes_covering_index();
                 let index_is_ephemeral = index.is_some_and(|index| index.ephemeral);
-                let table_not_required =
-                    OperationMode::SELECT == mode && use_covering_index && !index_is_ephemeral;
+                let table_not_required = matches!(mode, OperationMode::SELECT)
+                    && use_covering_index
+                    && !index_is_ephemeral;
                 let table_cursor_id = if table_not_required {
                     None
+                } else if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                    target_table,
+                    ..
+                }) = &mode
+                {
+                    // The cursor for the ephemeral table was already allocated earlier. Let's allocate one for the target table,
+                    // in case it wasn't already allocated when populating the ephemeral table.
+                    Some(program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(target_table.internal_id),
+                        match &target_table.table {
+                            Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
+                            Table::Virtual(virtual_table) => {
+                                CursorType::VirtualTable(virtual_table.clone())
+                            }
+                            _ => unreachable!("target table must be a btree or virtual table"),
+                        },
+                    ))
                 } else {
                     // Check if this is a materialized view
                     let cursor_type =
@@ -922,6 +948,7 @@ impl JoinedTable {
                             .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
                     )
                 };
+
                 let index_cursor_id = index.map(|index| {
                     program.alloc_cursor_id_keyed(
                         CursorKey::index(self.internal_id, index.clone()),
@@ -946,9 +973,19 @@ impl JoinedTable {
     pub fn resolve_cursors(
         &self,
         program: &mut ProgramBuilder,
+        mode: OperationMode,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
-        let table_cursor_id = program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id));
+        let table_cursor_id =
+            if let OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                target_table,
+                ..
+            }) = &mode
+            {
+                program.resolve_cursor_id_safe(&CursorKey::table(target_table.internal_id))
+            } else {
+                program.resolve_cursor_id_safe(&CursorKey::table(self.internal_id))
+            };
         let index_cursor_id = index.map(|index| {
             program.resolve_cursor_id(&CursorKey::index(self.internal_id, index.clone()))
         });
@@ -1004,54 +1041,91 @@ impl JoinedTable {
 /// A definition of a rowid/index search.
 ///
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
-/// [TerminationKey] is the condition that is used to terminate the search after a seek.
+/// [SeekKey] also used to represent range scan termination condition.
 #[derive(Debug, Clone)]
 pub struct SeekDef {
-    /// The key to use when seeking and when terminating the scan that follows the seek.
+    /// Common prefix of the key which is shared between start/end fields
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
     ///
-    /// The key is [(1, ASC), (30, DESC)]
-    pub key: Vec<(ast::Expr, SortOrder)>,
+    /// Then, prefix=[(eq=1, ASC)], start=Some((ge, Expr(30))), end=Some((gt, Sentinel))
+    pub prefix: Vec<SeekRangeConstraint>,
     /// The condition to use when seeking. See [SeekKey] for more details.
-    pub seek: Option<SeekKey>,
-    /// The condition to use when terminating the scan that follows the seek. See [TerminationKey] for more details.
-    pub termination: Option<TerminationKey>,
+    pub start: SeekKey,
+    /// The condition to use when terminating the scan that follows the seek. See [SeekKey] for more details.
+    pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+}
+
+pub struct SeekDefKeyIterator<'a> {
+    seek_def: &'a SeekDef,
+    seek_key: &'a SeekKey,
+    pos: usize,
+}
+
+impl<'a> Iterator for SeekDefKeyIterator<'a> {
+    type Item = SeekKeyComponent<&'a ast::Expr>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = if self.pos < self.seek_def.prefix.len() {
+            Some(SeekKeyComponent::Expr(
+                &self.seek_def.prefix[self.pos].eq.as_ref().unwrap().1,
+            ))
+        } else if self.pos == self.seek_def.prefix.len() {
+            match &self.seek_key.last_component {
+                SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::None => None,
+            }
+        } else {
+            None
+        };
+        self.pos += 1;
+        result
+    }
+}
+
+impl SeekDef {
+    /// returns amount of values in the given seek key
+    /// - so, for SELECT * FROM t WHERE x = 10 AND y = 20 AND y >= 30 there will be 3 values (10, 20, 30)
+    pub fn size(&self, key: &SeekKey) -> usize {
+        self.prefix.len()
+            + match key.last_component {
+                SeekKeyComponent::Expr(_) => 1,
+                SeekKeyComponent::None => 0,
+            }
+    }
+    /// iterate over value expressions in the given seek key
+    pub fn iter<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a> {
+        SeekDefKeyIterator {
+            seek_def: self,
+            seek_key: key,
+            pos: 0,
+        }
+    }
+}
+
+/// [SeekKeyComponent] enum represents optional last_component of the [SeekKey]
+///
+/// This component represented by separate enum instead of Option<E> because before there were third Sentinel value
+/// For now - we don't need this and it's enough to just either use some user-provided expression or omit last component of the key completely
+/// But as separate enum is almost never a harm - I decided to keep it here.
+///
+/// This enum accepts generic argument E in order to use both SeekKeyComponent<ast::Expr> and SeekKeyComponent<&ast::Expr>
+#[derive(Debug, Clone)]
+pub enum SeekKeyComponent<E> {
+    Expr(E),
+    None,
 }
 
 /// A condition to use when seeking.
 #[derive(Debug, Clone)]
 pub struct SeekKey {
-    /// How many columns from [SeekDef::key] are used in seeking.
-    pub len: usize,
-    /// Whether to NULL pad the last column of the seek key to match the length of [SeekDef::key].
-    /// The reason it is done is that sometimes our full index key is not used in seeking,
-    /// but we want to find the lowest value that matches the non-null prefix of the key.
-    /// For example, given:
-    /// - CREATE INDEX i ON t (x, y)
-    /// - SELECT * FROM t WHERE x = 1 AND y < 30
-    ///
-    /// We want to seek to the first row where x = 1, and then iterate forwards.
-    /// In this case, the seek key is GT(1, NULL) since NULL is always LT in index key comparisons.
-    /// We can't use just GT(1) because in index key comparisons, only the given number of columns are compared,
-    /// so this means any index keys with (x=1) will compare equal, e.g. (x=1, y=usize::MAX) will compare equal to the seek key (x:1)
-    pub null_pad: bool,
-    /// The comparison operator to use when seeking.
-    pub op: SeekOp,
-}
+    /// Complete key must be constructed from common [SeekDef::prefix] and optional last_component
+    pub last_component: SeekKeyComponent<ast::Expr>,
 
-#[derive(Debug, Clone)]
-/// A condition to use when terminating the scan that follows a seek.
-pub struct TerminationKey {
-    /// How many columns from [SeekDef::key] are used in terminating the scan that follows the seek.
-    pub len: usize,
-    /// Whether to NULL pad the last column of the termination key to match the length of [SeekDef::key].
-    /// See [SeekKey::null_pad].
-    pub null_pad: bool,
-    /// The comparison operator to use when terminating the scan that follows the seek.
+    /// The comparison operator to use when seeking.
     pub op: SeekOp,
 }
 
@@ -1223,4 +1297,128 @@ pub struct WindowFunction {
     pub func: AggFunc,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_chacha::{
+        rand_core::{RngCore, SeedableRng},
+        ChaCha8Rng,
+    };
+
+    #[test]
+    fn test_column_used_mask_empty() {
+        let mask = ColumnUsedMask::default();
+        assert!(mask.is_empty());
+
+        let mut mask2 = ColumnUsedMask::default();
+        mask2.set(0);
+        assert!(!mask2.is_empty());
+    }
+
+    #[test]
+    fn test_column_used_mask_set_and_get() {
+        let mut mask = ColumnUsedMask::default();
+
+        let max_columns = 10000;
+        let mut set_indices = Vec::new();
+        let mut rng = ChaCha8Rng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+
+        for i in 0..max_columns {
+            if rng.next_u32() % 3 == 0 {
+                set_indices.push(i);
+                mask.set(i);
+            }
+        }
+
+        // Verify set bits are present
+        for &i in &set_indices {
+            assert!(mask.get(i), "Expected bit {i} to be set");
+        }
+
+        // Verify unset bits are not present
+        for i in 0..max_columns {
+            if !set_indices.contains(&i) {
+                assert!(!mask.get(i), "Expected bit {i} to not be set");
+            }
+        }
+    }
+
+    #[test]
+    fn test_column_used_mask_subset_relationship() {
+        let mut full_mask = ColumnUsedMask::default();
+        let mut subset_mask = ColumnUsedMask::default();
+
+        let max_columns = 5000;
+        let mut rng = ChaCha8Rng::seed_from_u64(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+
+        // Create a pattern where subset has fewer bits
+        for i in 0..max_columns {
+            if rng.next_u32() % 5 == 0 {
+                full_mask.set(i);
+                if i % 2 == 0 {
+                    subset_mask.set(i);
+                }
+            }
+        }
+
+        // full_mask contains all bits of subset_mask
+        assert!(full_mask.contains_all_set_bits_of(&subset_mask));
+
+        // subset_mask does not contain all bits of full_mask
+        assert!(!subset_mask.contains_all_set_bits_of(&full_mask));
+
+        // A mask contains itself
+        assert!(full_mask.contains_all_set_bits_of(&full_mask));
+        assert!(subset_mask.contains_all_set_bits_of(&subset_mask));
+    }
+
+    #[test]
+    fn test_column_used_mask_empty_subset() {
+        let mut mask = ColumnUsedMask::default();
+        for i in (0..1000).step_by(7) {
+            mask.set(i);
+        }
+
+        let empty_mask = ColumnUsedMask::default();
+
+        // Empty mask is subset of everything
+        assert!(mask.contains_all_set_bits_of(&empty_mask));
+        assert!(empty_mask.contains_all_set_bits_of(&empty_mask));
+    }
+
+    #[test]
+    fn test_column_used_mask_sparse_indices() {
+        let mut sparse_mask = ColumnUsedMask::default();
+
+        // Test with very sparse, large indices
+        let sparse_indices = vec![0, 137, 1042, 5389, 10000, 50000, 100000, 500000, 1000000];
+
+        for &idx in &sparse_indices {
+            sparse_mask.set(idx);
+        }
+
+        for &idx in &sparse_indices {
+            assert!(sparse_mask.get(idx), "Expected bit {idx} to be set");
+        }
+
+        // Check some indices that shouldn't be set
+        let unset_indices = vec![1, 100, 1000, 5000, 25000, 75000, 250000, 750000];
+        for &idx in &unset_indices {
+            assert!(!sparse_mask.get(idx), "Expected bit {idx} to not be set");
+        }
+
+        assert!(!sparse_mask.is_empty());
+    }
 }

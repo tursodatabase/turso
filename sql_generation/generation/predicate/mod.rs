@@ -21,7 +21,7 @@ struct CompoundPredicate(Predicate);
 struct SimplePredicate(Predicate);
 
 impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for SimplePredicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, row, predicate_value): (&T, A, bool),
@@ -46,7 +46,7 @@ impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for Sim
 }
 
 impl<T: TableContext> ArbitraryFrom<(&T, bool)> for CompoundPredicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, predicate_value): (&T, bool),
@@ -56,14 +56,18 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for CompoundPredicate {
 }
 
 impl<T: TableContext> ArbitraryFrom<&T> for Predicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(rng: &mut R, context: &C, table: &T) -> Self {
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+        rng: &mut R,
+        context: &C,
+        table: &T,
+    ) -> Self {
         let predicate_value = rng.random_bool(0.5);
         Predicate::arbitrary_from(rng, context, (table, predicate_value)).parens()
     }
 }
 
 impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, predicate_value): (&T, bool),
@@ -72,18 +76,8 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
     }
 }
 
-impl ArbitraryFrom<(&str, &SimValue)> for Predicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
-        rng: &mut R,
-        context: &C,
-        (column_name, value): (&str, &SimValue),
-    ) -> Self {
-        Predicate::from_column_binary(rng, context, column_name, value)
-    }
-}
-
 impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
-    fn arbitrary_from<R: Rng, C: GenerationContext>(
+    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (t, row): (&Table, &Vec<SimValue>),

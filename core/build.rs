@@ -1,7 +1,13 @@
-use std::fs;
 use std::path::PathBuf;
+use std::{env, fs};
 
 fn main() {
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+
+    if profile == "debug" {
+        println!("cargo::rerun-if-changed=build.rs");
+    }
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let built_file = out_dir.join("built.rs");
 

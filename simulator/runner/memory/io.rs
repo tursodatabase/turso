@@ -1,9 +1,9 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
 
@@ -121,7 +121,7 @@ pub struct MemorySimIO {
     timeouts: CallbackQueue,
     pub files: RefCell<IndexMap<Fd, Arc<MemorySimFile>>>,
     pub rng: RefCell<ChaCha8Rng>,
-    pub nr_run_once_faults: Cell<usize>,
+    #[expect(dead_code)]
     pub page_size: usize,
     seed: u64,
     latency_probability: u8,
@@ -141,13 +141,11 @@ impl MemorySimIO {
     ) -> Self {
         let files = RefCell::new(IndexMap::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
-        let nr_run_once_faults = Cell::new(0);
         Self {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             timeouts: Arc::new(Mutex::new(Vec::new())),
             files,
             rng,
-            nr_run_once_faults,
             page_size,
             seed,
             latency_probability,
@@ -191,6 +189,17 @@ impl SimIO for MemorySimIO {
         for file in self.files.borrow().values() {
             file.closed.set(true);
         }
+    }
+
+    fn persist_files(&self) -> anyhow::Result<()> {
+        let files = self.files.borrow();
+        for (file_path, file) in files.iter() {
+            if file_path.ends_with(".db") || file_path.ends_with("wal") || file_path.ends_with("lg")
+            {
+                std::fs::write(file_path, &*file.buffer.borrow())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -260,7 +269,11 @@ impl IO for MemorySimIO {
     }
 
     fn generate_random_number(&self) -> i64 {
-        self.rng.borrow_mut().next_u64() as i64
+        self.rng.borrow_mut().random()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.rng.borrow_mut().fill_bytes(dest);
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {

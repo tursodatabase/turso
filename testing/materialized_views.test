@@ -3,6 +3,35 @@
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
+# Test that INSERT with reused primary keys maintains correct aggregate counts
+# When a row is deleted and a new row is inserted with the same primary key
+# but different group value, all groups should maintain correct counts
+do_execsql_test_on_specific_db {:memory:} matview-insert-reused-key-maintains-all-groups {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'A'), (2, 'B');
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT val, COUNT(*) as cnt
+        FROM t
+        GROUP BY val;
+
+    -- Initial state: A=1, B=1
+    SELECT * FROM v ORDER BY val;
+
+    -- Delete id=1 (which has 'A')
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM v ORDER BY val;
+
+    -- Insert id=1 with different value 'C'
+    -- This should NOT affect group 'B'
+    INSERT INTO t VALUES (1, 'C');
+    SELECT * FROM v ORDER BY val;
+} {A|1
+B|1
+B|1
+B|1
+C|1}
+
 do_execsql_test_on_specific_db {:memory:} matview-basic-filter-population {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES
@@ -37,9 +66,9 @@ do_execsql_test_on_specific_db {:memory:} matview-aggregation-population {
         GROUP BY day;
 
     SELECT * FROM daily_totals ORDER BY day;
-} {1|7|2
-2|2|2
-3|4|2}
+} {1|7.0|2
+2|2.0|2
+3|4.0|2}
 
 do_execsql_test_on_specific_db {:memory:} matview-filter-with-groupby {
     CREATE TABLE t(a INTEGER, b INTEGER);
@@ -52,9 +81,9 @@ do_execsql_test_on_specific_db {:memory:} matview-filter-with-groupby {
         GROUP BY b;
 
     SELECT * FROM v ORDER BY yourb;
-} {3|3|1
-6|6|1
-7|7|1}
+} {3|3.0|1
+6|6.0|1
+7|7.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-insert-maintenance {
     CREATE TABLE t(a INTEGER, b INTEGER);
@@ -72,12 +101,12 @@ do_execsql_test_on_specific_db {:memory:} matview-insert-maintenance {
 
     INSERT INTO t VALUES (1,1), (2,2);
     SELECT * FROM v ORDER BY b;
-} {3|3|1
-6|6|1
-3|7|2
-6|11|2
-3|7|2
-6|11|2}
+} {3|3.0|1
+6|6.0|1
+3|7.0|2
+6|11.0|2
+3|7.0|2
+6|11.0|2}
 
 do_execsql_test_on_specific_db {:memory:} matview-delete-maintenance {
     CREATE TABLE items(id INTEGER, category TEXT, amount INTEGER);
@@ -100,11 +129,11 @@ do_execsql_test_on_specific_db {:memory:} matview-delete-maintenance {
 
     DELETE FROM items WHERE category = 'B';
     SELECT * FROM category_sums ORDER BY category;
-} {A|90|3
-B|60|2
-A|60|2
-B|60|2
-A|60|2}
+} {A|90.0|3
+B|60.0|2
+A|60.0|2
+B|60.0|2
+A|60.0|2}
 
 do_execsql_test_on_specific_db {:memory:} matview-update-maintenance {
     CREATE TABLE records(id INTEGER, value INTEGER, status INTEGER);
@@ -126,12 +155,12 @@ do_execsql_test_on_specific_db {:memory:} matview-update-maintenance {
 
     UPDATE records SET status = 2 WHERE id = 3;
     SELECT * FROM status_totals ORDER BY status;
-} {1|400|2
-2|600|2
-1|450|2
-2|600|2
-1|150|1
-2|900|3}
+} {1|400.0|2
+2|600.0|2
+1|450.0|2
+2|600.0|2
+1|150.0|1
+2|900.0|3}
 
 do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-basic {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
@@ -214,12 +243,12 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-with-aggre
 
     DELETE FROM t WHERE a = 3;
     SELECT * FROM v ORDER BY b;
-} {10|500|1
-20|700|2
-10|600|2
-20|700|2
-10|600|2
-20|400|1}
+} {10|500.0|1
+20|700.0|2
+10|600.0|2
+20|700.0|2
+10|600.0|2
+20|400.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-complex-filter-aggregation {
     CREATE TABLE transactions(
@@ -253,17 +282,17 @@ do_execsql_test_on_specific_db {:memory:} matview-complex-filter-aggregation {
 
     DELETE FROM transactions WHERE id = 3;
     SELECT * FROM account_deposits ORDER BY account;
-} {100|70|2
-200|100|1
-300|60|1
-100|95|3
-200|100|1
-300|60|1
-100|125|3
-200|100|1
-300|60|1
-100|125|3
-300|60|1}
+} {100|70.0|2
+200|100.0|1
+300|60.0|1
+100|95.0|3
+200|100.0|1
+300|60.0|1
+100|125.0|3
+200|100.0|1
+300|60.0|1
+100|125.0|3
+300|60.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-sum-count-only {
     CREATE TABLE data(id INTEGER, value INTEGER, category INTEGER);
@@ -288,12 +317,12 @@ do_execsql_test_on_specific_db {:memory:} matview-sum-count-only {
 
     UPDATE data SET value = 35 WHERE id = 3;
     SELECT * FROM category_stats ORDER BY category;
-} {1|80|3
-2|70|2
-1|85|4
-2|70|2
-1|85|4
-2|75|2}
+} {1|80.0|3
+2|70.0|2
+1|85.0|4
+2|70.0|2
+1|85.0|4
+2|75.0|2}
 
 do_execsql_test_on_specific_db {:memory:} matview-empty-table-population {
     CREATE TABLE t(a INTEGER, b INTEGER);
@@ -308,8 +337,8 @@ do_execsql_test_on_specific_db {:memory:} matview-empty-table-population {
     INSERT INTO t VALUES (1, 3), (2, 7), (3, 9);
     SELECT * FROM v ORDER BY b;
 } {0
-7|2|1
-9|3|1}
+7|2.0|1
+9|3.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-all-rows-filtered {
     CREATE TABLE t(a INTEGER, b INTEGER);
@@ -357,17 +386,17 @@ do_execsql_test_on_specific_db {:memory:} matview-mixed-operations-sequence {
 
     INSERT INTO orders VALUES (4, 300, 150);
     SELECT * FROM customer_totals ORDER BY customer_id;
-} {100|50|1
-200|75|1
-100|75|2
-200|75|1
-100|75|2
-200|100|1
-100|25|1
-200|100|1
-100|25|1
-200|100|1
-300|150|1}
+} {100|50.0|1
+200|75.0|1
+100|75.0|2
+200|75.0|1
+100|75.0|2
+200|100.0|1
+100|25.0|1
+200|100.0|1
+100|25.0|1
+200|100.0|1
+300|150.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-projections {
     CREATE TABLE t(a,b);
@@ -473,13 +502,13 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-aggregation {
     ROLLBACK;
 
     SELECT * FROM product_totals ORDER BY product_id;
-} {1|300|2
-2|400|2
-1|350|3
-2|400|2
-3|300|1
-1|300|2
-2|400|2}
+} {1|300.0|2
+2|400.0|2
+1|350.0|3
+2|400.0|2
+3|300.0|1
+1|300.0|2
+2|400.0|2}
 
 do_execsql_test_on_specific_db {:memory:} matview-rollback-mixed-operations {
     CREATE TABLE orders(id INTEGER PRIMARY KEY, customer INTEGER, amount INTEGER);
@@ -500,12 +529,12 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-mixed-operations {
     ROLLBACK;
 
     SELECT * FROM customer_totals ORDER BY customer;
-} {100|75|2
-200|75|1
-100|150|2
-200|150|1
-100|75|2
-200|75|1}
+} {100|75.0|2
+200|75.0|1
+100|150.0|2
+200|150.0|1
+100|75.0|2
+200|75.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-rollback-filtered-aggregation {
     CREATE TABLE transactions(id INTEGER, account INTEGER, amount INTEGER, type TEXT);
@@ -531,11 +560,11 @@ do_execsql_test_on_specific_db {:memory:} matview-rollback-filtered-aggregation 
     ROLLBACK;
 
     SELECT * FROM deposits ORDER BY account;
-} {100|50|1
-200|100|1
-100|135|2
-100|50|1
-200|100|1}
+} {100|50.0|1
+200|100.0|1
+100|135.0|2
+100|50.0|1
+200|100.0|1}
 
 do_execsql_test_on_specific_db {:memory:} matview-rollback-empty-view {
     CREATE TABLE t(a INTEGER, b INTEGER);
@@ -590,8 +619,8 @@ do_execsql_test_on_specific_db {:memory:} matview-join-with-aggregation {
         GROUP BY u.name;
 
     SELECT * FROM user_totals ORDER BY name;
-} {Alice|250
-Bob|250}
+} {Alice|250.0
+Bob|250.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-three-way-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
@@ -632,9 +661,9 @@ do_execsql_test_on_specific_db {:memory:} matview-three-way-join-with-aggregatio
         GROUP BY c.name, p.name;
 
     SELECT * FROM sales_totals ORDER BY customer_name, product_name;
-} {Alice|Gadget|3|60
-Alice|Widget|9|90
-Bob|Widget|2|20}
+} {Alice|Gadget|3.0|60.0
+Alice|Widget|9.0|90.0
+Bob|Widget|2.0|20.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-join-incremental-insert {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
@@ -835,9 +864,9 @@ do_execsql_test_on_specific_db {:memory:} matview-aggregation-before-join {
         GROUP BY c.id, c.name, c.tier;
 
     SELECT * FROM customer_order_summary ORDER BY total_quantity DESC;
-} {Bob|Silver|2|7
-Alice|Gold|3|6
-Charlie|Bronze|1|1}
+} {Bob|Silver|2|7.0
+Alice|Gold|3|6.0
+Charlie|Bronze|1|1.0}
 
 # Test 4: Join with aggregation AFTER the join
 do_execsql_test_on_specific_db {:memory:} matview-aggregation-after-join {
@@ -865,8 +894,8 @@ do_execsql_test_on_specific_db {:memory:} matview-aggregation-after-join {
         GROUP BY st.region;
 
     SELECT * FROM regional_sales ORDER BY total_revenue DESC;
-} {North|38|3150
-South|18|1500}
+} {North|38.0|3150.0
+South|18.0|1500.0}
 
 # Test 5: Modifying both tables in same transaction
 do_execsql_test_on_specific_db {:memory:} matview-join-both-tables-modified {
@@ -1194,8 +1223,8 @@ do_execsql_test_on_specific_db {:memory:} matview-union-with-aggregation {
         FROM q2_sales;
 
     SELECT * FROM half_year_summary ORDER BY quarter;
-} {Q1|68|16450
-Q2|105|21750}
+} {Q1|68.0|16450.0
+Q2|105.0|21750.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-union-with-join {
     CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, type TEXT);
@@ -1625,8 +1654,8 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-scalar-function {
         GROUP BY substr(orderdate, 1, 4);
 
     SELECT * FROM yearly_totals ORDER BY 1;
-} {2020|250
-2021|200}
+} {2020|250.0
+2021|200.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-groupby-alias {
     CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER);
@@ -1640,8 +1669,8 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-alias {
         GROUP BY year;
 
     SELECT * FROM yearly_totals ORDER BY year;
-} {2020|250
-2021|200}
+} {2020|250.0
+2021|200.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-groupby-position {
     CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER, nation TEXT);
@@ -1655,8 +1684,8 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-position {
         GROUP BY 1, 2;
 
     SELECT * FROM national_yearly ORDER BY nation, year;
-} {UK|2021|200
-USA|2020|250}
+} {UK|2021|200.0
+USA|2020|250.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-groupby-scalar-incremental {
     CREATE TABLE orders(id INTEGER, orderdate TEXT, amount INTEGER);
@@ -1672,10 +1701,10 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-scalar-incremental {
     SELECT * FROM yearly_totals;
     INSERT INTO orders VALUES (3, '2021-03-20', 200);
     SELECT * FROM yearly_totals ORDER BY year;
-} {2020|100
-2020|250
-2020|250
-2021|200}
+} {2020|100.0
+2020|250.0
+2020|250.0
+2021|200.0}
 
 do_execsql_test_on_specific_db {:memory:} matview-groupby-join-position {
     CREATE TABLE t(a INTEGER);
@@ -1691,3 +1720,777 @@ do_execsql_test_on_specific_db {:memory:} matview-groupby-join-position {
     SELECT * FROM tujoingroup ORDER BY a;
 } {1|2
 2|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-basic {
+    CREATE TABLE items(id INTEGER, category TEXT, value INTEGER);
+    INSERT INTO items VALUES
+        (1, 'A', 100),
+        (2, 'B', 200),
+        (3, 'A', 100),  -- duplicate of row 1
+        (4, 'C', 300),
+        (5, 'B', 200),  -- duplicate of row 2
+        (6, 'A', 100);  -- another duplicate of row 1
+
+    CREATE MATERIALIZED VIEW distinct_items AS
+        SELECT DISTINCT category, value FROM items;
+
+    SELECT category, value FROM distinct_items ORDER BY category, value;
+} {A|100
+B|200
+C|300}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-single-column {
+    CREATE TABLE numbers(n INTEGER);
+    INSERT INTO numbers VALUES (1), (2), (1), (3), (2), (1), (4), (3);
+
+    CREATE MATERIALIZED VIEW distinct_numbers AS
+        SELECT DISTINCT n FROM numbers;
+
+    SELECT n FROM distinct_numbers ORDER BY n;
+} {1
+2
+3
+4}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert {
+    CREATE TABLE data(x INTEGER, y TEXT);
+    CREATE MATERIALIZED VIEW distinct_data AS
+        SELECT DISTINCT x, y FROM data;
+
+    -- Initial data
+    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (1, 'alpha');
+    SELECT x, y FROM distinct_data ORDER BY x, y;
+} {1|alpha
+2|beta}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert-new {
+    CREATE TABLE data(x INTEGER, y TEXT);
+    CREATE MATERIALIZED VIEW distinct_data AS
+        SELECT DISTINCT x, y FROM data;
+
+    -- Initial data
+    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (1, 'alpha');
+
+    -- Add new distinct values
+    INSERT INTO data VALUES (3, 'gamma'), (4, 'delta');
+    SELECT x, y FROM distinct_data ORDER BY x, y;
+} {1|alpha
+2|beta
+3|gamma
+4|delta}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-insert-dups {
+    CREATE TABLE data(x INTEGER, y TEXT);
+    CREATE MATERIALIZED VIEW distinct_data AS
+        SELECT DISTINCT x, y FROM data;
+
+    -- Initial data with some new values
+    INSERT INTO data VALUES
+        (1, 'alpha'), (2, 'beta'), (1, 'alpha'),
+        (3, 'gamma'), (4, 'delta');
+
+    -- Add duplicates of existing values
+    INSERT INTO data VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+    -- Should be same as before the duplicate insert
+    SELECT x, y FROM distinct_data ORDER BY x, y;
+} {1|alpha
+2|beta
+3|gamma
+4|delta}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
+    INSERT INTO records VALUES
+        (1, 'X', 1),
+        (2, 'Y', 2),
+        (3, 'X', 1),  -- duplicate values
+        (4, 'Z', 3),
+        (5, 'Y', 2);  -- duplicate values
+
+    CREATE MATERIALIZED VIEW distinct_records AS
+        SELECT DISTINCT category, status FROM records;
+
+    SELECT category, status FROM distinct_records ORDER BY category, status;
+} {X|1
+Y|2
+Z|3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete-partial {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
+    INSERT INTO records VALUES
+        (1, 'X', 1),
+        (2, 'Y', 2),
+        (3, 'X', 1),  -- duplicate values
+        (4, 'Z', 3),
+        (5, 'Y', 2);  -- duplicate values
+
+    CREATE MATERIALIZED VIEW distinct_records AS
+        SELECT DISTINCT category, status FROM records;
+
+    -- Delete one instance of duplicate
+    DELETE FROM records WHERE id = 3;
+    -- X|1 should still exist (one instance remains)
+    SELECT category, status FROM distinct_records ORDER BY category, status;
+} {X|1
+Y|2
+Z|3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-delete-all {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
+    INSERT INTO records VALUES
+        (1, 'X', 1),
+        (2, 'Y', 2),
+        (4, 'Z', 3),
+        (5, 'Y', 2);  -- duplicate values
+
+    CREATE MATERIALIZED VIEW distinct_records AS
+        SELECT DISTINCT category, status FROM records;
+
+    -- Delete all instances of X|1
+    DELETE FROM records WHERE category = 'X' AND status = 1;
+    -- Now X|1 should be gone
+    SELECT category, status FROM distinct_records ORDER BY category, status;
+} {Y|2
+Z|3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-incremental-reappear {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, category TEXT, status INTEGER);
+    INSERT INTO records VALUES
+        (2, 'Y', 2),
+        (4, 'Z', 3),
+        (5, 'Y', 2);  -- duplicate values
+
+    CREATE MATERIALIZED VIEW distinct_records AS
+        SELECT DISTINCT category, status FROM records;
+
+    -- Re-add a previously deleted value
+    INSERT INTO records VALUES (6, 'X', 1);
+    -- X|1 should appear
+    SELECT category, status FROM distinct_records ORDER BY category, status;
+} {X|1
+Y|2
+Z|3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-null-handling {
+    CREATE TABLE nullable(a INTEGER, b TEXT);
+    INSERT INTO nullable VALUES
+        (1, 'one'),
+        (2, NULL),
+        (NULL, 'three'),
+        (1, 'one'),     -- duplicate
+        (2, NULL),      -- duplicate with NULL
+        (NULL, 'three'), -- duplicate with NULL
+        (NULL, NULL);
+
+    CREATE MATERIALIZED VIEW distinct_nullable AS
+        SELECT DISTINCT a, b FROM nullable;
+
+    -- NULLs should be handled as distinct values
+    SELECT a, b FROM distinct_nullable ORDER BY a, b;
+} {|
+|three
+1|one
+2|}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-empty-table {
+    CREATE TABLE empty_source(x INTEGER, y TEXT);
+    CREATE MATERIALIZED VIEW distinct_empty AS
+        SELECT DISTINCT x, y FROM empty_source;
+
+    -- Should be empty
+    SELECT COUNT(*) FROM distinct_empty;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-empty-then-insert {
+    CREATE TABLE empty_source(x INTEGER, y TEXT);
+    CREATE MATERIALIZED VIEW distinct_empty AS
+        SELECT DISTINCT x, y FROM empty_source;
+
+    -- Insert into previously empty table
+    INSERT INTO empty_source VALUES (1, 'first'), (1, 'first'), (2, 'second');
+    SELECT x, y FROM distinct_empty ORDER BY x, y;
+} {1|first
+2|second}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-multi-column-types {
+    CREATE TABLE mixed_types(i INTEGER, t TEXT, r REAL, b BLOB);
+    INSERT INTO mixed_types VALUES
+        (1, 'text1', 1.5, x'0102'),
+        (2, 'text2', 2.5, x'0304'),
+        (1, 'text1', 1.5, x'0102'),  -- exact duplicate
+        (3, 'text3', 3.5, x'0506'),
+        (2, 'text2', 2.5, x'0304');  -- another duplicate
+
+    CREATE MATERIALIZED VIEW distinct_mixed AS
+        SELECT DISTINCT i, t FROM mixed_types;
+
+    SELECT i, t FROM distinct_mixed ORDER BY i, t;
+} {1|text1
+2|text2
+3|text3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation {
+    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
+
+    CREATE MATERIALIZED VIEW distinct_vals AS
+        SELECT DISTINCT val FROM updatable;
+
+    SELECT val FROM distinct_vals ORDER BY val;
+} {new
+old}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation-change {
+    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO updatable VALUES (1, 'old'), (2, 'old'), (3, 'new');
+
+    CREATE MATERIALIZED VIEW distinct_vals AS
+        SELECT DISTINCT val FROM updatable;
+
+    -- Simulate update by delete + insert
+    DELETE FROM updatable WHERE id = 1;
+    INSERT INTO updatable VALUES (1, 'new');
+
+    -- Now we have two 'new' and one 'old', but distinct shows each once
+    SELECT val FROM distinct_vals ORDER BY val;
+} {new
+old}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-update-simulation-all-same {
+    CREATE TABLE updatable(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO updatable VALUES (1, 'new'), (2, 'old'), (3, 'new');
+
+    CREATE MATERIALIZED VIEW distinct_vals AS
+        SELECT DISTINCT val FROM updatable;
+
+    -- Change the 'old' to 'new'
+    DELETE FROM updatable WHERE id = 2;
+    INSERT INTO updatable VALUES (2, 'new');
+
+    -- Now all three rows have 'new', old should disappear
+    SELECT val FROM distinct_vals ORDER BY val;
+} {new}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates {
+    CREATE TABLE many_dups(x INTEGER);
+
+    -- Insert many duplicates
+    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
+    INSERT INTO many_dups VALUES (2), (2), (2), (2), (2);
+    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
+
+    CREATE MATERIALIZED VIEW distinct_many AS
+        SELECT DISTINCT x FROM many_dups;
+
+    SELECT x FROM distinct_many ORDER BY x;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates-remove {
+    CREATE TABLE many_dups(x INTEGER);
+
+    -- Insert many duplicates
+    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
+    INSERT INTO many_dups VALUES (2), (2), (2), (2), (2);
+    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
+
+    CREATE MATERIALIZED VIEW distinct_many AS
+        SELECT DISTINCT x FROM many_dups;
+
+    -- Remove some instances of value 2 (rowids 7,8,9,10 keeping rowid 6)
+    DELETE FROM many_dups WHERE rowid IN (7, 8, 9, 10);
+
+    -- Should still have all three values
+    SELECT x FROM distinct_many ORDER BY x;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} matview-distinct-large-duplicates-remove-all {
+    CREATE TABLE many_dups(x INTEGER);
+
+    -- Insert many duplicates but only one instance of 2
+    INSERT INTO many_dups VALUES (1), (1), (1), (1), (1);
+    INSERT INTO many_dups VALUES (2);
+    INSERT INTO many_dups VALUES (3), (3), (3), (3), (3);
+
+    CREATE MATERIALIZED VIEW distinct_many AS
+        SELECT DISTINCT x FROM many_dups;
+
+    -- Remove ALL instances of value 2
+    DELETE FROM many_dups WHERE x = 2;
+
+    -- Now 2 should be gone
+    SELECT x FROM distinct_many ORDER BY x;
+} {1
+3}
+
+# COUNT(DISTINCT) tests for materialized views
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-basic {
+    CREATE TABLE sales(region TEXT, product TEXT, amount INTEGER);
+    INSERT INTO sales VALUES
+        ('North', 'A', 100),
+        ('North', 'A', 100),  -- Duplicate
+        ('North', 'B', 200),
+        ('South', 'A', 150),
+        ('South', 'A', 150);  -- Duplicate
+
+    CREATE MATERIALIZED VIEW sales_summary AS
+        SELECT region, COUNT(DISTINCT product) as unique_products
+        FROM sales GROUP BY region;
+
+    SELECT * FROM sales_summary ORDER BY region;
+} {North|2
+South|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-nulls {
+    -- COUNT(DISTINCT) should ignore NULL values per SQL standard
+    CREATE TABLE data(grp INTEGER, val INTEGER);
+    INSERT INTO data VALUES
+        (1, 10),
+        (1, 20),
+        (1, NULL),
+        (1, NULL),  -- Multiple NULLs
+        (2, 30),
+        (2, NULL);
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT grp, COUNT(DISTINCT val) as cnt FROM data GROUP BY grp;
+
+    SELECT * FROM v ORDER BY grp;
+
+    -- Add more NULLs (should not affect count)
+    INSERT INTO data VALUES (1, NULL), (2, NULL);
+    SELECT * FROM v ORDER BY grp;
+
+    -- Add a non-NULL value
+    INSERT INTO data VALUES (2, 40);
+    SELECT * FROM v ORDER BY grp;
+} {1|2
+2|1
+1|2
+2|1
+1|2
+2|2}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-empty-groups {
+    CREATE TABLE items(category TEXT, item TEXT);
+    INSERT INTO items VALUES
+        ('A', 'x'),
+        ('A', 'y'),
+        ('B', 'z');
+
+    CREATE MATERIALIZED VIEW category_counts AS
+        SELECT category, COUNT(DISTINCT item) as unique_items
+        FROM items GROUP BY category;
+
+    SELECT * FROM category_counts ORDER BY category;
+
+    -- Delete all items from category B
+    DELETE FROM items WHERE category = 'B';
+    SELECT * FROM category_counts ORDER BY category;
+
+    -- Re-add items to B
+    INSERT INTO items VALUES ('B', 'w'), ('B', 'w');  -- Same value twice
+    SELECT * FROM category_counts ORDER BY category;
+} {A|2
+B|1
+A|2
+A|2
+B|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-updates {
+    CREATE TABLE records(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO records VALUES
+        (1, 'X', 100),
+        (2, 'X', 200),
+        (3, 'Y', 100),
+        (4, 'Y', 100);  -- Duplicate
+
+    CREATE MATERIALIZED VIEW grp_summary AS
+        SELECT grp, COUNT(DISTINCT val) as distinct_vals
+        FROM records GROUP BY grp;
+
+    SELECT * FROM grp_summary ORDER BY grp;
+
+    -- Update that changes group membership
+    UPDATE records SET grp = 'Y' WHERE id = 1;
+    SELECT * FROM grp_summary ORDER BY grp;
+
+    -- Update that changes value within group
+    UPDATE records SET val = 300 WHERE id = 3;
+    SELECT * FROM grp_summary ORDER BY grp;
+} {X|2
+Y|1
+X|1
+Y|1
+X|1
+Y|2}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-large-scale {
+    CREATE TABLE events(user_id INTEGER, event_type INTEGER);
+
+    -- Insert many events with varying duplication
+    INSERT INTO events VALUES
+        (1, 1), (1, 1), (1, 1), (1, 2), (1, 3),  -- User 1: 3 distinct
+        (2, 1), (2, 2), (2, 2), (2, 2),           -- User 2: 2 distinct
+        (3, 4), (3, 4), (3, 4), (3, 4), (3, 4);   -- User 3: 1 distinct
+
+    CREATE MATERIALIZED VIEW user_stats AS
+        SELECT user_id, COUNT(DISTINCT event_type) as unique_events
+        FROM events GROUP BY user_id;
+
+    SELECT * FROM user_stats ORDER BY user_id;
+
+    -- Mass deletion
+    DELETE FROM events WHERE event_type = 2;
+    SELECT * FROM user_stats ORDER BY user_id;
+
+    -- Mass insertion with duplicates
+    INSERT INTO events VALUES
+        (1, 5), (1, 5), (1, 6),
+        (2, 5), (2, 6), (2, 7);
+    SELECT * FROM user_stats ORDER BY user_id;
+} {1|3
+2|2
+3|1
+1|2
+2|1
+3|1
+1|4
+2|4
+3|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-group-by-empty-start {
+    CREATE TABLE measurements(device TEXT, reading INTEGER);
+
+    CREATE MATERIALIZED VIEW device_summary AS
+        SELECT device, COUNT(DISTINCT reading) as unique_readings
+        FROM measurements GROUP BY device;
+
+    -- Start with empty table (no groups yet)
+    SELECT COUNT(*) FROM device_summary;
+
+    -- Add first group
+    INSERT INTO measurements VALUES ('D1', 100), ('D1', 100);
+    SELECT * FROM device_summary;
+
+    -- Add second group with distinct values
+    INSERT INTO measurements VALUES ('D2', 200), ('D2', 300);
+    SELECT * FROM device_summary ORDER BY device;
+
+    -- Remove all data
+    DELETE FROM measurements;
+    SELECT COUNT(*) FROM device_summary;
+} {0
+D1|1
+D1|1
+D2|2
+0}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-single-row-groups {
+    CREATE TABLE singles(k TEXT PRIMARY KEY, v INTEGER);
+    INSERT INTO singles VALUES
+        ('a', 1),
+        ('b', 2),
+        ('c', 3);
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT k, COUNT(DISTINCT v) as cnt FROM singles GROUP BY k;
+
+    SELECT * FROM v ORDER BY k;
+
+    -- Each group has exactly one row, so COUNT(DISTINCT v) = 1
+    UPDATE singles SET v = 999 WHERE k = 'b';
+    SELECT * FROM v ORDER BY k;
+
+    DELETE FROM singles WHERE k = 'c';
+    SELECT * FROM v ORDER BY k;
+} {a|1
+b|1
+c|1
+a|1
+b|1
+c|1
+a|1
+b|1}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-transactions {
+    CREATE TABLE txn_data(grp TEXT, val INTEGER);
+    INSERT INTO txn_data VALUES ('A', 1), ('A', 2);
+
+    CREATE MATERIALIZED VIEW txn_view AS
+        SELECT grp, COUNT(DISTINCT val) as cnt FROM txn_data GROUP BY grp;
+
+    SELECT * FROM txn_view;
+
+    -- Transaction that adds duplicates (should not change count)
+    BEGIN;
+    INSERT INTO txn_data VALUES ('A', 1), ('A', 2);
+    SELECT * FROM txn_view;
+    COMMIT;
+
+    SELECT * FROM txn_view;
+
+    -- Transaction that adds new distinct value then rolls back
+    BEGIN;
+    INSERT INTO txn_data VALUES ('A', 3);
+    SELECT * FROM txn_view;
+    ROLLBACK;
+
+    SELECT * FROM txn_view;
+} {A|2
+A|2
+A|2
+A|3
+A|2}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-text-values {
+    CREATE TABLE strings(category INTEGER, str TEXT);
+    INSERT INTO strings VALUES
+        (1, 'hello'),
+        (1, 'world'),
+        (1, 'hello'),  -- Duplicate
+        (2, 'foo'),
+        (2, 'bar'),
+        (2, 'bar');    -- Duplicate
+
+    CREATE MATERIALIZED VIEW str_counts AS
+        SELECT category, COUNT(DISTINCT str) as unique_strings
+        FROM strings GROUP BY category;
+
+    SELECT * FROM str_counts ORDER BY category;
+
+    -- Case sensitivity test
+    INSERT INTO strings VALUES (1, 'HELLO'), (2, 'FOO');
+    SELECT * FROM str_counts ORDER BY category;
+
+    -- Empty strings
+    INSERT INTO strings VALUES (1, ''), (1, ''), (2, '');
+    SELECT * FROM str_counts ORDER BY category;
+} {1|2
+2|2
+1|3
+2|3
+1|4
+2|4}
+
+do_execsql_test_on_specific_db {:memory:} matview-sum-distinct {
+    CREATE TABLE sales(region TEXT, amount INTEGER);
+    INSERT INTO sales VALUES
+        ('North', 100),
+        ('North', 200),
+        ('North', 100),  -- Duplicate
+        ('North', NULL),
+        ('South', 300),
+        ('South', 300),  -- Duplicate
+        ('South', 400);
+
+    CREATE MATERIALIZED VIEW sales_summary AS
+        SELECT region, SUM(DISTINCT amount) as total_distinct
+        FROM sales GROUP BY region;
+
+    SELECT * FROM sales_summary ORDER BY region;
+
+    -- Add a duplicate value
+    INSERT INTO sales VALUES ('North', 200);
+    SELECT * FROM sales_summary ORDER BY region;
+
+    -- Add a new distinct value
+    INSERT INTO sales VALUES ('South', 500);
+    SELECT * FROM sales_summary ORDER BY region;
+} {North|300.0
+South|700.0
+North|300.0
+South|700.0
+North|300.0
+South|1200.0}
+
+do_execsql_test_on_specific_db {:memory:} matview-avg-distinct {
+    CREATE TABLE grades(student TEXT, score INTEGER);
+    INSERT INTO grades VALUES
+        ('Alice', 90),
+        ('Alice', 85),
+        ('Alice', 90),  -- Duplicate
+        ('Alice', NULL),
+        ('Bob', 75),
+        ('Bob', 80),
+        ('Bob', 75);  -- Duplicate
+
+    CREATE MATERIALIZED VIEW avg_grades AS
+        SELECT student, AVG(DISTINCT score) as avg_score
+        FROM grades GROUP BY student;
+
+    SELECT * FROM avg_grades ORDER BY student;
+
+    -- Add duplicate scores
+    INSERT INTO grades VALUES ('Alice', 85), ('Bob', 80);
+    SELECT * FROM avg_grades ORDER BY student;
+
+    -- Add new distinct score
+    INSERT INTO grades VALUES ('Alice', 95);
+    SELECT * FROM avg_grades ORDER BY student;
+} {Alice|87.5
+Bob|77.5
+Alice|87.5
+Bob|77.5
+Alice|90.0
+Bob|77.5}
+
+do_execsql_test_on_specific_db {:memory:} matview-min-distinct {
+    CREATE TABLE metrics(category TEXT, value INTEGER);
+    INSERT INTO metrics VALUES
+        ('A', 10),
+        ('A', 20),
+        ('A', 10),  -- Duplicate
+        ('A', 30),
+        ('A', NULL),
+        ('B', 5),
+        ('B', 15),
+        ('B', 5);  -- Duplicate
+
+    CREATE MATERIALIZED VIEW metric_min AS
+        SELECT category,
+               MIN(DISTINCT value) as min_val
+        FROM metrics GROUP BY category;
+
+    SELECT * FROM metric_min ORDER BY category;
+
+    -- Add values that don't change min
+    INSERT INTO metrics VALUES ('A', 15), ('B', 10);
+    SELECT * FROM metric_min ORDER BY category;
+
+    -- Add values that change min
+    INSERT INTO metrics VALUES ('A', 5), ('B', 3);
+    SELECT * FROM metric_min ORDER BY category;
+} {A|10
+B|5
+A|10
+B|5
+A|5
+B|3}
+
+do_execsql_test_on_specific_db {:memory:} matview-max-distinct {
+    CREATE TABLE metrics2(category TEXT, value INTEGER);
+    INSERT INTO metrics2 VALUES
+        ('A', 10),
+        ('A', 20),
+        ('A', 10),  -- Duplicate
+        ('A', 30),
+        ('A', NULL),
+        ('B', 5),
+        ('B', 15),
+        ('B', 5);  -- Duplicate
+
+    CREATE MATERIALIZED VIEW metric_max AS
+        SELECT category,
+               MAX(DISTINCT value) as max_val
+        FROM metrics2 GROUP BY category;
+
+    SELECT * FROM metric_max ORDER BY category;
+
+    -- Add values that don't change max
+    INSERT INTO metrics2 VALUES ('A', 15), ('B', 10);
+    SELECT * FROM metric_max ORDER BY category;
+
+    -- Add values that change max
+    INSERT INTO metrics2 VALUES ('A', 40), ('B', 20);
+    SELECT * FROM metric_max ORDER BY category;
+} {A|30
+B|15
+A|30
+B|15
+A|40
+B|20}
+
+do_execsql_test_on_specific_db {:memory:} matview-multiple-distinct-aggregates-with-groupby {
+    CREATE TABLE data(grp TEXT, x INTEGER, y INTEGER, z INTEGER);
+    INSERT INTO data VALUES
+        ('A', 1, 10, 100),
+        ('A', 2, 20, 200),
+        ('A', 1, 10, 300),  -- x,y duplicates
+        ('A', 3, 30, 100),  -- z duplicate
+        ('A', NULL, 40, 400),
+        ('B', 4, 50, 500),
+        ('B', 5, 50, 600),  -- y duplicate
+        ('B', 4, 60, 700),  -- x duplicate
+        ('B', 6, NULL, 500), -- z duplicate
+        ('B', NULL, 70, NULL);
+
+    CREATE MATERIALIZED VIEW multi_distinct AS
+        SELECT grp,
+               COUNT(DISTINCT x) as cnt_x,
+               SUM(DISTINCT y) as sum_y,
+               AVG(DISTINCT z) as avg_z
+        FROM data GROUP BY grp;
+
+    SELECT * FROM multi_distinct ORDER BY grp;
+
+    -- Add more data with duplicates
+    INSERT INTO data VALUES
+        ('A', 1, 20, 200),  -- Existing values
+        ('B', 7, 80, 800);  -- New values
+
+    SELECT * FROM multi_distinct ORDER BY grp;
+} {A|3|100.0|250.0
+B|3|180.0|600.0
+A|3|100.0|250.0
+B|4|260.0|650.0}
+
+do_execsql_test_on_specific_db {:memory:} matview-multiple-distinct-aggregates-no-groupby {
+    CREATE TABLE data2(x INTEGER, y INTEGER, z INTEGER);
+    INSERT INTO data2 VALUES
+        (1, 10, 100),
+        (2, 20, 200),
+        (1, 10, 300),  -- x,y duplicates
+        (3, 30, 100),  -- z duplicate
+        (NULL, 40, 400),
+        (4, 50, 500),
+        (5, 50, 600),  -- y duplicate
+        (4, 60, 700),  -- x duplicate
+        (6, NULL, 500), -- z duplicate
+        (NULL, 70, NULL);
+
+    CREATE MATERIALIZED VIEW multi_distinct_global AS
+        SELECT COUNT(DISTINCT x) as cnt_x,
+               SUM(DISTINCT y) as sum_y,
+               AVG(DISTINCT z) as avg_z
+        FROM data2;
+
+    SELECT * FROM multi_distinct_global;
+
+    -- Add more data
+    INSERT INTO data2 VALUES
+        (1, 20, 200),  -- Existing values
+        (7, 80, 800);  -- New values
+
+    SELECT * FROM multi_distinct_global;
+} {6|280.0|400.0
+7|360.0|450.0}
+
+do_execsql_test_on_specific_db {:memory:} matview-count-distinct-global-aggregate {
+    CREATE TABLE all_data(val INTEGER);
+    INSERT INTO all_data VALUES (1), (2), (1), (3), (2);
+
+    CREATE MATERIALIZED VIEW summary AS
+        SELECT COUNT(DISTINCT val) as total_distinct FROM all_data;
+
+    SELECT * FROM summary;
+
+    -- Add duplicates
+    INSERT INTO all_data VALUES (1), (2), (3);
+    SELECT * FROM summary;
+
+    -- Add new distinct values
+    INSERT INTO all_data VALUES (4), (5);
+    SELECT * FROM summary;
+
+    -- Delete all of one value
+    DELETE FROM all_data WHERE val = 3;
+    SELECT * FROM summary;
+} {3
+3
+5
+4}

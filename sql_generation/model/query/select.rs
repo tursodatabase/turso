@@ -243,28 +243,24 @@ impl FromClause {
             match join.join_type {
                 JoinType::Inner => {
                     // Implement inner join logic
-                    let join_rows = joined_table
-                        .rows
-                        .iter()
-                        .filter(|row| join.on.test(row, joined_table))
-                        .cloned()
-                        .collect::<Vec<_>>();
                     // take a cartesian product of the rows
                     let all_row_pairs = join_table
                         .rows
                         .clone()
                         .into_iter()
-                        .cartesian_product(join_rows.iter());
+                        .cartesian_product(joined_table.rows.iter());
 
+                    let mut new_rows = Vec::new();
                     for (row1, row2) in all_row_pairs {
                         let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
 
                         let is_in = join.on.test(&row, &join_table);
 
                         if is_in {
-                            join_table.rows.push(row);
+                            new_rows.push(row);
                         }
                     }
+                    join_table.rows = new_rows;
                 }
                 _ => todo!(),
             }

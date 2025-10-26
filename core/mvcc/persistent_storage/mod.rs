@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;
@@ -20,7 +21,7 @@ impl Storage {
 
 impl Storage {
     pub fn log_tx(&self, m: &LogRecord) -> Result<Completion> {
-        self.logical_log.write().unwrap().log_tx(m)
+        self.logical_log.write().log_tx(m)
     }
 
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
@@ -28,26 +29,27 @@ impl Storage {
     }
 
     pub fn sync(&self) -> Result<Completion> {
-        self.logical_log.write().unwrap().sync()
+        self.logical_log.write().sync()
     }
 
     pub fn truncate(&self) -> Result<Completion> {
-        self.logical_log.write().unwrap().truncate()
+        self.logical_log.write().truncate()
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
-        self.logical_log.write().unwrap().file.clone()
+        self.logical_log.write().file.clone()
     }
 
     pub fn should_checkpoint(&self) -> bool {
-        self.logical_log.read().unwrap().should_checkpoint()
+        self.logical_log.read().should_checkpoint()
     }
 
-    pub fn set_checkpoint_threshold(&self, threshold: u64) {
-        self.logical_log
-            .write()
-            .unwrap()
-            .set_checkpoint_threshold(threshold)
+    pub fn set_checkpoint_threshold(&self, threshold: i64) {
+        self.logical_log.write().set_checkpoint_threshold(threshold)
+    }
+
+    pub fn checkpoint_threshold(&self) -> i64 {
+        self.logical_log.read().checkpoint_threshold()
     }
 }
 

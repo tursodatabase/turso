@@ -5,6 +5,7 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
+use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
@@ -12,7 +13,7 @@ use crate::incremental::operator::{
     IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
 use crate::schema::Type;
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
@@ -300,6 +301,8 @@ pub enum DbspOperator {
     Input { name: String, schema: SchemaRef },
     /// Merge operator for combining streams (used in recursive CTEs and UNION)
     Merge { schema: SchemaRef },
+    /// Distinct operator - removes duplicates
+    Distinct { schema: SchemaRef },
 }
 
 /// Represents an expression in DBSP
@@ -328,6 +331,11 @@ pub struct DbspNode {
     /// The actual executable operator
     pub executable: Box<dyn IncrementalOperator>,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspNode {}
+unsafe impl Sync for DbspNode {}
 
 impl std::fmt::Debug for DbspNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -394,6 +402,11 @@ pub struct DbspCircuit {
     /// Root page for the DBSP state table's primary key index
     pub(super) internal_state_index_root: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for DbspCircuit {}
+unsafe impl Sync for DbspCircuit {}
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema
@@ -480,15 +493,10 @@ impl DbspCircuit {
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
             // Create temporary cursors for execute (non-commit) operations
-            let table_cursor = BTreeCursor::new_table(
-                None,
-                pager.clone(),
-                self.internal_state_root,
-                OPERATOR_COLUMNS,
-            );
+            let table_cursor =
+                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
             let index_def = create_dbsp_state_index(self.internal_state_index_root);
             let index_cursor = BTreeCursor::new_index(
-                None,
                 pager.clone(),
                 self.internal_state_index_root,
                 &index_def,
@@ -537,14 +545,12 @@ impl DbspCircuit {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
                     let state_table_cursor = BTreeCursor::new_table(
-                        None,
                         pager.clone(),
                         self.internal_state_root,
                         OPERATOR_COLUMNS,
                     );
                     let index_def = create_dbsp_state_index(self.internal_state_index_root);
                     let state_index_cursor = BTreeCursor::new_index(
-                        None,
                         pager.clone(),
                         self.internal_state_index_root,
                         &index_def,
@@ -575,7 +581,6 @@ impl DbspCircuit {
 
                     // Create view cursor when entering UpdateView state
                     let view_cursor = Box::new(BTreeCursor::new_table(
-                        None,
                         pager.clone(),
                         main_data_root,
                         num_columns,
@@ -605,7 +610,6 @@ impl DbspCircuit {
                         // due to btree cursor state machine limitations
                         if matches!(write_row_state, WriteRowView::GetRecord) {
                             *view_cursor = Box::new(BTreeCursor::new_table(
-                                None,
                                 pager.clone(),
                                 main_data_root,
                                 num_columns,
@@ -633,7 +637,6 @@ impl DbspCircuit {
                         let view_cursor = std::mem::replace(
                             view_cursor,
                             Box::new(BTreeCursor::new_table(
-                                None,
                                 pager.clone(),
                                 main_data_root,
                                 num_columns,
@@ -729,14 +732,12 @@ impl DbspCircuit {
 
                         // Create temporary cursors for the recursive call
                         let temp_table_cursor = BTreeCursor::new_table(
-                            None,
                             pager.clone(),
                             self.internal_state_root,
                             OPERATOR_COLUMNS,
                         );
                         let index_def = create_dbsp_state_index(self.internal_state_index_root);
                         let temp_index_cursor = BTreeCursor::new_index(
-                            None,
                             pager.clone(),
                             self.internal_state_index_root,
                             &index_def,
@@ -817,6 +818,13 @@ impl DbspCircuit {
                     writeln!(
                         f,
                         "{indent}Merge[{node_id}]: UNION/Recursive (schema: {} columns)",
+                        schema.columns.len()
+                    )?;
+                }
+                DbspOperator::Distinct { schema } => {
+                    writeln!(
+                        f,
+                        "{indent}Distinct[{node_id}]: (schema: {} columns)",
                         schema.columns.len()
                     )?;
                 }
@@ -1145,16 +1153,34 @@ impl DbspCompiler {
                     }
                 }
 
-                // Compile aggregate expressions
+                // Compile aggregate expressions (both DISTINCT and regular)
                 let mut aggregate_functions = Vec::new();
                 for expr in &agg.aggr_expr {
-                    if let LogicalExpr::AggregateFunction { fun, args, .. } = expr {
+                    if let LogicalExpr::AggregateFunction { fun, args, distinct } = expr {
                         use crate::function::AggFunc;
                         use crate::incremental::aggregate_operator::AggregateFunction;
 
                         match fun {
                             AggFunc::Count | AggFunc::Count0 => {
-                                aggregate_functions.push(AggregateFunction::Count);
+                                if *distinct {
+                                    // COUNT(DISTINCT col)
+                                    if args.is_empty() {
+                                        return Err(LimboError::ParseError("COUNT(DISTINCT) requires an argument".to_string()));
+                                    }
+                                    if let LogicalExpr::Column(col) = &args[0] {
+                                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                            .ok_or_else(|| LimboError::ParseError(
+                                                format!("COUNT(DISTINCT) column '{}' not found in input", col.name)
+                                            ))?;
+                                        aggregate_functions.push(AggregateFunction::CountDistinct(col_idx));
+                                    } else {
+                                        return Err(LimboError::ParseError(
+                                            "Only column references are supported in aggregate functions for incremental views".to_string()
+                                        ));
+                                    }
+                                } else {
+                                    aggregate_functions.push(AggregateFunction::Count);
+                                }
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
@@ -1166,7 +1192,11 @@ impl DbspCompiler {
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("SUM column '{}' not found in input", col.name)
                                         ))?;
-                                    aggregate_functions.push(AggregateFunction::Sum(col_idx));
+                                    if *distinct {
+                                        aggregate_functions.push(AggregateFunction::SumDistinct(col_idx));
+                                    } else {
+                                        aggregate_functions.push(AggregateFunction::Sum(col_idx));
+                                    }
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1182,7 +1212,11 @@ impl DbspCompiler {
                                         .ok_or_else(|| LimboError::ParseError(
                                             format!("AVG column '{}' not found in input", col.name)
                                         ))?;
-                                    aggregate_functions.push(AggregateFunction::Avg(col_idx));
+                                    if *distinct {
+                                        aggregate_functions.push(AggregateFunction::AvgDistinct(col_idx));
+                                    } else {
+                                        aggregate_functions.push(AggregateFunction::Avg(col_idx));
+                                    }
                                 } else {
                                     return Err(LimboError::ParseError(
                                         "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1366,14 +1400,48 @@ impl DbspCompiler {
                 // Handle UNION and UNION ALL
                 self.compile_union(union)
             }
+            LogicalPlan::Distinct(distinct) => {
+                // DISTINCT is implemented as GROUP BY all columns with a special aggregate
+                let input_id = self.compile_plan(&distinct.input)?;
+                let input_schema = distinct.input.schema();
+
+                // Create GROUP BY indices for all columns
+                let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
+
+                // Column names for the operator
+                let input_column_names: Vec<String> = input_schema.columns.iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+
+                // Create the aggregate operator with DISTINCT mode
+                let operator_id = self.circuit.next_id;
+                let executable: Box<dyn IncrementalOperator> = Box::new(
+                    AggregateOperator::new(
+                        operator_id,
+                        group_by,
+                        vec![], // Empty aggregates indicates plain DISTINCT
+                        input_column_names,
+                    ),
+                );
+
+                // Add the node to the circuit
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Distinct {
+                        schema: input_schema.clone(),
+                    },
+                    vec![input_id],
+                    executable,
+                );
+
+                Ok(node_id)
+            }
             _ => Err(LimboError::ParseError(
                 format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
                     match plan {
                         LogicalPlan::Sort(_) => "Sort",
                         LogicalPlan::Limit(_) => "Limit",
                         LogicalPlan::Union(_) => "Union",
-                        LogicalPlan::Distinct(_) => "Distinct",
-                        LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
                         LogicalPlan::Values(_) => "Values",
                         LogicalPlan::WithCTE(_) => "WithCTE",
                         LogicalPlan::CTERef(_) => "CTERef",
@@ -2149,6 +2217,31 @@ impl DbspCompiler {
                     ))
                 }
             }
+            LogicalExpr::IsNull { expr, negated } => {
+                // Extract column index from the inner expression
+                if let LogicalExpr::Column(col) = expr.as_ref() {
+                    let column_idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col.name)
+                        .ok_or_else(|| {
+                            LimboError::ParseError(format!(
+                                "Column '{}' not found in schema for IS NULL filter",
+                                col.name
+                            ))
+                        })?;
+
+                    if *negated {
+                        Ok(FilterPredicate::IsNotNull { column_idx })
+                    } else {
+                        Ok(FilterPredicate::IsNull { column_idx })
+                    }
+                } else {
+                    Err(LimboError::ParseError(
+                        "IS NULL/IS NOT NULL expects a column reference".to_string(),
+                    ))
+                }
+            }
             _ => Err(LimboError::ParseError(format!(
                 "Unsupported filter expression: {expr:?}"
             ))),
@@ -2220,8 +2313,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(users_table));
+            schema
+                .add_btree_table(Arc::new(users_table))
+                .expect("Test setup: failed to add users table");
 
             // Add products table for join tests
             let products_table = BTreeTable {
@@ -2273,8 +2369,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(products_table));
+            schema
+                .add_btree_table(Arc::new(products_table))
+                .expect("Test setup: failed to add products table");
 
             // Add orders table for join tests
             let orders_table = BTreeTable {
@@ -2338,8 +2437,11 @@ mod tests {
                 has_autoincrement: false,
                 is_strict: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(orders_table));
+            schema
+                .add_btree_table(Arc::new(orders_table))
+                .expect("Test setup: failed to add orders table");
 
             // Add customers table with id and name for testing column ambiguity
             let customers_table = BTreeTable {
@@ -2376,8 +2478,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(customers_table));
+            schema
+                .add_btree_table(Arc::new(customers_table))
+                .expect("Test setup: failed to add customers table");
 
             // Add purchases table (junction table for three-way join)
             let purchases_table = BTreeTable {
@@ -2438,8 +2543,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(purchases_table));
+            schema
+                .add_btree_table(Arc::new(purchases_table))
+                .expect("Test setup: failed to add purchases table");
 
             // Add vendors table with id, name, and price (ambiguous columns with customers)
             let vendors_table = BTreeTable {
@@ -2488,8 +2596,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(vendors_table));
+            schema
+                .add_btree_table(Arc::new(vendors_table))
+                .expect("Test setup: failed to add vendors table");
 
             let sales_table = BTreeTable {
                 name: "sales".to_string(),
@@ -2525,8 +2636,11 @@ mod tests {
                 is_strict: false,
                 has_autoincrement: false,
                 unique_sets: vec![],
+                foreign_keys: vec![],
             };
-            schema.add_btree_table(Arc::new(sales_table));
+            schema
+                .add_btree_table(Arc::new(sales_table))
+                .expect("Test setup: failed to add sales table");
 
             schema
         }};
@@ -2536,7 +2650,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         let _ = pager.io.block(|| pager.allocate_page1()).unwrap();
 
@@ -2710,14 +2824,15 @@ mod tests {
     // This reads the actual persisted data from the BTree
     #[cfg(test)]
     fn get_current_state(pager: Arc<Pager>, circuit: &DbspCircuit) -> Result<Delta> {
+        use crate::storage::btree::CursorTrait;
+
         let mut delta = Delta::new();
 
         let main_data_root = circuit.main_data_root;
         let num_columns = circuit.output_schema.columns.len() + 1;
 
         // Create a cursor to read the btree
-        let mut btree_cursor =
-            BTreeCursor::new_table(None, pager.clone(), main_data_root, num_columns);
+        let mut btree_cursor = BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
 
         // Rewind to the beginning
         pager.io.block(|| btree_cursor.rewind())?;
@@ -3266,11 +3381,12 @@ mod tests {
         assert_eq!(row.values.len(), 1);
 
         // The hex function converts the number to string first, then to hex
-        // 96 as string is "96", which in hex is "3936" (hex of ASCII '9' and '6')
+        // SUM now returns Float, so 96.0 as string is "96.0", which in hex is "39362E30"
+        // (hex of ASCII '9', '6', '.', '0')
         assert_eq!(
             row.values[0],
-            Value::Text("3936".to_string().into()),
-            "HEX(SUM(age + 2)) should return '3936' for sum of 96"
+            Value::Text("39362E30".to_string().into()),
+            "HEX(SUM(age + 2)) should return '39362E30' for sum of 96.0"
         );
 
         // Test incremental update: add a new user
@@ -3289,22 +3405,22 @@ mod tests {
 
         let result = test_execute(&mut circuit, input_data, pager.clone()).unwrap();
 
-        // Expected: new SUM(age + 2) = 96 + (40+2) = 138
-        // HEX(138) = hex of "138" = "313338"
+        // Expected: new SUM(age + 2) = 96.0 + (40+2) = 138.0
+        // HEX(138.0) = hex of "138.0" = "3133382E30"
         assert_eq!(result.changes.len(), 2);
 
-        // First change: remove old aggregate (96)
+        // First change: remove old aggregate (96.0)
         let (row, weight) = &result.changes[0];
         assert_eq!(*weight, -1);
-        assert_eq!(row.values[0], Value::Text("3936".to_string().into()));
+        assert_eq!(row.values[0], Value::Text("39362E30".to_string().into()));
 
-        // Second change: add new aggregate (138)
+        // Second change: add new aggregate (138.0)
         let (row, weight) = &result.changes[1];
         assert_eq!(*weight, 1);
         assert_eq!(
             row.values[0],
-            Value::Text("313338".to_string().into()),
-            "HEX(SUM(age + 2)) should return '313338' for sum of 138"
+            Value::Text("3133382E30".to_string().into()),
+            "HEX(SUM(age + 2)) should return '3133382E30' for sum of 138.0"
         );
     }
 
@@ -3352,8 +3468,8 @@ mod tests {
             .unwrap();
 
         // Expected results:
-        // Alice: SUM(25*2 + 35*2) = 50 + 70 = 120, HEX("120") = "313230"
-        // Bob: SUM(30*2) = 60, HEX("60") = "3630"
+        // Alice: SUM(25*2 + 35*2) = 50 + 70 = 120.0, HEX("120.0") = "3132302E30"
+        // Bob: SUM(30*2) = 60.0, HEX("60.0") = "36302E30"
         assert_eq!(result.changes.len(), 2);
 
         let results: HashMap<String, String> = result
@@ -3374,13 +3490,13 @@ mod tests {
 
         assert_eq!(
             results.get("Alice").unwrap(),
-            "313230",
-            "Alice's HEX(SUM(age * 2)) should be '313230' (120)"
+            "3132302E30",
+            "Alice's HEX(SUM(age * 2)) should be '3132302E30' (120.0)"
         );
         assert_eq!(
             results.get("Bob").unwrap(),
-            "3630",
-            "Bob's HEX(SUM(age * 2)) should be '3630' (60)"
+            "36302E30",
+            "Bob's HEX(SUM(age * 2)) should be '36302E30' (60.0)"
         );
     }
 
@@ -4697,12 +4813,12 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, i64> = HashMap::new();
+        let mut results_map: HashMap<String, f64> = HashMap::new();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total_quantity
 
-            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+            if let (Value::Text(name), Value::Float(total)) = (&row.values[0], &row.values[1]) {
                 results_map.insert(name.to_string(), *total);
             } else {
                 panic!("Unexpected value types in result");
@@ -4711,12 +4827,12 @@ mod tests {
 
         assert_eq!(
             results_map.get("Alice"),
-            Some(&10),
+            Some(&10.0),
             "Alice should have total quantity 10"
         );
         assert_eq!(
             results_map.get("Bob"),
-            Some(&7),
+            Some(&7.0),
             "Bob should have total quantity 7"
         );
     }
@@ -4813,24 +4929,24 @@ mod tests {
         );
 
         // Check the results
-        let mut results_map: HashMap<String, i64> = HashMap::new();
+        let mut results_map: HashMap<String, f64> = HashMap::new();
         for (row, weight) in result.changes {
             assert_eq!(weight, 1);
             assert_eq!(row.values.len(), 2); // name and total
 
-            if let (Value::Text(name), Value::Integer(total)) = (&row.values[0], &row.values[1]) {
+            if let (Value::Text(name), Value::Float(total)) = (&row.values[0], &row.values[1]) {
                 results_map.insert(name.to_string(), *total);
             }
         }
 
         assert_eq!(
             results_map.get("Alice"),
-            Some(&8),
+            Some(&8.0),
             "Alice should have total 8"
         );
         assert_eq!(
             results_map.get("Charlie"),
-            Some(&7),
+            Some(&7.0),
             "Charlie should have total 7"
         );
         assert_eq!(results_map.get("Bob"), None, "Bob should be filtered out");
@@ -4969,7 +5085,7 @@ mod tests {
             // Row should have name, product_name, and sum columns
             assert_eq!(row.values.len(), 3);
 
-            if let (Value::Text(name), Value::Text(product), Value::Integer(total)) =
+            if let (Value::Text(name), Value::Text(product), Value::Float(total)) =
                 (&row.values[0], &row.values[1], &row.values[2])
             {
                 let key = format!("{}-{}", name.as_ref(), product.as_ref());
@@ -4977,12 +5093,14 @@ mod tests {
 
                 match key.as_str() {
                     "Alice-Widget" => {
-                        assert_eq!(*total, 9, "Alice should have ordered 9 Widgets total")
+                        assert_eq!(*total, 9.0, "Alice should have ordered 9 Widgets total")
                     }
-                    "Alice-Gadget" => assert_eq!(*total, 3, "Alice should have ordered 3 Gadgets"),
-                    "Bob-Widget" => assert_eq!(*total, 7, "Bob should have ordered 7 Widgets"),
+                    "Alice-Gadget" => {
+                        assert_eq!(*total, 3.0, "Alice should have ordered 3 Gadgets")
+                    }
+                    "Bob-Widget" => assert_eq!(*total, 7.0, "Bob should have ordered 7 Widgets"),
                     "Bob-Doohickey" => {
-                        assert_eq!(*total, 2, "Bob should have ordered 2 Doohickeys")
+                        assert_eq!(*total, 2.0, "Bob should have ordered 2 Doohickeys")
                     }
                     _ => panic!("Unexpected result: {key}"),
                 }

@@ -112,6 +112,7 @@ pub struct InsertFlags(pub u8);
 impl InsertFlags {
     pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
+    pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -128,6 +129,11 @@ impl InsertFlags {
 
     pub fn update_rowid_change(mut self) -> Self {
         self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
+        self
+    }
+
+    pub fn is_ephemeral_table_insert(mut self) -> Self {
+        self.0 |= InsertFlags::EPHEMERAL_TABLE_INSERT;
         self
     }
 }
@@ -791,6 +797,8 @@ pub enum Insn {
     Delete {
         cursor_id: CursorID,
         table_name: String,
+        /// Whether the DELETE is part of an UPDATE statement. If so, it doesn't count towards the change counter.
+        is_part_of_update: bool,
     },
 
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
@@ -853,10 +861,12 @@ pub enum Insn {
         db: usize,
     },
 
+    /// Make a copy of register src..src+extra_amount into dst..dst+extra_amount.
     Copy {
         src_reg: usize,
         dst_reg: usize,
-        extra_amount: usize, // 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        /// 0 extra_amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
+        extra_amount: usize,
     },
 
     /// Allocate a new b-tree.
@@ -1169,6 +1179,20 @@ pub enum Insn {
         p2: Option<usize>, // P2: address of parent explain instruction
         detail: String,    // P4: detail text
     },
+    // Increment a "constraint counter" by P2 (P2 may be negative or positive).
+    // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
+    // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
+    FkCounter {
+        increment_value: isize,
+        deferred: bool,
+    },
+    // This opcode tests if a foreign key constraint-counter is currently zero. If so, jump to instruction P2. Otherwise, fall through to the next instruction.
+    // If P1 is non-zero, then the jump is taken if the database constraint-counter is zero (the one that counts deferred constraint violations).
+    // If P1 is zero, the jump is taken if the statement constraint-counter is zero (immediate foreign key constraint violations).
+    FkIfZero {
+        deferred: bool,
+        target_pc: BranchOffset,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1335,6 +1359,8 @@ impl InsnVariants {
             InsnVariants::MemMax => execute::op_mem_max,
             InsnVariants::Sequence => execute::op_sequence,
             InsnVariants::SequenceTest => execute::op_sequence_test,
+            InsnVariants::FkCounter => execute::op_fk_counter,
+            InsnVariants::FkIfZero => execute::op_fk_if_zero,
         }
     }
 }

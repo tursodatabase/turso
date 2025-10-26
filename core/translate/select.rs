@@ -4,7 +4,7 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
-use crate::translate::emitter::Resolver;
+use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
@@ -43,7 +43,7 @@ pub fn translate_select(
         query_destination,
         connection,
     )?;
-    optimize_plan(&mut select_plan, resolver.schema)?;
+    optimize_plan(&mut program, &mut select_plan, resolver.schema)?;
     let num_result_cols;
     let opts = match &select_plan {
         Plan::Select(select) => {
@@ -505,7 +505,7 @@ fn prepare_one_select_plan(
             // Return the unoptimized query plan
             Ok(plan)
         }
-        ast::OneSelect::Values(values) => {
+        ast::OneSelect::Values(mut values) => {
             if !order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }
@@ -522,6 +522,21 @@ fn prepare_one_select_plan(
                     contains_aggregates: false,
                 });
             }
+
+            for value_row in values.iter_mut() {
+                for value in value_row.iter_mut() {
+                    bind_and_rewrite_expr(
+                        value,
+                        None,
+                        None,
+                        connection,
+                        &mut program.param_ctx,
+                        // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
+                        BindingBehavior::AllowUnboundIdentifiers,
+                    )?;
+                }
+            }
+
             let plan = SelectPlan {
                 join_order: vec![],
                 table_references: TableReferences::new(vec![], vec![]),
@@ -674,7 +689,7 @@ pub fn emit_simple_count(
         .joined_tables()
         .first()
         .unwrap()
-        .resolve_cursors(program)?;
+        .resolve_cursors(program, OperationMode::SELECT)?;
 
     let cursor_id = {
         match cursors {

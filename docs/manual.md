@@ -40,6 +40,7 @@ Welcome to Turso database manual!
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
   - [Encryption](#encryption)
+  - [Vector search](#vector-search)
   - [CDC](#cdc-early-preview)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
@@ -396,7 +397,7 @@ ROLLBACK [ TRANSACTION ]
 SELECT expression
     [ FROM table-or-subquery ]
     [ WHERE condition ]
-    [ GROU BY expression ]
+    [ GROUP BY expression ]
 ```
 
 **Example:**
@@ -608,6 +609,167 @@ $ cargo run -- --experimental-encryption \
    "file:database.db?cipher=aegis256hexkey=2d7a30108d3eb3e45c90a732041fe54778bdcf707c76749fab7da335d1b39c1d"
 ```
 
+
+## Vector search
+
+Turso supports vector search for building workloads such as semantic search, recommendation systems, and similarity matching. Vector embeddings can be stored and queried using specialized functions for distance calculations.
+
+### Vector types
+
+Turso supports both **dense** and **sparse** vector representations:
+
+#### Dense vectors
+
+Dense vectors store a value for every dimension. Turso provides two precision levels:
+
+* **Float32 dense vectors** (`vector32`): 32-bit floating-point values, suitable for most machine learning embeddings (e.g., OpenAI embeddings, sentence transformers). Uses 4 bytes per dimension.
+* **Float64 dense vectors** (`vector64`): 64-bit floating-point values for applications requiring higher precision. Uses 8 bytes per dimension.
+
+Dense vectors are ideal for embeddings from neural networks where most dimensions contain non-zero values.
+
+#### Sparse vectors
+
+Sparse vectors only store non-zero values and their indices, making them memory-efficient for high-dimensional data with many zero values:
+
+* **Float32 sparse vectors** (`vector32_sparse`): Stores only non-zero 32-bit float values along with their dimension indices.
+
+Sparse vectors are ideal for TF-IDF representations, bag-of-words models, and other scenarios where most dimensions are zero.
+
+### Vector functions
+
+#### Creating and converting vectors
+
+**`vector32(value)`**
+
+Converts a text or blob value into a 32-bit dense vector.
+
+```sql
+SELECT vector32('[1.0, 2.0, 3.0]');
+```
+
+**`vector32_sparse(value)`**
+
+Converts a text or blob value into a 32-bit sparse vector.
+
+```sql
+SELECT vector32_sparse('[0.0, 1.5, 0.0, 2.3, 0.0]');
+```
+
+**`vector64(value)`**
+
+Converts a text or blob value into a 64-bit dense vector.
+
+```sql
+SELECT vector64('[1.0, 2.0, 3.0]');
+```
+
+**`vector_extract(blob)`**
+
+Extracts and displays a vector blob as human-readable text.
+
+```sql
+SELECT vector_extract(embedding) FROM documents;
+```
+
+#### Distance functions
+
+Turso provides three distance metrics for measuring vector similarity:
+
+**`vector_distance_cos(v1, v2)`**
+
+Computes the cosine distance between two vectors. Returns a value between 0 (identical direction) and 2 (opposite direction). Cosine distance is computed as `1 - cosine_similarity`.
+
+Cosine distance is ideal for:
+- Text embeddings where magnitude is less important than direction
+- Comparing document similarity
+
+```sql
+SELECT name, vector_distance_cos(embedding, vector32('[0.1, 0.5, 0.3]')) AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
+**`vector_distance_l2(v1, v2)`**
+
+Computes the Euclidean (L2) distance between two vectors. Returns the straight-line distance in n-dimensional space.
+
+L2 distance is ideal for:
+- Image embeddings where absolute differences matter
+- Spatial data and geometric problems
+- When embeddings are not normalized
+
+```sql
+SELECT name, vector_distance_l2(embedding, vector32('[0.1, 0.5, 0.3]')) AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
+**`vector_distance_jaccard(v1, v2)`**
+
+Computes the weighted Jaccard distance between two vectors, measuring dissimilarity based on the ratio of minimum to maximum values across dimensions. Note that this is different from the ordinary Jaccard distance, which is defined only for binary vectors.
+
+Weighted Jaccard distance is ideal for:
+- Sparse vectors with many zero values
+- Set-like comparisons
+- TF-IDF and bag-of-words representations
+
+```sql
+SELECT name, vector_distance_jaccard(sparse_embedding, vector32_sparse('[0.0, 1.0, 0.0, 2.0]')) AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
+#### Utility functions
+
+**`vector_concat(v1, v2)`**
+
+Concatenates two vectors into a single vector. The resulting vector has dimensions equal to the sum of both input vectors.
+
+```sql
+SELECT vector_concat(vector32('[1.0, 2.0]'), vector32('[3.0, 4.0]'));
+-- Results in a 4-dimensional vector: [1.0, 2.0, 3.0, 4.0]
+```
+
+**`vector_slice(vector, start_index, end_index)`**
+
+Extracts a slice of a vector from `start_index` to `end_index` (exclusive).
+
+```sql
+SELECT vector_slice(vector32('[1.0, 2.0, 3.0, 4.0, 5.0]'), 1, 4);
+-- Results in: [2.0, 3.0, 4.0]
+```
+
+### Example: Semantic search
+
+Here's a complete example of building a semantic search system:
+
+```sql
+-- Create a table for documents with embeddings
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    content TEXT,
+    embedding BLOB
+);
+
+-- Insert documents with precomputed embeddings
+INSERT INTO documents (name, content, embedding) VALUES
+    ('Doc 1', 'Machine learning basics', vector32('[0.2, 0.5, 0.1, 0.8]')),
+    ('Doc 2', 'Database fundamentals', vector32('[0.1, 0.3, 0.9, 0.2]')),
+    ('Doc 3', 'Neural networks guide', vector32('[0.3, 0.6, 0.2, 0.7]'));
+
+-- Find documents similar to a query embedding
+SELECT
+    name,
+    content,
+    vector_distance_cos(embedding, vector32('[0.25, 0.55, 0.15, 0.75]')) AS similarity
+FROM documents
+ORDER BY similarity
+LIMIT 5;
+```
 
 ## CDC (Early Preview)
 

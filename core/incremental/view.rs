@@ -2,7 +2,7 @@ use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::CursorTrait;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -39,6 +39,11 @@ pub enum PopulateState {
     /// Population complete
     Done,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for PopulateState {}
+unsafe impl Sync for PopulateState {}
 
 /// State machine for merge_delta to handle I/O operations
 impl fmt::Debug for PopulateState {
@@ -130,6 +135,11 @@ pub struct AllViewsTxState {
     states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
 }
 
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for AllViewsTxState {}
+unsafe impl Sync for AllViewsTxState {}
+
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
@@ -209,6 +219,11 @@ pub struct IncrementalView {
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
 }
+
+// SAFETY: This needs to be audited for thread safety.
+// See: https://github.com/tursodatabase/turso/issues/1552
+unsafe impl Send for IncrementalView {}
+unsafe impl Sync for IncrementalView {}
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit
@@ -1112,7 +1127,7 @@ impl IncrementalView {
         &mut self,
         conn: &std::sync::Arc<crate::Connection>,
         pager: &std::sync::Arc<crate::Pager>,
-        _btree_cursor: &mut BTreeCursor,
+        _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
         assert!(
@@ -1282,7 +1297,7 @@ impl IncrementalView {
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
                                 // TODO: Get the actual I/O completion from the statement
-                                let completion = crate::io::Completion::new_dummy();
+                                let completion = crate::io::Completion::new_yield();
                                 return Ok(IOResult::IO(crate::types::IOCompletions::Single(
                                     completion,
                                 )));
@@ -1411,6 +1426,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
             has_autoincrement: false,
         };
 
@@ -1460,6 +1476,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1509,6 +1526,7 @@ mod tests {
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
@@ -1558,13 +1576,26 @@ mod tests {
             has_rowid: true, // Has implicit rowid but no alias
             is_strict: false,
             has_autoincrement: false,
+            foreign_keys: vec![],
             unique_sets: vec![],
         };
 
-        schema.add_btree_table(Arc::new(customers_table));
-        schema.add_btree_table(Arc::new(orders_table));
-        schema.add_btree_table(Arc::new(products_table));
-        schema.add_btree_table(Arc::new(logs_table));
+        schema
+            .add_btree_table(Arc::new(customers_table))
+            .expect("Test setup: failed to add customers table");
+
+        schema
+            .add_btree_table(Arc::new(orders_table))
+            .expect("Test setup: failed to add orders table");
+
+        schema
+            .add_btree_table(Arc::new(products_table))
+            .expect("Test setup: failed to add products table");
+
+        schema
+            .add_btree_table(Arc::new(logs_table))
+            .expect("Test setup: failed to add logs table");
+
         schema
     }
 

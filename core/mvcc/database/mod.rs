@@ -5,6 +5,7 @@ use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
+use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
@@ -18,11 +19,11 @@ use crate::Completion;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
-use crate::RefValue;
 use crate::Result;
 use crate::Statement;
 use crate::StepResult;
 use crate::Value;
+use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
@@ -115,9 +116,10 @@ impl Row {
 }
 
 /// A row version.
+/// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
-    pub begin: TxTimestampOrID,
+    pub begin: Option<TxTimestampOrID>,
     pub end: Option<TxTimestampOrID>,
     pub row: Row,
 }
@@ -402,7 +404,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
     ) -> Self {
-        let pager = connection.pager.read().clone();
+        let pager = connection.pager.load().clone();
         Self {
             state,
             is_finalized: false,
@@ -572,11 +574,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
                         for row_version in row_versions.iter_mut() {
-                            if let TxTimestampOrID::TxID(id) = row_version.begin {
+                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
                                 if id == self.tx_id {
                                     // New version is valid STARTING FROM committing transaction's end timestamp
                                     // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.begin = TxTimestampOrID::Timestamp(*end_ts);
+                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
                                     mvcc_store.insert_version_raw(
                                         &mut log_record.row_versions,
                                         row_version.clone(),
@@ -625,7 +627,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_dummy(),
+                            Completion::new_yield(),
                         )));
                     }
                 }
@@ -654,7 +656,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let schema_did_change = self.did_commit_schema_change;
                 if schema_did_change {
                     let schema = connection.schema.read().clone();
-                    connection.db.update_schema_if_newer(schema)?;
+                    connection.db.update_schema_if_newer(schema);
                 }
                 let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
                 let tx_unlocked = tx.value();
@@ -1045,7 +1047,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.insert_table_id_to_rootpage(root_page_as_table_id, Some(*root_page));
         }
 
-        if !self.maybe_recover_logical_log(bootstrap_conn.pager.read().clone())? {
+        if !self.maybe_recover_logical_log(bootstrap_conn.pager.load().clone())? {
             // There was no logical log to recover, so we're done.
             return Ok(());
         }
@@ -1091,7 +1093,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id;
         let row_version = RowVersion {
-            begin: TxTimestampOrID::TxID(tx.tx_id),
+            begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
             end: None,
             row,
         };
@@ -1354,7 +1356,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         pager: Arc<Pager>,
         maybe_existing_tx_id: Option<TxID>,
-    ) -> Result<IOResult<TxID>> {
+    ) -> Result<TxID> {
         if !self.blocking_checkpoint_lock.read() {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -1390,7 +1392,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
         self.txs.insert(tx_id, tx);
-        Ok(IOResult::Done(tx_id))
+        Ok(tx_id)
     }
 
     /// Begins a new transaction in the database.
@@ -1547,14 +1549,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
                 // this transaction changed.
                 for row_version in row_versions.iter_mut().rev() {
-                    if let TxTimestampOrID::TxID(id) = row_version.begin {
+                    if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
                         turso_assert!(
                             id == tx_id,
                             "only one tx(0) should exist on loading logical log"
                         );
                         // New version is valid STARTING FROM committing transaction's end timestamp
                         // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        row_version.begin = TxTimestampOrID::Timestamp(end_ts);
+                        row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                     }
                     if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
                         turso_assert!(
@@ -1578,38 +1580,36 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// # Arguments
     ///
     /// * `tx_id` - The ID of the transaction to abort.
-    pub fn rollback_tx(
-        &self,
-        tx_id: TxID,
-        _pager: Arc<Pager>,
-        connection: &Connection,
-    ) -> Result<()> {
+    pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
         let tx_unlocked = self.txs.get(&tx_id).unwrap();
         let tx = tx_unlocked.value();
         *connection.mv_tx.write() = None;
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
-        let write_set: Vec<RowID> = tx.write_set.iter().map(|v| *v.value()).collect();
 
         if self.is_exclusive_tx(&tx_id) {
             self.commit_coordinator.pager_commit_lock.unlock();
             self.release_exclusive_tx(&tx_id);
         }
 
-        for ref id in write_set {
-            if let Some(row_versions) = self.rows.get(id) {
+        for rowid in &tx.write_set {
+            let rowid = rowid.value();
+            if let Some(row_versions) = self.rows.get(rowid) {
                 let mut row_versions = row_versions.value().write();
                 for rv in row_versions.iter_mut() {
-                    if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+                    if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
+                        assert_eq!(id, tx_id);
+                        // If the transaction has aborted,
+                        // it marks all its new versions as garbage and sets their Begin
+                        // and End timestamps to infinity to make them invisible
+                        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                        rv.begin = None;
+                        rv.end = None;
+                    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
                         // undo deletions by this transaction
                         rv.end = None;
                     }
-                }
-                // remove insertions by this transaction
-                row_versions.retain(|rv| rv.begin != TxTimestampOrID::TxID(tx_id));
-                if row_versions.is_empty() {
-                    self.rows.remove(id);
                 }
             }
         }
@@ -1618,7 +1618,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             > connection.db.schema.lock().unwrap().schema_version
         {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema()?;
+            *connection.schema.write() = connection.db.clone_schema();
         }
 
         let tx = tx_unlocked.value();
@@ -1627,8 +1627,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
-
-        Ok(())
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
@@ -1759,10 +1757,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     // Extracts the begin timestamp from a transaction
     #[inline]
-    fn get_begin_timestamp(&self, ts_or_id: &TxTimestampOrID) -> u64 {
+    fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
-            TxTimestampOrID::Timestamp(ts) => *ts,
-            TxTimestampOrID::TxID(tx_id) => self.txs.get(tx_id).unwrap().value().begin_ts,
+            Some(TxTimestampOrID::Timestamp(ts)) => *ts,
+            Some(TxTimestampOrID::TxID(tx_id)) => self.txs.get(tx_id).unwrap().value().begin_ts,
+            // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
+            //
+            // The row version chain should be append-only (aside from garbage collection),
+            // so the specific ordering handled by this function may not be critical. We might
+            // be able to append directly to the row version chain in the future.
+            //
+            // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
+            // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
+            // while actual timestamps will start from 1.
+            None => 0,
         }
     }
 
@@ -1876,7 +1884,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .value()
             .unwrap_or_else(|| panic!("Table ID does not have a root page: {table_id}"));
         let mut cursor = BTreeCursor::new_table(
-            None, // No MVCC cursor for scanning
             pager.clone(),
             root_page as i64,
             1, // We'll adjust this as needed
@@ -1914,7 +1921,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         self.insert_version(
                             id,
                             RowVersion {
-                                begin: TxTimestampOrID::Timestamp(0),
+                                begin: Some(TxTimestampOrID::Timestamp(0)),
                                 end: None,
                                 row: Row::new(id, record.get_payload().to_vec(), column_count),
                             },
@@ -1985,7 +1992,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let record_values = record_cursor.get_values(&record).unwrap();
-                        let RefValue::Integer(root_page) = record_values[3] else {
+                        let ValueRef::Integer(root_page) = record_values[3] else {
                             panic!(
                                 "Expected integer value for root page, got {:?}",
                                 record_values[3]
@@ -2023,7 +2030,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
                 StreamingResult::Eof => {
                     // Set offset to the end so that next writes go to the end of the file
-                    self.storage.logical_log.write().unwrap().offset = reader.offset as u64;
+                    self.storage.logical_log.write().offset = reader.offset as u64;
                     break;
                 }
             }
@@ -2032,8 +2039,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(true)
     }
 
-    pub fn set_checkpoint_threshold(&self, threshold: u64) {
+    pub fn set_checkpoint_threshold(&self, threshold: i64) {
         self.storage.set_checkpoint_threshold(threshold)
+    }
+
+    pub fn checkpoint_threshold(&self) -> i64 {
+        self.storage.checkpoint_threshold()
     }
 }
 
@@ -2080,8 +2091,8 @@ impl RowVersion {
 
 fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
     match rv.begin {
-        TxTimestampOrID::Timestamp(rv_begin_ts) => tx.begin_ts >= rv_begin_ts,
-        TxTimestampOrID::TxID(rv_begin) => {
+        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
+        Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs.get(&rv_begin).unwrap();
             let tb = tb.value();
             let visible = match tb.state.load() {
@@ -2101,6 +2112,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
             );
             visible
         }
+        None => false,
     }
 }
 

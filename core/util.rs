@@ -11,6 +11,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use std::sync::atomic::AtomicU8;
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -27,12 +28,6 @@ use turso_parser::parser::Parser;
 macro_rules! io_yield_one {
     ($c:expr) => {
         return Ok(IOResult::IO(IOCompletions::Single($c)));
-    };
-}
-#[macro_export]
-macro_rules! io_yield_many {
-    ($v:expr) => {
-        return Ok(IOResult::IO(IOCompletions::Many($v)));
     };
 }
 
@@ -312,7 +307,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
 pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
     match (lhs, rhs) {
         (Literal::Numeric(n1), Literal::Numeric(n2)) => cmp_numeric_strings(n1, n2),
-        (Literal::String(s1), Literal::String(s2)) => check_ident_equivalency(s1, s2),
+        (Literal::String(s1), Literal::String(s2)) => s1 == s2,
         (Literal::Blob(b1), Literal::Blob(b2)) => b1 == b2,
         (Literal::Keyword(k1), Literal::Keyword(k2)) => check_ident_equivalency(k1, k2),
         (Literal::Null, Literal::Null) => true,
@@ -1335,6 +1330,39 @@ pub fn extract_view_columns(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+pub fn rewrite_fk_parent_cols_if_self_ref(
+    clause: &mut ast::ForeignKeyClause,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(table) {
+        for c in &mut clause.columns {
+            if normalize_ident(c.col_name.as_str()) == normalize_ident(from) {
+                c.col_name = ast::Name::exact(to.to_owned());
+            }
+        }
+    }
+}
+
+/// Update a column-level REFERENCES <tbl>(col,...) constraint
+pub fn rewrite_column_references_if_needed(
+    col: &mut ast::ColumnDefinition,
+    table: &str,
+    from: &str,
+    to: &str,
+) {
+    for cc in &mut col.constraints {
+        if let ast::NamedColumnConstraint {
+            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
+            ..
+        } = cc
+        {
+            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        }
+    }
 }
 
 #[cfg(test)]

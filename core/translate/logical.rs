@@ -2389,6 +2389,7 @@ mod tests {
             name: "users".to_string(),
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
+            foreign_keys: vec![],
             columns: vec![
                 SchemaColumn {
                     name: Some("id".to_string()),
@@ -2444,7 +2445,9 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
         };
-        schema.add_btree_table(Arc::new(users_table));
+        schema
+            .add_btree_table(Arc::new(users_table))
+            .expect("Test setup: failed to add users table");
 
         // Create orders table
         let orders_table = BTreeTable {
@@ -2505,8 +2508,11 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
         };
-        schema.add_btree_table(Arc::new(orders_table));
+        schema
+            .add_btree_table(Arc::new(orders_table))
+            .expect("Test setup: failed to add orders table");
 
         // Create products table
         let products_table = BTreeTable {
@@ -2567,8 +2573,11 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             unique_sets: vec![],
+            foreign_keys: vec![],
         };
-        schema.add_btree_table(Arc::new(products_table));
+        schema
+            .add_btree_table(Arc::new(products_table))
+            .expect("Test setup: failed to add products table");
 
         schema
     }
