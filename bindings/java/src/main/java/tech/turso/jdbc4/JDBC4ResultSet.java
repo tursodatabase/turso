@@ -405,13 +405,15 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public Object getObject(int columnIndex) throws SQLException {
-    return resultSet.get(columnIndex);
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    return result;
   }
 
   @Override
   @SkipNullableCheck
   public Object getObject(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getObject(findColumn(columnLabel));
   }
 
   @Override
