@@ -838,15 +838,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (date == null || cal == null) {
       return date;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(date);
-
-    final long offset =
-        cal.getTimeZone().getOffset(date.getTime())
-            - localCal.getTimeZone().getOffset(date.getTime());
-
-    return new Date(date.getTime() + offset);
+    return new Date(date.getTime() + calculateTimezoneOffset(date.getTime(), cal));
   }
 
   @Override
@@ -862,15 +854,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (time == null || cal == null) {
       return time;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(time);
-
-    final long offset =
-        cal.getTimeZone().getOffset(time.getTime())
-            - localCal.getTimeZone().getOffset(time.getTime());
-
-    return new Time(time.getTime() + offset);
+    return new Time(time.getTime() + calculateTimezoneOffset(time.getTime(), cal));
   }
 
   @Override
@@ -886,15 +870,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (timestamp == null || cal == null) {
       return timestamp;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(timestamp);
-
-    final long offset =
-        cal.getTimeZone().getOffset(timestamp.getTime())
-            - localCal.getTimeZone().getOffset(timestamp.getTime());
-
-    return new Timestamp(timestamp.getTime() + offset);
+    return new Timestamp(timestamp.getTime() + calculateTimezoneOffset(timestamp.getTime(), cal));
   }
 
   @Override
@@ -1340,6 +1316,12 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public String getColumnClassName(int column) throws SQLException {
     throw new UnsupportedOperationException("not implemented");
+  }
+
+  private long calculateTimezoneOffset(long timeMillis, Calendar targetCal) {
+    Calendar localCal = Calendar.getInstance();
+    return targetCal.getTimeZone().getOffset(timeMillis)
+        - localCal.getTimeZone().getOffset(timeMillis);
   }
 
   @FunctionalInterface
