@@ -1904,6 +1904,18 @@ impl Limbo {
             "Fetched metadata"
         );
 
+        if let Some(pgno) = page_no {
+            if pgno <= 0 {
+                anyhow::bail!("Page number must be a positive integer.");
+            }
+            if pgno > metadata.page_count {
+                anyhow::bail!(
+                    "Page number {pgno} is out of bounds. The database only has {} pages.",
+                    metadata.page_count
+                );
+            }
+        }
+
         writeln!(
             self,
             "| size {} pagesize {} filename {}",
