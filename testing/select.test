@@ -1008,6 +1008,11 @@ do_execsql_test_in_memory_error_content limit-expr-invalid-data-type-4 {
   SELECT 1 LIMIT 4+NULL;
 } {"datatype mismatch"}
 
+do_execsql_test_in_memory_error_content limit-expression-invalid-type {
+  SELECT 1 LIMIT '1.xx';
+} {"datatype mismatch"}
+
+
 do_execsql_test_on_specific_db {:memory:} rowid-references {
   CREATE TABLE test_table (id INTEGER);
   INSERT INTO test_table VALUES (5),(5);
