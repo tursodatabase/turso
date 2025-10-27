@@ -13,6 +13,7 @@ use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     resolve_window_and_aggregate_functions,
 };
+use crate::translate::subquery::plan_subqueries_from_where_clause;
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -502,6 +503,15 @@ fn prepare_one_select_plan(
                     &mut windows,
                 )?;
             }
+
+            plan_subqueries_from_where_clause(
+                program,
+                &mut plan.non_from_clause_subqueries,
+                &mut plan.table_references,
+                resolver,
+                &mut plan.where_clause,
+                connection,
+            )?;
 
             // Return the unoptimized query plan
             Ok(plan)
