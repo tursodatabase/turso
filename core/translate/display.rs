@@ -119,6 +119,15 @@ impl Display for SelectPlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let index_method = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY INDEX METHOD {}",
+                        indent,
+                        index_method.definition().method_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -161,6 +170,15 @@ impl Display for DeletePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -215,6 +233,15 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
             }
         }
         if !self.order_by.is_empty() {
