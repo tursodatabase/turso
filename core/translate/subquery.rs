@@ -60,7 +60,7 @@ pub fn emit_subqueries(
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
-                emit_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
+                emit_from_clause_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
@@ -72,9 +72,9 @@ pub fn emit_subqueries(
     Ok(())
 }
 
-/// Emit a subquery and return the start register of the result columns.
+/// Emit a FROM clause subquery and return the start register of the result columns.
 /// This is done by emitting a coroutine that stores the result columns in sequential registers.
-/// Each subquery in a FROM clause has its own separate SelectPlan which is wrapped in a coroutine.
+/// Each FROM clause subquery has its own separate SelectPlan which is wrapped in a coroutine.
 ///
 /// The resulting bytecode from a subquery is mostly exactly the same as a regular query, except:
 /// - it ends in an EndCoroutine instead of a Halt.
@@ -85,7 +85,7 @@ pub fn emit_subqueries(
 ///
 /// Since a subquery has its own SelectPlan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
-pub fn emit_subquery(
+pub fn emit_from_clause_subquery(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     t_ctx: &mut TranslateCtx,
@@ -102,7 +102,7 @@ pub fn emit_subquery(
             // The parent query will use this register to reinitialize the coroutine when it needs to run multiple times.
             *coroutine_implementation_start = coroutine_implementation_start_offset;
         }
-        _ => unreachable!("emit_subquery called on non-subquery"),
+        _ => unreachable!("emit_from_clause_subquery called on non-subquery"),
     }
     let end_coroutine_label = program.allocate_label();
     let mut metadata = TranslateCtx {
