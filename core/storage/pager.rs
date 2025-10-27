@@ -60,20 +60,18 @@ impl HeaderRef {
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.get().is_initialized()
-                     {
+                    if !pager.db_state.get().is_initialized() {
+                        let mut default_header = DatabaseHeader::default();
+                        let page_size = pager.get_page_size().unwrap_or_default();
+                        default_header.page_size = page_size;
+                        let page = allocate_new_page(1, &pager.buffer_pool, 0);
 
-                    let mut default_header = DatabaseHeader::default();
-                    let page_size = pager.get_page_size().unwrap_or_else(PageSize::default);
-                    default_header.page_size = page_size;
-                    let page = allocate_new_page(1, &pager.buffer_pool, 0);
-                    
-                    let contents = page.get_contents();
-                    contents.write_database_header(&default_header);
+                        let contents = page.get_contents();
+                        contents.write_database_header(&default_header);
 
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    continue;
-                }
+                        *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                        continue;
+                    }
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
                     *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
                     if let Some(c) = c {
