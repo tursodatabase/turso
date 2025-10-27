@@ -503,7 +503,6 @@ fn prepare_one_select_plan(
                     &mut windows,
                 )?;
             }
-        
 
             // TODO: support subqueries in the following positions:
             // - result column of a select, e.g.: SELECT x = (SELECT ...) FROM t

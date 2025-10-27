@@ -891,6 +891,7 @@ impl TableMask {
 pub fn table_mask_from_expr(
     top_level_expr: &Expr,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<TableMask> {
     let mut mask = TableMask::new();
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
@@ -910,6 +911,34 @@ pub fn table_mask_from_expr(
                     // so they don't need to be added to the table mask. However, if the table is not found
                     // in the outer scope either, then it's an invalid reference.
                     crate::bail_parse_error!("table not found in joined_tables");
+                }
+            }
+            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
+            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
+            // Hence, the tables referenced in subqueries must be added to the table mask.
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                let SubqueryState::Unevaluated { plan } = &subquery.state else {
+                    crate::bail_parse_error!("subquery has already been evaluated");
+                };
+                let used_outer_query_refs = plan
+                    .as_ref()
+                    .unwrap()
+                    .table_references
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|t| t.is_used());
+                for outer_query_ref in used_outer_query_refs {
+                    if let Some(table_idx) = table_references
+                        .joined_tables()
+                        .iter()
+                        .position(|t| t.internal_id == outer_query_ref.internal_id)
+                    {
+                        mask.add_table(table_idx);
+                    }
                 }
             }
             _ => {}
