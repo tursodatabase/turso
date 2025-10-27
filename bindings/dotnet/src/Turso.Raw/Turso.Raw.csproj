@@ -31,13 +31,13 @@
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </None>
     </ItemGroup>
-    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\turso_dotnet.so')">
-        <None Include="..\..\rs_compiled\release\turso_dotnet.so" Visible="false">
+    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\libturso_dotnet.so')">
+        <None Include="..\..\rs_compiled\release\libturso_dotnet.so" Visible="false">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </None>
     </ItemGroup>
-    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\turso_dotnet.dylib')">
-        <None Include="..\..\rs_compiled\release\turso_dotnet.dylib" Visible="false">
+    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\libturso_dotnet.dylib')">
+        <None Include="..\..\rs_compiled\release\libturso_dotnet.dylib" Visible="false">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </None>
     </ItemGroup>

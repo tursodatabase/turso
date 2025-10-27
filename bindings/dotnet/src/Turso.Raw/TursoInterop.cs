@@ -10,9 +10,9 @@ internal static class TursoInterop
 #if OS_WINDOWS
     "turso_dotnet.dll";
 #elif OS_LINUX
-    "turso_dotnet.so";
+    "libturso_dotnet.so";
 #elif OS_MAC
-    "turso_dotnet.dylib";
+    "libturso_dotnet.dylib";
 #endif
     
     [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
