@@ -347,7 +347,7 @@ fn update_column_used_masks(
 
 /// Emit the subqueries contained in the FROM clause.
 /// This is done first so the results can be read in the main query loop.
-pub fn emit_subqueries(
+pub fn emit_from_clause_subqueries(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,

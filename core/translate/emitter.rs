@@ -21,7 +21,7 @@ use super::plan::{
     Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
-use super::subquery::emit_subqueries;
+use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Schema, Table, ROWID_SENTINEL};
@@ -280,8 +280,8 @@ pub fn emit_query<'a>(
         return Ok(reg_result_cols_start);
     }
 
-    // Emit subqueries first so the results can be read in the main query loop.
-    emit_subqueries(program, t_ctx, &mut plan.table_references)?;
+    // Emit FROM clause subqueries first so the results can be read in the main query loop.
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
