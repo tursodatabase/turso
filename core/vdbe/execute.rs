@@ -8082,6 +8082,22 @@ pub fn op_integrity_check(
         },
         insn
     );
+
+    let db_size = match with_header(pager, mv_store, program, |header| {
+        header.database_size.get()
+    }) {
+        Err(_) => 0,
+        Ok(IOResult::Done(v)) => v,
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+    };
+
+    if db_size == 0 {
+        state.registers[*message_register] = Register::Value(Value::build_text("ok"));
+        state.op_integrity_check_state = OpIntegrityCheckState::Start;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     match &mut state.op_integrity_check_state {
         OpIntegrityCheckState::Start => {
             let (freelist_trunk_page, db_size) =
