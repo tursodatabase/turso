@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use core_tester::common::rng_from_time_or_env;
+use rand::RngCore;
+use rand_chacha::ChaCha8Rng;
 use turso_core::{
     index_method::{
         toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod, IndexMethod,
@@ -252,4 +255,73 @@ fn test_vector_sparse_ivf_update() {
         run(&tmp_db, || reader.query_column(0)).unwrap().as_float()
     );
     assert!(!run(&tmp_db, || reader.query_next()).unwrap());
+}
+
+#[test]
+fn test_vector_sparse_ivf_fuzz() {
+    let _ = env_logger::try_init();
+    let simple_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
+    let index_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
+    let simple_conn = simple_db.connect_limbo();
+    let index_conn = index_db.connect_limbo();
+    index_conn
+        .execute("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+
+    let vector = |dim: usize, rng: &mut ChaCha8Rng| {
+        let mut values = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            if rng.next_u32() % 10 == 0 {
+                values.push((rng.next_u32() as f32 / (u32::MAX as f32)).to_string());
+            } else {
+                values.push("0".to_string())
+            }
+        }
+        format!("[{}]", values.join(", "))
+    };
+
+    let (mut rng, seed) = rng_from_time_or_env();
+    tracing::info!("seed: {}", seed);
+    let mut keys = Vec::new();
+    for _ in 0..10000 {
+        let choice = rng.next_u32() % 4;
+        if choice == 0 {
+            let key = rng.next_u64().to_string();
+            let v = vector(128, &mut rng);
+            let sql = format!("INSERT INTO t VALUES ('{}', vector32_sparse('{}'))", key, v);
+            tracing::info!("{}", sql);
+            simple_conn.execute(&sql).unwrap();
+            index_conn.execute(sql).unwrap();
+            keys.push(key);
+        } else if choice == 1 && !keys.is_empty() {
+            // let idx = rng.next_u32() as usize % keys.len();
+            // let key = &keys[idx];
+            // let v = vector(128, &mut rng);
+            // let sql = format!(
+            //     "UPDATE t SET embedding = vector32_sparse('{}') WHERE key = '{}'",
+            //     v, key
+            // );
+            // tracing::info!("{}", sql);
+            // simple_conn.execute(&sql).unwrap();
+            // index_conn.execute(&sql).unwrap();
+        } else if choice == 2 && !keys.is_empty() {
+            // let idx = rng.next_u32() as usize % keys.len();
+            // let key = &keys[idx];
+            // let sql = format!("DELETE FROM t WHERE key = '{}'", key);
+            // tracing::info!("{}", sql);
+            // simple_conn.execute(&sql).unwrap();
+            // index_conn.execute(&sql).unwrap();
+            // keys.remove(idx);
+        } else {
+            let v = vector(128, &mut rng);
+            let k = rng.next_u32() % 20;
+            let sql = format!("SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{}')) as d FROM t ORDER BY d LIMIT {}", v, k);
+            tracing::info!("{}", sql);
+            let simple_rows = limbo_exec_rows(&simple_db, &simple_conn, &sql);
+            let index_rows = limbo_exec_rows(&index_db, &index_conn, &sql);
+            tracing::info!("simple: {:?}, index_rows: {:?}", simple_rows, index_rows);
+        }
+    }
 }
