@@ -119,7 +119,7 @@ pub fn translate_create_index(
         );
     }
 
-    let mut module = None;
+    let mut index_method = None;
     if let Some(using) = &using {
         let index_modules = &resolver.symbol_table.index_methods;
         let using = using.as_str();
@@ -129,7 +129,7 @@ pub fn translate_create_index(
         }
         if let Some(index_module) = index_module {
             let parameters = resolve_index_method_parameters(with_clause)?;
-            module = Some(index_module.attach(&IndexMethodConfiguration {
+            index_method = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.clone(),
@@ -148,6 +148,7 @@ pub fn translate_create_index(
         // store the *original* where clause, because we need to rewrite it
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
+        index_method: index_method.clone(),
     });
 
     if !idx.validate_where_expr(table) {
@@ -225,7 +226,7 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    if module.is_none() {
+    if index_method.is_none() {
         // determine the order of the columns in the index for the sorter
         let order = idx.columns.iter().map(|c| c.order).collect();
         // open the sorter and the pseudo table

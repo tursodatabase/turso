@@ -1076,6 +1076,7 @@ fn ephemeral_index_build(
             .table
             .btree()
             .is_some_and(|btree| btree.has_rowid),
+        index_method: None,
     };
 
     ephemeral_index

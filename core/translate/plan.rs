@@ -1000,6 +1000,9 @@ impl JoinedTable {
         if self.col_used_mask.is_empty() {
             return false;
         }
+        if index.index_method.is_some() {
+            return false;
+        }
         let mut index_cols_mask = ColumnUsedMask::default();
         for col in index.columns.iter() {
             index_cols_mask.set(col.pos_in_table);

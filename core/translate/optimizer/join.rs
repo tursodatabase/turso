@@ -675,6 +675,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            index_method: None,
         });
         available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
 
@@ -744,6 +745,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            index_method: None,
         });
         available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
 
@@ -861,6 +863,7 @@ mod tests {
                     ephemeral: false,
                     root_page: 1,
                     has_rowid: true,
+                    index_method: None,
                 });
                 available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
             });
@@ -879,6 +882,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            index_method: None,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -895,6 +899,7 @@ mod tests {
             ephemeral: false,
             root_page: 1,
             has_rowid: true,
+            index_method: None,
         });
 
         available_indexes
@@ -1318,6 +1323,7 @@ mod tests {
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
+            index_method: None,
         });
 
         let mut available_indexes = HashMap::new();
@@ -1412,6 +1418,7 @@ mod tests {
             root_page: 2,
             ephemeral: false,
             has_rowid: true,
+            index_method: None,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
@@ -1524,6 +1531,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             unique: false,
+            index_method: None,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
