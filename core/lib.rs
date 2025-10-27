@@ -1094,8 +1094,12 @@ pub struct Connection {
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
-    /// Whether the connection is executing a statement initiated by another statement.
-    /// Generally this is only true for ParseSchema.
+    /// Greater than zero if connection executes a program within a program
+    /// This is necessary in order for connection to not "finalize" transaction (commit/abort) when program ends
+    /// (because parent program is still pending and it will handle "finalization" instead)
+    ///
+    /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
+    /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     nestedness: AtomicI32,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
@@ -1128,12 +1132,15 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
     pub fn is_nested_stmt(&self) -> bool {
         self.nestedness.load(Ordering::SeqCst) > 0
     }
+    /// starts nested program execution
     pub fn start_nested(&self) {
         self.nestedness.fetch_add(1, Ordering::SeqCst);
     }
+    /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
     }
