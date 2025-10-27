@@ -273,6 +273,7 @@ fn prepare_one_select_plan(
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -555,6 +556,7 @@ fn prepare_one_select_plan(
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             Ok(plan)

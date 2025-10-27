@@ -301,6 +301,7 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
+        non_from_clause_subqueries: vec![],
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);

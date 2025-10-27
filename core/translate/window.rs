@@ -208,6 +208,7 @@ fn prepare_window_subquery(
         distinctness: Distinctness::NonDistinct,
         values: vec![],
         window: None,
+        non_from_clause_subqueries: vec![],
     };
 
     prepare_window_subquery(

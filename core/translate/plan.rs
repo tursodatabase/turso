@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
-use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
+use turso_parser::ast::{
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+};
 
 use crate::{
     function::AggFunc,
@@ -359,6 +361,8 @@ pub struct SelectPlan {
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
     pub window: Option<Window>,
+    /// Subqueries that appear in any part of the query apart from the FROM clause
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 impl SelectPlan {
@@ -1322,6 +1326,84 @@ pub struct WindowFunction {
     pub func: AggFunc,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubqueryState {
+    /// The subquery has not been evaluated yet.
+    /// The 'plan' field is only optional because it is .take()'d when the the subquery
+    /// is translated into bytecode.
+    Unevaluated { plan: Option<Box<SelectPlan>> },
+    /// The subquery has been evaluated.
+    /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
+    /// The query plan struct no longer exists because translating the plan currently
+    /// requires an ownership transfer.
+    Evaluated { evaluated_at: EvalAt },
+}
+
+#[derive(Debug, Clone)]
+/// A subquery that is not part of the `FROM` clause.
+/// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
+/// Currently only subqueries in the WHERE clause are supported.
+pub struct NonFromClauseSubquery {
+    pub internal_id: TableInternalId,
+    pub query_type: SubqueryType,
+    pub state: SubqueryState,
+    pub correlated: bool,
+}
+
+impl NonFromClauseSubquery {
+    /// Returns true if the subquery has been evaluated (translated into bytecode).
+    pub fn has_been_evaluated(&self) -> bool {
+        matches!(self.state, SubqueryState::Evaluated { .. })
+    }
+
+    /// Returns the loop index where the subquery should be evaluated in this particular join order.
+    /// If the subquery references tables from the parent query, it will be evaluated at the right-most
+    /// nested loop whose table it references.
+    pub fn get_eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
+        let mut eval_at = EvalAt::BeforeLoop;
+        let SubqueryState::Unevaluated { plan } = &self.state else {
+            crate::bail_parse_error!("subquery has already been evaluated");
+        };
+        let used_outer_refs = plan
+            .as_ref()
+            .unwrap()
+            .table_references
+            .outer_query_refs()
+            .iter()
+            .filter(|t| t.is_used());
+
+        for outer_ref in used_outer_refs {
+            let Some(loop_idx) = join_order
+                .iter()
+                .position(|t| t.table_id == outer_ref.internal_id)
+            else {
+                continue;
+            };
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+        for subquery in plan.as_ref().unwrap().non_from_clause_subqueries.iter() {
+            let eval_at_inner = subquery.get_eval_at(join_order)?;
+            eval_at = eval_at.max(eval_at_inner);
+        }
+        Ok(eval_at)
+    }
+
+    /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
+    /// This is used when the subquery is translated into bytecode.
+    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
+        match &mut self.state {
+            SubqueryState::Unevaluated { plan } => {
+                let plan = plan.take().unwrap();
+                self.state = SubqueryState::Evaluated { evaluated_at };
+                plan
+            }
+            SubqueryState::Evaluated { .. } => {
+                panic!("subquery has already been evaluated");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
