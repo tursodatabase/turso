@@ -16,6 +16,7 @@ mod json;
 pub mod mvcc;
 mod parameters;
 mod pragma;
+mod pseudo;
 pub mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -39,6 +40,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::index_method::IndexMethod;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::translate::display::PlanContext;

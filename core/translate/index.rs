@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::index_method::IndexMethodConfiguration;
+use crate::numeric::Numeric;
 use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
@@ -125,7 +128,7 @@ pub fn translate_create_index(
             crate::bail_parse_error!("Error: unknown module name '{}'", using);
         }
         if let Some(index_module) = index_module {
-            let parameters = resolve_module_parameters(with_clause)?;
+            let parameters = resolve_index_method_parameters(with_clause)?;
             module = Some(index_module.attach(&IndexMethodConfiguration {
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
@@ -427,6 +430,40 @@ pub fn resolve_sorted_columns(
             collation: col.1.collation,
             default: col.1.default.clone(),
         });
+    }
+    Ok(resolved)
+}
+
+pub fn resolve_index_method_parameters(
+    parameters: Vec<(turso_parser::ast::Name, Box<Expr>)>,
+) -> crate::Result<HashMap<String, crate::Value>> {
+    let mut resolved = HashMap::new();
+    for (key, value) in parameters {
+        let value = match *value {
+            Expr::Literal(literal) => match literal {
+                ast::Literal::Numeric(s) => match Numeric::from(s) {
+                    Numeric::Null => crate::Value::Null,
+                    Numeric::Integer(v) => crate::Value::Integer(v),
+                    Numeric::Float(v) => crate::Value::Float(v.into()),
+                },
+                ast::Literal::Null => crate::Value::Null,
+                ast::Literal::String(s) => crate::Value::Text(s.into()),
+                ast::Literal::Blob(b) => crate::Value::Blob(
+                    b.as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            // We assume that sqlite3-parser has already validated that
+                            // the input is valid hex string, thus unwrap is safe.
+                            let hex_byte = std::str::from_utf8(pair).unwrap();
+                            u8::from_str_radix(hex_byte, 16).unwrap()
+                        })
+                        .collect(),
+                ),
+                _ => bail_parse_error!("parameters must be constant literals"),
+            },
+            _ => bail_parse_error!("parameters must be constant literals"),
+        };
+        resolved.insert(key.as_str().to_string(), value);
     }
     Ok(resolved)
 }
