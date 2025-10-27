@@ -49,10 +49,12 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
-    if !connection.experimental_custom_modules_enabled()
+    if !connection.experimental_index_method_enabled()
         && (using.is_some() || !with_clause.is_empty())
     {
-        bail_parse_error!("custom modules is an experimental feature. Enable with --experimental-custom-modules flag")
+        bail_parse_error!(
+            "index method is an experimental feature. Enable with --experimental-index-method flag"
+        )
     }
 
     let original_idx_name = idx_name;

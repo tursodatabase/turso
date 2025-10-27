@@ -113,7 +113,7 @@ pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
-    pub enable_custom_modules: bool,
+    pub enable_index_method: bool,
     enable_load_extension: bool,
 }
 
@@ -125,7 +125,7 @@ impl Default for DatabaseOpts {
             enable_views: false,
             enable_strict: false,
             enable_encryption: false,
-            enable_custom_modules: false,
+            enable_index_method: false,
             enable_load_extension: false,
         }
     }
@@ -167,8 +167,8 @@ impl DatabaseOpts {
         self
     }
 
-    pub fn with_custom_modules(mut self, enable: bool) -> Self {
-        self.enable_custom_modules = enable;
+    pub fn with_index_method(mut self, enable: bool) -> Self {
+        self.enable_index_method = enable;
         self
     }
 }
@@ -877,8 +877,8 @@ impl Database {
         self.opts.enable_views
     }
 
-    pub fn experimental_custom_modules_enabled(&self) -> bool {
-        self.opts.enable_custom_modules
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.opts.enable_index_method
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {
@@ -1503,7 +1503,7 @@ impl Connection {
                     .with_views(views)
                     .with_strict(strict)
                     .with_encryption(encryption)
-                    .with_custom_modules(custom_modules),
+                    .with_index_method(custom_modules),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1533,7 +1533,7 @@ impl Connection {
                 .with_views(views)
                 .with_strict(strict)
                 .with_encryption(encryption)
-                .with_custom_modules(custom_modules),
+                .with_index_method(custom_modules),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -2012,8 +2012,8 @@ impl Connection {
         self.db.experimental_views_enabled()
     }
 
-    pub fn experimental_custom_modules_enabled(&self) -> bool {
-        self.db.experimental_custom_modules_enabled()
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.db.experimental_index_method_enabled()
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {
