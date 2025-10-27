@@ -43,6 +43,7 @@ pub enum VectorSparseInvertedIndexCreateState {
     Run { stmt: Box<Statement> },
 }
 
+#[derive(Debug)]
 pub enum VectorSparseInvertedIndexInsertState {
     Init,
     Prepare {
@@ -64,6 +65,7 @@ pub enum VectorSparseInvertedIndexInsertState {
     },
 }
 
+#[derive(Debug)]
 pub enum VectorSparseInvertedIndexDeleteState {
     Init,
     Prepare {
@@ -286,6 +288,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             ));
         };
         loop {
+            tracing::debug!("insert_state: {:?}", self.insert_state);
             match &mut self.insert_state {
                 VectorSparseInvertedIndexInsertState::Init => {
                     let Some(vector) = values[0].get_value().to_blob() else {
@@ -375,6 +378,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             ));
         };
         loop {
+            tracing::debug!("delete_state: {:?}", self.delete_state);
             match &mut self.delete_state {
                 VectorSparseInvertedIndexDeleteState::Init => {
                     let Some(vector) = values[0].get_value().to_blob() else {
@@ -469,7 +473,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             ));
         };
         loop {
-            tracing::debug!("state: {:?}", self.search_state);
+            tracing::debug!("query_state: {:?}", self.search_state);
             match &mut self.search_state {
                 VectorSparseInvertedIndexSearchState::Init => {
                     let Some(vector) = values[1].get_value().to_blob() else {

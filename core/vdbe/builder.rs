@@ -340,6 +340,7 @@ impl ProgramBuilder {
         key: Option<CursorKey>,
         index: &Arc<Index>,
     ) -> crate::Result<usize> {
+        tracing::debug!("alloc cursor: {:?} {:?}", key, index.index_method.is_some());
         let module = index.index_method.as_ref();
         if module.is_some_and(|m| !m.definition().backing_btree) {
             let module = module.unwrap().clone();

@@ -6364,6 +6364,7 @@ pub fn op_idx_delete(
         insn
     );
 
+    tracing::info!("idx_delete cursor: {:?}", program.cursor_ref[*cursor_id]);
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
         state.pc += 1;
@@ -7261,7 +7262,8 @@ pub fn op_index_method_query(
     }
     let cursor = state.cursors[*cursor_id].as_mut().unwrap();
     let cursor = cursor.as_index_method_mut();
-    let has_rows = return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    let has_rows =
+        return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
     if !has_rows {
         state.pc = pc_if_empty.as_offset_int();
     } else {
