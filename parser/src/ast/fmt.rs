@@ -686,6 +686,10 @@ impl ToTokens for Expr {
         context: &C,
     ) -> Result<(), S::Error> {
         match self {
+            Self::SubqueryResult { .. } => {
+                // FIXME: what to put here? This is a highly "artificial" AST node that has no meaning when stringified.
+                Ok(())
+            }
             Self::Between {
                 lhs,
                 not,

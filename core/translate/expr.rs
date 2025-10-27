@@ -288,6 +288,7 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
+        ast::Expr::SubqueryResult { .. } => unimplemented!(), // Will be implemented in a future commit
         ast::Expr::Register(_) => {
             crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
         }
@@ -593,6 +594,7 @@ pub fn translate_expr(
     }
 
     match expr {
+        ast::Expr::SubqueryResult { .. } => unimplemented!(), // Will be implemented in a future commit
         ast::Expr::Between { .. } => {
             unreachable!("expression should have been rewritten in optmizer")
         }
@@ -3184,6 +3186,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {
@@ -3712,6 +3719,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr_mut(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {

@@ -766,6 +766,7 @@ impl Optimizable for ast::Expr {
     /// by writing more complex code.
     fn is_nonnull(&self, tables: &TableReferences) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
@@ -843,6 +844,7 @@ impl Optimizable for ast::Expr {
     /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {

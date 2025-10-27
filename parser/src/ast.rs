@@ -472,6 +472,40 @@ pub enum Expr {
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
     Variable(String),
+    /// Subqueries from e.g. the WHERE clause are planned separately
+    /// and their results will be placed in registers or in an ephemeral index
+    /// pointed to by this type.
+    SubqueryResult {
+        /// Internal "opaque" identifier for the subquery. When the translator encounters
+        /// a [Expr::SubqueryResult], it needs to know which subquery in the corresponding
+        /// query plan it references.
+        subquery_id: TableInternalId,
+        /// Left-hand side expression for IN subqueries.
+        /// This property plus 'not_in' are only relevant for IN subqueries,
+        /// and the reason they are not included in the [SubqueryType] enum is so that
+        /// we don't have to clone this Box.
+        lhs: Option<Box<Expr>>,
+        /// Whether the IN subquery is a NOT IN subquery.
+        not_in: bool,
+        /// The type of subquery.
+        query_type: SubqueryType,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SubqueryType {
+    /// EXISTS subquery; result is stored in a single register.
+    Exists { result_reg: usize },
+    /// Row value subquery; result is stored in a range of registers.
+    /// Example: x = (SELECT ...) or (x, y) = (SELECT ...)
+    RowValue {
+        result_reg_start: usize,
+        num_regs: usize,
+    },
+    /// IN subquery; result is stored in an ephemeral index.
+    /// Example: x <NOT> IN (SELECT ...)
+    In { cursor_id: usize },
 }
 
 impl Expr {
