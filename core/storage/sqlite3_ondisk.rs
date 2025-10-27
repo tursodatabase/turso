@@ -950,6 +950,59 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
     }
 }
 
+/// Write `snap` buffer (captured at submit-time) to `page`'s location in the main DB file.
+/// On completion, clear dirty *only if* the page still has the same dirty generation
+/// that it had at submit time, meaning it hasnt been modified in-memory since we submitted the write.
+/// This is used for cache-spilling to ephemeral DB files, where pages are typically very hot and
+/// we have to be sure we are not improperly clearing the dirty flag.
+pub fn begin_write_btree_page_with_snapshot(
+    pager: &Pager,
+    page: &PageRef,
+    snap: Arc<Buffer>,
+    cb: Arc<AtomicBool>,
+    gen_at_submit: u64,
+) -> Result<Completion> {
+    tracing::trace!(
+        "begin_write_btree_page_with_snapshot(page={})",
+        page.get().id
+    );
+    let page_source = &pager.db_file;
+    let page_finish = page.clone();
+
+    let page_id = page.get().id;
+    let buf_len = snap.len() as i32;
+
+    let write_complete = {
+        Box::new(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
+            tracing::trace!(
+                "finish_write_btree_page_with_snapshot(page={})",
+                page_finish.get().id
+            );
+            turso_assert!(
+                bytes_written == buf_len,
+                "wrote({bytes_written}) != expected({buf_len})"
+            );
+            // Clear dirty only if the page didn't change since submit.
+            if page_finish.dirty_gen() == gen_at_submit {
+                cb.store(true, Ordering::Release);
+                tracing::trace!(
+                    "Page {page_id} spilled, is_pinned={}, is_locked={}, gen={}",
+                    page_finish.is_pinned(),
+                    page_finish.is_locked(),
+                    page_finish.dirty_gen(),
+                );
+            }
+        })
+    };
+
+    let c = Completion::new_write(write_complete);
+    let io_ctx = pager.io_ctx.read();
+    page_source.write_page(page_id, snap, &io_ctx, c)
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);

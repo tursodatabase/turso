@@ -3,13 +3,14 @@ use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 use tracing::trace;
 
-use crate::turso_assert;
+use crate::{
+    storage::{btree::PinGuard, sqlite3_ondisk::DatabaseHeader},
+    turso_assert,
+};
 
 use super::pager::PageRef;
 
-/// FIXME: https://github.com/tursodatabase/turso/issues/1661
-const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED: usize =
-    100000;
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 1000;
 
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
@@ -17,6 +18,7 @@ pub struct PageCacheKey(usize);
 
 const CLEAR: u8 = 0;
 const REF_MAX: u8 = 3;
+const HOT_PAGE_THRESHOLD: u64 = 5;
 
 /// An entry in the page cache.
 ///
@@ -96,6 +98,8 @@ pub enum CacheError {
     ActiveRefs,
     #[error("Page cache is full")]
     Full,
+    #[error("Page cache is full, can spill to disk")]
+    FullCanSpill,
     #[error("key already exists")]
     KeyExists,
 }
@@ -106,10 +110,23 @@ pub enum CacheResizeResult {
     PendingEvictions,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum EvictionMode {
+    /// only evict if ref_bit is CLEAR, otherwise decrement.
+    Sieve,
+    /// evict clean & unpinned & unlocked page, still in eviction order.
+    Aggressive,
+}
+
 impl PageCacheKey {
     pub fn new(pgno: usize) -> Self {
         Self(pgno)
     }
+}
+
+#[inline]
+fn evictable_clean(page: &PageRef) -> bool {
+    !page.is_dirty() && !page.is_locked() && !page.is_pinned() && Arc::strong_count(page).eq(&1)
 }
 
 impl PageCache {
@@ -151,17 +168,220 @@ impl PageCache {
         }
     }
 
+    #[inline]
+    /// Returns true if there is at least one unpinned dirty page that can be spilled to disk
+    pub fn has_spillable(&self) -> bool {
+        if self.len() == 0 {
+            return false;
+        }
+        let mut cur = self.queue.front();
+        while let Some(entry) = cur.get() {
+            let p = &entry.page;
+            if Self::can_spill_page(p) {
+                return true;
+            }
+            cur.move_next();
+        }
+        false
+    }
+
+    #[inline]
+    fn can_spill_page(p: &PageRef) -> bool {
+        p.is_dirty()
+            && !p.is_pinned()
+            && !p.is_locked()
+            // Don't spill if someone else still holds a reference to the page.
+            && Arc::strong_count(p) == 1
+            // Don't spill while there are pending overflow cells not written into the page body yet.
+            && p.get()
+                .contents
+                .as_ref()
+                .is_some_and(|c| c.overflow_cells.is_empty())
+            && p.get().id.ne(&DatabaseHeader::PAGE_ID) // never spill page 1
+            // dirty_gen is increased every time `mark_dirty` is called on a PageRef, dont spill hot pages
+            && p.dirty_gen() <= HOT_PAGE_THRESHOLD
+    }
+
+    /// Collect candidates for spilling to disk when cache under pressure
+    pub fn compute_spill_candidates(&mut self) -> Vec<PinGuard> {
+        const SPILL_BATCH: usize = 128;
+        if self.len() == 0 || self.clock_hand.is_null() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(SPILL_BATCH);
+        let start = self.clock_hand;
+        let mut ptr = start;
+        loop {
+            let entry = unsafe { &mut *ptr };
+            let page = &entry.page;
+            // On the first  pass, only spill if ref_bit is CLEAR, we that we can ensure spilling the coldest pages.
+            // For the second pass, we can be more lenient and accept pages with ref_bit < REF_MAX.
+            if Self::can_spill_page(page) {
+                out.push(PinGuard::new(page.clone()));
+                if out.len() >= SPILL_BATCH {
+                    break;
+                }
+            }
+            let mut cur = unsafe { self.queue.cursor_mut_from_ptr(ptr) };
+            cur.move_next();
+            if let Some(next) = cur.get() {
+                ptr = next as *const _ as *mut PageCacheEntry;
+            } else if let Some(front) = self.queue.front_mut().get() {
+                ptr = front as *const _ as *mut PageCacheEntry;
+            } else {
+                break;
+            }
+            if ptr == start {
+                break;
+            }
+        }
+        out
+    }
+
+    #[inline]
+    /// Evict up to `target` clean, unpinned pages
+    pub fn evict_clean_aggressive(&mut self, target: usize) -> Result<usize, CacheError> {
+        self.evict(target, EvictionMode::Aggressive)
+    }
+
+    fn evict(&mut self, target: usize, mode: EvictionMode) -> Result<usize, CacheError> {
+        if self.len() == 0 || target == 0 {
+            return Err(CacheError::InternalError(
+                "Cannot evict from empty cache".into(),
+            ));
+        }
+        let default_pred = |entry: &mut PageCacheEntry| {
+            if entry.ref_bit == CLEAR {
+                true // Evict
+            } else {
+                entry.decrement_ref();
+                false // Give second chance
+            }
+        };
+        let evicted = match mode {
+            EvictionMode::Sieve => {
+                let max_rounds = REF_MAX as usize + 1;
+                let mut total_evicted = 0;
+                for _ in 0..max_rounds {
+                    if total_evicted >= target {
+                        break;
+                    }
+                    let need = target - total_evicted;
+                    let evicted_this_round = self.evict_pass(need, default_pred)?;
+                    total_evicted += evicted_this_round;
+                    // If we made no progress, we're stuck
+                    if evicted_this_round == 0 {
+                        break;
+                    }
+                }
+                total_evicted
+            }
+            EvictionMode::Aggressive => {
+                // Two-passes, first we try to respect ref_bits, and if we don't get enough
+                // from the first pass, the second pass we evict all evictible still in eviction order.
+                let mut evicted = 0;
+                evicted += self.evict_pass(target, default_pred)?;
+                if evicted < target {
+                    let remaining = target - evicted;
+                    evicted += self.evict_pass(remaining, |_| true)?;
+                }
+                evicted
+            }
+        };
+        if evicted >= target {
+            Ok(evicted)
+        } else {
+            Err(if self.has_spillable() {
+                CacheError::FullCanSpill
+            } else {
+                CacheError::Full
+            })
+        }
+    }
+
+    #[inline]
+    /// Performs a single eviction pass with a custom predicate.
+    /// Walks the ring once, evicting clean pages that match the predicate.
+    /// Returns number of pages evicted.
+    fn evict_pass<F>(&mut self, target: usize, should_evict: F) -> Result<usize, CacheError>
+    where
+        F: Fn(&mut PageCacheEntry) -> bool,
+    {
+        if self.clock_hand.is_null() || target == 0 {
+            return Ok(0);
+        }
+
+        let mut evicted = 0usize;
+        let start = self.clock_hand;
+        let mut ptr = start;
+        loop {
+            let entry = unsafe { &mut *ptr };
+            // Get next pointer before potential eviction
+            let next_ptr = {
+                let mut cursor = unsafe { self.queue.cursor_mut_from_ptr(ptr) };
+                cursor.move_next();
+
+                if let Some(next) = cursor.get() {
+                    next as *const _ as *mut PageCacheEntry
+                } else if let Some(front) = self.queue.front_mut().get() {
+                    front as *const _ as *mut PageCacheEntry
+                } else {
+                    std::ptr::null_mut()
+                }
+            };
+            // Now safe to evict current entry if it matches criteria
+            if evictable_clean(&entry.page) && should_evict(entry) {
+                // Handle clock hand before eviction
+                if self.clock_hand == ptr {
+                    self.clock_hand = if next_ptr != ptr && !next_ptr.is_null() {
+                        next_ptr
+                    } else {
+                        // Find any other entry or null
+                        if let Some(first) = self.queue.front().get() {
+                            first as *const _ as *mut PageCacheEntry
+                        } else {
+                            std::ptr::null_mut()
+                        }
+                    };
+                }
+                // Evict the entry
+                let key = entry.key;
+                self.map.remove(&key);
+                entry.page.clear_loaded();
+                let _ = entry.page.get().contents.take();
+                unsafe {
+                    let mut cursor = self.queue.cursor_mut_from_ptr(ptr);
+                    cursor.remove();
+                }
+                evicted += 1;
+                if evicted >= target {
+                    break;
+                }
+            }
+            // Move to next entry
+            if next_ptr.is_null() || next_ptr == start {
+                break; // Either we have done a full rotation or empty
+            }
+            ptr = next_ptr;
+        }
+        Ok(evicted)
+    }
+
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
         self.map.contains_key(key)
     }
 
     #[inline]
-    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
+    pub fn insert(&mut self, key: PageCacheKey, value: PageRef) -> Result<PageRef, CacheError> {
         self._insert(key, value, false)
     }
 
     #[inline]
-    pub fn upsert_page(&mut self, key: PageCacheKey, value: PageRef) -> Result<(), CacheError> {
+    pub fn upsert_page(
+        &mut self,
+        key: PageCacheKey,
+        value: PageRef,
+    ) -> Result<PageRef, CacheError> {
         self._insert(key, value, true)
     }
 
@@ -170,13 +390,15 @@ impl PageCache {
         key: PageCacheKey,
         value: PageRef,
         update_in_place: bool,
-    ) -> Result<(), CacheError> {
+    ) -> Result<PageRef, CacheError> {
         trace!("insert(key={:?})", key);
 
         if let Some(&entry_ptr) = self.map.get(&key) {
             let entry = unsafe { &mut *entry_ptr };
             let p = &entry.page;
 
+            // if the existing page is neither loaded nor locked, this means that it's garbage
+            // from an aborted read_page operation. We can evict it and insert the new page.
             if !p.is_loaded() && !p.is_locked() {
                 // evict, then continue with fresh insert
                 self._delete(key, true)?;
@@ -185,7 +407,7 @@ impl PageCache {
                 entry.bump_ref();
                 if update_in_place {
                     entry.page = value;
-                    return Ok(());
+                    return Ok(entry.page.clone());
                 } else {
                     turso_assert!(
                         Arc::ptr_eq(&entry.page, &value),
@@ -197,9 +419,15 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1)?;
+        match self.make_room_for(1) {
+            Err(CacheError::Full) => {
+                self.evict(1, EvictionMode::Aggressive)?;
+            }
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
 
-        let entry = PageCacheEntry::new(key, value);
+        let entry = PageCacheEntry::new(key, value.clone());
 
         if self.clock_hand.is_null() {
             // First entry - just push it
@@ -221,7 +449,7 @@ impl PageCache {
             }
         }
 
-        Ok(())
+        Ok(value)
     }
 
     fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
@@ -323,10 +551,9 @@ impl PageCache {
         }
 
         // Evict entries one by one until we're at new capacity
-        while new_cap < self.len() {
-            if self.evict_one().is_err() {
-                return CacheResizeResult::PendingEvictions;
-            }
+        let need = self.len().saturating_sub(new_cap);
+        if self.evict(need, EvictionMode::Sieve).is_err() {
+            return CacheResizeResult::PendingEvictions;
         }
 
         self.capacity = new_cap;
@@ -348,79 +575,14 @@ impl PageCache {
         if n > self.capacity {
             return Err(CacheError::Full);
         }
-        let available = self.capacity - self.len();
+        let available = self.capacity.saturating_sub(self.len());
         if n <= available {
             return Ok(());
         }
 
         let need = n - available;
-        for _ in 0..need {
-            self.evict_one()?;
-        }
+        self.evict(need, EvictionMode::Sieve)?;
         Ok(())
-    }
-
-    /// Evicts a single page using the SIEVE algorithm
-    /// Unlike make_room_for(), this ignores capacity and always tries to evict one page
-    fn evict_one(&mut self) -> Result<(), CacheError> {
-        if self.len() == 0 {
-            return Err(CacheError::InternalError(
-                "Cannot evict from empty cache".into(),
-            ));
-        }
-
-        let mut examined = 0usize;
-        let max_examinations = self.len().saturating_mul(REF_MAX as usize + 1);
-
-        while examined < max_examinations {
-            // Clock hand should never be null here since we checked len() > 0
-            assert!(
-                !self.clock_hand.is_null(),
-                "clock hand is null but cache has {} entries",
-                self.len()
-            );
-
-            let entry_ptr = self.clock_hand;
-            let entry = unsafe { &mut *entry_ptr };
-            let key = entry.key;
-            let page = &entry.page;
-
-            let evictable = !page.is_dirty() && !page.is_locked() && !page.is_pinned();
-
-            if evictable && entry.ref_bit == CLEAR {
-                // Evict this entry
-                self.advance_clock_hand();
-                // Check if clock hand wrapped back to the same entry (meaning this is the only/last entry)
-                if self.clock_hand == entry_ptr {
-                    self.clock_hand = std::ptr::null_mut();
-                }
-
-                self.map.remove(&key);
-
-                // Clean the page
-                page.clear_loaded();
-                let _ = page.get().contents.take();
-
-                // Remove from queue
-                unsafe {
-                    let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
-                    cursor.remove();
-                }
-
-                return Ok(());
-            } else if evictable {
-                // Decrement ref bit and continue
-                entry.decrement_ref();
-                self.advance_clock_hand();
-                examined += 1;
-            } else {
-                // Skip unevictable page
-                self.advance_clock_hand();
-                examined += 1;
-            }
-        }
-
-        Err(CacheError::Full)
     }
 
     pub fn clear(&mut self, clear_dirty: bool) -> Result<(), CacheError> {
@@ -473,7 +635,7 @@ impl PageCache {
                 i,
                 entry.key,
                 page.get().flags.load(Ordering::SeqCst),
-                page.get().pin_count.load(Ordering::SeqCst),
+                page.get().pin_flags.load(Ordering::SeqCst),
                 entry.ref_bit,
             );
             cursor.move_next();
@@ -538,9 +700,7 @@ impl PageCache {
 
 impl Default for PageCache {
     fn default() -> Self {
-        PageCache::new(
-            DEFAULT_PAGE_CACHE_SIZE_IN_PAGES_MAKE_ME_SMALLER_ONCE_WAL_SPILL_IS_IMPLEMENTED,
-        )
+        PageCache::new(DEFAULT_PAGE_CACHE_SIZE_IN_PAGES)
     }
 }
 
