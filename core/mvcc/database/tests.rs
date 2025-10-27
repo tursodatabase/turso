@@ -1612,3 +1612,27 @@ fn test_cursor_with_btree_and_mvcc() {
     assert_eq!(rows[0], vec![Value::Integer(1)]);
     assert_eq!(rows[1], vec![Value::Integer(2)]);
 }
+
+#[test]
+fn test_cursor_with_btree_and_mvcc_2() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::Integer(1)]);
+    assert_eq!(rows[1], vec![Value::Integer(2)]);
+    assert_eq!(rows[2], vec![Value::Integer(3)]);
+}
