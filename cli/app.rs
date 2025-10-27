@@ -856,15 +856,34 @@ impl Limbo {
                         indent_count: usize,
                         curr_insn: &str,
                         prev_insn: &str,
+                        p1: &str,
+                        unclosed_begin_subrtns: &mut Vec<String>,
                     ) -> usize {
                         let indent_count = match prev_insn {
                             "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
-                            | "SeekLT" => indent_count + 1,
+                            | "SeekLT" | "BeginSubrtn" => indent_count + 1,
                             _ => indent_count,
                         };
 
+                        // The corresponding closing instruction for BeginSubrtn is Return,
+                        // but Return is also used for other purposes, so we need to track pairs of
+                        // BeginSubrtn and Return that share the same 1st parameter (the subroutine register).
+                        if curr_insn == "BeginSubrtn" {
+                            unclosed_begin_subrtns.push(p1.to_string());
+                        }
+
                         match curr_insn {
                             "Next" | "SorterNext" | "Prev" => indent_count - 1,
+                            "Return" => {
+                                let matching_begin_subrtn =
+                                    unclosed_begin_subrtns.iter().position(|b| b == p1);
+                                if let Some(matching_begin_subrtn) = matching_begin_subrtn {
+                                    unclosed_begin_subrtns.remove(matching_begin_subrtn);
+                                    indent_count - 1
+                                } else {
+                                    indent_count
+                                }
+                            }
                             _ => indent_count,
                         }
                     }
@@ -879,16 +898,24 @@ impl Limbo {
                     let mut prev_insn: String = "".to_string();
                     let mut indent_count = 0;
                     let indent = "  ";
+                    let mut unclosed_begin_subrtns = vec![];
                     loop {
                         row_step_result_query!(self, sql, rows, statistics, {
                             let row = rows.row().unwrap();
                             let insn = row.get_value(1).to_string();
-                            indent_count = get_explain_indent(indent_count, &insn, &prev_insn);
+                            let p1 = row.get_value(2).to_string();
+                            indent_count = get_explain_indent(
+                                indent_count,
+                                &insn,
+                                &prev_insn,
+                                &p1,
+                                &mut unclosed_begin_subrtns,
+                            );
                             let _ = self.writeln(format!(
                                 "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
                                 row.get_value(0).to_string(),
                                 &(indent.repeat(indent_count) + &insn),
-                                row.get_value(2).to_string(),
+                                p1,
                                 row.get_value(3).to_string(),
                                 row.get_value(4).to_string(),
                                 row.get_value(5).to_string(),
