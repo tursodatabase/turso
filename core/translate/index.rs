@@ -172,7 +172,7 @@ pub fn translate_create_index(
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
-    let index_cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
+    let index_cursor_id = program.alloc_cursor_index(None, &idx)?;
     let table_cursor_id = program.alloc_cursor_id_keyed(
         CursorKey::table(table_ref),
         CursorType::BTreeTable(tbl.clone()),
@@ -201,11 +201,20 @@ pub fn translate_create_index(
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: 0,
-        root: root_page_reg,
-        flags: CreateBTreeFlags::new_index(),
-    });
+    if !idx.is_backing_btree_index() {
+        program.emit_insn(Insn::IndexMethodCreate {
+            db: 0,
+            cursor_id: index_cursor_id,
+        });
+        // index method sqlite_schema row always has root_page equals to zero in the schema (same as virtual tables)
+        program.emit_int(0, root_page_reg);
+    } else {
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: root_page_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
+    }
 
     // open the sqlite schema table for writing and create a new entry for the index
     program.emit_insn(Insn::OpenWrite {
@@ -226,7 +235,92 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
-    if index_method.is_none() {
+    if index_method
+        .as_ref()
+        .is_some_and(|m| !m.definition().backing_btree)
+    {
+        // open the table we are creating the index on for reading
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor_id,
+            root_page: tbl.root_page,
+            db: 0,
+        });
+
+        // Open the index btree we created for writing to insert the
+        // newly sorted index records.
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: index_cursor_id,
+            root_page: RegisterOrLiteral::Register(root_page_reg),
+            db: 0,
+        });
+
+        let loop_start_label = program.allocate_label();
+        let loop_end_label = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: table_cursor_id,
+            pc_if_empty: loop_end_label,
+        });
+        program.preassign_label_to_next_insn(loop_start_label);
+
+        // Loop start:
+        // Collect index values into start_reg..rowid_reg
+        // emit MakeRecord (index key + rowid) into record_reg.
+        //
+        // Then insert the record into the sorter
+        let mut skip_row_label = None;
+        if let Some(where_clause) = where_clause {
+            let label = program.allocate_label();
+            translate_condition_expr(
+                &mut program,
+                &table_references,
+                &where_clause,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label,
+                    jump_target_when_true: BranchOffset::Placeholder,
+                    jump_target_when_null: label,
+                },
+                resolver,
+            )?;
+            skip_row_label = Some(label);
+        }
+
+        let start_reg = program.alloc_registers(columns.len() + 1);
+        for (i, col) in columns.iter().enumerate() {
+            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+        }
+        let rowid_reg = start_reg + columns.len();
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: rowid_reg,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg,
+            count: columns.len() + 1,
+            dest_reg: record_reg,
+            index_name: Some(idx_name.clone()),
+            affinity_str: None,
+        });
+
+        // insert new index record
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: index_cursor_id,
+            record_reg,
+            unpacked_start: Some(start_reg),
+            unpacked_count: Some((columns.len() + 1) as u16),
+            flags: IdxInsertFlags::new().use_seek(false),
+        });
+
+        if let Some(skip_row_label) = skip_row_label {
+            program.resolve_label(skip_row_label, program.offset());
+        }
+        program.emit_insn(Insn::Next {
+            cursor_id: table_cursor_id,
+            pc_if_next: loop_start_label,
+        });
+        program.preassign_label_to_next_insn(loop_end_label);
+    } else if index_method.is_none() {
         // determine the order of the columns in the index for the sorter
         let order = idx.columns.iter().map(|c| c.order).collect();
         // open the sorter and the pseudo table
@@ -642,20 +736,24 @@ pub fn translate_drop_index(
         p5: 0,
     });
 
-    // Destroy index btree
-    program.emit_insn(Insn::Destroy {
-        root: maybe_index.unwrap().root_page,
-        former_root_reg: 0,
-        is_temp: 0,
-    });
-
-    // Remove from the Schema any mention of the index
-    if let Some(idx) = maybe_index {
-        program.emit_insn(Insn::DropIndex {
-            index: idx.clone(),
-            db: 0,
+    let index = maybe_index.unwrap();
+    if !index.is_backing_btree_index() {
+        let cursor_id = program.alloc_cursor_index(None, index)?;
+        program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
+    } else {
+        // Destroy index btree
+        program.emit_insn(Insn::Destroy {
+            root: index.root_page,
+            former_root_reg: 0,
+            is_temp: 0,
         });
     }
+
+    // Remove from the Schema any mention of the index
+    program.emit_insn(Insn::DropIndex {
+        index: index.clone(),
+        db: 0,
+    });
 
     Ok(program)
 }
