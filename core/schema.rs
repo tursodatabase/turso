@@ -3,6 +3,7 @@ use crate::incremental::view::IncrementalView;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
+use crate::translate::index::resolve_sorted_columns;
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
@@ -2449,27 +2450,7 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let mut index_columns = Vec::with_capacity(columns.len());
-                for col in columns.into_iter() {
-                    let name = normalize_ident(match col.expr.as_ref() {
-                        Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
-                        _ => crate::bail_parse_error!("cannot use expressions in CREATE INDEX"),
-                    });
-                    let Some((pos_in_table, _)) = table.get_column(&name) else {
-                        return Err(crate::LimboError::InternalError(format!(
-                            "Column {} is in index {} but not found in table {}",
-                            name, index_name, table.name
-                        )));
-                    };
-                    let (_, column) = table.get_column(&name).unwrap();
-                    index_columns.push(IndexColumn {
-                        name,
-                        order: col.order.unwrap_or(SortOrder::Asc),
-                        pos_in_table,
-                        collation: column.collation,
-                        default: column.default.clone(),
-                    });
-                }
+                let index_columns = resolve_sorted_columns(table, &columns)?;
                 Ok(Index {
                     name: index_name,
                     table_name: normalize_ident(tbl_name.as_str()),

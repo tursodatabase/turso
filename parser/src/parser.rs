@@ -3579,6 +3579,57 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_create_index_using(&mut self) -> Result<Option<Name>> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == Some(TK_USING) {
+                eat_assert!(self, TK_USING);
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
+
+        Ok(Some(self.parse_nm()?))
+    }
+
+    fn parse_with_parameter(&mut self) -> Result<(Name, Box<Expr>)> {
+        let name = self.parse_nm()?;
+        eat_expect!(self, TK_EQ);
+        let value = self.parse_term()?;
+        Ok((name, value))
+    }
+
+    fn parse_with_parameters(&mut self) -> Result<Vec<(Name, Box<Expr>)>> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == Some(TK_WITH) {
+                eat_assert!(self, TK_WITH);
+            } else {
+                return Ok(Vec::new());
+            }
+        } else {
+            return Ok(Vec::new());
+        }
+
+        eat_expect!(self, TK_LP);
+        let mut parameters = vec![];
+        let mut first = true;
+        loop {
+            let tok = peek_expect!(self, TK_RP, TK_COMMA, TK_ID);
+            if tok.token_type == Some(TK_RP) {
+                break;
+            }
+            if !first {
+                eat_expect!(self, TK_COMMA);
+            }
+            first = false;
+            parameters.push(self.parse_with_parameter()?);
+        }
+        eat_expect!(self, TK_RP);
+
+        Ok(parameters)
+    }
+
     fn parse_create_index(&mut self) -> Result<Stmt> {
         let tok = eat_assert!(self, TK_INDEX, TK_UNIQUE);
         let has_unique = tok.token_type == Some(TK_UNIQUE);
@@ -3590,16 +3641,23 @@ impl<'a> Parser<'a> {
         let idx_name = self.parse_fullname(false)?;
         eat_expect!(self, TK_ON);
         let tbl_name = self.parse_nm()?;
+
+        let using = self.parse_create_index_using()?;
+
         eat_expect!(self, TK_LP);
         let columns = self.parse_sort_list()?;
         eat_expect!(self, TK_RP);
+
+        let with_clause = self.parse_with_parameters()?;
         let where_clause = self.parse_where()?;
 
         Ok(Stmt::CreateIndex {
             if_not_exists,
             idx_name,
             tbl_name,
+            using,
             columns,
+            with_clause,
             where_clause,
             unique: has_unique,
         })
@@ -9998,6 +10056,8 @@ mod tests {
                         nulls: None,
                     }],
                     where_clause: None,
+                    using: None,
+                    with_clause: Vec::new(),
                 })],
             ),
             (
@@ -10018,7 +10078,9 @@ mod tests {
                     }],
                     where_clause: Some(Box::new(
                         Expr::Literal(Literal::Numeric("1".to_owned()))
-                      )),
+                    )),
+                    using: None,
+                    with_clause: Vec::new(),
                 })],
             ),
             // parse create table
@@ -11558,6 +11620,32 @@ mod tests {
                         constraints: vec![],
                         options: TableOptions::NONE,
                     },
+                })],
+            ),
+            (
+                b"CREATE INDEX t_idx ON t USING custom_index (x) WITH (a = 1, b = 'test', c = x'deadbeef', d = NULL)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateIndex {
+                    unique: false,
+                    if_not_exists: false,
+                    idx_name: QualifiedName {
+                        db_name: None,
+                        name: Name::exact("t_idx".to_owned()),
+                        alias: None,
+                    },
+                    tbl_name: Name::exact("t".to_owned()),
+                    columns: vec![SortedColumn {
+                        expr: Box::new(Expr::Id(Name::exact("x".to_owned()))),
+                        order: None,
+                        nulls: None,
+                    }],
+                    where_clause: None,
+                    using: Some(Name::exact("custom_index".to_owned())),
+                    with_clause: vec![
+                        (Name::exact("a".to_string()), Box::new(Expr::Literal(Literal::Numeric("1".to_string())))),
+                        (Name::exact("b".to_string()), Box::new(Expr::Literal(Literal::String("'test'".to_string())))),
+                        (Name::exact("c".to_string()), Box::new(Expr::Literal(Literal::Blob("deadbeef".to_string())))),
+                        (Name::exact("d".to_string()), Box::new(Expr::Literal(Literal::Null))),
+                    ],
                 })],
             )
         ];

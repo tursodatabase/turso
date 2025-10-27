@@ -294,7 +294,9 @@ impl ToTokens for Stmt {
                 if_not_exists,
                 idx_name,
                 tbl_name,
+                using,
                 columns,
+                with_clause,
                 where_clause,
             } => {
                 s.append(TK_CREATE, None)?;
@@ -310,9 +312,28 @@ impl ToTokens for Stmt {
                 idx_name.to_tokens(s, context)?;
                 s.append(TK_ON, None)?;
                 tbl_name.to_tokens(s, context)?;
+                if let Some(using) = using {
+                    s.append(TK_USING, None)?;
+                    using.to_tokens(s, context)?;
+                }
                 s.append(TK_LP, None)?;
                 comma(columns, s, context)?;
                 s.append(TK_RP, None)?;
+                if !with_clause.is_empty() {
+                    s.append(TK_WITH, None)?;
+                    s.append(TK_LP, None)?;
+                    let mut first = true;
+                    for (name, value) in with_clause.iter() {
+                        if !first {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        first = false;
+                        name.to_tokens(s, context)?;
+                        s.append(TK_EQ, None)?;
+                        value.to_tokens(s, context)?;
+                    }
+                    s.append(TK_RP, None)?;
+                }
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
                     where_clause.to_tokens(s, context)?;

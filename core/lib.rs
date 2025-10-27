@@ -113,6 +113,7 @@ pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
+    pub enable_index_method: bool,
     enable_load_extension: bool,
 }
 
@@ -124,6 +125,7 @@ impl Default for DatabaseOpts {
             enable_views: false,
             enable_strict: false,
             enable_encryption: false,
+            enable_index_method: false,
             enable_load_extension: false,
         }
     }
@@ -162,6 +164,11 @@ impl DatabaseOpts {
 
     pub fn with_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_index_method(mut self, enable: bool) -> Self {
+        self.enable_index_method = enable;
         self
     }
 }
@@ -580,7 +587,7 @@ impl Database {
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
-            is_nested_stmt: AtomicBool::new(false),
+            nestedness: AtomicI32::new(0),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
@@ -870,6 +877,10 @@ impl Database {
         self.opts.enable_views
     }
 
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.opts.enable_index_method
+    }
+
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
     }
@@ -1094,9 +1105,13 @@ pub struct Connection {
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
-    /// Whether the connection is executing a statement initiated by another statement.
-    /// Generally this is only true for ParseSchema.
-    is_nested_stmt: AtomicBool,
+    /// Greater than zero if connection executes a program within a program
+    /// This is necessary in order for connection to not "finalize" transaction (commit/abort) when program ends
+    /// (because parent program is still pending and it will handle "finalization" instead)
+    ///
+    /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
+    /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
+    nestedness: AtomicI32,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
@@ -1128,6 +1143,18 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
+    pub fn is_nested_stmt(&self) -> bool {
+        self.nestedness.load(Ordering::SeqCst) > 0
+    }
+    /// starts nested program execution
+    pub fn start_nested(&self) {
+        self.nestedness.fetch_add(1, Ordering::SeqCst);
+    }
+    /// ends nested program execution
+    pub fn end_nested(&self) {
+        self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
             // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
@@ -1458,6 +1485,8 @@ impl Connection {
         strict: bool,
         // flag to opt-in encryption support
         encryption: bool,
+        // flag to opt-in custom modules support
+        custom_modules: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1473,7 +1502,8 @@ impl Connection {
                     .with_indexes(use_indexes)
                     .with_views(views)
                     .with_strict(strict)
-                    .with_encryption(encryption),
+                    .with_encryption(encryption)
+                    .with_index_method(custom_modules),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1502,7 +1532,8 @@ impl Connection {
                 .with_indexes(use_indexes)
                 .with_views(views)
                 .with_strict(strict)
-                .with_encryption(encryption),
+                .with_encryption(encryption)
+                .with_index_method(custom_modules),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -1979,6 +2010,10 @@ impl Connection {
 
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
+    }
+
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.db.experimental_index_method_enabled()
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {
@@ -2681,12 +2716,7 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self
-            .program
-            .connection
-            .is_nested_stmt
-            .load(Ordering::SeqCst)
-        {
+        if self.program.connection.is_nested_stmt() {
             return res;
         }
         if res.is_err() {

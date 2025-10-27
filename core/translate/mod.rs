@@ -152,23 +152,9 @@ pub fn translate_inner(
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
         ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
-        ast::Stmt::CreateIndex {
-            unique,
-            if_not_exists,
-            idx_name,
-            tbl_name,
-            columns,
-            where_clause,
-        } => translate_create_index(
-            (unique, if_not_exists),
-            resolver,
-            &idx_name.name,
-            &tbl_name,
-            &columns,
-            program,
-            connection,
-            where_clause,
-        )?,
+        ast::Stmt::CreateIndex { .. } => {
+            translate_create_index(program, connection, resolver, stmt)?
+        }
         ast::Stmt::CreateTable {
             temporary,
             if_not_exists,
