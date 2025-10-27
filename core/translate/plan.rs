@@ -795,6 +795,12 @@ impl ColumnUsedMask {
     }
 }
 
+impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
+    fn bitor_assign(&mut self, rhs: &Self) {
+        self.0 |= &rhs.0;
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
