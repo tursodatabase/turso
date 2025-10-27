@@ -1,4 +1,4 @@
--- LIMBO_SKIP: subquery in where not supported
+-- LIMBO_SKIP: query 17 is slow as hell in both Turso and Sqlite
 
 
 select
