@@ -243,7 +243,7 @@ pub fn emit_program(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-fn emit_program_for_select(
+pub fn emit_program_for_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: SelectPlan,

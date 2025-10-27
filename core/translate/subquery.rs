@@ -7,6 +7,7 @@ use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
+        emitter::emit_program_for_select,
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
@@ -470,4 +471,89 @@ pub fn emit_from_clause_subquery(
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
+}
+
+/// Translate a subquery that is not part of the FROM clause.
+/// If a subquery is uncorrelated (i.e. does not reference columns from the outer query),
+/// it will be executed only once.
+///
+/// If it is correlated (i.e. references columns from the outer query),
+/// it will be executed for each row of the outer query.
+///
+/// The result of the subquery is stored in:
+///
+/// - a single register for EXISTS subqueries,
+/// - a range of registers for RowValue subqueries,
+/// - an ephemeral index for IN subqueries.
+pub fn emit_non_from_clause_subquery(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: SelectPlan,
+    query_type: &SubqueryType,
+    is_correlated: bool,
+) -> Result<()> {
+    program.incr_nesting();
+
+    let label_skip_after_first_run = if !is_correlated {
+        let label = program.allocate_label();
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    } else {
+        None
+    };
+
+    match query_type {
+        SubqueryType::Exists { result_reg, .. } => {
+            let subroutine_reg = program.alloc_register();
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine_reg,
+                dest_end: None,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: *result_reg,
+            });
+            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine_reg,
+                can_fallthrough: true,
+            });
+        }
+        SubqueryType::In { cursor_id } => {
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: *cursor_id,
+                is_table: false,
+            });
+            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+        }
+        SubqueryType::RowValue {
+            result_reg_start,
+            num_regs,
+        } => {
+            let subroutine_reg = program.alloc_register();
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine_reg,
+                dest_end: None,
+            });
+            for result_reg in *result_reg_start..*result_reg_start + *num_regs {
+                program.emit_insn(Insn::Null {
+                    dest: result_reg,
+                    dest_end: None,
+                });
+            }
+            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine_reg,
+                can_fallthrough: true,
+            });
+        }
+    }
+    if let Some(label) = label_skip_after_first_run {
+        program.preassign_label_to_next_insn(label);
+    }
+
+    program.decr_nesting();
+    Ok(())
 }
