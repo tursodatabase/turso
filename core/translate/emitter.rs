@@ -364,6 +364,8 @@ pub fn emit_query<'a>(
         plan.group_by.as_ref(),
         OperationMode::SELECT,
         &plan.where_clause,
+        &plan.join_order,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     if plan.is_simple_count() {
@@ -380,6 +382,7 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         None,
         OperationMode::SELECT,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -463,6 +466,8 @@ fn emit_program_for_delete(
         None,
         OperationMode::DELETE,
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Set up main query execution loop
@@ -474,6 +479,7 @@ fn emit_program_for_delete(
         &plan.where_clause,
         None,
         OperationMode::DELETE,
+        &mut [],
     )?;
 
     emit_delete_insns(
@@ -963,6 +969,8 @@ fn emit_program_for_update(
         None,
         mode.clone(),
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Prepare index cursors
@@ -999,6 +1007,7 @@ fn emit_program_for_update(
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
+        &mut [],
     )?;
 
     let target_table_cursor_id =

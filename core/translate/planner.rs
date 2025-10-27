@@ -13,6 +13,7 @@ use super::{
 use crate::translate::{
     emitter::Resolver,
     expr::{BindingBehavior, WalkControl},
+    plan::{NonFromClauseSubquery, SubqueryState},
 };
 use crate::{
     ast::Limit,
@@ -776,6 +777,7 @@ pub fn parse_where(
 pub fn determine_where_to_eval_term(
     term: &WhereTerm,
     join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
         return Ok(EvalAt::Loop(
@@ -786,7 +788,7 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    determine_where_to_eval_expr(&term.expr, join_order)
+    determine_where_to_eval_expr(&term.expr, join_order, subqueries)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -921,16 +923,50 @@ pub fn table_mask_from_expr(
 pub fn determine_where_to_eval_expr(
     top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<EvalAt> {
+    // If the expression references no tables, it can be evaluated before any table loops are opened.
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
     walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let join_idx = join_order
-                    .iter()
-                    .position(|t| t.table_id == *table)
-                    .unwrap_or(usize::MAX);
+                let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
+                    // Must be an outer query reference; in that case, the table is already in scope.
+                    return Ok(WalkControl::Continue);
+                };
                 eval_at = eval_at.max(EvalAt::Loop(join_idx));
+            }
+            // Given something like WHERE t.a = (SELECT ...), we can only evaluate that expression
+            // when all both table 't' and all outer scope tables referenced by the subquery OR its nested subqueries are in scope.
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                match &subquery.state {
+                    SubqueryState::Evaluated { evaluated_at } => {
+                        eval_at = eval_at.max(*evaluated_at);
+                    }
+                    SubqueryState::Unevaluated { plan } => {
+                        let used_outer_refs = plan
+                            .as_ref()
+                            .unwrap()
+                            .table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used());
+                        for outer_ref in used_outer_refs {
+                            let Some(join_idx) = join_order
+                                .iter()
+                                .position(|t| t.table_id == outer_ref.internal_id)
+                            else {
+                                continue;
+                            };
+                            eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                        }
+                        return Ok(WalkControl::Continue);
+                    }
+                }
             }
             _ => {}
         }

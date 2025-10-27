@@ -108,28 +108,41 @@ pub struct WhereTerm {
 }
 
 impl WhereTerm {
-    pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_before_loop(
+        &self,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
     }
 
-    pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_at_loop(
+        &self,
+        loop_idx: usize,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
     }
 
-    fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order)
+    fn eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> Result<EvalAt> {
+        determine_where_to_eval_term(self, join_order, subqueries)
     }
 }
 
