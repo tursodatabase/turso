@@ -6,7 +6,6 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY, val TEXT);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
 
@@ -91,7 +90,7 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
 fn test_integer_primary_key() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);", false);
+        TempDatabase::new_with_rusqlite("CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     for query in &[

@@ -9,7 +9,7 @@ const ENABLE_ENCRYPTION: bool = true;
 fn test_per_page_encryption() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_name = format!("test-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     {
@@ -199,7 +199,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
 fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_name = format!("test-8k-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     {
@@ -261,7 +261,7 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
 fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_name = format!("test-corruption-magic-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     {
@@ -331,7 +331,7 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
 fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_name = format!("test-corruption-ad-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     {
@@ -365,7 +365,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
             corrupt_pos,
             rng().next_u32()
         );
-        let test_tmp_db = TempDatabase::new(&test_db_name, false);
+        let test_tmp_db = TempDatabase::new(&test_db_name);
         let test_db_path = test_tmp_db.path.clone();
         std::fs::copy(&db_path, &test_db_path)?;
 
@@ -509,7 +509,7 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
 
     for (cipher_name, expected_id, description, hexkey) in test_cases {
         let db_name = format!("test-header-{}-{}.db", cipher_name, rng().next_u32());
-        let tmp_db = TempDatabase::new(&db_name, false);
+        let tmp_db = TempDatabase::new(&db_name);
         let db_path = tmp_db.path.clone();
 
         {

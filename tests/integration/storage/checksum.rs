@@ -7,7 +7,7 @@ use turso_core::Row;
 fn test_per_page_checksum() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db_name = format!("test-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     {
@@ -65,7 +65,7 @@ fn test_per_page_checksum() -> anyhow::Result<()> {
 fn test_checksum_detects_corruption() {
     let _ = env_logger::try_init();
     let db_name = format!("test-corruption-{}.db", rng().next_u32());
-    let tmp_db = TempDatabase::new(&db_name, false);
+    let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
     // Create and populate the database
@@ -98,7 +98,7 @@ fn test_checksum_detects_corruption() {
     }
 
     {
-        let existing_db = TempDatabase::new_with_existent(&db_path, false);
+        let existing_db = TempDatabase::new_with_existent(&db_path);
         // this query should fail and result in panic because db is now corrupted
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let conn = existing_db.connect_limbo();

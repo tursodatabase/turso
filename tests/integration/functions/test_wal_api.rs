@@ -13,7 +13,7 @@ use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
 
 #[test]
 fn test_wal_frame_count() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     assert_eq!(conn.wal_state().unwrap().max_frame, 0);
     conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -29,9 +29,9 @@ fn test_wal_frame_count() {
 
 #[test]
 fn test_wal_frame_transfer_no_schema_changes() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -68,9 +68,9 @@ fn test_wal_frame_transfer_no_schema_changes() {
 
 #[test]
 fn test_wal_frame_transfer_various_schema_changes() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     let conn3 = db2.connect_limbo();
     conn1
@@ -127,9 +127,9 @@ fn test_wal_frame_transfer_various_schema_changes() {
 
 #[test]
 fn test_wal_frame_transfer_schema_changes() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -166,9 +166,9 @@ fn test_wal_frame_transfer_schema_changes() {
 
 #[test]
 fn test_wal_frame_transfer_no_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -205,9 +205,9 @@ fn test_wal_frame_transfer_no_schema_changes_rollback() {
 
 #[test]
 fn test_wal_frame_transfer_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -240,9 +240,9 @@ fn test_wal_frame_transfer_schema_changes_rollback() {
 
 #[test]
 fn test_wal_frame_conflict() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -259,9 +259,9 @@ fn test_wal_frame_conflict() {
 
 #[test]
 fn test_wal_frame_far_away_write() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -287,9 +287,9 @@ fn test_wal_frame_far_away_write() {
 fn test_wal_frame_api_no_schema_changes_fuzz() {
     let (mut rng, _) = rng_from_time();
     for _ in 0..4 {
-        let db1 = TempDatabase::new_empty(false);
+        let db1 = TempDatabase::new_empty();
         let conn1 = db1.connect_limbo();
-        let db2 = TempDatabase::new_empty(false);
+        let db2 = TempDatabase::new_empty();
         let conn2 = db2.connect_limbo();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -342,7 +342,7 @@ fn test_wal_frame_api_no_schema_changes_fuzz() {
 
 #[test]
 fn test_wal_api_changed_pages() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -421,7 +421,7 @@ fn revert_to(conn: &Arc<turso_core::Connection>, frame_watermark: u64) -> turso_
 
 #[test]
 fn test_wal_api_revert_pages() {
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -465,7 +465,7 @@ fn test_wal_api_revert_pages() {
 
 #[test]
 fn test_wal_upper_bound_passive() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer
@@ -499,7 +499,7 @@ fn test_wal_upper_bound_passive() {
 
         let db_path_copy = format!("{}-{}-copy", db.path.to_str().unwrap(), watermark);
         std::fs::copy(&db.path, db_path_copy.clone()).unwrap();
-        let db_copy = TempDatabase::new_with_existent(&PathBuf::from(db_path_copy), false);
+        let db_copy = TempDatabase::new_with_existent(&PathBuf::from(db_path_copy));
         let conn = db_copy.connect_limbo();
         let mut stmt = conn.prepare("select * from test").unwrap();
         let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
@@ -520,7 +520,7 @@ fn test_wal_upper_bound_passive() {
 
 #[test]
 fn test_wal_upper_bound_truncate() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer
@@ -548,7 +548,7 @@ fn test_wal_upper_bound_truncate() {
 
 #[test]
 fn test_wal_state_checkpoint_seq() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer
@@ -586,7 +586,7 @@ fn test_wal_state_checkpoint_seq() {
 
 #[test]
 fn test_wal_checkpoint_no_work() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
     let reader = db.connect_limbo();
 
@@ -631,7 +631,7 @@ fn test_wal_checkpoint_no_work() {
 
 #[test]
 fn test_wal_revert_change_db_size() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer.execute("create table t(x, y)").unwrap();
@@ -678,7 +678,7 @@ fn test_wal_revert_change_db_size() {
 
 #[test]
 fn test_wal_api_exec_commit() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer
@@ -725,7 +725,7 @@ fn test_wal_api_exec_commit() {
 
 #[test]
 fn test_wal_api_exec_rollback() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let writer = db.connect_limbo();
 
     writer
@@ -760,7 +760,7 @@ fn test_wal_api_exec_rollback() {
 
 #[test]
 fn test_wal_api_insert_exec_mix() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
     conn.execute("create table a(x, y)").unwrap();
@@ -928,9 +928,9 @@ fn test_db_share_same_file() {
 #[test]
 fn test_wal_api_simulate_spilled_frames() {
     let (mut rng, _) = rng_from_time();
-    let db1 = TempDatabase::new_empty(false);
+    let db1 = TempDatabase::new_empty();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty(false);
+    let db2 = TempDatabase::new_empty();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")

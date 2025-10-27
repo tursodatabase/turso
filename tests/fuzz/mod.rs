@@ -23,7 +23,7 @@ mod fuzz_tests {
     /// [See this issue for more info](https://github.com/tursodatabase/turso/issues/1763)
     #[test]
     pub fn fuzz_failure_issue_1763() {
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
@@ -37,7 +37,7 @@ mod fuzz_tests {
 
     #[test]
     pub fn arithmetic_expression_fuzz_ex1() {
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -56,10 +56,8 @@ mod fuzz_tests {
 
     #[test]
     pub fn rowid_seek_fuzz() {
-        let db = TempDatabase::new_with_rusqlite(
-            "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)",
-            false,
-        ); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+        let db =
+            TempDatabase::new_with_rusqlite("CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
@@ -173,7 +171,7 @@ mod fuzz_tests {
 
     #[test]
     pub fn index_scan_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x PRIMARY KEY)", true);
+        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x PRIMARY KEY)");
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let insert = format!(
@@ -234,14 +232,14 @@ mod fuzz_tests {
         ];
         // Create all different 3-column primary key permutations
         let dbs = [
-            TempDatabase::new_with_rusqlite(table_defs[0], true),
-            TempDatabase::new_with_rusqlite(table_defs[1], true),
-            TempDatabase::new_with_rusqlite(table_defs[2], true),
-            TempDatabase::new_with_rusqlite(table_defs[3], true),
-            TempDatabase::new_with_rusqlite(table_defs[4], true),
-            TempDatabase::new_with_rusqlite(table_defs[5], true),
-            TempDatabase::new_with_rusqlite(table_defs[6], true),
-            TempDatabase::new_with_rusqlite(table_defs[7], true),
+            TempDatabase::new_with_rusqlite(table_defs[0]),
+            TempDatabase::new_with_rusqlite(table_defs[1]),
+            TempDatabase::new_with_rusqlite(table_defs[2]),
+            TempDatabase::new_with_rusqlite(table_defs[3]),
+            TempDatabase::new_with_rusqlite(table_defs[4]),
+            TempDatabase::new_with_rusqlite(table_defs[5]),
+            TempDatabase::new_with_rusqlite(table_defs[6]),
+            TempDatabase::new_with_rusqlite(table_defs[7]),
         ];
         let mut pk_tuples = HashSet::new();
         while pk_tuples.len() < 100000 {
@@ -565,7 +563,7 @@ mod fuzz_tests {
         // Create databases for each variant using rusqlite, then open limbo on the same file.
         let dbs: Vec<TempDatabase> = table_defs
             .iter()
-            .map(|ddl| TempDatabase::new_with_rusqlite(ddl, true))
+            .map(|ddl| TempDatabase::new_with_rusqlite(ddl))
             .collect();
 
         // Seed data focuses on case and trailing spaces to exercise NOCASE and RTRIM semantics.
@@ -664,8 +662,8 @@ mod fuzz_tests {
         for outer in 0..OUTER_ITERS {
             println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1003,8 +1001,8 @@ mod fuzz_tests {
         for outer in 0..OUTER_ITERS {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1314,8 +1312,8 @@ mod fuzz_tests {
 
         // parent rowid, child textified integers -> MustBeInt coercion path
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1380,8 +1378,8 @@ mod fuzz_tests {
 
         // slf-referential rowid FK
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1443,8 +1441,8 @@ mod fuzz_tests {
 
         // self-referential UNIQUE(u,v) parent (fast-path for composite)
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1523,8 +1521,8 @@ mod fuzz_tests {
 
         // parent TEXT UNIQUE(u,v), child types differ; rely on parent-index affinities
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1650,8 +1648,8 @@ mod fuzz_tests {
                 OUTER_ITERS
             );
 
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1860,8 +1858,8 @@ mod fuzz_tests {
                 i + 1,
                 OUTER_ITERATIONS
             );
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -2088,8 +2086,8 @@ mod fuzz_tests {
             );
 
             // Columns: id (rowid PK), plus a few data columns we can reference in predicates/keys.
-            let limbo_db = TempDatabase::new_empty(true);
-            let sqlite_db = TempDatabase::new_empty(true);
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2431,7 +2429,7 @@ mod fuzz_tests {
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
 
-        let db = TempDatabase::new_empty(true);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2557,7 +2555,7 @@ mod fuzz_tests {
         let (mut rng, seed) = rng_from_time_or_env();
         const ITERATIONS: usize = 1000;
         for i in 0..ITERATIONS {
-            let db = TempDatabase::new_empty(true);
+            let db = TempDatabase::new_empty();
             let conn = db.connect_limbo();
             let num_cols = rng.random_range(1..=5);
             let col_names: Vec<String> = (0..num_cols).map(|c| format!("c{c}")).collect();
@@ -2719,7 +2717,7 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2739,7 +2737,7 @@ mod fuzz_tests {
     #[test]
     pub fn fuzz_ex() {
         let _ = env_logger::try_init();
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2838,7 +2836,7 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2998,7 +2996,7 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3367,7 +3365,7 @@ mod fuzz_tests {
             .push(expr)
             .build();
 
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3401,7 +3399,7 @@ mod fuzz_tests {
                 "SELECT * FROM t",
             ],
         ] {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
             for query in queries.iter() {
@@ -3428,7 +3426,7 @@ mod fuzz_tests {
             let datatype = datatypes[rng.random_range(0..datatypes.len())];
             let create_table = format!("CREATE TABLE t (x {datatype})");
 
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3479,7 +3477,7 @@ mod fuzz_tests {
         log::info!("affinity_fuzz seed: {seed}");
 
         for iteration in 0..500 {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3580,7 +3578,7 @@ mod fuzz_tests {
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3626,7 +3624,7 @@ mod fuzz_tests {
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3670,7 +3668,7 @@ mod fuzz_tests {
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3716,7 +3714,7 @@ mod fuzz_tests {
         log::info!("seed: {seed}");
 
         for _ in 0..100 {
-            let db = TempDatabase::new_empty(false);
+            let db = TempDatabase::new_empty();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3764,7 +3762,7 @@ mod fuzz_tests {
         let predicate = predicate_builders(&g, Some(&tables));
         let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
-        let db = TempDatabase::new_empty(true);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         for table in tables.iter() {
@@ -3855,7 +3853,7 @@ mod fuzz_tests {
 
     #[test]
     pub fn fuzz_distinct() {
-        let db = TempDatabase::new_empty(true);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4174,7 +4172,7 @@ mod fuzz_tests {
             let db_path = tempfile::NamedTempFile::new()?;
 
             {
-                let db = TempDatabase::new_with_existent(db_path.path(), true);
+                let db = TempDatabase::new_with_existent(db_path.path());
 
                 let prev_pending_byte = TempDatabase::get_pending_byte();
                 tracing::debug!(prev_pending_byte);

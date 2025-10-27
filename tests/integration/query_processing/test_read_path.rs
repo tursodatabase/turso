@@ -3,7 +3,7 @@ use turso_core::{LimboError, StepResult, Value};
 
 #[test]
 fn test_statement_reset_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?")?;
@@ -47,7 +47,7 @@ fn test_statement_reset_bind() -> anyhow::Result<()> {
 
 #[test]
 fn test_statement_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?, ?1, :named, ?3, ?4")?;
@@ -112,7 +112,6 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
 
@@ -177,7 +176,6 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d, a, c, b) values (?, ?, ?, ?);")?;
@@ -245,7 +243,6 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d,c,b,a) values (?, ?, ?, ?);")?;
@@ -312,7 +309,6 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a,b,c,d) values (?, ?, ?, ?);")?;
@@ -379,7 +375,6 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
 
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b integer, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (b,a,d,c) values (?, ?, ?, ?), (?, ?, ?, ?);")?;
@@ -445,7 +440,7 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
 
 #[test]
 fn test_bind_parameters_update_query() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);");
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
     loop {
@@ -489,7 +484,6 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
 fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "create table test (a integer, b text, c integer, d integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
@@ -535,10 +529,8 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
 
 #[test]
 fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
-        false,
-    );
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);");
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (id, name) values (1, 'test');")?;
     loop {
@@ -596,7 +588,6 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
 fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'test', 4);")?;
@@ -664,7 +655,6 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
 fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
-        false,
     );
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'correct', 4);")?;
@@ -706,10 +696,8 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
 
 #[test]
 fn test_cte_alias() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
-        false,
-    );
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);");
     let conn = tmp_db.connect_limbo();
     conn.execute("INSERT INTO test (id, name) VALUES (1, 'Limbo');")?;
     conn.execute("INSERT INTO test (id, name) VALUES (2, 'Turso');")?;
@@ -753,7 +741,7 @@ fn test_cte_alias() -> anyhow::Result<()> {
 
 #[test]
 fn test_avg_agg() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x, y);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x, y);");
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into t values (1, null), (2, null), (3, null), (null, null), (4, null)")?;
     let mut rows = Vec::new();
@@ -787,7 +775,7 @@ fn test_avg_agg() -> anyhow::Result<()> {
 
 #[test]
 fn test_offset_limit_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (i INTEGER);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (i INTEGER);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
@@ -830,10 +818,8 @@ fn test_offset_limit_bind() -> anyhow::Result<()> {
 
 #[test]
 fn test_upsert_parameters_order() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);",
-        false,
-    );
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
@@ -879,10 +865,8 @@ fn test_upsert_parameters_order() -> anyhow::Result<()> {
 
 #[test]
 fn test_multiple_connections_visibility() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);",
-        false,
-    );
+    let tmp_db =
+        TempDatabase::new_with_rusqlite("CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
     conn1.execute("BEGIN")?;
@@ -901,7 +885,7 @@ fn test_multiple_connections_visibility() -> anyhow::Result<()> {
 #[test]
 /// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
 fn test_max_joined_tables_limit() {
-    let tmp_db = TempDatabase::new("test_max_joined_tables_limit", false);
+    let tmp_db = TempDatabase::new("test_max_joined_tables_limit");
     let conn = tmp_db.connect_limbo();
 
     // Create 64 tables
@@ -934,7 +918,7 @@ fn test_many_columns() {
     }
     create_sql.push(')');
 
-    let tmp_db = TempDatabase::new("test_many_columns", false);
+    let tmp_db = TempDatabase::new("test_many_columns");
     let conn = tmp_db.connect_limbo();
     conn.execute(&create_sql).unwrap();
 

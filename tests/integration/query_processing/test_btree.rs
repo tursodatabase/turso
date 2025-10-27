@@ -448,7 +448,6 @@ fn test_btree() {
         for attempt in 0..16 {
             let db = TempDatabase::new_with_rusqlite(
                 "create table test (k INTEGER PRIMARY KEY, b BLOB);",
-                false,
             );
             log::info!(
                 "depth: {}, attempt: {}, path: {:?}",

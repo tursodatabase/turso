@@ -16,7 +16,7 @@ fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Val
 
 #[test]
 fn test_cdc_simple_id() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -78,7 +78,7 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
 
 #[test]
 fn test_cdc_simple_before() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -149,7 +149,7 @@ fn test_cdc_simple_before() {
 
 #[test]
 fn test_cdc_simple_after() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -220,7 +220,7 @@ fn test_cdc_simple_after() {
 
 #[test]
 fn test_cdc_simple_full() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -296,7 +296,7 @@ fn test_cdc_simple_full() {
 
 #[test]
 fn test_cdc_crud() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
         .unwrap();
@@ -417,7 +417,7 @@ fn test_cdc_crud() {
 
 #[test]
 fn test_cdc_failed_op() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
         .unwrap();
@@ -491,7 +491,7 @@ fn test_cdc_failed_op() {
 
 #[test]
 fn test_cdc_uncaptured_connection() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -571,7 +571,7 @@ fn test_cdc_uncaptured_connection() {
 
 #[test]
 fn test_cdc_custom_table() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -620,7 +620,7 @@ fn test_cdc_custom_table() {
 
 #[test]
 fn test_cdc_ignore_changes_in_cdc_table() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -660,7 +660,7 @@ fn test_cdc_ignore_changes_in_cdc_table() {
 
 #[test]
 fn test_cdc_transaction() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     conn1
         .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y UNIQUE)")
@@ -743,7 +743,7 @@ fn test_cdc_transaction() {
 
 #[test]
 fn test_cdc_independent_connections() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
     conn1
@@ -799,7 +799,7 @@ fn test_cdc_independent_connections() {
 
 #[test]
 fn test_cdc_independent_connections_different_cdc_not_ignore() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn1 = db.connect_limbo();
     let conn2 = db.connect_limbo();
     conn1
@@ -889,7 +889,7 @@ fn test_cdc_independent_connections_different_cdc_not_ignore() {
 
 #[test]
 fn test_cdc_table_columns() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b, c UNIQUE)")
         .unwrap();
@@ -905,7 +905,7 @@ fn test_cdc_table_columns() {
 
 #[test]
 fn test_cdc_bin_record() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     let record = record([
         Value::Null,
@@ -934,7 +934,7 @@ fn test_cdc_bin_record() {
 
 #[test]
 fn test_cdc_schema_changes() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
@@ -1056,7 +1056,7 @@ fn test_cdc_schema_changes() {
 
 #[test]
 fn test_cdc_schema_changes_alter_table() {
-    let db = TempDatabase::new_empty(true);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("PRAGMA unstable_capture_data_changes_conn('full')")
         .unwrap();
