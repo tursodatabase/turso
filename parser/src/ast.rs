@@ -114,8 +114,12 @@ pub enum Stmt {
         idx_name: QualifiedName,
         /// table name
         tbl_name: Name,
+        /// USING module
+        using: Option<Name>,
         /// indexed columns or expressions
         columns: Vec<SortedColumn>,
+        /// WITH parameters
+        with_clause: Vec<(Name, Box<Expr>)>,
         /// partial index
         where_clause: Option<Box<Expr>>,
     },
