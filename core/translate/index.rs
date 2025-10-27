@@ -201,7 +201,7 @@ pub fn translate_create_index(
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
-    if !idx.is_backing_btree_index() {
+    if idx.index_method.is_some() && !idx.is_backing_btree_index() {
         program.emit_insn(Insn::IndexMethodCreate {
             db: 0,
             cursor_id: index_cursor_id,
@@ -737,7 +737,7 @@ pub fn translate_drop_index(
     });
 
     let index = maybe_index.unwrap();
-    if !index.is_backing_btree_index() {
+    if index.index_method.is_some() && !index.is_backing_btree_index() {
         let cursor_id = program.alloc_cursor_index(None, index)?;
         program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
     } else {
