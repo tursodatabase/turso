@@ -724,7 +724,9 @@ pub fn translate_expr(
         ast::Expr::DoublyQualified(_, _, _) => {
             crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
         }
-        ast::Expr::Exists(_) => crate::bail_parse_error!("EXISTS in WHERE clause is not supported"),
+        ast::Expr::Exists(_) => {
+            crate::bail_parse_error!("EXISTS is not supported in this position")
+        }
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -2142,10 +2144,10 @@ pub fn translate_expr(
             Ok(result_reg)
         }
         ast::Expr::InSelect { .. } => {
-            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported")
+            crate::bail_parse_error!("IN (...subquery) is not supported in this position")
         }
         ast::Expr::InTable { .. } => {
-            crate::bail_parse_error!("Table expression in WHERE clause is not supported")
+            crate::bail_parse_error!("Table expression is not supported in this position")
         }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2183,7 +2185,7 @@ pub fn translate_expr(
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => {
-            crate::bail_parse_error!("ast::Expr::Name in WHERE clause is not supported")
+            crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
         }
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
@@ -2230,7 +2232,7 @@ pub fn translate_expr(
         }
         ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
         ast::Expr::Subquery(_) => {
-            crate::bail_parse_error!("Subquery in WHERE clause is not supported")
+            crate::bail_parse_error!("Subquery is not supported in this position")
         }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
