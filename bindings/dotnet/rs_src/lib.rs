@@ -55,7 +55,7 @@ pub fn allocate<T>(value: T) -> *const T {
 }
 
 pub fn allocate_string(str: &str) -> *const i8 {
-    return std::ffi::CString::new(str).unwrap().into_raw();
+    std::ffi::CString::new(str).unwrap().into_raw()
 }
 
 pub fn to_vec(array: Array) -> Vec<u8> {
@@ -88,7 +88,7 @@ pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *co
         Connection::from_uri(path_str.unwrap(), true, false, false, false, false);
     match connection_result {
         Ok((io, val)) => {
-            return allocate(Database {
+            allocate(Database {
                 io,
                 connection: val,
             })
@@ -284,17 +284,17 @@ pub extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement) -> i32
 pub extern "C" fn db_statement_column_name(statement_ptr: *mut Statement, index: i32) -> *const i8 {
     let statement = unsafe { &mut (*statement_ptr) };
     let col_name = statement.get_column_name(index.try_into().unwrap());
-    return match col_name {
+    match col_name {
         Cow::Borrowed(value) => allocate_string(value),
         Cow::Owned(value) => allocate_string(value.as_str()),
-    };
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn db_statement_has_rows(statement_ptr: *mut Statement) -> bool {
     let statement = unsafe { &mut (*statement_ptr) };
-    return match statement.row() {
+    match statement.row() {
         Some(_val) => true,
         None => false,
-    };
+    }
 }
