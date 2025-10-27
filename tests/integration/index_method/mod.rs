@@ -157,10 +157,9 @@ fn test_vector_sparse_ivf_insert_query() {
             Register::Value(sparse_vector(vector)),
             Register::Value(Value::Integer(5)),
         ];
-        run(&tmp_db, || cursor.query_start(&values)).unwrap();
+        assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
-        for (rowid, dist) in results {
-            assert!(run(&tmp_db, || cursor.query_next()).unwrap());
+        for (i, (rowid, dist)) in results.iter().enumerate() {
             assert_eq!(
                 *rowid,
                 run(&tmp_db, || cursor.query_rowid()).unwrap().unwrap()
@@ -169,9 +168,11 @@ fn test_vector_sparse_ivf_insert_query() {
                 *dist,
                 run(&tmp_db, || cursor.query_column(0)).unwrap().as_float()
             );
+            assert_eq!(
+                i + 1 < results.len(),
+                run(&tmp_db, || cursor.query_next()).unwrap()
+            );
         }
-
-        assert!(!run(&tmp_db, || cursor.query_next()).unwrap());
     }
 }
 
@@ -234,8 +235,7 @@ fn test_vector_sparse_ivf_update() {
 
     let mut reader = attached.init().unwrap();
     run(&tmp_db, || reader.open_read(&conn)).unwrap();
-    run(&tmp_db, || reader.query_start(&query_values)).unwrap();
-    assert!(!run(&tmp_db, || reader.query_next()).unwrap());
+    assert!(!run(&tmp_db, || reader.query_start(&query_values)).unwrap());
 
     limbo_exec_rows(
         &tmp_db,
@@ -247,8 +247,7 @@ fn test_vector_sparse_ivf_update() {
 
     let mut reader = attached.init().unwrap();
     run(&tmp_db, || reader.open_read(&conn)).unwrap();
-    run(&tmp_db, || reader.query_start(&query_values)).unwrap();
-    assert!(run(&tmp_db, || reader.query_next()).unwrap());
+    assert!(run(&tmp_db, || reader.query_start(&query_values)).unwrap());
     assert_eq!(1, run(&tmp_db, || reader.query_rowid()).unwrap().unwrap());
     assert_eq!(
         0.0,
@@ -264,7 +263,7 @@ fn test_vector_sparse_ivf_fuzz() {
     const DIMS: usize = 40;
     const MOD: u32 = 5;
 
-    let (mut rng, seed) = rng_from_time_or_env();
+    let (mut rng, _) = rng_from_time_or_env();
     let mut keys = Vec::new();
     for _ in 0..10 {
         let seed = rng.next_u64();
@@ -297,7 +296,7 @@ fn test_vector_sparse_ivf_fuzz() {
             if choice == 0 {
                 let key = rng.next_u64().to_string();
                 let v = vector(&mut rng);
-                let sql = format!("INSERT INTO t VALUES ('{}', vector32_sparse('{}'))", key, v);
+                let sql = format!("INSERT INTO t VALUES ('{key}', vector32_sparse('{v}'))");
                 tracing::info!("{}", sql);
                 simple_conn.execute(&sql).unwrap();
                 index_conn.execute(sql).unwrap();
@@ -306,17 +305,15 @@ fn test_vector_sparse_ivf_fuzz() {
                 let idx = rng.next_u32() as usize % keys.len();
                 let key = &keys[idx];
                 let v = vector(&mut rng);
-                let sql = format!(
-                    "UPDATE t SET embedding = vector32_sparse('{}') WHERE key = '{}'",
-                    v, key
-                );
+                let sql =
+                    format!("UPDATE t SET embedding = vector32_sparse('{v}') WHERE key = '{key}'",);
                 tracing::info!("{}", sql);
                 simple_conn.execute(&sql).unwrap();
                 index_conn.execute(&sql).unwrap();
             } else if choice == 2 && !keys.is_empty() {
                 let idx = rng.next_u32() as usize % keys.len();
                 let key = &keys[idx];
-                let sql = format!("DELETE FROM t WHERE key = '{}'", key);
+                let sql = format!("DELETE FROM t WHERE key = '{key}'");
                 tracing::info!("{}", sql);
                 simple_conn.execute(&sql).unwrap();
                 index_conn.execute(&sql).unwrap();
@@ -324,17 +321,17 @@ fn test_vector_sparse_ivf_fuzz() {
             } else {
                 let v = vector(&mut rng);
                 let k = rng.next_u32() % 20 + 1;
-                let sql = format!("SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{}')) as d FROM t ORDER BY d LIMIT {}", v, k);
+                let sql = format!("SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{v}')) as d FROM t ORDER BY d LIMIT {k}");
                 tracing::info!("{}", sql);
                 let simple_rows = limbo_exec_rows(&simple_db, &simple_conn, &sql);
                 let index_rows = limbo_exec_rows(&index_db, &index_conn, &sql);
                 assert!(index_rows.len() <= simple_rows.len());
-                for i in 0..index_rows.len() {
-                    assert_eq!(index_rows[i], simple_rows[i]);
+                for (a, b) in index_rows.iter().zip(simple_rows.iter()) {
+                    assert_eq!(a, b);
                 }
-                for i in index_rows.len()..simple_rows.len() {
-                    match &simple_rows[i][1] {
-                        rusqlite::types::Value::Real(r) => assert_eq!(*r, 1.0),
+                for row in simple_rows.iter().skip(index_rows.len()) {
+                    match row[1] {
+                        rusqlite::types::Value::Real(r) => assert_eq!(r, 1.0),
                         _ => panic!("unexpected simple row value"),
                     }
                 }
