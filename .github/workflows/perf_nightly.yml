@@ -56,7 +56,7 @@ jobs:
 
           # parameters of the algorithm. Note: These are global, so we only set them once and for all.
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.0001
+          nyrkio-settings-pvalue: 0.00001
           # Ignore changes smaller than this.
           nyrkio-settings-threshold: 0%
 
@@ -94,6 +94,8 @@ jobs:
           never-fail: true
           # Make results and change points public, so that any oss contributor can see them
           nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
 
       - name: Analyze SQLITE3 result with Nyrkiö
         uses: nyrkio/change-detection@HEAD
@@ -107,6 +109,8 @@ jobs:
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
           never-fail: true
           nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
 
   tpc-h-criterion:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
@@ -159,7 +163,6 @@ jobs:
 
           # parameters of the algorithm. Note: These are global, so we only set them once and for all.
           # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
-          nyrkio-settings-pvalue: 0.0001
-          # Ignore changes smaller than this.
+          nyrkio-settings-pvalue: 0.00001
           nyrkio-settings-threshold: 0%
 
