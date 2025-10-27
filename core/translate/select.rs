@@ -503,7 +503,18 @@ fn prepare_one_select_plan(
                     &mut windows,
                 )?;
             }
+        
 
+            // TODO: support subqueries in the following positions:
+            // - result column of a select, e.g.: SELECT x = (SELECT ...) FROM t
+            // - GROUP BY clause, e.g.: SELECT * FROM t GROUP BY (SELECT ...) <-- however nonsensical that might be...
+            // - HAVING clause, e.g.: SELECT * FROM t GROUP BY x HAVING x = (SELECT ...)
+            // - ORDER BY clause, e.g.: SELECT * FROM t ORDER BY x = (SELECT ...)
+            // - LIMIT clause, e.g.: SELECT * FROM t LIMIT (SELECT ...)
+            // - OFFSET clause, e.g.: SELECT * FROM t OFFSET (SELECT ...)
+            //
+            // in these positions, unlike in the WHERE clause, the subquery cannot reference columns from the outer query,
+            // so we don't need to collect outer query references.
             plan_subqueries_from_where_clause(
                 program,
                 &mut plan.non_from_clause_subqueries,
