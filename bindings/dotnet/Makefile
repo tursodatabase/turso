@@ -23,3 +23,7 @@ test: build
 
 benchmark: build-production
 	dotnet run -c Release --project ./src/Benchmarks/Benchmarks.csproj
+
+publish:
+	dotnet pack --configuration Release ./src/Turso/Turso.csproj
+	dotnet pack --configuration Release ./src/Turso.Raw/Turso.Raw.csproj

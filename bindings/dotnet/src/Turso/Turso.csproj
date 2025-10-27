@@ -6,8 +6,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>Turso</RootNamespace>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    
+    <PackageId>Turso</PackageId>
+    <Description>ADO.NET provider for turso bindings</Description>
+    <Version>0.0.1</Version>
   </PropertyGroup>
+  
+  <ItemGroup>
+    <PackageReference Include="Turso.Raw" Version="0.0.1" />
+  </ItemGroup>
   
   <ItemGroup>
     <ProjectReference Include="..\Turso.Raw\Turso.Raw.csproj" />
