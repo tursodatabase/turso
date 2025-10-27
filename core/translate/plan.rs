@@ -36,12 +36,12 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
                 table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
@@ -659,17 +659,22 @@ impl TableReferences {
             .find(|t| t.internal_id == internal_id)
     }
 
-    /// Returns an immutable reference to the [Table] with the given internal ID.
-    pub fn find_table_by_internal_id(&self, internal_id: TableInternalId) -> Option<&Table> {
+    /// Returns an immutable reference to the [Table] with the given internal ID,
+    /// plus a boolean indicating whether the table is a joined table from the current query scope (false),
+    /// or an outer query reference (true).
+    pub fn find_table_by_internal_id(
+        &self,
+        internal_id: TableInternalId,
+    ) -> Option<(bool, &Table)> {
         self.joined_tables
             .iter()
             .find(|t| t.internal_id == internal_id)
-            .map(|t| &t.table)
+            .map(|t| (false, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
                     .find(|t| t.internal_id == internal_id)
-                    .map(|t| &t.table)
+                    .map(|t| (true, &t.table))
             })
     }
 

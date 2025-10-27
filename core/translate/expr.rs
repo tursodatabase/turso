@@ -1948,7 +1948,7 @@ pub fn translate_expr(
                 }
             };
 
-            let table = referenced_tables
+            let (_, table) = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
                 .unwrap_or_else(|| {
@@ -3887,7 +3887,7 @@ pub fn get_expr_affinity(
     match expr {
         ast::Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
-                if let Some(table_ref) = tables.find_table_by_internal_id(*table) {
+                if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
                         return col.affinity();
                     }

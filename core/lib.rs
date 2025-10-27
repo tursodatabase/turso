@@ -2749,7 +2749,7 @@ impl Statement {
                 .program
                 .table_references
                 .find_table_by_internal_id(*table)
-                .map(|table_ref| Cow::Borrowed(table_ref.get_name())),
+                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
             _ => None,
         }
     }
@@ -2778,7 +2778,7 @@ impl Statement {
                 column: column_idx,
                 ..
             } => {
-                let table_ref = self
+                let (_, table_ref) = self
                     .program
                     .table_references
                     .find_table_by_internal_id(*table)?;
