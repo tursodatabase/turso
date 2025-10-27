@@ -5396,6 +5396,8 @@ pub fn op_function(
                                 idx_name,
                                 columns,
                                 where_clause,
+                                using,
+                                with_clause,
                             } => {
                                 let table_name = normalize_ident(tbl_name.as_str());
 
@@ -5411,6 +5413,8 @@ pub fn op_function(
                                         idx_name,
                                         columns,
                                         where_clause,
+                                        using,
+                                        with_clause,
                                     }
                                     .to_string(),
                                 )
@@ -5494,6 +5498,8 @@ pub fn op_function(
                                 if_not_exists,
                                 idx_name,
                                 where_clause,
+                                using,
+                                with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -5520,6 +5526,8 @@ pub fn op_function(
                                         if_not_exists,
                                         idx_name,
                                         where_clause,
+                                        using,
+                                        with_clause,
                                     }
                                     .to_string(),
                                 )

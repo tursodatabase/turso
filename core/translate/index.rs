@@ -15,7 +15,7 @@ use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, PseudoCursorType},
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
     util::normalize_ident,
     vdbe::{
@@ -23,7 +23,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
 };
-use turso_parser::ast::{Expr, Name, SortOrder, SortedColumn};
+use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
@@ -56,8 +56,7 @@ pub fn translate_create_index(
     }
 
     let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let idx_name = normalize_ident(idx_name.as_str());
+    let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(tbl_name.as_str());
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
@@ -97,7 +96,7 @@ pub fn translate_create_index(
     // the name is globally unique in the schema.
     if !resolver.schema.is_unique_idx_name(&idx_name) {
         // If IF NOT EXISTS is specified, silently return without error
-        if unique_if_not_exists.1 {
+        if if_not_exists {
             return Ok(program);
         }
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
@@ -108,24 +107,18 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
-    let original_columns = columns;
-    let columns = resolve_sorted_columns(&tbl, columns)?;
-    let unique = unique_if_not_exists.0;
-
+    let columns = resolve_sorted_columns(&tbl, &columns)?;
+    let custom_module = using.is_some();
+    if !with_clause.is_empty() && !custom_module {
+        crate::bail_parse_error!(
+            "Error: additional parameters are allowed only for custom module indices: '{idx_name}' is not custom module index"
+        );
+    }
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns: columns
-            .iter()
-            .map(|((pos_in_table, col), order)| IndexColumn {
-                name: col.name.as_ref().unwrap().clone(),
-                order: *order,
-                pos_in_table: *pos_in_table,
-                collation: col.collation,
-                default: col.default.clone(),
-            })
-            .collect(),
+        columns: columns.clone(),
         unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
@@ -138,6 +131,7 @@ pub fn translate_create_index(
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
+                .as_ref()
                 .expect("where expr has to exist in order to fail")
                 .to_string()
         );
@@ -195,13 +189,6 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: 0,
     });
-    let sql = create_idx_stmt_to_sql(
-        &original_tbl_name.as_ident(),
-        &original_idx_name.as_ident(),
-        unique_if_not_exists,
-        original_columns,
-        &idx.where_clause.clone(),
-    );
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
     emit_schema_entry(
         &mut program,
@@ -270,8 +257,8 @@ pub fn translate_create_index(
     }
 
     let start_reg = program.alloc_registers(columns.len() + 1);
-    for (i, (col, _)) in columns.iter().enumerate() {
-        program.emit_column_or_rowid(table_cursor_id, col.0, start_reg + i);
+    for (i, col) in columns.iter().enumerate() {
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
     }
     let rowid_reg = start_reg + columns.len();
     program.emit_insn(Insn::RowId {
@@ -393,10 +380,10 @@ pub fn translate_create_index(
     Ok(program)
 }
 
-fn resolve_sorted_columns<'a>(
-    table: &'a BTreeTable,
+pub fn resolve_sorted_columns(
+    table: &BTreeTable,
     cols: &[SortedColumn],
-) -> crate::Result<Vec<((usize, &'a Column), SortOrder)>> {
+) -> crate::Result<Vec<IndexColumn>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
         let ident = match sc.expr.as_ref() {
@@ -411,50 +398,15 @@ fn resolve_sorted_columns<'a>(
                 table.name
             );
         };
-        resolved.push((col, sc.order.unwrap_or(SortOrder::Asc)));
+        resolved.push(IndexColumn {
+            name: col.1.name.as_ref().unwrap().clone(),
+            order: sc.order.unwrap_or(SortOrder::Asc),
+            pos_in_table: col.0,
+            collation: col.1.collation,
+            default: col.1.default.clone(),
+        });
     }
     Ok(resolved)
-}
-
-fn create_idx_stmt_to_sql(
-    tbl_name: &str,
-    idx_name: &str,
-    unique_if_not_exists: (bool, bool),
-    cols: &[SortedColumn],
-    where_clause: &Option<Box<Expr>>,
-) -> String {
-    let mut sql = String::with_capacity(128);
-    sql.push_str("CREATE ");
-    if unique_if_not_exists.0 {
-        sql.push_str("UNIQUE ");
-    }
-    sql.push_str("INDEX ");
-    if unique_if_not_exists.1 {
-        sql.push_str("IF NOT EXISTS ");
-    }
-    sql.push_str(idx_name);
-    sql.push_str(" ON ");
-    sql.push_str(tbl_name);
-    sql.push_str(" (");
-    for (i, col) in cols.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        let col_ident = match col.expr.as_ref() {
-            Expr::Id(name) | Expr::Name(name) => name.as_ident(),
-            _ => unreachable!("expressions in CREATE INDEX should have been rejected earlier"),
-        };
-        sql.push_str(&col_ident);
-        if col.order.unwrap_or(SortOrder::Asc) == SortOrder::Desc {
-            sql.push_str(" DESC");
-        }
-    }
-    sql.push(')');
-    if let Some(where_clause) = where_clause {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_clause.to_string());
-    }
-    sql
 }
 
 pub fn translate_drop_index(
