@@ -879,6 +879,24 @@ pub enum Insn {
         flags: CreateBTreeFlags,
     },
 
+    /// Create custom index method (calls [crate::index_method::IndexMethodCursor::create] under the hood)
+    IndexMethodCreate {
+        db: usize,
+        cursor_id: CursorID,
+    },
+    /// Destroy custom index method (calls [crate::index_method::IndexMethodCursor::destroy] under the hood)
+    IndexMethodDestroy {
+        db: usize,
+        cursor_id: CursorID,
+    },
+    /// Query custom index method (call [crate::index_method::IndexMethodCursor::query_start] under the hood)
+    IndexMethodQuery {
+        db: usize,
+        cursor_id: CursorID,
+        start_reg: usize,
+        count_reg: usize,
+    },
+
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
     Destroy {
         /// The root page of the table/index to destroy
@@ -1318,6 +1336,9 @@ impl InsnVariants {
             InsnVariants::OpenWrite => execute::op_open_write,
             InsnVariants::Copy => execute::op_copy,
             InsnVariants::CreateBtree => execute::op_create_btree,
+            InsnVariants::IndexMethodCreate => execute::op_index_method_create,
+            InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
+            InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
