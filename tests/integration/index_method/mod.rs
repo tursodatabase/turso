@@ -14,10 +14,10 @@ use turso_parser::ast::SortOrder;
 
 use crate::common::{limbo_exec_rows, TempDatabase};
 
-fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> T {
+fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
     loop {
-        match f().unwrap() {
-            IOResult::Done(value) => return value,
+        match f()? {
+            IOResult::Done(value) => return Ok(value),
             IOResult::IO(iocompletions) => {
                 while !iocompletions.finished() {
                     db.io.step().unwrap();
@@ -69,7 +69,7 @@ fn test_vector_sparse_ivf_create_destroy() {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn));
+        run(&tmp_db, || cursor.create(&conn)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(schema_rows(), vec!["t", "t_idx_scratch"]);
@@ -77,7 +77,7 @@ fn test_vector_sparse_ivf_create_destroy() {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.destroy(&conn));
+        run(&tmp_db, || cursor.destroy(&conn)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
     assert_eq!(schema_rows(), vec!["t"]);
@@ -108,7 +108,7 @@ fn test_vector_sparse_ivf_insert_query() {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn));
+        run(&tmp_db, || cursor.create(&conn)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
@@ -122,13 +122,13 @@ fn test_vector_sparse_ivf_insert_query() {
     .enumerate()
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_write(&conn));
+        run(&tmp_db, || cursor.open_write(&conn)).unwrap();
 
         let values = [
             Register::Value(sparse_vector(vector_str)),
             Register::Value(Value::Integer((i + 1) as i64)),
         ];
-        run(&tmp_db, || cursor.insert(&values));
+        run(&tmp_db, || cursor.insert(&values)).unwrap();
         limbo_exec_rows(
             &tmp_db,
             &conn,
@@ -147,22 +147,28 @@ fn test_vector_sparse_ivf_insert_query() {
         ),
     ] {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.open_read(&conn));
+        run(&tmp_db, || cursor.open_read(&conn)).unwrap();
 
         let values = [
             Register::Value(Value::Integer(0)),
             Register::Value(sparse_vector(vector)),
             Register::Value(Value::Integer(5)),
         ];
-        run(&tmp_db, || cursor.query_start(&values));
+        run(&tmp_db, || cursor.query_start(&values)).unwrap();
 
         for (rowid, dist) in results {
-            assert!(run(&tmp_db, || cursor.query_next()));
-            assert_eq!(*rowid, run(&tmp_db, || cursor.query_rowid()).unwrap());
-            assert_eq!(*dist, run(&tmp_db, || cursor.query_column(0)).as_float());
+            assert!(run(&tmp_db, || cursor.query_next()).unwrap());
+            assert_eq!(
+                *rowid,
+                run(&tmp_db, || cursor.query_rowid()).unwrap().unwrap()
+            );
+            assert_eq!(
+                *dist,
+                run(&tmp_db, || cursor.query_column(0)).unwrap().as_float()
+            );
         }
 
-        assert!(!run(&tmp_db, || cursor.query_next()));
+        assert!(!run(&tmp_db, || cursor.query_next()).unwrap());
     }
 }
 
@@ -191,12 +197,12 @@ fn test_vector_sparse_ivf_update() {
     conn.wal_insert_begin().unwrap();
     {
         let mut cursor = attached.init().unwrap();
-        run(&tmp_db, || cursor.create(&conn));
+        run(&tmp_db, || cursor.create(&conn)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
 
     let mut writer = attached.init().unwrap();
-    run(&tmp_db, || writer.open_write(&conn));
+    run(&tmp_db, || writer.open_write(&conn)).unwrap();
 
     let v0_str = "[0, 1, 0, 0]";
     let v1_str = "[1, 0, 0, 1]";
@@ -216,7 +222,7 @@ fn test_vector_sparse_ivf_update() {
         Register::Value(q.clone()),
         Register::Value(Value::Integer(1)),
     ];
-    run(&tmp_db, || writer.insert(&insert0_values));
+    run(&tmp_db, || writer.insert(&insert0_values)).unwrap();
     limbo_exec_rows(
         &tmp_db,
         &conn,
@@ -224,23 +230,26 @@ fn test_vector_sparse_ivf_update() {
     );
 
     let mut reader = attached.init().unwrap();
-    run(&tmp_db, || reader.open_read(&conn));
-    run(&tmp_db, || reader.query_start(&query_values));
-    assert!(!run(&tmp_db, || reader.query_next()));
+    run(&tmp_db, || reader.open_read(&conn)).unwrap();
+    run(&tmp_db, || reader.query_start(&query_values)).unwrap();
+    assert!(!run(&tmp_db, || reader.query_next()).unwrap());
 
     limbo_exec_rows(
         &tmp_db,
         &conn,
         &format!("UPDATE t SET embedding = vector32_sparse('{v1_str}') WHERE rowid = 1"),
     );
-    run(&tmp_db, || writer.delete(&insert0_values));
-    run(&tmp_db, || writer.insert(&insert1_values));
+    run(&tmp_db, || writer.delete(&insert0_values)).unwrap();
+    run(&tmp_db, || writer.insert(&insert1_values)).unwrap();
 
     let mut reader = attached.init().unwrap();
-    run(&tmp_db, || reader.open_read(&conn));
-    run(&tmp_db, || reader.query_start(&query_values));
-    assert!(run(&tmp_db, || reader.query_next()));
-    assert_eq!(1, run(&tmp_db, || reader.query_rowid()).unwrap());
-    assert_eq!(0.0, run(&tmp_db, || reader.query_column(0)).as_float());
-    assert!(!run(&tmp_db, || reader.query_next()));
+    run(&tmp_db, || reader.open_read(&conn)).unwrap();
+    run(&tmp_db, || reader.query_start(&query_values)).unwrap();
+    assert!(run(&tmp_db, || reader.query_next()).unwrap());
+    assert_eq!(1, run(&tmp_db, || reader.query_rowid()).unwrap().unwrap());
+    assert_eq!(
+        0.0,
+        run(&tmp_db, || reader.query_column(0)).unwrap().as_float()
+    );
+    assert!(!run(&tmp_db, || reader.query_next()).unwrap());
 }
