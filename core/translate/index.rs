@@ -29,15 +29,32 @@ use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
-    unique_if_not_exists: (bool, bool),
-    resolver: &Resolver,
-    idx_name: &Name,
-    tbl_name: &Name,
-    columns: &[SortedColumn],
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    where_clause: Option<Box<Expr>>,
+    resolver: &Resolver,
+    stmt: ast::Stmt,
 ) -> crate::Result<ProgramBuilder> {
+    let sql = stmt.to_string();
+    let ast::Stmt::CreateIndex {
+        unique,
+        if_not_exists,
+        idx_name,
+        tbl_name,
+        columns,
+        where_clause,
+        with_clause,
+        using,
+    } = stmt
+    else {
+        panic!("translate_create_index must be called with CreateIndex AST node");
+    };
+
+    if !connection.experimental_custom_modules_enabled()
+        && (using.is_some() || !with_clause.is_empty())
+    {
+        bail_parse_error!("custom modules is an experimental feature. Enable with --experimental-custom-modules flag")
+    }
+
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
     let idx_name = normalize_ident(idx_name.as_str());

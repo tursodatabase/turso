@@ -113,6 +113,7 @@ pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
+    pub enable_custom_modules: bool,
     enable_load_extension: bool,
 }
 
@@ -124,6 +125,7 @@ impl Default for DatabaseOpts {
             enable_views: false,
             enable_strict: false,
             enable_encryption: false,
+            enable_custom_modules: false,
             enable_load_extension: false,
         }
     }
@@ -162,6 +164,11 @@ impl DatabaseOpts {
 
     pub fn with_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_custom_modules(mut self, enable: bool) -> Self {
+        self.enable_custom_modules = enable;
         self
     }
 }
@@ -870,6 +877,10 @@ impl Database {
         self.opts.enable_views
     }
 
+    pub fn experimental_custom_modules_enabled(&self) -> bool {
+        self.opts.enable_custom_modules
+    }
+
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
     }
@@ -1474,6 +1485,8 @@ impl Connection {
         strict: bool,
         // flag to opt-in encryption support
         encryption: bool,
+        // flag to opt-in custom modules support
+        custom_modules: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1489,7 +1502,8 @@ impl Connection {
                     .with_indexes(use_indexes)
                     .with_views(views)
                     .with_strict(strict)
-                    .with_encryption(encryption),
+                    .with_encryption(encryption)
+                    .with_custom_modules(custom_modules),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1518,7 +1532,8 @@ impl Connection {
                 .with_indexes(use_indexes)
                 .with_views(views)
                 .with_strict(strict)
-                .with_encryption(encryption),
+                .with_encryption(encryption)
+                .with_custom_modules(custom_modules),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -1995,6 +2010,10 @@ impl Connection {
 
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
+    }
+
+    pub fn experimental_custom_modules_enabled(&self) -> bool {
+        self.db.experimental_custom_modules_enabled()
     }
 
     pub fn experimental_strict_enabled(&self) -> bool {

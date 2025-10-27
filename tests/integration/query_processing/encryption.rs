@@ -46,8 +46,15 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            true,
+            false,
+            false,
+            false,
+            ENABLE_ENCRYPTION,
+            false,
+        )?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -62,8 +69,15 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            true,
+            false,
+            false,
+            false,
+            ENABLE_ENCRYPTION,
+            false,
+        )?;
         run_query(
             &tmp_db,
             &conn,
@@ -77,8 +91,15 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            true,
+            false,
+            false,
+            false,
+            ENABLE_ENCRYPTION,
+            false,
+        )?;
         run_query(
             &tmp_db,
             &conn,
@@ -100,8 +121,15 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            true,
+            false,
+            false,
+            false,
+            ENABLE_ENCRYPTION,
+            false,
+        )?;
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
         }));
@@ -114,8 +142,16 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         //test connecting to encrypted db using insufficient encryption parameters in URI.This should panic.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
-                .unwrap();
+            turso_core::Connection::from_uri(
+                &uri,
+                true,
+                false,
+                false,
+                false,
+                ENABLE_ENCRYPTION,
+                false,
+            )
+            .unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -128,8 +164,16 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             db_path.to_str().unwrap()
         );
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)
-                .unwrap();
+            turso_core::Connection::from_uri(
+                &uri,
+                true,
+                false,
+                false,
+                false,
+                ENABLE_ENCRYPTION,
+                false,
+            )
+            .unwrap();
         }));
         assert!(
             should_panic.is_err(),
@@ -195,8 +239,15 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) =
-            turso_core::Connection::from_uri(&uri, true, false, false, false, ENABLE_ENCRYPTION)?;
+        let (_io, conn) = turso_core::Connection::from_uri(
+            &uri,
+            true,
+            false,
+            false,
+            false,
+            ENABLE_ENCRYPTION,
+            false,
+        )?;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
             assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
@@ -261,6 +312,7 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
                 false,
                 false,
                 ENABLE_ENCRYPTION,
+                false,
             )
             .unwrap();
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
@@ -353,6 +405,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
                     false,
                     false,
                     ENABLE_ENCRYPTION,
+                    false,
                 )
                 .unwrap();
                 run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})
