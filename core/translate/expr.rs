@@ -12,7 +12,7 @@ use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::ResultSetColumn;
+use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
@@ -2098,19 +2098,25 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            let (index, use_covering_index) = {
+            let (index, index_method, use_covering_index) = {
                 if let Some(table_reference) = referenced_tables
                     .unwrap()
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
+                        if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
+                            Some(index_method)
+                        } else {
+                            None
+                        },
                         table_reference.utilizes_covering_index(),
                     )
                 } else {
-                    (None, false)
+                    (None, None, false)
                 }
             };
+            let use_index_method = index_method.and_then(|m| m.covered_columns.get(column));
 
             let (is_from_outer_query_scope, table) = referenced_tables
                 .unwrap()
@@ -2122,11 +2128,13 @@ pub fn translate_expr(
                     )
                 });
 
-            let Some(table_column) = table.get_column_at(*column) else {
-                crate::bail_parse_error!("column index out of bounds");
-            };
-            // Counter intuitive but a column always needs to have a collation
-            program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            if use_index_method.is_none() {
+                let Some(table_column) = table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+                // Counter intuitive but a column always needs to have a collation
+                program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
@@ -2161,7 +2169,17 @@ pub fn translate_expr(
                         (table_cursor_id, index_cursor_id)
                     };
 
-                    if *is_rowid_alias {
+                    let index_cursor_id = index.map(|index| {
+                        program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
+                    });
+                    if let Some(custom_module_column) = use_index_method {
+                        program.emit_column_or_rowid(
+                            index_cursor_id.unwrap(),
+                            *custom_module_column,
+                            target_register,
+                        );
+                    } else {
+                         if *is_rowid_alias {
                         if let Some(index_cursor_id) = index_cursor_id {
                             program.emit_insn(Insn::IdxRowId {
                                 cursor_id: index_cursor_id,
@@ -2202,12 +2220,13 @@ pub fn translate_expr(
                             *column
                         };
 
-                        program.emit_column_or_rowid(read_cursor, column, target_register);
+                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                        }
+                        let Some(column) = table.get_column_at(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        maybe_apply_affinity(column.ty, target_register, program);
                     }
-                    let Some(column) = table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
-                    };
-                    maybe_apply_affinity(column.ty, target_register, program);
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
@@ -3596,7 +3615,7 @@ pub fn bind_and_rewrite_expr<'a>(
     connection: &'a Arc<crate::Connection>,
     param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
-) -> Result<WalkControl> {
+) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -3894,7 +3913,8 @@ pub fn bind_and_rewrite_expr<'a>(
             }
             Ok(WalkControl::Continue)
         },
-    )
+    )?;
+    Ok(())
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
