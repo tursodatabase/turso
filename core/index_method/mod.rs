@@ -87,7 +87,9 @@ pub trait IndexMethodCursor {
     /// For example, for 2 patterns ["SELECT * FROM {table} LIMIT ?", "SELECT * FROM {table} WHERE x = ?"], query_start(...) call can have following arguments:
     /// - [Integer(0), Integer(10)] - pattern "SELECT * FROM {table} LIMIT ?" was chosen with LIMIT parameter equals to 10
     /// - [Integer(1), Text("turso")] - pattern "SELECT * FROM {table} WHERE x = ?" was chosen with equality comparison equals to "turso"
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>>;
+    ///
+    /// Returns false if query will produce no rows (similar to VFilter/Rewind op codes)
+    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>>;
 
     /// Moves cursor to the next response row
     /// Returns false if query exhausted all rows

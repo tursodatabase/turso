@@ -7248,6 +7248,7 @@ pub fn op_index_method_query(
             cursor_id,
             start_reg,
             count_reg,
+            pc_if_empty,
         },
         insn
     );
@@ -7260,8 +7261,12 @@ pub fn op_index_method_query(
     }
     let cursor = state.cursors[*cursor_id].as_mut().unwrap();
     let cursor = cursor.as_index_method_mut();
-    return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
-    state.pc += 1;
+    let has_rows = return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    if !has_rows {
+        state.pc = pc_if_empty.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 

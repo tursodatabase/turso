@@ -151,7 +151,6 @@ pub struct VectorSparseInvertedIndexMethodCursor {
     delete_state: VectorSparseInvertedIndexDeleteState,
     search_state: VectorSparseInvertedIndexSearchState,
     search_result: VecDeque<(i64, f64)>,
-    search_row: Option<(i64, f64)>,
 }
 
 impl IndexMethod for VectorSparseInvertedIndexMethod {
@@ -199,7 +198,6 @@ impl VectorSparseInvertedIndexMethodCursor {
             scratch_cursor: None,
             main_btree: None,
             search_result: VecDeque::new(),
-            search_row: None,
             create_state: VectorSparseInvertedIndexCreateState::Init,
             insert_state: VectorSparseInvertedIndexInsertState::Init,
             delete_state: VectorSparseInvertedIndexDeleteState::Init,
@@ -459,7 +457,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         }
     }
 
-    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+    fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>> {
         let Some(scratch) = &mut self.scratch_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
@@ -521,7 +519,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         continue;
                     }
                     let position = p[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 2);
+                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
                     self.search_state = VectorSparseInvertedIndexSearchState::Seek {
                         collected: collected.take(),
                         positions: positions.take(),
@@ -551,7 +549,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 limit: *limit,
                             };
                         }
-                        SeekResult::TryAdvance => {
+                        SeekResult::TryAdvance | SeekResult::NotFound => {
                             self.search_state = VectorSparseInvertedIndexSearchState::Next {
                                 collected: collected.take(),
                                 positions: positions.take(),
@@ -559,9 +557,6 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 idx: *idx,
                                 limit: *limit,
                             };
-                        }
-                        SeekResult::NotFound => {
-                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
                         }
                     }
                 }
@@ -637,7 +632,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let Some(rowid) = rowids.as_ref().unwrap().last() else {
                         let distances = distances.take().unwrap();
                         self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
-                        return Ok(IOResult::Done(()));
+                        return Ok(IOResult::Done(!self.search_result.is_empty()));
                     };
                     let result = return_if_io!(
                         main.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })
@@ -709,17 +704,17 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
-        let result = self.search_row.as_ref().unwrap();
+        let result = self.search_result.front().unwrap();
         Ok(IOResult::Done(Some(result.0)))
     }
 
     fn query_column(&mut self, _: usize) -> Result<IOResult<Value>> {
-        let result = self.search_row.as_ref().unwrap();
+        let result = self.search_result.front().unwrap();
         Ok(IOResult::Done(Value::Float(result.1)))
     }
 
     fn query_next(&mut self) -> Result<IOResult<bool>> {
-        self.search_row = self.search_result.pop_front();
-        Ok(IOResult::Done(self.search_row.is_some()))
+        let _ = self.search_result.pop_front();
+        Ok(IOResult::Done(!self.search_result.is_empty()))
     }
 }

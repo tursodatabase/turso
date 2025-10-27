@@ -720,10 +720,7 @@ pub fn open_loop(
                     cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
                     start_reg,
                     count_reg: query.arguments.len() + 1,
-                });
-                program.emit_insn(Insn::Next {
-                    cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
-                    pc_if_next: loop_end,
+                    pc_if_empty: loop_end,
                 });
                 program.preassign_label_to_next_insn(loop_start);
                 if let Some(table_cursor_id) = table_cursor_id {

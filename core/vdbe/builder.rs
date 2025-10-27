@@ -819,6 +819,9 @@ impl ProgramBuilder {
                 Insn::IdxLT { target_pc, .. } => {
                     resolve(target_pc, "IdxLT");
                 }
+                Insn::IndexMethodQuery { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "IndexMethodQuery");
+                }
                 Insn::IsNull { reg: _, target_pc } => {
                     resolve(target_pc, "IsNull");
                 }

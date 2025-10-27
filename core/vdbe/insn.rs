@@ -895,6 +895,7 @@ pub enum Insn {
         cursor_id: CursorID,
         start_reg: usize,
         count_reg: usize,
+        pc_if_empty: BranchOffset,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
