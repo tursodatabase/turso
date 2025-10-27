@@ -8,6 +8,7 @@ mod fast_lock;
 mod function;
 mod functions;
 mod incremental;
+pub mod index_method;
 mod info;
 mod io;
 #[cfg(feature = "json")]
@@ -15,8 +16,7 @@ mod json;
 pub mod mvcc;
 mod parameters;
 mod pragma;
-mod pseudo;
-mod schema;
+pub mod schema;
 #[cfg(feature = "series")]
 mod series;
 pub mod state_machine;
@@ -30,7 +30,7 @@ mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 mod vdbe;
-mod vector;
+pub mod vector;
 mod vtab;
 
 #[cfg(feature = "fuzz")]
@@ -103,7 +103,9 @@ pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
-pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
+pub use vdbe::{
+    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, Register,
+};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +491,9 @@ impl Database {
             n_connections: AtomicUsize::new(0),
         });
 
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
             // parse schema
@@ -511,10 +516,14 @@ impl Database {
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .inspect_err(|_| pager.end_read_tx());
-                if let Err(LimboError::ExtensionError(e)) = result {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    eprintln!("Warning: {e}");
+                match result {
+                    Err(LimboError::ExtensionError(e)) => {
+                        // this means that a vtab exists and we no longer have the module loaded. we print
+                        // a warning to the user to load the module
+                        eprintln!("Warning: {e}");
+                    }
+                    Err(e) => return Err(e),
+                    _ => {}
                 }
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
@@ -533,9 +542,6 @@ impl Database {
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
 
         Ok(db)
     }
@@ -2885,6 +2891,7 @@ pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
+    pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -2926,6 +2933,7 @@ impl SymbolTable {
             functions: HashMap::new(),
             vtabs: HashMap::new(),
             vtab_modules: HashMap::new(),
+            index_methods: HashMap::new(),
         }
     }
     pub fn resolve_function(
@@ -2945,6 +2953,9 @@ impl SymbolTable {
         }
         for (name, module) in &other.vtab_modules {
             self.vtab_modules.insert(name.clone(), module.clone());
+        }
+        for (name, module) in &other.index_methods {
+            self.index_methods.insert(name.clone(), module.clone());
         }
     }
 }
