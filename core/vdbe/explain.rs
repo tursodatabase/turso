@@ -19,11 +19,12 @@ pub fn insn_to_row(
     let get_table_or_index_name = |cursor_id: usize| {
         let cursor_type = &program.cursor_ref[cursor_id].1;
         match cursor_type {
-            CursorType::BTreeTable(table) => &table.name,
-            CursorType::BTreeIndex(index) => &index.name,
+            CursorType::BTreeTable(table) => table.name.as_str(),
+            CursorType::BTreeIndex(index) => index.name.as_str(),
+            CursorType::IndexMethod(descriptor) => descriptor.definition().index_name,
             CursorType::Pseudo(_) => "pseudo",
-            CursorType::VirtualTable(virtual_table) => &virtual_table.name,
-            CursorType::MaterializedView(table, _) => &table.name,
+            CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
+            CursorType::MaterializedView(table, _) => table.name.as_str(),
             CursorType::Sorter => "sorter",
         }
     };
@@ -551,6 +552,7 @@ pub fn insn_to_row(
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
+                    CursorType::IndexMethod(..) => None,
                     CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
                 };
                 (
@@ -1282,6 +1284,33 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("r[{}]=root iDb={} flags={}", root, db, flags.get_flags()),
+            ),
+            Insn::IndexMethodCreate { db, cursor_id } => (
+                "IndexMethodCreate",
+                *db as i32,
+                *cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
+            Insn::IndexMethodDestroy { db, cursor_id } => (
+                "IndexMethodDestroy",
+                *db as i32,
+                *cursor_id as i32,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
+            Insn::IndexMethodQuery { db, cursor_id, start_reg, .. } => (
+                "IndexMethodQuery",
+                *db as i32,
+                *cursor_id as i32,
+                *start_reg as i32,
+                Value::build_text(""),
+                0,
+                "".to_string()
             ),
             Insn::Destroy {
                 root,
