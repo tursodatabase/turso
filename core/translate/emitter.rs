@@ -983,7 +983,7 @@ fn emit_program_for_update(
         )) {
             cursor
         } else {
-            let cursor = program.alloc_cursor_index(None, &index)?;
+            let cursor = program.alloc_cursor_index(None, index)?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
