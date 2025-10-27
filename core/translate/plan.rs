@@ -225,6 +225,20 @@ pub enum QueryDestination {
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
     },
+    /// The result of an EXISTS subquery are stored in a single register.
+    ExistsSubqueryResult {
+        /// The register that holds the result of the EXISTS subquery.
+        result_reg: usize,
+    },
+    /// The results of a subquery that is neither 'EXISTS' nor 'IN' are stored in a range of registers.
+    RowValueSubqueryResult {
+        /// The start register of the range that holds the result of the subquery.
+        result_reg_start: usize,
+        /// The number of registers that hold the result of the subquery.
+        num_regs: usize,
+    },
+    /// Decision made at some point after query plan construction.
+    Unset,
 }
 
 impl QueryDestination {
