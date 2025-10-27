@@ -83,7 +83,7 @@ use super::{
     sorter::Sorter,
 };
 use regex::{Regex, RegexBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 
 #[cfg(feature = "json")]
 use crate::{
