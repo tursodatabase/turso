@@ -392,7 +392,10 @@ pub fn emit_from_clause_subqueries(
                 },
                 Operation::IndexMethodQuery(query) => {
                     let index_method = query.index.index_method.as_ref().unwrap();
-                    format!("QUERY INDEX METHOD {}", index_method.definition().method_name)
+                    format!(
+                        "QUERY INDEX METHOD {}",
+                        index_method.definition().method_name
+                    )
                 }
             }
         );
