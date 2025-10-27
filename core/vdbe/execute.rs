@@ -15,7 +15,7 @@ use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize}
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
-    SeekResult, Text,
+    RecordCursor, SeekResult, Text,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
@@ -1623,64 +1623,88 @@ pub fn op_column(
                             }
 
                             let target_column = *column;
-                            let mut parse_pos = record_cursor.header_offset;
-                            let mut data_offset = record_cursor
-                                .offsets
-                                .last()
-                                .copied()
-                                .expect("header_offset must be set");
+                            if record_cursor.serial_types.len() <= target_column {
+                                let mut parse_pos = record_cursor.header_offset;
+                                let mut data_offset = record_cursor
+                                    .offsets
+                                    .last()
+                                    .copied()
+                                    .expect("header_offset must be set");
 
-                            // Parse the header for serial types incrementally until we have the target column
-                            while record_cursor.serial_types.len() <= target_column
-                                && parse_pos < record_cursor.header_size
-                            {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
-                                record_cursor.serial_types.push(serial_type);
-                                parse_pos += varint_len;
-                                let data_size = match serial_type {
-                                    // NULL
-                                    0 => 0,
-                                    // I8
-                                    1 => 1,
-                                    // I16
-                                    2 => 2,
-                                    // I24
-                                    3 => 3,
-                                    // I32
-                                    4 => 4,
-                                    // I48
-                                    5 => 6,
-                                    // I64
-                                    6 => 8,
-                                    // F64
-                                    7 => 8,
-                                    // CONST_INT0
-                                    8 => 0,
-                                    // CONST_INT1
-                                    9 => 0,
-                                    // BLOB
-                                    n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
-                                    // TEXT
-                                    n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
-                                    // Reserved
-                                    10 | 11 => {
-                                        return Err(LimboError::Corrupt(format!(
-                                            "Reserved serial type: {serial_type}"
-                                        )))
-                                    }
-                                    _ => unreachable!("Invalid serial type: {serial_type}"),
-                                } as usize;
-                                data_offset += data_size;
-                                record_cursor.offsets.push(data_offset);
+                                // EAGER parsing optimization - parse entire header if it's in memory
+                                let should_parse_eager = payload.len() >= record_cursor.header_size;
+
+                                // Determine stopping condition based on parsing strategy
+                                let should_continue =
+                                    |record_cursor: &RecordCursor,
+                                     target_column: usize,
+                                     parse_pos: usize,
+                                     header_size: usize| {
+                                        if should_parse_eager {
+                                            // Eager: parse entire header
+                                            parse_pos < header_size
+                                        } else {
+                                            // Lazy: parse only up to target column
+                                            record_cursor.serial_types.len() <= target_column
+                                                && parse_pos < header_size
+                                        }
+                                    };
+
+                                // Single parsing loop with conditional stopping
+                                while should_continue(
+                                    &record_cursor,
+                                    target_column,
+                                    parse_pos,
+                                    record_cursor.header_size,
+                                ) {
+                                    let (serial_type, varint_len) =
+                                        read_varint_fast(&payload[parse_pos..])?;
+                                    record_cursor.serial_types.push(serial_type);
+                                    parse_pos += varint_len;
+                                    let data_size = match serial_type {
+                                        // NULL
+                                        0 => 0,
+                                        // I8
+                                        1 => 1,
+                                        // I16
+                                        2 => 2,
+                                        // I24
+                                        3 => 3,
+                                        // I32
+                                        4 => 4,
+                                        // I48
+                                        5 => 6,
+                                        // I64
+                                        6 => 8,
+                                        // F64
+                                        7 => 8,
+                                        // CONST_INT0
+                                        8 => 0,
+                                        // CONST_INT1
+                                        9 => 0,
+                                        // BLOB
+                                        n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
+                                        // TEXT
+                                        n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
+                                        // Reserved
+                                        10 | 11 => {
+                                            return Err(LimboError::Corrupt(format!(
+                                                "Reserved serial type: {serial_type}"
+                                            )))
+                                        }
+                                        _ => unreachable!("Invalid serial type: {serial_type}"),
+                                    } as usize;
+                                    data_offset += data_size;
+                                    record_cursor.offsets.push(data_offset);
+                                }
+
+                                debug_assert!(
+                                    parse_pos <= record_cursor.header_size,
+                                    "parse_pos: {parse_pos}, header_size: {}",
+                                    record_cursor.header_size
+                                );
+                                record_cursor.header_offset = parse_pos;
                             }
-
-                            debug_assert!(
-                                parse_pos <= record_cursor.header_size,
-                                "parse_pos: {parse_pos}, header_size: {}",
-                                record_cursor.header_size
-                            );
-                            record_cursor.header_offset = parse_pos;
                             if target_column >= record_cursor.serial_types.len() {
                                 break 'ifnull;
                             }
