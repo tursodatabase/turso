@@ -374,6 +374,15 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
+    /// Whether this query or any of its subqueries reference columns from the outer query.
+    pub fn is_correlated(&self) -> bool {
+        self.table_references
+            .outer_query_refs()
+            .iter()
+            .any(|t| t.is_used())
+            || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
+    }
+
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
     ///
     /// Checks to see if the query is of the format `SELECT count(*) FROM <tbl>`
