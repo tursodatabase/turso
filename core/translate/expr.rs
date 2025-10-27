@@ -2179,46 +2179,46 @@ pub fn translate_expr(
                             target_register,
                         );
                     } else {
-                         if *is_rowid_alias {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::IdxRowId {
-                                cursor_id: index_cursor_id,
-                                dest: target_register,
-                            });
-                        } else if let Some(table_cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::RowId {
-                                cursor_id: table_cursor_id,
-                                dest: target_register,
-                            });
+                        if *is_rowid_alias {
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                program.emit_insn(Insn::IdxRowId {
+                                    cursor_id: index_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else if let Some(table_cursor_id) = table_cursor_id {
+                                program.emit_insn(Insn::RowId {
+                                    cursor_id: table_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else {
+                                unreachable!("Either index or table cursor must be opened");
+                            }
                         } else {
-                            unreachable!("Either index or table cursor must be opened");
-                        }
-                    } else {
-                        let read_from_index = if is_from_outer_query_scope {
-                            index_cursor_id.is_some()
-                        } else {
-                            use_covering_index
-                        };
-                        let read_cursor = if read_from_index {
-                            index_cursor_id.expect("index cursor should be opened")
-                        } else {
-                            table_cursor_id.expect("table cursor should be opened")
-                        };
-                        let column = if read_from_index {
-                            let index = program.resolve_index_for_cursor_id(
-                                index_cursor_id.expect("index cursor should be opened"),
-                            );
-                            index
-                                .column_table_pos_to_index_pos(*column)
-                                .unwrap_or_else(|| {
-                                    panic!(
+                            let read_from_index = if is_from_outer_query_scope {
+                                index_cursor_id.is_some()
+                            } else {
+                                use_covering_index
+                            };
+                            let read_cursor = if read_from_index {
+                                index_cursor_id.expect("index cursor should be opened")
+                            } else {
+                                table_cursor_id.expect("table cursor should be opened")
+                            };
+                            let column = if read_from_index {
+                                let index = program.resolve_index_for_cursor_id(
+                                    index_cursor_id.expect("index cursor should be opened"),
+                                );
+                                index
+                                    .column_table_pos_to_index_pos(*column)
+                                    .unwrap_or_else(|| {
+                                        panic!(
                                         "index {} does not contain column number {} of table {}",
                                         index.name, column, table_ref_id
                                     )
-                                })
-                        } else {
-                            *column
-                        };
+                                    })
+                            } else {
+                                *column
+                            };
 
                             program.emit_column_or_rowid(read_cursor, column, target_register);
                         }
