@@ -7,6 +7,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
+    index_method::IndexMethodAttachment,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
@@ -134,6 +135,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
+    IndexMethod(Arc<dyn IndexMethodAttachment>),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
@@ -330,6 +332,20 @@ impl ProgramBuilder {
         } else {
             self._alloc_cursor_id(Some(key), cursor_type)
         }
+    }
+
+    /// allocate proper cursor for the given index (either [CursorType::BTreeIndex] or [CursorType::IndexMethod])
+    pub fn alloc_cursor_index(
+        &mut self,
+        key: Option<CursorKey>,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        let module = index.index_method.as_ref();
+        if module.is_some_and(|m| !m.definition().backing_btree) {
+            let module = module.unwrap().clone();
+            return Ok(self._alloc_cursor_id(key, CursorType::IndexMethod(module)));
+        }
+        Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
