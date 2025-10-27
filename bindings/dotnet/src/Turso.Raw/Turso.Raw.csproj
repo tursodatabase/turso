@@ -7,14 +7,33 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
 
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+        <DefineConstants>OS_WINDOWS</DefineConstants>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+        <DefineConstants>OS_LINUX</DefineConstants>
+    </PropertyGroup>
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+        <DefineConstants>OS_MAC</DefineConstants>
+    </PropertyGroup>
+    
     <ItemGroup Condition="'$(Configuration)'=='Debug'">
         <None Include="..\..\rs_compiled\debug\*.*" Visible="false">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </None>
     </ItemGroup>
-
-    <ItemGroup Condition="'$(Configuration)'=='Release'">
+    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\turso_dotnet.dll')">
         <None Include="..\..\rs_compiled\release\turso_dotnet.dll" Visible="false">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\turso_dotnet.so')">
+        <None Include="..\..\rs_compiled\release\turso_dotnet.so" Visible="false">
+            <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        </None>
+    </ItemGroup>
+    <ItemGroup Condition="'$(Configuration)'=='Release' AND Exists('..\..\rs_compiled\release\turso_dotnet.dylib')">
+        <None Include="..\..\rs_compiled\release\turso_dotnet.dylib" Visible="false">
             <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         </None>
     </ItemGroup>
