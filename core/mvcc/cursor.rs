@@ -17,7 +17,14 @@ enum CursorPosition {
     /// We haven't loaded any row yet.
     BeforeFirst,
     /// We have loaded a row. This position points to a rowid in either MVCC index or in BTree.
-    Loaded { row_id: RowID, in_btree: bool },
+    Loaded {
+        row_id: RowID,
+        /// Indicates whether the rowid is pointing BTreeCursor or MVCC index.
+        in_btree: bool,
+        /// Indicates whether the rowid poiting in BTreeCursor has been consumed.
+        /// This is required to know whether `next` or `prev` has been called but not yet consumed.
+        btree_consumed: bool,
+    },
     /// We have reached the end of the table.
     End,
 }
@@ -80,6 +87,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
+                btree_consumed: _,
             } => self.db.read(self.tx_id, row_id),
             CursorPosition::BeforeFirst => {
                 // If we are before first, we need to try and find the first row.
@@ -90,6 +98,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     self.current_pos.replace(CursorPosition::Loaded {
                         row_id: id,
                         in_btree: false,
+                        btree_consumed: false,
                     });
                     self.db.read(self.tx_id, id)
                 } else {
@@ -113,6 +122,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
+                btree_consumed: _,
             } => row_id.row_id + 1,
             CursorPosition::BeforeFirst => 1,
             CursorPosition::End => i64::MAX,
@@ -148,6 +158,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                             row_id: *mvcc_rowid,
                         },
                         in_btree: false,
+                        btree_consumed: false, // there is a BTree rowid being pointed but we choose not to consume it yet.
                     }
                 } else {
                     CursorPosition::Loaded {
@@ -156,6 +167,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                             row_id: *btree_rowid,
                         },
                         in_btree: true,
+                        btree_consumed: true,
                     }
                 }
             }
@@ -165,6 +177,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     row_id: *btree_rowid,
                 },
                 in_btree: true,
+                btree_consumed: true,
             },
             (Some(mvcc_rowid), None) => CursorPosition::Loaded {
                 row_id: RowID {
@@ -172,6 +185,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     row_id: *mvcc_rowid,
                 },
                 in_btree: false,
+                btree_consumed: true,
             },
             (None, None) => CursorPosition::End,
         };
@@ -189,6 +203,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id: last_rowid,
                 },
                 in_btree: false,
+                btree_consumed: false,
             });
         } else {
             self.current_pos.replace(CursorPosition::BeforeFirst);
@@ -206,6 +221,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
+                    btree_consumed: _,
                 } => row_id.row_id + 1,
                 // TODO: do we need to forward twice?
                 CursorPosition::BeforeFirst => i64::MIN, // we need to find first row, so we look from the first id,
@@ -223,6 +239,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     Some(id) => CursorPosition::Loaded {
                         row_id: id,
                         in_btree: false,
+                        btree_consumed: false,
                     },
                     None => {
                         if before_first {
@@ -247,13 +264,28 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             panic!("Invalid state {:?}", self.state.borrow());
         };
 
-        let found = return_if_io!(self.btree_cursor.next());
+        let btree_consumed = match self.get_current_pos() {
+            CursorPosition::Loaded {
+                row_id,
+                in_btree: _,
+                btree_consumed,
+            } => btree_consumed,
+            CursorPosition::BeforeFirst => false,
+            CursorPosition::End => false,
+        };
+
+        let found = if btree_consumed {
+            return_if_io!(self.btree_cursor.next())
+        } else {
+            true
+        };
         // get current rowid in mvcc and in btree
         // compare both and set loaded to position of the one that is lesser
         let new_position_in_mvcc = match new_position_in_mvcc {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
+                btree_consumed: _,
             } => Some(row_id.row_id),
             CursorPosition::BeforeFirst => None,
             CursorPosition::End => None,
@@ -287,6 +319,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
+                btree_consumed: _,
             } => Some(row_id.row_id),
             CursorPosition::BeforeFirst => {
                 // If we are before first, we need to try and find the first row.
@@ -297,6 +330,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.current_pos.replace(CursorPosition::Loaded {
                         row_id: id,
                         in_btree: false,
+                        btree_consumed: false,
                     });
                     Some(id.row_id)
                 } else {
@@ -355,6 +389,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.current_pos.replace(CursorPosition::Loaded {
                 row_id: rowid,
                 in_btree: false,
+                btree_consumed: false,
             });
             if op.eq_only() {
                 if rowid.row_id == row_id {
@@ -393,6 +428,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.current_pos.replace(CursorPosition::Loaded {
             row_id: row.id,
             in_btree: false,
+            btree_consumed: false,
         });
         if self.db.read(self.tx_id, row.id)?.is_some() {
             self.db.update(self.tx_id, row).inspect_err(|_| {
@@ -452,6 +488,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id: *int_key,
                 },
                 in_btree: false,
+                btree_consumed: false,
             });
         }
         Ok(IOResult::Done(exists))
@@ -537,6 +574,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.current_pos.replace(CursorPosition::Loaded {
                 row_id: rowid,
                 in_btree: false,
+                btree_consumed: false,
             });
         } else {
             self.current_pos.replace(CursorPosition::End);
