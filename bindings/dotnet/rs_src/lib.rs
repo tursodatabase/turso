@@ -87,12 +87,10 @@ pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *co
     let connection_result =
         Connection::from_uri(path_str.unwrap(), true, false, false, false, false, false);
     match connection_result {
-        Ok((io, val)) => {
-            allocate(Database {
-                io,
-                connection: val,
-            })
-        }
+        Ok((io, val)) => allocate(Database {
+            io,
+            connection: val,
+        }),
         Err(err) => {
             unsafe {
                 *error_ptr =
