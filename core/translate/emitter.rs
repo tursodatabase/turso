@@ -21,7 +21,7 @@ use super::plan::{
     Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
-use super::subquery::emit_subqueries;
+use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Schema, Table, ROWID_SENTINEL};
@@ -243,7 +243,7 @@ pub fn emit_program(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-fn emit_program_for_select(
+pub fn emit_program_for_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: SelectPlan,
@@ -280,8 +280,8 @@ pub fn emit_query<'a>(
         return Ok(reg_result_cols_start);
     }
 
-    // Emit subqueries first so the results can be read in the main query loop.
-    emit_subqueries(program, t_ctx, &mut plan.table_references)?;
+    // Emit FROM clause subqueries first so the results can be read in the main query loop.
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -364,6 +364,8 @@ pub fn emit_query<'a>(
         plan.group_by.as_ref(),
         OperationMode::SELECT,
         &plan.where_clause,
+        &plan.join_order,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     if plan.is_simple_count() {
@@ -380,6 +382,7 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         None,
         OperationMode::SELECT,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -463,6 +466,8 @@ fn emit_program_for_delete(
         None,
         OperationMode::DELETE,
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Set up main query execution loop
@@ -474,6 +479,7 @@ fn emit_program_for_delete(
         &plan.where_clause,
         None,
         OperationMode::DELETE,
+        &mut [],
     )?;
 
     emit_delete_insns(
@@ -963,6 +969,8 @@ fn emit_program_for_update(
         None,
         mode.clone(),
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Prepare index cursors
@@ -999,6 +1007,7 @@ fn emit_program_for_update(
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
+        &mut [],
     )?;
 
     let target_table_cursor_id =

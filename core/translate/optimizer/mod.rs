@@ -23,8 +23,8 @@ use crate::{
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
         plan::{
-            ColumnUsedMask, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
-            SeekKeyComponent,
+            ColumnUsedMask, NonFromClauseSubquery, OuterQueryReference, QueryDestination,
+            ResultSetColumn, Scan, SeekKeyComponent,
         },
     },
     types::SeekOp,
@@ -89,6 +89,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut plan.group_by,
+        &plan.non_from_clause_subqueries,
     )?;
 
     if let Some(best_join_order) = best_join_order {
@@ -114,6 +115,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &[],
     )?;
 
     Ok(())
@@ -138,6 +140,7 @@ fn optimize_update_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
+        &[],
     )?;
 
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
@@ -301,6 +304,7 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
+        non_from_clause_subqueries: vec![],
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -336,6 +340,7 @@ fn optimize_table_access(
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
@@ -345,8 +350,12 @@ fn optimize_table_access(
     }
     let access_methods_arena = RefCell::new(Vec::new());
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
-    let constraints_per_table =
-        constraints_from_where_clause(where_clause, table_references, available_indexes)?;
+    let constraints_per_table = constraints_from_where_clause(
+        where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+    )?;
 
     // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
@@ -766,6 +775,7 @@ impl Optimizable for ast::Expr {
     /// by writing more complex code.
     fn is_nonnull(&self, tables: &TableReferences) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
@@ -804,7 +814,9 @@ impl Optimizable for ast::Expr {
                     return true;
                 }
 
-                let table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables
+                    .find_table_by_internal_id(*table)
+                    .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
                 column.primary_key || column.notnull
@@ -843,6 +855,7 @@ impl Optimizable for ast::Expr {
     /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
+            Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
             } => {

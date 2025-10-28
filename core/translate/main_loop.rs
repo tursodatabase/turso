@@ -19,7 +19,11 @@ use super::{
     },
 };
 use crate::translate::{
-    collate::get_collseq_from_expr, emitter::UpdateRowSource, window::emit_window_loop_source,
+    collate::get_collseq_from_expr,
+    emitter::UpdateRowSource,
+    plan::{EvalAt, NonFromClauseSubquery},
+    subquery::emit_non_from_clause_subquery,
+    window::emit_window_loop_source,
 };
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
@@ -116,6 +120,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
 }
 
 /// Initialize resources needed for the source operators (tables, joins, etc)
+#[allow(clippy::too_many_arguments)]
 pub fn init_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -124,6 +129,8 @@ pub fn init_loop(
     group_by: Option<&GroupBy>,
     mode: OperationMode,
     where_clause: &[WhereTerm],
+    join_order: &[JoinOrderMember],
+    subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -397,9 +404,25 @@ pub fn init_loop(
         }
     }
 
+    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+        let eval_at = subquery.get_eval_at(join_order)?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            program,
+            t_ctx,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
     for cond in where_clause
         .iter()
-        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
+        .filter(|c| c.should_eval_before_loop(join_order, subqueries))
     {
         let jump_target = program.allocate_label();
         let meta = ConditionMetadata {
@@ -418,6 +441,7 @@ pub fn init_loop(
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
+#[allow(clippy::too_many_arguments)]
 pub fn open_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -426,6 +450,7 @@ pub fn open_loop(
     predicates: &[WhereTerm],
     temp_cursor_id: Option<CursorID>,
     mode: OperationMode,
+    subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
@@ -666,6 +691,25 @@ pub fn open_loop(
             }
         }
 
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            assert!(subquery.correlated, "subquery must be correlated");
+            let eval_at = subquery.get_eval_at(join_order)?;
+
+            if eval_at != EvalAt::Loop(join_index) {
+                continue;
+            }
+
+            let plan = subquery.consume_plan(eval_at);
+
+            emit_non_from_clause_subquery(
+                program,
+                t_ctx,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+
         // First emit outer join conditions, if any.
         emit_conditions(
             program,
@@ -676,6 +720,7 @@ pub fn open_loop(
             join_index,
             next,
             true,
+            subqueries,
         )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
@@ -706,7 +751,18 @@ pub fn open_loop(
             join_index,
             next,
             false,
+            subqueries,
         )?;
+    }
+
+    if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+        crate::bail_parse_error!(
+            "all subqueries should have already been emitted, but found {} unevaluated subqueries",
+            subqueries
+                .iter()
+                .filter(|s| !s.has_been_evaluated())
+                .count()
+        );
     }
 
     Ok(())
@@ -722,11 +778,12 @@ fn emit_conditions(
     join_index: usize,
     next: BranchOffset,
     from_outer_join: bool,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<()> {
     for cond in predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
-        .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+        .filter(|cond| cond.should_eval_at_loop(join_index, join_order, subqueries))
     {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {

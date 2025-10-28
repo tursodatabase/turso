@@ -13,6 +13,7 @@ use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     resolve_window_and_aggregate_functions,
 };
+use crate::translate::subquery::plan_subqueries_from_where_clause;
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -273,6 +274,7 @@ fn prepare_one_select_plan(
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -502,6 +504,25 @@ fn prepare_one_select_plan(
                 )?;
             }
 
+            // TODO: support subqueries in the following positions:
+            // - result column of a select, e.g.: SELECT x = (SELECT ...) FROM t
+            // - GROUP BY clause, e.g.: SELECT * FROM t GROUP BY (SELECT ...) <-- however nonsensical that might be...
+            // - HAVING clause, e.g.: SELECT * FROM t GROUP BY x HAVING x = (SELECT ...)
+            // - ORDER BY clause, e.g.: SELECT * FROM t ORDER BY x = (SELECT ...)
+            // - LIMIT clause, e.g.: SELECT * FROM t LIMIT (SELECT ...)
+            // - OFFSET clause, e.g.: SELECT * FROM t OFFSET (SELECT ...)
+            //
+            // in these positions, unlike in the WHERE clause, the subquery cannot reference columns from the outer query,
+            // so we don't need to collect outer query references.
+            plan_subqueries_from_where_clause(
+                program,
+                &mut plan.non_from_clause_subqueries,
+                &mut plan.table_references,
+                resolver,
+                &mut plan.where_clause,
+                connection,
+            )?;
+
             // Return the unoptimized query plan
             Ok(plan)
         }
@@ -555,6 +576,7 @@ fn prepare_one_select_plan(
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             Ok(plan)

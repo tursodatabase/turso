@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
-use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
+use turso_parser::ast::{
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+};
 
 use crate::{
     function::AggFunc,
@@ -36,12 +38,12 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
                 table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let table_ref = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
@@ -106,28 +108,41 @@ pub struct WhereTerm {
 }
 
 impl WhereTerm {
-    pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_before_loop(
+        &self,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
     }
 
-    pub fn should_eval_at_loop(&self, loop_idx: usize, join_order: &[JoinOrderMember]) -> bool {
+    pub fn should_eval_at_loop(
+        &self,
+        loop_idx: usize,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
     }
 
-    fn eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order)
+    fn eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        subqueries: &[NonFromClauseSubquery],
+    ) -> Result<EvalAt> {
+        determine_where_to_eval_term(self, join_order, subqueries)
     }
 }
 
@@ -225,6 +240,20 @@ pub enum QueryDestination {
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
     },
+    /// The result of an EXISTS subquery are stored in a single register.
+    ExistsSubqueryResult {
+        /// The register that holds the result of the EXISTS subquery.
+        result_reg: usize,
+    },
+    /// The results of a subquery that is neither 'EXISTS' nor 'IN' are stored in a range of registers.
+    RowValueSubqueryResult {
+        /// The start register of the range that holds the result of the subquery.
+        result_reg_start: usize,
+        /// The number of registers that hold the result of the subquery.
+        num_regs: usize,
+    },
+    /// Decision made at some point after query plan construction.
+    Unset,
 }
 
 impl QueryDestination {
@@ -345,6 +374,8 @@ pub struct SelectPlan {
     /// The window definition and all window functions associated with it. There is at most one
     /// window per SELECT. If the original query contains more, they are pushed down into subqueries.
     pub window: Option<Window>,
+    /// Subqueries that appear in any part of the query apart from the FROM clause
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 impl SelectPlan {
@@ -354,6 +385,15 @@ impl SelectPlan {
 
     pub fn agg_args_count(&self) -> usize {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
+    }
+
+    /// Whether this query or any of its subqueries reference columns from the outer query.
+    pub fn is_correlated(&self) -> bool {
+        self.table_references
+            .outer_query_refs()
+            .iter()
+            .any(|t| t.is_used())
+            || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
     }
 
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
@@ -659,17 +699,22 @@ impl TableReferences {
             .find(|t| t.internal_id == internal_id)
     }
 
-    /// Returns an immutable reference to the [Table] with the given internal ID.
-    pub fn find_table_by_internal_id(&self, internal_id: TableInternalId) -> Option<&Table> {
+    /// Returns an immutable reference to the [Table] with the given internal ID,
+    /// plus a boolean indicating whether the table is a joined table from the current query scope (false),
+    /// or an outer query reference (true).
+    pub fn find_table_by_internal_id(
+        &self,
+        internal_id: TableInternalId,
+    ) -> Option<(bool, &Table)> {
         self.joined_tables
             .iter()
             .find(|t| t.internal_id == internal_id)
-            .map(|t| &t.table)
+            .map(|t| (false, &t.table))
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
                     .find(|t| t.internal_id == internal_id)
-                    .map(|t| &t.table)
+                    .map(|t| (true, &t.table))
             })
     }
 
@@ -787,6 +832,12 @@ impl ColumnUsedMask {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
+    fn bitor_assign(&mut self, rhs: &Self) {
+        self.0 |= &rhs.0;
     }
 }
 
@@ -1297,6 +1348,84 @@ pub struct WindowFunction {
     pub func: AggFunc,
     /// The expression from which the function was resolved.
     pub original_expr: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubqueryState {
+    /// The subquery has not been evaluated yet.
+    /// The 'plan' field is only optional because it is .take()'d when the the subquery
+    /// is translated into bytecode.
+    Unevaluated { plan: Option<Box<SelectPlan>> },
+    /// The subquery has been evaluated.
+    /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
+    /// The query plan struct no longer exists because translating the plan currently
+    /// requires an ownership transfer.
+    Evaluated { evaluated_at: EvalAt },
+}
+
+#[derive(Debug, Clone)]
+/// A subquery that is not part of the `FROM` clause.
+/// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
+/// Currently only subqueries in the WHERE clause are supported.
+pub struct NonFromClauseSubquery {
+    pub internal_id: TableInternalId,
+    pub query_type: SubqueryType,
+    pub state: SubqueryState,
+    pub correlated: bool,
+}
+
+impl NonFromClauseSubquery {
+    /// Returns true if the subquery has been evaluated (translated into bytecode).
+    pub fn has_been_evaluated(&self) -> bool {
+        matches!(self.state, SubqueryState::Evaluated { .. })
+    }
+
+    /// Returns the loop index where the subquery should be evaluated in this particular join order.
+    /// If the subquery references tables from the parent query, it will be evaluated at the right-most
+    /// nested loop whose table it references.
+    pub fn get_eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
+        let mut eval_at = EvalAt::BeforeLoop;
+        let SubqueryState::Unevaluated { plan } = &self.state else {
+            crate::bail_parse_error!("subquery has already been evaluated");
+        };
+        let used_outer_refs = plan
+            .as_ref()
+            .unwrap()
+            .table_references
+            .outer_query_refs()
+            .iter()
+            .filter(|t| t.is_used());
+
+        for outer_ref in used_outer_refs {
+            let Some(loop_idx) = join_order
+                .iter()
+                .position(|t| t.table_id == outer_ref.internal_id)
+            else {
+                continue;
+            };
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+        for subquery in plan.as_ref().unwrap().non_from_clause_subqueries.iter() {
+            let eval_at_inner = subquery.get_eval_at(join_order)?;
+            eval_at = eval_at.max(eval_at_inner);
+        }
+        Ok(eval_at)
+    }
+
+    /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
+    /// This is used when the subquery is translated into bytecode.
+    pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
+        match &mut self.state {
+            SubqueryState::Unevaluated { plan } => {
+                let plan = plan.take().unwrap();
+                self.state = SubqueryState::Evaluated { evaluated_at };
+                plan
+            }
+            SubqueryState::Evaluated { .. } => {
+                panic!("subquery has already been evaluated");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

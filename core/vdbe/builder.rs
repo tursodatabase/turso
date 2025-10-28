@@ -842,6 +842,42 @@ impl ProgramBuilder {
             .unwrap_or_else(|| panic!("Cursor not found: {key:?}"))
     }
 
+    /// Resolve the first allocated index cursor for a given table reference.
+    /// This method exists due to a limitation of our translation system where
+    /// a subquery that references an outer query table cannot know whether a
+    /// table cursor, index cursor, or both were opened for that table reference.
+    /// Hence: currently we first try to resolve a table cursor, and if that fails,
+    /// we resolve an index cursor via this method.
+    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
+        self.cursor_ref
+            .iter()
+            .position(|(k, _)| {
+                k.as_ref()
+                    .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+            })
+            .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
+    }
+
+    /// Resolve the [Index] that a given cursor is associated with.
+    pub fn resolve_index_for_cursor_id(&self, cursor_id: CursorID) -> Arc<Index> {
+        let cursor_ref = &self
+            .cursor_ref
+            .get(cursor_id)
+            .unwrap_or_else(|| panic!("Cursor not found: {cursor_id}"))
+            .1;
+        let CursorType::BTreeIndex(index) = cursor_ref else {
+            panic!("Cursor is not an index: {cursor_id}");
+        };
+        index.clone()
+    }
+
+    /// Get the [CursorType] of a given cursor.
+    pub fn get_cursor_type(&self, cursor_id: CursorID) -> Option<&CursorType> {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type)
+    }
+
     pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
         self.collation = c
     }
