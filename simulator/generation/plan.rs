@@ -237,6 +237,7 @@ impl InteractionPlan {
                 Query::AlterTable(_) => stats.alter_table_count += 1,
                 Query::DropIndex(_) => stats.drop_index_count += 1,
                 Query::Placeholder => {}
+                Query::Pragma(_) => stats.pragma_count += 1,
             }
         }
         for interactions in &self.plan {
@@ -771,6 +772,7 @@ pub(crate) struct InteractionStats {
     pub rollback_count: u32,
     pub alter_table_count: u32,
     pub drop_index_count: u32,
+    pub pragma_count: u32,
 }
 
 impl Display for InteractionStats {

@@ -43,6 +43,7 @@ mod numeric;
 use crate::index_method::IndexMethod;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
+use crate::storage::pager::{AutoVacuumMode, HeaderRef};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -565,6 +566,29 @@ impl Database {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
+
+        if self.db_state.get().is_initialized() {
+            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+
+            let header = header_ref.borrow();
+
+            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+                if header.incremental_vacuum_enabled.get() > 0 {
+                    AutoVacuumMode::Incremental
+                } else {
+                    AutoVacuumMode::Full
+                }
+            } else {
+                AutoVacuumMode::None
+            };
+
+            pager.set_auto_vacuum_mode(mode);
+
+            tracing::debug!(
+                "Opened existing database. Detected auto_vacuum_mode from header: {:?}",
+                mode
+            );
+        }
 
         let page_size = pager.get_page_size_unchecked();
 

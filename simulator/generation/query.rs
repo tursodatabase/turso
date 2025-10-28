@@ -5,12 +5,15 @@ use crate::{
 use rand::{
     Rng,
     distr::{Distribution, weighted::WeightedIndex},
+    seq::IndexedRandom,
 };
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
         query::{
-            Create, CreateIndex, Delete, DropIndex, Insert, Select, alter_table::AlterTable,
+            Create, CreateIndex, Delete, DropIndex, Insert, Select,
+            alter_table::AlterTable,
+            pragma::{Pragma, VacuumMode},
             update::Update,
         },
         table::Table,
@@ -82,6 +85,18 @@ fn random_create_index<R: rand::Rng + ?Sized>(
     Query::CreateIndex(create_index)
 }
 
+fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, _conn_ctx: &impl GenerationContext) -> Query {
+    const ALL_MODES: [VacuumMode; 2] = [
+        VacuumMode::None,
+        // VacuumMode::Incremental, not implemented yet
+        VacuumMode::Full,
+    ];
+
+    let mode = ALL_MODES.choose(rng).unwrap();
+
+    Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+}
+
 fn random_alter_table<R: rand::Rng + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
@@ -140,6 +155,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
+            QueryDiscriminants::Pragma => random_pragma,
         }
     }
 
@@ -164,6 +180,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
+            QueryDiscriminants::Pragma => remaining.pragma_count,
         }
     }
 }

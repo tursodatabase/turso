@@ -241,6 +241,18 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
+            let is_empty = is_database_empty(resolver.schema, &pager)?;
+            tracing::debug!(
+                "Checking if database is empty for auto_vacuum pragma: {}",
+                is_empty
+            );
+
+            if !is_empty {
+                // SQLite's behavior is to silently ignore this pragma if the database is not empty.
+                tracing::debug!("Attempted to set auto_vacuum, database is not empty so we are ignoring pragma.");
+                return Ok((program, TransactionMode::None));
+            }
+
             let auto_vacuum_mode = match value {
                 Expr::Name(name) => {
                     let name = name.as_str().as_bytes();
@@ -893,4 +905,31 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
+}
+
+fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
+    if schema.tables.len() > 1 {
+        return Ok(false);
+    }
+    if let Some(table_arc) = schema.tables.values().next() {
+        let table_name = match table_arc.as_ref() {
+            crate::schema::Table::BTree(tbl) => &tbl.name,
+            crate::schema::Table::Virtual(tbl) => &tbl.name,
+            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
+        };
+
+        if table_name != "sqlite_schema" {
+            return Ok(false);
+        }
+    }
+
+    let db_size_result = pager
+        .io
+        .block(|| pager.with_header(|header| header.database_size.get()));
+
+    match db_size_result {
+        Err(_) => Ok(true),
+        Ok(0 | 1) => Ok(true),
+        Ok(_) => Ok(false),
+    }
 }
