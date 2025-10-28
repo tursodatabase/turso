@@ -193,3 +193,4 @@ jobs:
 
       - name: Run benchmark
         run: uv run bench-vfs "SELECT 1;" 100
+
