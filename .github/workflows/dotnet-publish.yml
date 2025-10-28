@@ -1,4 +1,4 @@
-name: Publish dotnet bindings to nuget
+name: Dotnet Publish
 
 on:
   # Manually trigger the workflow
@@ -11,27 +11,27 @@ jobs:
   # Build native libraries for each platform
   build-natives:
     strategy:
-        matrix:
-          include:
-          - os: ubuntu-latest
-            make-target: build-rust-linux64
-            artifact-name: linux64
-            target: x86_64-unknown-linux-gnu
+      matrix:
+        include:
+        - os: ubuntu-latest
+          make-target: build-rust-linux64
+          artifact-name: linux64
+          target: x86_64-unknown-linux-gnu
 
-          - os: macos-latest
-            make-target: build-rust-macos64
-            artifact-name: macos64
-            target: x86_64-apple-darwin
+        - os: macos-latest
+          make-target: build-rust-macos64
+          artifact-name: macos64
+          target: x86_64-apple-darwin
 
-          - os: macos-latest
-            make-target: build-rust-macosarm64
-            target: aarch64-apple-darwin
-            artifact-name: macosarm64
+        - os: macos-latest
+          make-target: build-rust-macosarm64
+          target: aarch64-apple-darwin
+          artifact-name: macosarm64
 
-          - os: windows-latest
-            make-target: build-rust-windows64
-            target: x86_64-pc-windows-msvc
-            artifact-name: windows64
+        - os: windows-latest
+          make-target: build-rust-windows64
+          target: x86_64-pc-windows-msvc
+          artifact-name: windows64
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

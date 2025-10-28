@@ -1,4 +1,4 @@
-name: dotnet bindings tests
+name: Dotnet Tests
 
 on:
   push:
