@@ -4295,7 +4295,12 @@ mod fuzz_tests {
         };
 
         // Helper function to generate simple subquery
-        fn gen_subquery(rng: &mut ChaCha8Rng, depth: usize, outer_table: Option<&str>) -> String {
+        fn gen_subquery(
+            rng: &mut ChaCha8Rng,
+            depth: usize,
+            outer_table: Option<&str>,
+            allowed_outer_cols: Option<&[&str]>,
+        ) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 return "SELECT 1".to_string();
             }
@@ -4328,56 +4333,96 @@ mod fuzz_tests {
             // Helper function to generate correlated WHERE conditions
             let gen_correlated_where =
                 |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    let pick =
+                        |rng: &mut ChaCha8Rng, mut candidates: Vec<(String, &'static str)>| {
+                            let filtered: Vec<String> = if let Some(allowed) = allowed_outer_cols {
+                                candidates
+                                    .drain(..)
+                                    .filter(|(_, col)| allowed.contains(col))
+                                    .map(|(cond, _)| cond)
+                                    .collect()
+                            } else {
+                                candidates.drain(..).map(|(cond, _)| cond).collect()
+                            };
+                            if filtered.is_empty() {
+                                "1=1".to_string()
+                            } else {
+                                filtered[rng.random_range(0..filtered.len())].clone()
+                            }
+                        };
                     match (outer_table, inner_table) {
-                        ("t1", "t2") => {
-                            // t2.ref_id relates to t1.id
-                            let conditions = [
-                                format!("{inner_table}.ref_id = {outer_table}.id"),
-                                format!("{inner_table}.id < {outer_table}.value1"),
-                                format!("{inner_table}.data > {outer_table}.value2"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t1", "t3") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.category < {outer_table}.value1"),
-                                format!("{inner_table}.amount > {outer_table}.value2"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t2", "t1") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.ref_id"),
-                                format!("{inner_table}.value1 > {outer_table}.data"),
-                                format!("{inner_table}.value2 < {outer_table}.id"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t2", "t3") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.category = {outer_table}.ref_id"),
-                                format!("{inner_table}.amount > {outer_table}.data"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t3", "t1") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.value1 > {outer_table}.category"),
-                                format!("{inner_table}.value2 < {outer_table}.amount"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t3", "t2") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.ref_id = {outer_table}.category"),
-                                format!("{inner_table}.data < {outer_table}.amount"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
+                        ("t1", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.ref_id = {outer_table}.id"), "id"),
+                                (format!("{inner_table}.id < {outer_table}.value1"), "value1"),
+                                (
+                                    format!("{inner_table}.data > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t1", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category < {outer_table}.value1"),
+                                    "value1",
+                                ),
+                                (
+                                    format!("{inner_table}.amount > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t2", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.ref_id"), "ref_id"),
+                                (format!("{inner_table}.value1 > {outer_table}.data"), "data"),
+                                (format!("{inner_table}.value2 < {outer_table}.id"), "id"),
+                            ],
+                        ),
+                        ("t2", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category = {outer_table}.ref_id"),
+                                    "ref_id",
+                                ),
+                                (format!("{inner_table}.amount > {outer_table}.data"), "data"),
+                            ],
+                        ),
+                        ("t3", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.value1 > {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.value2 < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        ("t3", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.ref_id = {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.data < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
                         _ => "1=1".to_string(),
                     }
                 };
@@ -4410,7 +4455,11 @@ mod fuzz_tests {
 
             // Add correlated conditions if outer_table is provided and sometimes
             let final_query = if let Some(outer_table) = outer_table {
-                if rng.random_bool(0.4) {
+                let can_correlate = match allowed_outer_cols {
+                    Some(cols) => !cols.is_empty(),
+                    None => true,
+                };
+                if can_correlate && rng.random_bool(0.4) {
                     // 40% chance for correlation
                     // Extract the inner table from the base query
                     let inner_table = if base_query.contains("FROM t1") {
@@ -4440,7 +4489,7 @@ mod fuzz_tests {
             // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
             if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, 0, outer_table);
+                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols);
                 if final_query.contains("WHERE") {
                     format!("{final_query} AND id IN ({nested})")
                 } else {
@@ -4456,6 +4505,7 @@ mod fuzz_tests {
             rng: &mut ChaCha8Rng,
             depth: usize,
             outer_table: Option<&str>,
+            allowed_outer_cols: Option<&[&str]>,
         ) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 // Reduced nesting depth
@@ -4490,56 +4540,96 @@ mod fuzz_tests {
             // Helper function to generate correlated WHERE conditions
             let gen_correlated_where =
                 |rng: &mut ChaCha8Rng, inner_table: &str, outer_table: &str| -> String {
+                    let pick =
+                        |rng: &mut ChaCha8Rng, mut candidates: Vec<(String, &'static str)>| {
+                            let filtered: Vec<String> = if let Some(allowed) = allowed_outer_cols {
+                                candidates
+                                    .drain(..)
+                                    .filter(|(_, col)| allowed.contains(col))
+                                    .map(|(cond, _)| cond)
+                                    .collect()
+                            } else {
+                                candidates.drain(..).map(|(cond, _)| cond).collect()
+                            };
+                            if filtered.is_empty() {
+                                "1=1".to_string()
+                            } else {
+                                filtered[rng.random_range(0..filtered.len())].clone()
+                            }
+                        };
                     match (outer_table, inner_table) {
-                        ("t1", "t2") => {
-                            // t2.ref_id relates to t1.id
-                            let conditions = [
-                                format!("{inner_table}.ref_id = {outer_table}.id"),
-                                format!("{inner_table}.id < {outer_table}.value1"),
-                                format!("{inner_table}.data > {outer_table}.value2"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t1", "t3") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.category < {outer_table}.value1"),
-                                format!("{inner_table}.amount > {outer_table}.value2"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t2", "t1") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.ref_id"),
-                                format!("{inner_table}.value1 > {outer_table}.data"),
-                                format!("{inner_table}.value2 < {outer_table}.id"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t2", "t3") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.category = {outer_table}.ref_id"),
-                                format!("{inner_table}.amount > {outer_table}.data"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t3", "t1") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.value1 > {outer_table}.category"),
-                                format!("{inner_table}.value2 < {outer_table}.amount"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
-                        ("t3", "t2") => {
-                            let conditions = [
-                                format!("{inner_table}.id = {outer_table}.id"),
-                                format!("{inner_table}.ref_id = {outer_table}.category"),
-                                format!("{inner_table}.data < {outer_table}.amount"),
-                            ];
-                            conditions[rng.random_range(0..conditions.len())].clone()
-                        }
+                        ("t1", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.ref_id = {outer_table}.id"), "id"),
+                                (format!("{inner_table}.id < {outer_table}.value1"), "value1"),
+                                (
+                                    format!("{inner_table}.data > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t1", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category < {outer_table}.value1"),
+                                    "value1",
+                                ),
+                                (
+                                    format!("{inner_table}.amount > {outer_table}.value2"),
+                                    "value2",
+                                ),
+                            ],
+                        ),
+                        ("t2", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.ref_id"), "ref_id"),
+                                (format!("{inner_table}.value1 > {outer_table}.data"), "data"),
+                                (format!("{inner_table}.value2 < {outer_table}.id"), "id"),
+                            ],
+                        ),
+                        ("t2", "t3") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.category = {outer_table}.ref_id"),
+                                    "ref_id",
+                                ),
+                                (format!("{inner_table}.amount > {outer_table}.data"), "data"),
+                            ],
+                        ),
+                        ("t3", "t1") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.value1 > {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.value2 < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
+                        ("t3", "t2") => pick(
+                            rng,
+                            vec![
+                                (format!("{inner_table}.id = {outer_table}.id"), "id"),
+                                (
+                                    format!("{inner_table}.ref_id = {outer_table}.category"),
+                                    "category",
+                                ),
+                                (
+                                    format!("{inner_table}.data < {outer_table}.amount"),
+                                    "amount",
+                                ),
+                            ],
+                        ),
                         _ => "1=1".to_string(),
                     }
                 };
@@ -4573,7 +4663,11 @@ mod fuzz_tests {
 
             // Add correlated conditions if outer_table is provided and sometimes
             let final_query = if let Some(outer_table) = outer_table {
-                if rng.random_bool(0.4) {
+                let can_correlate = match allowed_outer_cols {
+                    Some(cols) => !cols.is_empty(),
+                    None => true,
+                };
+                if can_correlate && rng.random_bool(0.4) {
                     // 40% chance for correlation
                     // Extract the inner table from the base query
                     let inner_table = if base_query.contains("FROM t1") {
@@ -4603,7 +4697,7 @@ mod fuzz_tests {
             // Sometimes add nesting
             if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, depth + 1, outer_table);
+                let nested = gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols);
                 if final_query.contains("WHERE") {
                     format!("{final_query} AND id IN ({nested})")
                 } else {
@@ -4614,11 +4708,110 @@ mod fuzz_tests {
             }
         }
 
+        // Helper to generate a SELECT-list expression as a scalar subquery, optionally correlated
+        fn gen_selectlist_scalar_expr(rng: &mut ChaCha8Rng, outer_table: &str) -> String {
+            // Reuse scalar subquery generator; return the inner SELECT (without wrapping)
+            gen_scalar_subquery(rng, 0, Some(outer_table), None)
+        }
+
+        // Helper to generate a GROUP BY expression which may include a correlated scalar subquery
+        fn gen_group_by_expr(rng: &mut ChaCha8Rng, main_table: &str) -> String {
+            // Either a plain column or a correlated scalar subquery
+            if rng.random_bool(0.4) {
+                // Prefer plain columns most of the time to keep GROUP BY semantics simple
+                match main_table {
+                    "t1" => ["id", "value1", "value2"][rng.random_range(0..3)].to_string(),
+                    "t2" => ["id", "ref_id", "data"][rng.random_range(0..3)].to_string(),
+                    "t3" => ["id", "category", "amount"][rng.random_range(0..3)].to_string(),
+                    _ => "id".to_string(),
+                }
+            } else {
+                // If GROUP BY is present, a subquery that references outer columns would be invalid
+                // unless it only references GROUP BY columns; since this subquery becomes the
+                // grouping expression itself, disallow correlation entirely here.
+                format!(
+                    "({})",
+                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]))
+                )
+            }
+        }
+
+        // Helper to generate a HAVING condition comparing an aggregate to a scalar subquery
+        fn gen_having_condition(
+            rng: &mut ChaCha8Rng,
+            main_table: &str,
+            allowed_outer_cols: Option<&[&str]>,
+        ) -> String {
+            let (agg_func, agg_col) = match main_table {
+                "t1" => [
+                    ("SUM", "value1"),
+                    ("SUM", "value2"),
+                    ("MAX", "value1"),
+                    ("MAX", "value2"),
+                    ("MIN", "value1"),
+                    ("MIN", "value2"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..7)],
+                "t2" => [
+                    ("SUM", "data"),
+                    ("MAX", "data"),
+                    ("MIN", "data"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..4)],
+                "t3" => [
+                    ("SUM", "amount"),
+                    ("MAX", "amount"),
+                    ("MIN", "amount"),
+                    ("COUNT", "*"),
+                ][rng.random_range(0..4)],
+                _ => ("COUNT", "*"),
+            };
+            let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
+            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), allowed_outer_cols);
+            if agg_col == "*" {
+                format!("COUNT(*) {op} ({rhs})")
+            } else {
+                format!("{agg_func}({agg_col}) {op} ({rhs})")
+            }
+        }
+
+        // Helper to generate LIMIT/OFFSET clause (optionally empty). Expressions may be subqueries.
+        fn gen_limit_offset_clause(rng: &mut ChaCha8Rng) -> String {
+            // 50% of the time, no LIMIT/OFFSET
+            if rng.random_bool(0.5) {
+                return String::new();
+            }
+
+            fn gen_limit_like_expr(rng: &mut ChaCha8Rng) -> String {
+                // Small literal or a scalar subquery from a random table
+                if rng.random_bool(0.6) {
+                    // Keep literal sizes modest
+                    format!("{}", rng.random_range(0..20))
+                } else {
+                    let which = rng.random_range(0..3);
+                    match which {
+                        0 => "(SELECT COUNT(*) FROM t1)".to_string(),
+                        1 => "(SELECT COUNT(*) FROM t2)".to_string(),
+                        _ => "(SELECT COUNT(*) FROM t3)".to_string(),
+                    }
+                }
+            }
+
+            let mut clause = String::new();
+            let limit_expr = gen_limit_like_expr(rng);
+            clause.push_str(&format!(" LIMIT {limit_expr}",));
+            if rng.random_bool(0.5) {
+                let offset_expr = gen_limit_like_expr(rng);
+                clause.push_str(&format!(" OFFSET {offset_expr}",));
+            }
+            clause
+        }
+
         for iter_num in 0..NUM_FUZZ_ITERATIONS {
             let main_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
 
-            let query_type = rng.random_range(0..6); // Increased from 4 to 6 for new correlated query types
-            let query = match query_type {
+            let query_type = rng.random_range(0..8); // Add GROUP BY/HAVING variants
+            let mut query = match query_type {
                 0 => {
                     // Comparison subquery: WHERE column <op> (SELECT ...)
                     let column = match main_table {
@@ -4628,13 +4821,13 @@ mod fuzz_tests {
                         _ => "id",
                     };
                     let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table));
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
                     format!("SELECT * FROM {main_table} WHERE {column} {op} ({subquery})",)
                 }
                 1 => {
                     // EXISTS subquery: WHERE [NOT] EXISTS (SELECT ...)
                     let not_exists = if rng.random_bool(0.3) { "NOT " } else { "" };
-                    let subquery = gen_subquery(&mut rng, 0, Some(main_table));
+                    let subquery = gen_subquery(&mut rng, 0, Some(main_table), None);
                     format!("SELECT * FROM {main_table} WHERE {not_exists}EXISTS ({subquery})",)
                 }
                 2 => {
@@ -4646,7 +4839,7 @@ mod fuzz_tests {
                         "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
                         _ => "id",
                     };
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table));
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
                     format!("SELECT * FROM {main_table} WHERE {column} {not_in}IN ({subquery})",)
                 }
                 3 => {
@@ -4843,8 +5036,93 @@ mod fuzz_tests {
                         "SELECT * FROM {main_table} WHERE {column} {op} (SELECT {select_column} FROM {inner_table} WHERE {correlated_condition})",
                     )
                 }
+                6 => {
+                    // Aggregated query with GROUP BY and optional HAVING; allow subqueries in GROUP BY/HAVING
+                    let group_expr = gen_group_by_expr(&mut rng, main_table);
+                    // Only GROUP BY columns may be referenced by correlated subqueries
+                    let allowed_outer_cols: Vec<&str> = match group_expr.as_str() {
+                        "id" => vec!["id"],
+                        "value1" => vec!["value1"],
+                        "value2" => vec!["value2"],
+                        "ref_id" => vec!["ref_id"],
+                        "data" => vec!["data"],
+                        "category" => vec!["category"],
+                        "amount" => vec!["amount"],
+                        _ => Vec::new(),
+                    };
+                    let (agg_func, agg_col) = match main_table {
+                        "t1" => [
+                            ("SUM", "value1"),
+                            ("SUM", "value2"),
+                            ("MAX", "value1"),
+                            ("MAX", "value2"),
+                            ("COUNT", "*"),
+                        ][rng.random_range(0..5)],
+                        "t2" => [("SUM", "data"), ("MAX", "data"), ("COUNT", "*")]
+                            [rng.random_range(0..3)],
+                        "t3" => [("SUM", "amount"), ("MAX", "amount"), ("COUNT", "*")]
+                            [rng.random_range(0..3)],
+                        _ => ("COUNT", "*"),
+                    };
+                    let mut q;
+                    if agg_col == "*" {
+                        q = format!("SELECT {group_expr} AS g, COUNT(*) AS c FROM {main_table}");
+                    } else {
+                        q = format!("SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}");
+                    }
+                    if rng.random_bool(0.5) {
+                        q.push_str(&format!(
+                            " WHERE {}",
+                            gen_simple_where(&mut rng, main_table)
+                        ));
+                    }
+                    q.push_str(&format!(" GROUP BY {group_expr}"));
+                    if rng.random_bool(0.4) {
+                        q.push_str(&format!(
+                            " HAVING {}",
+                            gen_having_condition(&mut rng, main_table, Some(&allowed_outer_cols))
+                        ));
+                    }
+                    q
+                }
+                7 => {
+                    // Simple GROUP BY without HAVING (baseline support); may use subquery in GROUP BY
+                    let group_expr = gen_group_by_expr(&mut rng, main_table);
+                    let select_expr = if rng.random_bool(0.5) {
+                        // Use aggregate
+                        match main_table {
+                            "t1" => "SUM(value1) AS s".to_string(),
+                            "t2" => "SUM(data) AS s".to_string(),
+                            _ => "SUM(amount) AS s".to_string(),
+                        }
+                    } else {
+                        "COUNT(*) AS c".to_string()
+                    };
+                    let mut q =
+                        format!("SELECT {group_expr} AS g, {select_expr} FROM {main_table}");
+                    if rng.random_bool(0.5) {
+                        q.push_str(&format!(
+                            " WHERE {}",
+                            gen_simple_where(&mut rng, main_table)
+                        ));
+                    }
+                    q.push_str(&format!(" GROUP BY {group_expr}"));
+                    q
+                }
                 _ => unreachable!(),
             };
+            // Optionally inject a SELECT-list scalar subquery into non-aggregated SELECT * queries
+            if query.starts_with("SELECT * FROM ") && rng.random_bool(0.4) {
+                let sel_expr = gen_selectlist_scalar_expr(&mut rng, main_table);
+                let replacement = "SELECT *, (".to_string() + &sel_expr + ") AS s_sub FROM ";
+                query = query.replacen("SELECT * FROM ", &replacement, 1);
+            }
+
+            // Optionally append LIMIT/OFFSET (with or without subqueries)
+            let limit_clause = gen_limit_offset_clause(&mut rng);
+            if !limit_clause.is_empty() {
+                query.push_str(&limit_clause);
+            }
 
             log::info!(
                 "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
