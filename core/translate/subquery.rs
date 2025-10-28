@@ -264,6 +264,7 @@ pub fn plan_subqueries_from_where_clause(
                             root_page: 0,
                             unique: false,
                             where_clause: None,
+                            index_method: None,
                         });
 
                         let cursor_id = program
