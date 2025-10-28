@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap, sync::Arc};
-use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder};
+use turso_parser::ast::{
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+};
 
 use crate::{
     function::AggFunc,

@@ -2157,7 +2157,7 @@ pub fn translate_expr(
                             )
                         }
                     } else {
-                        let table_cursor_id = if use_covering_index {
+                        let table_cursor_id = if use_covering_index || use_index_method.is_some() {
                             None
                         } else {
                             Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
@@ -2169,9 +2169,6 @@ pub fn translate_expr(
                         (table_cursor_id, index_cursor_id)
                     };
 
-                    let index_cursor_id = index.map(|index| {
-                        program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
-                    });
                     if let Some(custom_module_column) = use_index_method {
                         program.emit_column_or_rowid(
                             index_cursor_id.unwrap(),

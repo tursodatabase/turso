@@ -23,8 +23,8 @@ use crate::{
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
         plan::{
-            ColumnUsedMask, IndexMethodQuery, NonFromClauseSubquery, OuterQueryReference, QueryDestination,
-            ResultSetColumn, Scan, SeekKeyComponent,
+            ColumnUsedMask, IndexMethodQuery, NonFromClauseSubquery, OuterQueryReference,
+            QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
         },
     },
     types::SeekOp,
