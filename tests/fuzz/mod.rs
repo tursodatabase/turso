@@ -4215,7 +4215,7 @@ mod fuzz_tests {
         const MIN_ROWS_PER_TABLE: usize = 5;
         const MAX_SUBQUERY_DEPTH: usize = 4;
 
-        let db = TempDatabase::new_empty(true);
+        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
