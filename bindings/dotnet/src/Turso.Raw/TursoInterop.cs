@@ -6,14 +6,7 @@ namespace Turso.Raw;
 
 internal static class TursoInterop
 {
-    private const string DllName = 
-#if OS_WINDOWS
-    "turso_dotnet.dll";
-#elif OS_LINUX
-    "libturso_dotnet.so";
-#elif OS_MAC
-    "libturso_dotnet.dylib";
-#endif
+    private const string DllName = "turso_dotnet";
     
     [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr OpenDatabase(string path, out IntPtr errorPtr);
