@@ -321,6 +321,8 @@ fn collect_non_aggregate_expressions<'a>(
     Ok(())
 }
 
+/// Collects columns from different parts of a SELECT that are needed for
+/// GROUP BY.
 fn collect_result_columns<'a>(
     root_expr: &'a ast::Expr,
     plan: &SelectPlan,
@@ -336,6 +338,13 @@ fn collect_result_columns<'a>(
                 {
                     result_columns.push(expr);
                 }
+            }
+            // SubqueryResult is an exception because we can't "extract" columns from it
+            // unlike other expressions like function calls or direct column references,
+            // so we must add it so that the subquery result gets collected to the GROUP BY
+            // columns.
+            ast::Expr::SubqueryResult { .. } => {
+                result_columns.push(expr);
             }
             _ => {
                 if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
