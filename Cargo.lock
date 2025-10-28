@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dotnet"
-version = "0.2.0"
+version = "0.3.0-pre.4"
 dependencies = [
  "turso_core",
 ]

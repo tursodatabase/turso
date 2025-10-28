@@ -85,7 +85,7 @@ pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *co
     let path_str = path_cstr.to_str();
 
     let connection_result =
-        Connection::from_uri(path_str.unwrap(), true, false, false, false, false);
+        Connection::from_uri(path_str.unwrap(), true, false, false, false, false, false);
     match connection_result {
         Ok((io, val)) => {
             allocate(Database {
