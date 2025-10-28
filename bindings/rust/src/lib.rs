@@ -32,6 +32,10 @@
 //! # }
 //! ```
 
+#[cfg(all(not(target_family = "wasm"), not(miri)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod params;
 mod rows;
 pub mod transaction;
