@@ -79,8 +79,8 @@ pub fn rowid_alias_differential_fuzz() {
     };
 
     // Create two Limbo databases with indexes enabled
-    let db_with_alias = TempDatabase::new_empty(true);
-    let db_without_alias = TempDatabase::new_empty(true);
+    let db_with_alias = TempDatabase::new_empty();
+    let db_without_alias = TempDatabase::new_empty();
 
     // Connect to both databases
     let conn_with_alias = db_with_alias.connect_limbo();

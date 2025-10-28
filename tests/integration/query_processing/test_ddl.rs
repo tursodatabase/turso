@@ -3,7 +3,7 @@ use crate::common::TempDatabase;
 #[test]
 fn test_fail_drop_indexed_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE INDEX i ON t (a)")?;
@@ -15,7 +15,7 @@ fn test_fail_drop_indexed_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_unique_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a UNIQUE, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a UNIQUE, b);");
     let conn = tmp_db.connect_limbo();
 
     let res = conn.execute("ALTER TABLE t DROP COLUMN a");
@@ -26,7 +26,7 @@ fn test_fail_drop_unique_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_compound_unique_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b, UNIQUE(a, b));", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b, UNIQUE(a, b));");
     let conn = tmp_db.connect_limbo();
 
     let res = conn.execute("ALTER TABLE t DROP COLUMN a");
@@ -40,7 +40,7 @@ fn test_fail_drop_compound_unique_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_primary_key_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a PRIMARY KEY, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a PRIMARY KEY, b);");
     let conn = tmp_db.connect_limbo();
 
     let res = conn.execute("ALTER TABLE t DROP COLUMN a");
@@ -54,7 +54,7 @@ fn test_fail_drop_primary_key_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_compound_primary_key_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b, PRIMARY KEY(a, b));", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b, PRIMARY KEY(a, b));");
     let conn = tmp_db.connect_limbo();
 
     let res = conn.execute("ALTER TABLE t DROP COLUMN a");
@@ -68,7 +68,7 @@ fn test_fail_drop_compound_primary_key_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_partial_index_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE INDEX i ON t (b) WHERE a > 0")?;
@@ -83,7 +83,7 @@ fn test_fail_drop_partial_index_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_drop_view_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE VIEW v AS SELECT a, b FROM t")?;
@@ -99,7 +99,7 @@ fn test_fail_drop_view_column() -> anyhow::Result<()> {
 #[test]
 fn test_fail_rename_view_column() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);", true);
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a, b);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("CREATE VIEW v AS SELECT a, b FROM t")?;
@@ -116,7 +116,6 @@ fn test_allow_drop_unreferenced_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let tmp_db = TempDatabase::new_with_rusqlite(
         "CREATE TABLE t (pk INTEGER PRIMARY KEY, indexed INTEGER, viewed INTEGER, partial INTEGER, compound1 INTEGER, compound2 INTEGER, unused1 INTEGER, unused2 INTEGER, unused3 INTEGER);",
-        true
     );
     let conn = tmp_db.connect_limbo();
 

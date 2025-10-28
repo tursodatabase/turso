@@ -3,7 +3,7 @@ use turso_core::{StepResult, Value};
 
 #[test]
 fn test_pragma_module_list_returns_list() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
     let mut module_list = conn.query("PRAGMA module_list;").unwrap();
@@ -21,7 +21,7 @@ fn test_pragma_module_list_returns_list() {
 
 #[test]
 fn test_pragma_module_list_generate_series() {
-    let db = TempDatabase::new_empty(false);
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
     let mut rows = conn
@@ -61,7 +61,7 @@ fn test_pragma_module_list_generate_series() {
 #[test]
 fn test_pragma_page_sizes_without_writes_persists() {
     for test_page_size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         {
             let conn = db.connect_limbo();
             let pragma_query = format!("PRAGMA page_size={test_page_size}");
@@ -81,7 +81,7 @@ fn test_pragma_page_sizes_without_writes_persists() {
         assert_eq!(*page_size, test_page_size);
 
         // Reopen database and verify page size
-        let db = TempDatabase::new_with_existent(&db.path, false);
+        let db = TempDatabase::new_with_existent(&db.path);
         let conn = db.connect_limbo();
         let mut rows = conn.query("PRAGMA page_size").unwrap().unwrap();
         let StepResult::Row = rows.step().unwrap() else {
@@ -98,7 +98,7 @@ fn test_pragma_page_sizes_without_writes_persists() {
 #[test]
 fn test_pragma_page_sizes_with_writes_persists() {
     for test_page_size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
-        let db = TempDatabase::new_empty(false);
+        let db = TempDatabase::new_empty();
         {
             {
                 let conn = db.connect_limbo();
@@ -153,7 +153,7 @@ fn test_pragma_page_sizes_with_writes_persists() {
         }
 
         // Drop the db and reopen it, and verify the same
-        let db = TempDatabase::new_with_existent(&db.path, false);
+        let db = TempDatabase::new_with_existent(&db.path);
         let conn = db.connect_limbo();
         let mut page_size = conn.pragma_query("page_size").unwrap();
         let mut page_size = page_size.pop().unwrap();

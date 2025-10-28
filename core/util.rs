@@ -182,7 +182,7 @@ pub fn parse_schema_rows(
         }
     }
 
-    schema.populate_indices(from_sql_indexes, automatic_indices)?;
+    schema.populate_indices(syms, from_sql_indexes, automatic_indices)?;
     schema.populate_materialized_views(
         materialized_view_info,
         dbsp_state_roots,
