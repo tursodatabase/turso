@@ -35,8 +35,9 @@ use crate::translate::fkeys::{
     emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
-use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
+use crate::translate::plan::{DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -276,6 +277,27 @@ pub fn emit_query<'a>(
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
+    }
+
+    // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
+    for subquery in plan
+        .non_from_clause_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&plan.join_order)?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            program,
+            t_ctx,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
