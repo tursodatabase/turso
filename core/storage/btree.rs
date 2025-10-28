@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -43,7 +44,7 @@ use std::{
     any::Any,
     cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
     fmt::Debug,
     ops::DerefMut,
     pin::Pin,
@@ -5805,7 +5806,7 @@ pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
     pub db_size: usize,
     first_leaf_level: Option<usize>,
-    pub page_reference: HashMap<i64, i64>,
+    pub page_reference: FxHashMap<i64, i64>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -5815,7 +5816,7 @@ impl IntegrityCheckState {
         Self {
             page_stack: Vec::new(),
             db_size,
-            page_reference: HashMap::new(),
+            page_reference: FxHashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {

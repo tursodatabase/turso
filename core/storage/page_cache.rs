@@ -1,8 +1,6 @@
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
-use std::{
-    collections::HashMap,
-    sync::{atomic::Ordering, Arc},
-};
+use rustc_hash::FxHashMap;
+use std::sync::{atomic::Ordering, Arc};
 use tracing::trace;
 
 use crate::turso_assert;
@@ -74,7 +72,7 @@ pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
     /// Map of Key -> pointer to entry in the queue
-    map: HashMap<PageCacheKey, *mut PageCacheEntry>,
+    map: FxHashMap<PageCacheKey, *mut PageCacheEntry>,
     /// The eviction queue (intrusive doubly-linked list)
     queue: LinkedList<EntryAdapter>,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
@@ -119,7 +117,7 @@ impl PageCache {
         assert!(capacity > 0);
         Self {
             capacity,
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             queue: LinkedList::new(EntryAdapter::new()),
             clock_hand: std::ptr::null_mut(),
         }

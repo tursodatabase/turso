@@ -19,8 +19,7 @@ use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::HashSet;
-use std::hash;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
@@ -513,7 +512,11 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
+    /// Dirty pages sorted by page number.
+    ///
+    /// We need dirty pages in page number order when we flush them out to ensure
+    /// that the WAL we generate is compatible with SQLite.
+    dirty_pages: Arc<RwLock<BTreeSet<usize>>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -635,9 +638,7 @@ impl Pager {
             wal,
             page_cache,
             io,
-            dirty_pages: Arc::new(RwLock::new(HashSet::with_hasher(
-                hash::BuildHasherDefault::new(),
-            ))),
+            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {

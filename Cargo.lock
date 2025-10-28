@@ -4935,6 +4935,7 @@ dependencies = [
  "roaring",
  "rstest",
  "rusqlite",
+ "rustc-hash",
  "rustix 1.0.7",
  "ryu",
  "serde",
