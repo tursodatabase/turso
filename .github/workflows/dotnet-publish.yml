@@ -47,6 +47,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Build rust native library
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--release'
@@ -55,7 +58,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.artifact-name }}
-          path: ${{ env.working-directory }}/rs_compiled/
+          path: |
+            ${{ env.working-directory }}/rs_compiled/**/turso_dotnet.dll
+            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.so
+            ${{ env.working-directory }}/rs_compiled/**/libturso_dotnet.dylib
+
           retention-days: 1
 
   # Create Turso.Raw and Turso nuget packages
@@ -106,7 +113,7 @@ jobs:
       - name: Upload Turso to artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Turso.Raw
+          name: Turso
           path: ${{ env.working-directory }}/src/Turso/bin/Release/Turso.*.nupkg
           retention-days: 7
 
