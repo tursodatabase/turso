@@ -200,8 +200,9 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | IS (NOT)                  | Yes     |                                          |
 | IS (NOT) DISTINCT FROM    | Yes     |                                          |
 | (NOT) BETWEEN ... AND ... | Yes     | Expression is rewritten in the optimizer |
-| (NOT) IN (subquery)       | No      |                                          |
-| (NOT) EXISTS (subquery)   | No      |                                          |
+| (NOT) IN (SELECT...)       | Yes      |                                          |
+| (NOT) EXISTS (SELECT...)   | Yes      |                                          |
+| x <operator> (SELECT...))   | Partial  | Only scalar subqueries supported, i.e. not (x,y) = (SELECT...)
 | CASE WHEN THEN ELSE END   | Yes     |                                          |
 | RAISE                     | No      |                                          |
 
