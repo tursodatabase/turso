@@ -1366,6 +1366,16 @@ pub enum SubqueryState {
     Evaluated { evaluated_at: EvalAt },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubqueryPosition {
+    ResultColumn,
+    Where,
+    GroupBy,
+    Having,
+    OrderBy,
+    LimitOffset,
+}
+
 #[derive(Debug, Clone)]
 /// A subquery that is not part of the `FROM` clause.
 /// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.

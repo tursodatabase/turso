@@ -343,7 +343,23 @@ fn collect_result_columns<'a>(
             // unlike other expressions like function calls or direct column references,
             // so we must add it so that the subquery result gets collected to the GROUP BY
             // columns.
-            ast::Expr::SubqueryResult { .. } => {
+            //
+            // However, if the subquery is of the form: 'aggregate_result IN (SELECT...)', we need to skip it because the aggregation
+            // is done later.
+            ast::Expr::SubqueryResult { lhs, .. } => {
+                if let Some(ref lhs) = lhs {
+                    let mut lhs_contains_agg = false;
+                    walk_expr(lhs, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                        if plan.aggregates.iter().any(|a| a.original_expr == *expr) {
+                            lhs_contains_agg = true;
+                            return Ok(WalkControl::SkipChildren);
+                        }
+                        Ok(WalkControl::Continue)
+                    })?;
+                    if lhs_contains_agg {
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                }
                 result_columns.push(expr);
             }
             _ => {
