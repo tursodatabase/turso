@@ -418,22 +418,6 @@ pub fn init_loop(
         }
     }
 
-    for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-        let eval_at = subquery.get_eval_at(join_order)?;
-        if eval_at != EvalAt::BeforeLoop {
-            continue;
-        }
-        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
-
-        emit_non_from_clause_subquery(
-            program,
-            t_ctx,
-            *plan,
-            &subquery.query_type,
-            subquery.correlated,
-        )?;
-    }
-
     for cond in where_clause
         .iter()
         .filter(|c| c.should_eval_before_loop(join_order, subqueries))
