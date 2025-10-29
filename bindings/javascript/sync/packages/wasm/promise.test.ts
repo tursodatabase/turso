@@ -75,6 +75,21 @@ test('simple-db', async () => {
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
 })
 
+test('reconnect-db', async () => {
+    {
+        const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
+        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        expect(await stmt.all()).toEqual([])
+        stmt.close();
+    }
+    {
+        const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
+        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        expect(await stmt.all()).toEqual([])
+        stmt.close();
+    }
+})
+
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
     const defer = db.prepare("SELECT * FROM not_found");
