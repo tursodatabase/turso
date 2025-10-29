@@ -4737,11 +4737,7 @@ mod fuzz_tests {
         }
 
         // Helper to generate a HAVING condition comparing an aggregate to a scalar subquery
-        fn gen_having_condition(
-            rng: &mut ChaCha8Rng,
-            main_table: &str,
-            allowed_outer_cols: Option<&[&str]>,
-        ) -> String {
+        fn gen_having_condition(rng: &mut ChaCha8Rng, main_table: &str) -> String {
             let (agg_func, agg_col) = match main_table {
                 "t1" => [
                     ("SUM", "value1"),
@@ -4767,7 +4763,7 @@ mod fuzz_tests {
                 _ => ("COUNT", "*"),
             };
             let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), allowed_outer_cols);
+            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]));
             if agg_col == "*" {
                 format!("COUNT(*) {op} ({rhs})")
             } else {
@@ -5039,17 +5035,6 @@ mod fuzz_tests {
                 6 => {
                     // Aggregated query with GROUP BY and optional HAVING; allow subqueries in GROUP BY/HAVING
                     let group_expr = gen_group_by_expr(&mut rng, main_table);
-                    // Only GROUP BY columns may be referenced by correlated subqueries
-                    let allowed_outer_cols: Vec<&str> = match group_expr.as_str() {
-                        "id" => vec!["id"],
-                        "value1" => vec!["value1"],
-                        "value2" => vec!["value2"],
-                        "ref_id" => vec!["ref_id"],
-                        "data" => vec!["data"],
-                        "category" => vec!["category"],
-                        "amount" => vec!["amount"],
-                        _ => Vec::new(),
-                    };
                     let (agg_func, agg_col) = match main_table {
                         "t1" => [
                             ("SUM", "value1"),
@@ -5080,7 +5065,7 @@ mod fuzz_tests {
                     if rng.random_bool(0.4) {
                         q.push_str(&format!(
                             " HAVING {}",
-                            gen_having_condition(&mut rng, main_table, Some(&allowed_outer_cols))
+                            gen_having_condition(&mut rng, main_table)
                         ));
                     }
                     q

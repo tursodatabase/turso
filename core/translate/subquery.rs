@@ -192,6 +192,16 @@ fn get_subquery_parser<'a>(
     get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
     position: SubqueryPosition,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {
+    fn handle_unsupported_correlation(correlated: bool, position: SubqueryPosition) -> Result<()> {
+        if correlated && !position.allow_correlated() {
+            crate::bail_parse_error!(
+                "correlated subqueries in {} clause are not supported yet",
+                position.name()
+            );
+        }
+        Ok(())
+    }
+
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
@@ -229,6 +239,7 @@ fn get_subquery_parser<'a>(
                     "1".to_string(),
                 ))));
                 let correlated = plan.is_correlated();
+                handle_unsupported_correlation(correlated, position)?;
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,
                     query_type: subquery_type,
@@ -301,6 +312,7 @@ fn get_subquery_parser<'a>(
                 *num_regs = reg_count;
 
                 let correlated = plan.is_correlated();
+                handle_unsupported_correlation(correlated, position)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: *subquery_id,
@@ -399,12 +411,7 @@ fn get_subquery_parser<'a>(
                 };
 
                 let correlated = plan.is_correlated();
-
-                if correlated && position == SubqueryPosition::Having {
-                    crate::bail_parse_error!(
-                        "correlated IN subqueries in HAVING clause are not supported yet"
-                    );
-                }
+                handle_unsupported_correlation(correlated, position)?;
 
                 out_subqueries.push(NonFromClauseSubquery {
                     internal_id: subquery_id,

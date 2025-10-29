@@ -1390,7 +1390,7 @@ pub enum SubqueryState {
     Evaluated { evaluated_at: EvalAt },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubqueryPosition {
     ResultColumn,
     Where,
@@ -1398,6 +1398,30 @@ pub enum SubqueryPosition {
     Having,
     OrderBy,
     LimitOffset,
+}
+
+impl SubqueryPosition {
+    /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
+    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
+    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
+    /// in the main query.
+    pub fn allow_correlated(&self) -> bool {
+        matches!(
+            self,
+            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
+        )
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SubqueryPosition::ResultColumn => "SELECT list",
+            SubqueryPosition::Where => "WHERE",
+            SubqueryPosition::GroupBy => "GROUP BY",
+            SubqueryPosition::Having => "HAVING",
+            SubqueryPosition::OrderBy => "ORDER BY",
+            SubqueryPosition::LimitOffset => "LIMIT/OFFSET",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -744,48 +744,6 @@ do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-group-by-with-j
 North|Bob|200
 South|Alice|150}
 
-# Uncorrelated subquery in ORDER BY clause
-do_execsql_test_on_specific_db {:memory:} subquery-uncorrelated-in-order-by {
-    create table products(id, name, category_id);
-    create table sort_config(sort_order);
-    insert into products values (1, 'hat', 2), (2, 'laptop', 1), (3, 'book', 3);
-    insert into sort_config values ('asc');
-
-    select id, name from products 
-    order by (select case when sort_order = 'asc' then id else -id end from sort_config);
-} {1|hat
-2|laptop
-3|book}
-
-# Correlated subquery in ORDER BY clause
-do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-order-by {
-    create table products(id, name, category_id);
-    create table categories(id, priority);
-    insert into products values (1, 'hat', 2), (2, 'laptop', 1), (3, 'book', 3);
-    insert into categories values (1, 10), (2, 20), (3, 5);
-
-    select id, name from products 
-    order by (select priority from categories where id = category_id);
-} {3|book
-2|laptop
-1|hat}
-
-# Correlated subquery in ORDER BY clause with join
-do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-order-by-with-join {
-    create table products(id, name, category_id, supplier_id);
-    create table categories(id, priority);
-    create table suppliers(id, name);
-    insert into products values (1, 'hat', 2, 100), (2, 'laptop', 1, 200), (3, 'book', 3, 100);
-    insert into categories values (1, 10), (2, 20), (3, 5);
-    insert into suppliers values (100, 'SupplierA'), (200, 'SupplierB');
-
-    select p.id, p.name, s.name as supplier
-    from products p join suppliers s on p.supplier_id = s.id
-    order by (select priority from categories where id = p.category_id);
-} {3|book|SupplierA
-2|laptop|SupplierB
-1|hat|SupplierA}
-
 # Uncorrelated IN-subquery in ORDER BY clause
 do_execsql_test_on_specific_db {:memory:} subquery-uncorrelated-in-order-by-in {
     create table products(id, name, category_id);
@@ -798,19 +756,6 @@ do_execsql_test_on_specific_db {:memory:} subquery-uncorrelated-in-order-by-in {
 } {2|laptop
 3|book
 1|hat}
-
-# Correlated IN-subquery in ORDER BY clause
-do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-order-by-in {
-    create table products(id, name, category_id);
-    create table category_priorities(category_id, priority);
-    insert into products values (1, 'hat', 2), (2, 'laptop', 1), (3, 'book', 3);
-    insert into category_priorities values (1, 10), (2, 20), (3, 5);
-
-    select id, name from products 
-    order by category_id in (select category_id from category_priorities where priority > 8), id;
-} {3|book
-1|hat
-2|laptop}
 
 # Uncorrelated subquery in HAVING clause
 do_execsql_test_on_specific_db {:memory:} subquery-uncorrelated-in-having {
@@ -838,64 +783,6 @@ do_execsql_test_on_specific_db {:memory:} subquery-uncorrelated-in-having-in {
     having total in (select total_amount from target_totals);
 } {100|200
 300|100}
-
-# Correlated subquery in HAVING clause
-do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-having {
-    create table orders(id, customer_id, amount);
-    create table customer_thresholds(customer_id, min_amount);
-    insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30), (4, 200, 80);
-    insert into customer_thresholds values (100, 100), (200, 150);
-
-    select customer_id, sum(amount) as total 
-    from orders 
-    group by customer_id 
-    having total > (select min_amount from customer_thresholds where customer_thresholds.customer_id = orders.customer_id);
-} {100|200}
-
-# Correlated IN-subquery in HAVING clause
-# FIXME: currently disabled
-# do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-having-in {
-#     create table orders(id, customer_id, amount);
-#     create table customer_targets(customer_id, target_amount);
-#     insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30), (4, 200, 80);
-#     insert into customer_targets values (100, 200), (100, 250), (200, 110);
-# 
-#     select customer_id, sum(amount) as total 
-#     from orders 
-#     group by customer_id 
-#     having total in (select target_amount from customer_targets where customer_targets.customer_id = orders.customer_id);
-# } {100|200
-# 200|110}
-
-# Correlated subquery in HAVING clause with join
-do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-having-with-join {
-    create table orders(id, customer_id, amount, region_id);
-    create table customer_thresholds(customer_id, min_amount);
-    create table regions(id, name);
-    insert into orders values (1, 100, 50, 1), (2, 100, 150, 1), (3, 200, 30, 2), (4, 200, 80, 2);
-    insert into customer_thresholds values (100, 100), (200, 150);
-    insert into regions values (1, 'East'), (2, 'West');
-
-    select o.customer_id, r.name as region, sum(o.amount) as total 
-    from orders o join regions r on o.region_id = r.id
-    group by o.customer_id, r.name
-    having total > (select min_amount from customer_thresholds where customer_thresholds.customer_id = o.customer_id);
-} {100|East|200}
-
-# Correlated IN-subquery in HAVING clause with join
-# do_execsql_test_on_specific_db {:memory:} subquery-correlated-in-subquery-in-having-with-join {
-#     create table orders(id, customer_id, amount, region_id);
-#     create table customer_thresholds(customer_id, min_amount);
-#     create table regions(id, name);
-#     insert into orders values (1, 100, 50, 1), (2, 100, 150, 1), (3, 200, 30, 2), (4, 200, 80, 2);
-#     insert into customer_thresholds values (100, 100), (200, 150);
-#     insert into regions values (1, 'East'), (2, 'West');
-# 
-#     select o.customer_id, r.name as region, sum(o.amount) as total 
-#     from orders o join regions r on o.region_id = r.id
-#     group by o.customer_id, r.name
-#     having total + 40 in (select min_amount from customer_thresholds where customer_thresholds.customer_id = o.customer_id);
-# } {200|West|110}
 
 # Uncorrelated subquery in LIMIT clause
 do_execsql_test_on_specific_db {:memory:} subquery-in-limit {
