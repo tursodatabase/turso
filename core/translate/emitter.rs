@@ -272,8 +272,6 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
-
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
@@ -356,6 +354,9 @@ pub fn emit_query<'a>(
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
+
+    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+
     init_loop(
         program,
         t_ctx,
@@ -2079,7 +2080,7 @@ fn init_limit(
                 _ => {
                     let r = limit_ctx.reg_limit;
 
-                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
+                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
                     program.emit_insn(Insn::MustBeInt { reg: r });
                 }
             }
@@ -2109,7 +2110,7 @@ fn init_limit(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver);
+                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
