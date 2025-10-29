@@ -6,7 +6,7 @@ use crate::common::{maybe_setup_tracing, TempDatabase};
 
 #[test]
 fn test_schema_reprepare() {
-    let tmp_db = TempDatabase::new_empty(false);
+    let tmp_db = TempDatabase::new_empty();
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     conn1
@@ -55,7 +55,7 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
     maybe_setup_tracing();
     let tries = 1;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty(false));
+        let tmp_db = Arc::new(TempDatabase::new_empty());
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -134,7 +134,7 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
 fn test_reader_writer() -> anyhow::Result<()> {
     let tries = 10;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty(false));
+        let tmp_db = Arc::new(TempDatabase::new_empty());
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -206,7 +206,7 @@ fn test_reader_writer() -> anyhow::Result<()> {
 #[test]
 fn test_schema_reprepare_write() {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty(false);
+    let tmp_db = TempDatabase::new_empty();
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     let conn2 = tmp_db.connect_limbo();
@@ -253,7 +253,7 @@ fn advance(stmt: &mut Statement) -> anyhow::Result<()> {
 #[test]
 fn test_interleaved_transactions() -> anyhow::Result<()> {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty(true);
+    let tmp_db = TempDatabase::new_empty();
     {
         let bootstrap_conn = tmp_db.connect_limbo();
         bootstrap_conn.execute("CREATE TABLE table_0 (id INTEGER,col_1 REAL,col_2 INTEGER,col_3 REAL,col_4 TEXT,col_5 REAL,col_6 TEXT)")?;

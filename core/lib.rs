@@ -8,6 +8,7 @@ mod fast_lock;
 mod function;
 mod functions;
 mod incremental;
+pub mod index_method;
 mod info;
 mod io;
 #[cfg(feature = "json")]
@@ -16,7 +17,7 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
-mod schema;
+pub mod schema;
 #[cfg(feature = "series")]
 mod series;
 pub mod state_machine;
@@ -30,7 +31,7 @@ mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 mod vdbe;
-mod vector;
+pub mod vector;
 mod vtab;
 
 #[cfg(feature = "fuzz")]
@@ -39,8 +40,10 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::index_method::IndexMethod;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
+use crate::storage::pager::{AutoVacuumMode, HeaderRef};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -51,6 +54,7 @@ use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
+use arc_swap::ArcSwap;
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -63,6 +67,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 use schema::Schema;
 use std::task::Waker;
 use std::{
@@ -102,7 +107,9 @@ pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
-pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
+pub use vdbe::{
+    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, Register,
+};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +119,7 @@ pub struct DatabaseOpts {
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
+    pub enable_index_method: bool,
     enable_load_extension: bool,
 }
 
@@ -123,6 +131,7 @@ impl Default for DatabaseOpts {
             enable_views: false,
             enable_strict: false,
             enable_encryption: false,
+            enable_index_method: false,
             enable_load_extension: false,
         }
     }
@@ -161,6 +170,11 @@ impl DatabaseOpts {
 
     pub fn with_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_index_method(mut self, enable: bool) -> Self {
+        self.enable_index_method = enable;
         self
     }
 }
@@ -481,13 +495,16 @@ impl Database {
             n_connections: AtomicUsize::new(0),
         });
 
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
         if db_state.is_initialized() {
             // parse schema
             let conn = db.connect()?;
 
             let syms = conn.syms.read();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
 
             if let Some(encryption_opts) = encryption_opts {
                 conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
@@ -503,10 +520,14 @@ impl Database {
                 let result = schema
                     .make_from_btree(None, pager.clone(), &syms)
                     .inspect_err(|_| pager.end_read_tx());
-                if let Err(LimboError::ExtensionError(e)) = result {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    eprintln!("Warning: {e}");
+                match result {
+                    Err(LimboError::ExtensionError(e)) => {
+                        // this means that a vtab exists and we no longer have the module loaded. we print
+                        // a warning to the user to load the module
+                        eprintln!("Warning: {e}");
+                    }
+                    Err(e) => return Err(e),
+                    _ => {}
                 }
 
                 if db.mvcc_enabled() && !schema.indexes.is_empty() {
@@ -525,9 +546,6 @@ impl Database {
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
 
         Ok(db)
     }
@@ -550,6 +568,29 @@ impl Database {
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
 
+        if self.db_state.get().is_initialized() {
+            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+
+            let header = header_ref.borrow();
+
+            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+                if header.incremental_vacuum_enabled.get() > 0 {
+                    AutoVacuumMode::Incremental
+                } else {
+                    AutoVacuumMode::Full
+                }
+            } else {
+                AutoVacuumMode::None
+            };
+
+            pager.set_auto_vacuum_mode(mode);
+
+            tracing::debug!(
+                "Opened existing database. Detected auto_vacuum_mode from header: {:?}",
+                mode
+            );
+        }
+
         let page_size = pager.get_page_size_unchecked();
 
         let default_cache_size = pager
@@ -559,9 +600,9 @@ impl Database {
             .get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            pager: RwLock::new(pager),
+            pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().unwrap().clone()),
-            database_schemas: RwLock::new(std::collections::HashMap::new()),
+            database_schemas: RwLock::new(FxHashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
@@ -579,7 +620,7 @@ impl Database {
             mv_tx: RwLock::new(None),
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
-            is_nested_stmt: AtomicBool::new(false),
+            nestedness: AtomicI32::new(0),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
@@ -869,6 +910,10 @@ impl Database {
         self.opts.enable_views
     }
 
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.opts.enable_index_method
+    }
+
     pub fn experimental_strict_enabled(&self) -> bool {
         self.opts.enable_strict
     }
@@ -1061,11 +1106,11 @@ impl DatabaseCatalog {
 
 pub struct Connection {
     db: Arc<Database>,
-    pager: RwLock<Arc<Pager>>,
+    pager: ArcSwap<Pager>,
     schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    database_schemas: RwLock<std::collections::HashMap<usize, Arc<Schema>>>,
+    database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
     transaction_state: AtomicTransactionState,
@@ -1093,9 +1138,13 @@ pub struct Connection {
     view_transaction_states: AllViewsTxState,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
-    /// Whether the connection is executing a statement initiated by another statement.
-    /// Generally this is only true for ParseSchema.
-    is_nested_stmt: AtomicBool,
+    /// Greater than zero if connection executes a program within a program
+    /// This is necessary in order for connection to not "finalize" transaction (commit/abort) when program ends
+    /// (because parent program is still pending and it will handle "finalization" instead)
+    ///
+    /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
+    /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
+    nestedness: AtomicI32,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
@@ -1127,6 +1176,18 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
+    pub fn is_nested_stmt(&self) -> bool {
+        self.nestedness.load(Ordering::SeqCst) > 0
+    }
+    /// starts nested program execution
+    pub fn start_nested(&self) {
+        self.nestedness.fetch_add(1, Ordering::SeqCst);
+    }
+    /// ends nested program execution
+    pub fn end_nested(&self) {
+        self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
             // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
@@ -1151,7 +1212,7 @@ impl Connection {
         }
 
         let sql = sql.as_ref();
-        tracing::trace!("Preparing: {}", sql);
+        tracing::debug!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let syms = self.syms.read();
@@ -1161,7 +1222,7 @@ impl Connection {
             .unwrap()
             .trim();
         self.maybe_update_schema();
-        let pager = self.pager.read().clone();
+        let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
@@ -1192,7 +1253,7 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself
     #[allow(dead_code)]
     fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.read().clone();
+        let pager = self.pager.load().clone();
 
         // first, quickly read schema_version from the root page in order to check if schema changed
         pager.begin_read_tx()?;
@@ -1258,7 +1319,7 @@ impl Connection {
     }
 
     fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.read().clone();
+        let pager = self.pager.load().clone();
 
         // read cookie before consuming statement program - otherwise we can end up reading cookie with closed transaction state
         let cookie = pager
@@ -1315,7 +1376,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
-            let pager = self.pager.read().clone();
+            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -1367,7 +1428,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let syms = self.syms.read();
-        let pager = self.pager.read().clone();
+        let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let program = translate::translate(
@@ -1399,7 +1460,7 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         while let Some(cmd) = parser.next_cmd()? {
             let syms = self.syms.read();
-            let pager = self.pager.read().clone();
+            let pager = self.pager.load().clone();
             let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
@@ -1428,7 +1489,7 @@ impl Connection {
             return Ok(None);
         };
         let syms = self.syms.read();
-        let pager = self.pager.read().clone();
+        let pager = self.pager.load().clone();
         let byte_offset_end = parser.offset();
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
@@ -1457,6 +1518,8 @@ impl Connection {
         strict: bool,
         // flag to opt-in encryption support
         encryption: bool,
+        // flag to opt-in custom modules support
+        custom_modules: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1472,7 +1535,8 @@ impl Connection {
                     .with_indexes(use_indexes)
                     .with_views(views)
                     .with_strict(strict)
-                    .with_encryption(encryption),
+                    .with_encryption(encryption)
+                    .with_index_method(custom_modules),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1501,7 +1565,8 @@ impl Connection {
                 .with_indexes(use_indexes)
                 .with_views(views)
                 .with_strict(strict)
-                .with_encryption(encryption),
+                .with_encryption(encryption)
+                .with_index_method(custom_modules),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
@@ -1518,7 +1583,7 @@ impl Connection {
         if let Some(encryption_opts) = encryption_opts {
             let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
             let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
-            let pager = conn.pager.read();
+            let pager = conn.pager.load();
             if db.db_state.get().is_initialized() {
                 // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
                 pager.clear_page_cache(false);
@@ -1572,7 +1637,7 @@ impl Connection {
     /// Read schema version at current transaction
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn read_schema_version(&self) -> Result<u32> {
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie))
@@ -1590,7 +1655,7 @@ impl Connection {
                 "write_schema_version must be called from within Write transaction".to_string(),
             ));
         };
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         pager.io.block(|| {
             pager.with_header_mut(|header| {
                 turso_assert!(
@@ -1617,7 +1682,7 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
             // on windows, zero read will trigger UnexpectedEof
@@ -1643,19 +1708,19 @@ impl Connection {
     /// (so, if concurrent connection wrote something to the WAL - this method will not see this change)
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        self.pager.read().wal_changed_pages_after(frame_watermark)
+        self.pager.load().wal_changed_pages_after(frame_watermark)
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_state(&self) -> Result<WalState> {
-        self.pager.read().wal_state()
+        self.pager.load().wal_state()
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
 
-        let c = self.pager.read().wal_get_frame(frame_no, frame)?;
+        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
         self.db.io.wait_for_completion(c)?;
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
@@ -1669,13 +1734,13 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        self.pager.read().wal_insert_frame(frame_no, frame)
+        self.pager.load().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         pager.begin_read_tx()?;
         pager.io.block(|| pager.begin_write_tx()).inspect_err(|_| {
             pager.end_read_tx();
@@ -1695,7 +1760,7 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
         {
-            let pager = self.pager.read();
+            let pager = self.pager.load();
 
             let Some(wal) = pager.wal.as_ref() else {
                 return Err(LimboError::InternalError(
@@ -1745,14 +1810,14 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.read().cacheflush()
+        self.pager.load().cacheflush()
     }
 
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.read().wal_checkpoint(mode)
+        self.pager.load().wal_checkpoint(mode)
     }
 
     /// Close a connection and checkpoint.
@@ -1768,7 +1833,7 @@ impl Connection {
             }
             _ => {
                 if !self.mvcc_enabled() {
-                    let pager = self.pager.read();
+                    let pager = self.pager.load();
                     pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
@@ -1782,7 +1847,7 @@ impl Connection {
             .eq(&1)
         {
             self.pager
-                .read()
+                .load()
                 .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())?;
         };
         Ok(())
@@ -1891,11 +1956,11 @@ impl Connection {
             shared_wal.enabled.store(false, Ordering::SeqCst);
             shared_wal.file = None;
         }
-        self.pager.write().clear_page_cache(false);
+        self.pager.load().clear_page_cache(false);
         let pager = self.db.init_pager(Some(size.get() as usize))?;
         pager.enable_encryption(self.db.opts.enable_encryption);
-        *self.pager.write() = Arc::new(pager);
-        self.pager.read().set_initial_page_size(size);
+        self.pager.store(Arc::new(pager));
+        self.pager.load().set_initial_page_size(size);
 
         Ok(())
     }
@@ -1980,6 +2045,10 @@ impl Connection {
         self.db.experimental_views_enabled()
     }
 
+    pub fn experimental_index_method_enabled(&self) -> bool {
+        self.db.experimental_index_method_enabled()
+    }
+
     pub fn experimental_strict_enabled(&self) -> bool {
         self.db.experimental_strict_enabled()
     }
@@ -2034,7 +2103,7 @@ impl Connection {
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
         if *index < 2 {
-            self.pager.read().clone()
+            self.pager.load().clone()
         } else {
             self.attached_databases.read().get_pager_by_index(index)
         }
@@ -2247,7 +2316,7 @@ impl Connection {
     }
 
     pub fn get_pager(&self) -> Arc<Pager> {
-        self.pager.read().clone()
+        self.pager.load().clone()
     }
 
     pub fn get_query_only(&self) -> bool {
@@ -2294,7 +2363,7 @@ impl Connection {
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         pager.set_reserved_space_bytes(reserved_bytes);
         Ok(())
     }
@@ -2317,7 +2386,7 @@ impl Connection {
             return Ok(());
         };
         tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.read();
+        let pager = self.pager.load();
         if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
                 "cannot reset encryption attributes if already set in the session".to_string(),
@@ -2680,12 +2749,7 @@ impl Statement {
 
     pub fn run_once(&self) -> Result<()> {
         let res = self.pager.io.step();
-        if self
-            .program
-            .connection
-            .is_nested_stmt
-            .load(Ordering::SeqCst)
-        {
+        if self.program.connection.is_nested_stmt() {
             return res;
         }
         if res.is_err() {
@@ -2748,7 +2812,7 @@ impl Statement {
                 .program
                 .table_references
                 .find_table_by_internal_id(*table)
-                .map(|table_ref| Cow::Borrowed(table_ref.get_name())),
+                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
             _ => None,
         }
     }
@@ -2777,7 +2841,7 @@ impl Statement {
                 column: column_idx,
                 ..
             } => {
-                let table_ref = self
+                let (_, table_ref) = self
                     .program
                     .table_references
                     .find_table_by_internal_id(*table)?;
@@ -2854,6 +2918,7 @@ pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
+    pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -2895,6 +2960,7 @@ impl SymbolTable {
             functions: HashMap::new(),
             vtabs: HashMap::new(),
             vtab_modules: HashMap::new(),
+            index_methods: HashMap::new(),
         }
     }
     pub fn resolve_function(
@@ -2914,6 +2980,9 @@ impl SymbolTable {
         }
         for (name, module) in &other.vtab_modules {
             self.vtab_modules.insert(name.clone(), module.clone());
+        }
+        for (name, module) in &other.index_methods {
+            self.index_methods.insert(name.clone(), module.clone());
         }
     }
 }

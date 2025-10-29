@@ -1,8 +1,10 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
+use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
 };
+use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
 
@@ -368,6 +370,7 @@ impl Schema {
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
+            .filter(|i| !i.is_backing_btree_index())
     }
 
     pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
@@ -485,7 +488,7 @@ impl Schema {
 
         pager.end_read_tx();
 
-        self.populate_indices(from_sql_indexes, automatic_indices)?;
+        self.populate_indices(syms, from_sql_indexes, automatic_indices)?;
 
         self.populate_materialized_views(
             materialized_view_info,
@@ -501,6 +504,7 @@ impl Schema {
     /// automatic_indices: indices created automatically for primary key and unique constraints
     pub fn populate_indices(
         &mut self,
+        syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
     ) -> Result<()> {
@@ -512,6 +516,7 @@ impl Schema {
                     .get_btree_table(&unparsed_sql_from_index.table_name)
                     .unwrap();
                 let index = Index::from_sql(
+                    syms,
                     &unparsed_sql_from_index.sql,
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
@@ -2432,6 +2437,7 @@ pub struct Index {
     /// and  SELECT DISTINCT ephemeral indexes will not have a rowid.
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
+    pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
 }
 
 #[allow(dead_code)]
@@ -2450,7 +2456,12 @@ pub struct IndexColumn {
 }
 
 impl Index {
-    pub fn from_sql(sql: &str, root_page: i64, table: &BTreeTable) -> Result<Index> {
+    pub fn from_sql(
+        syms: &SymbolTable,
+        sql: &str,
+        root_page: i64,
+        table: &BTreeTable,
+    ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
@@ -2460,43 +2471,64 @@ impl Index {
                 columns,
                 unique,
                 where_clause,
+                using,
+                with_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let mut index_columns = Vec::with_capacity(columns.len());
-                for col in columns.into_iter() {
-                    let name = normalize_ident(match col.expr.as_ref() {
-                        Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
-                        _ => crate::bail_parse_error!("cannot use expressions in CREATE INDEX"),
-                    });
-                    let Some((pos_in_table, _)) = table.get_column(&name) else {
-                        return Err(crate::LimboError::InternalError(format!(
-                            "Column {} is in index {} but not found in table {}",
-                            name, index_name, table.name
-                        )));
+                let index_columns = resolve_sorted_columns(table, &columns)?;
+                if let Some(using) = using {
+                    if where_clause.is_some() {
+                        bail_parse_error!("custom index module do not support partial indices");
+                    }
+                    if unique {
+                        bail_parse_error!("custom index module do not support UNIQUE indices");
+                    }
+                    let parameters = resolve_index_method_parameters(with_clause)?;
+                    let Some(module) = syms.index_methods.get(using.as_str()) else {
+                        bail_parse_error!("unknown module name: '{}'", using);
                     };
-                    let (_, column) = table.get_column(&name).unwrap();
-                    index_columns.push(IndexColumn {
-                        name,
-                        order: col.order.unwrap_or(SortOrder::Asc),
-                        pos_in_table,
-                        collation: column.collation,
-                        default: column.default.clone(),
-                    });
+                    let configuration = IndexMethodConfiguration {
+                        table_name: table.name.clone(),
+                        index_name: index_name.clone(),
+                        columns: index_columns.clone(),
+                        parameters,
+                    };
+                    let descriptor = module.attach(&configuration)?;
+                    Ok(Index {
+                        name: index_name,
+                        table_name: normalize_ident(tbl_name.as_str()),
+                        root_page,
+                        columns: index_columns,
+                        unique: false,
+                        ephemeral: false,
+                        has_rowid: table.has_rowid,
+                        where_clause: None,
+                        index_method: Some(descriptor),
+                    })
+                } else {
+                    Ok(Index {
+                        name: index_name,
+                        table_name: normalize_ident(tbl_name.as_str()),
+                        root_page,
+                        columns: index_columns,
+                        unique,
+                        ephemeral: false,
+                        has_rowid: table.has_rowid,
+                        where_clause,
+                        index_method: None,
+                    })
                 }
-                Ok(Index {
-                    name: index_name,
-                    table_name: normalize_ident(tbl_name.as_str()),
-                    root_page,
-                    columns: index_columns,
-                    unique,
-                    ephemeral: false,
-                    has_rowid: table.has_rowid,
-                    where_clause,
-                })
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// check if this is special backing_btree index created and managed by custom index_method
+    pub fn is_backing_btree_index(&self) -> bool {
+        self.index_method
+            .as_ref()
+            .is_some_and(|x| x.definition().backing_btree)
     }
 
     pub fn automatic_from_primary_key(
@@ -2538,6 +2570,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
+            index_method: None,
         })
     }
 
@@ -2575,6 +2608,7 @@ impl Index {
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
+            index_method: None,
         })
     }
 

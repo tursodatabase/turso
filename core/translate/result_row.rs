@@ -143,6 +143,24 @@ pub fn emit_result_row_and_limit(
                 end_offset: BranchOffset::Offset(0),
             });
         }
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: *result_reg,
+            });
+        }
+        QueryDestination::RowValueSubqueryResult {
+            result_reg_start,
+            num_regs,
+        } => {
+            assert!(plan.result_columns.len() == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            program.emit_insn(Insn::Copy {
+                src_reg: result_columns_start_reg,
+                dst_reg: *result_reg_start,
+                extra_amount: num_regs - 1,
+            });
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
 
     if plan.limit.is_some() {

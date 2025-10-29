@@ -14,7 +14,7 @@ use crate::common::TempDatabase;
 //    was still fresh (no reads or writes happened).
 #[test]
 fn test_deferred_transaction_restart() {
-    let tmp_db = TempDatabase::new("test_deferred_tx.db", true);
+    let tmp_db = TempDatabase::new("test_deferred_tx.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -57,7 +57,7 @@ fn test_deferred_transaction_restart() {
 //    because it has performed reads and has a committed snapshot.
 #[test]
 fn test_deferred_transaction_no_restart() {
-    let tmp_db = TempDatabase::new("test_deferred_tx_no_restart.db", true);
+    let tmp_db = TempDatabase::new("test_deferred_tx_no_restart.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -106,7 +106,7 @@ fn test_deferred_transaction_no_restart() {
 
 #[test]
 fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x);", false);
+    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("begin")?;
@@ -131,7 +131,7 @@ fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
 /// Connection 2 should see the initial data (table 'test' in schema + 2 rows). Regression test for #2997
 /// It should then see another created table 'test2' in schema, as well.
 fn test_transaction_visibility() {
-    let tmp_db = TempDatabase::new("test_transaction_visibility.db", true);
+    let tmp_db = TempDatabase::new("test_transaction_visibility.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -179,10 +179,8 @@ fn test_transaction_visibility() {
 #[test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
-    let tmp_db = TempDatabase::new(
-        "test_constraint_error_aborts_only_stmt_not_entire_transaction.db",
-        true,
-    );
+    let tmp_db =
+        TempDatabase::new("test_constraint_error_aborts_only_stmt_not_entire_transaction.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table succeeds
@@ -224,7 +222,7 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
 /// violations being persisted to the database, even though the transaction was aborted.
 /// This test ensures that dirty pages are not flushed to WAL until after deferred violations are checked.
 fn test_deferred_fk_violation_rollback_in_autocommit() {
-    let tmp_db = TempDatabase::new("test_deferred_fk_violation_rollback.db", true);
+    let tmp_db = TempDatabase::new("test_deferred_fk_violation_rollback.db");
     let conn = tmp_db.connect_limbo();
 
     // Enable foreign keys
@@ -579,7 +577,7 @@ fn test_mvcc_checkpoint_works() {
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
     // Verify all rows after reopening database
-    let tmp_db = TempDatabase::new_with_existent(&tmp_db.path, true);
+    let tmp_db = TempDatabase::new_with_existent(&tmp_db.path);
     let conn = tmp_db.connect_limbo();
     let stmt = conn
         .query("SELECT * FROM test ORDER BY id, value")
@@ -723,7 +721,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
 #[test]
 fn test_non_mvcc_to_mvcc() {
     // Create non-mvcc database
-    let tmp_db = TempDatabase::new("test_non_mvcc_to_mvcc.db", false);
+    let tmp_db = TempDatabase::new("test_non_mvcc_to_mvcc.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert data

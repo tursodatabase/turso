@@ -21,6 +21,7 @@ turso_core = { workspace = true, features = ["io_uring"] }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
+mimalloc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -13,6 +13,7 @@ use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
     resolve_window_and_aggregate_functions,
 };
+use crate::translate::subquery::plan_subqueries_from_select_plan;
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -273,6 +274,7 @@ fn prepare_one_select_plan(
                 distinctness: Distinctness::from_ast(distinctness.as_ref()),
                 values: vec![],
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             let mut windows = Vec::with_capacity(window_clause.len());
@@ -502,6 +504,8 @@ fn prepare_one_select_plan(
                 )?;
             }
 
+            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+
             // Return the unoptimized query plan
             Ok(plan)
         }
@@ -555,6 +559,7 @@ fn prepare_one_select_plan(
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
                 window: None,
+                non_from_clause_subqueries: vec![],
             };
 
             Ok(plan)
@@ -623,6 +628,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
                 Search::RowidEq { .. } => 1,
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
             }
+            Operation::IndexMethodQuery(_) => 1,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_plan_required_cursors(&from_clause_subquery.plan)
         } else {
@@ -642,6 +648,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
+            Operation::IndexMethodQuery(_) => 15,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             10 + estimate_num_instructions(&from_clause_subquery.plan)
         } else {
@@ -665,6 +672,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
         .map(|t| match &t.op {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
+            Operation::IndexMethodQuery(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             3 + estimate_num_labels(&from_clause_subquery.plan)
         } else {

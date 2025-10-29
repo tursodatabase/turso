@@ -270,7 +270,7 @@ pub enum TxnCleanup {
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
-    cursors: Vec<Option<Cursor>>,
+    pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
@@ -417,10 +417,14 @@ impl ProgramState {
             self.cursors.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
         }
-        if let Some(max_resgisters) = max_registers {
+        if let Some(max_registers) = max_registers {
             self.registers
-                .resize_with(max_resgisters, || Register::Value(Value::Null));
+                .resize_with(max_registers, || Register::Value(Value::Null));
         }
+        // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursors.iter_mut().for_each(|c| {
+            let _ = c.take();
+        });
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
@@ -917,11 +921,11 @@ impl Program {
             // hence the mv_store.is_none() check.
             return Ok(IOResult::Done(()));
         }
+        if self.connection.is_nested_stmt() {
+            // We don't want to commit on nested statements. Let parent handle it.
+            return Ok(IOResult::Done(()));
+        }
         if let Some(mv_store) = mv_store {
-            if self.connection.is_nested_stmt.load(Ordering::SeqCst) {
-                // We don't want to commit on nested statements. Let parent handle it.
-                return Ok(IOResult::Done(()));
-            }
             let conn = self.connection.clone();
             let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
             if auto_commit {
@@ -954,7 +958,7 @@ impl Program {
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
-            tracing::trace!(
+            tracing::debug!(
                 "Halt auto_commit {}, state={:?}",
                 auto_commit,
                 program_state.commit_state
@@ -1050,7 +1054,7 @@ impl Program {
         cleanup: &mut TxnCleanup,
     ) {
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt.load(Ordering::SeqCst) {
+        if !self.connection.is_nested_stmt() {
             match err {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}

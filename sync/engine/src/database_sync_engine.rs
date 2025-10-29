@@ -9,7 +9,7 @@ use crate::{
     database_replay_generator::DatabaseReplayGenerator,
     database_sync_operations::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
-        count_local_changes, fetch_last_change_id, has_table, push_logical_changes, read_wal_salt,
+        count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
         reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
         wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
@@ -507,51 +507,36 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let mut revert_session = WalSession::new(revert_conn.clone());
         revert_session.begin()?;
 
+        // start of the pull updates apply process
+        // during this process we need to be very careful with the state of the WAL as at some points it can be not safe to read data from it
+        // the reasons why this can be not safe:
+        // 1. we are in the middle of rollback or apply from remote WAL - so DB now is in some weird state and no operations can be made safely
+        // 2. after rollback or apply from remote WAL it's unsafe to prepare statements because schema cookie can go "back in time" and we first need to adjust it before executing any statement over DB
         let mut main_session = WalSession::new(main_conn.clone());
         main_session.begin()?;
 
+        // we need to make sure that updates from the session will not be commited accidentally in the middle of the pull process
+        // in order to achieve that we mark current session as "nested program" which eliminates possibility that data will be actually commited without our explicit command
+        //
+        // the reason to not use auto-commit is because it has its own rules which resets the flag in case of statement reset - which we do under the hood sometimes
+        // that's why nested executed was chosen instead of auto-commit=false mode
+        main_conn.start_nested();
+
         let had_cdc_table = has_table(coro, &main_conn, "turso_cdc").await?;
 
+        // read current pull generation from local table for the given client
+        let (local_pull_gen, _) =
+            read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
+
         // read schema version after initiating WAL session (in order to read it with consistent max_frame_no)
+        // note, that as we initiated WAL session earlier - no changes can be made in between and we will have consistent race-free view of schema version
         let main_conn_schema_version = main_conn.read_schema_version()?;
 
         let mut main_session = DatabaseWalSession::new(coro, main_session).await?;
 
-        // fetch last_change_id from remote
-        let (pull_gen, last_change_id) = fetch_last_change_id(
-            coro,
-            self.protocol.as_ref(),
-            &main_conn,
-            &self.client_unique_id,
-        )
-        .await?;
+        // Phase 1 (start): rollback local changes from the WAL
 
-        // collect local changes before doing anything with the main DB
-        // it's important to do this after opening WAL session - otherwise we can miss some updates
-        let iterate_opts = DatabaseChangesIteratorOpts {
-            first_change_id: last_change_id.map(|x| x + 1),
-            mode: DatabaseChangesIteratorMode::Apply,
-            ignore_schema_changes: false,
-            ..Default::default()
-        };
-        let mut local_changes = Vec::new();
-        let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
-        while let Some(operation) = iterator.next(coro).await? {
-            match operation {
-                DatabaseTapeOperation::StmtReplay(_) => {
-                    panic!("changes iterator must not use StmtReplay option")
-                }
-                DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
-                DatabaseTapeOperation::Commit => continue,
-            }
-        }
-        tracing::info!(
-            "apply_changes(path={}): collected {} changes",
-            self.main_db_path,
-            local_changes.len()
-        );
-
-        // rollback local changes not checkpointed to the revert-db
+        // Phase 1.a: rollback local changes not checkpointed to the revert-db
         tracing::info!(
             "apply_changes(path={}): rolling back frames after {} watermark, max_frame={}",
             self.main_db_path,
@@ -567,14 +552,14 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             self.main_db_path,
             remote_rollback
         );
-        // rollback local changes by using frames from revert-db
+        // Phase 1.b: rollback local changes by using frames from revert-db
         // it's important to append pages from revert-db after local revert - because pages from revert-db must overwrite rollback from main DB
         for frame_no in 1..=remote_rollback {
             let info = revert_session.read_at(frame_no, &mut frame)?;
             main_session.append_page(info.page_no, &frame[WAL_FRAME_HEADER..])?;
         }
 
-        // after rollback - WAL state is aligned with remote - let's apply changes from it
+        // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
         let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
         tracing::info!(
             "apply_changes(path={}): applied changes from remote: db_size={}",
@@ -582,27 +567,83 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             db_size,
         );
 
-        let revert_since_wal_watermark;
-        if local_changes.is_empty() && local_rollback == 0 && remote_rollback == 0 && !had_cdc_table
-        {
-            main_session.commit(db_size)?;
-            revert_since_wal_watermark = main_session.frames_count()?;
-            main_session.wal_session.end(false)?;
-        } else {
-            main_session.commit(0)?;
-            let current_schema_version = main_conn.read_schema_version()?;
-            revert_since_wal_watermark = main_session.frames_count()?;
-            let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
-            main_conn.write_schema_version(final_schema_version)?;
-            tracing::info!(
-                "apply_changes(path={}): updated schema version to {}",
-                self.main_db_path,
-                final_schema_version
-            );
+        main_session.commit(0)?;
+        // now DB is equivalent to the some remote state (all local changes reverted, all remote changes applied)
+        // remember this frame watermark as a checkpoint for revert for pull operations in future
+        let revert_since_wal_watermark = main_session.frames_count()?;
 
-            update_last_change_id(coro, &main_conn, &self.client_unique_id, pull_gen + 1, 0)
-                .await
-                .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
+        // Phase 3: DB now has sane WAL - but schema cookie can be arbitrary - so we need to bump it (potentially forcing re-prepare for cached statement)
+        let current_schema_version = main_conn.read_schema_version()?;
+        let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
+        main_conn.write_schema_version(final_schema_version)?;
+        tracing::info!(
+            "apply_changes(path={}): updated schema version to {}",
+            self.main_db_path,
+            final_schema_version
+        );
+
+        // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
+        // we will use last_change_id in order to replay local changes made strictly after that id locally
+        let (remote_pull_gen, remote_last_change_id) =
+            read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
+
+        // we update pull generation and last_change_id at remote on push, but locally its updated on pull
+        // so its impossible to have remote pull generation to be greater than local one
+        if remote_pull_gen > local_pull_gen {
+            return Err(Error::DatabaseSyncEngineError(format!("protocol error: remote_pull_gen > local_pull_gen: {remote_pull_gen} > {local_pull_gen}")));
+        }
+        let last_change_id = if remote_pull_gen == local_pull_gen {
+            // if remote_pull_gen == local_pull gen - this means that remote portion of WAL have overlap with our local changes
+            // (because we did one or more push operations since last pull) - so we need to take some suffix of local changes for replay
+            remote_last_change_id
+        } else {
+            // if remove_pull_gen < local_pull_gen - this means that remote portion of WAL have no overlaps with all our local changes and we need to replay all of them
+            Some(0)
+        };
+
+        // Phase 5: collect local changes
+        // note, that collecting chanages from main_conn will yield zero rows as we already rolled back everything from it
+        // but since we didn't commited these changes yet - we can just collect changes from another connection
+        let iterate_opts = DatabaseChangesIteratorOpts {
+            first_change_id: last_change_id.map(|x| x + 1),
+            mode: DatabaseChangesIteratorMode::Apply,
+            ignore_schema_changes: false,
+            ..Default::default()
+        };
+        let mut local_changes = Vec::new();
+        {
+            // it's important here that DatabaseTape create fresh connection under the hood
+            let mut iterator = self.main_tape.iterate_changes(iterate_opts)?;
+            while let Some(operation) = iterator.next(coro).await? {
+                match operation {
+                    DatabaseTapeOperation::StmtReplay(_) => {
+                        panic!("changes iterator must not use StmtReplay option")
+                    }
+                    DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
+                    DatabaseTapeOperation::Commit => continue,
+                }
+            }
+        }
+        tracing::info!(
+            "apply_changes(path={}): collected {} changes",
+            self.main_db_path,
+            local_changes.len()
+        );
+
+        // Phase 6: replay local changes
+        // we can skip this phase if we are sure that we had no local changes before
+        if !local_changes.is_empty() || local_rollback != 0 || remote_rollback != 0 || had_cdc_table
+        {
+            // first, we update last_change id in the local meta table for sync
+            update_last_change_id(
+                coro,
+                &main_conn,
+                &self.client_unique_id,
+                local_pull_gen + 1,
+                0,
+            )
+            .await
+            .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
 
             if had_cdc_table {
                 tracing::info!(
@@ -641,6 +682,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             };
 
             assert!(!replay.conn().get_auto_commit());
+            // Replay local changes collected on Phase 5
             for (i, change) in local_changes.into_iter().enumerate() {
                 let operation = if let Some(transformed) = &mut transformed {
                     match std::mem::replace(&mut transformed[i], DatabaseRowTransformResult::Skip) {
@@ -658,9 +700,11 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                 replay.replay(coro, operation).await?;
             }
             assert!(!replay.conn().get_auto_commit());
-
-            main_session.wal_session.end(true)?;
         }
+
+        // Final: now we did all necessary operations as one big transaction and we are ready to commit
+        main_conn.end_nested();
+        main_session.wal_session.end(true)?;
 
         Ok(revert_since_wal_watermark)
     }

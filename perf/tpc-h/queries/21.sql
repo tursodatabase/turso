@@ -1,4 +1,4 @@
--- LIMBO_SKIP: subquery in where not supported
+
 
 
 select

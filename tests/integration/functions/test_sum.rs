@@ -5,7 +5,7 @@ use turso_core::LimboError;
 fn sum_errors_on_integer_overflow() {
     let _ = env_logger::try_init();
 
-    let tmp_db = TempDatabase::new_empty(false);
+    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 

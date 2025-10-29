@@ -410,7 +410,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .write()
+                    .load()
                     .wal_checkpoint_start(*checkpoint_mode);
                 match step_result {
                     Ok(IOResult::Done(result)) => {
@@ -431,7 +431,7 @@ pub fn op_checkpoint_inner(
                 let step_result = program
                     .connection
                     .pager
-                    .write()
+                    .load()
                     .wal_checkpoint_finish(result.as_mut().unwrap());
                 match step_result {
                     Ok(IOResult::Done(())) => {
@@ -1047,6 +1047,20 @@ pub fn op_open_read(
 
     let pager = program.get_pager_from_database_index(db);
 
+    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+
+        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = cursor.as_index_method_mut();
+        return_if_io!(cursor.open_read(&program.connection));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
     if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
@@ -1138,6 +1152,9 @@ pub fn op_open_read(
         }
         CursorType::Sorter => {
             panic!("OpenRead on sorter cursor");
+        }
+        CursorType::IndexMethod(..) => {
+            unreachable!("IndexMethod handled above")
         }
         CursorType::VirtualTable(_) => {
             panic!("OpenRead on virtual table cursor, use Insn:VOpen instead");
@@ -1538,8 +1555,11 @@ pub fn op_column(
             } => {
                 let Some(rowid) = ({
                     let index_cursor = state.get_cursor(index_cursor_id);
-                    let index_cursor = index_cursor.as_btree_mut();
-                    return_if_io!(index_cursor.rowid())
+                    match index_cursor {
+                        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+                        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
+                        _ => panic!("unexpected cursor type"),
+                    }
                 }) else {
                     state.registers[*dest] = Register::Value(Value::Null);
                     break 'outer;
@@ -1860,6 +1880,12 @@ pub fn op_column(
                         };
                         state.registers[*dest] = Register::Value(value);
                     }
+                    CursorType::IndexMethod(..) => {
+                        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+                        let cursor = cursor.as_index_method_mut();
+                        let value = return_if_io!(cursor.query_column(*column));
+                        state.registers[*dest] = Register::Value(value);
+                    }
                     CursorType::VirtualTable(_) => {
                         panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
                     }
@@ -2038,6 +2064,11 @@ pub fn op_next(
             }
             Cursor::MaterializedView(mv_cursor) => {
                 let has_more = return_if_io!(mv_cursor.next());
+                !has_more
+            }
+            Cursor::IndexMethod(_) => {
+                let cursor = cursor.as_index_method_mut();
+                let has_more = return_if_io!(cursor.query_next());
                 !has_more
             }
             _ => panic!("Next on non-btree/materialized-view cursor"),
@@ -2282,8 +2313,7 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
-                let (new_transaction_state, updated) = if conn.is_nested_stmt.load(Ordering::SeqCst)
-                {
+                let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else {
                     match (current_state, write) {
@@ -2373,7 +2403,7 @@ pub fn op_transaction_inner(
                     }
                     if updated && matches!(current_state, TransactionState::None) {
                         turso_assert!(
-                            !conn.is_nested_stmt.load(Ordering::SeqCst),
+                            !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
                         );
                         pager.begin_read_tx()?;
@@ -2382,7 +2412,7 @@ pub fn op_transaction_inner(
 
                     if updated && matches!(new_transaction_state, TransactionState::Write { .. }) {
                         turso_assert!(
-                            !conn.is_nested_stmt.load(Ordering::SeqCst),
+                            !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
                         let begin_w_tx_res = pager.begin_write_tx();
@@ -2782,15 +2812,22 @@ pub fn op_row_id(
             } => {
                 let rowid = {
                     let index_cursor = state.get_cursor(index_cursor_id);
-                    let index_cursor = index_cursor.as_btree_mut();
-                    let record = return_if_io!(index_cursor.record());
-                    let record = record.as_ref().unwrap();
-                    let mut record_cursor_ref = index_cursor.record_cursor_mut();
-                    let record_cursor = record_cursor_ref.deref_mut();
-                    let rowid = record.last_value(record_cursor).unwrap();
-                    match rowid {
-                        Ok(ValueRef::Integer(rowid)) => rowid,
-                        _ => unreachable!(),
+                    match index_cursor {
+                        Cursor::BTree(index_cursor) => {
+                            let record = return_if_io!(index_cursor.record());
+                            let record = record.as_ref().unwrap();
+                            let mut record_cursor_ref = index_cursor.record_cursor_mut();
+                            let record_cursor = record_cursor_ref.deref_mut();
+                            let rowid = record.last_value(record_cursor).unwrap();
+                            match rowid {
+                                Ok(ValueRef::Integer(rowid)) => rowid,
+                                _ => unreachable!(),
+                            }
+                        }
+                        Cursor::IndexMethod(index_cursor) => {
+                            return_if_io!(index_cursor.query_rowid()).unwrap()
+                        }
+                        _ => panic!("unexpected cursor type"),
                     }
                 };
                 state.op_row_id_state = OpRowIdState::Seek {
@@ -2836,6 +2873,14 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
+                } else if let Some(Cursor::IndexMethod(cursor)) =
+                    cursors.get_mut(*cursor_id).unwrap()
+                {
+                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
+                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                    } else {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    }
                 } else {
                     return Err(LimboError::InternalError(
                         "RowId: cursor is not a table, virtual, or materialized view cursor"
@@ -2862,8 +2907,12 @@ pub fn op_idx_row_id(
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
     let cursor = cursors.get_mut(*cursor_id).unwrap().as_mut().unwrap();
-    let cursor = cursor.as_btree_mut();
-    let rowid = return_if_io!(cursor.rowid());
+
+    let rowid = match cursor {
+        Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+        Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
+        _ => panic!("unexpected cursor type"),
+    };
     state.registers[*dest] = match rowid {
         Some(rowid) => Register::Value(Value::Integer(rowid)),
         None => Register::Value(Value::Null),
@@ -5405,6 +5454,8 @@ pub fn op_function(
                                 idx_name,
                                 columns,
                                 where_clause,
+                                using,
+                                with_clause,
                             } => {
                                 let table_name = normalize_ident(tbl_name.as_str());
 
@@ -5420,6 +5471,8 @@ pub fn op_function(
                                         idx_name,
                                         columns,
                                         where_clause,
+                                        using,
+                                        with_clause,
                                     }
                                     .to_string(),
                                 )
@@ -5503,6 +5556,8 @@ pub fn op_function(
                                 if_not_exists,
                                 idx_name,
                                 where_clause,
+                                using,
+                                with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -5529,6 +5584,8 @@ pub fn op_function(
                                         if_not_exists,
                                         idx_name,
                                         where_clause,
+                                        using,
+                                        with_clause,
                                     }
                                     .to_string(),
                                 )
@@ -6315,6 +6372,13 @@ pub fn op_idx_delete(
         insn
     );
 
+    tracing::info!("idx_delete cursor: {:?}", program.cursor_ref[*cursor_id]);
+    if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
+        return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     loop {
         #[cfg(debug_assertions)]
         tracing::debug!(
@@ -6421,10 +6485,28 @@ pub fn op_idx_insert(
             cursor_id,
             record_reg,
             flags,
+            unpacked_start,
+            unpacked_count,
             ..
         },
         *insn
     );
+
+    if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
+        let Some(start) = unpacked_start else {
+            return Err(LimboError::InternalError(
+                "IndexMethod must receive unpacked values".to_string(),
+            ));
+        };
+        let Some(count) = unpacked_count else {
+            return Err(LimboError::InternalError(
+                "IndexMethod must receive unpacked values".to_string(),
+            ));
+        };
+        return_if_io!(cursor.insert(&state.registers[start..start + count as usize]));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
 
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,
@@ -6707,11 +6789,12 @@ pub fn op_must_be_int(
             Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
             Err(_) => crate::bail_parse_error!("datatype mismatch"),
         },
-        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str()) {
+        Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Ok(Value::Float(f)) => {
-                state.registers[*reg] = Register::Value(Value::Integer(f as i64))
-            }
+            Ok(Value::Float(f)) => match cast_real_to_integer(f) {
+                Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
+                Err(_) => crate::bail_parse_error!("datatype mismatch"),
+            },
             _ => crate::bail_parse_error!("datatype mismatch"),
         },
         _ => {
@@ -6929,6 +7012,20 @@ pub fn op_open_write(
     }
     let pager = program.get_pager_from_database_index(db);
 
+    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+
+        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = cursor.as_index_method_mut();
+        return_if_io!(cursor.open_write(&program.connection));
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let root_page = match root_page {
         RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
@@ -6963,59 +7060,71 @@ pub fn op_open_write(
         CursorType::BTreeIndex(index) => Some(index),
         _ => None,
     };
-    let maybe_promote_to_mvcc_cursor =
-        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store.unwrap().clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    tx_id,
-                    root_page,
-                    pager.clone(),
-                    btree_cursor,
-                )?))
-            } else {
-                Ok(btree_cursor)
-            }
-        };
-    if let Some(index) = maybe_index {
-        let conn = program.connection.clone();
-        let schema = conn.schema.read();
-        let table = schema
-            .get_table(&index.table_name)
-            .and_then(|table| table.btree());
 
-        let num_columns = index.columns.len();
-        let btree_cursor = Box::new(BTreeCursor::new_index(
-            pager.clone(),
-            root_page,
-            index.as_ref(),
-            num_columns,
-        ));
-        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
-        cursors
-            .get_mut(*cursor_id)
-            .unwrap()
-            .replace(Cursor::new_btree(cursor));
+    // Check if we can reuse the existing cursor
+    let can_reuse_cursor = if let Some(Some(Cursor::BTree(btree_cursor))) = cursors.get(*cursor_id)
+    {
+        // Reuse if the root_page matches (same table/index)
+        btree_cursor.root_page() == root_page
     } else {
-        let num_columns = match cursor_type {
-            CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
-            CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
-            _ => unreachable!(
-                "Expected BTreeTable or MaterializedView. This should not have happened."
-            ),
-        };
+        false
+    };
 
-        let btree_cursor = Box::new(BTreeCursor::new_table(
-            pager.clone(),
-            root_page,
-            num_columns,
-        ));
-        let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
-        cursors
-            .get_mut(*cursor_id)
-            .unwrap()
-            .replace(Cursor::new_btree(cursor));
+    if !can_reuse_cursor {
+        let maybe_promote_to_mvcc_cursor =
+            |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store.unwrap().clone();
+                    Ok(Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        pager.clone(),
+                        btree_cursor,
+                    )?))
+                } else {
+                    Ok(btree_cursor)
+                }
+            };
+        if let Some(index) = maybe_index {
+            let conn = program.connection.clone();
+            let schema = conn.schema.read();
+            let table = schema
+                .get_table(&index.table_name)
+                .and_then(|table| table.btree());
+
+            let num_columns = index.columns.len();
+            let btree_cursor = Box::new(BTreeCursor::new_index(
+                pager.clone(),
+                root_page,
+                index.as_ref(),
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            cursors
+                .get_mut(*cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        } else {
+            let num_columns = match cursor_type {
+                CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
+                CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
+                _ => unreachable!(
+                    "Expected BTreeTable or MaterializedView. This should not have happened."
+                ),
+            };
+
+            let btree_cursor = Box::new(BTreeCursor::new_table(
+                pager.clone(),
+                root_page,
+                num_columns,
+            ));
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            cursors
+                .get_mut(*cursor_id)
+                .unwrap()
+                .replace(Cursor::new_btree(cursor));
+        }
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7072,6 +7181,102 @@ pub fn op_create_btree(
     let root_page = return_if_io!(pager.btree_create(flags));
     state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
     state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_create(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IndexMethodCreate { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_index_method_mut();
+    return_if_io!(cursor.create(&program.connection));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_destroy(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_index_method_mut();
+    return_if_io!(cursor.destroy(&program.connection));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_query(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        IndexMethodQuery {
+            db,
+            cursor_id,
+            start_reg,
+            count_reg,
+            pc_if_empty,
+        },
+        insn
+    );
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    if let Some(mv_store) = mv_store {
+        todo!("MVCC is not supported yet");
+    }
+    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = cursor.as_index_method_mut();
+    let has_rows =
+        return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
+    if !has_rows {
+        state.pc = pc_if_empty.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -7298,7 +7503,7 @@ pub fn op_parse_schema(
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.is_nested_stmt.store(true, Ordering::SeqCst);
+            conn.start_nested();
             parse_schema_rows(
                 stmt,
                 schema,
@@ -7313,7 +7518,7 @@ pub fn op_parse_schema(
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.is_nested_stmt.store(true, Ordering::SeqCst);
+            conn.start_nested();
             parse_schema_rows(
                 stmt,
                 schema,
@@ -7323,7 +7528,7 @@ pub fn op_parse_schema(
             )
         })
     };
-    conn.is_nested_stmt.store(false, Ordering::SeqCst);
+    conn.end_nested();
     conn.auto_commit
         .store(previous_auto_commit, Ordering::SeqCst);
     maybe_nested_stmt_err?;
@@ -7697,7 +7902,7 @@ pub fn op_open_ephemeral(
             let page_size =
                 return_if_io!(with_header(pager, mv_store, program, |header| header.page_size));
             let conn = program.connection.clone();
-            let io = conn.pager.read().io.clone();
+            let io = conn.pager.load().io.clone();
             let rand_num = io.generate_random_number();
             let db_file;
             let db_file_io: Arc<dyn crate::IO>;
@@ -7817,6 +8022,9 @@ pub fn op_open_ephemeral(
                 }
                 CursorType::VirtualTable(_) => {
                     panic!("OpenEphemeral on virtual table cursor, use Insn::VOpen instead");
+                }
+                CursorType::IndexMethod(..) => {
+                    panic!("OpenEphemeral on index method cursor")
                 }
                 CursorType::MaterializedView(_, _) => {
                     panic!("OpenEphemeral on materialized view cursor");
@@ -8127,6 +8335,33 @@ pub fn op_integrity_check(
                         actual_count: integrity_check_state.freelist_count.actual_count,
                         expected_count: integrity_check_state.freelist_count.expected_count,
                     });
+                }
+
+                #[cfg(not(feature = "omit_autovacuum"))]
+                {
+                    let auto_vacuum_mode = pager.get_auto_vacuum_mode();
+                    if !matches!(
+                        auto_vacuum_mode,
+                        crate::storage::pager::AutoVacuumMode::None
+                    ) {
+                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
+                        let page_size = pager.get_page_size_unchecked().get() as usize;
+
+                        for page_number in 2..=integrity_check_state.db_size {
+                            if crate::storage::pager::ptrmap::is_ptrmap_page(
+                                page_number as u32,
+                                page_size,
+                            ) {
+                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
+
+                                integrity_check_state.start(
+                                    page_number as i64,
+                                    PageCategory::PointerMap,
+                                    errors,
+                                );
+                            }
+                        }
+                    }
                 }
                 for page_number in 2..=integrity_check_state.db_size {
                     if !integrity_check_state
@@ -9705,7 +9940,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     if s.starts_with("0x") {
                         return false;
                     }
-                    if let Ok(num) = checked_cast_text_to_numeric(s) {
+                    if let Ok(num) = checked_cast_text_to_numeric(s, false) {
                         *value = num;
                         return true;
                     } else {

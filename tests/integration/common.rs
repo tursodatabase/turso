@@ -17,15 +17,15 @@ unsafe impl Send for TempDatabase {}
 
 #[allow(dead_code, clippy::arc_with_non_send_sync)]
 impl TempDatabase {
-    pub fn new_empty(enable_indexes: bool) -> Self {
-        Self::new(&format!("test-{}.db", rng().next_u32()), enable_indexes)
+    pub fn new_empty() -> Self {
+        Self::new(&format!("test-{}.db", rng().next_u32()))
     }
 
-    pub fn new(db_name: &str, enable_indexes: bool) -> Self {
+    pub fn new(db_name: &str) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
 
-        Self::new_with_existent(&path, enable_indexes)
+        Self::new_with_existent(&path)
     }
 
     pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
@@ -47,12 +47,8 @@ impl TempDatabase {
         }
     }
 
-    pub fn new_with_existent(db_path: &Path, enable_indexes: bool) -> Self {
-        Self::new_with_existent_with_flags(
-            db_path,
-            turso_core::OpenFlags::default(),
-            enable_indexes,
-        )
+    pub fn new_with_existent(db_path: &Path) -> Self {
+        Self::new_with_existent_with_flags(db_path, turso_core::OpenFlags::default())
     }
 
     pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
@@ -72,18 +68,14 @@ impl TempDatabase {
         }
     }
 
-    pub fn new_with_existent_with_flags(
-        db_path: &Path,
-        flags: turso_core::OpenFlags,
-        enable_indexes: bool,
-    ) -> Self {
+    pub fn new_with_existent_with_flags(db_path: &Path, flags: turso_core::OpenFlags) -> Self {
         let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
             turso_core::DatabaseOpts::new()
-                .with_indexes(enable_indexes)
+                .with_indexes(true)
                 .with_encryption(true),
             None,
         )
@@ -95,7 +87,7 @@ impl TempDatabase {
         }
     }
 
-    pub fn new_with_rusqlite(table_sql: &str, enable_indexes: bool) -> Self {
+    pub fn new_with_rusqlite(table_sql: &str) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
         {
@@ -110,7 +102,9 @@ impl TempDatabase {
             io.clone(),
             path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_indexes(enable_indexes),
+            turso_core::DatabaseOpts::new()
+                .with_indexes(true)
+                .with_index_method(true),
             None,
         )
         .unwrap();
@@ -439,7 +433,6 @@ mod tests {
         let _ = env_logger::try_init();
         let tmp_db = TempDatabase::new_with_rusqlite(
             "create table test (foo integer, bar integer, baz integer);",
-            false,
         );
         let conn = tmp_db.connect_limbo();
 
@@ -477,11 +470,8 @@ mod tests {
     fn test_limbo_open_read_only() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
         {
-            let db = TempDatabase::new_with_existent_with_flags(
-                &path,
-                turso_core::OpenFlags::default(),
-                false,
-            );
+            let db =
+                TempDatabase::new_with_existent_with_flags(&path, turso_core::OpenFlags::default());
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "CREATE table t (a)");
             assert!(ret.is_empty(), "{ret:?}");
@@ -493,7 +483,6 @@ mod tests {
             let db = TempDatabase::new_with_existent_with_flags(
                 &path,
                 turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
-                false,
             );
             let conn = db.connect_limbo();
             let ret = limbo_exec_rows(&db, &conn, "SELECT * from t");
@@ -509,7 +498,7 @@ mod tests {
     fn test_unique_index_ordering() -> anyhow::Result<()> {
         use rand::Rng;
 
-        let db = TempDatabase::new_empty(true);
+        let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
 
         let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER UNIQUE)");
@@ -550,7 +539,7 @@ mod tests {
     #[test]
     fn test_large_unique_blobs() -> anyhow::Result<()> {
         let path = TempDir::new().unwrap().keep().join("temp_read_only");
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
         let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x BLOB UNIQUE)");
@@ -580,7 +569,7 @@ mod tests {
             .unwrap()
             .keep()
             .join("temp_transaction_isolation");
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
 
         // Create two separate connections
         let conn1 = db.connect_limbo();
@@ -611,7 +600,7 @@ mod tests {
             .unwrap()
             .keep()
             .join("temp_transaction_isolation");
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
 
         // Create two separate connections
         let conn1 = db.connect_limbo();
@@ -648,7 +637,7 @@ mod tests {
             .unwrap()
             .keep()
             .join("temp_transaction_isolation");
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
 
         let conn = db.connect_limbo();
 
@@ -667,7 +656,7 @@ mod tests {
         let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (69)");
 
         // Reopen the database
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
         // Should only see the last committed value
@@ -688,7 +677,7 @@ mod tests {
             .unwrap()
             .keep()
             .join("temp_transaction_isolation");
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
 
         let conn = db.connect_limbo();
 
@@ -703,7 +692,7 @@ mod tests {
         do_flush(&conn, &db)?;
 
         // Reopen the database without committing
-        let db = TempDatabase::new_with_existent(&path, true);
+        let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
         // Should see no rows since transaction was never committed

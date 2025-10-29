@@ -7,6 +7,7 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, TableInternalId};
 
 use crate::{
+    index_method::IndexMethodAttachment,
     numeric::Numeric,
     parameters::Parameters,
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
@@ -134,6 +135,7 @@ pub struct ProgramBuilder {
 pub enum CursorType {
     BTreeTable(Arc<BTreeTable>),
     BTreeIndex(Arc<Index>),
+    IndexMethod(Arc<dyn IndexMethodAttachment>),
     Pseudo(PseudoCursorType),
     Sorter,
     VirtualTable(Arc<VirtualTable>),
@@ -330,6 +332,21 @@ impl ProgramBuilder {
         } else {
             self._alloc_cursor_id(Some(key), cursor_type)
         }
+    }
+
+    /// allocate proper cursor for the given index (either [CursorType::BTreeIndex] or [CursorType::IndexMethod])
+    pub fn alloc_cursor_index(
+        &mut self,
+        key: Option<CursorKey>,
+        index: &Arc<Index>,
+    ) -> crate::Result<usize> {
+        tracing::debug!("alloc cursor: {:?} {:?}", key, index.index_method.is_some());
+        let module = index.index_method.as_ref();
+        if module.is_some_and(|m| !m.definition().backing_btree) {
+            let module = module.unwrap().clone();
+            return Ok(self._alloc_cursor_id(key, CursorType::IndexMethod(module)));
+        }
+        Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
@@ -803,6 +820,9 @@ impl ProgramBuilder {
                 Insn::IdxLT { target_pc, .. } => {
                     resolve(target_pc, "IdxLT");
                 }
+                Insn::IndexMethodQuery { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "IndexMethodQuery");
+                }
                 Insn::IsNull { reg: _, target_pc } => {
                     resolve(target_pc, "IsNull");
                 }
@@ -840,6 +860,42 @@ impl ProgramBuilder {
     pub fn resolve_cursor_id(&self, key: &CursorKey) -> CursorID {
         self.resolve_cursor_id_safe(key)
             .unwrap_or_else(|| panic!("Cursor not found: {key:?}"))
+    }
+
+    /// Resolve the first allocated index cursor for a given table reference.
+    /// This method exists due to a limitation of our translation system where
+    /// a subquery that references an outer query table cannot know whether a
+    /// table cursor, index cursor, or both were opened for that table reference.
+    /// Hence: currently we first try to resolve a table cursor, and if that fails,
+    /// we resolve an index cursor via this method.
+    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
+        self.cursor_ref
+            .iter()
+            .position(|(k, _)| {
+                k.as_ref()
+                    .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+            })
+            .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
+    }
+
+    /// Resolve the [Index] that a given cursor is associated with.
+    pub fn resolve_index_for_cursor_id(&self, cursor_id: CursorID) -> Arc<Index> {
+        let cursor_ref = &self
+            .cursor_ref
+            .get(cursor_id)
+            .unwrap_or_else(|| panic!("Cursor not found: {cursor_id}"))
+            .1;
+        let CursorType::BTreeIndex(index) = cursor_ref else {
+            panic!("Cursor is not an index: {cursor_id}");
+        };
+        index.clone()
+    }
+
+    /// Get the [CursorType] of a given cursor.
+    pub fn get_cursor_type(&self, cursor_id: CursorID) -> Option<&CursorType> {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type)
     }
 
     pub fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {

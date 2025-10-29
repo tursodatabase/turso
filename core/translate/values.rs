@@ -24,6 +24,17 @@ pub fn emit_values(
         }
         QueryDestination::EphemeralIndex { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: result_reg,
+            });
+            result_reg
+        }
+        QueryDestination::RowValueSubqueryResult { .. } => {
+            emit_toplevel_values(program, plan, t_ctx)?
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     };
     Ok(reg_result_cols_start)
 }
@@ -168,6 +179,24 @@ fn emit_values_to_destination(
             emit_values_to_index(program, plan, start_reg, row_len);
         }
         QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::ExistsSubqueryResult { result_reg } => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: *result_reg,
+            });
+        }
+        QueryDestination::RowValueSubqueryResult {
+            result_reg_start,
+            num_regs,
+        } => {
+            assert!(row_len == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            program.emit_insn(Insn::Copy {
+                src_reg: start_reg,
+                dst_reg: *result_reg_start,
+                extra_amount: num_regs - 1,
+            });
+        }
+        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
 }
 

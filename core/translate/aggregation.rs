@@ -107,7 +107,7 @@ fn emit_collseq_if_needed(
 
     // If no explicit collation, check if this is a column with table-defined collation
     if let ast::Expr::Column { table, column, .. } = expr {
-        if let Some(table_ref) = referenced_tables.find_table_by_internal_id(*table) {
+        if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
             if let Some(table_column) = table_ref.get_column_at(*column) {
                 if let Some(collation) = &table_column.collation {
                     program.emit_insn(Insn::CollSeq {

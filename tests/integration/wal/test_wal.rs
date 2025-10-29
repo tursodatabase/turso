@@ -9,7 +9,7 @@ use turso_core::{Connection, LimboError, Result, StepResult};
 #[test]
 fn test_wal_checkpoint_result() -> Result<()> {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new("test_wal.db", false);
+    let tmp_db = TempDatabase::new("test_wal.db");
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t1 (id text);")?;
 
@@ -36,7 +36,7 @@ fn test_wal_checkpoint_result() -> Result<()> {
 #[ignore = "ignored for now because it's flaky"]
 fn test_wal_1_writer_1_reader() -> Result<()> {
     maybe_setup_tracing();
-    let tmp_db = Arc::new(Mutex::new(TempDatabase::new("test_wal.db", false)));
+    let tmp_db = Arc::new(Mutex::new(TempDatabase::new("test_wal.db")));
     let db = tmp_db.lock().unwrap().limbo_database(false);
 
     {

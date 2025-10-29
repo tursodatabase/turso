@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, As, Expr, UnaryOperator};
+use turso_parser::ast::{self, As, Expr, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -12,7 +12,7 @@ use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{affinity, Affinity, Table, Type};
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::ResultSetColumn;
+use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::builder::CursorKey;
@@ -288,6 +288,25 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
+        ast::Expr::SubqueryResult { query_type, .. } => match query_type {
+            SubqueryType::Exists { result_reg } => {
+                emit_cond_jump(program, condition_metadata, *result_reg);
+            }
+            SubqueryType::In { .. } => {
+                let result_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+                emit_cond_jump(program, condition_metadata, result_reg);
+            }
+            SubqueryType::RowValue { num_regs, .. } => {
+                if *num_regs != 1 {
+                    // A query like SELECT * FROM t WHERE (SELECT ...) must return a single column.
+                    crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+                }
+                let result_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+                emit_cond_jump(program, condition_metadata, result_reg);
+            }
+        },
         ast::Expr::Register(_) => {
             crate::bail_parse_error!("Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead");
         }
@@ -593,6 +612,149 @@ pub fn translate_expr(
     }
 
     match expr {
+        ast::Expr::SubqueryResult {
+            lhs,
+            not_in,
+            query_type,
+            ..
+        } => {
+            match query_type {
+                SubqueryType::Exists { result_reg } => {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *result_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                    Ok(target_register)
+                }
+                SubqueryType::In { cursor_id } => {
+                    // jump here when we can definitely skip the row
+                    let label_skip_row = program.allocate_label();
+                    // jump here when we can definitely include the row
+                    let label_include_row = program.allocate_label();
+                    // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+                    let label_null_rewind = program.allocate_label();
+                    let label_null_checks_loop_start = program.allocate_label();
+                    let label_null_checks_next = program.allocate_label();
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target_register,
+                    });
+                    let lhs_columns = match unwrap_parens(lhs.as_ref().unwrap())? {
+                        ast::Expr::Parenthesized(exprs) => {
+                            exprs.iter().map(|e| e.as_ref()).collect()
+                        }
+                        expr => vec![expr],
+                    };
+                    let lhs_column_count = lhs_columns.len();
+                    let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
+                    for (i, lhs_column) in lhs_columns.iter().enumerate() {
+                        translate_expr(
+                            program,
+                            referenced_tables,
+                            lhs_column,
+                            lhs_column_regs_start + i,
+                            resolver,
+                        )?;
+                        if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                            program.emit_insn(Insn::IsNull {
+                                reg: lhs_column_regs_start + i,
+                                target_pc: if *not_in {
+                                    label_null_rewind
+                                } else {
+                                    label_skip_row
+                                },
+                            });
+                        }
+                    }
+                    if *not_in {
+                        // WHERE ... NOT IN (SELECT ...)
+                        // We must skip the row if we find a match.
+                        program.emit_insn(Insn::Found {
+                            cursor_id: *cursor_id,
+                            target_pc: label_skip_row,
+                            record_reg: lhs_column_regs_start,
+                            num_regs: lhs_column_count,
+                        });
+                        // Ok, so Found didn't return a match.
+                        // Because SQL NULL, we need do extra checks to see if we can include the row.
+                        // Consider:
+                        // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
+                        // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
+                        // _Both_ of these queries should return nothing, because... SQL NULL.
+                        // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
+                        // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
+                        // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
+                        // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
+                        //
+                        // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
+                        // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
+                        // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
+                        // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
+                        // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
+                        // in which case we need to NOT include the row.
+                        // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
+                        program.preassign_label_to_next_insn(label_null_rewind);
+                        program.emit_insn(Insn::Rewind {
+                            cursor_id: *cursor_id,
+                            pc_if_empty: label_include_row,
+                        });
+                        program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                        let column_check_reg = program.alloc_register();
+                        for i in 0..lhs_column_count {
+                            program.emit_insn(Insn::Column {
+                                cursor_id: *cursor_id,
+                                column: i,
+                                dest: column_check_reg,
+                                default: None,
+                            });
+                            program.emit_insn(Insn::Ne {
+                                lhs: lhs_column_regs_start + i,
+                                rhs: column_check_reg,
+                                target_pc: label_null_checks_next,
+                                flags: CmpInsFlags::default(),
+                                collation: program.curr_collation(),
+                            });
+                        }
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_skip_row,
+                        });
+                        program.preassign_label_to_next_insn(label_null_checks_next);
+                        program.emit_insn(Insn::Next {
+                            cursor_id: *cursor_id,
+                            pc_if_next: label_null_checks_loop_start,
+                        })
+                    } else {
+                        // WHERE ... IN (SELECT ...)
+                        // We can skip the row if we don't find a match
+                        program.emit_insn(Insn::NotFound {
+                            cursor_id: *cursor_id,
+                            target_pc: label_skip_row,
+                            record_reg: lhs_column_regs_start,
+                            num_regs: lhs_column_count,
+                        });
+                    }
+                    program.preassign_label_to_next_insn(label_include_row);
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: target_register,
+                    });
+                    program.preassign_label_to_next_insn(label_skip_row);
+                    Ok(target_register)
+                }
+                SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                } => {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: *result_reg_start,
+                        dst_reg: target_register,
+                        extra_amount: num_regs - 1,
+                    });
+                    Ok(target_register)
+                }
+            }
+        }
         ast::Expr::Between { .. } => {
             unreachable!("expression should have been rewritten in optmizer")
         }
@@ -724,7 +886,9 @@ pub fn translate_expr(
         ast::Expr::DoublyQualified(_, _, _) => {
             crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
         }
-        ast::Expr::Exists(_) => crate::bail_parse_error!("EXISTS in WHERE clause is not supported"),
+        ast::Expr::Exists(_) => {
+            crate::bail_parse_error!("EXISTS is not supported in this position")
+        }
         ast::Expr::FunctionCall {
             name,
             distinctness: _,
@@ -1934,21 +2098,27 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
-            let (index, use_covering_index) = {
+            let (index, index_method, use_covering_index) = {
                 if let Some(table_reference) = referenced_tables
                     .unwrap()
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
+                        if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
+                            Some(index_method)
+                        } else {
+                            None
+                        },
                         table_reference.utilizes_covering_index(),
                     )
                 } else {
-                    (None, false)
+                    (None, None, false)
                 }
             };
+            let use_index_method = index_method.and_then(|m| m.covered_columns.get(column));
 
-            let table = referenced_tables
+            let (is_from_outer_query_scope, table) = referenced_tables
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
                 .unwrap_or_else(|| {
@@ -1958,66 +2128,102 @@ pub fn translate_expr(
                     )
                 });
 
-            let Some(table_column) = table.get_column_at(*column) else {
-                crate::bail_parse_error!("column index out of bounds");
-            };
-            // Counter intuitive but a column always needs to have a collation
-            program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            if use_index_method.is_none() {
+                let Some(table_column) = table.get_column_at(*column) else {
+                    crate::bail_parse_error!("column index out of bounds");
+                };
+                // Counter intuitive but a column always needs to have a collation
+                program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+            }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
             // the table and read the column from the cursor.
             // If we have a covering index, we don't have an open table cursor so we read from the index cursor.
             match &table {
                 Table::BTree(_) => {
-                    let table_cursor_id = if use_covering_index {
-                        None
-                    } else {
-                        Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
-                    };
-                    let index_cursor_id = index.map(|index| {
-                        program.resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
-                    });
-                    if *is_rowid_alias {
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            program.emit_insn(Insn::IdxRowId {
-                                cursor_id: index_cursor_id,
-                                dest: target_register,
-                            });
-                        } else if let Some(table_cursor_id) = table_cursor_id {
-                            program.emit_insn(Insn::RowId {
-                                cursor_id: table_cursor_id,
-                                dest: target_register,
-                            });
+                    let (table_cursor_id, index_cursor_id) = if is_from_outer_query_scope {
+                        // Due to a limitation of our translation system, a subquery that references an outer query table
+                        // cannot know whether a table cursor, index cursor, or both were opened for that table reference.
+                        // Hence: currently we first try to resolve a table cursor, and if that fails,
+                        // we resolve an index cursor.
+                        if let Some(table_cursor_id) =
+                            program.resolve_cursor_id_safe(&CursorKey::table(*table_ref_id))
+                        {
+                            (Some(table_cursor_id), None)
                         } else {
-                            unreachable!("Either index or table cursor must be opened");
+                            (
+                                None,
+                                Some(program.resolve_any_index_cursor_id_for_table(*table_ref_id)),
+                            )
                         }
                     } else {
-                        let read_cursor = if use_covering_index {
-                            index_cursor_id.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            )
+                        let table_cursor_id = if use_covering_index || use_index_method.is_some() {
+                            None
                         } else {
-                            table_cursor_id.expect(
-                                "table cursor should be opened when use_covering_index=false",
-                            )
+                            Some(program.resolve_cursor_id(&CursorKey::table(*table_ref_id)))
                         };
-                        let column = if use_covering_index {
-                            let index = index.expect(
-                                "index cursor should be opened when use_covering_index=true",
-                            );
-                            index.column_table_pos_to_index_pos(*column).unwrap_or_else(|| {
-                                        panic!("covering index {} does not contain column number {} of table {}", index.name, column, table_ref_id)
-                                    })
-                        } else {
-                            *column
-                        };
-
-                        program.emit_column_or_rowid(read_cursor, column, target_register);
-                    }
-                    let Some(column) = table.get_column_at(*column) else {
-                        crate::bail_parse_error!("column index out of bounds");
+                        let index_cursor_id = index.map(|index| {
+                            program
+                                .resolve_cursor_id(&CursorKey::index(*table_ref_id, index.clone()))
+                        });
+                        (table_cursor_id, index_cursor_id)
                     };
-                    maybe_apply_affinity(column.ty, target_register, program);
+
+                    if let Some(custom_module_column) = use_index_method {
+                        program.emit_column_or_rowid(
+                            index_cursor_id.unwrap(),
+                            *custom_module_column,
+                            target_register,
+                        );
+                    } else {
+                        if *is_rowid_alias {
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                program.emit_insn(Insn::IdxRowId {
+                                    cursor_id: index_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else if let Some(table_cursor_id) = table_cursor_id {
+                                program.emit_insn(Insn::RowId {
+                                    cursor_id: table_cursor_id,
+                                    dest: target_register,
+                                });
+                            } else {
+                                unreachable!("Either index or table cursor must be opened");
+                            }
+                        } else {
+                            let read_from_index = if is_from_outer_query_scope {
+                                index_cursor_id.is_some()
+                            } else {
+                                use_covering_index
+                            };
+                            let read_cursor = if read_from_index {
+                                index_cursor_id.expect("index cursor should be opened")
+                            } else {
+                                table_cursor_id.expect("table cursor should be opened")
+                            };
+                            let column = if read_from_index {
+                                let index = program.resolve_index_for_cursor_id(
+                                    index_cursor_id.expect("index cursor should be opened"),
+                                );
+                                index
+                                    .column_table_pos_to_index_pos(*column)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                        "index {} does not contain column number {} of table {}",
+                                        index.name, column, table_ref_id
+                                    )
+                                    })
+                            } else {
+                                *column
+                            };
+
+                            program.emit_column_or_rowid(read_cursor, column, target_register);
+                        }
+                        let Some(column) = table.get_column_at(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        maybe_apply_affinity(column.ty, target_register, program);
+                    }
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
@@ -2142,10 +2348,10 @@ pub fn translate_expr(
             Ok(result_reg)
         }
         ast::Expr::InSelect { .. } => {
-            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported")
+            crate::bail_parse_error!("IN (...subquery) is not supported in this position")
         }
         ast::Expr::InTable { .. } => {
-            crate::bail_parse_error!("Table expression in WHERE clause is not supported")
+            crate::bail_parse_error!("Table expression is not supported in this position")
         }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2183,7 +2389,7 @@ pub fn translate_expr(
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => {
-            crate::bail_parse_error!("ast::Expr::Name in WHERE clause is not supported")
+            crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
         }
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
@@ -2230,7 +2436,7 @@ pub fn translate_expr(
         }
         ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
         ast::Expr::Subquery(_) => {
-            crate::bail_parse_error!("Subquery in WHERE clause is not supported")
+            crate::bail_parse_error!("Subquery is not supported in this position")
         }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
@@ -3140,12 +3346,12 @@ pub fn as_binary_components(
 
 /// Recursively unwrap parentheses from an expression
 /// e.g. (((t.x > 5))) -> t.x > 5
-fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
+pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     match expr {
         ast::Expr::Column { .. } => Ok(expr),
         ast::Expr::Parenthesized(exprs) => match exprs.len() {
             1 => unwrap_parens(exprs.first().unwrap()),
-            _ => crate::bail_parse_error!("expected single expression in parentheses"),
+            _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.
         },
         _ => Ok(expr),
     }
@@ -3182,6 +3388,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {
@@ -3401,7 +3612,7 @@ pub fn bind_and_rewrite_expr<'a>(
     connection: &'a Arc<crate::Connection>,
     param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
-) -> Result<WalkControl> {
+) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -3699,7 +3910,8 @@ pub fn bind_and_rewrite_expr<'a>(
             }
             Ok(WalkControl::Continue)
         },
-    )
+    )?;
+    Ok(())
 }
 
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
@@ -3710,6 +3922,11 @@ where
     match func(expr)? {
         WalkControl::Continue => {
             match expr {
+                ast::Expr::SubqueryResult { lhs, .. } => {
+                    if let Some(lhs) = lhs {
+                        walk_expr_mut(lhs, func)?;
+                    }
+                }
                 ast::Expr::Between {
                     lhs, start, end, ..
                 } => {
@@ -3887,7 +4104,7 @@ pub fn get_expr_affinity(
     match expr {
         ast::Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
-                if let Some(table_ref) = tables.find_table_by_internal_id(*table) {
+                if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
                         return col.affinity();
                     }

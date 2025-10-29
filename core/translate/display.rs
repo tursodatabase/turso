@@ -119,6 +119,15 @@ impl Display for SelectPlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let index_method = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY INDEX METHOD {}",
+                        indent,
+                        index_method.definition().method_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -161,6 +170,15 @@ impl Display for DeletePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
             }
         }
         Ok(())
@@ -215,6 +233,15 @@ impl fmt::Display for UpdatePlan {
                         )?;
                     }
                 },
+                Operation::IndexMethodQuery(query) => {
+                    let module = query.index.index_method.as_ref().unwrap();
+                    writeln!(
+                        f,
+                        "{}QUERY MODULE {}",
+                        indent,
+                        module.definition().method_name
+                    )?;
+                }
             }
         }
         if !self.order_by.is_empty() {
@@ -251,7 +278,7 @@ pub struct PlanContext<'a>(pub &'a [&'a TableReferences]);
 // Definitely not perfect yet
 impl ToSqlContext for PlanContext<'_> {
     fn get_column_name(&self, table_id: TableInternalId, col_idx: usize) -> Option<Option<&str>> {
-        let table = self
+        let (_, table) = self
             .0
             .iter()
             .find_map(|table_ref| table_ref.find_table_by_internal_id(table_id))?;
@@ -270,7 +297,8 @@ impl ToSqlContext for PlanContext<'_> {
         match (joined_table, outer_query) {
             (Some(table), None) => Some(&table.identifier),
             (None, Some(table)) => Some(&table.identifier),
-            _ => unreachable!(),
+            (Some(table), Some(_)) => Some(&table.identifier),
+            (None, None) => unreachable!(),
         }
     }
 }

@@ -109,6 +109,7 @@ pub fn init_order_by(
             unique: false,
             has_rowid: false,
             where_clause: None,
+            index_method: None,
         });
         program.alloc_cursor_id(CursorType::BTreeIndex(index))
     } else {

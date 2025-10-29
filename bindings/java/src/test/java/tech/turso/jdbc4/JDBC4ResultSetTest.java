@@ -2,6 +2,7 @@ package tech.turso.jdbc4;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -868,5 +869,286 @@ class JDBC4ResultSetTest {
     Timestamp timestamp = resultSet.getTimestamp("created_at", utcCal);
 
     assertNotNull(timestamp);
+  }
+
+  @Test
+  void test_wasNull() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_was_null (id INTEGER, name TEXT);");
+    stmt.executeUpdate("INSERT INTO test_was_null VALUES (1, 'test');");
+    stmt.executeUpdate("INSERT INTO test_was_null VALUES (NULL, NULL);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_was_null");
+
+    // First row - non-null values
+    assertTrue(resultSet.next());
+    int id = resultSet.getInt(1);
+    assertFalse(resultSet.wasNull());
+    String name = resultSet.getString(2);
+    assertFalse(resultSet.wasNull());
+
+    // Second row - null values
+    assertTrue(resultSet.next());
+    int nullInt = resultSet.getInt(1);
+    assertTrue(resultSet.wasNull());
+    assertEquals(0, nullInt);
+    String nullString = resultSet.getString(2);
+    assertTrue(resultSet.wasNull());
+    assertNull(nullString);
+  }
+
+  @Test
+  void test_columnLabel_getters() throws Exception {
+    stmt.executeUpdate(
+        "CREATE TABLE test_column_label ("
+            + "bool_col INTEGER, "
+            + "byte_col INTEGER, "
+            + "short_col INTEGER, "
+            + "int_col INTEGER, "
+            + "long_col BIGINT, "
+            + "float_col REAL, "
+            + "double_col REAL, "
+            + "bytes_col BLOB);");
+
+    stmt.executeUpdate(
+        "INSERT INTO test_column_label VALUES ("
+            + "1, 127, 32767, 2147483647, 9223372036854775807, 3.14, 2.718281828, X'48656C6C6F');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_column_label");
+    assertTrue(resultSet.next());
+
+    // Test columnLabel-based getters
+    assertTrue(resultSet.getBoolean("bool_col"));
+    assertEquals(127, resultSet.getByte("byte_col"));
+    assertEquals(32767, resultSet.getShort("short_col"));
+    assertEquals(2147483647, resultSet.getInt("int_col"));
+    assertEquals(9223372036854775807L, resultSet.getLong("long_col"));
+    assertEquals(3.14f, resultSet.getFloat("float_col"), 0.001);
+    assertEquals(2.718281828, resultSet.getDouble("double_col"), 0.000001);
+    assertArrayEquals("Hello".getBytes(), resultSet.getBytes("bytes_col"));
+  }
+
+  @Test
+  void test_getObject_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_object (id INTEGER, name TEXT);");
+    stmt.executeUpdate("INSERT INTO test_object VALUES (42, 'test');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_object");
+    assertTrue(resultSet.next());
+
+    Object idObj = resultSet.getObject("id");
+    assertEquals(42L, idObj);
+    assertFalse(resultSet.wasNull());
+
+    Object nameObj = resultSet.getObject("name");
+    assertEquals("test", nameObj);
+    assertFalse(resultSet.wasNull());
+  }
+
+  @Test
+  void test_getBigDecimal_with_scale_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_decimal (amount REAL);");
+    stmt.executeUpdate("INSERT INTO test_decimal VALUES (123.456789);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_decimal");
+    assertTrue(resultSet.next());
+
+    BigDecimal result = resultSet.getBigDecimal("amount", 2);
+    assertEquals(new BigDecimal("123.46"), result); // Should be rounded to 2 decimal places
+  }
+
+  @Test
+  void test_getTime_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_time (time_col BLOB);");
+
+    long timeMillis = System.currentTimeMillis();
+    byte[] timeBytes = ByteBuffer.allocate(Long.BYTES).putLong(timeMillis).array();
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : timeBytes) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_time VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_time");
+    assertTrue(resultSet.next());
+
+    Time time = resultSet.getTime("time_col");
+    assertNotNull(time);
+    assertEquals(timeMillis, time.getTime());
+  }
+
+  @Test
+  void test_getAsciiStream() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_ascii (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_ascii VALUES ('Hello ASCII');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_ascii");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getAsciiStream(1);
+    assertNotNull(stream);
+    byte[] buffer = new byte[11];
+    int bytesRead = stream.read(buffer);
+    assertEquals(11, bytesRead);
+    assertEquals("Hello ASCII", new String(buffer, "US-ASCII"));
+    assertFalse(resultSet.wasNull());
+  }
+
+  @Test
+  void test_getAsciiStream_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_ascii (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_ascii VALUES ('Test');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_ascii");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getAsciiStream("text_col");
+    assertNotNull(stream);
+    byte[] buffer = new byte[4];
+    stream.read(buffer);
+    assertEquals("Test", new String(buffer, "US-ASCII"));
+  }
+
+  @Test
+  void test_getBinaryStream() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_binary (binary_col BLOB);");
+    byte[] data = {0x01, 0x02, 0x03, 0x04, 0x05};
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : data) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_binary VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_binary");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getBinaryStream(1);
+    assertNotNull(stream);
+    byte[] buffer = new byte[5];
+    int bytesRead = stream.read(buffer);
+    assertEquals(5, bytesRead);
+    assertArrayEquals(data, buffer);
+    assertFalse(resultSet.wasNull());
+  }
+
+  @Test
+  void test_getBinaryStream_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_binary (data BLOB);");
+    byte[] data = {0x0A, 0x0B, 0x0C};
+
+    StringBuilder hexString = new StringBuilder();
+    for (byte b : data) {
+      hexString.append(String.format("%02X", b));
+    }
+    stmt.executeUpdate("INSERT INTO test_binary VALUES (X'" + hexString + "');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_binary");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getBinaryStream("data");
+    assertNotNull(stream);
+    byte[] buffer = new byte[3];
+    stream.read(buffer);
+    assertArrayEquals(data, buffer);
+  }
+
+  @Test
+  void test_getUnicodeStream() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_unicode (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_unicode VALUES ('Hello minseok');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_unicode");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getUnicodeStream(1);
+    assertNotNull(stream);
+    byte[] buffer = new byte[1024];
+    int bytesRead = stream.read(buffer);
+    String result = new String(buffer, 0, bytesRead, "UTF-8");
+    assertEquals("Hello minseok", result);
+    assertFalse(resultSet.wasNull());
+  }
+
+  @Test
+  void test_getUnicodeStream_with_columnLabel() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_unicode (text_col TEXT);");
+    stmt.executeUpdate("INSERT INTO test_unicode VALUES ('Unicode 테스트');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_unicode");
+    assertTrue(resultSet.next());
+
+    InputStream stream = resultSet.getUnicodeStream("text_col");
+    assertNotNull(stream);
+    byte[] buffer = new byte[1024];
+    int bytesRead = stream.read(buffer);
+    String result = new String(buffer, 0, bytesRead, "UTF-8");
+    assertEquals("Unicode 테스트", result);
+  }
+
+  @Test
+  void test_stream_methods_return_null_on_null() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_null_stream (text_col TEXT, binary_col BLOB);");
+    stmt.executeUpdate("INSERT INTO test_null_stream VALUES (NULL, NULL);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_null_stream");
+    assertTrue(resultSet.next());
+
+    assertNull(resultSet.getAsciiStream(1));
+    assertTrue(resultSet.wasNull());
+
+    assertNull(resultSet.getUnicodeStream(1));
+    assertTrue(resultSet.wasNull());
+
+    assertNull(resultSet.getBinaryStream(2));
+    assertTrue(resultSet.wasNull());
+  }
+
+  @Test
+  void test_getMetaData_column_count() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_meta (col1 INTEGER, col2 TEXT, col3 REAL);");
+    stmt.executeUpdate("INSERT INTO test_meta VALUES (1, 'test', 3.14);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_meta");
+    ResultSetMetaData metaData = resultSet.getMetaData();
+
+    assertEquals(3, metaData.getColumnCount());
+    assertEquals("col1", metaData.getColumnName(1));
+    assertEquals("col2", metaData.getColumnName(2));
+    assertEquals("col3", metaData.getColumnName(3));
+    assertEquals("col1", metaData.getColumnLabel(1));
+    assertEquals(Integer.MAX_VALUE, metaData.getColumnDisplaySize(1));
+  }
+
+  @Test
+  void test_wasNull_consistency_across_types() throws Exception {
+    stmt.executeUpdate(
+        "CREATE TABLE test_null_types ("
+            + "int_col INTEGER, "
+            + "text_col TEXT, "
+            + "real_col REAL, "
+            + "blob_col BLOB);");
+    stmt.executeUpdate("INSERT INTO test_null_types VALUES (NULL, NULL, NULL, NULL);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_null_types");
+    assertTrue(resultSet.next());
+
+    // Test wasNull for various getter methods
+    resultSet.getInt(1);
+    assertTrue(resultSet.wasNull());
+
+    resultSet.getString(2);
+    assertTrue(resultSet.wasNull());
+
+    resultSet.getDouble(3);
+    assertTrue(resultSet.wasNull());
+
+    resultSet.getBytes(4);
+    assertTrue(resultSet.wasNull());
+
+    resultSet.getObject(1);
+    assertTrue(resultSet.wasNull());
+
+    resultSet.getBigDecimal(3);
+    assertTrue(resultSet.wasNull());
   }
 }

@@ -19,8 +19,7 @@ use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::HashSet;
-use std::hash;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
@@ -513,7 +512,11 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    dirty_pages: Arc<RwLock<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
+    /// Dirty pages sorted by page number.
+    ///
+    /// We need dirty pages in page number order when we flush them out to ensure
+    /// that the WAL we generate is compatible with SQLite.
+    dirty_pages: Arc<RwLock<BTreeSet<usize>>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -635,9 +638,7 @@ impl Pager {
             wal,
             page_cache,
             io,
-            dirty_pages: Arc::new(RwLock::new(HashSet::with_hasher(
-                hash::BuildHasherDefault::new(),
-            ))),
+            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -1222,6 +1223,21 @@ impl Pager {
                                     BtreePageAllocMode::Exact(root_page_num),
                                 ));
                                 let allocated_page_id = page.get().id as u32;
+
+                                return_if_io!(self.with_header_mut(|header| {
+                                    if allocated_page_id
+                                        > header.vacuum_mode_largest_root_page.get()
+                                    {
+                                        tracing::debug!(
+                                            "Updating largest root page in header from {} to {}",
+                                            header.vacuum_mode_largest_root_page.get(),
+                                            allocated_page_id
+                                        );
+                                        header.vacuum_mode_largest_root_page =
+                                            allocated_page_id.into();
+                                    }
+                                }));
+
                                 if allocated_page_id != root_page_num {
                                     //  TODO(Zaid): Handle swapping the allocated page with the desired root page
                                 }
@@ -1443,8 +1459,8 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
-        if connection.is_nested_stmt.load(Ordering::SeqCst) {
-            // Parent statement will handle the transaction rollback.
+        if connection.is_nested_stmt() {
+            // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(PagerCommitResult::Rollback));
         }
         let Some(wal) = self.wal.as_ref() else {
@@ -1473,7 +1489,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
-        if connection.is_nested_stmt.load(Ordering::SeqCst) {
+        if connection.is_nested_stmt() {
             // Parent statement will handle the transaction rollback.
             return;
         }
@@ -1512,7 +1528,7 @@ impl Pager {
         allow_empty_read: bool,
     ) -> Result<(PageRef, Completion)> {
         assert!(page_idx >= 0);
-        tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
+        tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -1549,11 +1565,11 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
-        tracing::trace!("read_page(page_idx = {})", page_idx);
+        tracing::debug!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx as usize);
         if let Some(page) = page_cache.get(&page_key)? {
-            tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            tracing::debug!("read_page(page_idx = {}) = cached", page_idx);
             turso_assert!(
                 page_idx as usize == page.get().id,
                 "attempted to read page {page_idx} but got page {}",
@@ -2886,7 +2902,7 @@ impl CreateBTreeFlags {
 **               identifies the parent page in the btree.
 */
 #[cfg(not(feature = "omit_autovacuum"))]
-mod ptrmap {
+pub(crate) mod ptrmap {
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
 
     // Constants

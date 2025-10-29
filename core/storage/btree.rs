@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -43,7 +44,7 @@ use std::{
     any::Any,
     cell::{Cell, Ref, RefCell},
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
     fmt::Debug,
     ops::DerefMut,
     pin::Pin,
@@ -2588,6 +2589,9 @@ impl BTreeCursor {
     /// 4. Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
     #[instrument(skip(self), level = Level::DEBUG)]
     fn balance_quick(&mut self) -> Result<IOResult<()>> {
+        // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
+        let _ = self.move_to_right_state.1.take();
+
         // Allocate a new leaf page and insert the overflow cell payload in it.
         let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
             PageType::TableLeaf,
@@ -5784,6 +5788,8 @@ pub(crate) enum PageCategory {
     Overflow,
     FreeListTrunk,
     FreePage,
+    #[cfg(not(feature = "omit_autovacuum"))]
+    PointerMap,
 }
 
 #[derive(Clone)]
@@ -5803,7 +5809,7 @@ pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
     pub db_size: usize,
     first_leaf_level: Option<usize>,
-    pub page_reference: HashMap<i64, i64>,
+    pub page_reference: FxHashMap<i64, i64>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -5813,7 +5819,7 @@ impl IntegrityCheckState {
         Self {
             page_stack: Vec::new(),
             db_size,
-            page_reference: HashMap::new(),
+            page_reference: FxHashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {
@@ -7870,11 +7876,11 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    conn.pager.read().clone(),
+                    conn.pager.load().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.read().clone(),
+            &conn.pager.load().clone(),
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, pos, 4096).unwrap();
@@ -8143,7 +8149,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         // FIXME: handle page cache is full
 
@@ -8163,7 +8169,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         let mut cursor = BTreeCursor::new(pager, 1, 5);
         let result = cursor.rewind()?;
@@ -8553,6 +8559,7 @@ mod tests {
                 unique: false,
                 ephemeral: false,
                 has_rowid: false,
+                index_method: None,
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
@@ -8712,6 +8719,7 @@ mod tests {
                 unique: false,
                 ephemeral: false,
                 has_rowid: false,
+                index_method: None,
             };
             let mut cursor = BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1);
 
@@ -9632,11 +9640,11 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                conn.pager.read().clone(),
+                                conn.pager.load().clone(),
                                 &mut fill_cell_payload_state,
                             )
                         },
-                        &conn.pager.read().clone(),
+                        &conn.pager.load().clone(),
                     )
                     .unwrap();
                     if (free as usize) < payload.len() + 2 {
@@ -9714,11 +9722,11 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    conn.pager.read().clone(),
+                                    conn.pager.load().clone(),
                                     &mut fill_cell_payload_state,
                                 )
                             },
-                            &conn.pager.read().clone(),
+                            &conn.pager.load().clone(),
                         )
                         .unwrap();
                         if (free as usize) < payload.len() - 2 {
@@ -10087,11 +10095,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.read().clone(),
+                    conn.pager.load().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.read().clone(),
+            &conn.pager.load().clone(),
         )
         .unwrap();
 
@@ -10173,11 +10181,11 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.read().clone(),
+                    conn.pager.load().clone(),
                     &mut fill_cell_payload_state,
                 )
             },
-            &conn.pager.read().clone(),
+            &conn.pager.load().clone(),
         )
         .unwrap();
         insert_into_cell(page.get_contents(), &payload, 0, 4096).unwrap();

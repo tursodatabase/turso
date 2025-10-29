@@ -70,6 +70,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         ephemeral: false,
         has_rowid: true,
         where_clause: None,
+        index_method: None,
     }
 }
 
@@ -270,7 +271,7 @@ mod tests {
         let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
         let conn = db.connect().unwrap();
 
-        let pager = conn.pager.read().clone();
+        let pager = conn.pager.load().clone();
 
         // Allocate page 1 first (database header)
         let _ = pager.io.block(|| pager.allocate_page1());

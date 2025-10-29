@@ -23,7 +23,7 @@ use super::plan::{
     Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
-use super::subquery::emit_subqueries;
+use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Schema, Table, ROWID_SENTINEL};
@@ -38,8 +38,9 @@ use crate::translate::fkeys::{
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::insert::{ColMapping, Insertion, emit_check_constraints};
-use crate::translate::plan::{DeletePlan, JoinedTable, Plan, QueryDestination, Search};
+use crate::translate::plan::{DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, Search};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -246,7 +247,7 @@ pub fn emit_program(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-fn emit_program_for_select(
+pub fn emit_program_for_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: SelectPlan,
@@ -275,16 +276,35 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
-
     if !plan.values.is_empty() {
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
     }
 
-    // Emit subqueries first so the results can be read in the main query loop.
-    emit_subqueries(program, t_ctx, &mut plan.table_references)?;
+    // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
+    for subquery in plan
+        .non_from_clause_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&plan.join_order)?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            program,
+            t_ctx,
+            *plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
+    // Emit FROM clause subqueries first so the results can be read in the main query loop.
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -359,6 +379,9 @@ pub fn emit_query<'a>(
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
+
+    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+
     init_loop(
         program,
         t_ctx,
@@ -367,6 +390,8 @@ pub fn emit_query<'a>(
         plan.group_by.as_ref(),
         OperationMode::SELECT,
         &plan.where_clause,
+        &plan.join_order,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     if plan.is_simple_count() {
@@ -383,6 +408,7 @@ pub fn emit_query<'a>(
         &plan.where_clause,
         None,
         OperationMode::SELECT,
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Process result columns and expressions in the inner loop
@@ -466,6 +492,8 @@ fn emit_program_for_delete(
         None,
         OperationMode::DELETE,
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Set up main query execution loop
@@ -477,6 +505,7 @@ fn emit_program_for_delete(
         &plan.where_clause,
         None,
         OperationMode::DELETE,
+        &mut [],
     )?;
 
     emit_delete_insns(
@@ -667,6 +696,9 @@ fn emit_delete_insns(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
+        Operation::IndexMethodQuery(_) => {
+            panic!("access through IndexMethod is not supported for delete statements")
+        }
     };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
 
@@ -722,30 +754,24 @@ fn emit_delete_insns(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let indexes = t_ctx.resolver.schema.indexes.get(table_name);
+        let indexes = t_ctx.resolver.schema.get_indices(table_name);
 
         // Get the index that is being used to iterate the deletion loop, if there is one.
         let iteration_index = unsafe { &*table_reference }.op.index();
         // Get all indexes that are not the iteration index.
         let other_indexes = indexes
-            .map(|indexes| {
-                indexes
-                    .iter()
-                    .filter(|index| {
-                        iteration_index
-                            .as_ref()
-                            .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
-                    })
-                    .map(|index| {
-                        (
-                            index.clone(),
-                            program
-                                .resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+            .filter(|index| {
+                iteration_index
+                    .as_ref()
+                    .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
             })
-            .unwrap_or_default();
+            .map(|index| {
+                (
+                    index.clone(),
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
+                )
+            })
+            .collect::<Vec<_>>();
 
         for (index, index_cursor_id) in other_indexes {
             let skip_delete_label = if index.where_clause.is_some() {
@@ -966,6 +992,8 @@ fn emit_program_for_update(
         None,
         mode.clone(),
         &plan.where_clause,
+        &[JoinOrderMember::default()],
+        &mut [],
     )?;
 
     // Prepare index cursors
@@ -981,7 +1009,7 @@ fn emit_program_for_update(
         )) {
             cursor
         } else {
-            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            let cursor = program.alloc_cursor_index(None, index)?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
@@ -1002,6 +1030,7 @@ fn emit_program_for_update(
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
+        &mut [],
     )?;
 
     let target_table_cursor_id =
@@ -1087,6 +1116,9 @@ fn emit_update_insns(
                 false,
             ),
         },
+        Operation::IndexMethodQuery(_) => {
+            panic!("access through IndexMethod is not supported for update operations")
+        }
     };
 
     let beg = program.alloc_registers(
@@ -2102,7 +2134,7 @@ fn init_limit(
                 _ => {
                     let r = limit_ctx.reg_limit;
 
-                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver);
+                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
                     program.emit_insn(Insn::MustBeInt { reg: r });
                 }
             }
@@ -2132,7 +2164,7 @@ fn init_limit(
                     }
                 }
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver);
+                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");

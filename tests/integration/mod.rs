@@ -1,6 +1,7 @@
 mod common;
 mod functions;
 mod fuzz_transaction;
+mod index_method;
 mod pragma;
 mod query_processing;
 mod storage;

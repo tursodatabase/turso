@@ -105,7 +105,7 @@ pub fn get_collseq_from_expr(
                 return Ok(WalkControl::SkipChildren);
             }
             Expr::Column { table, column, .. } => {
-                let table_ref = referenced_tables
+                let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
                 let column = table_ref
@@ -117,7 +117,7 @@ pub fn get_collseq_from_expr(
                 return Ok(WalkControl::Continue);
             }
             Expr::RowId { table, .. } => {
-                let table_ref = referenced_tables
+                let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
                 if let Some(btree) = table_ref.btree() {

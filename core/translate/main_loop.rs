@@ -19,7 +19,11 @@ use super::{
     },
 };
 use crate::translate::{
-    collate::get_collseq_from_expr, emitter::UpdateRowSource, window::emit_window_loop_source,
+    collate::get_collseq_from_expr,
+    emitter::UpdateRowSource,
+    plan::{EvalAt, NonFromClauseSubquery},
+    subquery::emit_non_from_clause_subquery,
+    window::emit_window_loop_source,
 };
 use crate::{
     schema::{Affinity, Index, IndexColumn, Table},
@@ -99,6 +103,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
         unique: false,
         has_rowid: false,
         where_clause: None,
+        index_method: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     let ctx = DistinctCtx {
@@ -116,6 +121,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
 }
 
 /// Initialize resources needed for the source operators (tables, joins, etc)
+#[allow(clippy::too_many_arguments)]
 pub fn init_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -124,6 +130,8 @@ pub fn init_loop(
     group_by: Option<&GroupBy>,
     mode: OperationMode,
     where_clause: &[WhereTerm],
+    join_order: &[JoinOrderMember],
+    subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.joined_tables().len(),
@@ -173,6 +181,7 @@ pub fn init_loop(
             has_rowid: false,
             unique: false,
             where_clause: None,
+            index_method: None,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
@@ -240,25 +249,23 @@ pub fn init_loop(
                         });
                     }
                     // For delete, we need to open all the other indexes too for writing
-                    if let Some(indexes) = t_ctx.resolver.schema.indexes.get(&btree.name) {
-                        for index in indexes {
-                            if table
-                                .op
-                                .index()
-                                .is_some_and(|table_index| table_index.name == index.name)
-                            {
-                                continue;
-                            }
-                            let cursor_id = program.alloc_cursor_id_keyed(
-                                CursorKey::index(table.internal_id, index.clone()),
-                                CursorType::BTreeIndex(index.clone()),
-                            );
-                            program.emit_insn(Insn::OpenWrite {
-                                cursor_id,
-                                root_page: index.root_page.into(),
-                                db: table.database_id,
-                            });
+                    for index in t_ctx.resolver.schema.get_indices(&btree.name) {
+                        if table
+                            .op
+                            .index()
+                            .is_some_and(|table_index| table_index.name == index.name)
+                        {
+                            continue;
                         }
+                        let cursor_id = program.alloc_cursor_index(
+                            Some(CursorKey::index(table.internal_id, index.clone())),
+                            index,
+                        )?;
+                        program.emit_insn(Insn::OpenWrite {
+                            cursor_id,
+                            root_page: index.root_page.into(),
+                            db: table.database_id,
+                        });
                     }
                 }
                 (OperationMode::UPDATE(update_mode), Table::BTree(btree)) => {
@@ -335,27 +342,23 @@ pub fn init_loop(
                         // For DELETE, we need to open all the indexes for writing
                         // UPDATE opens these in emit_program_for_update() separately
                         if matches!(mode, OperationMode::DELETE) {
-                            if let Some(indexes) =
-                                t_ctx.resolver.schema.indexes.get(table.table.get_name())
-                            {
-                                for index in indexes {
-                                    if table
-                                        .op
-                                        .index()
-                                        .is_some_and(|table_index| table_index.name == index.name)
-                                    {
-                                        continue;
-                                    }
-                                    let cursor_id = program.alloc_cursor_id_keyed(
-                                        CursorKey::index(table.internal_id, index.clone()),
-                                        CursorType::BTreeIndex(index.clone()),
-                                    );
-                                    program.emit_insn(Insn::OpenWrite {
-                                        cursor_id,
-                                        root_page: index.root_page.into(),
-                                        db: table.database_id,
-                                    });
+                            for index in t_ctx.resolver.schema.get_indices(table.table.get_name()) {
+                                if table
+                                    .op
+                                    .index()
+                                    .is_some_and(|table_index| table_index.name == index.name)
+                                {
+                                    continue;
                                 }
+                                let cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    index,
+                                )?;
+                                program.emit_insn(Insn::OpenWrite {
+                                    cursor_id,
+                                    root_page: index.root_page.into(),
+                                    db: table.database_id,
+                                });
                             }
                         }
                     }
@@ -394,12 +397,30 @@ pub fn init_loop(
                     }
                 }
             }
+            Operation::IndexMethodQuery(_) => match mode {
+                OperationMode::SELECT => {
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: table_cursor_id,
+                            root_page: table.table.get_root_page(),
+                            db: table.database_id,
+                        });
+                    }
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().unwrap().root_page,
+                        db: table.database_id,
+                    });
+                }
+                _ => panic!("only SELECT is supported for index method"),
+            },
         }
     }
 
     for cond in where_clause
         .iter()
-        .filter(|c| c.should_eval_before_loop(&[JoinOrderMember::default()]))
+        .filter(|c| c.should_eval_before_loop(join_order, subqueries))
     {
         let jump_target = program.allocate_label();
         let meta = ConditionMetadata {
@@ -418,6 +439,7 @@ pub fn init_loop(
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
+#[allow(clippy::too_many_arguments)]
 pub fn open_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
@@ -426,6 +448,7 @@ pub fn open_loop(
     predicates: &[WhereTerm],
     temp_cursor_id: Option<CursorID>,
     mode: OperationMode,
+    subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
@@ -664,6 +687,54 @@ pub fn open_loop(
                     }
                 }
             }
+            Operation::IndexMethodQuery(query) => {
+                let start_reg = program.alloc_registers(query.arguments.len() + 1);
+                program.emit_int(query.pattern_idx as i64, start_reg);
+                for i in 0..query.arguments.len() {
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        &query.arguments[i],
+                        start_reg + 1 + i,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.emit_insn(Insn::IndexMethodQuery {
+                    db: 0,
+                    cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
+                    start_reg,
+                    count_reg: query.arguments.len() + 1,
+                    pc_if_empty: loop_end,
+                });
+                program.preassign_label_to_next_insn(loop_start);
+                if let Some(table_cursor_id) = table_cursor_id {
+                    if let Some(index_cursor_id) = index_cursor_id {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            assert!(subquery.correlated, "subquery must be correlated");
+            let eval_at = subquery.get_eval_at(join_order)?;
+
+            if eval_at != EvalAt::Loop(join_index) {
+                continue;
+            }
+
+            let plan = subquery.consume_plan(eval_at);
+
+            emit_non_from_clause_subquery(
+                program,
+                t_ctx,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
         }
 
         // First emit outer join conditions, if any.
@@ -676,6 +747,7 @@ pub fn open_loop(
             join_index,
             next,
             true,
+            subqueries,
         )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
@@ -706,7 +778,18 @@ pub fn open_loop(
             join_index,
             next,
             false,
+            subqueries,
         )?;
+    }
+
+    if subqueries.iter().any(|s| !s.has_been_evaluated()) {
+        crate::bail_parse_error!(
+            "all subqueries should have already been emitted, but found {} unevaluated subqueries",
+            subqueries
+                .iter()
+                .filter(|s| !s.has_been_evaluated())
+                .count()
+        );
     }
 
     Ok(())
@@ -722,11 +805,12 @@ fn emit_conditions(
     join_index: usize,
     next: BranchOffset,
     from_outer_join: bool,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<()> {
     for cond in predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
-        .filter(|cond| cond.should_eval_at_loop(join_index, join_order))
+        .filter(|cond| cond.should_eval_at_loop(join_index, join_order, subqueries))
     {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
@@ -1114,6 +1198,14 @@ pub fn close_loop(
                         });
                     }
                 }
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::IndexMethodQuery(_) => {
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Next {
+                    cursor_id: index_cursor_id.unwrap(),
+                    pc_if_next: loop_labels.loop_start,
+                });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
         }

@@ -9,7 +9,7 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         expr::as_binary_components,
-        plan::{JoinOrderMember, TableReferences, WhereTerm},
+        plan::{JoinOrderMember, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
@@ -188,6 +188,7 @@ pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -241,7 +242,7 @@ pub fn constraints_from_where_clause(
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity: estimate_selectivity(table_column, operator),
                             usable: true,
                         });
@@ -258,7 +259,7 @@ pub fn constraints_from_where_clause(
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
                             table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(rhs, table_references)?,
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity: estimate_selectivity(table_column, operator),
                             usable: true,
                         });
@@ -274,7 +275,7 @@ pub fn constraints_from_where_clause(
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: *column,
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity: estimate_selectivity(table_column, operator),
                             usable: true,
                         });
@@ -288,7 +289,7 @@ pub fn constraints_from_where_clause(
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
                             table_col_pos: rowid_alias_column.unwrap(),
-                            lhs_mask: table_mask_from_expr(lhs, table_references)?,
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity: estimate_selectivity(table_column, operator),
                             usable: true,
                         });

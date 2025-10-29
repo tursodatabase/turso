@@ -4,6 +4,60 @@ import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } fr
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 const intCompare = (a, b) => a.x - b.x;
 
+test('checkpoint-and-actions', async () => {
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS rows(key TEXT PRIMARY KEY, value INTEGER)");
+        await db.exec("DELETE FROM rows");
+        await db.exec("INSERT INTO rows VALUES ('key', 0)");
+        await db.push();
+        await db.close();
+    }
+    const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
+    await db1.exec("PRAGMA busy_timeout=100");
+    console.info('run_info', await db1.prepare("SELECT * FROM sqlite_master").all());
+    const pull = async function (iterations: number) {
+        for (let i = 0; i < iterations; i++) {
+            console.info('pull', i);
+            try {
+                await db1.pull();
+            }
+            catch (e) { console.error('pull', e); }
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+    const push = async function (iterations: number) {
+        for (let i = 0; i < iterations; i++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+            console.info('push', i);
+            try {
+                if ((await db1.stats()).operations > 0) {
+                    const start = performance.now();
+                    await db1.push();
+                    console.info('push', performance.now() - start);
+                }
+            }
+            catch (e) { console.error('push', e); }
+        }
+    }
+    const run = async function (iterations: number) {
+        let rows = 0;
+        for (let i = 0; i < iterations; i++) {
+            console.info('run', i, rows);
+            await db1.prepare("UPDATE rows SET value = value + 1 WHERE key = ?").run('key');
+            rows += 1;
+            const { cnt } = await db1.prepare("SELECT value as cnt FROM rows WHERE key = ?").get(['key']);
+            expect(cnt).toBe(rows);
+            await new Promise(resolve => setTimeout(resolve, 1));
+        }
+    }
+    await Promise.all([pull(20), push(20), run(1000)]);
+})
+
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
     const defer = db.prepare("SELECT * FROM not_found");
@@ -19,6 +73,21 @@ test('simple-db', async () => {
     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
     expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }])
     await expect(async () => await db.pull()).rejects.toThrowError(/sync is disabled as database was opened without sync support/);
+})
+
+test('reconnect-db', async () => {
+    {
+        const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
+        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        expect(await stmt.all()).toEqual([])
+        stmt.close();
+    }
+    {
+        const db = await connect({ path: 'local.db', url: process.env.VITE_TURSO_DB_URL });
+        const stmt = db.prepare("SELECT * FROM turso_cdc");
+        expect(await stmt.all()).toEqual([])
+        stmt.close();
+    }
 })
 
 test('implicit connect', async () => {

@@ -513,7 +513,7 @@ mod tests {
         let db = MvccTestDbNoConn::new_with_random_db();
         let (io, pager) = {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
             // insert table id -2 into sqlite_schema table (table_id -1)
@@ -580,7 +580,7 @@ mod tests {
         let db = MvccTestDbNoConn::new_with_random_db();
         let (io, pager) = {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
 
             let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
@@ -691,7 +691,7 @@ mod tests {
         let mut db = MvccTestDbNoConn::new_with_random_db();
         let pager = {
             let conn = db.connect();
-            let pager = conn.pager.read().clone();
+            let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
 
             // insert table id -2 into sqlite_schema table (table_id -1)
