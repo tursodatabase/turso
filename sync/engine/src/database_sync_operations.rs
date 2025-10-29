@@ -597,8 +597,7 @@ pub async fn read_last_change_id<Ctx>(
     tracing::info!("read_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let mut select_last_change_id_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)
-    {
+    let mut select_last_change_id_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
         Ok(stmt) => stmt,
         Err(LimboError::ParseError(..)) => return Ok((0, None)),
         Err(err) => return Err(err.into()),
