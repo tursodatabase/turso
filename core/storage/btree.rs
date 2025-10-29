@@ -2589,6 +2589,9 @@ impl BTreeCursor {
     /// 4. Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
     #[instrument(skip(self), level = Level::DEBUG)]
     fn balance_quick(&mut self) -> Result<IOResult<()>> {
+        // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
+        let _ = self.move_to_right_state.1.take();
+
         // Allocate a new leaf page and insert the overflow cell payload in it.
         let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
             PageType::TableLeaf,
