@@ -589,6 +589,39 @@ pub async fn update_last_change_id<Ctx>(
     Ok(())
 }
 
+pub async fn read_last_change_id<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+) -> Result<(i64, Option<i64>)> {
+    tracing::info!("read_last_change_id: client_id={client_id}");
+
+    // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
+    let mut select_last_change_id_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
+        Ok(stmt) => stmt,
+        Err(LimboError::ParseError(..)) => return Ok((0, None)),
+        Err(err) => return Err(err.into()),
+    };
+
+    select_last_change_id_stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
+
+    match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt).await? {
+        Some(row) => {
+            let pull_gen = row[0].as_int().ok_or_else(|| {
+                Error::DatabaseSyncEngineError("unexpected source pull_gen type".to_string())
+            })?;
+            let change_id = row[1].as_int().ok_or_else(|| {
+                Error::DatabaseSyncEngineError("unexpected source change_id type".to_string())
+            })?;
+            Ok((pull_gen, Some(change_id)))
+        }
+        None => {
+            tracing::info!("read_last_change_id: client_id={client_id}, turso_sync_last_change_id client id is not found");
+            Ok((0, None))
+        }
+    }
+}
+
 pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
     coro: &Coro<Ctx>,
     client: &C,
@@ -598,27 +631,7 @@ pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
     tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
-    let source_pull_gen = 'source_pull_gen: {
-        let mut select_last_change_id_stmt =
-            match source_conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
-                Ok(stmt) => stmt,
-                Err(LimboError::ParseError(..)) => break 'source_pull_gen 0,
-                Err(err) => return Err(err.into()),
-            };
-
-        select_last_change_id_stmt
-            .bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
-
-        match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt).await? {
-            Some(row) => row[0].as_int().ok_or_else(|| {
-                Error::DatabaseSyncEngineError("unexpected source pull_gen type".to_string())
-            })?,
-            None => {
-                tracing::info!("fetch_last_change_id: client_id={client_id}, turso_sync_last_change_id table is not found");
-                0
-            }
-        }
-    };
+    let (source_pull_gen, _) = read_last_change_id(coro, source_conn, client_id).await?;
     tracing::info!(
         "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
@@ -676,8 +689,8 @@ pub async fn fetch_last_change_id<C: ProtocolIO, Ctx>(
         ));
     };
     tracing::debug!(
-            "fetch_last_change_id: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
-        );
+        "fetch_last_change_id: client_id={client_id}, target_pull_gen={target_pull_gen}, target_change_id={target_change_id}"
+    );
     if target_pull_gen > source_pull_gen {
         return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
     }
@@ -893,7 +906,7 @@ pub async fn push_logical_changes<C: ProtocolIO, Ctx>(
     }
     sql_over_http_requests.push(step("COMMIT".to_string(), Vec::new()));
 
-    tracing::trace!("hrana request: {:?}", sql_over_http_requests);
+    tracing::debug!("hrana request: {:?}", sql_over_http_requests);
     let replay_hrana_request = server_proto::PipelineReqBody {
         baton: None,
         requests: vec![StreamRequest::Batch(BatchStreamReq {

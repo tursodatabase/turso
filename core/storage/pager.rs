@@ -1528,7 +1528,7 @@ impl Pager {
         allow_empty_read: bool,
     ) -> Result<(PageRef, Completion)> {
         assert!(page_idx >= 0);
-        tracing::trace!("read_page_no_cache(page_idx = {})", page_idx);
+        tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -1565,11 +1565,11 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
-        tracing::trace!("read_page(page_idx = {})", page_idx);
+        tracing::debug!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx as usize);
         if let Some(page) = page_cache.get(&page_key)? {
-            tracing::trace!("read_page(page_idx = {}) = cached", page_idx);
+            tracing::debug!("read_page(page_idx = {}) = cached", page_idx);
             turso_assert!(
                 page_idx as usize == page.get().id,
                 "attempted to read page {page_idx} but got page {}",
