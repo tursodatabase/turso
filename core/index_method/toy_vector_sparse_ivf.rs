@@ -143,44 +143,144 @@ impl Ord for FloatOrd {
 }
 
 #[derive(Debug)]
+struct ComponentStat {
+    position: u32,
+    cnt: i64,
+    min: f64,
+    max: f64,
+}
+
+fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
+    let Some(record) = record else {
+        return Err(LimboError::Corrupt(format!(
+            "stats index corrupted: expected row"
+        )));
+    };
+    let ValueRef::Integer(position) = record.get_value(0)? else {
+        return Err(LimboError::Corrupt(format!(
+            "stats index corrupted: expected integer"
+        )));
+    };
+    let ValueRef::Integer(cnt) = record.get_value(1)? else {
+        return Err(LimboError::Corrupt(format!(
+            "stats index corrupted: expected integer"
+        )));
+    };
+    let ValueRef::Float(min) = record.get_value(2)? else {
+        return Err(LimboError::Corrupt(format!(
+            "stats index corrupted: expected float"
+        )));
+    };
+    let ValueRef::Float(max) = record.get_value(3)? else {
+        return Err(LimboError::Corrupt(format!(
+            "stats index corrupted: expected float"
+        )));
+    };
+    Ok(ComponentStat {
+        position: position as u32,
+        cnt,
+        min,
+        max,
+    })
+}
+#[derive(Debug)]
+struct ComponentRow {
+    position: u32,
+    sum: f64,
+    rowid: i64,
+}
+
+fn parse_scratch_row(record: Option<&ImmutableRecord>) -> Result<ComponentRow> {
+    let Some(record) = record else {
+        return Err(LimboError::Corrupt(format!(
+            "scratch index corrupted: expected row"
+        )));
+    };
+    let ValueRef::Integer(position) = record.get_value(0)? else {
+        return Err(LimboError::Corrupt(format!(
+            "scratch index corrupted: expected integer"
+        )));
+    };
+    let ValueRef::Float(sum) = record.get_value(1)? else {
+        return Err(LimboError::Corrupt(format!(
+            "scratch index corrupted: expected float"
+        )));
+    };
+    let ValueRef::Integer(rowid) = record.get_value(2)? else {
+        return Err(LimboError::Corrupt(format!(
+            "scratch index corrupted: expected integer"
+        )));
+    };
+    Ok(ComponentRow {
+        position: position as u32,
+        sum,
+        rowid,
+    })
+}
+
+#[derive(Debug)]
 enum VectorSparseInvertedIndexSearchState {
     Init,
-    Prepare {
-        collected: Option<HashSet<i64>>,
-        positions: Option<Vec<u32>>,
-        idx: usize,
+    CollectComponentsSeek {
+        sum: f64,
+        positions: Option<VecDeque<u32>>,
+        components: Option<Vec<ComponentStat>>,
+        limit: i64,
+        key: Option<ImmutableRecord>,
+    },
+    CollectComponentsRead {
+        sum: f64,
+        positions: Option<VecDeque<u32>>,
+        components: Option<Vec<ComponentStat>>,
         limit: i64,
     },
     Seek {
+        sum: f64,
+        components: Option<VecDeque<ComponentStat>>,
         collected: Option<HashSet<i64>>,
-        positions: Option<Vec<u32>>,
-        key: Option<ImmutableRecord>,
-        idx: usize,
+        distances: Option<BTreeSet<(FloatOrd, i64)>>,
         limit: i64,
+        key: Option<ImmutableRecord>,
+        sum_threshold: Option<f64>,
+        component: Option<u32>,
     },
     Read {
+        sum: f64,
+        components: Option<VecDeque<ComponentStat>>,
         collected: Option<HashSet<i64>>,
-        positions: Option<Vec<u32>>,
-        key: Option<ImmutableRecord>,
-        idx: usize,
+        distances: Option<BTreeSet<(FloatOrd, i64)>>,
         limit: i64,
+        sum_threshold: Option<f64>,
+        component: u32,
+        current: Option<Vec<i64>>,
     },
     Next {
+        sum: f64,
+        components: Option<VecDeque<ComponentStat>>,
         collected: Option<HashSet<i64>>,
-        positions: Option<Vec<u32>>,
-        key: Option<ImmutableRecord>,
-        idx: usize,
+        distances: Option<BTreeSet<(FloatOrd, i64)>>,
         limit: i64,
+        sum_threshold: Option<f64>,
+        component: u32,
+        current: Option<Vec<i64>>,
     },
     EvaluateSeek {
-        rowids: Option<Vec<i64>>,
+        sum: f64,
+        components: Option<VecDeque<ComponentStat>>,
+        collected: Option<HashSet<i64>>,
         distances: Option<BTreeSet<(FloatOrd, i64)>>,
         limit: i64,
+        current: Option<VecDeque<i64>>,
+        rowid: Option<i64>,
     },
     EvaluateRead {
-        rowids: Option<Vec<i64>>,
+        sum: f64,
+        components: Option<VecDeque<ComponentStat>>,
+        collected: Option<HashSet<i64>>,
         distances: Option<BTreeSet<(FloatOrd, i64)>>,
         limit: i64,
+        current: Option<VecDeque<i64>>,
+        rowid: i64,
     },
 }
 
@@ -240,7 +340,7 @@ impl VectorSparseInvertedIndexMethodCursor {
         let stats_btree = format!("{}_stats", configuration.index_name);
         let delta = match configuration.parameters.get("delta") {
             Some(&Value::Float(delta)) => delta,
-            None => 0.0,
+            _ => 0.0,
         };
         Self {
             configuration,
@@ -322,8 +422,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             connection,
             &self.configuration.table_name,
             &self.stats_btree,
-            // component, count, non-zero-min, non-zero-max
-            vec![key_info(), key_info(), key_info(), key_info()],
+            // component
+            vec![key_info()],
         )?);
         self.main_btree = Some(open_table_cursor(
             connection,
@@ -513,38 +613,24 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let record = return_if_io!(stats_cursor.record()).unwrap();
-                    let ValueRef::Integer(cnt) = record.get_value(1)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected integer"
-                        )));
-                    };
-                    let ValueRef::Float(min) = record.get_value(2)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected float"
-                        )));
-                    };
-                    let ValueRef::Float(max) = record.get_value(3)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected float"
-                        )));
-                    };
+                    let record = return_if_io!(stats_cursor.record());
+                    let component = parse_stat_row(record.as_deref())?;
                     let v = vector.as_ref().unwrap();
                     let position = v.as_f32_sparse().idx[*idx];
                     let value = v.as_f32_sparse().values[*idx] as f64;
                     tracing::debug!(
                         "update stats(insert): {} (cnt={}, min={}, max={})",
                         position,
-                        cnt + 1,
-                        value.min(min),
-                        value.max(max),
+                        component.cnt + 1,
+                        value.min(component.min),
+                        value.max(component.max),
                     );
                     let key = ImmutableRecord::from_values(
                         &[
                             Value::Integer(position as i64),
-                            Value::Integer(cnt + 1),
-                            Value::Float(value.min(min)),
-                            Value::Float(value.max(max)),
+                            Value::Integer(component.cnt + 1),
+                            Value::Float(value.min(component.min)),
+                            Value::Float(value.max(component.max)),
                         ],
                         4,
                     );
@@ -716,37 +802,23 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let record = return_if_io!(stats_cursor.record()).unwrap();
-                    let ValueRef::Integer(cnt) = record.get_value(1)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected integer"
-                        )));
-                    };
-                    let ValueRef::Float(min) = record.get_value(2)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected float"
-                        )));
-                    };
-                    let ValueRef::Float(max) = record.get_value(3)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "stats index corrupted: expected float"
-                        )));
-                    };
+                    let record = return_if_io!(stats_cursor.record());
+                    let component = parse_stat_row(record.as_deref())?;
                     let v = vector.as_ref().unwrap();
                     let position = v.as_f32_sparse().idx[*idx];
                     tracing::debug!(
                         "update stats(delete): {} (cnt={}, min={}, max={})",
                         position,
-                        cnt - 1,
-                        min,
-                        max,
+                        component.cnt - 1,
+                        component.min,
+                        component.max,
                     );
                     let key = ImmutableRecord::from_values(
                         &[
                             Value::Integer(position as i64),
-                            Value::Integer(cnt - 1),
-                            Value::Float(min),
-                            Value::Float(max),
+                            Value::Integer(component.cnt - 1),
+                            Value::Float(component.min),
+                            Value::Float(component.max),
                         ],
                         4,
                     );
@@ -785,6 +857,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 "cursor must be opened".to_string(),
             ));
         };
+        let Some(stats) = &mut self.stats_cursor else {
+            return Err(LimboError::InternalError(
+                "cursor must be opened".to_string(),
+            ));
+        };
         let Some(main) = &mut self.main_btree else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
@@ -811,52 +888,139 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     }
                     let sparse = vector.as_f32_sparse();
-                    self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
-                        collected: Some(HashSet::new()),
-                        positions: Some(sparse.idx.to_vec()),
-                        idx: 0,
-                        limit,
-                    };
+                    let sum = sparse.values.iter().sum::<f32>() as f64;
+                    self.search_state =
+                        VectorSparseInvertedIndexSearchState::CollectComponentsSeek {
+                            sum,
+                            positions: Some(sparse.idx.to_vec().into()),
+                            components: Some(Vec::new()),
+                            key: None,
+                            limit,
+                        };
                 }
-                VectorSparseInvertedIndexSearchState::Prepare {
-                    collected,
+                VectorSparseInvertedIndexSearchState::CollectComponentsSeek {
+                    sum,
                     positions,
-                    idx,
+                    components,
                     limit,
+                    key,
                 } => {
                     let p = positions.as_ref().unwrap();
-                    if *idx == p.len() {
-                        let mut rowids = collected
-                            .take()
-                            .unwrap()
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        rowids.sort();
-                        self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
-                            rowids: Some(rowids),
+                    if p.len() == 0 && key.is_none() {
+                        let mut components = components.take().unwrap();
+                        // order by cnt ASC in order to check low-cardinality components first
+                        components.sort_by_key(|c| c.cnt);
+
+                        tracing::debug!(
+                            "query_start: components: {:?}, delta: {}",
+                            components,
+                            self.delta
+                        );
+                        self.search_state = VectorSparseInvertedIndexSearchState::Seek {
+                            sum: *sum,
+                            components: Some(components.into()),
+                            collected: Some(HashSet::new()),
                             distances: Some(BTreeSet::new()),
                             limit: *limit,
+                            key: None,
+                            component: None,
+                            sum_threshold: None,
                         };
                         continue;
                     }
-                    let position = p[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
-                    self.search_state = VectorSparseInvertedIndexSearchState::Seek {
-                        collected: collected.take(),
-                        positions: positions.take(),
-                        key: Some(key),
-                        idx: *idx,
-                        limit: *limit,
-                    };
+                    if key.is_none() {
+                        let position = positions.as_mut().unwrap().pop_front().unwrap();
+                        *key = Some(ImmutableRecord::from_values(
+                            &[Value::Integer(position as i64)],
+                            1,
+                        ));
+                    }
+                    let k = key.as_ref().unwrap();
+                    let result = return_if_io!(
+                        stats.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
+                    );
+                    match result {
+                        SeekResult::Found => {
+                            self.search_state =
+                                VectorSparseInvertedIndexSearchState::CollectComponentsRead {
+                                    sum: *sum,
+                                    positions: positions.take(),
+                                    components: components.take(),
+                                    limit: *limit,
+                                };
+                        }
+                        SeekResult::NotFound | SeekResult::TryAdvance => {
+                            self.search_state =
+                                VectorSparseInvertedIndexSearchState::CollectComponentsSeek {
+                                    sum: *sum,
+                                    components: components.take(),
+                                    positions: positions.take(),
+                                    limit: *limit,
+                                    key: None,
+                                };
+                        }
+                    }
                 }
-                VectorSparseInvertedIndexSearchState::Seek {
-                    collected,
+                VectorSparseInvertedIndexSearchState::CollectComponentsRead {
+                    sum,
                     positions,
-                    key,
-                    idx,
+                    components,
                     limit,
                 } => {
+                    let record = return_if_io!(stats.record());
+                    let component = parse_stat_row(record.as_deref())?;
+                    components.as_mut().unwrap().push(component);
+                    self.search_state =
+                        VectorSparseInvertedIndexSearchState::CollectComponentsSeek {
+                            sum: *sum,
+                            components: components.take(),
+                            positions: positions.take(),
+                            limit: *limit,
+                            key: None,
+                        };
+                }
+                VectorSparseInvertedIndexSearchState::Seek {
+                    sum,
+                    components,
+                    collected,
+                    distances,
+                    limit,
+                    key,
+                    component,
+                    sum_threshold,
+                } => {
+                    let c = components.as_ref().unwrap();
+                    if c.len() == 0 && key.is_none() {
+                        let distances = distances.take().unwrap();
+                        self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
+                        return Ok(IOResult::Done(!self.search_result.is_empty()));
+                    }
+                    if key.is_none() {
+                        let remained_sum = c.iter().map(|c| c.max).sum::<f64>();
+                        if distances.as_ref().unwrap().len() >= *limit as usize {
+                            if let Some((max_threshold, _)) = distances.as_ref().unwrap().last() {
+                                let max_threshold = (1.0 - max_threshold.0) + self.delta;
+                                if max_threshold > 0.0 {
+                                    *sum_threshold =
+                                        Some(remained_sum / max_threshold + remained_sum - *sum);
+                                    tracing::info!(
+                                    "sum_threshold={:?}, max_threshold={}, remained_sum={}, sum={}, components={:?}",
+                                    sum_threshold,
+                                    max_threshold,
+                                    remained_sum,
+                                    sum,
+                                    c
+                                );
+                                }
+                            }
+                        }
+                        let c = components.as_mut().unwrap().pop_front().unwrap();
+                        *key = Some(ImmutableRecord::from_values(
+                            &[Value::Integer(c.position as i64)],
+                            1,
+                        ));
+                        *component = Some(c.position);
+                    }
                     let k = key.as_ref().unwrap();
                     let result = return_if_io!(
                         scratch.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
@@ -864,101 +1028,141 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     match result {
                         SeekResult::Found => {
                             self.search_state = VectorSparseInvertedIndexSearchState::Read {
+                                sum: *sum,
+                                components: components.take(),
                                 collected: collected.take(),
-                                positions: positions.take(),
-                                key: key.take(),
-                                idx: *idx,
+                                distances: distances.take(),
+                                current: Some(Vec::new()),
                                 limit: *limit,
+                                sum_threshold: sum_threshold.take(),
+                                component: component.unwrap(),
                             };
                         }
                         SeekResult::TryAdvance | SeekResult::NotFound => {
                             self.search_state = VectorSparseInvertedIndexSearchState::Next {
+                                sum: *sum,
+                                components: components.take(),
                                 collected: collected.take(),
-                                positions: positions.take(),
-                                key: key.take(),
-                                idx: *idx,
+                                distances: distances.take(),
+                                current: Some(Vec::new()),
                                 limit: *limit,
+                                sum_threshold: sum_threshold.take(),
+                                component: component.unwrap(),
                             };
                         }
                     }
                 }
                 VectorSparseInvertedIndexSearchState::Read {
+                    sum,
+                    components,
                     collected,
-                    positions,
-                    key,
-                    idx,
+                    distances,
                     limit,
+                    sum_threshold,
+                    component,
+                    current,
                 } => {
                     let record = return_if_io!(scratch.record());
-                    if let Some(record) = record {
-                        let ValueRef::Integer(position) = record.get_value(0)? else {
-                            return Err(LimboError::InternalError(
-                                "first value of index record must be int".to_string(),
-                            ));
+                    let row = parse_scratch_row(record.as_deref())?;
+                    if row.position != *component
+                        || (sum_threshold.is_some() && row.sum > sum_threshold.unwrap())
+                    {
+                        let mut current = current.take().unwrap();
+                        current.sort();
+
+                        self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
+                            sum: *sum,
+                            components: components.take(),
+                            collected: collected.take(),
+                            distances: distances.take(),
+                            limit: *limit,
+                            current: Some(current.into()),
+                            rowid: None,
                         };
-                        let ValueRef::Integer(rowid) = record.get_value(1)? else {
-                            return Err(LimboError::InternalError(
-                                "second value of index record must be int".to_string(),
-                            ));
-                        };
-                        tracing::debug!("position/rowid: {}/{}", position, rowid);
-                        if position == positions.as_ref().unwrap()[*idx] as i64 {
-                            collected.as_mut().unwrap().insert(rowid);
-                            self.search_state = VectorSparseInvertedIndexSearchState::Next {
-                                collected: collected.take(),
-                                positions: positions.take(),
-                                key: key.take(),
-                                idx: *idx,
-                                limit: *limit,
-                            };
-                            continue;
-                        }
+                        continue;
                     }
-                    self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
+                    if collected.as_mut().unwrap().insert(row.rowid) {
+                        current.as_mut().unwrap().push(row.rowid);
+                    }
+
+                    self.search_state = VectorSparseInvertedIndexSearchState::Next {
+                        sum: *sum,
+                        components: components.take(),
                         collected: collected.take(),
-                        positions: positions.take(),
-                        idx: *idx + 1,
+                        distances: distances.take(),
                         limit: *limit,
+                        sum_threshold: *sum_threshold,
+                        component: *component,
+                        current: current.take(),
                     };
                 }
                 VectorSparseInvertedIndexSearchState::Next {
+                    sum,
+                    components,
                     collected,
-                    positions,
-                    key,
-                    idx,
+                    distances,
                     limit,
+                    sum_threshold,
+                    component,
+                    current,
                 } => {
                     let result = return_if_io!(scratch.next());
                     if !result {
-                        self.search_state = VectorSparseInvertedIndexSearchState::Prepare {
+                        let mut current = current.take().unwrap();
+                        current.sort();
+
+                        self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
+                            sum: *sum,
+                            components: components.take(),
                             collected: collected.take(),
-                            positions: positions.take(),
-                            idx: *idx + 1,
+                            distances: distances.take(),
                             limit: *limit,
+                            current: Some(current.into()),
+                            rowid: None,
                         };
                     } else {
                         self.search_state = VectorSparseInvertedIndexSearchState::Read {
+                            sum: *sum,
+                            components: components.take(),
                             collected: collected.take(),
-                            positions: positions.take(),
-                            key: key.take(),
-                            idx: *idx,
+                            distances: distances.take(),
                             limit: *limit,
+                            sum_threshold: *sum_threshold,
+                            component: *component,
+                            current: current.take(),
                         };
                     }
                 }
                 VectorSparseInvertedIndexSearchState::EvaluateSeek {
-                    rowids,
+                    sum,
+                    components,
+                    collected,
                     distances,
                     limit,
+                    current,
+                    rowid,
                 } => {
-                    let Some(rowid) = rowids.as_ref().unwrap().last() else {
-                        let distances = distances.take().unwrap();
-                        self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
-                        return Ok(IOResult::Done(!self.search_result.is_empty()));
-                    };
-                    let result = return_if_io!(
-                        main.seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true })
-                    );
+                    let c = current.as_ref().unwrap();
+                    if c.len() == 0 && rowid.is_none() {
+                        self.search_state = VectorSparseInvertedIndexSearchState::Seek {
+                            sum: *sum,
+                            components: components.take(),
+                            collected: collected.take(),
+                            distances: distances.take(),
+                            limit: *limit,
+                            component: None,
+                            key: None,
+                            sum_threshold: None,
+                        };
+                        continue;
+                    }
+                    if rowid.is_none() {
+                        *rowid = Some(current.as_mut().unwrap().pop_front().unwrap());
+                    }
+
+                    let rowid = rowid.as_ref().unwrap().clone();
+                    let k = SeekKey::TableRowId(rowid);
+                    let result = return_if_io!(main.seek(k, SeekOp::GE { eq_only: true }));
                     if !matches!(result, SeekResult::Found) {
                         return Err(LimboError::Corrupt(
                             "vector_sparse_ivf corrupted: unable to find rowid in main table"
@@ -966,18 +1170,25 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     self.search_state = VectorSparseInvertedIndexSearchState::EvaluateRead {
-                        rowids: rowids.take(),
+                        sum: *sum,
+                        components: components.take(),
+                        collected: collected.take(),
                         distances: distances.take(),
                         limit: *limit,
+                        current: current.take(),
+                        rowid,
                     };
                 }
                 VectorSparseInvertedIndexSearchState::EvaluateRead {
-                    rowids,
+                    sum,
+                    components,
+                    collected,
                     distances,
                     limit,
+                    current,
+                    rowid,
                 } => {
                     let record = return_if_io!(main.record());
-                    let rowid = rowids.as_mut().unwrap().pop().unwrap();
                     if let Some(record) = record {
                         let column_idx = self.configuration.columns[0].pos_in_table;
                         let ValueRef::Blob(data) = record.get_value(column_idx)? else {
@@ -1009,16 +1220,20 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         );
                         let distance = operations::jaccard::vector_distance_jaccard(&data, &arg)?;
                         let distances = distances.as_mut().unwrap();
-                        distances.insert((FloatOrd(distance), rowid));
+                        distances.insert((FloatOrd(distance), *rowid));
                         if distances.len() > *limit as usize {
                             let _ = distances.pop_last();
                         }
                     }
 
                     self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
-                        rowids: rowids.take(),
+                        sum: *sum,
+                        components: components.take(),
+                        collected: collected.take(),
                         distances: distances.take(),
                         limit: *limit,
+                        current: current.take(),
+                        rowid: None,
                     };
                 }
             }
