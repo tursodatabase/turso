@@ -68,6 +68,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
+        println!("new MvccLazyCursor for table_id: {:?}", table_id);
         Ok(Self {
             db,
             tx_id,
@@ -82,31 +83,58 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         })
     }
 
-    pub fn current_row(&self) -> Result<Option<Row>> {
+    /// Returns the current row as an immutable record.
+    pub fn current_row(
+        &self,
+    ) -> Result<IOResult<Option<std::cell::Ref<'_, crate::types::ImmutableRecord>>>> {
         match *self.current_pos.borrow() {
             CursorPosition::Loaded {
-                row_id,
-                in_btree: _,
+                row_id: _,
+                in_btree,
                 btree_consumed: _,
-            } => self.db.read(self.tx_id, row_id),
-            CursorPosition::BeforeFirst => {
-                // If we are before first, we need to try and find the first row.
-                let maybe_rowid =
-                    self.db
-                        .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id);
-                if let Some(id) = maybe_rowid {
-                    self.current_pos.replace(CursorPosition::Loaded {
-                        row_id: id,
-                        in_btree: false,
-                        btree_consumed: false,
-                    });
-                    self.db.read(self.tx_id, id)
+            } => {
+                if in_btree {
+                    let IOResult::Done(Some(record)) = self.btree_cursor.record()? else {
+                        panic!("BTree should have returned record");
+                    };
+                    Ok(IOResult::Done(Some(record)))
                 } else {
-                    Ok(None)
+                    let Some(row) = self.read_mvcc_current_row()? else {
+                        return Ok(IOResult::Done(None));
+                    };
+                    {
+                        let mut record = self.get_immutable_record_or_create();
+                        let record = record.as_mut().unwrap();
+                        record.invalidate();
+                        record.start_serialization(&row.data);
+                    }
+
+                    let record_ref =
+                        Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| {
+                            opt.as_ref()
+                        })
+                        .unwrap();
+                    Ok(IOResult::Done(Some(record_ref)))
                 }
             }
-            CursorPosition::End => Ok(None),
+            CursorPosition::BeforeFirst => {
+                // Before first is not a valid position, so we return none.
+                Ok(IOResult::Done(None))
+            }
+            CursorPosition::End => Ok(IOResult::Done(None)),
         }
+    }
+
+    pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
+        let row_id = match *self.current_pos.borrow() {
+            CursorPosition::Loaded {
+                row_id,
+                in_btree,
+                btree_consumed: _,
+            } if !in_btree => row_id,
+            _ => panic!("invalid position to read current mvcc row"),
+        };
+        self.db.read(self.tx_id, row_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -191,6 +219,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         };
         new_position
     }
+
+    /// If page id is negative, it means the btree is not allocated.
+    fn is_btree_allocated(&self) -> bool {
+        self.table_id.is_btree_allocated()
+    }
 }
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
@@ -274,10 +307,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             CursorPosition::End => false,
         };
 
-        let found = if btree_consumed {
-            return_if_io!(self.btree_cursor.next())
+        let found = if self.is_btree_allocated() {
+            // If we have a functional btree, let's either find next value, or use the one pointed at by the cursor.
+            if btree_consumed {
+                return_if_io!(self.btree_cursor.next())
+            } else {
+                true
+            }
         } else {
-            true
+            // If we don't have a functional btree, we can't find next value, so we return false.
+            false
         };
         // get current rowid in mvcc and in btree
         // compare both and set loaded to position of the one that is lesser
@@ -298,8 +337,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         } else {
             None
         };
+        println!(
+            "new_position_in_mvcc: {:?}, current_rowid_in_btree: {:?}",
+            new_position_in_mvcc, current_rowid_in_btree
+        );
         let new_position = self
             .get_new_position_from_mvcc_and_btree(&new_position_in_mvcc, &current_rowid_in_btree);
+        println!("next new_position: {:?}", new_position);
         self.current_pos.replace(new_position);
         self.invalidate_record();
         self.state.replace(None);
@@ -346,20 +390,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn record(
         &self,
     ) -> Result<IOResult<Option<std::cell::Ref<'_, crate::types::ImmutableRecord>>>> {
-        let Some(row) = self.current_row()? else {
-            return Ok(IOResult::Done(None));
-        };
-
-        {
-            let mut record = self.get_immutable_record_or_create();
-            let record = record.as_mut().unwrap();
-            record.invalidate();
-            record.start_serialization(&row.data);
-        }
-
-        let record_ref =
-            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref()).unwrap();
-        Ok(IOResult::Done(Some(record_ref)))
+        self.current_row()
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
@@ -523,7 +554,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
         // First run btree_cursor rewind so that we don't need a explicit state machine.
-        return_if_io!(self.btree_cursor.rewind());
+        if self.is_btree_allocated() {
+            return_if_io!(self.btree_cursor.rewind());
+        }
 
         self.invalidate_record();
         if !matches!(self.get_current_pos(), CursorPosition::BeforeFirst) {
@@ -540,6 +573,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         };
         let new_position =
             self.get_new_position_from_mvcc_and_btree(&new_position_in_mvcc, &maybe_rowid_in_btree);
+        println!("rewind new_position: {:?}", new_position);
         self.current_pos.replace(new_position);
         Ok(IOResult::Done(()))
     }
