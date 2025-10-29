@@ -1200,7 +1200,7 @@ fn emit_update_insns(
                 continue;
             }
             if has_user_provided_rowid
-                && (table_column.primary_key || table_column.is_rowid_alias)
+                && (table_column.is_primary_key() || table_column.is_rowid_alias)
                 && !is_virtual
             {
                 let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();

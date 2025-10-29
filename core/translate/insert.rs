@@ -29,7 +29,7 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{Column, Schema},
+    schema::{Column, ColumnFlags, Schema},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -1236,7 +1236,7 @@ pub const ROWID_COLUMN: &Column = &Column {
     name: None,
     ty: schema::Type::Integer,
     ty_str: String::new(),
-    primary_key: true,
+    flags: ColumnFlags::PRIMARY_KEY,
     is_rowid_alias: true,
     notnull: true,
     default: None,
@@ -1599,7 +1599,7 @@ fn translate_column(
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
-        let nullable = !column.notnull && !column.primary_key && !column.unique;
+        let nullable = !column.notnull && !column.is_primary_key() && !column.unique;
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",

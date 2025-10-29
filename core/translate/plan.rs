@@ -3,7 +3,7 @@ use turso_parser::ast::{self, FrameBound, FrameClause, FrameExclude, FrameMode, 
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{BTreeTable, Column, ColumnFlags, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::get_collseq_from_expr, emitter::UpdateRowSource,
         optimizer::constraints::SeekRangeConstraint,
@@ -857,8 +857,8 @@ impl JoinedTable {
                 name: rc.name(&plan.table_references).map(String::from),
                 ty: Type::Blob, // FIXME: infer proper type
                 ty_str: "BLOB".to_string(),
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
-                primary_key: false,
                 notnull: false,
                 default: None,
                 unique: false,

@@ -1894,7 +1894,7 @@ pub fn op_type_check(
         .zip(table_reference.columns.iter())
         .try_for_each(|(reg, col)| {
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias && col.primary_key && matches!(reg.get_value(), Value::Null) {
+            if !col.is_rowid_alias && col.is_primary_key() && matches!(reg.get_value(), Value::Null) {
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
                     &table_reference.name,

@@ -5,6 +5,7 @@ use crate::ext::VTabImpl;
 use crate::schema::create_table;
 use crate::schema::BTreeTable;
 use crate::schema::Column;
+use crate::schema::ColumnFlags;
 use crate::schema::Table;
 use crate::schema::Type;
 use crate::schema::RESERVED_TABLE_PREFIXES;
@@ -435,7 +436,7 @@ fn collect_autoindexes(
         };
 
         let needs_index = if us.is_primary_key {
-            !(col.primary_key && col.is_rowid_alias)
+            !(col.is_primary_key() && col.is_rowid_alias)
         } else {
             // UNIQUE single needs an index
             true
@@ -845,7 +846,7 @@ pub fn translate_drop_table(
                 name: Some("rowid".to_string()),
                 ty: Type::Integer,
                 ty_str: "INTEGER".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,

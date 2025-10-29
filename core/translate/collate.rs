@@ -144,7 +144,7 @@ mod tests {
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeTable, Column, Table, Type},
+        schema::{BTreeTable, Column, ColumnFlags, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
     };
 
@@ -364,7 +364,7 @@ mod tests {
                     name: Some("foo".to_string()),
                     ty: Type::Text,
                     ty_str: "text".to_string(),
-                    primary_key: false,
+                    flags: ColumnFlags::empty(),
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
@@ -407,7 +407,7 @@ mod tests {
                     name: Some("a".to_string()),
                     ty: Type::Text,
                     ty_str: "text".to_string(),
-                    primary_key: false,
+                    flags: ColumnFlags::empty(),
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
@@ -441,7 +441,7 @@ mod tests {
                     name: Some("b".to_string()),
                     ty: Type::Text,
                     ty_str: "text".to_string(),
-                    primary_key: false,
+                    flags: ColumnFlags::empty(),
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
@@ -482,7 +482,7 @@ mod tests {
                     name: Some("id".to_string()),
                     ty: Type::Integer,
                     ty_str: "INTEGER".to_string(),
-                    primary_key: true,
+                    flags: ColumnFlags::PRIMARY_KEY,
                     is_rowid_alias: true,
                     notnull: false,
                     default: None,

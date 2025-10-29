@@ -746,7 +746,7 @@ fn emit_columns_for_table_info(
         }
 
         // pk
-        program.emit_bool(column.primary_key, base_reg + 5);
+        program.emit_bool(column.is_primary_key(), base_reg + 5);
 
         program.emit_result_row(base_reg, 6);
     }

@@ -110,7 +110,7 @@ pub fn translate_alter_table(
             // The column is used in the expression of a generated column.
             // The column appears in a trigger or view.
 
-            if column.primary_key {
+            if column.is_primary_key() {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
                 )));
