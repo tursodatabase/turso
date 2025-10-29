@@ -996,21 +996,40 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         return Ok(IOResult::Done(!self.search_result.is_empty()));
                     }
                     if key.is_none() {
-                        let remained_sum = c.iter().map(|c| c.max).sum::<f64>();
+                        // we estimate jaccard distance with the following approach:
+                        // J = min(L, M1 + M2 + ... + Mr) / (Q + N - min(L, M1 + M2 + ... + Mr))
+                        // so we want J > best + delta; define M1 + M2 + ... + Mr = M
+                        // J = min(L, M) / (Q + L - min(L, M)) > best + delta
+                        // we need to consider two cases:
+                        // 1. L < M: J = L / (Q + L - L) > best + delta => L > (best + delta) * Q
+                        // 2. L > M: J = M / (Q + L - M) > best + delta => M > (best + delta) * (Q + L - M) => L < M / (best + delta) - (Q - M)
+                        // so we have two intervals: [(best + delta) * Q .. M] and [M .. M / (best + delta) - (Q - M)]
+                        // to simplify code for now we will pick upper bound from second range if it is not degenerate, otherwise check first range
+                        let m = c.iter().map(|c| c.max).sum::<f64>().min(*sum);
                         if distances.as_ref().unwrap().len() >= *limit as usize {
                             if let Some((max_threshold, _)) = distances.as_ref().unwrap().last() {
-                                let max_threshold = (1.0 - max_threshold.0) + self.delta;
-                                if max_threshold > 0.0 {
-                                    *sum_threshold =
-                                        Some(remained_sum / max_threshold + remained_sum - *sum);
+                                let best = 1.0 - max_threshold.0;
+                                let delta = self.delta;
+                                let q = *sum;
+
+                                if best > 0.0 {
+                                    let first_range_l = (best + delta) * q;
+                                    let second_range_r = m / (best + delta) - (q - m);
+                                    if m <= second_range_r {
+                                        *sum_threshold = Some(second_range_r);
+                                    } else if first_range_l <= m {
+                                        *sum_threshold = Some(m);
+                                    } else {
+                                        *sum_threshold = Some(-1.0);
+                                    }
                                     tracing::info!(
-                                    "sum_threshold={:?}, max_threshold={}, remained_sum={}, sum={}, components={:?}",
-                                    sum_threshold,
-                                    max_threshold,
-                                    remained_sum,
-                                    sum,
-                                    c
-                                );
+                                        "sum_threshold={:?}, max_threshold={}, remained_sum={}, sum={}, components={:?}",
+                                        sum_threshold,
+                                        best,
+                                        m,
+                                        sum,
+                                        c
+                                    );
                                 }
                             }
                         }
