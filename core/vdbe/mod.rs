@@ -270,7 +270,7 @@ pub enum TxnCleanup {
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
-    cursors: Vec<Option<Cursor>>,
+    pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
@@ -417,10 +417,14 @@ impl ProgramState {
             self.cursors.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
         }
-        if let Some(max_resgisters) = max_registers {
+        if let Some(max_registers) = max_registers {
             self.registers
-                .resize_with(max_resgisters, || Register::Value(Value::Null));
+                .resize_with(max_registers, || Register::Value(Value::Null));
         }
+        // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursors.iter_mut().for_each(|c| {
+            let _ = c.take();
+        });
         self.registers
             .iter_mut()
             .for_each(|r| *r = Register::Value(Value::Null));
