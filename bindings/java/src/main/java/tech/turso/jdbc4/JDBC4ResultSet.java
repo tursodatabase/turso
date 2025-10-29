@@ -1,5 +1,6 @@
 package tech.turso.jdbc4;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.Reader;
 import java.io.StringReader;
@@ -32,6 +33,7 @@ import tech.turso.core.TursoResultSet;
 public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   private final TursoResultSet resultSet;
+  private boolean wasNull = false;
 
   /**
    * Creates a new JDBC4ResultSet.
@@ -54,13 +56,14 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public boolean wasNull() throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return wasNull;
   }
 
   @Override
   @Nullable
   public String getString(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -70,6 +73,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public boolean getBoolean(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return false;
     }
@@ -79,6 +83,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public byte getByte(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -88,6 +93,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public short getShort(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -97,6 +103,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public int getInt(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -106,6 +113,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public long getLong(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -115,6 +123,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public float getFloat(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -124,6 +133,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public double getDouble(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return 0;
     }
@@ -135,6 +145,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public BigDecimal getBigDecimal(int columnIndex, int scale) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -147,6 +158,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public byte[] getBytes(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -157,6 +169,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public Date getDate(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -177,6 +190,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Time getTime(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -197,6 +211,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Timestamp getTimestamp(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -216,81 +231,116 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public InputStream getAsciiStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof String) {
+            return new ByteArrayInputStream(((String) result).getBytes("US-ASCII"));
+          } else if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to ASCII stream: " + result.getClass());
+        });
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getUnicodeStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof String) {
+            return new ByteArrayInputStream(((String) result).getBytes("UTF-8"));
+          } else if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to Unicode stream: " + result.getClass());
+        });
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getBinaryStream(int columnIndex) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    if (result == null) {
+      return null;
+    }
+    return wrapTypeConversion(
+        () -> {
+          if (result instanceof byte[]) {
+            return new ByteArrayInputStream((byte[]) result);
+          }
+          throw new SQLException("Cannot convert to binary stream: " + result.getClass());
+        });
   }
 
   @Override
+  @Nullable
   public String getString(String columnLabel) throws SQLException {
-    final Object result = this.resultSet.get(columnLabel);
-    if (result == null) {
-      return "";
-    }
-
-    return wrapTypeConversion(() -> (String) result);
+    return getString(findColumn(columnLabel));
   }
 
   @Override
   public boolean getBoolean(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBoolean(findColumn(columnLabel));
   }
 
   @Override
   public byte getByte(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getByte(findColumn(columnLabel));
   }
 
   @Override
   public short getShort(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getShort(findColumn(columnLabel));
   }
 
   @Override
   public int getInt(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getInt(findColumn(columnLabel));
   }
 
   @Override
   public long getLong(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getLong(findColumn(columnLabel));
   }
 
   @Override
   public float getFloat(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getFloat(findColumn(columnLabel));
   }
 
   @Override
   public double getDouble(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getDouble(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public BigDecimal getBigDecimal(String columnLabel, int scale) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBigDecimal(findColumn(columnLabel), scale);
   }
 
   @Override
+  @Nullable
   public byte[] getBytes(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBytes(findColumn(columnLabel));
   }
 
   @Override
   @Nullable
   public Date getDate(String columnLabel) throws SQLException {
     final Object result = resultSet.get(columnLabel);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -314,7 +364,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public Time getTime(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getTime(findColumn(columnLabel));
   }
 
   @Override
@@ -326,19 +376,19 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   @SkipNullableCheck
   public InputStream getAsciiStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getAsciiStream(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getUnicodeStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getUnicodeStream(findColumn(columnLabel));
   }
 
   @Override
   @SkipNullableCheck
   public InputStream getBinaryStream(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getBinaryStream(findColumn(columnLabel));
   }
 
   @Override
@@ -364,13 +414,15 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
 
   @Override
   public Object getObject(int columnIndex) throws SQLException {
-    return resultSet.get(columnIndex);
+    final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
+    return result;
   }
 
   @Override
   @SkipNullableCheck
   public Object getObject(String columnLabel) throws SQLException {
-    throw new UnsupportedOperationException("not implemented");
+    return getObject(findColumn(columnLabel));
   }
 
   @Override
@@ -392,6 +444,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @SkipNullableCheck
   public Reader getCharacterStream(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -408,6 +461,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Nullable
   public BigDecimal getBigDecimal(int columnIndex) throws SQLException {
     final Object result = resultSet.get(columnIndex);
+    wasNull = result == null;
     if (result == null) {
       return null;
     }
@@ -830,15 +884,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (date == null || cal == null) {
       return date;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(date);
-
-    final long offset =
-        cal.getTimeZone().getOffset(date.getTime())
-            - localCal.getTimeZone().getOffset(date.getTime());
-
-    return new Date(date.getTime() + offset);
+    return new Date(date.getTime() + calculateTimezoneOffset(date.getTime(), cal));
   }
 
   @Override
@@ -854,15 +900,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (time == null || cal == null) {
       return time;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(time);
-
-    final long offset =
-        cal.getTimeZone().getOffset(time.getTime())
-            - localCal.getTimeZone().getOffset(time.getTime());
-
-    return new Time(time.getTime() + offset);
+    return new Time(time.getTime() + calculateTimezoneOffset(time.getTime(), cal));
   }
 
   @Override
@@ -878,15 +916,7 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (timestamp == null || cal == null) {
       return timestamp;
     }
-
-    final Calendar localCal = Calendar.getInstance();
-    localCal.setTime(timestamp);
-
-    final long offset =
-        cal.getTimeZone().getOffset(timestamp.getTime())
-            - localCal.getTimeZone().getOffset(timestamp.getTime());
-
-    return new Timestamp(timestamp.getTime() + offset);
+    return new Timestamp(timestamp.getTime() + calculateTimezoneOffset(timestamp.getTime(), cal));
   }
 
   @Override
@@ -1332,6 +1362,12 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
   @Override
   public String getColumnClassName(int column) throws SQLException {
     throw new UnsupportedOperationException("not implemented");
+  }
+
+  private long calculateTimezoneOffset(long timeMillis, Calendar targetCal) {
+    Calendar localCal = Calendar.getInstance();
+    return targetCal.getTimeZone().getOffset(timeMillis)
+        - localCal.getTimeZone().getOffset(timeMillis);
   }
 
   /**
