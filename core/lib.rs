@@ -1212,7 +1212,7 @@ impl Connection {
         }
 
         let sql = sql.as_ref();
-        tracing::trace!("Preparing: {}", sql);
+        tracing::debug!("Preparing: {}", sql);
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let syms = self.syms.read();
