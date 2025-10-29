@@ -19,7 +19,6 @@ test('concurrent-actions-consistency', async () => {
             path: ':memory:',
             url: process.env.VITE_TURSO_DB_URL,
             longPollTimeoutMs: 100,
-            // tracing: 'trace',
         });
         await db.exec("CREATE TABLE IF NOT EXISTS rows(key TEXT PRIMARY KEY, value INTEGER)");
         await db.exec("DELETE FROM rows");
@@ -41,7 +40,7 @@ test('concurrent-actions-consistency', async () => {
     const push = async function (iterations: number) {
         for (let i = 0; i < iterations; i++) {
             await new Promise(resolve => setTimeout(resolve, (Math.random() + 1)));
-            // console.info('push', i);
+            console.info('push', i);
             try {
                 if ((await db1.stats()).operations > 0) {
                     const start = performance.now();
@@ -67,7 +66,7 @@ test('concurrent-actions-consistency', async () => {
             await new Promise(resolve => setTimeout(resolve, 10 * (Math.random() + 1)));
         }
     }
-    await Promise.all([pull(20), push(20), run(200)]);
+    await Promise.all([pull(100), push(100), run(200)]);
 })
 
 test('simple-db', async () => {
@@ -450,7 +449,11 @@ test('concurrent-updates', async () => {
         await db.push();
         await db.close();
     }
-    const db1 = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, tracing: 'info' });
+    const db1 = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+    });
+    await db1.exec("PRAGMA busy_timeout=100");
     async function pull(db) {
         try {
             await db.pull();
@@ -471,20 +474,45 @@ test('concurrent-updates', async () => {
             setTimeout(async () => await push(db), 0);
         }
     }
+
     setTimeout(async () => await pull(db1), 0)
     setTimeout(async () => await push(db1), 0)
     for (let i = 0; i < 1000; i++) {
         try {
-            console.info('changes ' + JSON.stringify(await db1.prepare("SELECT change_id FROM turso_cdc").all()));
             await Promise.all([
-                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = ${i + 1}`),
-                db1.exec(`INSERT INTO q VALUES ('2', 0) ON CONFLICT DO UPDATE SET y = ${i + 1}`)
+                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`),
+                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`)
             ]);
+            console.info('insert ok');
         } catch (e) {
-            // ignore
+            console.error('insert error', e);
         }
         await new Promise(resolve => setTimeout(resolve, 1));
     }
+})
+
+test('corruption-bug-1', async () => {
+    {
+        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+        await db.exec("DELETE FROM q");
+        await db.push();
+        await db.close();
+    }
+    const db1 = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+    });
+    for (let i = 0; i < 100; i++) {
+        await db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`);
+    }
+    await db1.pull();
+    await db1.push();
+    for (let i = 0; i < 100; i++) {
+        await db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`);
+    }
+    await db1.pull();
+    await db1.push();
 })
 
 test('pull-push-concurrent', async () => {
@@ -549,7 +577,6 @@ test('checkpoint-and-actions', async () => {
             path: ':memory:',
             url: process.env.VITE_TURSO_DB_URL,
             longPollTimeoutMs: 100,
-            tracing: 'info'
         });
         await db.exec("CREATE TABLE IF NOT EXISTS rows(key TEXT PRIMARY KEY, value INTEGER)");
         await db.exec("DELETE FROM rows");
