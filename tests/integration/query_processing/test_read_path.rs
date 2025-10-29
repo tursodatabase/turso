@@ -883,6 +883,49 @@ fn test_multiple_connections_visibility() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_stmt_reset() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x);");
+    let conn1 = tmp_db.connect_limbo();
+    let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
+    for _ in 0..3 {
+        stmt1.reset();
+        stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+        loop {
+            match stmt1.step().unwrap() {
+                StepResult::Done => break,
+                _ => tmp_db.io.step().unwrap(),
+            }
+        }
+    }
+
+    // force btree-page split which will be "unnoticed" by stmt1 if it will cache something in between of calls
+    conn1
+        .execute("INSERT INTO test VALUES (randomblob(1024))")
+        .unwrap();
+
+    stmt1.reset();
+    stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Done => break,
+            _ => tmp_db.io.step().unwrap(),
+        }
+    }
+    let rows = limbo_exec_rows(&tmp_db, &conn1, "SELECT rowid FROM test");
+    assert_eq!(
+        rows,
+        vec![vec![
+            rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)],
+            vec![rusqlite::types::Value::Integer(4)],
+            vec![rusqlite::types::Value::Integer(5)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 /// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
 fn test_max_joined_tables_limit() {
     let tmp_db = TempDatabase::new("test_max_joined_tables_limit");
