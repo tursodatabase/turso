@@ -914,8 +914,8 @@ fn test_stmt_reset() -> anyhow::Result<()> {
     let rows = limbo_exec_rows(&tmp_db, &conn1, "SELECT rowid FROM test");
     assert_eq!(
         rows,
-        vec![vec![
-            rusqlite::types::Value::Integer(1)],
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
             vec![rusqlite::types::Value::Integer(2)],
             vec![rusqlite::types::Value::Integer(3)],
             vec![rusqlite::types::Value::Integer(4)],
