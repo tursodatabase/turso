@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
 };
@@ -38,7 +38,13 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                let joined_table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
+                    if module.covered_columns.contains_key(column) {
+                        return None;
+                    }
+                }
+                let table_ref = &joined_table_ref.table;
                 table_ref.get_column_at(*column).unwrap().name.as_deref()
             }
             ast::Expr::RowId { table, .. } => {
@@ -851,6 +857,8 @@ pub enum Operation {
     // This operation is used to search for a row in a table using an index
     // (i.e. a primary key or a secondary index)
     Search(Search),
+    // Access through custom index method query
+    IndexMethodQuery(IndexMethodQuery),
 }
 
 impl Operation {
@@ -872,9 +880,10 @@ impl Operation {
     pub fn index(&self) -> Option<&Arc<Index>> {
         match self {
             Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref(),
+            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
+            Operation::IndexMethodQuery(IndexMethodQuery { index, .. }) => Some(index),
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
-            Operation::Search(Search::Seek { index, .. }) => index.as_ref(),
         }
     }
 }
@@ -1000,12 +1009,14 @@ impl JoinedTable {
                     )
                 };
 
-                let index_cursor_id = index.map(|index| {
-                    program.alloc_cursor_id_keyed(
-                        CursorKey::index(self.internal_id, index.clone()),
-                        CursorType::BTreeIndex(index.clone()),
-                    )
-                });
+                let index_cursor_id = index
+                    .map(|index| {
+                        program.alloc_cursor_index(
+                            Some(CursorKey::index(self.internal_id, index.clone())),
+                            index,
+                        )
+                    })
+                    .transpose()?;
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
@@ -1219,6 +1230,19 @@ pub enum Search {
         index: Option<Arc<Index>>,
         seek_def: SeekDef,
     },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub struct IndexMethodQuery {
+    /// index method to use
+    pub index: Arc<Index>,
+    /// idx of the pattern from [crate::index_method::IndexMethodAttachment::definition] which planner chose to use for the access
+    pub pattern_idx: usize,
+    /// captured arguments for the pattern chosen by the planner
+    pub arguments: Vec<Expr>,
+    /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
+    pub covered_columns: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

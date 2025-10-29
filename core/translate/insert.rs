@@ -139,26 +139,24 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
-    ) -> Self {
+    ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
-        let idx_cursors = resolver
-            .schema
-            .get_indices(table.name.as_str())
-            .map(|idx| {
-                (
-                    &idx.name,
-                    idx.root_page,
-                    program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone())),
-                )
-            })
-            .collect::<Vec<(&String, i64, usize)>>();
+        let indices = resolver.schema.get_indices(table.name.as_str());
+        let mut idx_cursors = Vec::new();
+        for idx in indices {
+            idx_cursors.push((
+                &idx.name,
+                idx.root_page,
+                program.alloc_cursor_index(None, idx)?,
+            ));
+        }
         let halt_label = program.allocate_label();
         let loop_start_label = program.allocate_label();
         let row_done_label = program.allocate_label();
         let stmt_epilogue = program.allocate_label();
         let key_ready_for_uniqueness_check_label = program.allocate_label();
         let key_generation_label = program.allocate_label();
-        Self {
+        Ok(Self {
             table,
             idx_cursors,
             temp_table_ctx,
@@ -176,7 +174,7 @@ impl<'a> InsertEmitCtx<'a> {
             key_ready_for_uniqueness_check_label,
             key_generation_label,
             autoincrement_meta: None,
-        }
+        })
     }
 }
 
@@ -263,7 +261,7 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
-    );
+    )?;
 
     program = init_source_emission(
         program,

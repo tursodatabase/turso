@@ -257,10 +257,10 @@ pub fn init_loop(
                         {
                             continue;
                         }
-                        let cursor_id = program.alloc_cursor_id_keyed(
-                            CursorKey::index(table.internal_id, index.clone()),
-                            CursorType::BTreeIndex(index.clone()),
-                        );
+                        let cursor_id = program.alloc_cursor_index(
+                            Some(CursorKey::index(table.internal_id, index.clone())),
+                            index,
+                        )?;
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id,
                             root_page: index.root_page.into(),
@@ -350,10 +350,10 @@ pub fn init_loop(
                                 {
                                     continue;
                                 }
-                                let cursor_id = program.alloc_cursor_id_keyed(
-                                    CursorKey::index(table.internal_id, index.clone()),
-                                    CursorType::BTreeIndex(index.clone()),
-                                );
+                                let cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    index,
+                                )?;
                                 program.emit_insn(Insn::OpenWrite {
                                     cursor_id,
                                     root_page: index.root_page.into(),
@@ -397,6 +397,24 @@ pub fn init_loop(
                     }
                 }
             }
+            Operation::IndexMethodQuery(_) => match mode {
+                OperationMode::SELECT => {
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::OpenRead {
+                            cursor_id: table_cursor_id,
+                            root_page: table.table.get_root_page(),
+                            db: table.database_id,
+                        });
+                    }
+                    let index_cursor_id = index_cursor_id.unwrap();
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id: index_cursor_id,
+                        root_page: table.op.index().unwrap().root_page,
+                        db: table.database_id,
+                    });
+                }
+                _ => panic!("only SELECT is supported for index method"),
+            },
         }
     }
 
@@ -682,6 +700,35 @@ pub fn open_loop(
                                 });
                             }
                         }
+                    }
+                }
+            }
+            Operation::IndexMethodQuery(query) => {
+                let start_reg = program.alloc_registers(query.arguments.len() + 1);
+                program.emit_int(query.pattern_idx as i64, start_reg);
+                for i in 0..query.arguments.len() {
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        &query.arguments[i],
+                        start_reg + 1 + i,
+                        &t_ctx.resolver,
+                    )?;
+                }
+                program.emit_insn(Insn::IndexMethodQuery {
+                    db: 0,
+                    cursor_id: index_cursor_id.expect("IndexMethod requires a index cursor"),
+                    start_reg,
+                    count_reg: query.arguments.len() + 1,
+                    pc_if_empty: loop_end,
+                });
+                program.preassign_label_to_next_insn(loop_start);
+                if let Some(table_cursor_id) = table_cursor_id {
+                    if let Some(index_cursor_id) = index_cursor_id {
+                        program.emit_insn(Insn::DeferredSeek {
+                            index_cursor_id,
+                            table_cursor_id,
+                        });
                     }
                 }
             }
@@ -1167,6 +1214,14 @@ pub fn close_loop(
                         });
                     }
                 }
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::IndexMethodQuery(_) => {
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Next {
+                    cursor_id: index_cursor_id.unwrap(),
+                    pc_if_next: loop_labels.loop_start,
+                });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
         }

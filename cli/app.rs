@@ -865,7 +865,7 @@ impl Limbo {
                     ) -> usize {
                         let indent_count = match prev_insn {
                             "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
-                            | "SeekLT" | "BeginSubrtn" => indent_count + 1,
+                            | "SeekLT" | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
                             _ => indent_count,
                         };
 

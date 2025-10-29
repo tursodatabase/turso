@@ -670,6 +670,9 @@ fn emit_delete_insns(
                 index: Some(index), ..
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
+        Operation::IndexMethodQuery(_) => {
+            panic!("access through IndexMethod is not supported for delete statements")
+        }
     };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
 
@@ -980,7 +983,7 @@ fn emit_program_for_update(
         )) {
             cursor
         } else {
-            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            let cursor = program.alloc_cursor_index(None, index)?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
                 root_page: RegisterOrLiteral::Literal(index.root_page),
@@ -1087,6 +1090,9 @@ fn emit_update_insns(
                 false,
             ),
         },
+        Operation::IndexMethodQuery(_) => {
+            panic!("access through IndexMethod is not supported for update operations")
+        }
     };
 
     let beg = program.alloc_registers(
