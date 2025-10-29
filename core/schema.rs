@@ -1826,6 +1826,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 if primary_key {
                     flags.insert(ColumnFlags::PRIMARY_KEY);
                 }
+                if ty_str.contains("HIDDEN") {
+                    flags.insert(ColumnFlags::HIDDEN);
+                }
 
                 cols.push(Column {
                     name: Some(normalize_ident(&name)),
@@ -1839,7 +1842,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     default,
                     unique,
                     collation,
-                    hidden: false,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -2066,6 +2068,7 @@ bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct ColumnFlags: u16 {
         const PRIMARY_KEY = 0x0001;
+        const HIDDEN = 0x0002;
     }
 }
 
@@ -2081,7 +2084,6 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     pub unique: bool,
     pub collation: Option<CollationSeq>,
-    pub hidden: bool,
 }
 
 impl Column {
@@ -2098,6 +2100,18 @@ impl Column {
             self.flags.insert(ColumnFlags::PRIMARY_KEY);
         } else {
             self.flags.remove(ColumnFlags::PRIMARY_KEY);
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.flags.contains(ColumnFlags::HIDDEN)
+    }
+
+    pub fn set_hidden(&mut self, hidden: bool) {
+        if hidden {
+            self.flags.insert(ColumnFlags::HIDDEN);
+        } else {
+            self.flags.remove(ColumnFlags::HIDDEN);
         }
     }
 }
@@ -2143,11 +2157,12 @@ impl From<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
-        let hidden = ty_str.contains("HIDDEN");
-
         let mut flags = ColumnFlags::empty();
         if primary_key {
             flags.insert(ColumnFlags::PRIMARY_KEY);
+        }
+        if ty_str.contains("HIDDEN") {
+            flags.insert(ColumnFlags::HIDDEN);
         }
 
         Column {
@@ -2160,7 +2175,6 @@ impl From<&ColumnDefinition> for Column {
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
             unique,
             collation,
-            hidden,
         }
     }
 }
@@ -2376,7 +2390,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("name".to_string()),
@@ -2388,7 +2401,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("tbl_name".to_string()),
@@ -2400,7 +2412,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("rootpage".to_string()),
@@ -2412,7 +2423,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("sql".to_string()),
@@ -2424,7 +2434,6 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             },
         ],
         foreign_keys: vec![],
@@ -3035,7 +3044,6 @@ mod tests {
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             }],
             unique_sets: vec![],
             foreign_keys: vec![],

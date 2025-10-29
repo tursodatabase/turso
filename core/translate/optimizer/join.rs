@@ -1624,7 +1624,6 @@ mod tests {
             default: None,
             unique: false,
             collation: None,
-            hidden: false,
         }
     }
     fn _create_column_of_type(name: &str, ty: Type) -> Column {

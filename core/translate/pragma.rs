@@ -723,7 +723,7 @@ fn emit_columns_for_table_info(
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
     // Therefore, we enumerate only after filtering out hidden columns.
-    for (i, column) in columns.iter().filter(|col| !col.hidden).enumerate() {
+    for (i, column) in columns.iter().filter(|col| !col.is_hidden()).enumerate() {
         // cid
         program.emit_int(i as i64, base_reg);
         // name

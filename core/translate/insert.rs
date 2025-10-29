@@ -920,7 +920,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden)
+                .filter(|c| !c.is_hidden())
                 .map(|c| {
                     c.default
                         .clone()
@@ -1128,7 +1128,7 @@ fn init_source_emission<'a>(
                         ctx.table
                             .columns
                             .iter()
-                            .filter(|col| !col.hidden)
+                            .filter(|col| !col.is_hidden())
                             .map(|col| col.affinity().aff_mask())
                             .collect::<String>()
                     } else {
@@ -1242,7 +1242,6 @@ pub const ROWID_COLUMN: &Column = &Column {
     default: None,
     unique: false,
     collation: None,
-    hidden: false,
 };
 
 /// Represents how a table should be populated during an INSERT.
@@ -1384,7 +1383,7 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden).count() {
+        if num_values != table_columns.iter().filter(|c| !c.is_hidden()).count() {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
@@ -1394,7 +1393,7 @@ fn build_insertion<'a>(
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden {
+            if col.is_hidden() {
                 // Hidden columns are not taken into account.
                 continue;
             }
@@ -1590,7 +1589,7 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.hidden {
+    } else if column.is_hidden() {
         // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {
             dest: column_register,

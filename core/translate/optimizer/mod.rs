@@ -212,7 +212,6 @@ fn add_ephemeral_table_to_update_plan(
             default: None,
             unique: false,
             collation: None,
-            hidden: false,
         }],
         is_strict: false,
         unique_sets: vec![],

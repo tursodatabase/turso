@@ -1210,7 +1210,6 @@ pub fn extract_view_columns(
                             default: None,
                             unique: false,
                             collation: None,
-                            hidden: false,
                         },
                     });
                 }
@@ -1244,7 +1243,6 @@ pub fn extract_view_columns(
                                         default: None,
                                         unique: false,
                                         collation: table_column.collation,
-                                        hidden: false,
                                     },
                                 });
                             }
@@ -1265,7 +1263,6 @@ pub fn extract_view_columns(
                                 default: None,
                                 unique: false,
                                 collation: None,
-                                hidden: false,
                             },
                         });
                     }
@@ -1301,7 +1298,6 @@ pub fn extract_view_columns(
                                         default: None,
                                         unique: false,
                                         collation: table_column.collation,
-                                        hidden: false,
                                     },
                                 });
                             }
@@ -1319,7 +1315,6 @@ pub fn extract_view_columns(
                                     default: None,
                                     unique: false,
                                     collation: None,
-                                    hidden: false,
                                 },
                             });
                         }

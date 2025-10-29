@@ -2401,7 +2401,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("name".to_string()),
@@ -2413,7 +2412,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("age".to_string()),
@@ -2425,7 +2423,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("email".to_string()),
@@ -2437,7 +2434,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,
@@ -2465,7 +2461,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("user_id".to_string()),
@@ -2477,7 +2472,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("product".to_string()),
@@ -2489,7 +2483,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("amount".to_string()),
@@ -2501,7 +2494,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,
@@ -2530,7 +2522,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("name".to_string()),
@@ -2542,7 +2533,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("price".to_string()),
@@ -2554,7 +2544,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("product_id".to_string()),
@@ -2566,7 +2555,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,

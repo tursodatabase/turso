@@ -1408,7 +1408,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("name".to_string()),
@@ -1420,7 +1419,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,
@@ -1446,7 +1444,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("customer_id".to_string()),
@@ -1458,7 +1455,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("total".to_string()),
@@ -1470,7 +1466,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,
@@ -1496,7 +1491,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("name".to_string()),
@@ -1508,7 +1502,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("price".to_string()),
@@ -1520,7 +1513,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true,
@@ -1546,7 +1538,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("level".to_string()),
@@ -1558,7 +1549,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
                 SchemaColumn {
                     name: Some("timestamp".to_string()),
@@ -1570,7 +1560,6 @@ mod tests {
                     default: None,
                     unique: false,
                     collation: None,
-                    hidden: false,
                 },
             ],
             has_rowid: true, // Has implicit rowid but no alias

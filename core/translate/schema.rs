@@ -852,7 +852,6 @@ pub fn translate_drop_table(
                 default: None,
                 unique: false,
                 collation: None,
-                hidden: false,
             }],
             is_strict: false,
             unique_sets: vec![],

@@ -235,14 +235,14 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
+                            .map(|t| t.columns().iter().filter(|col| !col.is_hidden()).count())
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
+                            .map(|t| t.columns().iter().filter(|col| !col.is_hidden()).count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -315,7 +315,7 @@ fn prepare_one_select_plan(
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
                                 let column = &table.columns()[idx];
-                                if column.hidden {
+                                if column.is_hidden() {
                                     continue;
                                 }
                                 table.mark_column_used(idx);
@@ -337,7 +337,7 @@ fn prepare_one_select_plan(
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
                             let column = &table.columns()[idx];
-                            if column.hidden {
+                            if column.is_hidden() {
                                 continue;
                             }
                             plan.result_columns.push(ResultSetColumn {
