@@ -1622,7 +1622,6 @@ mod tests {
             flags: ColumnFlags::empty(),
             notnull: false,
             default: None,
-            unique: false,
             collation: None,
         }
     }

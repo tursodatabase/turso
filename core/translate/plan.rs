@@ -861,7 +861,6 @@ impl JoinedTable {
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
             })
             .collect::<Vec<_>>();

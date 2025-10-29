@@ -1406,7 +1406,6 @@ mod tests {
                     is_rowid_alias: true,
                     notnull: true,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1417,7 +1416,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
             ],
@@ -1442,7 +1440,6 @@ mod tests {
                     is_rowid_alias: true,
                     notnull: true,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1453,7 +1450,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1464,7 +1460,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
             ],
@@ -1489,7 +1484,6 @@ mod tests {
                     is_rowid_alias: true,
                     notnull: true,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1500,7 +1494,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1511,7 +1504,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
             ],
@@ -1536,7 +1528,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1547,7 +1538,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
                 SchemaColumn {
@@ -1558,7 +1548,6 @@ mod tests {
                     is_rowid_alias: false,
                     notnull: false,
                     default: None,
-                    unique: false,
                     collation: None,
                 },
             ],

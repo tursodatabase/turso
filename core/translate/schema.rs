@@ -850,7 +850,6 @@ pub fn translate_drop_table(
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
             }],
             is_strict: false,

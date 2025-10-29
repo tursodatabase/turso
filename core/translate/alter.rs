@@ -116,7 +116,7 @@ pub fn translate_alter_table(
                 )));
             }
 
-            if column.unique
+            if column.is_unique()
                 || btree.unique_sets.iter().any(|set| {
                     set.columns
                         .iter()

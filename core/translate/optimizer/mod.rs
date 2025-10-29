@@ -210,7 +210,6 @@ fn add_ephemeral_table_to_update_plan(
             is_rowid_alias: false,
             notnull: true,
             default: None,
-            unique: false,
             collation: None,
         }],
         is_strict: false,

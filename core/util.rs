@@ -1208,7 +1208,6 @@ pub fn extract_view_columns(
                             is_rowid_alias: false,
                             notnull: false,
                             default: None,
-                            unique: false,
                             collation: None,
                         },
                     });
@@ -1241,7 +1240,6 @@ pub fn extract_view_columns(
                                         is_rowid_alias: false,
                                         notnull: false,
                                         default: None,
-                                        unique: false,
                                         collation: table_column.collation,
                                     },
                                 });
@@ -1261,7 +1259,6 @@ pub fn extract_view_columns(
                                 is_rowid_alias: false,
                                 notnull: false,
                                 default: None,
-                                unique: false,
                                 collation: None,
                             },
                         });
@@ -1296,7 +1293,6 @@ pub fn extract_view_columns(
                                         is_rowid_alias: false,
                                         notnull: false,
                                         default: None,
-                                        unique: false,
                                         collation: table_column.collation,
                                     },
                                 });
@@ -1313,7 +1309,6 @@ pub fn extract_view_columns(
                                     is_rowid_alias: false,
                                     notnull: false,
                                     default: None,
-                                    unique: false,
                                     collation: None,
                                 },
                             });

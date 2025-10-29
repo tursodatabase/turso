@@ -1240,7 +1240,6 @@ pub const ROWID_COLUMN: &Column = &Column {
     is_rowid_alias: true,
     notnull: true,
     default: None,
-    unique: false,
     collation: None,
 };
 
@@ -1598,7 +1597,7 @@ fn translate_column(
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
-        let nullable = !column.notnull && !column.is_primary_key() && !column.unique;
+        let nullable = !column.notnull && !column.is_primary_key() && !column.is_unique();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",
