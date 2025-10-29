@@ -837,7 +837,7 @@ fn test_lazy_scan_cursor_basic() {
     // Check first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 1);
 
     // Iterate through all rows
@@ -851,7 +851,7 @@ fn test_lazy_scan_cursor_basic() {
             break;
         }
         count += 1;
-        let row = cursor.current_row().unwrap().unwrap();
+        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
     }
 
@@ -880,7 +880,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     // Check first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 5);
 
     // Test moving forward and checking IDs
@@ -933,7 +933,7 @@ fn test_cursor_basic() {
 
     // Check first row
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 1);
 
     // Iterate through all rows
@@ -947,7 +947,7 @@ fn test_cursor_basic() {
             break;
         }
         count += 1;
-        let row = cursor.current_row().unwrap().unwrap();
+        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
     }
 
@@ -1004,7 +1004,7 @@ fn test_cursor_modification_during_scan() {
 
     // Read first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
-    let first_row = cursor.current_row().unwrap().unwrap();
+    let first_row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(first_row.id.row_id, 1);
 
     // Insert a new row with ID between existing rows
@@ -1630,7 +1630,9 @@ fn test_cursor_with_btree_and_mvcc_2() {
     let conn = db.connect();
     // Insert a new row so that we have a gap in the BTree.
     conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    println!("getting rows");
     let rows = get_rows(&conn, "SELECT * FROM t");
+    dbg!(&rows);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec![Value::Integer(1)]);
     assert_eq!(rows[1], vec![Value::Integer(2)]);
