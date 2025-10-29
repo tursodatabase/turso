@@ -63,6 +63,10 @@ impl MVTableId {
         assert!(value < 0, "MVCC table IDs are always negative");
         Self(value)
     }
+
+    pub fn is_btree_allocated(&self) -> bool {
+        self.0 >= 0
+    }
 }
 
 impl From<i64> for MVTableId {
