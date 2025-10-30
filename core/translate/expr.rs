@@ -1,3 +1,4 @@
+
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
@@ -36,18 +37,39 @@ pub struct ConditionMetadata {
 
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
-    if cond_meta.jump_if_condition_is_true {
+    let jmp_true = cond_meta.jump_target_when_true;
+    let jmp_false = cond_meta.jump_target_when_false;
+    let jmp_null = cond_meta.jump_target_when_null;
+
+    if jmp_null == jmp_true && jmp_true == jmp_false {
+        program.emit_insn(Insn::Goto { target_pc: jmp_true });
+    } else if jmp_null == jmp_true {
+        // Treat Null as True - check constraints
         program.emit_insn(Insn::If {
             reg,
-            target_pc: cond_meta.jump_target_when_true,
-            jump_if_null: false,
-        });
-    } else {
-        program.emit_insn(Insn::IfNot {
-            reg,
-            target_pc: cond_meta.jump_target_when_false,
+            target_pc: jmp_true,
             jump_if_null: true,
         });
+        program.emit_insn(Insn::Goto { target_pc: jmp_false });
+    } else if jmp_null == jmp_false {
+        // Treat NULL as false  where clause.
+        program.emit_insn(Insn::IfNot {
+            reg,
+            target_pc: jmp_false,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::Goto { target_pc: jmp_true });
+    } else {
+        program.emit_insn(Insn::If {
+            reg,
+            target_pc: jmp_true,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::IsNull {
+            reg,
+            target_pc: jmp_null,
+        });
+        program.emit_insn(Insn::Goto { target_pc: jmp_false });
     }
 }
 
@@ -364,22 +386,25 @@ pub fn translate_condition_expr(
             )?;
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, never jump to the parent 'jump_target_when_false' label on the first condition, because
-            // the second condition CAN also be true. Instead we instruct the child expression to jump to a local
-            // false label.
-            let jump_target_when_false = program.allocate_label();
+            // In a binary OR, if the left-hand side is FALSE or NULL, we must evaluate the right-hand side.
+            // Therefore, for the LHS evaluation, we create a local "fallthrough" label and instruct
+            // the recursive call to jump to it for both FALSE and NULL outcomes.
+            let fallthrough_label = program.allocate_label();
             translate_condition_expr(
                 program,
                 referenced_tables,
                 lhs,
                 ConditionMetadata {
                     jump_if_condition_is_true: true,
-                    jump_target_when_false,
-                    ..condition_metadata
+                    jump_target_when_true: condition_metadata.jump_target_when_true,
+                    jump_target_when_false: fallthrough_label,
+                    jump_target_when_null: fallthrough_label,
                 },
                 resolver,
             )?;
-            program.preassign_label_to_next_insn(jump_target_when_false);
+            
+            program.preassign_label_to_next_insn(fallthrough_label);
+            
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -2938,41 +2963,25 @@ fn emit_binary_condition_insn(
         opposite_op
     };
 
-    let mut flags = CmpInsFlags::default().with_affinity(affinity);
-    let target_pc;
-
-    if condition_metadata.jump_if_condition_is_true {
-        target_pc = condition_metadata.jump_target_when_true;
-        if condition_metadata.jump_target_when_true == condition_metadata.jump_target_when_null {
-            flags = flags.jump_if_null();
-            tracing::debug!(?condition_metadata, "NULL result will jump to TRUE target");
-        }
+    let target_pc = if condition_metadata.jump_if_condition_is_true {
+        condition_metadata.jump_target_when_true
     } else {
-        target_pc = condition_metadata.jump_target_when_false;
-        if condition_metadata.jump_target_when_false == condition_metadata.jump_target_when_null {
-            flags = flags.jump_if_null();
-            tracing::debug!(?condition_metadata, "NULL result will jump to FALSE target");
-        }
+        condition_metadata.jump_target_when_false
+    };
+    
+    let should_jump_on_null = if condition_metadata.jump_if_condition_is_true {
+        condition_metadata.jump_target_when_true == condition_metadata.jump_target_when_null
+    } else {
+        condition_metadata.jump_target_when_false == condition_metadata.jump_target_when_null
+    };
+    
+    let mut flags = CmpInsFlags::default().with_affinity(affinity);
+    if should_jump_on_null {
+        flags = flags.jump_if_null();
     }
-
-    // For conditional jumps that don't have a clear "opposite op" (e.g. x+y), we check whether the result is nonzero/nonnull
-    // (or zero/null) depending on the condition metadata.
+    
     let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
-        if condition_metadata.jump_if_condition_is_true {
-            program.emit_insn(Insn::If {
-                reg: result_reg,
-                target_pc,
-                jump_if_null: condition_metadata.jump_target_when_true
-                    != condition_metadata.jump_target_when_null,
-            });
-        } else {
-            program.emit_insn(Insn::IfNot {
-                reg: result_reg,
-                target_pc,
-                jump_if_null: condition_metadata.jump_target_when_false
-                    == condition_metadata.jump_target_when_null,
-            });
-        }
+        emit_cond_jump(program, condition_metadata, result_reg);
     };
 
     match op_to_use {
