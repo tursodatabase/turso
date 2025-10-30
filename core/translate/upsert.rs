@@ -461,20 +461,25 @@ pub fn emit_upsert(
         }
     }
 
-
     if let Some(btree_table) = table.btree() {
-        let col_mappings: Vec<crate::translate::insert::ColMapping> = btree_table.columns.iter().enumerate().map(|(i, col)| {
-            crate::translate::insert::ColMapping {
+        let col_mappings: Vec<crate::translate::insert::ColMapping> = btree_table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| crate::translate::insert::ColMapping {
                 column: col,
                 value_index: None,
                 register: new_start + i,
-            }
-        }).collect();
+            })
+            .collect();
 
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
         let insertion_info = crate::translate::insert::Insertion {
-            key: crate::translate::insert::InsertionKey::LiteralRowid { value_index: None, register: new_rowid },
+            key: crate::translate::insert::InsertionKey::LiteralRowid {
+                value_index: None,
+                register: new_rowid,
+            },
             col_mappings,
             record_reg: 0,
         };
@@ -484,7 +489,7 @@ pub fn emit_upsert(
             &btree_table,
             &insertion_info,
             resolver,
-            connection
+            connection,
         )?;
     }
 

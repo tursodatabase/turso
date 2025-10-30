@@ -2938,20 +2938,22 @@ fn emit_binary_condition_insn(
         opposite_op
     };
 
-    // Similarly, we "jump if NULL" only when we intend to jump if the condition is false.
-    let flags = if condition_metadata.jump_if_condition_is_true {
-        CmpInsFlags::default().with_affinity(affinity)
-    } else {
-        CmpInsFlags::default()
-            .with_affinity(affinity)
-            .jump_if_null()
-    };
+    let mut flags = CmpInsFlags::default().with_affinity(affinity);
+    let target_pc;
 
-    let target_pc = if condition_metadata.jump_if_condition_is_true {
-        condition_metadata.jump_target_when_true
+    if condition_metadata.jump_if_condition_is_true {
+        target_pc = condition_metadata.jump_target_when_true;
+        if condition_metadata.jump_target_when_true == condition_metadata.jump_target_when_null {
+            flags = flags.jump_if_null();
+            tracing::debug!(?condition_metadata, "NULL result will jump to TRUE target");
+        }
     } else {
-        condition_metadata.jump_target_when_false
-    };
+        target_pc = condition_metadata.jump_target_when_false;
+        if condition_metadata.jump_target_when_false == condition_metadata.jump_target_when_null {
+            flags = flags.jump_if_null();
+            tracing::debug!(?condition_metadata, "NULL result will jump to FALSE target");
+        }
+    }
 
     // For conditional jumps that don't have a clear "opposite op" (e.g. x+y), we check whether the result is nonzero/nonnull
     // (or zero/null) depending on the condition metadata.
@@ -2960,13 +2962,15 @@ fn emit_binary_condition_insn(
             program.emit_insn(Insn::If {
                 reg: result_reg,
                 target_pc,
-                jump_if_null: false,
+                jump_if_null: condition_metadata.jump_target_when_true
+                    != condition_metadata.jump_target_when_null,
             });
         } else {
             program.emit_insn(Insn::IfNot {
                 reg: result_reg,
                 target_pc,
-                jump_if_null: true,
+                jump_if_null: condition_metadata.jump_target_when_false
+                    == condition_metadata.jump_target_when_null,
             });
         }
     };

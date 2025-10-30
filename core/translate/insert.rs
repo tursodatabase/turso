@@ -15,14 +15,9 @@ use crate::translate::emitter::{
     OperationMode,
 };
 use crate::translate::expr::{
-    BindingBehavior,
-    ConditionMetadata,
-    WalkControl,
-    bind_and_rewrite_expr,
-    emit_returning_results,
-    process_returning_clause,
-    translate_condition_expr,
-    walk_expr_mut,
+    bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
+    translate_condition_expr, walk_expr_mut, BindingBehavior, ConditionMetadata,
+    ReturningValueRegisters, WalkControl,
 };
 
 use crate::translate::fkeys::{
@@ -423,7 +418,7 @@ pub fn translate_insert(
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
-    emit_check_constraints(&mut program, &ctx, &insertion, resolver,connection)?;
+    emit_check_constraints(&mut program, &ctx, &insertion, resolver, connection)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -2955,15 +2950,15 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     Ok(())
 }
 
-
-
-
 /// Rewrites a CHECK constraint's AST
 ///
 /// the function replaces each column name reference with a direct reference
 /// to the register (`Expr::Register`) that holds the new row's value for that column.
 
-pub fn rewrite_check_expr(expr: &mut ast::Expr, insertion: &Insertion) -> crate::Result<WalkControl> {
+pub fn rewrite_check_expr(
+    expr: &mut ast::Expr,
+    insertion: &Insertion,
+) -> crate::Result<WalkControl> {
     walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
@@ -3000,11 +2995,9 @@ pub fn rewrite_check_expr(expr: &mut ast::Expr, insertion: &Insertion) -> crate:
     )
 }
 
-
-
 pub fn emit_generic_check_constraints(
     program: &mut ProgramBuilder,
-        table: &BTreeTable,
+    table: &BTreeTable,
     insertion: &Insertion,
     resolver: &Resolver,
     connection: &Arc<Connection>,
@@ -3031,13 +3024,13 @@ pub fn emit_generic_check_constraints(
         };
 
         let mut check_expr = expr.clone();
-        
+
         rewrite_check_expr(&mut check_expr, insertion)?;
-        
+
         let constraint_name_str = constraint
             .name
             .as_ref()
-            .map(|n| n.as_str()) 
+            .map(|n| n.as_str())
             .unwrap_or("<unnamed>");
 
         tracing::debug!(
@@ -3059,7 +3052,7 @@ pub fn emit_generic_check_constraints(
             constraint_name_str,
             &check_expr
         );
-        
+
         let fail_label = program.allocate_label();
         let continue_label = program.allocate_label();
 
@@ -3070,6 +3063,12 @@ pub fn emit_generic_check_constraints(
             jump_target_when_null: continue_label,
         };
 
+        tracing::debug!(
+            constraint = constraint_name_str,
+            ?metadata,
+            "Translating CHECK constraint with metadata"
+        );
+
         translate_condition_expr(
             program,
             &TableReferences::new_empty(),
@@ -3077,9 +3076,8 @@ pub fn emit_generic_check_constraints(
             metadata,
             resolver,
         )?;
-        
+
         program.preassign_label_to_next_insn(fail_label);
-  
 
         let err_msg = match &constraint.name {
             Some(name) => format!("CHECK constraint failed: {}", name.as_str()),
@@ -3097,9 +3095,6 @@ pub fn emit_generic_check_constraints(
     Ok(())
 }
 
-
-
-
 pub fn emit_check_constraints(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
@@ -3107,6 +3102,5 @@ pub fn emit_check_constraints(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-     emit_generic_check_constraints(program, ctx.table, insertion, resolver, connection)
+    emit_generic_check_constraints(program, ctx.table, insertion, resolver, connection)
 }
-
