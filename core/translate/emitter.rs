@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::translate::insert::InsertionKey;
+use crate::translate::insert::{CheckFailureMode, InsertionKey};
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, Literal};
@@ -1374,6 +1374,7 @@ fn emit_update_insns(
             &insertion_info,
             &t_ctx.resolver,
             connection,
+            CheckFailureMode::Halt,
         )?;
     }
 

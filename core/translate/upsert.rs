@@ -10,7 +10,7 @@ use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{
-    emit_generic_check_constraints, format_unique_violation_desc, InsertEmitCtx,
+    emit_generic_check_constraints, format_unique_violation_desc, CheckFailureMode, InsertEmitCtx,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
@@ -495,6 +495,7 @@ pub fn emit_upsert(
             &insertion_info,
             resolver,
             connection,
+            CheckFailureMode::Halt,
         )?;
     }
 
