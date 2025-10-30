@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
@@ -42,7 +41,9 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
     let jmp_null = cond_meta.jump_target_when_null;
 
     if jmp_null == jmp_true && jmp_true == jmp_false {
-        program.emit_insn(Insn::Goto { target_pc: jmp_true });
+        program.emit_insn(Insn::Goto {
+            target_pc: jmp_true,
+        });
     } else if jmp_null == jmp_true {
         // Treat Null as True - check constraints
         program.emit_insn(Insn::If {
@@ -50,7 +51,9 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             target_pc: jmp_true,
             jump_if_null: true,
         });
-        program.emit_insn(Insn::Goto { target_pc: jmp_false });
+        program.emit_insn(Insn::Goto {
+            target_pc: jmp_false,
+        });
     } else if jmp_null == jmp_false {
         // Treat NULL as false  where clause.
         program.emit_insn(Insn::IfNot {
@@ -58,7 +61,9 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             target_pc: jmp_false,
             jump_if_null: true,
         });
-        program.emit_insn(Insn::Goto { target_pc: jmp_true });
+        program.emit_insn(Insn::Goto {
+            target_pc: jmp_true,
+        });
     } else {
         program.emit_insn(Insn::If {
             reg,
@@ -69,7 +74,9 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             reg,
             target_pc: jmp_null,
         });
-        program.emit_insn(Insn::Goto { target_pc: jmp_false });
+        program.emit_insn(Insn::Goto {
+            target_pc: jmp_false,
+        });
     }
 }
 
@@ -402,9 +409,9 @@ pub fn translate_condition_expr(
                 },
                 resolver,
             )?;
-            
+
             program.preassign_label_to_next_insn(fallthrough_label);
-            
+
             translate_condition_expr(
                 program,
                 referenced_tables,
@@ -2968,18 +2975,18 @@ fn emit_binary_condition_insn(
     } else {
         condition_metadata.jump_target_when_false
     };
-    
+
     let should_jump_on_null = if condition_metadata.jump_if_condition_is_true {
         condition_metadata.jump_target_when_true == condition_metadata.jump_target_when_null
     } else {
         condition_metadata.jump_target_when_false == condition_metadata.jump_target_when_null
     };
-    
+
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
     if should_jump_on_null {
         flags = flags.jump_if_null();
     }
-    
+
     let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
         emit_cond_jump(program, condition_metadata, result_reg);
     };

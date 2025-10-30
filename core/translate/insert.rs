@@ -2954,7 +2954,6 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 ///
 /// the function replaces each column name reference with a direct reference
 /// to the register (`Expr::Register`) that holds the new row's value for that column.
-
 pub fn rewrite_check_expr(
     expr: &mut ast::Expr,
     insertion: &Insertion,
