@@ -36,3 +36,166 @@ do_execsql_test_on_specific_db {:memory:} check-1.7-through-1.10-insert-nulls-ok
 } {3|4.0
 |6.0
 2|}
+
+do_execsql_test_on_specific_db {:memory:} check-1.11-update-ok {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(3,4.0);
+    UPDATE t1 SET x=2 WHERE x==3;
+    SELECT * FROM t1;
+} {2|4.0}
+
+do_execsql_test_in_memory_any_error check-1.12-update-fail-x-too-large {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(2,4.0);
+    UPDATE t1 SET x=7 WHERE x==2;
+}
+
+do_execsql_test_in_memory_any_error check-1.14-update-fail-x-equals-boundary {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(2,4.0);
+    UPDATE t1 SET x=5 WHERE x==2;
+}
+
+do_execsql_test_on_specific_db {:memory:} check-1.16-update-ok-multiple-fields {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL CHECK( y>x ));
+    INSERT INTO t1 VALUES(2,4.0);
+    UPDATE t1 SET x=4, y=11 WHERE x==2;
+    SELECT * FROM t1;
+} {4|11.0}
+
+do_execsql_test_on_specific_db {:memory:} check-2.1-create-with-named-constraints {
+    CREATE TABLE t2(
+      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ),
+      y REAL CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ),
+      z TEXT CONSTRAINT three CHECK( typeof(coalesce(z,''))=='text' )
+    );
+    CREATE TABLE t2n(
+      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ),
+      y NUMERIC CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ),
+      z TEXT CONSTRAINT three CHECK( typeof(coalesce(z,''))=='text' )
+    );
+} {}
+
+do_execsql_test_on_specific_db {:memory:} check-2.2-insert-correct-types {
+    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ));
+    INSERT INTO t2 VALUES(1);
+    SELECT * FROM t2;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} check-2.3-insert-nulls {
+    CREATE TABLE t2(x INTEGER, y REAL, z TEXT, CHECK(1));
+    INSERT INTO t2 VALUES(NULL, NULL, NULL);
+    SELECT count(*) FROM t2;
+} {1}
+
+do_execsql_test_in_memory_any_error check-2.4-insert-fail-wrong-type-x {
+    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ));
+    INSERT INTO t2 VALUES(1.1);
+}
+
+do_execsql_test_on_specific_db {:memory:} check-2.5-insert-ok-type-promotion {
+    CREATE TABLE t2(y REAL CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ));
+    INSERT INTO t2 VALUES(5);
+} {}
+
+do_execsql_test_in_memory_any_error check-2.5b-insert-fail-no-type-promotion {
+    CREATE TABLE t2n(y NUMERIC CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ));
+    INSERT INTO t2n VALUES(5);
+}
+
+do_execsql_test_on_specific_db {:memory:} check-2.6-insert-ok-type-coercion {
+    CREATE TABLE t2(z TEXT CONSTRAINT three CHECK( typeof(coalesce(z,''))=='text' ));
+    INSERT INTO t2 VALUES(3.14159);
+} {}
+
+do_execsql_test_on_specific_db {:memory:} check-3.7-ok-qualified-column-name {
+    CREATE TABLE t3(x, y, z, CHECK( t3.x<25 ));
+} {}
+
+do_execsql_test_on_specific_db {:memory:} check-3.8-insert-ok-qualified-column-check {
+    CREATE TABLE t3(x, y, z, CHECK( t3.x<25 ));
+    INSERT INTO t3 VALUES(1,2,3);
+    SELECT * FROM t3;
+} {1|2|3}
+
+do_execsql_test_in_memory_any_error check-3.9-insert-fail-qualified-column-check {
+    CREATE TABLE t3(x, y, z, CHECK( t3.x<25 ));
+    INSERT INTO t3 VALUES(111,222,333);
+}
+
+do_execsql_test_on_specific_db {:memory:} check-4.1-to-4.5-complex-check-ok {
+    CREATE TABLE t4(x, y, CHECK (x+y==11 OR x*y==12 OR x/y BETWEEN 5 AND 8 OR -x==y+10));
+    INSERT INTO t4 VALUES(1,10); 
+    UPDATE t4 SET x=4, y=3;
+    UPDATE t4 SET x=12, y=2;  
+    UPDATE t4 SET x=12, y=-22;
+    SELECT * FROM t4;
+} {12|-22}
+
+do_execsql_test_in_memory_any_error check-4.6-complex-check-fail {
+    CREATE TABLE t4(x, y, CHECK (x+y==11 OR x*y==12 OR x/y BETWEEN 5 AND 8 OR -x==y+10));
+    INSERT INTO t4 VALUES(12, -22);
+    UPDATE t4 SET x=0, y=1;
+}
+
+
+do_execsql_test_in_memory_any_error check-6.5-update-or-fail {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL);
+    INSERT INTO t1 VALUES (4, 11.0);
+    UPDATE OR FAIL t1 SET x=7-x, y=0;
+}
+
+do_execsql_test_in_memory_any_error check-6.7-insert-or-rollback {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL);
+    BEGIN;
+    INSERT INTO t1 VALUES(1,30.0);
+    INSERT OR ROLLBACK INTO t1 VALUES(8,40.0);
+    COMMIT;
+}
+
+do_execsql_test_in_memory_any_error check-6.12-replace-fail {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL);
+    INSERT INTO t1 VALUES (3, 12.0);
+    REPLACE INTO t1 VALUES(6,7);
+}
+
+do_execsql_test_on_specific_db {:memory:} check-8.1-db-name-qualifier-ok {
+    CREATE TABLE t810(a, CHECK( main.t810.a>0 ));
+    CREATE TABLE t811(b, CHECK( xyzzy.t811.b BETWEEN 5 AND 10 ));
+} {}
+
+do_execsql_test_in_memory_any_error check-9.2-update-fail-rowid-check-b {
+    CREATE TABLE t1(
+        a INTEGER PRIMARY KEY,
+        b INTEGER NOT NULL CONSTRAINT 'b-check' CHECK( b>a ),
+        c INTEGER NOT NULL, d INTEGER NOT NULL
+    );
+    INSERT INTO t1(a,b,c,d) VALUES(1,2,4,3);
+    UPDATE t1 SET b=0 WHERE a=1;
+}
+
+do_execsql_test_in_memory_any_error check-9.3-update-fail-rowid-check-c {
+    CREATE TABLE t1(
+        a INTEGER PRIMARY KEY, b INTEGER NOT NULL,
+        c INTEGER NOT NULL CONSTRAINT 'c-check' CHECK( c>rowid*2 ),
+        d INTEGER NOT NULL
+    );
+    INSERT INTO t1(a,b,c,d) VALUES(1,2,4,3);
+    UPDATE t1 SET c=a*2 WHERE a=1;
+}
+
+
+do_execsql_test_on_specific_db {:memory:} check-11.0-collate-in-check-binary {
+    CREATE TABLE t1 (Col0 CHECK(1 COLLATE BINARY BETWEEN 1 AND 1) ) ;
+    INSERT INTO t1 VALUES (NULL);
+} {}
+
+do_execsql_test_on_specific_db {:memory:} check-11.3-collate-in-check-nocase {
+    CREATE TABLE t2(b, a CHECK(CASE 'abc' COLLATE nocase WHEN a THEN 1 ELSE 0 END));
+    INSERT INTO t2(a) VALUES('abc');
+    INSERT INTO t2(b, a) VALUES(1, 'abc'||'');
+    INSERT INTO t2(b, a) VALUES(2, 'abc');
+    SELECT count(*) FROM t2;
+} {3}
+
+
