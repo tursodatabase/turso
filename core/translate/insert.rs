@@ -2994,12 +2994,19 @@ pub fn rewrite_check_expr(
     )
 }
 
+// this is needed for insert or ignore.
+pub enum CheckFailureMode {
+    Halt,
+    Jump(BranchOffset),
+}
+
 pub fn emit_generic_check_constraints(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     insertion: &Insertion,
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    failure_mode: CheckFailureMode,
 ) -> Result<()> {
     if table.checks.is_empty() {
         return Ok(());
@@ -3078,15 +3085,23 @@ pub fn emit_generic_check_constraints(
 
         program.preassign_label_to_next_insn(fail_label);
 
-        let err_msg = match &constraint.name {
-            Some(name) => format!("CHECK constraint failed: {}", name.as_str()),
-            None => "CHECK constraint failed".to_string(),
-        };
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: err_msg,
-        });
-
+        match failure_mode {
+            CheckFailureMode::Halt => {
+                let err_msg = match &constraint.name {
+                    Some(name) => format!("CHECK constraint failed: {}", name.as_str()),
+                    None => "CHECK constraint failed".to_string(),
+                };
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_CHECK,
+                    description: err_msg,
+                });
+            }
+            CheckFailureMode::Jump(target_label) => {
+                program.emit_insn(Insn::Goto {
+                    target_pc: target_label,
+                });
+            }
+        }
         program.preassign_label_to_next_insn(continue_label);
     }
 
@@ -3101,5 +3116,17 @@ pub fn emit_check_constraints(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    emit_generic_check_constraints(program, ctx.table, insertion, resolver, connection)
+    let failure_mode = match ctx.on_conflict {
+        ResolveType::Ignore => CheckFailureMode::Jump(ctx.row_done_label),
+        _ => CheckFailureMode::Halt,
+    };
+
+    emit_generic_check_constraints(
+        program,
+        ctx.table,
+        insertion,
+        resolver,
+        connection,
+        failure_mode,
+    )
 }
