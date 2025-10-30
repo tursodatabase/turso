@@ -16,8 +16,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-    translate_condition_expr, walk_expr_mut, BindingBehavior, ConditionMetadata,
-    ReturningValueRegisters, WalkControl,
+    translate_condition_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
 };
 
 use crate::translate::fkeys::{

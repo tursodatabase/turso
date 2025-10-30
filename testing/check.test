@@ -191,4 +191,29 @@ do_execsql_test_on_specific_db {:memory:} check-11.3-collate-in-check-nocase {
     SELECT count(*) FROM t2;
 } {3}
 
+do_execsql_test_on_specific_db {:memory:} check-pragma-ignore-check-constraints-on {
+    CREATE TABLE t4(x, y, CHECK (x+y==11));
+    PRAGMA ignore_check_constraints=ON;
+    INSERT INTO t4 VALUES(0, 1);
+    SELECT * FROM t4;
+    PRAGMA integrity_check;
+} {0|1
+ok}
+
+do_execsql_test_on_specific_db {:memory:} check-insert-or-ignore-ok {
+    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL);
+    INSERT INTO t1 VALUES (4, 11.0);
+    INSERT OR IGNORE INTO t1 VALUES(5,4.0);
+    SELECT * FROM t1;
+} {4|11.0}
+
+# todo integrity_check
+# do_execsql_test_in_memory_any_error check-pragma-ignore-check-constraints-off {
+#    CREATE TABLE t4(x, y, CHECK (x+y==11));
+#    PRAGMA ignore_check_constraints=ON;
+#    INSERT INTO t4 VALUES(0, 1);
+#    PRAGMA ignore_check_constraints=OFF;
+#    PRAGMA integrity_check;
+#}
+
 
