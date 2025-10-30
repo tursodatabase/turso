@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: TursoDB
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Enberg"
+  given-names: "Pekka"
+  orcid: "https://orcid.org/0000-0002-5661-2124"
+- name: The TursoDB authors
+repository-code: "https://github.com/tursodatabase/turso"
+license: MIT
