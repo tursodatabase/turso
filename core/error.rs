@@ -57,8 +57,8 @@ pub enum LimboError {
     Busy,
     #[error("Conflict: {0}")]
     Conflict(String),
-    #[error("Database schema changed")]
-    SchemaUpdated,
+    #[error("Database schema changed: new_schema_version={new_schema_version}")]
+    SchemaUpdated { new_schema_version: u32 },
     #[error(
         "Database is empty, header does not exist - page 1 should've been allocated before this"
     )]
