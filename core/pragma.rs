@@ -147,6 +147,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        IgnoreCheckConstraints => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["ignore_check_constraints"],
+        ),
     }
 }
 
