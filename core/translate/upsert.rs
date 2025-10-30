@@ -9,7 +9,9 @@ use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
-use crate::translate::insert::{InsertEmitCtx, emit_generic_check_constraints, format_unique_violation_desc};
+use crate::translate::insert::{
+    emit_generic_check_constraints, format_unique_violation_desc, InsertEmitCtx,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::Connection;
@@ -464,20 +466,25 @@ pub fn emit_upsert(
         }
     }
 
-
     if let Some(btree_table) = table.btree() {
-        let col_mappings: Vec<crate::translate::insert::ColMapping> = btree_table.columns.iter().enumerate().map(|(i, col)| {
-            crate::translate::insert::ColMapping {
+        let col_mappings: Vec<crate::translate::insert::ColMapping> = btree_table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| crate::translate::insert::ColMapping {
                 column: col,
                 value_index: None,
                 register: new_start + i,
-            }
-        }).collect();
+            })
+            .collect();
 
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
         let insertion_info = crate::translate::insert::Insertion {
-            key: crate::translate::insert::InsertionKey::LiteralRowid { value_index: None, register: new_rowid },
+            key: crate::translate::insert::InsertionKey::LiteralRowid {
+                value_index: None,
+                register: new_rowid,
+            },
             col_mappings,
             record_reg: 0,
         };
@@ -487,7 +494,7 @@ pub fn emit_upsert(
             &btree_table,
             &insertion_info,
             resolver,
-            connection
+            connection,
         )?;
     }
 
