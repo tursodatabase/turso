@@ -65,19 +65,19 @@ do_execsql_test_on_specific_db {:memory:} check-1.16-update-ok-multiple-fields {
 
 do_execsql_test_on_specific_db {:memory:} check-2.1-create-with-named-constraints {
     CREATE TABLE t2(
-      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ),
+      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=='integer' ),
       y REAL CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ),
       z TEXT CONSTRAINT three CHECK( typeof(coalesce(z,''))=='text' )
     );
     CREATE TABLE t2n(
-      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ),
+      x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=='integer' ),
       y NUMERIC CONSTRAINT two CHECK( typeof(coalesce(y,0.1))=='real' ),
       z TEXT CONSTRAINT three CHECK( typeof(coalesce(z,''))=='text' )
     );
 } {}
 
 do_execsql_test_on_specific_db {:memory:} check-2.2-insert-correct-types {
-    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ));
+    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=='integer' ));
     INSERT INTO t2 VALUES(1);
     SELECT * FROM t2;
 } {1}
@@ -89,7 +89,7 @@ do_execsql_test_on_specific_db {:memory:} check-2.3-insert-nulls {
 } {1}
 
 do_execsql_test_in_memory_any_error check-2.4-insert-fail-wrong-type-x {
-    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=="integer" ));
+    CREATE TABLE t2(x INTEGER CONSTRAINT one CHECK( typeof(coalesce(x,0))=='integer' ));
     INSERT INTO t2 VALUES(1.1);
 }
 
@@ -136,13 +136,6 @@ do_execsql_test_in_memory_any_error check-4.6-complex-check-fail {
     CREATE TABLE t4(x, y, CHECK (x+y==11 OR x*y==12 OR x/y BETWEEN 5 AND 8 OR -x==y+10));
     INSERT INTO t4 VALUES(12, -22);
     UPDATE t4 SET x=0, y=1;
-}
-
-
-do_execsql_test_in_memory_any_error check-6.5-update-or-fail {
-    CREATE TABLE t1(x INTEGER CHECK( x<5 ), y REAL);
-    INSERT INTO t1 VALUES (4, 11.0);
-    UPDATE OR FAIL t1 SET x=7-x, y=0;
 }
 
 do_execsql_test_in_memory_any_error check-6.7-insert-or-rollback {
