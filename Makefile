@@ -68,6 +68,14 @@ test-shell: build uv-sync-test
 
 test-compat: check-tcl-version
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
+
+test-single: check-tcl-version
+	@if [ -z "$(TEST)" ]; then \
+		echo "Usage: make test-single TEST=path/to/test.test"; \
+		exit 1; \
+	fi
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/$(TEST)
+.PHONY: test-single
 .PHONY: test-compat
 
 test-vector:
