@@ -1507,6 +1507,7 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    IgnoreCheckConstraints,
 }
 
 /// `CREATE TRIGGER` time
