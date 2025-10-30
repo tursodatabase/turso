@@ -36,7 +36,7 @@ use crate::translate::fkeys::{
     emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
-use crate::translate::insert::{ColMapping, Insertion, emit_check_constraints};
+use crate::translate::insert::{ColMapping, Insertion};
 use crate::translate::plan::{
     DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
 };

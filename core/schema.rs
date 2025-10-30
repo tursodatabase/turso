@@ -3048,7 +3048,6 @@ mod tests {
                 "INT".to_string(),
                 None,
             )],
-            checks:vec![],
             checks: vec![],
             unique_sets: vec![],
             foreign_keys: vec![],
