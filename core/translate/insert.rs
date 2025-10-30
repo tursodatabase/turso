@@ -2705,6 +2705,10 @@ pub fn emit_generic_check_constraints(
         return Ok(());
     }
 
+    if connection.ignore_check_constraints_enabled() {
+        return Ok(());
+    }
+
     let affinity_str = insertion
         .col_mappings
         .iter()
