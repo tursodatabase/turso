@@ -24,6 +24,15 @@ do_execsql_test_on_specific_db {:memory:} strict-basic-creation {
     SELECT * FROM test1;
 } {1|item1|10.5}
 
+do_execsql_test_on_specific_db {:memory:} self-insert-sum-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t(b) VALUES(1),(2);
+    INSERT INTO t(b) SELECT sum(b) FROM t;
+    SELECT a, b FROM t ORDER BY a;
+} {1|1
+2|2
+3|3}
+
 # Reproducer for https://github.com/tursodatabase/turso/issues/2822
 do_execsql_test_on_specific_db {:memory:} strict-type-case-insensitivity {
     CREATE TABLE test1 (id integer, name text, price real) STRICT;

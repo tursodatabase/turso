@@ -1478,7 +1478,12 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     let translate_value_fn =
         |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| {
             if let Some(temp_table_ctx) = temp_table_ctx {
-                prg.emit_column_or_rowid(temp_table_ctx.cursor_id, value_index, column_register);
+                prg.emit_insn(Insn::Column {
+                    cursor_id: temp_table_ctx.cursor_id,
+                    column: value_index,
+                    dest: column_register,
+                    default: None,
+                });
             } else {
                 prg.emit_insn(Insn::Copy {
                     src_reg: yield_reg + value_index,
