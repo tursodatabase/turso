@@ -265,7 +265,7 @@ fn test_vector_sparse_ivf_fuzz() {
 
     let (mut rng, _) = rng_from_time_or_env();
     let mut operation = 0;
-    for attempt in 0..10 {
+    for _ in 0..10 {
         let seed = rng.next_u64();
         tracing::info!("======== seed: {} ========", seed);
 

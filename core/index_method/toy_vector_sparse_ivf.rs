@@ -158,29 +158,29 @@ struct ComponentStat {
 
 fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
     let Some(record) = record else {
-        return Err(LimboError::Corrupt(format!(
-            "stats index corrupted: expected row"
-        )));
+        return Err(LimboError::Corrupt(
+            "stats index corrupted: expected row".to_string(),
+        ));
     };
     let ValueRef::Integer(position) = record.get_value(0)? else {
-        return Err(LimboError::Corrupt(format!(
-            "stats index corrupted: expected integer"
-        )));
+        return Err(LimboError::Corrupt(
+            "stats index corrupted: expected integer".to_string(),
+        ));
     };
     let ValueRef::Integer(cnt) = record.get_value(1)? else {
-        return Err(LimboError::Corrupt(format!(
-            "stats index corrupted: expected integer"
-        )));
+        return Err(LimboError::Corrupt(
+            "stats index corrupted: expected integer".to_string(),
+        ));
     };
     let ValueRef::Float(min) = record.get_value(2)? else {
-        return Err(LimboError::Corrupt(format!(
-            "stats index corrupted: expected float"
-        )));
+        return Err(LimboError::Corrupt(
+            "stats index corrupted: expected float".to_string(),
+        ));
     };
     let ValueRef::Float(max) = record.get_value(3)? else {
-        return Err(LimboError::Corrupt(format!(
-            "stats index corrupted: expected float"
-        )));
+        return Err(LimboError::Corrupt(
+            "stats index corrupted: expected float".to_string(),
+        ));
     };
     Ok(ComponentStat {
         position: position as u32,
@@ -198,24 +198,24 @@ struct ComponentRow {
 
 fn parse_scratch_row(record: Option<&ImmutableRecord>) -> Result<ComponentRow> {
     let Some(record) = record else {
-        return Err(LimboError::Corrupt(format!(
-            "scratch index corrupted: expected row"
-        )));
+        return Err(LimboError::Corrupt(
+            "scratch index corrupted: expected row".to_string(),
+        ));
     };
     let ValueRef::Integer(position) = record.get_value(0)? else {
-        return Err(LimboError::Corrupt(format!(
-            "scratch index corrupted: expected integer"
-        )));
+        return Err(LimboError::Corrupt(
+            "scratch index corrupted: expected integer".to_string(),
+        ));
     };
     let ValueRef::Float(sum) = record.get_value(1)? else {
-        return Err(LimboError::Corrupt(format!(
-            "scratch index corrupted: expected float"
-        )));
+        return Err(LimboError::Corrupt(
+            "scratch index corrupted: expected float".to_string(),
+        ));
     };
     let ValueRef::Integer(rowid) = record.get_value(2)? else {
-        return Err(LimboError::Corrupt(format!(
-            "scratch index corrupted: expected integer"
-        )));
+        return Err(LimboError::Corrupt(
+            "scratch index corrupted: expected integer".to_string(),
+        ));
     };
     Ok(ComponentRow {
         position: position as u32,
@@ -604,7 +604,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             let key = ImmutableRecord::from_values(
                                 &[
                                     Value::Integer(position as i64),
-                                    Value::Integer(1 as i64),
+                                    Value::Integer(1),
                                     Value::Float(value),
                                     Value::Float(value),
                                 ],
@@ -760,11 +760,6 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let result = return_if_io!(
                         cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
-                    let record = match cursor.record().unwrap() {
-                        IOResult::Done(record) => record,
-                        IOResult::IO(iocompletions) => unreachable!(),
-                    };
-                    tracing::debug!("delete_state: seek: result={:?}", result);
                     match result {
                         SeekResult::Found => {
                             self.delete_state =
@@ -843,9 +838,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             };
                         }
                         SeekResult::NotFound | SeekResult::TryAdvance => {
-                            return Err(LimboError::Corrupt(format!(
-                                "stats index corrupted: can't find component row"
-                            )))
+                            return Err(LimboError::Corrupt(
+                                "stats index corrupted: can't find component row".to_string(),
+                            ))
                         }
                     }
                 }
@@ -959,7 +954,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     key,
                 } => {
                     let p = positions.as_ref().unwrap();
-                    if p.len() == 0 && key.is_none() {
+                    if p.is_empty() && key.is_none() {
                         let mut components = components.take().unwrap();
                         // order by cnt ASC in order to check low-cardinality components first
                         components.sort_by_key(|c| c.cnt);
@@ -1043,7 +1038,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     sum_threshold,
                 } => {
                     let c = components.as_ref().unwrap();
-                    if c.len() == 0 && key.is_none() {
+                    if c.is_empty() && key.is_none() {
                         let distances = distances.take().unwrap();
                         self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
                         return Ok(IOResult::Done(!self.search_result.is_empty()));
@@ -1215,7 +1210,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                 } => {
                     let c = current.as_ref().unwrap();
-                    if c.len() == 0 && rowid.is_none() {
+                    if c.is_empty() && rowid.is_none() {
                         self.search_state = VectorSparseInvertedIndexSearchState::Seek {
                             sum: *sum,
                             components: components.take(),
@@ -1232,7 +1227,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         *rowid = Some(current.as_mut().unwrap().pop_front().unwrap());
                     }
 
-                    let rowid = rowid.as_ref().unwrap().clone();
+                    let rowid = *rowid.as_ref().unwrap();
                     let k = SeekKey::TableRowId(rowid);
                     let result = return_if_io!(main.seek(k, SeekOp::GE { eq_only: true }));
                     if !matches!(result, SeekResult::Found) {
