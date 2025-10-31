@@ -11,10 +11,9 @@ use crate::model::query::select::{
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
-    Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+    Column, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use itertools::Itertools;
 use rand::seq::IndexedRandom;
 use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
@@ -289,6 +288,8 @@ impl Arbitrary for Insert {
             })
         };
 
+        // we keep this here for now, because gen_select does not generate subqueries, and they're
+        // important for surfacing bugs.
         let gen_nested_self_insert = |rng: &mut R| {
             let table = pick(env.tables(), rng);
 
@@ -325,14 +326,36 @@ impl Arbitrary for Insert {
             })
         };
 
-        backtrack(
-            vec![
-                (1, Box::new(gen_values)),
-                (1, Box::new(gen_nested_self_insert)),
-            ],
-            rng,
-        )
-        .expect("backtrack with these arguments should not return None")
+        let gen_select = |rng: &mut R| {
+            // Find a non-empty table
+            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
+            let row = pick(&select_table.rows, rng);
+            let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
+            // TODO change for arbitrary_sized and insert from arbitrary tables
+            // Build a SELECT from the same table to ensure schema matches for INSERT INTO ... SELECT
+            let select = Select::simple(select_table.name.clone(), predicate);
+            Some(Insert::Select {
+                table: select_table.name.clone(),
+                select: Box::new(select),
+            })
+        };
+
+        let mut choices = vec![
+            (
+                1,
+                Box::new(gen_values) as Box<dyn Fn(&mut R) -> Option<Insert>>,
+            ),
+            (
+                1,
+                Box::new(gen_nested_self_insert) as Box<dyn Fn(&mut R) -> Option<Insert>>,
+            ),
+        ];
+
+        if env.opts().arbitrary_insert_into_select {
+            choices.push((1, Box::new(gen_select)));
+        }
+
+        backtrack(choices, rng).expect("backtrack should with these arguments not return None")
     }
 }
 
