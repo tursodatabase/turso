@@ -305,6 +305,13 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_where {
 6
 8}
 
+do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_values {
+    CREATE TABLE t(a, b);
+    INSERT INTO t(a, b) SELECT * FROM (VALUES(3, 3)) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM t ORDER BY rowid;
+} {3|3
+4|4}
+
 do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
     
