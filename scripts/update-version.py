@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Script to update version in Cargo.toml, package.json, and package-lock.json files for the Turso project.
+Script to update version in Cargo.toml, package.json, package-lock.json, and
+gradle.properties files for the Turso project.
 This script updates all occurrences of the version in the workspace configuration,
 updates the JavaScript and WebAssembly bindings package.json and package-lock.json files,
+updates the Java bindings gradle.properties file,
 uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
 """
 
@@ -35,6 +37,8 @@ NPM_WORKSPACE_PACKAGES = [
 NPM_WORKSPACES = [
     "bindings/javascript"
 ]
+
+JAVA_GRADLE_PROPERTIES = "bindings/java/gradle.properties"
 
 
 def parse_args():
@@ -169,6 +173,28 @@ def update_all_packages(new_version):
     return results
 
 
+def update_gradle_properties(new_version):
+    """Update version in gradle.properties file."""
+    try:
+        gradle_path = Path(JAVA_GRADLE_PROPERTIES)
+        if not gradle_path.exists():
+            print(f"Warning: {JAVA_GRADLE_PROPERTIES} not found, skipping Java version update")
+            return False
+
+        content = gradle_path.read_text()
+
+        # Pattern to match projectVersion=x.y.z
+        pattern = r"(projectVersion\s*=\s*)([^\s]+)"
+        updated_content = re.sub(pattern, rf"\g<1>{new_version}", content)
+
+        gradle_path.write_text(updated_content)
+        print(f"Updated {JAVA_GRADLE_PROPERTIES} to version {new_version}")
+        return True
+    except Exception as e:
+        print(f"Error updating gradle.properties: {e}")
+        return False
+
+
 def run_cargo_update():
     """Run cargo update to update the Cargo.lock file."""
     try:
@@ -185,6 +211,10 @@ def create_git_commit_and_tag(version):
     try:
         # Add files that exist and have changes
         files_to_add = ["Cargo.toml", "Cargo.lock"]
+
+        # Add Java gradle.properties if it exists
+        if os.path.exists(JAVA_GRADLE_PROPERTIES):
+            files_to_add.append(JAVA_GRADLE_PROPERTIES)
 
         # Add all potential package.json and package-lock.json files
         for package_path in NPM_PACKAGES:
@@ -229,6 +259,9 @@ def main():
 
     # Update all npm packages
     update_all_packages(new_version)
+
+    # Update Java gradle.properties
+    update_gradle_properties(new_version)
 
     # Update Cargo.lock using cargo update
     run_cargo_update()
