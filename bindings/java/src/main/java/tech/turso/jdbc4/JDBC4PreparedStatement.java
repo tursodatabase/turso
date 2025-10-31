@@ -189,7 +189,47 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setObject(int parameterIndex, Object x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (x instanceof String) {
+      setString(parameterIndex, (String) x);
+    } else if (x instanceof Integer) {
+      setInt(parameterIndex, (Integer) x);
+    } else if (x instanceof Long) {
+      setLong(parameterIndex, (Long) x);
+    } else if (x instanceof Boolean) {
+      setBoolean(parameterIndex, (Boolean) x);
+    } else if (x instanceof Double) {
+      setDouble(parameterIndex, (Double) x);
+    } else if (x instanceof Float) {
+      setFloat(parameterIndex, (Float) x);
+    } else if (x instanceof Byte) {
+      setByte(parameterIndex, (Byte) x);
+    } else if (x instanceof Short) {
+      setShort(parameterIndex, (Short) x);
+    } else if (x instanceof byte[]) {
+      setBytes(parameterIndex, (byte[]) x);
+    } else if (x instanceof Timestamp) {
+      setTimestamp(parameterIndex, (Timestamp) x);
+    } else if (x instanceof Date) {
+      setDate(parameterIndex, (Date) x);
+    } else if (x instanceof Time) {
+      setTime(parameterIndex, (Time) x);
+    } else if (x instanceof BigDecimal) {
+      setBigDecimal(parameterIndex, (BigDecimal) x);
+    } else if (x instanceof Blob
+        || x instanceof Clob
+        || x instanceof InputStream
+        || x instanceof Reader) {
+      throw new SQLException(
+          "setObject does not yet support LOB or Stream types because the corresponding set methods are unimplemented. Type found: "
+              + x.getClass().getName());
+    } else {
+      throw new SQLException("Unsupported object type in setObject: " + x.getClass().getName());
+    }
   }
 
   @Override
