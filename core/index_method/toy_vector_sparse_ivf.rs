@@ -99,6 +99,12 @@ pub enum VectorSparseInvertedIndexDeleteState {
         rowid: i64,
         idx: usize,
     },
+    NextScratch {
+        vector: Option<Vector<'static>>,
+        sum: f64,
+        rowid: i64,
+        idx: usize,
+    },
     DeleteScratch {
         vector: Option<Vector<'static>>,
         sum: f64,
@@ -509,6 +515,12 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ],
                         3,
                     );
+                    tracing::debug!(
+                        "insert_state: seek: component={}, sum={}, rowid={}",
+                        vector.as_ref().unwrap().as_f32_sparse().idx[*idx],
+                        *sum,
+                        *rowid,
+                    );
                     self.insert_state = VectorSparseInvertedIndexInsertState::SeekScratch {
                         vector: vector.take(),
                         sum: *sum,
@@ -525,9 +537,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     key,
                 } => {
                     let k = key.as_ref().unwrap();
-                    let _ =
-                        return_if_io!(scratch_cursor
-                            .seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false }));
+                    let result = return_if_io!(
+                        scratch_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
+                    );
+                    tracing::debug!("insert_state: seek: result={:?}", result);
                     self.insert_state = VectorSparseInvertedIndexInsertState::InsertScratch {
                         vector: vector.take(),
                         sum: *sum,
@@ -566,7 +579,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 } => {
                     let k = key.as_ref().unwrap();
                     let result = return_if_io!(
-                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
+                        stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
                     match result {
                         SeekResult::Found => {
@@ -737,11 +750,51 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                     key,
                 } => {
+                    tracing::debug!(
+                        "delete_state: seek: component={}, sum={}, rowid={}",
+                        vector.as_ref().unwrap().as_f32_sparse().idx[*idx],
+                        *sum,
+                        *rowid,
+                    );
                     let k = key.as_ref().unwrap();
                     let result = return_if_io!(
                         cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
-                    if !matches!(result, SeekResult::Found) {
+                    let record = match cursor.record().unwrap() {
+                        IOResult::Done(record) => record,
+                        IOResult::IO(iocompletions) => unreachable!(),
+                    };
+                    tracing::debug!("delete_state: seek: result={:?}", result);
+                    match result {
+                        SeekResult::Found => {
+                            self.delete_state =
+                                VectorSparseInvertedIndexDeleteState::DeleteScratch {
+                                    vector: vector.take(),
+                                    sum: *sum,
+                                    idx: *idx,
+                                    rowid: *rowid,
+                                };
+                        }
+                        SeekResult::TryAdvance => {
+                            self.delete_state = VectorSparseInvertedIndexDeleteState::NextScratch {
+                                vector: vector.take(),
+                                sum: *sum,
+                                idx: *idx,
+                                rowid: *rowid,
+                            };
+                        }
+                        SeekResult::NotFound => {
+                            return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
+                        }
+                    }
+                }
+                VectorSparseInvertedIndexDeleteState::NextScratch {
+                    vector,
+                    sum,
+                    rowid,
+                    idx,
+                } => {
+                    if !return_if_io!(cursor.next()) {
                         return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
                     }
                     self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteScratch {
@@ -1022,7 +1075,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                     } else {
                                         *sum_threshold = Some(-1.0);
                                     }
-                                    tracing::info!(
+                                    tracing::debug!(
                                         "sum_threshold={:?}, max_threshold={}, remained_sum={}, sum={}, components={:?}",
                                         sum_threshold,
                                         best,
