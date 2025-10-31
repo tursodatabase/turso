@@ -284,7 +284,7 @@ fn test_vector_sparse_ivf_fuzz() {
         simple_conn.wal_auto_checkpoint_disable();
         index_conn.wal_auto_checkpoint_disable();
         index_conn
-            .execute(&format!("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding) WITH (delta = {delta})"))
+            .execute(format!("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding) WITH (delta = {delta})"))
             .unwrap();
 
         let vector = |rng: &mut ChaCha8Rng| {
