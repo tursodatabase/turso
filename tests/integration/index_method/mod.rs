@@ -265,7 +265,7 @@ fn test_vector_sparse_ivf_fuzz() {
 
     let (mut rng, _) = rng_from_time_or_env();
     let mut operation = 0;
-    for _ in 0..10 {
+    for delta in [0.0, 0.01, 0.05, 0.1, 0.5] {
         let seed = rng.next_u64();
         tracing::info!("======== seed: {} ========", seed);
 
@@ -284,7 +284,7 @@ fn test_vector_sparse_ivf_fuzz() {
         simple_conn.wal_auto_checkpoint_disable();
         index_conn.wal_auto_checkpoint_disable();
         index_conn
-            .execute("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding)")
+            .execute(&format!("CREATE INDEX t_idx ON t USING toy_vector_sparse_ivf (embedding) WITH (delta = {delta})"))
             .unwrap();
 
         let vector = |rng: &mut ChaCha8Rng| {
@@ -335,17 +335,39 @@ fn test_vector_sparse_ivf_fuzz() {
                 tracing::info!("({}) {}", operation, sql);
                 let simple_rows = limbo_exec_rows(&simple_db, &simple_conn, &sql);
                 let index_rows = limbo_exec_rows(&index_db, &index_conn, &sql);
+                tracing::info!("simple: {:?}, index_rows: {:?}", simple_rows, index_rows);
                 assert!(index_rows.len() <= simple_rows.len());
                 for (a, b) in index_rows.iter().zip(simple_rows.iter()) {
-                    assert_eq!(a, b);
+                    if delta == 0.0 {
+                        assert_eq!(a, b);
+                    } else {
+                        match (&a[1], &b[1]) {
+                            (rusqlite::types::Value::Real(a), rusqlite::types::Value::Real(b)) => {
+                                assert!(
+                                    *a >= *b || (*a - *b).abs() < 1e-5,
+                                    "a={}, b={}, delta={}",
+                                    *a,
+                                    *b,
+                                    delta
+                                );
+                                assert!(
+                                    *a - delta <= *b || (*a - delta - *b).abs() < 1e-5,
+                                    "a={}, b={}, delta={}",
+                                    *a,
+                                    *b,
+                                    delta
+                                );
+                            }
+                            _ => panic!("unexpected column values"),
+                        }
+                    }
                 }
                 for row in simple_rows.iter().skip(index_rows.len()) {
                     match row[1] {
-                        rusqlite::types::Value::Real(r) => assert_eq!(r, 1.0),
+                        rusqlite::types::Value::Real(r) => assert!((1.0 - r) < 1e-5),
                         _ => panic!("unexpected simple row value"),
                     }
                 }
-                tracing::info!("simple: {:?}, index_rows: {:?}", simple_rows, index_rows);
             }
         }
     }
