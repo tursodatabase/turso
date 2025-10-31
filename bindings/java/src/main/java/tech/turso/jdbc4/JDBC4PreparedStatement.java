@@ -26,9 +26,7 @@ import java.util.Calendar;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
-/**
- * JDBC 4 PreparedStatement implementation for Turso databases.
- */
+/** JDBC 4 PreparedStatement implementation for Turso databases. */
 public final class JDBC4PreparedStatement extends JDBC4Statement implements PreparedStatement {
 
   private final String sql;
@@ -38,7 +36,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
    * Creates a new JDBC4PreparedStatement.
    *
    * @param connection the database connection
-   * @param sql        the SQL statement to prepare
+   * @param sql the SQL statement to prepare
    * @throws SQLException if a database access error occurs
    */
   public JDBC4PreparedStatement(JDBC4Connection connection, String sql) throws SQLException {
@@ -214,19 +212,21 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
       setShort(parameterIndex, (Short) x);
     } else if (x instanceof byte[]) {
       setBytes(parameterIndex, (byte[]) x);
-    } else if (x instanceof java.sql.Timestamp) {
-      setTimestamp(parameterIndex, (java.sql.Timestamp) x);
-    } else if (x instanceof java.sql.Date) {
-      setDate(parameterIndex, (java.sql.Date) x);
-    } else if (x instanceof java.sql.Time) {
-      setTime(parameterIndex, (java.sql.Time) x);
-    } else if (x instanceof java.math.BigDecimal) {
-      setBigDecimal(parameterIndex, (java.math.BigDecimal) x);
-    } else if (x instanceof Blob || x instanceof Clob || x instanceof InputStream || x instanceof Reader) {
+    } else if (x instanceof Timestamp) {
+      setTimestamp(parameterIndex, (Timestamp) x);
+    } else if (x instanceof Date) {
+      setDate(parameterIndex, (Date) x);
+    } else if (x instanceof Time) {
+      setTime(parameterIndex, (Time) x);
+    } else if (x instanceof BigDecimal) {
+      setBigDecimal(parameterIndex, (BigDecimal) x);
+    } else if (x instanceof Blob
+        || x instanceof Clob
+        || x instanceof InputStream
+        || x instanceof Reader) {
       throw new SQLException(
           "setObject does not yet support LOB or Stream types because the corresponding set methods are unimplemented. Type found: "
-              + x.getClass().getName()
-      );
+              + x.getClass().getName());
     } else {
       throw new SQLException("Unsupported object type in setObject: " + x.getClass().getName());
     }
@@ -251,8 +251,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setCharacterStream(int parameterIndex, Reader reader, int length)
-      throws SQLException {
-  }
+      throws SQLException {}
 
   @Override
   public void setRef(int parameterIndex, Ref x) throws SQLException {
