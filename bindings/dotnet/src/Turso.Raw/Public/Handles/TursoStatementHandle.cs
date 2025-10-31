@@ -10,6 +10,12 @@ public class TursoStatementHandle() : SafeHandle(IntPtr.Zero, true)
         return true;
     }
 
+    public void ThrowIfInvalid()
+    {
+        if (IsInvalid)
+            throw new NullReferenceException("statement is invalid");
+    }
+
     public static TursoStatementHandle FromPtr(IntPtr ptr)
     {
         var handle = new TursoStatementHandle();

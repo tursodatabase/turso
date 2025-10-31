@@ -10,6 +10,12 @@ public class TursoDatabaseHandle() : SafeHandle(IntPtr.Zero, true)
         return true;
     }
 
+    public void ThrowIfInvalid()
+    {
+        if (IsInvalid)
+            throw new NullReferenceException("database is invalid");
+    }
+
     public static TursoDatabaseHandle FromPtr(IntPtr ptr)
     {
         var handle = new TursoDatabaseHandle();

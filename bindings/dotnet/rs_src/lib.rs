@@ -54,7 +54,7 @@ pub fn allocate<T>(value: T) -> *const T {
     Box::into_raw(Box::new(value))
 }
 
-pub fn allocate_string(str: &str) -> *const i8 {
+pub fn allocate_string(str: &str) -> *const c_char {
     std::ffi::CString::new(str).unwrap().into_raw()
 }
 
@@ -79,8 +79,16 @@ pub fn to_value(value: TursoValue) -> Value {
     }
 }
 
+/// Opens database with specified path. Returns pointer to the database
+/// If error occured, returns null and writes pointer to null-terminated string in error_ptr
+/// 
+/// # Safety
+/// 
+/// Pointer to the database should be freed with db_close. Error should be freed with free_string
+/// path_ptr should not be null
+/// error_ptr should points to a valid location for write
 #[no_mangle]
-pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *const Database {
+pub unsafe extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *const Database {
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
     let path_str = path_cstr.to_str();
 
@@ -101,18 +109,39 @@ pub extern "C" fn db_open(path_ptr: *const c_char, error_ptr: *mut Error) -> *co
     }
 }
 
+/// Disposes pointer to the database. 
+/// 
+/// # Safety
+/// 
+/// db_ptr should be pointer, allocated with db_open method
+/// db_close should be called only once per db_ptr
 #[no_mangle]
-pub extern "C" fn db_close(db_ptr: *mut Database) {
+pub unsafe extern "C" fn db_close(db_ptr: *mut Database) {
     let _ = unsafe { Box::from_raw(db_ptr) };
 }
 
+/// Disposes null terminated string
+/// 
+/// # Safety
+/// 
+/// Accepts error_ptr and other null terminated string, allocated in rust level
+/// free_string should be called only once per string_ptr
 #[no_mangle]
-pub extern "C" fn free_string(error_ptr: *mut i8) {
-    unsafe { drop(std::ffi::CString::from_raw(error_ptr)) };
+pub unsafe extern "C" fn free_string(string_ptr: *mut c_char) {
+    unsafe { drop(std::ffi::CString::from_raw(string_ptr)) };
 }
 
+/// Prepare sql statement. Returns pointer to prepared statement
+/// If error occured, returns null and writes pointer to null-terminated string in error_ptr
+/// 
+/// # Safety
+/// 
+/// db_ptr should not be null
+/// sql_ptr should not be null
+/// error_ptr should points to valid location for write
+/// Statement ptr and error_ptr should be freed when not null with free_statement and free_string methods
 #[no_mangle]
-pub extern "C" fn db_prepare_statement(
+pub unsafe extern "C" fn db_prepare_statement(
     db_ptr: *mut Database,
     sql_ptr: *const c_char,
     error_ptr: *mut Error,
@@ -132,25 +161,37 @@ pub extern "C" fn db_prepare_statement(
     }
 }
 
+/// Bind parameter to sql_statement
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be exact ptr from db_prepare_statement
+/// index should be >= 1
+/// parameter_value should be valid ponter to TursoValue
 #[no_mangle]
-pub extern "C" fn bind_parameter(
+pub unsafe extern "C" fn bind_parameter(
     statement_ptr: *mut Statement,
-    index: usize,
-    parameter_value: *mut TursoValue,
+    index: i32,
+    parameter_value: *const TursoValue,
 ) {
     let statement = unsafe { &mut (*statement_ptr) };
-    let parameter = unsafe { &mut (*parameter_value) };
-    statement.bind_at(NonZero::new(index).unwrap(), to_value(*parameter));
+    statement.bind_at(NonZero::new(index.try_into().unwrap()).unwrap(), to_value(*parameter_value));
 }
 
+/// Bind parameter to sql_statement by name
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be exact ptr from db_prepare_statement
+/// parameter_name should not be null
+/// parameter_value should be valid ponter to TursoValue
 #[no_mangle]
-pub extern "C" fn bind_named_parameter(
+pub unsafe extern "C" fn bind_named_parameter(
     statement_ptr: *mut Statement,
     parameter_name: *const c_char,
-    parameter_value_ptr: *mut TursoValue,
+    parameter_value: *const TursoValue,
 ) {
     let statement = unsafe { &mut (*statement_ptr) };
-    let parameter_value = unsafe { &mut (*parameter_value_ptr) };
     let parameter_name = unsafe { CStr::from_ptr(parameter_name) }.to_str().unwrap();
 
     for idx in 1..statement.parameters_count() + 1 {
@@ -166,14 +207,27 @@ pub extern "C" fn bind_named_parameter(
     }
 }
 
+/// Returns rows changed in statement
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be not null
 #[no_mangle]
-pub extern "C" fn db_statement_nchange(statement_ptr: *mut Statement) -> i64 {
+pub unsafe extern "C" fn db_statement_nchange(statement_ptr: *mut Statement) -> i64 {
     let statement = unsafe { &mut (*statement_ptr) };
     statement.n_change()
 }
 
+/// Execute statement
+/// If error occured, sets error_ptr to a pointer to null terminated string 
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be not null
+/// error_ptr should be not null and points to a location that valid for write
+/// error_ptr should be freed if not null
 #[no_mangle]
-pub extern "C" fn db_statement_execute_step(
+pub unsafe extern "C" fn db_statement_execute_step(
     statement_ptr: *mut Statement,
     error_ptr: *mut Error,
 ) -> bool {
@@ -212,20 +266,32 @@ pub extern "C" fn db_statement_execute_step(
     }
 }
 
+/// Free statement_ptr
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be not null
+/// free_statement should be called only once per statement_ptr
 #[no_mangle]
-pub extern "C" fn free_statement(statement_ptr: *mut Statement) {
+pub unsafe extern "C" fn free_statement(statement_ptr: *mut Statement) {
     let mut statement = unsafe { Box::from_raw(statement_ptr) };
     statement.reset();
 }
 
+/// Get current value from statement
+/// 
+/// # Safety
+/// 
+/// statement_ptr should be not null
+/// col_idx should be >= 0
 #[no_mangle]
-pub extern "C" fn db_statement_get_value(
+pub unsafe extern "C" fn db_statement_get_value(
     statement_ptr: *mut Statement,
-    col_idx: usize,
+    col_idx: i32,
 ) -> TursoValue {
     let statement = unsafe { &mut (*statement_ptr) };
     if let Some(row) = statement.row() {
-        let value = match row.get_value(col_idx) {
+        let value = match row.get_value(col_idx.try_into().unwrap()) {
             Value::Null => TursoValue {
                 value_type: ValueType::Null,
                 value: TursoValueUnion { int_val: 0 },
@@ -272,14 +338,25 @@ pub extern "C" fn db_statement_get_value(
     }
 }
 
+/// Get number of columns in statement
+/// 
+/// # Safety
+/// 
+/// statement_ptr should not be null
 #[no_mangle]
-pub extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement) -> i32 {
+pub unsafe extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement) -> i32 {
     let statement = unsafe { &mut (*statement_ptr) };
     statement.num_columns().try_into().unwrap()
 }
 
+/// Get column name 
+/// 
+/// # Safety
+/// 
+/// statement_ptr should not be null
+/// index should be >= 0
 #[no_mangle]
-pub extern "C" fn db_statement_column_name(statement_ptr: *mut Statement, index: i32) -> *const i8 {
+pub unsafe extern "C" fn db_statement_column_name(statement_ptr: *mut Statement, index: i32) -> *const i8 {
     let statement = unsafe { &mut (*statement_ptr) };
     let col_name = statement.get_column_name(index.try_into().unwrap());
     match col_name {
@@ -288,8 +365,13 @@ pub extern "C" fn db_statement_column_name(statement_ptr: *mut Statement, index:
     }
 }
 
+/// Check statement has rows
+/// 
+/// # Safety
+/// 
+/// statement_ptr should not be null
 #[no_mangle]
-pub extern "C" fn db_statement_has_rows(statement_ptr: *mut Statement) -> bool {
+pub unsafe extern "C" fn db_statement_has_rows(statement_ptr: *mut Statement) -> bool {
     let statement = unsafe { &mut (*statement_ptr) };
     match statement.row() {
         Some(_val) => true,

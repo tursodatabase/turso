@@ -10,6 +10,8 @@ public static class TursoBindings
 {
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
+        ArgumentNullException.ThrowIfNull(path);
+
         var dbPtr = TursoInterop.OpenDatabase(path, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             ThrowException(errorPtr);
@@ -19,6 +21,9 @@ public static class TursoBindings
 
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
     {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(sql);
+
         var statementPtr = TursoInterop.PrepareStatement(db, sql, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             ThrowException(errorPtr);
@@ -28,6 +33,9 @@ public static class TursoBindings
 
     public static void BindParameter(TursoStatementHandle statement, int index, TursoValue parameter)
     {
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(index);
+
         var nativeValue = FromValue(parameter, out var handle);
         try
         {
@@ -46,6 +54,9 @@ public static class TursoBindings
 
     public static void BindNamedParameter(TursoStatementHandle statement, string name, TursoValue parameter)
     {
+        statement.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+
         var nativeValue = FromValue(parameter, out var handle);
         try
         {
@@ -64,6 +75,8 @@ public static class TursoBindings
 
     public static bool Read(TursoStatementHandle statement)
     {
+        statement.ThrowIfInvalid();
+
         var hasData = TursoInterop.StatementExecuteStep(statement, out var errorPtr);
         if (errorPtr != IntPtr.Zero)
             ThrowException(errorPtr);
@@ -72,8 +85,8 @@ public static class TursoBindings
 
     public static TursoValue GetValue(TursoStatementHandle statement, int columnIndex)
     {
-        if (columnIndex < 0)
-            throw new ArgumentOutOfRangeException(nameof(columnIndex));
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegative(columnIndex);
 
         var rowValue = TursoInterop.GetValueFromStatement(statement, columnIndex);
         return rowValue.ValueType switch
@@ -91,8 +104,8 @@ public static class TursoBindings
 
     public static string GetName(TursoStatementHandle statement, int ordinal)
     {
-        if (ordinal < 0)
-            throw new ArgumentOutOfRangeException(nameof(ordinal));
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
 
         var cname = TursoInterop.StatementColumnName(statement, ordinal);
         try
@@ -107,17 +120,23 @@ public static class TursoBindings
 
     public static int GetFieldCount(TursoStatementHandle statement)
     {
+        statement.ThrowIfInvalid();
+
         return TursoInterop.StatementNumColumns(statement);
     }
 
     public static int RowsAffected(TursoStatementHandle statement)
     {
+        statement.ThrowIfInvalid();
+
         return (int)TursoInterop.StatementRowsAffected(statement);
     }
 
 
     public static bool HasRows(TursoStatementHandle statement)
     {
+        statement.ThrowIfInvalid();
+
         return TursoInterop.StatementHasRows(statement);
     }
 

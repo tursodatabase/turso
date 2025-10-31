@@ -4,7 +4,7 @@ using Turso.Raw.Public.Value;
 namespace Turso.Raw.Data;
 
 [StructLayout(LayoutKind.Explicit)]
-internal struct TursoNativeValue
+internal ref struct TursoNativeValue
 {
     [FieldOffset(0)] 
     public TursoValueType ValueType;
