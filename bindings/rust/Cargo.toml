@@ -10,18 +10,19 @@ repository.workspace = true
 description = "Turso Rust API"
 
 [features]
-default = ["experimental_indexes"]
+default = ["experimental_indexes", "mimalloc"]
 conn_raw_api = ["turso_core/conn_raw_api"]
 experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
 tracing_release = ["turso_core/tracing_release"]
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 turso_core = { workspace = true, features = ["io_uring"] }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
-mimalloc = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
