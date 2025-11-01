@@ -19,7 +19,7 @@ use crate::{
         Query,
         interactions::{
             Fault, Interaction, InteractionBuilder, InteractionPlan, InteractionPlanIterator,
-            InteractionType, Interactions, InteractionsType, Span,
+            InteractionType, Interactions, InteractionsType,
         },
         metrics::{InteractionStats, Remaining},
         property::Property,
@@ -245,7 +245,6 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                         )
                         .connection_index(conn_index)
                         .id(self.plan.next_property_id())
-                        .span(Span::StartEnd)
                         .build()
                         .unwrap();
 
@@ -287,20 +286,14 @@ impl Interactions {
             InteractionsType::Query(query) => {
                 let mut builder =
                     InteractionBuilder::with_interaction(InteractionType::Query(query.clone()));
-                builder
-                    .connection_index(self.connection_index)
-                    .id(id)
-                    .span(Span::StartEnd);
+                builder.connection_index(self.connection_index).id(id);
                 let interaction = builder.build().unwrap();
                 vec![interaction]
             }
             InteractionsType::Fault(fault) => {
                 let mut builder =
                     InteractionBuilder::with_interaction(InteractionType::Fault(*fault));
-                builder
-                    .connection_index(self.connection_index)
-                    .id(id)
-                    .span(Span::StartEnd);
+                builder.connection_index(self.connection_index).id(id);
                 let interaction = builder.build().unwrap();
                 vec![interaction]
             }
