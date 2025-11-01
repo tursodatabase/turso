@@ -2608,4 +2608,23 @@ pub mod tests {
             Ok(Float(-3.22))
         );
     }
+
+    #[test]
+    fn test_trim_ascii_whitespace_helper() {
+        assert_eq!(trim_ascii_whitespace("  hello  "), "hello");
+        assert_eq!(trim_ascii_whitespace("\t\nhello\r\n"), "hello");
+        assert_eq!(trim_ascii_whitespace("hello"), "hello");
+        assert_eq!(trim_ascii_whitespace("   "), "");
+        assert_eq!(trim_ascii_whitespace(""), "");
+
+        // non-breaking space should NOT be trimmed
+        assert_eq!(
+            trim_ascii_whitespace("\u{00A0}hello\u{00A0}"),
+            "\u{00A0}hello\u{00A0}"
+        );
+        assert_eq!(
+            trim_ascii_whitespace("  \u{00A0}hello\u{00A0}  "),
+            "\u{00A0}hello\u{00A0}"
+        );
+    }
 }
