@@ -1119,6 +1119,12 @@ do_execsql_test_in_memory_any_error duplicate-with-cte-name {
   WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
 }
 
+do_execsql_test_on_specific_db {:memory:} collation-rtrim-1 {
+  SELECT 'x' || CHAR(9) = 'x' COLLATE RTRIM;
+} {0}
+
+
+
 # Test UNION with different collations
 do_execsql_test_on_specific_db {:memory:} collate-compound-1 {
   CREATE TABLE t1(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
