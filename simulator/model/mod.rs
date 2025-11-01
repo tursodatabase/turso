@@ -20,6 +20,12 @@ use turso_parser::ast::Distinctness;
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
+pub mod interactions;
+pub mod metrics;
+pub mod property;
+
+pub(crate) type ResultSet = turso_core::Result<Vec<Vec<SimValue>>>;
+
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
 pub enum Query {
