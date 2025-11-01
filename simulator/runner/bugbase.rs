@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env::current_dir,
     fs::File,
-    io::{self, Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -11,60 +11,84 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{InteractionPlan, Paths};
+use crate::{Paths, model::interactions::InteractionPlan};
 
 use super::cli::SimulatorCLI;
 
+const READABLE_PLAN_PATH: &str = "plan.sql";
+const SHRUNK_READABLE_PLAN_PATH: &str = "shrunk.sql";
+const SEED_PATH: &str = "seed.txt";
+const RUNS_PATH: &str = "runs.json";
+
 /// A bug is a run that has been identified as buggy.
 #[derive(Clone)]
-pub(crate) enum Bug {
-    Unloaded { seed: u64 },
-    Loaded(LoadedBug),
-}
-
-#[derive(Clone)]
-pub struct LoadedBug {
+pub struct Bug {
     /// The seed of the bug.
     pub seed: u64,
+
     /// The plan of the bug.
-    pub plan: InteractionPlan,
+    /// TODO: currently plan is only saved to the .sql file, and that is not deserializable yet
+    /// so we cannot always store an interaction plan here
+    pub plan: Option<InteractionPlan>,
+
     /// The shrunk plan of the bug, if any.
     pub shrunk_plan: Option<InteractionPlan>,
+
     /// The runs of the bug.
     pub runs: Vec<BugRun>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct BugRun {
+pub struct BugRun {
     /// Commit hash of the current version of Limbo.
-    pub(crate) hash: String,
+    pub hash: String,
     /// Timestamp of the run.
     #[serde(with = "chrono::serde::ts_seconds")]
-    pub(crate) timestamp: DateTime<Utc>,
+    pub timestamp: DateTime<Utc>,
     /// Error message of the run.
-    pub(crate) error: Option<String>,
+    pub error: Option<String>,
     /// Options
-    pub(crate) cli_options: SimulatorCLI,
+    pub cli_options: SimulatorCLI,
     /// Whether the run was a shrunk run.
-    pub(crate) shrunk: bool,
+    pub shrunk: bool,
 }
 
 impl Bug {
-    #[expect(dead_code)]
-    /// Check if the bug is loaded.
-    pub(crate) fn is_loaded(&self) -> bool {
-        match self {
-            Bug::Unloaded { .. } => false,
-            Bug::Loaded { .. } => true,
+    fn save_to_path(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let bug_path = path.join(self.seed.to_string());
+        std::fs::create_dir_all(&bug_path)
+            .with_context(|| "should be able to create bug directory")?;
+
+        let seed_path = bug_path.join(SEED_PATH);
+        std::fs::write(&seed_path, self.seed.to_string())
+            .with_context(|| "should be able to write seed file")?;
+
+        if let Some(plan) = &self.plan {
+            let readable_plan_path = bug_path.join(READABLE_PLAN_PATH);
+            std::fs::write(&readable_plan_path, plan.to_string())
+                .with_context(|| "should be able to write readable plan file")?;
         }
+
+        if let Some(shrunk_plan) = &self.shrunk_plan {
+            let readable_shrunk_plan_path = bug_path.join(SHRUNK_READABLE_PLAN_PATH);
+            std::fs::write(&readable_shrunk_plan_path, shrunk_plan.to_string())
+                .with_context(|| "should be able to write readable shrunk plan file")?;
+        }
+
+        let runs_path = bug_path.join(RUNS_PATH);
+        std::fs::write(
+            &runs_path,
+            serde_json::to_string_pretty(&self.runs)
+                .with_context(|| "should be able to serialize runs")?,
+        )
+        .with_context(|| "should be able to write runs file")?;
+
+        Ok(())
     }
 
-    /// Get the seed of the bug.
-    pub(crate) fn seed(&self) -> u64 {
-        match self {
-            Bug::Unloaded { seed } => *seed,
-            Bug::Loaded(LoadedBug { seed, .. }) => *seed,
-        }
+    pub fn last_cli_opts(&self) -> SimulatorCLI {
+        self.runs.last().unwrap().cli_options.clone()
     }
 }
 
@@ -73,13 +97,14 @@ pub(crate) struct BugBase {
     /// Path to the bug base directory.
     path: PathBuf,
     /// The list of buggy runs, uniquely identified by their seed
-    bugs: HashMap<u64, Bug>,
+    bugs: HashMap<u64, Option<Bug>>,
 }
 
 impl BugBase {
     /// Create a new bug base.
     fn new(path: PathBuf) -> anyhow::Result<Self> {
         let mut bugs = HashMap::new();
+
         // list all the bugs in the path as directories
         if let Ok(entries) = std::fs::read_dir(&path) {
             for entry in entries.flatten() {
@@ -95,7 +120,7 @@ impl BugBase {
                                 entry.file_name().to_string_lossy()
                             )
                         })?;
-                    bugs.insert(seed, Bug::Unloaded { seed });
+                    bugs.insert(seed, None);
                 }
             }
         }
@@ -105,7 +130,7 @@ impl BugBase {
 
     /// Load the bug base from one of the potential paths.
     pub(crate) fn load() -> anyhow::Result<Self> {
-        let potential_paths = vec![
+        let potential_paths = [
             // limbo project directory
             BugBase::get_limbo_project_dir()?,
             // home directory
@@ -132,57 +157,33 @@ impl BugBase {
         Err(anyhow!("failed to create bug base"))
     }
 
-    #[expect(dead_code)]
-    /// Load the bug base from one of the potential paths.
-    pub(crate) fn interactive_load() -> anyhow::Result<Self> {
-        let potential_paths = vec![
-            // limbo project directory
-            BugBase::get_limbo_project_dir()?,
-            // home directory
-            dirs::home_dir().with_context(|| "should be able to get home directory")?,
-            // current directory
-            std::env::current_dir().with_context(|| "should be able to get current directory")?,
-        ];
+    fn load_bug(&self, seed: u64) -> anyhow::Result<Bug> {
+        let path = self.path.join(seed.to_string()).join(RUNS_PATH);
 
-        for path in potential_paths {
-            let path = path.join(".bugbase");
-            if path.exists() {
-                return BugBase::new(path);
-            }
-        }
-
-        println!("select bug base location:");
-        println!("1. limbo project directory");
-        println!("2. home directory");
-        println!("3. current directory");
-        print!("> ");
-        io::stdout().flush().unwrap();
-        let mut choice = String::new();
-        io::stdin()
-            .read_line(&mut choice)
-            .expect("failed to read line");
-
-        let choice = choice
-            .trim()
-            .parse::<u32>()
-            .with_context(|| format!("invalid choice {choice}"))?;
-        let path = match choice {
-            1 => BugBase::get_limbo_project_dir()?.join(".bugbase"),
-            2 => {
-                let home = std::env::var("HOME").with_context(|| "failed to get home directory")?;
-                PathBuf::from(home).join(".bugbase")
-            }
-            3 => PathBuf::from(".bugbase"),
-            _ => anyhow::bail!(format!("invalid choice {choice}")),
+        let runs = if !path.exists() {
+            vec![]
+        } else {
+            std::fs::read_to_string(self.path.join(seed.to_string()).join(RUNS_PATH))
+                .with_context(|| "should be able to read runs file")
+                .and_then(|runs| serde_json::from_str(&runs).map_err(|e| anyhow!("{}", e)))?
         };
 
-        if path.exists() {
-            unreachable!("bug base already exists at {}", path.display());
-        } else {
-            std::fs::create_dir_all(&path).with_context(|| "failed to create bug base")?;
-            tracing::info!("bug base created at {}", path.display());
-            BugBase::new(path)
-        }
+        let bug = Bug {
+            seed,
+            plan: None,
+            shrunk_plan: None,
+            runs,
+        };
+        Ok(bug)
+    }
+
+    pub fn load_bugs(&self) -> anyhow::Result<Vec<Bug>> {
+        let seeds = self.bugs.keys().copied().collect::<Vec<_>>();
+
+        seeds
+            .iter()
+            .map(|seed| self.load_bug(*seed))
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Add a new bug to the bug base.
@@ -193,12 +194,11 @@ impl BugBase {
         error: Option<String>,
         cli_options: &SimulatorCLI,
     ) -> anyhow::Result<()> {
-        tracing::debug!("adding bug with seed {}", seed);
-        let bug = self.get_bug(seed);
+        let path = self.path.clone();
 
-        if bug.is_some() {
-            let mut bug = self.load_bug(seed)?;
-            bug.plan = plan.clone();
+        tracing::debug!("adding bug with seed {}", seed);
+        let bug = self.get_or_load_bug(seed)?;
+        let bug = if let Some(bug) = bug {
             bug.runs.push(BugRun {
                 hash: Self::get_current_commit_hash()?,
                 timestamp: SystemTime::now().into(),
@@ -206,11 +206,13 @@ impl BugBase {
                 cli_options: cli_options.clone(),
                 shrunk: false,
             });
-            self.bugs.insert(seed, Bug::Loaded(bug.clone()));
+            bug.plan = Some(plan);
+            bug
         } else {
-            let bug = LoadedBug {
+            let bug = Bug {
                 seed,
-                plan: plan.clone(),
+                plan: Some(plan),
+                shrunk_plan: None,
                 runs: vec![BugRun {
                     hash: Self::get_current_commit_hash()?,
                     timestamp: SystemTime::now().into(),
@@ -218,172 +220,44 @@ impl BugBase {
                     cli_options: cli_options.clone(),
                     shrunk: false,
                 }],
-                shrunk_plan: None,
             };
-            self.bugs.insert(seed, Bug::Loaded(bug.clone()));
-        }
+
+            self.bugs.insert(seed, Some(bug.clone()));
+            self.bugs.get_mut(&seed).unwrap().as_mut().unwrap()
+        };
+
         // Save the bug to the bug base.
-        self.save_bug(seed)
+        bug.save_to_path(&path)
     }
 
-    /// Get a bug from the bug base.
-    pub(crate) fn get_bug(&self, seed: u64) -> Option<&Bug> {
-        self.bugs.get(&seed)
-    }
+    pub fn get_or_load_bug(&mut self, seed: u64) -> anyhow::Result<Option<&mut Bug>> {
+        // Check if the bug exists and is loaded
+        let needs_loading = match self.bugs.get(&seed) {
+            Some(Some(_)) => false,  // Already loaded
+            Some(None) => true,      // Exists but unloaded
+            None => return Ok(None), // Doesn't exist
+        };
 
-    /// Save a bug to the bug base.
-    fn save_bug(&self, seed: u64) -> anyhow::Result<()> {
-        let bug = self.get_bug(seed);
-
-        match bug {
-            None | Some(Bug::Unloaded { .. }) => {
-                unreachable!("save should only be called within add_bug");
-            }
-            Some(Bug::Loaded(bug)) => {
-                let bug_path = self.path.join(seed.to_string());
-                std::fs::create_dir_all(&bug_path)
-                    .with_context(|| "should be able to create bug directory")?;
-
-                let seed_path = bug_path.join("seed.txt");
-                std::fs::write(&seed_path, seed.to_string())
-                    .with_context(|| "should be able to write seed file")?;
-
-                let plan_path = bug_path.join("plan.json");
-                std::fs::write(
-                    &plan_path,
-                    serde_json::to_string_pretty(&bug.plan)
-                        .with_context(|| "should be able to serialize plan")?,
-                )
-                .with_context(|| "should be able to write plan file")?;
-
-                if let Some(shrunk_plan) = &bug.shrunk_plan {
-                    let shrunk_plan_path = bug_path.join("shrunk.json");
-                    std::fs::write(
-                        &shrunk_plan_path,
-                        serde_json::to_string_pretty(shrunk_plan)
-                            .with_context(|| "should be able to serialize shrunk plan")?,
-                    )
-                    .with_context(|| "should be able to write shrunk plan file")?;
-
-                    let readable_shrunk_plan_path = bug_path.join("shrunk.sql");
-                    std::fs::write(&readable_shrunk_plan_path, shrunk_plan.to_string())
-                        .with_context(|| "should be able to write readable shrunk plan file")?;
-                }
-
-                let readable_plan_path = bug_path.join("plan.sql");
-                std::fs::write(&readable_plan_path, bug.plan.to_string())
-                    .with_context(|| "should be able to write readable plan file")?;
-
-                let runs_path = bug_path.join("runs.json");
-                std::fs::write(
-                    &runs_path,
-                    serde_json::to_string_pretty(&bug.runs)
-                        .with_context(|| "should be able to serialize runs")?,
-                )
-                .with_context(|| "should be able to write runs file")?;
-            }
+        if needs_loading {
+            let bug = self.load_bug(seed)?;
+            self.bugs.insert(seed, Some(bug));
         }
 
-        Ok(())
+        // Now get the mutable reference
+        Ok(self.bugs.get_mut(&seed).and_then(|opt| opt.as_mut()))
     }
 
-    pub(crate) fn load_bug(&mut self, seed: u64) -> anyhow::Result<LoadedBug> {
-        let seed_match = self.bugs.get(&seed);
-
-        match seed_match {
-            None => anyhow::bail!("No bugs found for seed {}", seed),
-            Some(Bug::Unloaded { .. }) => {
-                let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("plan.json"))
-                        .with_context(|| {
-                            format!(
-                                "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("plan.json").display()
-                            )
-                        })?;
-                let plan: InteractionPlan = serde_json::from_str(&plan)
-                    .with_context(|| "should be able to deserialize plan")?;
-
-                let shrunk_plan: Option<String> =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("shrunk.json"))
-                        .with_context(|| "should be able to read shrunk plan file")
-                        .and_then(|shrunk| {
-                            serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e))
-                        })
-                        .ok();
-
-                let shrunk_plan: Option<InteractionPlan> =
-                    shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
-
-                let runs =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))
-                        .with_context(|| "should be able to read runs file")
-                        .and_then(|runs| serde_json::from_str(&runs).map_err(|e| anyhow!("{}", e)))
-                        .unwrap_or_default();
-
-                let bug = LoadedBug {
-                    seed,
-                    plan: plan.clone(),
-                    runs,
-                    shrunk_plan,
-                };
-
-                self.bugs.insert(seed, Bug::Loaded(bug.clone()));
-                tracing::debug!("Loaded bug with seed {}", seed);
-                Ok(bug)
-            }
-            Some(Bug::Loaded(bug)) => {
-                tracing::warn!(
-                    "Bug with seed {} is already loaded, returning the existing plan",
-                    seed
-                );
-                Ok(bug.clone())
-            }
-        }
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn mark_successful_run(
-        &mut self,
-        seed: u64,
-        cli_options: &SimulatorCLI,
-    ) -> anyhow::Result<()> {
-        let bug = self.get_bug(seed);
-        match bug {
-            None => {
-                tracing::debug!("removing bug base entry for {}", seed);
-                std::fs::remove_dir_all(self.path.join(seed.to_string()))
-                    .with_context(|| "should be able to remove bug directory")?;
-            }
-            Some(_) => {
-                let mut bug = self.load_bug(seed)?;
-                bug.runs.push(BugRun {
-                    hash: Self::get_current_commit_hash()?,
-                    timestamp: SystemTime::now().into(),
-                    error: None,
-                    cli_options: cli_options.clone(),
-                    shrunk: false,
-                });
-                self.bugs.insert(seed, Bug::Loaded(bug.clone()));
-                // Save the bug to the bug base.
-                self.save_bug(seed)
-                    .with_context(|| "should be able to save bug")?;
-                tracing::debug!("Updated bug with seed {}", seed);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn make_shrunk(
+    pub(crate) fn save_shrunk(
         &mut self,
         seed: u64,
         cli_options: &SimulatorCLI,
         shrunk_plan: InteractionPlan,
         error: Option<String>,
     ) -> anyhow::Result<()> {
-        let mut bug = self.load_bug(seed)?;
-        bug.shrunk_plan = Some(shrunk_plan);
+        let path = self.path.clone();
+        let bug = self
+            .get_or_load_bug(seed)?
+            .expect("bug should have been loaded");
         bug.runs.push(BugRun {
             hash: Self::get_current_commit_hash()?,
             timestamp: SystemTime::now().into(),
@@ -391,27 +265,18 @@ impl BugBase {
             cli_options: cli_options.clone(),
             shrunk: true,
         });
-        self.bugs.insert(seed, Bug::Loaded(bug.clone()));
+        bug.shrunk_plan = Some(shrunk_plan);
+
         // Save the bug to the bug base.
-        self.save_bug(seed)
+        bug.save_to_path(path)
             .with_context(|| "should be able to save shrunk bug")?;
         Ok(())
-    }
-
-    pub(crate) fn load_bugs(&mut self) -> anyhow::Result<Vec<LoadedBug>> {
-        let seeds = self.bugs.keys().copied().collect::<Vec<_>>();
-
-        seeds
-            .iter()
-            .map(|seed| self.load_bug(*seed))
-            .collect::<Result<Vec<_>, _>>()
     }
 
     pub(crate) fn list_bugs(&mut self) -> anyhow::Result<()> {
         let bugs = self.load_bugs()?;
         for bug in bugs {
             println!("seed: {}", bug.seed);
-            println!("plan: {}", bug.plan.stats());
             println!("runs:");
             println!("  ------------------");
             for run in &bug.runs {
