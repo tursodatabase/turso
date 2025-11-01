@@ -1113,3 +1113,8 @@ do_execsql_test_on_specific_db {:memory:} group-by-limit-0 {
 	INSERT INTO t VALUES (1), (2), (3); 
 	SELECT a, COUNT(*) FROM t GROUP BY a LIMIT 0;
 } {}
+
+do_execsql_test_in_memory_any_error duplicate-with-cte-name {
+  CREATE TABLE t2(x INTEGER);
+  WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
+}
