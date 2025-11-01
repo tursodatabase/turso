@@ -281,6 +281,15 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            if col_def
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }))
+            {
+                return Err(LimboError::ParseError(
+                    "Alter table does not support adding generated columns".to_string(),
+                ));
+            }
             let column = Column::from(&col_def);
 
             if let Some(default) = &column.default {
