@@ -235,6 +235,10 @@ impl SimulatorEnv {
         }
         self.db = None;
 
+        if self.profile.seed_sqlite_autovacuum {
+            self.seed_sqlite_autovacuum(&db_path);
+        }
+
         let db = match Database::open_file(
             io.clone(),
             db_path.to_str().unwrap(),
@@ -249,6 +253,28 @@ impl SimulatorEnv {
         };
         self.io = io;
         self.db = Some(db);
+    }
+
+    fn seed_sqlite_autovacuum(&self, db_path: &Path) {
+        let conn = rusqlite::Connection::open(db_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to open sqlite connection while seeding auto-vacuum database at {}: {e}",
+                db_path.display()
+            )
+        });
+        conn.execute_batch(
+            "PRAGMA auto_vacuum=FULL;\
+             VACUUM;\
+             CREATE TABLE IF NOT EXISTS __sim_autovacuum_seed__(id INTEGER PRIMARY KEY, value TEXT);\
+             INSERT OR IGNORE INTO __sim_autovacuum_seed__ VALUES (1,'seed');",
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to seed sqlite auto-vacuum database at {}: {e}",
+                db_path.display()
+            )
+        });
+        drop(conn);
     }
 
     pub(crate) fn get_db_path(&self) -> PathBuf {
