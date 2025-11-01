@@ -18,7 +18,9 @@ pub fn translate_integrity_check(
             root_pages.push(table.root_page);
             if let Some(indexes) = schema.indexes.get(table.name.as_str()) {
                 for index in indexes.iter() {
-                    root_pages.push(index.root_page);
+                    if index.root_page > 0 {
+                        root_pages.push(index.root_page);
+                    }
                 }
             }
         };
