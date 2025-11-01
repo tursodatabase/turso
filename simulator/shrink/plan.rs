@@ -227,6 +227,10 @@ impl InteractionPlan {
                             | InteractionType::Query(Query::Commit(..))
                             | InteractionType::Query(Query::Rollback(..))
                     );
+                    let is_pragma = matches!(
+                        &interaction.interaction,
+                        InteractionType::Query(Query::Pragma(..))
+                    );
 
                     let skip_interaction = if let Some(property_meta) = interaction.property_meta {
                         if matches!(
@@ -255,7 +259,7 @@ impl InteractionPlan {
                     };
 
                     (is_part_of_property || !skip_interaction)
-                        && (is_fault || is_transaction || has_table)
+                        && (is_fault || is_transaction || is_pragma || has_table)
                 };
                 retain_map.push(retain);
             }
