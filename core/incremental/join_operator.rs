@@ -76,13 +76,13 @@ fn read_next_join_row(
                 _ => return Ok(IOResult::Done(None)),
             };
             let found_zset_hash = match &values[1].to_owned() {
-                Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
+                Value::Blob(blob) => Hash128::from_blob(&blob.value).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid zset_hash blob".to_string())
                 })?,
                 _ => return Ok(IOResult::Done(None)),
             };
             let element_hash = match &values[2].to_owned() {
-                Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
+                Value::Blob(blob) => Hash128::from_blob(&blob.value).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid element_hash blob".to_string())
                 })?,
                 _ => {
@@ -118,7 +118,7 @@ fn read_next_join_row(
                 // Deserialize the row from the blob
                 let value_at_3 = table_values[3].to_owned();
                 let blob = match value_at_3 {
-                    Value::Blob(ref b) => b,
+                    Value::Blob(ref b) => &b.value,
                     _ => return Ok(IOResult::Done(None)),
                 };
 
@@ -655,7 +655,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.left_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
-                        Value::Blob(row_blob),
+                        Value::build_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly
@@ -703,7 +703,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.right_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
-                        Value::Blob(row_blob),
+                        Value::build_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly
