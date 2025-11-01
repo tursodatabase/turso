@@ -10205,4 +10205,62 @@ mod tests {
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
     }
+
+    #[test]
+    fn test_ascii_whitespace_is_trimmed() {
+        // Regular ASCII whitespace SHOULD be trimmed
+        let ascii_whitespace_cases = vec![
+            (" 12", 12i64),            // space
+            ("12 ", 12i64),            // trailing space
+            (" 12 ", 12i64),           // both sides
+            ("\t42\t", 42i64),         // tab
+            ("\n99\n", 99i64),         // newline
+            (" \t\n123\r\n ", 123i64), // mixed ASCII whitespace
+        ];
+
+        for (input, expected_int) in ascii_whitespace_cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Integer(i)) => {
+                    assert_eq!(
+                        i, expected_int,
+                        "String '{input}' should convert to {expected_int}, got {i}"
+                    );
+                }
+                other => {
+                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_breaking_space_not_trimmed() {
+        let test_strings = vec![
+            ("12\u{00A0}", "text", 3),   // '12' + non-breaking space (3 chars, 4 bytes)
+            ("\u{00A0}12", "text", 3),   // non-breaking space + '12' (3 chars, 4 bytes)
+            ("12\u{00A0}34", "text", 5), // '12' + nbsp + '34' (5 chars, 6 bytes)
+        ];
+
+        for (input, _expected_type, expected_len) in test_strings {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(
+                        t.as_str().chars().count(),
+                        expected_len,
+                        "String '{input}' should have {expected_len} characters",
+                    );
+                }
+                Register::Value(Value::Integer(_)) => {
+                    panic!("String '{input}' should NOT be converted to integer");
+                }
+                other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
+    }
 }
