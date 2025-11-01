@@ -329,3 +329,12 @@ do_execsql_test_in_memory_any_error pragma-max-page-count-enforcement-error {
 do_execsql_test_regex pragma-module-list-nonempty {
   SELECT * FROM pragma_module_list;
 } {\ngenerate_series\n|^generate_series\n|\ngenerate_series$|^generate_series$}
+
+do_execsql_test_on_specific_db ":memory:" pragma-integrity-check-empty-db {
+  PRAGMA integrity_check;
+} {ok}
+
+do_execsql_test_on_specific_db ":memory:" pragma-integrity-check-empty-db {
+select group_concat(name) over () from sqlite_schema;
+} {}
+
