@@ -32,7 +32,7 @@ use crate::{
     model::{
         Query, QueryCapabilities, QueryDiscriminants, ResultSet,
         interactions::{
-            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata, Span,
+            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
@@ -252,7 +252,7 @@ impl Property {
         connection_index: usize,
         id: NonZeroUsize,
     ) -> Vec<Interaction> {
-        let mut interactions: Vec<InteractionBuilder> = match self {
+        let interactions: Vec<InteractionBuilder> = match self {
             Property::AllTableHaveExpectedContent { tables } => {
                 assert_all_table_values(tables, connection_index).collect()
             }
@@ -1108,14 +1108,6 @@ impl Property {
         };
 
         assert!(!interactions.is_empty());
-
-        // Add a span to the interactions that matter
-        if interactions.len() == 1 {
-            interactions.first_mut().unwrap().span(Span::StartEnd);
-        } else {
-            interactions.first_mut().unwrap().span(Span::Start);
-            interactions.last_mut().unwrap().span(Span::End);
-        };
 
         interactions
             .into_iter()

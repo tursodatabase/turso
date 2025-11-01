@@ -350,24 +350,30 @@ impl Display for InteractionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const PAD: usize = 4;
         let mut indentation_level: usize = 0;
-        for interaction in &self.plan {
-            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
-                && interaction.span.is_some_and(|span| span.start())
-            {
-                indentation_level = indentation_level.saturating_add(1);
-                writeln!(f, "-- begin testing '{name}'")?;
-            }
+        let mut iter = self.iter_properties();
+        while let Some(property) = iter.next_property() {
+            let mut property = property.peekable();
+            let mut start = true;
+            while let Some((_, interaction)) = property.next() {
+                if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                    && start
+                {
+                    indentation_level = indentation_level.saturating_add(1);
+                    writeln!(f, "-- begin testing '{name}'")?;
+                    start = false;
+                }
 
-            if indentation_level > 0 {
-                let padding = " ".repeat(indentation_level * PAD);
-                f.pad(&padding)?;
-            }
-            writeln!(f, "{interaction}")?;
-            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
-                && interaction.span.is_some_and(|span| span.end())
-            {
-                indentation_level = indentation_level.saturating_sub(1);
-                writeln!(f, "-- end testing '{name}'")?;
+                if indentation_level > 0 {
+                    let padding = " ".repeat(indentation_level * PAD);
+                    f.pad(&padding)?;
+                }
+                writeln!(f, "{interaction}")?;
+                if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                    && property.peek().is_none()
+                {
+                    indentation_level = indentation_level.saturating_sub(1);
+                    writeln!(f, "-- end testing '{name}'")?;
+                }
             }
         }
 
@@ -432,24 +438,6 @@ impl Display for Fault {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Span {
-    Start,
-    End,
-    // Both start and end
-    StartEnd,
-}
-
-impl Span {
-    fn start(&self) -> bool {
-        matches!(self, Self::Start | Self::StartEnd)
-    }
-
-    fn end(&self) -> bool {
-        matches!(self, Self::End | Self::StartEnd)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct PropertyMetadata {
     pub property: PropertyDiscriminants,
     // If the query is an extension query
@@ -466,7 +454,6 @@ impl PropertyMetadata {
 }
 
 #[derive(Debug, Clone, derive_builder::Builder)]
-#[builder(build_fn(validate = "Self::validate"))]
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
@@ -474,8 +461,6 @@ pub struct Interaction {
     pub ignore_error: bool,
     #[builder(setter(strip_option), default)]
     pub property_meta: Option<PropertyMetadata>,
-    #[builder(setter(strip_option), default)]
-    pub span: Option<Span>,
     /// 0 id means the ID was not set
     id: NonZeroUsize,
 }
@@ -491,9 +476,6 @@ impl InteractionBuilder {
         if let Some(property_meta) = interaction.property_meta {
             builder.property_meta(property_meta);
         }
-        if let Some(span) = interaction.span {
-            builder.span(span);
-        }
         builder
     }
 
@@ -506,19 +488,6 @@ impl InteractionBuilder {
     /// Checks to see if the property metadata was already set
     pub fn has_property_meta(&self) -> bool {
         self.property_meta.is_some()
-    }
-
-    fn validate(&self) -> Result<(), InteractionBuilderError> {
-        // Cannot have span and property_meta.extension being true at the same time
-        if let Some(property_meta) = self.property_meta.flatten()
-            && property_meta.extension
-            && self.span.flatten().is_some()
-        {
-            return Err(InteractionBuilderError::ValidationError(
-                "cannot have a span set with an extension query".to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
