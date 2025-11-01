@@ -34,13 +34,13 @@
 
         cargoArtifacts = craneLib.buildDepsOnly {
           src = ./.;
-          pname = "limbo";
+          pname = "turso";
           nativeBuildInputs = with pkgs; [ python3 ];
         };
 
         commonArgs = {
           inherit cargoArtifacts;
-          pname = "limbo";
+          pname = "turso";
           src = ./.;
           nativeBuildInputs = with pkgs; [ python3 ];
           strictDeps = true;
@@ -58,10 +58,10 @@
             cargoClippyExtraArgs = "--all-targets";
           });
         };
-        packages.limbo = craneLib.buildPackage (commonArgs // {
-          cargoExtraArgs = "--bin limbo";
+        packages.turso_cli = craneLib.buildPackage (commonArgs // {
+          cargoExtraArgs = "--package turso_cli";
         });
-        packages.default = packages.limbo;
+        packages.default = packages.turso_cli;
         devShells.default = with pkgs; mkShell {
           nativeBuildInputs = [
             clang
