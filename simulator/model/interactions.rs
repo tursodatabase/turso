@@ -8,7 +8,6 @@ use std::{
     sync::Arc,
 };
 
-use either::Either;
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -100,49 +99,37 @@ impl InteractionPlan {
         let backward = || -> usize {
             interactions
                 .iter()
+                .enumerate()
                 .rev()
                 .skip(interactions.len() - idx)
-                .position(|interaction| {
-                    interaction.id() == id
-                        && interaction
-                            .span
-                            .is_some_and(|span| matches!(span, Span::Start))
-                })
-                .map(|idx| (interactions.len() - 1) - idx - 1)
-                .expect("A start span should have been emitted")
+                .find(|(_, interaction)| interaction.id() != id)
+                .map(|(idx, _)| idx.saturating_add(1))
+                .unwrap_or(idx)
         };
 
         let forward = || -> usize {
             interactions
                 .iter()
+                .enumerate()
                 .skip(idx + 1)
-                .position(|interaction| interaction.id() != id)
-                .map(|idx| idx - 1)
-                .unwrap_or(interactions.len() - 1)
-            // It can happen we do not have an end Span as we can fail in the middle of a property
+                .find(|(_, interaction)| interaction.id() != id)
+                .map(|(idx, _)| idx.saturating_sub(1))
+                .unwrap_or(idx)
         };
 
-        if let Some(span) = interaction.span {
-            match span {
-                Span::Start => {
-                    // go forward and find the end span
-                    let end_idx = forward();
-                    idx..end_idx + 1
-                }
-                Span::End => {
-                    // go backward and find the start span
-                    let start_idx = backward();
-                    start_idx..idx + 1
-                }
-                Span::StartEnd => idx..idx + 1,
-            }
-        } else {
-            // go backward and find the start span
+        let range = if interaction.property_meta.is_some() {
+            // go backward and find the interaction that is not the same id
             let start_idx = backward();
-            // go forward and find the end span
+            // go forward and find the interaction that is not the same id
             let end_idx = forward();
+
             start_idx..end_idx + 1
-        }
+        } else {
+            idx..idx + 1
+        };
+
+        assert!(!range.is_empty());
+        range
     }
 
     /// Truncates up to a particular interaction
@@ -225,23 +212,13 @@ where
     pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
         let (idx, interaction) = self.iter.next()?;
         let id = interaction.id();
-        // get interactions from a particular property
-        let span = interaction
-            .span
-            .expect("we should loop on interactions that have a span");
-
+        // get interactions with a particular property
         let first = std::iter::once((idx, interaction));
 
-        let property_interactions = match span {
-            Span::Start => Either::Left(
-                first.chain(
-                    self.iter
-                        .peeking_take_while(move |(_idx, interaction)| interaction.id() == id),
-                ),
-            ),
-            Span::End => panic!("we should always be at the start of an interaction"),
-            Span::StartEnd => Either::Right(first),
-        };
+        let property_interactions = first.chain(
+            self.iter
+                .peeking_take_while(move |(_idx, interaction)| interaction.id() == id),
+        );
 
         Some(property_interactions)
     }
@@ -257,22 +234,14 @@ where
     pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
         let (idx, interaction) = self.iter.next()?;
         let id = interaction.id();
-        // get interactions from a particular property
-        let span = interaction
-            .span
-            .expect("we should loop on interactions that have a span");
+        // get interactions with a particular id
 
         let first = std::iter::once((idx, interaction));
 
-        let property_interactions = match span {
-            Span::Start => panic!("we should always be at the end of an interaction"),
-            Span::End => Either::Left(
-                self.iter
-                    .peeking_take_while(move |(_idx, interaction)| interaction.id() == id)
-                    .chain(first),
-            ),
-            Span::StartEnd => Either::Right(first),
-        };
+        let property_interactions = self
+            .iter
+            .peeking_take_while(move |(_idx, interaction)| interaction.id() == id)
+            .chain(first);
 
         Some(property_interactions.into_iter())
     }
