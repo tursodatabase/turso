@@ -29,7 +29,7 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{Column, Schema},
+    schema::{Column, ColumnFlags, Schema},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -918,7 +918,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden)
+                .filter(|c| !c.is_hidden())
                 .map(|c| {
                     c.default
                         .clone()
@@ -1133,7 +1133,7 @@ fn init_source_emission<'a>(
                         ctx.table
                             .columns
                             .iter()
-                            .filter(|col| !col.hidden)
+                            .filter(|col| !col.is_hidden())
                             .map(|col| col.affinity().aff_mask())
                             .collect::<String>()
                     } else {
@@ -1241,13 +1241,11 @@ pub const ROWID_COLUMN: &Column = &Column {
     name: None,
     ty: schema::Type::Integer,
     ty_str: String::new(),
-    primary_key: true,
+    flags: ColumnFlags::PRIMARY_KEY,
     is_rowid_alias: true,
     notnull: true,
     default: None,
-    unique: false,
     collation: None,
-    hidden: false,
 };
 
 /// Represents how a table should be populated during an INSERT.
@@ -1389,7 +1387,7 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden).count() {
+        if num_values != table_columns.iter().filter(|c| !c.is_hidden()).count() {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
@@ -1399,7 +1397,7 @@ fn build_insertion<'a>(
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden {
+            if col.is_hidden() {
                 // Hidden columns are not taken into account.
                 continue;
             }
@@ -1600,7 +1598,7 @@ fn translate_column(
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.hidden {
+    } else if column.is_hidden() {
         // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {
             dest: column_register,
@@ -1609,7 +1607,7 @@ fn translate_column(
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
-        let nullable = !column.notnull && !column.primary_key && !column.unique;
+        let nullable = !column.notnull && !column.is_primary_key() && !column.is_unique();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",

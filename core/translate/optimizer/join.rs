@@ -507,7 +507,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        schema::{BTreeTable, Column, Index, IndexColumn, Table, Type},
+        schema::{BTreeTable, Column, ColumnFlags, Index, IndexColumn, Table, Type},
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
@@ -1675,12 +1675,10 @@ mod tests {
             ty: c.ty,
             ty_str: c.ty.to_string(),
             is_rowid_alias: c.is_rowid_alias,
-            primary_key: false,
+            flags: ColumnFlags::empty(),
             notnull: false,
             default: None,
-            unique: false,
             collation: None,
-            hidden: false,
         }
     }
     fn _create_column_of_type(name: &str, ty: Type) -> Column {

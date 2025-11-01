@@ -85,6 +85,7 @@ use crate::{
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use crate::{util::normalize_ident, Result};
+use bitflags::bitflags;
 use core::fmt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
@@ -545,7 +546,7 @@ impl Schema {
                         table.name
                     )));
                 };
-                if column.primary_key && unique_set.is_primary_key {
+                if column.is_primary_key() && unique_set.is_primary_key {
                     if column.is_rowid_alias {
                         // rowid alias, no index needed
                         continue;
@@ -1388,10 +1389,10 @@ impl BTreeTable {
                 sql.push_str(" NOT NULL");
             }
 
-            if column.unique {
+            if column.is_unique() {
                 sql.push_str(" UNIQUE");
             }
-            if needs_pk_inline && column.primary_key {
+            if needs_pk_inline && column.is_primary_key() {
                 sql.push_str(" PRIMARY KEY");
             }
 
@@ -1826,19 +1827,28 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                let mut flags = ColumnFlags::empty();
+                if primary_key {
+                    flags.insert(ColumnFlags::PRIMARY_KEY);
+                }
+                if ty_str.contains("HIDDEN") {
+                    flags.insert(ColumnFlags::HIDDEN);
+                }
+                if unique {
+                    flags.insert(ColumnFlags::UNIQUE);
+                }
+
                 cols.push(Column {
                     name: Some(normalize_ident(&name)),
                     ty,
                     ty_str,
-                    primary_key,
+                    flags,
                     is_rowid_alias: typename_exactly_integer
                         && primary_key
                         && !primary_key_desc_columns_constraint,
                     notnull,
                     default,
-                    unique,
                     collation,
-                    hidden: false,
                 });
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -2061,24 +2071,67 @@ impl ResolvedFkRef {
     }
 }
 
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct ColumnFlags: u16 {
+        const PRIMARY_KEY = 0x0001;
+        const HIDDEN = 0x0002;
+        const UNIQUE = 0x0004;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
     pub ty: Type,
     // many sqlite operations like table_info retain the original string
     pub ty_str: String,
-    pub primary_key: bool,
+    pub flags: ColumnFlags,
     pub is_rowid_alias: bool,
     pub notnull: bool,
     pub default: Option<Box<Expr>>,
-    pub unique: bool,
     pub collation: Option<CollationSeq>,
-    pub hidden: bool,
 }
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
         affinity(&self.ty_str)
+    }
+
+    pub fn is_primary_key(&self) -> bool {
+        self.flags.contains(ColumnFlags::PRIMARY_KEY)
+    }
+
+    pub fn set_primary_key(&mut self, is_primary_key: bool) {
+        if is_primary_key {
+            self.flags.insert(ColumnFlags::PRIMARY_KEY);
+        } else {
+            self.flags.remove(ColumnFlags::PRIMARY_KEY);
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.flags.contains(ColumnFlags::HIDDEN)
+    }
+
+    pub fn set_hidden(&mut self, hidden: bool) {
+        if hidden {
+            self.flags.insert(ColumnFlags::HIDDEN);
+        } else {
+            self.flags.remove(ColumnFlags::HIDDEN);
+        }
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.flags.contains(ColumnFlags::UNIQUE)
+    }
+
+    pub fn set_unique(&mut self, unique: bool) {
+        if unique {
+            self.flags.insert(ColumnFlags::UNIQUE);
+        } else {
+            self.flags.remove(ColumnFlags::UNIQUE);
+        }
     }
 }
 
@@ -2123,7 +2176,16 @@ impl From<&ColumnDefinition> for Column {
             .map(|t| t.name.to_string())
             .unwrap_or_default();
 
-        let hidden = ty_str.contains("HIDDEN");
+        let mut flags = ColumnFlags::empty();
+        if primary_key {
+            flags.insert(ColumnFlags::PRIMARY_KEY);
+        }
+        if ty_str.contains("HIDDEN") {
+            flags.insert(ColumnFlags::HIDDEN);
+        }
+        if unique {
+            flags.insert(ColumnFlags::UNIQUE);
+        }
 
         Column {
             name: Some(normalize_ident(name)),
@@ -2131,11 +2193,9 @@ impl From<&ColumnDefinition> for Column {
             default,
             notnull,
             ty_str,
-            primary_key,
+            flags,
             is_rowid_alias: primary_key && matches!(ty, Type::Integer),
-            unique,
             collation,
-            hidden,
         }
     }
 }
@@ -2345,61 +2405,51 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 name: Some("type".to_string()),
                 ty: Type::Text,
                 ty_str: "TEXT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("name".to_string()),
                 ty: Type::Text,
                 ty_str: "TEXT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("tbl_name".to_string()),
                 ty: Type::Text,
                 ty_str: "TEXT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("rootpage".to_string()),
                 ty: Type::Integer,
                 ty_str: "INT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             },
             Column {
                 name: Some("sql".to_string()),
                 ty: Type::Text,
                 ty_str: "TEXT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             },
         ],
         foreign_keys: vec![],
@@ -2819,11 +2869,20 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'a' should be a primary key"
+        );
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2848,11 +2907,20 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'a' should be a primary key"
+        );
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Desc)],
             table.primary_key_columns,
@@ -2866,11 +2934,20 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'a' should be a primary key"
+        );
         let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'b' shouldn be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![
                 ("a".to_string(), SortOrder::Asc),
@@ -2887,11 +2964,20 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY('a'));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'a' should be a primary key"
+        );
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2904,11 +2990,20 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY("a"));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(
+            column.is_primary_key(),
+            "column 'a' should be a primary key"
+        );
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.is_primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -3033,13 +3128,11 @@ mod tests {
                 name: Some("a".to_string()),
                 ty: Type::Integer,
                 ty_str: "INT".to_string(),
-                primary_key: false,
+                flags: ColumnFlags::empty(),
                 is_rowid_alias: false,
                 notnull: false,
                 default: None,
-                unique: false,
                 collation: None,
-                hidden: false,
             }],
             unique_sets: vec![],
             foreign_keys: vec![],

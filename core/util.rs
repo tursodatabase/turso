@@ -7,7 +7,7 @@ use crate::translate::plan::JoinedTable;
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::{
-    schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
+    schema::{self, BTreeTable, Column, ColumnFlags, Schema, Table, Type, DBSP_TABLE_PREFIX},
     translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
@@ -1362,13 +1362,11 @@ pub fn extract_view_columns(
                             name: Some(col_name),
                             ty: Type::Text, // Default to TEXT, could be refined with type analysis
                             ty_str: "TEXT".to_string(),
-                            primary_key: false,
+                            flags: ColumnFlags::empty(),
                             is_rowid_alias: false,
                             notnull: false,
                             default: None,
-                            unique: false,
                             collation: None,
-                            hidden: false,
                         },
                     });
                 }
@@ -1396,13 +1394,11 @@ pub fn extract_view_columns(
                                         name: Some(final_name),
                                         ty: table_column.ty,
                                         ty_str: table_column.ty_str.clone(),
-                                        primary_key: false,
+                                        flags: ColumnFlags::empty(),
                                         is_rowid_alias: false,
                                         notnull: false,
                                         default: None,
-                                        unique: false,
                                         collation: table_column.collation,
-                                        hidden: false,
                                     },
                                 });
                             }
@@ -1417,13 +1413,11 @@ pub fn extract_view_columns(
                                 name: Some("*".to_string()),
                                 ty: Type::Text,
                                 ty_str: "TEXT".to_string(),
-                                primary_key: false,
+                                flags: ColumnFlags::empty(),
                                 is_rowid_alias: false,
                                 notnull: false,
                                 default: None,
-                                unique: false,
                                 collation: None,
-                                hidden: false,
                             },
                         });
                     }
@@ -1453,13 +1447,11 @@ pub fn extract_view_columns(
                                         name: Some(final_name),
                                         ty: table_column.ty,
                                         ty_str: table_column.ty_str.clone(),
-                                        primary_key: false,
+                                        flags: ColumnFlags::empty(),
                                         is_rowid_alias: false,
                                         notnull: false,
                                         default: None,
-                                        unique: false,
                                         collation: table_column.collation,
-                                        hidden: false,
                                     },
                                 });
                             }
@@ -1471,13 +1463,11 @@ pub fn extract_view_columns(
                                     name: Some(format!("{table_name_str}.*")),
                                     ty: Type::Text,
                                     ty_str: "TEXT".to_string(),
-                                    primary_key: false,
+                                    flags: ColumnFlags::empty(),
                                     is_rowid_alias: false,
                                     notnull: false,
                                     default: None,
-                                    unique: false,
                                     collation: None,
-                                    hidden: false,
                                 },
                             });
                         }

@@ -165,7 +165,7 @@ const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABL
 fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_rowid_alias || column.primary_key {
+            if column.is_rowid_alias || column.is_primary_key() {
                 SELECTIVITY_UNIQUE_EQUALITY
             } else {
                 SELECTIVITY_EQ

@@ -16,7 +16,7 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
+    schema::{BTreeTable, Column, ColumnFlags, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
     translate::{
         optimizer::{
             access_method::AccessMethodParams,
@@ -221,13 +221,11 @@ fn add_ephemeral_table_to_update_plan(
             name: Some("rowid".to_string()),
             ty: Type::Integer,
             ty_str: "INTEGER".to_string(),
-            primary_key: true,
+            flags: ColumnFlags::PRIMARY_KEY,
             is_rowid_alias: false,
             notnull: true,
             default: None,
-            unique: false,
             collation: None,
-            hidden: false,
         }],
         is_strict: false,
         unique_sets: vec![],
@@ -1034,7 +1032,7 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key || column.notnull
+                column.is_primary_key() || column.notnull
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
