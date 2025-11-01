@@ -87,6 +87,31 @@ impl TempDatabase {
         }
     }
 
+    pub fn new_with_autovacuum_full(sql: &str) -> Self {
+        let mut path = TempDir::new().unwrap().keep();
+        path.push("test.db");
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.pragma_update(None, "page_size", 4096).unwrap();
+            connection.pragma_update(None, "auto_vacuum", 1).unwrap();
+            connection.execute_batch("VACUUM;").unwrap();
+            connection.execute_batch(sql).unwrap();
+        }
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_indexes(true)
+                .with_index_method(true),
+            None,
+        )
+        .unwrap();
+
+        Self { path, io, db }
+    }
+
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push("test.db");
