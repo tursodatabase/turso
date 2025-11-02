@@ -2899,23 +2899,13 @@ fn translate_without_rowid_insert(
         tracing::debug!("Processing secondary index '{}'", index.name);
 
         let secondary_key_cols = &index.columns;
-        let num_key_cols = secondary_key_cols.len() + pk_columns.len();
+        let num_key_cols = secondary_key_cols.len();
         let key_start_reg = program.alloc_registers(num_key_cols);
 
         let mut current_reg = key_start_reg;
 
         for idx_col in secondary_key_cols {
             let mapping = insertion.get_col_mapping_by_name(&idx_col.name).unwrap();
-            program.emit_insn(Insn::Copy {
-                src_reg: mapping.register,
-                dst_reg: current_reg,
-                extra_amount: 0,
-            });
-            current_reg += 1;
-        }
-
-        for pk_col in pk_columns {
-            let mapping = insertion.get_col_mapping_by_name(&pk_col.name).unwrap();
             program.emit_insn(Insn::Copy {
                 src_reg: mapping.register,
                 dst_reg: current_reg,
