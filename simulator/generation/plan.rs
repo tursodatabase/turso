@@ -1225,11 +1225,15 @@ fn reopen_database(env: &mut SimulatorEnv) {
         }
         SimulationType::Default | SimulationType::Doublecheck => {
             env.db = None;
-            let db = match turso_core::Database::open_file(
+            let db = match turso_core::Database::open_file_with_flags(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
-                mvcc,
-                indexes,
+                turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new()
+                    .with_mvcc(mvcc)
+                    .with_indexes(indexes)
+                    .with_autovacuum(true),
+                None,
             ) {
                 Ok(db) => db,
                 Err(e) => {

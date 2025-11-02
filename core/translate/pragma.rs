@@ -241,6 +241,14 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
+            // Check if autovacuum is enabled in database opts
+            if !connection.db.opts.enable_autovacuum {
+                return Err(LimboError::InvalidArgument(
+                    "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
+                        .to_string(),
+                ));
+            }
+
             let is_empty = is_database_empty(resolver.schema, &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",

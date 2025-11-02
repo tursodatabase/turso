@@ -120,6 +120,7 @@ pub struct DatabaseOpts {
     pub enable_strict: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
+    pub enable_autovacuum: bool,
     enable_load_extension: bool,
 }
 
@@ -132,6 +133,7 @@ impl Default for DatabaseOpts {
             enable_strict: false,
             enable_encryption: false,
             enable_index_method: false,
+            enable_autovacuum: false,
             enable_load_extension: false,
         }
     }
@@ -175,6 +177,11 @@ impl DatabaseOpts {
 
     pub fn with_index_method(mut self, enable: bool) -> Self {
         self.enable_index_method = enable;
+        self
+    }
+
+    pub fn with_autovacuum(mut self, enable: bool) -> Self {
+        self.enable_autovacuum = enable;
         self
     }
 }
@@ -583,11 +590,24 @@ impl Database {
                 AutoVacuumMode::None
             };
 
-            pager.set_auto_vacuum_mode(mode);
+            // Force autovacuum to None if the experimental flag is not enabled
+            let final_mode = if !self.opts.enable_autovacuum {
+                if mode != AutoVacuumMode::None {
+                    tracing::warn!(
+                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
+                    );
+                }
+                AutoVacuumMode::None
+            } else {
+                mode
+            };
+
+            pager.set_auto_vacuum_mode(final_mode);
 
             tracing::debug!(
-                "Opened existing database. Detected auto_vacuum_mode from header: {:?}",
-                mode
+                "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
+                mode,
+                final_mode
             );
         }
 
@@ -1510,6 +1530,7 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_uri(
         uri: &str,
         use_indexes: bool,
@@ -1520,6 +1541,8 @@ impl Connection {
         encryption: bool,
         // flag to opt-in custom modules support
         custom_modules: bool,
+        // flag to opt-in autovacuum support
+        autovacuum: bool,
     ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
@@ -1536,7 +1559,8 @@ impl Connection {
                     .with_views(views)
                     .with_strict(strict)
                     .with_encryption(encryption)
-                    .with_index_method(custom_modules),
+                    .with_index_method(custom_modules)
+                    .with_autovacuum(autovacuum),
                 None,
             )?;
             let conn = db.connect()?;
@@ -1566,7 +1590,8 @@ impl Connection {
                 .with_views(views)
                 .with_strict(strict)
                 .with_encryption(encryption)
-                .with_index_method(custom_modules),
+                .with_index_method(custom_modules)
+                .with_autovacuum(autovacuum),
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
