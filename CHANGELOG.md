@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.3.1 --2025-11-01
+## 0.3.2 -- 2025-11-02
+
+### Updated
+
+* core: Disable autovacuum by default (Pekka Enberg)
+* Update Java package version in scripts/update-version.py (Pekka Enberg)
+
+## 0.3.1 -- 2025-11-01
 
 ### Updated
 
