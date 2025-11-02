@@ -452,7 +452,8 @@ fn collect_autoindexes(
         };
 
         let needs_index = if us.is_primary_key {
-            !is_without_rowid && !(col.primary_key() && col.is_rowid_alias())
+
+            !(is_without_rowid || (col.primary_key() && col.is_rowid_alias()))
         } else {
             // UNIQUE single needs an index
             true
