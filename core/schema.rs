@@ -2520,31 +2520,52 @@ impl Index {
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
+        let mut index_columns = Vec::new();
+        let mut key_column_positions = std::collections::HashSet::new();
+
         for (col_name, order) in table.primary_key_columns.iter() {
-            let Some((pos_in_table, _)) = table.get_column(col_name) else {
+            let Some((pos_in_table, column)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
                     "Column {} not found in table {}",
                     col_name, table.name
                 )));
             };
-            let (_, column) = table.get_column(col_name).unwrap();
-            primary_keys.push(IndexColumn {
+            index_columns.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
             });
+            key_column_positions.insert(pos_in_table);
         }
 
-        assert!(primary_keys.len() == column_count);
+        assert!(
+            index_columns.len() == column_count,
+            "Mismatch in primary key column count"
+        );
+
+        if !table.has_rowid {
+            for (pos_in_table, column) in table.columns.iter().enumerate() {
+                // TODO: when we support generated cols look at this
+
+                if !key_column_positions.contains(&pos_in_table) {
+                    index_columns.push(IndexColumn {
+                        name: normalize_ident(column.name.as_ref().unwrap()),
+                        order: SortOrder::Asc,
+                        pos_in_table,
+                        collation: None,
+                        default: column.default.clone(),
+                    });
+                }
+            }
+        }
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
             root_page,
-            columns: primary_keys,
+            columns: index_columns,
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
