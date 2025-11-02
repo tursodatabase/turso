@@ -149,6 +149,7 @@ pub fn translate_create_index(
         // before translating, and it cannot reference a table alias
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
+        is_primary_key: false,
     });
 
     if !idx.validate_where_expr(table) {

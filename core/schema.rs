@@ -751,7 +751,29 @@ impl Schema {
                         }
                     }
 
+                    let has_rowid = table.has_rowid;
+                    let table_name_for_index = table.name.clone();
+                    let root_page_for_index = table.root_page;
+
                     self.add_btree_table(Arc::new(table))?;
+
+                    if !has_rowid {
+                        tracing::debug!(
+                            "WITHOUT ROWID table '{}' found. Synthesizing primary key index.",
+                            &table_name_for_index
+                        );
+                        let table_ref = self.get_btree_table(&table_name_for_index).unwrap();
+                        let pk_index = Index::automatic_from_primary_key(
+                            &table_ref,
+
+                            (
+                                format!("sqlite_autoindex_{}_1", &table_name_for_index),
+                                root_page_for_index,
+                            ),
+                            table_ref.primary_key_columns.len(),
+                        )?;
+                        self.add_index(Arc::new(pk_index))?;
+                    }
                 }
             }
             "index" => {
@@ -2393,6 +2415,7 @@ pub struct Index {
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
+    pub is_primary_key: bool,
 }
 
 #[allow(dead_code)]
@@ -2459,6 +2482,7 @@ impl Index {
                         ephemeral: false,
                         has_rowid: table.has_rowid,
                         where_clause: None,
+                        is_primary_key: false,
                         index_method: Some(descriptor),
                     })
                 } else {
@@ -2472,6 +2496,7 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause,
                         index_method: None,
+                        is_primary_key: false,
                     })
                 }
             }
@@ -2526,6 +2551,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            is_primary_key: true,
         })
     }
 
@@ -2564,6 +2590,7 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            is_primary_key: false,
         })
     }
 

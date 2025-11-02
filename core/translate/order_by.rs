@@ -110,6 +110,7 @@ pub fn init_order_by(
             has_rowid: false,
             where_clause: None,
             index_method: None,
+            is_primary_key: false,
         });
         program.alloc_cursor_id(CursorType::BTreeIndex(index))
     } else {

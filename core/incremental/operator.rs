@@ -71,6 +71,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         has_rowid: true,
         where_clause: None,
         index_method: None,
+        is_primary_key: false,
     }
 }
 

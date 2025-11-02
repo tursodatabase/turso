@@ -5044,6 +5044,26 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+        // remove this after getting sanity, before merging
+
+        match key {
+            BTreeKey::TableRowId((rowid, record)) => {
+                tracing::debug!(
+                    "BTreeCursor::insert: root_page={}, key_type=TableRowId, rowid={}, record_size={}",
+                    self.root_page,
+                    rowid,
+                    record.map_or(0, |r| r.get_payload().len())
+                );
+            }
+            BTreeKey::IndexKey(record) => {
+                tracing::debug!(
+                    "BTreeCursor::insert: root_page={}, key_type=IndexKey, record_size={}",
+                    self.root_page,
+                    record.get_payload().len()
+                );
+            }
+        }
+
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         return_if_io!(self.insert_into_page(key));
         if key.maybe_rowid().is_some() {

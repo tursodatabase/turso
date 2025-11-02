@@ -392,6 +392,7 @@ fn get_subquery_parser<'a>(
                     unique: false,
                     where_clause: None,
                     index_method: None,
+                    is_primary_key: false,
                 });
 
                 let cursor_id =
