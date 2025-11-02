@@ -765,7 +765,6 @@ impl Schema {
                         let table_ref = self.get_btree_table(&table_name_for_index).unwrap();
                         let pk_index = Index::automatic_from_primary_key(
                             &table_ref,
-
                             (
                                 format!("sqlite_autoindex_{}_1", &table_name_for_index),
                                 root_page_for_index,
