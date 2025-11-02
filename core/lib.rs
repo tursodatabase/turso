@@ -1530,39 +1530,13 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_uri(
-        uri: &str,
-        use_indexes: bool,
-        mvcc: bool,
-        views: bool,
-        strict: bool,
-        // flag to opt-in encryption support
-        encryption: bool,
-        // flag to opt-in custom modules support
-        custom_modules: bool,
-        // flag to opt-in autovacuum support
-        autovacuum: bool,
-    ) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
+    pub fn from_uri(uri: &str, db_opts: DatabaseOpts) -> Result<(Arc<dyn IO>, Arc<Connection>)> {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
         if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
             let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                DatabaseOpts::new()
-                    .with_mvcc(mvcc)
-                    .with_indexes(use_indexes)
-                    .with_views(views)
-                    .with_strict(strict)
-                    .with_encryption(encryption)
-                    .with_index_method(custom_modules)
-                    .with_autovacuum(autovacuum),
-                None,
-            )?;
+            let db = Database::open_file_with_flags(io.clone(), MEMORY_PATH, flags, db_opts, None)?;
             let conn = db.connect()?;
             return Ok((io, conn));
         }
@@ -1584,14 +1558,7 @@ impl Connection {
             &opts.path,
             opts.vfs.as_ref(),
             flags,
-            DatabaseOpts::new()
-                .with_mvcc(mvcc)
-                .with_indexes(use_indexes)
-                .with_views(views)
-                .with_strict(strict)
-                .with_encryption(encryption)
-                .with_index_method(custom_modules)
-                .with_autovacuum(autovacuum),
+            db_opts,
             encryption_opts.clone(),
         )?;
         if let Some(modeof) = opts.modeof {
