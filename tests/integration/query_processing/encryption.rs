@@ -54,6 +54,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             false,
             ENABLE_ENCRYPTION,
             false,
+            false,
         )?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
@@ -77,6 +78,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             false,
             ENABLE_ENCRYPTION,
             false,
+            false,
         )?;
         run_query(
             &tmp_db,
@@ -98,6 +100,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             false,
             false,
             ENABLE_ENCRYPTION,
+            false,
             false,
         )?;
         run_query(
@@ -129,6 +132,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
             false,
             ENABLE_ENCRYPTION,
             false,
+            false,
         )?;
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
@@ -149,6 +153,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
                 false,
                 false,
                 ENABLE_ENCRYPTION,
+                false,
                 false,
             )
             .unwrap();
@@ -171,6 +176,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
                 false,
                 false,
                 ENABLE_ENCRYPTION,
+                false,
                 false,
             )
             .unwrap();
@@ -247,6 +253,7 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
             false,
             ENABLE_ENCRYPTION,
             false,
+            false,
         )?;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -312,6 +319,7 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
                 false,
                 false,
                 ENABLE_ENCRYPTION,
+                false,
                 false,
             )
             .unwrap();
@@ -405,6 +413,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
                     false,
                     false,
                     ENABLE_ENCRYPTION,
+                    false,
                     false,
                 )
                 .unwrap();
