@@ -74,9 +74,9 @@ fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> 
             "INSERT to table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
         );
     }
-    if table.btree().is_some_and(|t| !t.has_rowid) {
-        crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
-    }
+    // if table.btree().is_some_and(|t| !t.has_rowid) {
+    //     crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
+    // }
 
     Ok(())
 }
@@ -180,6 +180,23 @@ impl<'a> InsertEmitCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn translate_without_rowid_insert(
+    resolver: &Resolver,
+    on_conflict: Option<ResolveType>,
+    table: &Arc<BTreeTable>,
+    columns: Vec<ast::Name>,
+    mut body: InsertBody,
+    mut returning: Vec<ResultColumn>,
+    mut program: ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<ProgramBuilder> {
+    crate::bail_parse_error!(
+        "INSERT into WITHOUT ROWID table '{}' is not yet implemented.",
+        table.name
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
     resolver: &Resolver,
     on_conflict: Option<ResolveType>,
@@ -221,6 +238,18 @@ pub fn translate_insert(
         crate::bail_parse_error!("no such table: {}", table_name);
     };
 
+    if !btree_table.has_rowid {
+        return translate_without_rowid_insert(
+            resolver,
+            on_conflict,
+            &btree_table,
+            columns,
+            body,
+            returning,
+            program,
+            connection,
+        );
+    }
     let BoundInsertResult {
         mut values,
         mut upsert_actions,
