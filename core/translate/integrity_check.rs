@@ -12,10 +12,14 @@ pub fn translate_integrity_check(
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+
     // Collect root pages to run integrity check on
     for table in schema.tables.values() {
         if let crate::schema::Table::BTree(table) = table.as_ref() {
-            root_pages.push(table.root_page);
+            if table.has_rowid {
+                root_pages.push(table.root_page);
+            }
+
             if let Some(indexes) = schema.indexes.get(table.name.as_str()) {
                 for index in indexes.iter() {
                     if index.root_page > 0 {
