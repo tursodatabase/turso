@@ -1,7 +1,7 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
 use std::panic;
-use turso_core::Row;
+use turso_core::{DatabaseOpts, Row};
 
 const ENABLE_ENCRYPTION: bool = true;
 
@@ -48,13 +48,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
-            true,
-            false,
-            false,
-            false,
-            ENABLE_ENCRYPTION,
-            false,
-            false,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
         )?;
         let mut row_count = 0;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
@@ -72,13 +66,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
-            true,
-            false,
-            false,
-            false,
-            ENABLE_ENCRYPTION,
-            false,
-            false,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
         )?;
         run_query(
             &tmp_db,
@@ -95,13 +83,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
-            true,
-            false,
-            false,
-            false,
-            ENABLE_ENCRYPTION,
-            false,
-            false,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
         )?;
         run_query(
             &tmp_db,
@@ -126,13 +108,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
-            true,
-            false,
-            false,
-            false,
-            ENABLE_ENCRYPTION,
-            false,
-            false,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
         )?;
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
@@ -148,13 +124,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             turso_core::Connection::from_uri(
                 &uri,
-                true,
-                false,
-                false,
-                false,
-                ENABLE_ENCRYPTION,
-                false,
-                false,
+                DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
             )
             .unwrap();
         }));
@@ -171,13 +141,7 @@ fn test_per_page_encryption() -> anyhow::Result<()> {
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             turso_core::Connection::from_uri(
                 &uri,
-                true,
-                false,
-                false,
-                false,
-                ENABLE_ENCRYPTION,
-                false,
-                false,
+                DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
             )
             .unwrap();
         }));
@@ -247,13 +211,7 @@ fn test_non_4k_page_size_encryption() -> anyhow::Result<()> {
         );
         let (_io, conn) = turso_core::Connection::from_uri(
             &uri,
-            true,
-            false,
-            false,
-            false,
-            ENABLE_ENCRYPTION,
-            false,
-            false,
+            DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
         )?;
         run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |row: &Row| {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
@@ -314,13 +272,7 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
         let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let (_io, conn) = turso_core::Connection::from_uri(
                 &uri,
-                true,
-                false,
-                false,
-                false,
-                ENABLE_ENCRYPTION,
-                false,
-                false,
+                DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
             )
             .unwrap();
             run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
@@ -408,13 +360,7 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
             let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 let (_io, conn) = turso_core::Connection::from_uri(
                     &uri,
-                    true,
-                    false,
-                    false,
-                    false,
-                    ENABLE_ENCRYPTION,
-                    false,
-                    false,
+                    DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
                 )
                 .unwrap();
                 run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})

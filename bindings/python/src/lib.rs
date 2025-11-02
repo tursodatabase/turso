@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
-use turso_core::Value;
+use turso_core::{DatabaseOpts, Value};
 
 mod errors;
 
@@ -317,7 +317,7 @@ impl Drop for Connection {
 #[allow(clippy::arc_with_non_send_sync)]
 #[pyfunction(signature = (path))]
 pub fn connect(path: &str) -> Result<Connection> {
-    match turso_core::Connection::from_uri(path, true, false, false, false, false, false, false) {
+    match turso_core::Connection::from_uri(path, DatabaseOpts::default()) {
         Ok((io, conn)) => Ok(Connection { conn, _io: io }),
         Err(e) => Err(PyErr::new::<ProgrammingError, _>(format!(
             "Failed to create connection: {e:?}"
