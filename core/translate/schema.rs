@@ -187,10 +187,25 @@ pub fn translate_create_table(
     // TODO: SetCookie
 
     let table_root_reg = program.alloc_register();
+
+    let btree_flags = if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
+        if options.contains(ast::TableOptions::WITHOUT_ROWID) {
+            tracing::debug!(
+                "CREATE TABLE: `{}` is a WITHOUT ROWID table, using index b-tree flags.",
+                normalized_tbl_name
+            );
+            CreateBTreeFlags::new_index()
+        } else {
+            CreateBTreeFlags::new_table()
+        }
+    } else {
+        CreateBTreeFlags::new_table()
+    };
+
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
