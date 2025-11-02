@@ -8443,12 +8443,35 @@ pub fn op_rename_table(
             let Table::BTree(btree) = table else {
                 panic!("only btree tables can be renamed");
             };
-
             let btree = Arc::make_mut(btree);
+            // update this table's own foreign keys
+            for fk_arc in &mut btree.foreign_keys {
+                let fk = Arc::make_mut(fk_arc);
+                if normalize_ident(&fk.parent_table) == normalized_from {
+                    fk.parent_table = normalized_to.clone();
+                }
+            }
+
             btree.name = normalized_to.to_owned();
         }
 
         schema.tables.insert(normalized_to.to_owned(), table);
+
+        for (tname, t_arc) in schema.tables.iter_mut() {
+            // skip the table we just renamed
+            if normalize_ident(tname) == normalized_to {
+                continue;
+            }
+            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
+                let child_btree = Arc::make_mut(child_btree_arc);
+                for fk_arc in &mut child_btree.foreign_keys {
+                    if normalize_ident(&fk_arc.parent_table) == normalized_from {
+                        let fk = Arc::make_mut(fk_arc);
+                        fk.parent_table = normalized_to.clone();
+                    }
+                }
+            }
+        }
     });
 
     state.pc += 1;
