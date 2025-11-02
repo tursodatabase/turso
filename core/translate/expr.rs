@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, As, Expr, SubqueryType, UnaryOperator};
 
@@ -11,7 +9,7 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{affinity, Affinity, Table, Type};
-use crate::translate::optimizer::TakeOwnership;
+use crate::translate::optimizer::{ConstantFlags, TakeOwnership};
 use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -588,7 +586,7 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
+    let constant_span = if expr.is_constant(resolver, ConstantFlags::default()) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
         } else {
@@ -3609,7 +3607,7 @@ pub fn bind_and_rewrite_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
-    connection: &'a Arc<crate::Connection>,
+    connection: &'a crate::Connection,
     param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
