@@ -2967,7 +2967,7 @@ pub fn op_seek_rowid(
                             match temp_reg.get_value() {
                                 Value::Integer(i) => Some(*i),
                                 Value::Float(f) => Some(*f as i64),
-                                _ => unreachable!("apply_affinity_char with Numeric should produce an integer if it returns true"),
+                                _ => None,
                             }
                         } else {
                             None
