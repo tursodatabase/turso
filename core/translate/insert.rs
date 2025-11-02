@@ -927,43 +927,48 @@ fn bind_insert(
                 .collect();
         }
         InsertBody::Select(select, upsert_opt) => {
-            match &mut select.body.select {
-                // TODO see how to avoid clone
-                OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
-                    if values_expr.is_empty() {
-                        crate::bail_parse_error!("no values to insert");
-                    }
-                    for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                        match expr.as_mut() {
-                            Expr::Id(name) => {
-                                if name.quoted_with('"') {
-                                    *expr = Expr::Literal(ast::Literal::String(name.as_literal()))
-                                        .into();
-                                } else {
-                                    // an INSERT INTO ... VALUES (...) cannot reference columns
-                                    crate::bail_parse_error!("no such column: {name}");
-                                }
-                            }
-                            Expr::Qualified(first_name, second_name) => {
-                                // an INSERT INTO ... VALUES (...) cannot reference columns
-                                crate::bail_parse_error!(
-                                    "no such column: {first_name}.{second_name}"
-                                );
-                            }
-                            _ => {}
+            if select.body.compounds.is_empty() {
+                match &mut select.body.select {
+                    // TODO see how to avoid clone
+                    OneSelect::Values(values_expr) if values_expr.len() <= 1 => {
+                        if values_expr.is_empty() {
+                            crate::bail_parse_error!("no values to insert");
                         }
-                        bind_and_rewrite_expr(
-                            expr,
-                            None,
-                            None,
-                            connection,
-                            &mut program.param_ctx,
-                            BindingBehavior::ResultColumnsNotAllowed,
-                        )?;
+                        for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                            match expr.as_mut() {
+                                Expr::Id(name) => {
+                                    if name.quoted_with('"') {
+                                        *expr =
+                                            Expr::Literal(ast::Literal::String(name.as_literal()))
+                                                .into();
+                                    } else {
+                                        // an INSERT INTO ... VALUES (...) cannot reference columns
+                                        crate::bail_parse_error!("no such column: {name}");
+                                    }
+                                }
+                                Expr::Qualified(first_name, second_name) => {
+                                    // an INSERT INTO ... VALUES (...) cannot reference columns
+                                    crate::bail_parse_error!(
+                                        "no such column: {first_name}.{second_name}"
+                                    );
+                                }
+                                _ => {}
+                            }
+                            bind_and_rewrite_expr(
+                                expr,
+                                None,
+                                None,
+                                connection,
+                                &mut program.param_ctx,
+                                BindingBehavior::ResultColumnsNotAllowed,
+                            )?;
+                        }
+                        values = values_expr.pop().unwrap_or_else(Vec::new);
                     }
-                    values = values_expr.pop().unwrap_or_else(Vec::new);
+                    _ => inserting_multiple_rows = true,
                 }
-                _ => inserting_multiple_rows = true,
+            } else {
+                inserting_multiple_rows = true;
             }
             upsert = upsert_opt.take();
         }
@@ -1056,8 +1061,10 @@ fn init_source_emission<'a>(
 ) -> Result<ProgramBuilder> {
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
-            // Simple Common case of INSERT INTO <table> VALUES (...)
-            if matches!(&select.body.select, OneSelect::Values(values) if values.len() <= 1) {
+            // Simple common case of INSERT INTO <table> VALUES (...) without compounds.
+            if select.body.compounds.is_empty()
+                && matches!(&select.body.select, OneSelect::Values(values) if values.len() <= 1)
+            {
                 (
                     values.len(),
                     program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone())),
@@ -1478,7 +1485,12 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     let translate_value_fn =
         |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| {
             if let Some(temp_table_ctx) = temp_table_ctx {
-                prg.emit_column_or_rowid(temp_table_ctx.cursor_id, value_index, column_register);
+                prg.emit_insn(Insn::Column {
+                    cursor_id: temp_table_ctx.cursor_id,
+                    column: value_index,
+                    dest: column_register,
+                    default: None,
+                });
             } else {
                 prg.emit_insn(Insn::Copy {
                     src_reg: yield_reg + value_index,

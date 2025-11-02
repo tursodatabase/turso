@@ -644,12 +644,13 @@ pub fn parse_from(
         return Ok(());
     }
 
-    let mut ctes_as_subqueries = vec![];
+    let mut ctes_as_subqueries: Vec<JoinedTable> = vec![];
 
     if let Some(with) = with {
         if with.recursive {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
         }
+
         for cte in with.ctes {
             if cte.materialized == Materialized::Yes {
                 crate::bail_parse_error!("Materialized CTEs are not yet supported");
@@ -662,6 +663,13 @@ pub fn parse_from(
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
             // We should carry over the 'Scope' struct to all of our identifier resolution.
             let cte_name_normalized = normalize_ident(cte.tbl_name.as_str());
+            if ctes_as_subqueries
+                .iter()
+                .any(|t| t.table.get_name() == cte_name_normalized)
+            {
+                crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+            }
+
             if resolver.schema.get_table(&cte_name_normalized).is_some() {
                 crate::bail_parse_error!(
                     "CTE name {} conflicts with catalog table name",
@@ -702,6 +710,7 @@ pub fn parse_from(
             let Plan::Select(cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
+
             ctes_as_subqueries.push(JoinedTable::new_subquery(
                 cte_name_normalized,
                 cte_plan,

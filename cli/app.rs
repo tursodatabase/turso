@@ -32,7 +32,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, LimboError, OpenFlags, QueryMode, Statement, StepResult, Value,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, StepResult,
+    Value,
 };
 
 #[derive(Parser, Debug)]
@@ -80,6 +81,8 @@ pub struct Opts {
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
     pub experimental_index_method: bool,
+    #[clap(long, help = "Enable experimental autovacuum feature")]
+    pub experimental_autovacuum: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -186,15 +189,17 @@ impl Limbo {
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
         let indexes_enabled = opts.experimental_indexes.unwrap_or(true);
+
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
             Connection::from_uri(
                 &db_file,
-                indexes_enabled,
-                opts.experimental_mvcc,
-                opts.experimental_views,
-                opts.experimental_strict,
-                opts.experimental_encryption,
-                opts.experimental_index_method,
+                DatabaseOpts::new()
+                    .with_indexes(indexes_enabled)
+                    .with_mvcc(opts.experimental_mvcc)
+                    .with_views(opts.experimental_views)
+                    .with_strict(opts.experimental_strict)
+                    .with_encryption(opts.experimental_encryption)
+                    .with_index_method(opts.experimental_index_method),
             )?
         } else {
             let flags = if opts.readonly {
@@ -213,6 +218,7 @@ impl Limbo {
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
                     .with_index_method(opts.experimental_index_method)
+                    .with_autovacuum(opts.experimental_autovacuum)
                     .turso_cli(),
                 None,
             )?;

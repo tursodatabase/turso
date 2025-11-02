@@ -10,9 +10,10 @@
 <p align="center">
   <a title="Build Status" target="_blank" href="https://github.com/tursodatabase/turso/actions/workflows/rust.yml"><img src="https://img.shields.io/github/actions/workflow/status/tursodatabase/turso/rust.yml?style=flat-square"></a>
   <a title="Releases" target="_blank" href="https://github.com/tursodatabase/turso/releases"><img src="https://img.shields.io/github/release/tursodatabase/turso?style=flat-square&color=9CF"></a>
-  <a title="Rust" target="_blank" href="https://crates.io/crates/turso"><img alt="PyPI" src="https://img.shields.io/crates/v/turso"></a>
-  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/database"><img alt="PyPI" src="https://img.shields.io/npm/v/@tursodatabase/database"></a>
+  <a title="Rust" target="_blank" href="https://crates.io/crates/turso"><img alt="Crate" src="https://img.shields.io/crates/v/turso"></a>
+  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/database"><img alt="NPM" src="https://img.shields.io/npm/v/@tursodatabase/database"></a>
   <a title="Python" target="_blank" href="https://pypi.org/project/pyturso/"><img alt="PyPI" src="https://img.shields.io/pypi/v/pyturso"></a>
+  <a title="Java" target="_blank" href="https://central.sonatype.com/artifact/tech.turso/turso"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/tech.turso/turso"></a>
   <a title="MIT" target="_blank" href="https://github.com/tursodatabase/turso/blob/main/LICENSE.md"><img src="http://img.shields.io/badge/license-MIT-orange.svg?style=flat-square"></a>
   <br>
   <a title="GitHub Pull Requests" target="_blank" href="https://github.com/tursodatabase/turso/pulls"><img src="https://img.shields.io/github/issues-pr-closed/tursodatabase/turso.svg?style=flat-square&color=FF9966"></a>
@@ -398,12 +399,14 @@ Even during Alpha, if you find a bug that leads to a data corruption and demonst
 how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
 increase the size of the prize, and the scope of the bugs.
 
+List of rewarded cases:
+
+* B-Tree interior cell replacement issue in btrees with depth >=3 ([#2106](https://github.com/tursodatabase/turso/issues/2106))
+* Don't allow autovacuum to be flipped on non-empty databases ([#3830](https://github.com/tursodatabase/turso/pull/3830))
+
 More details [here](https://turso.algora.io).
 
-You can see an example of an awarded case on [#2049](https://github.com/tursodatabase/turso/issues/2049).
-
 Turso core staff are not eligible.
-
 
 ## FAQ
 

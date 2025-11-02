@@ -390,7 +390,7 @@ struct CommitInfo {
 }
 
 /// Track the state of the auto-vacuum mode.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutoVacuumMode {
     None,
     Full,

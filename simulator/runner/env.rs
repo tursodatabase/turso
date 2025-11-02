@@ -239,11 +239,15 @@ impl SimulatorEnv {
             self.seed_sqlite_autovacuum(&db_path);
         }
 
-        let db = match Database::open_file(
+        let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
-            self.profile.experimental_mvcc,
-            self.profile.query.gen_opts.indexes,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_mvcc(self.profile.experimental_mvcc)
+                .with_indexes(self.profile.query.gen_opts.indexes)
+                .with_autovacuum(true),
+            None,
         ) {
             Ok(db) => db,
             Err(e) => {
@@ -408,11 +412,15 @@ impl SimulatorEnv {
             )
         };
 
-        let db = match Database::open_file(
+        let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
-            profile.experimental_mvcc,
-            profile.query.gen_opts.indexes,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_mvcc(profile.experimental_mvcc)
+                .with_indexes(profile.query.gen_opts.indexes)
+                .with_autovacuum(true),
+            None,
         ) {
             Ok(db) => db,
             Err(e) => {

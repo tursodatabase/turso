@@ -408,7 +408,7 @@ impl TursoMcpServer {
 
         // Open the new database connection
         let conn = if path == ":memory:" || path.contains([':', '?', '&', '#']) {
-            match Connection::from_uri(&path, true, false, false, false, false, false) {
+            match Connection::from_uri(&path, DatabaseOpts::default()) {
                 Ok((_io, c)) => c,
                 Err(e) => return format!("Failed to open database '{path}': {e}"),
             }
@@ -417,7 +417,9 @@ impl TursoMcpServer {
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
-                DatabaseOpts::new().with_indexes(true),
+                DatabaseOpts::new()
+                    .with_indexes(true)
+                    .with_autovacuum(false),
                 None,
             ) {
                 Ok((_io, db)) => match db.connect() {
