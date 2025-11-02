@@ -80,6 +80,8 @@ pub struct Opts {
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
     pub experimental_index_method: bool,
+    #[clap(long, help = "Enable experimental autovacuum feature")]
+    pub experimental_autovacuum: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -195,6 +197,7 @@ impl Limbo {
                 opts.experimental_strict,
                 opts.experimental_encryption,
                 opts.experimental_index_method,
+                opts.experimental_autovacuum,
             )?
         } else {
             let flags = if opts.readonly {
@@ -213,6 +216,7 @@ impl Limbo {
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
                     .with_index_method(opts.experimental_index_method)
+                    .with_autovacuum(opts.experimental_autovacuum)
                     .turso_cli(),
                 None,
             )?;
