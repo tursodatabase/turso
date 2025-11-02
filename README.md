@@ -399,12 +399,14 @@ Even during Alpha, if you find a bug that leads to a data corruption and demonst
 how our simulator failed to catch it, you can get up to $1,000.00. As the project matures we will
 increase the size of the prize, and the scope of the bugs.
 
+List of rewarded cases:
+
+* B-Tree interior cell replacement issue in btrees with depth >=3 ([#2106](https://github.com/tursodatabase/turso/issues/2106))
+* Don't allow autovacuum to be flipped on non-empty databases ([#3830](https://github.com/tursodatabase/turso/pull/3830))
+
 More details [here](https://turso.algora.io).
 
-You can see an example of an awarded case on [#2049](https://github.com/tursodatabase/turso/issues/2049).
-
 Turso core staff are not eligible.
-
 
 ## FAQ
 
