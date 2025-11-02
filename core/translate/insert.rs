@@ -2756,7 +2756,7 @@ fn translate_without_rowid_insert(
     let pk_index = resolver
         .schema
         .get_indices(&table.name)
-        .find(|idx| idx.is_primary_key) 
+        .find(|idx| idx.is_primary_key)
         .ok_or_else(|| {
             crate::error::LimboError::InternalError(format!(
                 "WITHOUT ROWID table {} has no primary key index",
