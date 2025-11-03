@@ -354,7 +354,7 @@ pub fn simple_bind_expr(
                         database: None,
                         table: internal_id,
                         column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     };
                 } else {
                     // only if we haven't found a match, check for explicit rowid reference
@@ -1358,18 +1358,7 @@ pub fn extract_view_columns(
 
                     columns.push(ViewColumn {
                         table_index: table_index.unwrap_or(usize::MAX),
-                        column: Column {
-                            name: Some(col_name),
-                            ty: Type::Text, // Default to TEXT, could be refined with type analysis
-                            ty_str: "TEXT".to_string(),
-                            primary_key: false,
-                            is_rowid_alias: false,
-                            notnull: false,
-                            default: None,
-                            unique: false,
-                            collation: None,
-                            hidden: false,
-                        },
+                        column: Column::new_default_text(Some(col_name), "TEXT".to_string(), None),
                     });
                 }
                 ast::ResultColumn::Star => {
@@ -1392,18 +1381,18 @@ pub fn extract_view_columns(
 
                                 columns.push(ViewColumn {
                                     table_index: table_idx,
-                                    column: Column {
-                                        name: Some(final_name),
-                                        ty: table_column.ty,
-                                        ty_str: table_column.ty_str.clone(),
-                                        primary_key: false,
-                                        is_rowid_alias: false,
-                                        notnull: false,
-                                        default: None,
-                                        unique: false,
-                                        collation: table_column.collation,
-                                        hidden: false,
-                                    },
+                                    column: Column::new(
+                                        Some(final_name),
+                                        table_column.ty_str.clone(),
+                                        None,
+                                        table_column.ty(),
+                                        table_column.collation_opt(),
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                    ),
                                 });
                             }
                         }
@@ -1413,18 +1402,11 @@ pub fn extract_view_columns(
                     if tables.is_empty() {
                         columns.push(ViewColumn {
                             table_index: usize::MAX,
-                            column: Column {
-                                name: Some("*".to_string()),
-                                ty: Type::Text,
-                                ty_str: "TEXT".to_string(),
-                                primary_key: false,
-                                is_rowid_alias: false,
-                                notnull: false,
-                                default: None,
-                                unique: false,
-                                collation: None,
-                                hidden: false,
-                            },
+                            column: Column::new_default_text(
+                                Some("*".to_string()),
+                                "TEXT".to_string(),
+                                None,
+                            ),
                         });
                     }
                 }
@@ -1449,36 +1431,29 @@ pub fn extract_view_columns(
 
                                 columns.push(ViewColumn {
                                     table_index: table_idx,
-                                    column: Column {
-                                        name: Some(final_name),
-                                        ty: table_column.ty,
-                                        ty_str: table_column.ty_str.clone(),
-                                        primary_key: false,
-                                        is_rowid_alias: false,
-                                        notnull: false,
-                                        default: None,
-                                        unique: false,
-                                        collation: table_column.collation,
-                                        hidden: false,
-                                    },
+                                    column: Column::new(
+                                        Some(final_name),
+                                        table_column.ty_str.clone(),
+                                        None,
+                                        table_column.ty(),
+                                        table_column.collation_opt(),
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                    ),
                                 });
                             }
                         } else {
                             // Table not found, create placeholder
                             columns.push(ViewColumn {
                                 table_index: usize::MAX,
-                                column: Column {
-                                    name: Some(format!("{table_name_str}.*")),
-                                    ty: Type::Text,
-                                    ty_str: "TEXT".to_string(),
-                                    primary_key: false,
-                                    is_rowid_alias: false,
-                                    notnull: false,
-                                    default: None,
-                                    unique: false,
-                                    collation: None,
-                                    hidden: false,
-                                },
+                                column: Column::new_default_text(
+                                    Some(format!("{table_name_str}.*")),
+                                    "TEXT".to_string(),
+                                    None,
+                                ),
                             });
                         }
                     }

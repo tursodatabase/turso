@@ -16,8 +16,9 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
+    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
+        insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
@@ -167,7 +168,7 @@ fn optimize_update_plan(
         };
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias)
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
                 break 'requires true;
@@ -217,18 +218,7 @@ fn add_ephemeral_table_to_update_plan(
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![Column {
-            name: Some("rowid".to_string()),
-            ty: Type::Integer,
-            ty_str: "INTEGER".to_string(),
-            primary_key: true,
-            is_rowid_alias: false,
-            notnull: true,
-            default: None,
-            unique: false,
-            collation: None,
-            hidden: false,
-        }],
+        columns: vec![ROWID_COLUMN],
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
@@ -1034,7 +1024,7 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key || column.notnull
+                column.primary_key() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
@@ -1265,7 +1255,7 @@ fn ephemeral_index_build(
             name: c.name.clone().unwrap(),
             order: SortOrder::Asc,
             pos_in_table: i,
-            collation: c.collation,
+            collation: c.collation_opt(),
             default: c.default.clone(),
         })
         // only include columns that are used in the query

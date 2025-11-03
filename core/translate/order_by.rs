@@ -87,7 +87,7 @@ pub fn init_order_by(
             name: pos_in_table.to_string(),
             order: SortOrder::Asc,
             pos_in_table,
-            collation: Some(CollationSeq::Binary),
+            collation: None,
             default: None,
         });
         for _ in remappings.iter().filter(|r| !r.deduplicated) {

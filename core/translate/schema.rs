@@ -2,25 +2,16 @@ use std::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::schema::create_table;
-use crate::schema::BTreeTable;
-use crate::schema::Column;
-use crate::schema::Table;
-use crate::schema::Type;
-use crate::schema::RESERVED_TABLE_PREFIXES;
+use crate::schema::{create_table, BTreeTable, Column, Table, Type, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
-use crate::translate::emitter::emit_cdc_full_record;
-use crate::translate::emitter::emit_cdc_insns;
-use crate::translate::emitter::prepare_cdc_if_necessary;
-use crate::translate::emitter::OperationMode;
-use crate::translate::emitter::Resolver;
-use crate::translate::ProgramBuilder;
-use crate::translate::ProgramBuilderOpts;
+use crate::translate::emitter::{
+    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+};
+use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::Cookie;
-use crate::vdbe::insn::{CmpInsFlags, InsertFlags, Insn};
+use crate::vdbe::insn::{CmpInsFlags, Cookie, InsertFlags, Insn};
 use crate::Connection;
 use crate::{bail_parse_error, Result};
 
@@ -435,7 +426,7 @@ fn collect_autoindexes(
         };
 
         let needs_index = if us.is_primary_key {
-            !(col.primary_key && col.is_rowid_alias)
+            !(col.primary_key() && col.is_rowid_alias())
         } else {
             // UNIQUE single needs an index
             true
@@ -841,18 +832,18 @@ pub fn translate_drop_table(
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns: vec![Column {
-                name: Some("rowid".to_string()),
-                ty: Type::Integer,
-                ty_str: "INTEGER".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
+            columns: vec![Column::new(
+                Some("rowid".to_string()),
+                "INTEGER".to_string(),
+                None,
+                Type::Integer,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )],
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],

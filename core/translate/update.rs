@@ -241,7 +241,7 @@ pub fn prepare_update_plan(
                             .columns()
                             .iter()
                             .enumerate()
-                            .find(|(_i, c)| c.is_rowid_alias)
+                            .find(|(_i, c)| c.is_rowid_alias())
                         {
                             // Use the rowid alias column index
                             match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
@@ -320,7 +320,7 @@ pub fn prepare_update_plan(
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()

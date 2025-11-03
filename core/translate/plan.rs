@@ -512,7 +512,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 .columns()
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| !col.hidden)
+                .filter(|(_, col)| !col.hidden())
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
@@ -532,7 +532,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         database: None,
                         table: table.internal_id,
                         column: i,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     },
                     contains_aggregates: false,
                 }),
@@ -913,23 +913,27 @@ impl JoinedTable {
         let mut columns = plan
             .result_columns
             .iter()
-            .map(|rc| Column {
-                name: rc.name(&plan.table_references).map(String::from),
-                ty: Type::Blob, // FIXME: infer proper type
-                ty_str: "BLOB".to_string(),
-                is_rowid_alias: false,
-                primary_key: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
+            .map(|rc| {
+                Column::new(
+                    rc.name(&plan.table_references).map(String::from),
+                    "BLOB".to_string(),
+                    None,
+                    Type::Blob, // FIXME: infer proper type
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
             })
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
-            column.collation =
-                get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
+            column.set_collation(get_collseq_from_expr(
+                &plan.result_columns[i].expr,
+                &plan.table_references,
+            )?);
         }
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {

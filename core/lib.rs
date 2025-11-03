@@ -2838,7 +2838,7 @@ impl Statement {
                     .table_references
                     .find_table_by_internal_id(*table)?;
                 let table_column = table_ref.get_column_at(*column_idx)?;
-                match &table_column.ty {
+                match &table_column.ty() {
                     crate::schema::Type::Integer => Some("INTEGER".to_string()),
                     crate::schema::Type::Real => Some("REAL".to_string()),
                     crate::schema::Type::Text => Some("TEXT".to_string()),
