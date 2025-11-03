@@ -2842,32 +2842,82 @@ fn translate_without_rowid_insert(
         description: format_unique_violation_desc(&table.name, pk_index),
     });
 
+
     program.preassign_label_to_next_insn(ok_to_insert_label);
     tracing::debug!("Uniqueness check passed. Continuing with insertion.");
 
+
+    let physically_ordered_cols: Vec<&Column> = {
+        let mut ordered = Vec::with_capacity(table.columns.len());
+        let mut pk_cols_added = std::collections::HashSet::new();
+
+        for pk_col_def in pk_index.columns.iter().take(pk_index.n_key_col) {
+            let (_, col) = table.get_column(&pk_col_def.name).unwrap();
+            ordered.push(col);
+            pk_cols_added.insert(col.name.as_ref().unwrap().as_str());
+            tracing::trace!(
+                "  Physical col {}: {}",
+                ordered.len() - 1,
+                col.name.as_ref().unwrap()
+            );
+        }
+
+        for col in table.columns.iter() {
+            if !pk_cols_added.contains(col.name.as_ref().unwrap().as_str()) {
+                ordered.push(col);
+                tracing::trace!(
+                    "  Physical col {}: {}",
+                    ordered.len() - 1,
+                    col.name.as_ref().unwrap()
+                );
+            }
+        }
+        assert_eq!(
+            ordered.len(),
+            table.columns.len(),
+            "Physical column ordering failed: count mismatch."
+        );
+        ordered
+    };
+
+    let reordered_start_reg = program.alloc_registers(insertion.col_mappings.len());
+    tracing::debug!(
+        "Reordering columns into physical order. New registers start at {}",
+        reordered_start_reg
+    );
+
+    for (i, physical_col) in physically_ordered_cols.iter().enumerate() {
+        let logical_mapping = insertion
+            .get_col_mapping_by_name(physical_col.name.as_ref().unwrap())
+            .unwrap();
+        program.emit_insn(Insn::Copy {
+            src_reg: logical_mapping.register,
+            dst_reg: reordered_start_reg + i,
+            extra_amount: 0,
+        });
+    }
+
     let full_record_reg = program.alloc_register();
-    let affinity_str = insertion
-        .col_mappings
+    let affinity_str = physically_ordered_cols
         .iter()
-        .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
+
     program.emit_insn(Insn::MakeRecord {
-        start_reg: insertion.first_col_register(),
+        start_reg: reordered_start_reg,
         count: insertion.col_mappings.len(),
         dest_reg: full_record_reg,
         index_name: Some(pk_index.name.clone()),
         affinity_str: Some(affinity_str),
     });
-    tracing::debug!(
-        "Emitted OP_MakeRecord for full row into register {}",
-        full_record_reg
-    );
+
+
 
     program.emit_insn(Insn::IdxInsert {
         cursor_id: pk_cursor_id,
         record_reg: full_record_reg,
-        unpacked_start: Some(insertion.first_col_register()),
+        unpacked_start: Some(reordered_start_reg),
         unpacked_count: Some(insertion.col_mappings.len() as u16),
         flags: IdxInsertFlags::new().nchange(true),
     });
@@ -2891,7 +2941,6 @@ fn translate_without_rowid_insert(
             .expect("no cursor found for secondary index");
 
         tracing::debug!("Processing secondary index '{}'", index.name);
-
 
         let num_key_cols = index.n_key_col;
         let key_start_reg = program.alloc_registers(num_key_cols);

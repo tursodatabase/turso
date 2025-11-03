@@ -437,7 +437,7 @@ fn create_dedupe_index(
         };
         column.collation = collation;
     }
- let n_key_col = dedupe_columns.len();
+    let n_key_col = dedupe_columns.len();
     let dedupe_index = Arc::new(Index {
         columns: dedupe_columns,
         name: "compound_dedupe".to_string(),
@@ -449,7 +449,7 @@ fn create_dedupe_index(
         where_clause: None,
         index_method: None,
         is_primary_key: false,
-           n_key_col,
+        n_key_col,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

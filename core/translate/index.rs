@@ -150,7 +150,7 @@ pub fn translate_create_index(
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
         is_primary_key: false,
-         n_key_col: columns.len(),
+        n_key_col: columns.len(),
     });
 
     if !idx.validate_where_expr(table) {

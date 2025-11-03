@@ -382,7 +382,7 @@ fn get_subquery_parser<'a>(
                     )?;
                 }
 
-                let  n_key_col=columns.len();
+                let n_key_col = columns.len();
                 let ephemeral_index = Arc::new(Index {
                     columns,
                     name: format!("ephemeral_index_where_sub_{subquery_id}"),
@@ -394,7 +394,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     is_primary_key: false,
-                     n_key_col,
+                    n_key_col,
                 });
 
                 let cursor_id =
