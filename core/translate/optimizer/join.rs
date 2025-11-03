@@ -1670,18 +1670,18 @@ mod tests {
     }
 
     fn _create_column(c: &TestColumn) -> Column {
-        Column {
-            name: Some(c.name.clone()),
-            ty: c.ty,
-            ty_str: c.ty.to_string(),
-            is_rowid_alias: c.is_rowid_alias,
-            primary_key: false,
-            notnull: false,
-            default: None,
-            unique: false,
-            collation: None,
-            hidden: false,
-        }
+        Column::new(
+            Some(c.name.clone()),
+            c.ty.to_string(),
+            None,
+            c.ty,
+            None,
+            c.is_rowid_alias,
+            false,
+            false,
+            false,
+            false,
+        )
     }
     fn _create_column_of_type(name: &str, ty: Type) -> Column {
         _create_column(&TestColumn {

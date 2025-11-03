@@ -1488,9 +1488,10 @@ fn emit_seek_termination(
         affinity = if let Some(table_ref) = tables
             .joined_tables()
             .iter()
-            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias))
+            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias()))
         {
-            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias) {
+            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias())
+            {
                 Some(table_ref.columns()[rowid_col_idx].affinity())
             } else {
                 Some(Affinity::Numeric)

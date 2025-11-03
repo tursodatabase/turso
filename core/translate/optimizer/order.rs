@@ -184,7 +184,7 @@ pub fn plan_satisfies_order_target(
                             .table
                             .columns()
                             .iter()
-                            .position(|c| c.is_rowid_alias);
+                            .position(|c| c.is_rowid_alias());
                         let Some(rowid_alias_col) = rowid_alias_col else {
                             return false;
                         };

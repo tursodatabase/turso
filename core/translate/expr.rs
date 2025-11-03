@@ -2133,7 +2133,7 @@ pub fn translate_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 };
                 // Counter intuitive but a column always needs to have a collation
-                program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+                program.set_collation(Some((table_column.collation(), false)));
             }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
@@ -2222,7 +2222,7 @@ pub fn translate_expr(
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-                        maybe_apply_affinity(column.ty, target_register, program);
+                        maybe_apply_affinity(column.ty(), target_register, program);
                     }
                     Ok(target_register)
                 }
@@ -3701,7 +3701,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     joined_table.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
@@ -3743,7 +3743,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     outer_ref.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         }
@@ -3822,7 +3822,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         database: None, // TODO: support different databases
                         table: tbl_id,
                         column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     };
                     tracing::debug!("rewritten to column");
                     referenced_tables.mark_column_used(tbl_id, col_idx);
@@ -3882,7 +3882,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let col = table.columns().get(col_idx).unwrap();
 
                     // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias;
+                    let is_rowid_alias = col.is_rowid_alias();
 
                     // Convert to Column expression - since this is a cross-database reference,
                     // we need to create a synthetic table reference for it

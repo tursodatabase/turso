@@ -19,14 +19,13 @@ use crate::{
 /// **Pre defined collation sequences**\
 /// Collating functions only matter when comparing string values.
 /// Numeric values are always compared numerically, and BLOBs are always compared byte-by-byte using memcmp().
+#[repr(u8)]
 pub enum CollationSeq {
-    /// Standard String compare
+    Unset = 0,
     #[default]
-    Binary,
-    /// Ascii case insensitive
-    NoCase,
-    /// Same as Binary but with trimmed whitespace
-    Rtrim,
+    Binary = 1,
+    NoCase = 2,
+    Rtrim = 3,
 }
 
 impl CollationSeq {
@@ -35,11 +34,20 @@ impl CollationSeq {
             crate::LimboError::ParseError(format!("no such collation sequence: {collation}"))
         })
     }
+    #[inline]
+    /// Returns the collation, defaulting to BINARY if unset
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits {
+            2 => CollationSeq::NoCase,
+            3 => CollationSeq::Rtrim,
+            _ => CollationSeq::Binary,
+        }
+    }
 
     #[inline(always)]
     pub fn compare_strings(&self, lhs: &str, rhs: &str) -> Ordering {
         match self {
-            CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
+            CollationSeq::Unset | CollationSeq::Binary => Self::binary_cmp(lhs, rhs),
             CollationSeq::NoCase => Self::nocase_cmp(lhs, rhs),
             CollationSeq::Rtrim => Self::rtrim_cmp(lhs, rhs),
         }
@@ -112,7 +120,7 @@ pub fn get_collseq_from_expr(
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
                 if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation;
+                    maybe_column_collseq = column.collation_opt();
                 }
                 return Ok(WalkControl::Continue);
             }
@@ -123,7 +131,7 @@ pub fn get_collseq_from_expr(
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation;
+                            maybe_column_collseq = rowid_alias_col.collation_opt();
                         }
                     }
                 }
@@ -360,18 +368,18 @@ mod tests {
                 is_strict: false,
                 name: "foo".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("foo".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
+                columns: vec![Column::new(
+                    Some("foo".to_string()),
+                    "text".to_string(),
+                    None,
+                    Type::Text,
                     collation,
-                    hidden: false,
-                }],
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),
@@ -403,18 +411,18 @@ mod tests {
                 is_strict: false,
                 name: "t1".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("a".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: left,
-                    hidden: false,
-                }],
+                columns: vec![Column::new(
+                    Some("a".to_string()),
+                    "text".to_string(),
+                    None,
+                    Type::Text,
+                    left,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),
@@ -437,18 +445,18 @@ mod tests {
                 is_strict: false,
                 name: "t2".to_string(),
                 primary_key_columns: vec![],
-                columns: vec![Column {
-                    name: Some("b".to_string()),
-                    ty: Type::Text,
-                    ty_str: "text".to_string(),
-                    primary_key: false,
-                    is_rowid_alias: false,
-                    notnull: false,
-                    default: None,
-                    unique: false,
-                    collation: right,
-                    hidden: false,
-                }],
+                columns: vec![Column::new(
+                    Some("b".to_string()),
+                    "text".to_string(),
+                    None,
+                    Type::Text,
+                    right,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),
@@ -478,18 +486,18 @@ mod tests {
                 is_strict: false,
                 name: "bar".to_string(),
                 primary_key_columns: vec![("id".to_string(), SortOrder::Asc)],
-                columns: vec![Column {
-                    name: Some("id".to_string()),
-                    ty: Type::Integer,
-                    ty_str: "INTEGER".to_string(),
-                    primary_key: true,
-                    is_rowid_alias: true,
-                    notnull: false,
-                    default: None,
-                    unique: true,
+                columns: vec![Column::new(
+                    Some("id".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                    Type::Integer,
                     collation,
-                    hidden: false,
-                }],
+                    true,
+                    true,
+                    false,
+                    true,
+                    false,
+                )],
                 unique_sets: vec![],
                 foreign_keys: vec![],
             })),

@@ -593,7 +593,7 @@ fn transform_args_into_where_terms(
     let mut args_iter = args.iter();
     let mut hidden_count = 0;
     for (i, col) in table.columns().iter().enumerate() {
-        if !col.hidden {
+        if !col.hidden() {
             continue;
         }
         hidden_count += 1;
@@ -603,7 +603,7 @@ fn transform_args_into_where_terms(
                 database: None,
                 table: internal_id,
                 column: i,
-                is_rowid_alias: col.is_rowid_alias,
+                is_rowid_alias: col.is_rowid_alias(),
             };
             let expr = match arg_expr.as_ref() {
                 Expr::Literal(Null) => Expr::IsNull(Box::new(column_expr)),
@@ -1087,14 +1087,14 @@ fn parse_join(
         let mut distinct_names: Vec<ast::Name> = vec![];
         // TODO: O(n^2) maybe not great for large tables or big multiway joins
         // SQLite doesn't use HIDDEN columns for NATURAL joins: https://www3.sqlite.org/src/info/ab09ef427181130b
-        for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden) {
+        for right_col in rightmost_table.columns().iter().filter(|col| !col.hidden()) {
             let mut found_match = false;
             for left_table in table_references
                 .joined_tables()
                 .iter()
                 .take(table_references.joined_tables().len() - 1)
             {
-                for left_col in left_table.columns().iter().filter(|col| !col.hidden) {
+                for left_col in left_table.columns().iter().filter(|col| !col.hidden()) {
                     if left_col.name == right_col.name {
                         distinct_names.push(ast::Name::exact(
                             left_col.name.clone().expect("column name is None"),
@@ -1154,7 +1154,7 @@ fn parse_join(
                             .columns()
                             .iter()
                             .enumerate()
-                            .filter(|(_, col)| !natural || !col.hidden)
+                            .filter(|(_, col)| !natural || !col.hidden())
                             .find(|(_, col)| {
                                 col.name
                                     .as_ref()
@@ -1189,14 +1189,14 @@ fn parse_join(
                             database: None,
                             table: left_table_id,
                             column: left_col_idx,
-                            is_rowid_alias: left_col.is_rowid_alias,
+                            is_rowid_alias: left_col.is_rowid_alias(),
                         }),
                         ast::Operator::Equals,
                         Box::new(Expr::Column {
                             database: None,
                             table: right_table.internal_id,
                             column: right_col_idx,
-                            is_rowid_alias: right_col.is_rowid_alias,
+                            is_rowid_alias: right_col.is_rowid_alias(),
                         }),
                     );
 

@@ -165,7 +165,7 @@ const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABL
 fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_rowid_alias || column.primary_key {
+            if column.is_rowid_alias() || column.primary_key() {
                 SELECTIVITY_UNIQUE_EQUALITY
             } else {
                 SELECTIVITY_EQ
@@ -197,7 +197,7 @@ pub fn constraints_from_where_clause(
         let rowid_alias_column = table_reference
             .columns()
             .iter()
-            .position(|c| c.is_rowid_alias);
+            .position(|c| c.is_rowid_alias());
 
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
@@ -313,7 +313,7 @@ pub fn constraints_from_where_clause(
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
             let constrained_column = &table_reference.table.columns()[constraint.table_col_pos];
-            let column_collation = constrained_column.collation.unwrap_or_default();
+            let column_collation = constrained_column.collation();
             let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
             // Index seek keys must use the same collation as the constrained column.
             match get_collseq_from_expr(constraining_expr, table_references)? {

@@ -858,10 +858,10 @@ fn emit_notnulls(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &
     for column_mapping in insertion
         .col_mappings
         .iter()
-        .filter(|column_mapping| column_mapping.column.notnull)
+        .filter(|column_mapping| column_mapping.column.notnull())
     {
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
-        if column_mapping.column.is_rowid_alias {
+        if column_mapping.column.is_rowid_alias() {
             continue;
         }
         program.emit_insn(Insn::HaltIfNull {
@@ -918,7 +918,7 @@ fn bind_insert(
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden)
+                .filter(|c| !c.hidden())
                 .map(|c| {
                     c.default
                         .clone()
@@ -1153,7 +1153,7 @@ fn init_source_emission<'a>(
                         ctx.table
                             .columns
                             .iter()
-                            .filter(|col| !col.hidden)
+                            .filter(|col| !col.hidden())
                             .map(|col| col.affinity().aff_mask())
                             .collect::<String>()
                     } else {
@@ -1257,18 +1257,18 @@ pub struct AutoincMeta {
     table_name_reg: usize,
 }
 
-pub const ROWID_COLUMN: &Column = &Column {
-    name: None,
-    ty: schema::Type::Integer,
-    ty_str: String::new(),
-    primary_key: true,
-    is_rowid_alias: true,
-    notnull: true,
-    default: None,
-    unique: false,
-    collation: None,
-    hidden: false,
-};
+pub const ROWID_COLUMN: Column = Column::new(
+    None,          // name
+    String::new(), // type string
+    None,          // default
+    schema::Type::Integer,
+    None,
+    true,  // primary key
+    true,  // rowid alias
+    true,  // notnull
+    false, // unique
+    false, // hidden
+);
 
 /// Represents how a table should be populated during an INSERT.
 #[derive(Debug)]
@@ -1409,7 +1409,7 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden).count() {
+        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
@@ -1419,11 +1419,11 @@ fn build_insertion<'a>(
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden {
+            if col.hidden() {
                 // Hidden columns are not taken into account.
                 continue;
             }
-            if col.is_rowid_alias {
+            if col.is_rowid_alias() {
                 insertion_key = InsertionKey::RowidAlias(ColMapping {
                     column: col,
                     value_index: Some(value_idx),
@@ -1441,7 +1441,7 @@ fn build_insertion<'a>(
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Named column
-                if col_in_table.is_rowid_alias {
+                if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
                         column: col_in_table,
                         value_index: Some(value_index),
@@ -1455,7 +1455,7 @@ fn build_insertion<'a>(
                 .any(|s| s.eq_ignore_ascii_case(&column_name))
             {
                 // Explicit use of the 'rowid' keyword
-                if let Some(col_in_table) = table.columns().iter().find(|c| c.is_rowid_alias) {
+                if let Some(col_in_table) = table.columns().iter().find(|c| c.is_rowid_alias()) {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
                         column: col_in_table,
                         value_index: Some(value_index),
@@ -1594,7 +1594,7 @@ fn translate_key(
             register,
         } => translate_column(
             program,
-            ROWID_COLUMN,
+            &ROWID_COLUMN,
             *register,
             *value_index,
             &mut translate_value_fn,
@@ -1614,13 +1614,13 @@ fn translate_column(
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
-    } else if column.is_rowid_alias {
+    } else if column.is_rowid_alias() {
         // Although a non-NULL integer key is used for the insertion key,
         // the rowid alias column is emitted as NULL.
         program.emit_insn(Insn::SoftNull {
             reg: column_register,
         });
-    } else if column.hidden {
+    } else if column.hidden() {
         // Emit NULL for not-explicitly-mentioned hidden columns, even ignoring DEFAULT.
         program.emit_insn(Insn::Null {
             dest: column_register,
@@ -1629,7 +1629,7 @@ fn translate_column(
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
-        let nullable = !column.notnull && !column.primary_key && !column.unique;
+        let nullable = !column.notnull() && !column.primary_key() && !column.unique();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",
@@ -2083,7 +2083,7 @@ pub fn rewrite_partial_index_where(
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             Some(insertion.key_register())
         } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-            if c.column.is_rowid_alias {
+            if c.column.is_rowid_alias() {
                 Some(insertion.key_register())
             } else {
                 Some(c.register)
@@ -2251,7 +2251,7 @@ pub fn emit_fk_child_insert_checks(
         let fk_ok = program.allocate_label();
         for cname in &fk_ref.child_cols {
             let (i, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias {
+            let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
                 new_start_reg + i
@@ -2270,7 +2270,7 @@ pub fn emit_fk_child_insert_checks(
 
             // first child col carries rowid
             let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
-            let val_reg = if col_child.is_rowid_alias {
+            let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
                 new_start_reg + i_child
@@ -2325,7 +2325,7 @@ pub fn emit_fk_child_insert_checks(
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias {
+                        src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
                             new_start_reg + i
@@ -2353,7 +2353,7 @@ pub fn emit_fk_child_insert_checks(
                 for (i, pname) in parent_cols.iter().enumerate() {
                     let (pos, col) = child_tbl.get_column(pname).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias {
+                        src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
                             new_start_reg + pos

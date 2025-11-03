@@ -109,10 +109,10 @@ fn emit_collseq_if_needed(
     if let ast::Expr::Column { table, column, .. } = expr {
         if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
             if let Some(table_column) = table_ref.get_column_at(*column) {
-                if let Some(collation) = &table_column.collation {
+                if let Some(c) = table_column.collation_opt() {
                     program.emit_insn(Insn::CollSeq {
                         reg: None,
-                        collation: *collation,
+                        collation: c,
                     });
                 }
             }
