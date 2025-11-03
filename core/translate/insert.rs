@@ -1059,6 +1059,20 @@ fn init_source_emission<'a>(
     body: InsertBody,
     columns: &'a [ast::Name],
 ) -> Result<ProgramBuilder> {
+    let required_column_count = if columns.is_empty() {
+        table.columns().len()
+    } else {
+        columns.len()
+    };
+    if !values.is_empty() {
+        // If we had a single tuple in VALUES, it was inserted into the values vector parameter.
+        if values.len() != required_column_count {
+            crate::bail_parse_error!(
+                "{} values for {required_column_count} columns",
+                values.len()
+            );
+        }
+    }
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
             // Simple common case of INSERT INTO <table> VALUES (...) without compounds.
@@ -1088,6 +1102,12 @@ fn init_source_emission<'a>(
                 program.incr_nesting();
                 let result =
                     translate_select(select, resolver, program, query_destination, connection)?;
+                if result.num_result_cols != required_column_count {
+                    crate::bail_parse_error!(
+                        "{} values for {required_column_count} columns",
+                        result.num_result_cols,
+                    );
+                }
                 program = result.program;
                 program.decr_nesting();
 
