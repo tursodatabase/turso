@@ -189,7 +189,11 @@ pub fn init_loop(
             where_clause: None,
             index_method: None,
             is_primary_key: false,
-            n_key_col: group_by.as_ref().unwrap().exprs.len(),
+            n_key_col: if let Some(gb) = group_by.as_ref() {
+                gb.exprs.len()
+            } else {
+                0
+            },
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {

@@ -2842,10 +2842,8 @@ fn translate_without_rowid_insert(
         description: format_unique_violation_desc(&table.name, pk_index),
     });
 
-
     program.preassign_label_to_next_insn(ok_to_insert_label);
     tracing::debug!("Uniqueness check passed. Continuing with insertion.");
-
 
     let physically_ordered_cols: Vec<&Column> = {
         let mut ordered = Vec::with_capacity(table.columns.len());
@@ -2903,7 +2901,6 @@ fn translate_without_rowid_insert(
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
-
     program.emit_insn(Insn::MakeRecord {
         start_reg: reordered_start_reg,
         count: insertion.col_mappings.len(),
@@ -2911,8 +2908,6 @@ fn translate_without_rowid_insert(
         index_name: Some(pk_index.name.clone()),
         affinity_str: Some(affinity_str),
     });
-
-
 
     program.emit_insn(Insn::IdxInsert {
         cursor_id: pk_cursor_id,
