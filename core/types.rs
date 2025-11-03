@@ -1195,7 +1195,9 @@ impl ImmutableRecord {
                     writer.extend_from_slice(&t.value);
                 }
                 Value::Blob(b) => {
-                    writer.extend_from_slice(&b.value);
+                    let mut blob = b.clone();
+                    blob.expand();
+                    writer.extend_from_slice(&blob.value);
                 }
             };
         }

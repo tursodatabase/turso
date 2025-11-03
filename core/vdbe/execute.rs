@@ -9298,7 +9298,11 @@ impl Value {
                 let text = self.to_string();
                 Value::build_text(hex::encode_upper(text))
             }
-            Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(&blob_bytes.value)),
+            Value::Blob(b) => {
+                let mut blob = b.clone();
+                blob.expand();
+                Value::build_text(hex::encode_upper(&blob.value))
+            }
             Value::Null => Value::build_text(""),
         }
     }

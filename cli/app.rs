@@ -32,9 +32,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    types::BlobSubtype, Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement,
-    StepResult,
-    Value,
+    types::BlobSubtype, Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode,
+    Statement, StepResult, Value,
 };
 
 #[derive(Parser, Debug)]
