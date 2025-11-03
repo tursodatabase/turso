@@ -2415,6 +2415,7 @@ pub struct Index {
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
     pub is_primary_key: bool,
+     pub n_key_col: usize,
 }
 
 #[allow(dead_code)]
@@ -2483,6 +2484,7 @@ impl Index {
                         where_clause: None,
                         is_primary_key: false,
                         index_method: Some(descriptor),
+                         n_key_col: columns.len(),
                     })
                 } else {
                     Ok(Index {
@@ -2496,6 +2498,7 @@ impl Index {
                         where_clause,
                         index_method: None,
                         is_primary_key: false,
+                         n_key_col: columns.len(),
                     })
                 }
             }
@@ -2572,6 +2575,7 @@ impl Index {
             where_clause: None,
             index_method: None,
             is_primary_key: true,
+            n_key_col: column_count,
         })
     }
 
@@ -2600,6 +2604,7 @@ impl Index {
             })
             .collect::<Vec<_>>();
 
+             let n_key_col = unique_cols.len();
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
@@ -2611,6 +2616,7 @@ impl Index {
             where_clause: None,
             index_method: None,
             is_primary_key: false,
+              n_key_col, 
         })
     }
 

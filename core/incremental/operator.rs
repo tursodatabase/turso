@@ -72,6 +72,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
         where_clause: None,
         index_method: None,
         is_primary_key: false,
+         n_key_col: 3,
     }
 }
 

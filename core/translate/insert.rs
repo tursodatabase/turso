@@ -2765,9 +2765,10 @@ fn translate_without_rowid_insert(
         })?;
 
     tracing::debug!(
-        "Found primary key index '{}' with root page {}",
+        "Found WITHOUT ROWID primary key index '{}' with root page {} and {} key columns.",
         pk_index.name,
-        pk_index.root_page
+        pk_index.root_page,
+        pk_index.n_key_col
     );
 
     let pk_cursor_id = program.alloc_cursor_index(None, pk_index)?;
@@ -2807,8 +2808,7 @@ fn translate_without_rowid_insert(
 
     emit_notnulls(&mut program, &ctx, &insertion);
 
-    let pk_columns = &pk_index.columns;
-    let num_pk_cols = pk_columns.len();
+    let num_pk_cols = pk_index.n_key_col;
     let pk_registers_start = program.alloc_registers(num_pk_cols);
     tracing::debug!(
         "Allocated registers {}-{} for PK uniqueness check",
@@ -2816,7 +2816,7 @@ fn translate_without_rowid_insert(
         pk_registers_start + num_pk_cols - 1
     );
 
-    for (i, pk_col) in pk_columns.iter().enumerate() {
+    for (i, pk_col) in pk_index.columns.iter().take(num_pk_cols).enumerate() {
         let mapping = insertion.get_col_mapping_by_name(&pk_col.name).unwrap();
         program.emit_insn(Insn::Copy {
             src_reg: mapping.register,
@@ -2879,13 +2879,7 @@ fn translate_without_rowid_insert(
 
     tracing::debug!("Beginning update of secondary indices.");
     for index in resolver.schema.get_indices(table.name.as_str()) {
-        let is_pk = index.columns.len() == pk_index.columns.len()
-            && index
-                .columns
-                .iter()
-                .zip(pk_index.columns.iter())
-                .all(|(a, b)| a.name == b.name);
-        if is_pk {
+        if index.is_primary_key {
             continue;
         }
 
@@ -2898,13 +2892,12 @@ fn translate_without_rowid_insert(
 
         tracing::debug!("Processing secondary index '{}'", index.name);
 
-        let secondary_key_cols = &index.columns;
-        let num_key_cols = secondary_key_cols.len();
+
+        let num_key_cols = index.n_key_col;
         let key_start_reg = program.alloc_registers(num_key_cols);
 
         let mut current_reg = key_start_reg;
-
-        for idx_col in secondary_key_cols {
+        for idx_col in index.columns.iter().take(num_key_cols) {
             let mapping = insertion.get_col_mapping_by_name(&idx_col.name).unwrap();
             program.emit_insn(Insn::Copy {
                 src_reg: mapping.register,

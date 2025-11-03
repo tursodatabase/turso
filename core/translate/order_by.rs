@@ -100,6 +100,7 @@ pub fn init_order_by(
                 default: None,
             })
         }
+           let n_key_col = index_columns.len();
         let index = Arc::new(Index {
             name: index_name.clone(),
             table_name: String::new(),
@@ -111,6 +112,7 @@ pub fn init_order_by(
             where_clause: None,
             index_method: None,
             is_primary_key: false,
+              n_key_col,
         });
         program.alloc_cursor_id(CursorType::BTreeIndex(index))
     } else {
