@@ -5,7 +5,9 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, expr_vector_size, BindingBehavior, ParamState,
+};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -506,6 +508,8 @@ fn prepare_one_select_plan(
 
             plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
 
+            validate_expr_correct_column_counts(&plan)?;
+
             // Return the unoptimized query plan
             Ok(plan)
         }
@@ -562,9 +566,91 @@ fn prepare_one_select_plan(
                 non_from_clause_subqueries: vec![],
             };
 
+            validate_expr_correct_column_counts(&plan)?;
+
             Ok(plan)
         }
     }
+}
+
+/// Validate that all expressions in the plan return the correct number of values;
+/// generally this only applies to parenthesized lists and subqueries.
+fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
+    for result_column in plan.result_columns.iter() {
+        let vec_size = expr_vector_size(&result_column.expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
+        }
+    }
+    for (expr, _) in plan.order_by.iter() {
+        let vec_size = expr_vector_size(expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);
+        }
+    }
+    if let Some(group_by) = &plan.group_by {
+        for expr in group_by.exprs.iter() {
+            let vec_size = expr_vector_size(expr)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!(
+                    "group by expression must return 1 value, got {}",
+                    vec_size
+                );
+            }
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having.iter() {
+                let vec_size = expr_vector_size(expr)?;
+                if vec_size != 1 {
+                    crate::bail_parse_error!(
+                        "having expression must return 1 value, got {}",
+                        vec_size
+                    );
+                }
+            }
+        }
+    }
+    for aggregate in plan.aggregates.iter() {
+        for arg in aggregate.args.iter() {
+            let vec_size = expr_vector_size(arg)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!(
+                    "aggregate argument must return 1 value, got {}",
+                    vec_size
+                );
+            }
+        }
+    }
+    for term in plan.where_clause.iter() {
+        let vec_size = expr_vector_size(&term.expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!(
+                "where clause expression must return 1 value, got {}",
+                vec_size
+            );
+        }
+    }
+    for expr in plan.values.iter() {
+        for value in expr.iter() {
+            let vec_size = expr_vector_size(value)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!("value must return 1 value, got {}", vec_size);
+            }
+        }
+    }
+    if let Some(limit) = &plan.limit {
+        let vec_size = expr_vector_size(limit)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("limit expression must return 1 value, got {}", vec_size);
+        }
+    }
+    if let Some(offset) = &plan.offset {
+        let vec_size = expr_vector_size(offset)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("offset expression must return 1 value, got {}", vec_size);
+        }
+    }
+    Ok(())
 }
 
 fn add_vtab_predicates_to_where_clause(
