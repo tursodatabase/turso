@@ -2,11 +2,13 @@ package tech.turso.jdbc4;
 
 import static java.util.Objects.requireNonNull;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.Clob;
@@ -164,7 +166,33 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setAsciiStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setAsciiStream length must be non-negative");
+    }
+    try {
+      byte[] buffer = new byte[length];
+      int offset = 0;
+      while (offset < length) {
+        int read = x.read(buffer, offset, length - offset);
+        if (read == -1) {
+          break;
+        }
+        offset += read;
+      }
+      if (offset == 0) {
+        this.statement.bindNull(parameterIndex);
+      } else {
+        String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
+        this.statement.bindText(parameterIndex, ascii);
+      }
+    } catch (IOException e) {
+      throw new SQLException("Error reading ASCII stream", e);
+    }
   }
 
   @Override
