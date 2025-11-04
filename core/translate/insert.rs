@@ -2937,24 +2937,29 @@ fn translate_without_rowid_insert(
 
         tracing::debug!("Processing secondary index '{}'", index.name);
 
-        let num_key_cols = index.n_key_col;
-        let key_start_reg = program.alloc_registers(num_key_cols);
+        let num_total_cols = index.columns.len();
+        let key_start_reg = program.alloc_registers(num_total_cols);
 
-        let mut current_reg = key_start_reg;
-        for idx_col in index.columns.iter().take(num_key_cols) {
-            let mapping = insertion.get_col_mapping_by_name(&idx_col.name).unwrap();
+        for (i, idx_col) in index.columns.iter().enumerate() {
+            let mapping = insertion
+                .get_col_mapping_by_name(&idx_col.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Could not find column mapping for '{}' in index '{}'",
+                        idx_col.name, index.name
+                    )
+                });
             program.emit_insn(Insn::Copy {
                 src_reg: mapping.register,
-                dst_reg: current_reg,
+                dst_reg: key_start_reg + i,
                 extra_amount: 0,
             });
-            current_reg += 1;
         }
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: key_start_reg,
-            count: num_key_cols,
+            count: num_total_cols,
             dest_reg: record_reg,
             index_name: Some(index.name.clone()),
             affinity_str: None,
@@ -2969,7 +2974,7 @@ fn translate_without_rowid_insert(
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(key_start_reg),
-            unpacked_count: Some(num_key_cols as u16),
+            unpacked_count: Some(num_total_cols as u16),
             flags: IdxInsertFlags::new().nchange(true),
         });
         tracing::debug!("Emitted OP_IdxInsert for secondary index '{}'", index.name);

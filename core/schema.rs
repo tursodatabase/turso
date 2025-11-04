@@ -2454,7 +2454,33 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let mut index_columns = resolve_sorted_columns(table, &columns)?;
+
+                if !table.has_rowid {
+                    let existing_index_cols: HashSet<String> =
+                        index_columns.iter().map(|c| c.name.clone()).collect();
+
+                    for (pk_col_name, _order) in &table.primary_key_columns {
+                        if !existing_index_cols.contains(pk_col_name.as_str()) {
+                            let (pos_in_table, column) =
+                                table.get_column(pk_col_name).ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "Could not find PK column '{}' in table '{}'",
+                                        pk_col_name, table.name
+                                    ))
+                                })?;
+
+                            index_columns.push(IndexColumn {
+                                name: pk_col_name.clone(),
+                                order: SortOrder::Asc,
+                                pos_in_table,
+                                collation: column.collation_opt(),
+                                default: column.default.clone(),
+                            });
+                        }
+                    }
+                }
+
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
