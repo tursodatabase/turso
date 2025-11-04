@@ -24,6 +24,7 @@ import java.sql.SQLException;
 import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.util.Arrays;
 import java.util.Calendar;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
@@ -202,7 +203,33 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setBinaryStream length must be non-negative");
+    }
+    try {
+      byte[] buffer = new byte[length];
+      int offset = 0;
+      while (offset < length) {
+        int read = x.read(buffer, offset, length - offset);
+        if (read == -1) {
+          break;
+        }
+        offset += read;
+      }
+      if (offset == 0) {
+        this.statement.bindNull(parameterIndex);
+      } else {
+        byte[] actualData = Arrays.copyOf(buffer, offset);
+        this.statement.bindBlob(parameterIndex, actualData);
+      }
+    } catch (IOException e) {
+      throw new SQLException("Error reading binary stream", e);
+    }
   }
 
   @Override
