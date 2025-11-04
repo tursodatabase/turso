@@ -3,9 +3,14 @@ package tech.turso.jdbc4;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
@@ -386,6 +391,70 @@ class JDBC4PreparedStatementTest {
     assertEquals(
         new java.math.BigDecimal("12345.6789").stripTrailingZeros(),
         new java.math.BigDecimal(decimalText).stripTrailingZeros());
+  }
+
+  @Test
+  void testSetAsciiStream_insert_and_select() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "test";
+    byte[] bytes = text.getBytes(StandardCharsets.US_ASCII);
+    InputStream stream = new ByteArrayInputStream(bytes);
+
+    stmt.setAsciiStream(1, stream, bytes.length);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(text, rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_nullStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    stmt.setAsciiStream(1, null, 0);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_emptyStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream empty = new ByteArrayInputStream(new byte[0]);
+    stmt.setAsciiStream(1, empty, 10);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_negativeLength() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "test";
+    byte[] bytes = text.getBytes(StandardCharsets.US_ASCII);
+    InputStream stream = new ByteArrayInputStream(bytes);
+
+    assertThrows(SQLException.class, () -> stmt.setAsciiStream(1, stream, -1));
   }
 
   @Test
