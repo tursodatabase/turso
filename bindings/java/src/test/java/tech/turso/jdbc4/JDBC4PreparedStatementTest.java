@@ -418,6 +418,7 @@ class JDBC4PreparedStatementTest {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
 
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
     stmt.setAsciiStream(1, null, 0);
     stmt.execute();
 
@@ -434,6 +435,7 @@ class JDBC4PreparedStatementTest {
 
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
     InputStream empty = new ByteArrayInputStream(new byte[0]);
+
     stmt.setAsciiStream(1, empty, 10);
     stmt.execute();
 
@@ -455,6 +457,70 @@ class JDBC4PreparedStatementTest {
     InputStream stream = new ByteArrayInputStream(bytes);
 
     assertThrows(SQLException.class, () -> stmt.setAsciiStream(1, stream, -1));
+  }
+
+  @Test
+  void testSetBinaryStream_insert_and_select() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    byte[] data = {1, 2, 3, 4, 5};
+    InputStream stream = new ByteArrayInputStream(data);
+
+    stmt.setBinaryStream(1, stream, data.length);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertArrayEquals(data, rs.getBytes(1));
+  }
+
+  @Test
+  void testSetBinaryStream_nullStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setBinaryStream(1, null, 0);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getBytes(1));
+  }
+
+  @Test
+  void testSetBinaryStream_emptyStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    InputStream empty = new ByteArrayInputStream(new byte[0]);
+    stmt.setBinaryStream(1, empty, 10);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getBytes(1));
+  }
+
+  @Test
+  void testSetBinaryStream_negativeLength() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    byte[] data = {1, 2, 3};
+    InputStream stream = new ByteArrayInputStream(data);
+
+    assertThrows(SQLException.class, () -> stmt.setBinaryStream(1, stream, -1));
   }
 
   @Test
