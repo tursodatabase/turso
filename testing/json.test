@@ -634,6 +634,10 @@ do_execsql_test json_type_null_arg {
   select json_type(null)
 } {{}}
 
+do_execsql_test json_type_blob_with_trailing_bytes {
+  select json_type(x'7B2261223A317D00FF')
+} {{object}}
+
 do_execsql_test json_error_position_valid {
   SELECT json_error_position('{"a":55,"b":72,}');
 } {{0}}
@@ -739,6 +743,10 @@ do_execsql_test json_valid_8 {
 do_execsql_test json_valid_9 {
     SELECT json_valid(NULL);
 } {}
+
+do_execsql_test json_valid_blob_embedded_null {
+   SELECT json_valid(x'7B226100223A317D');
+} {0}
 do_execsql_test json-patch-basic-1 {
     select json_patch('{"a":1}', '{"b":2}');
 } {{{"a":1,"b":2}}}
@@ -1773,4 +1781,3 @@ do_execsql_test json-tree-nested-object {
 {$.a[1]|2}
 {$.a[2]|3}
 }
-
