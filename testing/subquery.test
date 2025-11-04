@@ -120,6 +120,17 @@ do_execsql_test nested-subquery-cte {
     select sub.loudest_hat from sub;
 } {HAT!!!}
 
+do_execsql_test_on_specific_db {:memory:} correlated-left-join-exists {
+    create table t(a);
+    create table s(a);
+    insert into t values (1);
+    select t.a
+      from t
+      left join s
+        on t.a = s.a
+     where exists (select 1 where s.a is null);
+} {1}
+
 do_execsql_test subquery-orderby-limit {
     select upper(sub.loud_name) as loudest_name 
     from (

@@ -718,25 +718,6 @@ pub fn open_loop(
             }
         }
 
-        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            assert!(subquery.correlated, "subquery must be correlated");
-            let eval_at = subquery.get_eval_at(join_order)?;
-
-            if eval_at != EvalAt::Loop(join_index) {
-                continue;
-            }
-
-            let plan = subquery.consume_plan(eval_at);
-
-            emit_non_from_clause_subquery(
-                program,
-                t_ctx,
-                *plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
-
         // First emit outer join conditions, if any.
         emit_conditions(
             program,
@@ -763,6 +744,25 @@ pub fn open_loop(
                     dest: lj_meta.reg_match_flag,
                 });
             }
+        }
+
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            assert!(subquery.correlated, "subquery must be correlated");
+            let eval_at = subquery.get_eval_at(join_order)?;
+
+            if eval_at != EvalAt::Loop(join_index) {
+                continue;
+            }
+
+            let plan = subquery.consume_plan(eval_at);
+
+            emit_non_from_clause_subquery(
+                program,
+                t_ctx,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
         }
 
         // Now we can emit conditions from the WHERE clause.
