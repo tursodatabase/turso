@@ -198,7 +198,33 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setUnicodeStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setUnicodeStream length must be non-negative");
+    }
+    try {
+      byte[] buffer = new byte[length];
+      int offset = 0;
+      while (offset < length) {
+        int readBytes = x.read(buffer, offset, length - offset);
+        if (readBytes == -1) {
+          break;
+        }
+        offset += readBytes;
+      }
+      if (offset == 0) {
+        this.statement.bindNull(parameterIndex);
+      } else {
+        String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
+        this.statement.bindText(parameterIndex, text);
+      }
+    } catch (IOException ioe) {
+      throw new SQLException("Error reading Unicode stream", ioe);
+    }
   }
 
   @Override
