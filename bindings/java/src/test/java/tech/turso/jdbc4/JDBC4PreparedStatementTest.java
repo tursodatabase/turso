@@ -524,6 +524,72 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
+  void testSetUnicodeStream_insert_and_select() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "안녕하세요😊 Hello🌏";
+    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+    InputStream stream = new ByteArrayInputStream(bytes);
+
+    stmt.setUnicodeStream(1, stream, bytes.length);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(text, rs.getString(1));
+  }
+
+  @Test
+  void testSetUnicodeStream_nullStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setUnicodeStream(1, null, 0);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetUnicodeStream_emptyStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream empty = new ByteArrayInputStream(new byte[0]);
+
+    stmt.setUnicodeStream(1, empty, 10);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetUnicodeStream_negativeLength() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "테스트";
+    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+    InputStream stream = new ByteArrayInputStream(bytes);
+
+    assertThrows(SQLException.class, () -> stmt.setUnicodeStream(1, stream, -5));
+  }
+
+  @Test
   void execute_insert_should_return_number_of_inserted_elements() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
     PreparedStatement prepareStatement =
