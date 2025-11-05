@@ -217,7 +217,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         offset += readBytes;
       }
       if (offset == 0) {
-        this.statement.bindNull(parameterIndex);
+        this.statement.bindText(parameterIndex, "");
       } else {
         String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
         this.statement.bindText(parameterIndex, text);
@@ -249,9 +249,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
       }
       if (offset == 0) {
         this.statement.bindNull(parameterIndex);
+      } else if (offset == buffer.length) {
+        this.statement.bindBlob(parameterIndex, buffer);
       } else {
-        byte[] actualData = Arrays.copyOf(buffer, offset);
-        this.statement.bindBlob(parameterIndex, actualData);
+        this.statement.bindBlob(parameterIndex, Arrays.copyOf(buffer, offset));
       }
     } catch (IOException e) {
       throw new SQLException("Error reading binary stream", e);
