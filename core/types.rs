@@ -249,6 +249,38 @@ impl Debug for ValueRef<'_> {
     }
 }
 
+pub trait AsValueRef {
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+}
+
+impl<'b> AsValueRef for ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        *self
+    }
+}
+
+impl AsValueRef for Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &mut Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
 impl Value {
     pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
         match self {
