@@ -1638,10 +1638,10 @@ where
     V2: AsValueRef,
     E1: ExactSizeIterator<Item = V1>,
     E2: ExactSizeIterator<Item = V2>,
-    I1: IntoIterator<IntoIter = E1>,
-    I2: IntoIterator<IntoIter = E2>,
+    I1: IntoIterator<IntoIter = E1, Item = E1::Item>,
+    I2: IntoIterator<IntoIter = E2, Item = E2::Item>,
 {
-    let (l, r) = (l.into_iter(), r.into_iter());
+    let (l, r): (E1, E2) = (l.into_iter(), r.into_iter());
     assert!(
         l.len() >= column_info.len(),
         "{} < {}",
@@ -1656,17 +1656,9 @@ where
     );
     let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
     for (i, (l, r)) in l.zip(r).enumerate() {
-        let l = l.as_value_ref();
-        let r = r.as_value_ref();
         let column_order = column_info[i].sort_order;
         let collation = column_info[i].collation;
-        let cmp = match (l, r) {
-            (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                &String::from_utf8_lossy(left),
-                &String::from_utf8_lossy(right),
-            ),
-            _ => l.partial_cmp(&r).unwrap(),
-        };
+        let cmp = compare_immutable_single(l, r, collation);
         if !cmp.is_eq() {
             return match column_order {
                 SortOrder::Asc => cmp,
@@ -1675,6 +1667,22 @@ where
         }
     }
     std::cmp::Ordering::Equal
+}
+
+pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
+            &String::from_utf8_lossy(left),
+            &String::from_utf8_lossy(right),
+        ),
+        _ => l.partial_cmp(&r).unwrap(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
