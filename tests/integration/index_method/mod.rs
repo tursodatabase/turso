@@ -75,7 +75,10 @@ fn test_vector_sparse_ivf_create_destroy() {
         run(&tmp_db, || cursor.create(&conn)).unwrap();
     }
     conn.wal_insert_end(true).unwrap();
-    assert_eq!(schema_rows(), vec!["t", "t_idx_scratch", "t_idx_stats"]);
+    assert_eq!(
+        schema_rows(),
+        vec!["t", "t_idx_inverted_index", "t_idx_stats"]
+    );
 
     conn.wal_insert_begin().unwrap();
     {

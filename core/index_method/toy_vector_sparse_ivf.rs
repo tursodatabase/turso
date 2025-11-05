@@ -796,12 +796,13 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 };
                         }
                         SeekResult::TryAdvance => {
-                            self.delete_state = VectorSparseInvertedIndexDeleteState::NextInverted {
-                                vector: vector.take(),
-                                sum: *sum,
-                                idx: *idx,
-                                rowid: *rowid,
-                            };
+                            self.delete_state =
+                                VectorSparseInvertedIndexDeleteState::NextInverted {
+                                    vector: vector.take(),
+                                    sum: *sum,
+                                    idx: *idx,
+                                    rowid: *rowid,
+                                };
                         }
                         SeekResult::NotFound => {
                             return Err(LimboError::Corrupt("inverted index corrupted".to_string()))
