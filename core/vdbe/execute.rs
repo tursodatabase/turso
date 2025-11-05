@@ -20,6 +20,7 @@ use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
@@ -50,10 +51,7 @@ use turso_macros::match_ignore_ascii_case;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::{
-    schema::Affinity,
-    storage::btree::{BTreeCursor, BTreeKey},
-};
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use crate::{
     storage::wal::CheckpointResult,

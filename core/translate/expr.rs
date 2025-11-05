@@ -10,11 +10,12 @@ use super::plan::TableReferences;
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
-use crate::schema::{affinity, Affinity, Table, Type};
+use crate::schema::{Table, Type};
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,
@@ -868,7 +869,7 @@ pub fn translate_expr(
         ast::Expr::Cast { expr, type_name } => {
             let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let type_affinity = affinity(&type_name.name);
+            let type_affinity = Affinity::affinity(&type_name.name);
             program.emit_insn(Insn::Cast {
                 reg: target_register,
                 affinity: type_affinity,
@@ -4115,7 +4116,7 @@ pub fn get_expr_affinity(
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
-                crate::schema::affinity(&type_name.name)
+                Affinity::affinity(&type_name.name)
             } else {
                 Affinity::Blob
             }

@@ -5,10 +5,11 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{Affinity, BTreeTable, Column, Index},
+    schema::{BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
+    vdbe::affinity::Affinity,
     Value,
 };
 use strum::EnumCount;

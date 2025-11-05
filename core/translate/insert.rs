@@ -7,7 +7,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, Affinity, BTreeTable, Index, ResolvedFkRef, Table};
+use crate::schema::{self, BTreeTable, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
@@ -25,6 +25,7 @@ use crate::translate::upsert::{
     collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
 };
 use crate::util::normalize_ident;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;

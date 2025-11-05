@@ -5,9 +5,9 @@ use regex::{Regex, RegexBuilder};
 use crate::{
     function::MathFunc,
     numeric::{NullableInteger, Numeric},
-    schema::{affinity, Affinity},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
+    vdbe::affinity::Affinity,
     LimboError, Result, Value, ValueRef,
 };
 
@@ -613,7 +613,7 @@ impl Value {
         if matches!(self, Value::Null) {
             return Value::Null;
         }
-        match affinity(datatype) {
+        match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
             Affinity::Blob => {
