@@ -260,6 +260,13 @@ impl<'b> AsValueRef for ValueRef<'b> {
     }
 }
 
+impl<'b> AsValueRef for &ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        **self
+    }
+}
+
 impl AsValueRef for Value {
     #[inline]
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
@@ -1621,11 +1628,20 @@ impl IndexInfo {
     }
 }
 
-pub fn compare_immutable(
-    l: &[ValueRef],
-    r: &[ValueRef],
+pub fn compare_immutable<V1, V2, E1, E2, I1, I2>(
+    l: I1,
+    r: I2,
     column_info: &[KeyInfo],
-) -> std::cmp::Ordering {
+) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+    E1: ExactSizeIterator<Item = V1>,
+    E2: ExactSizeIterator<Item = V2>,
+    I1: IntoIterator<IntoIter = E1>,
+    I2: IntoIterator<IntoIter = E2>,
+{
+    let (l, r) = (l.into_iter(), r.into_iter());
     assert!(
         l.len() >= column_info.len(),
         "{} < {}",
@@ -1638,9 +1654,10 @@ pub fn compare_immutable(
         r.len(),
         column_info.len()
     );
-    let l_values = l.iter().take(column_info.len());
-    let r_values = r.iter().take(column_info.len());
-    for (i, (l, r)) in l_values.zip(r_values).enumerate() {
+    let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
+    for (i, (l, r)) in l.zip(r).enumerate() {
+        let l = l.as_value_ref();
+        let r = r.as_value_ref();
         let column_order = column_info[i].sort_order;
         let collation = column_info[i].collation;
         let cmp = match (l, r) {
@@ -1648,7 +1665,7 @@ pub fn compare_immutable(
                 &String::from_utf8_lossy(left),
                 &String::from_utf8_lossy(right),
             ),
-            _ => l.partial_cmp(r).unwrap(),
+            _ => l.partial_cmp(&r).unwrap(),
         };
         if !cmp.is_eq() {
             return match column_order {
