@@ -21,7 +21,6 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::value::{exec_char, exec_concat_strings, exec_concat_ws};
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
@@ -4742,17 +4741,20 @@ pub fn op_function(
             }
             ScalarFunc::Char => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest] = Register::Value(exec_char(reg_values));
+                state.registers[*dest] = Register::Value(Value::exec_char(
+                    reg_values.iter().map(|reg| reg.get_value()),
+                ));
             }
             ScalarFunc::Coalesce => {}
             ScalarFunc::Concat => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = exec_concat_strings(reg_values);
+                let result =
+                    Value::exec_concat_strings(reg_values.iter().map(|reg| reg.get_value()));
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::ConcatWs => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                let result = exec_concat_ws(reg_values);
+                let result = Value::exec_concat_ws(reg_values.iter().map(|reg| reg.get_value()));
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Glob => {

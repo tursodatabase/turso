@@ -6,7 +6,7 @@ use crate::{
     function::MathFunc,
     numeric::{NullableInteger, Numeric},
     schema::{affinity, Affinity},
-    LimboError, Register, Result, Value,
+    LimboError, Result, Value,
 };
 
 mod cmath {
@@ -903,56 +903,49 @@ impl Value {
         regs.max().map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    pub fn exec_comparison() {}
-}
-
-pub fn exec_concat_strings(registers: &[Register]) -> Value {
-    let mut result = String::new();
-    for reg in registers {
-        match reg.get_value() {
-            Value::Null => continue,
-            Value::Blob(_) => todo!("TODO concat blob"),
-            v => result.push_str(&format!("{v}")),
-        }
-    }
-    Value::build_text(result)
-}
-
-pub fn exec_concat_ws(registers: &[Register]) -> Value {
-    if registers.is_empty() {
-        return Value::Null;
-    }
-
-    let separator = match registers[0].get_value() {
-        Value::Null | Value::Blob(_) => return Value::Null,
-        v => format!("{v}"),
-    };
-
-    let parts = registers[1..]
-        .iter()
-        .filter_map(|reg| match reg.get_value() {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                Some(format!("{}", reg.get_value()))
+    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
+        let mut result = String::new();
+        for val in registers {
+            match val {
+                Value::Null => continue,
+                Value::Blob(_) => todo!("TODO concat blob"),
+                v => result.push_str(&format!("{v}")),
             }
+        }
+        Value::build_text(result)
+    }
+
+    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
+        if registers.len() == 0 {
+            return Value::Null;
+        }
+
+        let separator = match registers.next().unwrap() {
+            Value::Null | Value::Blob(_) => return Value::Null,
+            v => format!("{v}"),
+        };
+
+        let parts = registers.filter_map(|val| match val {
+            Value::Text(_) | Value::Integer(_) | Value::Float(_) => Some(format!("{val}")),
             _ => None,
         });
 
-    let result = parts.collect::<Vec<_>>().join(&separator);
-    Value::build_text(result)
-}
+        let result = parts.collect::<Vec<_>>().join(&separator);
+        Value::build_text(result)
+    }
 
-pub fn exec_char(values: &[Register]) -> Value {
-    let result: String = values
-        .iter()
-        .filter_map(|x| {
-            if let Value::Integer(i) = x.get_value() {
-                Some(*i as u8 as char)
-            } else {
-                None
-            }
-        })
-        .collect();
-    Value::build_text(result)
+    pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
+        let result: String = values
+            .filter_map(|x| {
+                if let Value::Integer(i) = x {
+                    Some(*i as u8 as char)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Value::build_text(result)
+    }
 }
 
 pub fn construct_like_regex(pattern: &str) -> Regex {
@@ -985,7 +978,6 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::types::Value;
     use crate::vdbe::{Bitfield, Register};
 
@@ -1659,19 +1651,31 @@ mod tests {
     #[test]
     fn test_char() {
         assert_eq!(
-            exec_char(&[
-                Register::Value(Value::Integer(108)),
-                Register::Value(Value::Integer(105))
-            ]),
+            Value::exec_char(
+                [
+                    Register::Value(Value::Integer(108)),
+                    Register::Value(Value::Integer(105))
+                ]
+                .iter()
+                .map(|reg| reg.get_value())
+            ),
             Value::build_text("li")
         );
-        assert_eq!(exec_char(&[]), Value::build_text(""));
+        assert_eq!(Value::exec_char(std::iter::empty()), Value::build_text(""));
         assert_eq!(
-            exec_char(&[Register::Value(Value::Null)]),
+            Value::exec_char(
+                [Register::Value(Value::Null)]
+                    .iter()
+                    .map(|reg| reg.get_value())
+            ),
             Value::build_text("")
         );
         assert_eq!(
-            exec_char(&[Register::Value(Value::build_text("a"))]),
+            Value::exec_char(
+                [Register::Value(Value::build_text("a"))]
+                    .iter()
+                    .map(|reg| reg.get_value())
+            ),
             Value::build_text("")
         );
     }
