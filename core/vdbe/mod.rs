@@ -24,6 +24,7 @@ pub mod insn;
 pub mod likeop;
 pub mod metrics;
 pub mod sorter;
+pub mod value;
 
 use crate::{
     error::LimboError,
