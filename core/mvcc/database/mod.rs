@@ -1925,6 +1925,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn checkpoint_threshold(&self) -> i64 {
         self.storage.checkpoint_threshold()
     }
+
+    pub fn get_real_table_id(&self, table_id: i64) -> i64 {
+        let entry = self.table_id_to_rootpage.get(&MVTableId::from(table_id));
+        if let Some(entry) = entry {
+            entry.value().map_or(table_id, |value| value as i64)
+        } else {
+            table_id
+        }
+    }
 }
 
 /// A write-write conflict happens when transaction T_current attempts to update a

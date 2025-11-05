@@ -960,7 +960,7 @@ pub fn op_open_read(
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
-                *root_page,
+                maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
@@ -989,7 +989,7 @@ pub fn op_open_read(
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
-                *root_page,
+                maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
@@ -7134,7 +7134,7 @@ pub fn op_open_write(
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager.clone(),
-                root_page,
+                maybe_transform_root_page_to_positive(mv_store, root_page),
                 index.as_ref(),
                 num_columns,
             ));
@@ -7154,7 +7154,7 @@ pub fn op_open_write(
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
-                root_page,
+                maybe_transform_root_page_to_positive(mv_store, root_page),
                 num_columns,
             ));
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
@@ -8106,7 +8106,7 @@ pub fn op_open_dup(
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
                 pager.clone(),
-                root_page,
+                maybe_transform_root_page_to_positive(mv_store, root_page),
                 table.columns.len(),
             ));
             let cursor: Box<dyn CursorTrait> =
@@ -9219,6 +9219,20 @@ fn get_schema_cookie(
             .map(IOResult::Done)
     } else {
         pager.get_schema_cookie()
+    }
+}
+
+/// A root page in MVCC might still be marked as negative in schema. On restart it is automatically transformed to positive but in other cases
+/// we need to map it to positive if we can in case checkpoint happened.
+fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root_page: i64) -> i64 {
+    if let Some(mvcc_store) = mvcc_store {
+        if root_page < 0 {
+            mvcc_store.get_real_table_id(root_page)
+        } else {
+            root_page
+        }
+    } else {
+        root_page
     }
 }
 
