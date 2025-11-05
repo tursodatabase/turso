@@ -1,3 +1,4 @@
+use either::Either;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
@@ -320,6 +321,34 @@ impl AsValueRef for &mut Value {
     #[inline]
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
         self.as_ref()
+    }
+}
+
+impl<V1, V2> AsValueRef for Either<V1, V2>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        match self {
+            Either::Left(left) => left.as_value_ref(),
+            Either::Right(right) => right.as_value_ref(),
+        }
+    }
+}
+
+impl<V1, V2> AsValueRef for &Either<V1, V2>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        match self {
+            Either::Left(left) => left.as_value_ref(),
+            Either::Right(right) => right.as_value_ref(),
+        }
     }
 }
 

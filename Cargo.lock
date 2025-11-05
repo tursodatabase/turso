@@ -4910,6 +4910,7 @@ dependencies = [
  "chrono",
  "criterion",
  "crossbeam-skiplist",
+ "either",
  "env_logger 0.11.7",
  "fallible-iterator",
  "hex",
