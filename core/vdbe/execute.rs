@@ -21,6 +21,7 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
@@ -668,69 +669,6 @@ pub fn op_not_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ComparisonOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-impl ComparisonOp {
-    fn compare(&self, lhs: &Value, rhs: &Value, collation: &CollationSeq) -> bool {
-        match (lhs, rhs) {
-            (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-                let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
-                match self {
-                    ComparisonOp::Eq => order.is_eq(),
-                    ComparisonOp::Ne => order.is_ne(),
-                    ComparisonOp::Lt => order.is_lt(),
-                    ComparisonOp::Le => order.is_le(),
-                    ComparisonOp::Gt => order.is_gt(),
-                    ComparisonOp::Ge => order.is_ge(),
-                }
-            }
-            (_, _) => match self {
-                ComparisonOp::Eq => *lhs == *rhs,
-                ComparisonOp::Ne => *lhs != *rhs,
-                ComparisonOp::Lt => *lhs < *rhs,
-                ComparisonOp::Le => *lhs <= *rhs,
-                ComparisonOp::Gt => *lhs > *rhs,
-                ComparisonOp::Ge => *lhs >= *rhs,
-            },
-        }
-    }
-
-    fn compare_integers(&self, lhs: &Value, rhs: &Value) -> bool {
-        match self {
-            ComparisonOp::Eq => lhs == rhs,
-            ComparisonOp::Ne => lhs != rhs,
-            ComparisonOp::Lt => lhs < rhs,
-            ComparisonOp::Le => lhs <= rhs,
-            ComparisonOp::Gt => lhs > rhs,
-            ComparisonOp::Ge => lhs >= rhs,
-        }
-    }
-
-    fn handle_nulls(&self, lhs: &Value, rhs: &Value, null_eq: bool, jump_if_null: bool) -> bool {
-        match self {
-            ComparisonOp::Eq => {
-                let both_null = lhs == rhs;
-                (null_eq && both_null) || (!null_eq && jump_if_null)
-            }
-            ComparisonOp::Ne => {
-                let at_least_one_null = lhs != rhs;
-                (null_eq && at_least_one_null) || (!null_eq && jump_if_null)
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
-                jump_if_null
-            }
-        }
-    }
-}
-
 pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
@@ -828,7 +766,7 @@ pub fn op_comparison(
 
     assert!(target_pc.is_offset());
 
-    let nulleq = flags.has_nulleq();
+    let null_eq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
 
@@ -837,7 +775,7 @@ pub fn op_comparison(
 
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
-        if op.compare_integers(lhs_value, rhs_value) {
+        if op.compare(lhs_value, rhs_value, collation) {
             state.pc = target_pc.as_offset_int();
         } else {
             state.pc += 1;
@@ -847,7 +785,15 @@ pub fn op_comparison(
 
     // Handle NULL values
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
-        if op.handle_nulls(lhs_value, rhs_value, nulleq, jump_if_null) {
+        let cmp_res = op.compare_nulls(lhs_value, rhs_value, null_eq);
+        let jump = match op {
+            ComparisonOp::Eq => cmp_res || (!null_eq && jump_if_null),
+            ComparisonOp::Ne => cmp_res || (!null_eq && jump_if_null),
+            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
+                jump_if_null
+            }
+        };
+        if jump {
             state.pc = target_pc.as_offset_int();
         } else {
             state.pc += 1;
@@ -936,7 +882,7 @@ pub fn op_comparison(
             .as_ref()
             .unwrap_or(&state.registers[rhs])
             .get_value(),
-        &collation,
+        collation,
     );
 
     if lhs_converted {
