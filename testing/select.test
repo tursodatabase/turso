@@ -1113,3 +1113,117 @@ do_execsql_test_on_specific_db {:memory:} group-by-limit-0 {
 	INSERT INTO t VALUES (1), (2), (3); 
 	SELECT a, COUNT(*) FROM t GROUP BY a LIMIT 0;
 } {}
+
+do_execsql_test_in_memory_any_error duplicate-with-cte-name {
+  CREATE TABLE t2(x INTEGER);
+  WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
+}
+
+# Test UNION with different collations
+do_execsql_test_on_specific_db {:memory:} collate-compound-1 {
+  CREATE TABLE t1(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+  INSERT INTO t1 VALUES ('abc', 'ABC'), ('ABC', 'abc'), ('def', 'DEF');
+  SELECT a FROM t1 WHERE a = 'ABC' 
+  UNION 
+  SELECT b FROM t1 WHERE b = 'ABC';
+} {ABC}
+
+# Test INTERSECT with explicit collation
+do_execsql_test_on_specific_db {:memory:} collate-compound-3 {
+  CREATE TABLE t2(x TEXT COLLATE NOCASE);
+  CREATE TABLE t3(y TEXT COLLATE BINARY);
+  INSERT INTO t2 VALUES ('abc'), ('def');
+  INSERT INTO t3 VALUES ('ABC'), ('def');
+  SELECT x FROM t2 INTERSECT SELECT y FROM t3;
+} {abc
+def}
+
+# Test EXCEPT with collation mismatch
+do_execsql_test_on_specific_db {:memory:} collate-compound-4 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'abc' COLLATE NOCASE EXCEPT SELECT 'ABC' COLLATE BINARY;
+} {}
+
+# Test compound with COLLATE in result column
+do_execsql_test_on_specific_db {:memory:} collate-compound-5 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'abc' COLLATE NOCASE 
+  UNION 
+  SELECT 'ABC' COLLATE NOCASE;
+} {ABC}
+
+
+# Test nested compound with collations
+do_execsql_test_on_specific_db {:memory:} collate-compound-7 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'a' COLLATE NOCASE
+  UNION
+  SELECT 'A' COLLATE NOCASE UNION SELECT 'b' COLLATE NOCASE;
+} {A b}
+
+# Test UNION ALL preserving duplicates with case differences
+do_execsql_test_on_specific_db {:memory:} collate-compound-8 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'Test' COLLATE NOCASE
+  UNION ALL
+  SELECT 'TEST' COLLATE NOCASE
+  UNION ALL
+  SELECT 'test' COLLATE NOCASE;
+} {Test TEST test}
+
+# Test INTERSECT with RTRIM collation
+do_execsql_test_on_specific_db {:memory:} collate-compound-9 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'abc  ' COLLATE RTRIM
+  INTERSECT
+  SELECT 'abc' COLLATE RTRIM;
+} {"abc  "}
+
+# Test compound with collation in WHERE clause
+do_execsql_test_on_specific_db {:memory:} collate-compound-10 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  CREATE TABLE t4(col TEXT);
+  INSERT INTO t4 VALUES ('abc'), ('ABC'), ('def');
+  SELECT col FROM t4 WHERE col = 'ABC' COLLATE NOCASE
+  UNION
+  SELECT col FROM t4 WHERE col = 'DEF' COLLATE NOCASE;
+} {ABC
+abc
+def}
+
+# Test EXCEPT with multiple collations
+do_execsql_test_on_specific_db {:memory:} collate-compound-11 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'apple' UNION SELECT 'BANANA' UNION SELECT 'cherry'
+  EXCEPT
+  SELECT 'APPLE' COLLATE BINARY;
+} {BANANA apple cherry}
+
+
+# Test UNION with table having default collation vs explicit
+do_execsql_test_on_specific_db {:memory:} collate-compound-13 {
+  CREATE TABLE t5(n TEXT COLLATE NOCASE);
+  INSERT INTO t5 VALUES ('Test');
+  SELECT n FROM t5
+  UNION
+  SELECT 'TEST' COLLATE BINARY;
+} {TEST}
+
+# Test three-way compound with different collations
+do_execsql_test_on_specific_db {:memory:} collate-compound-14 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'abc'
+  UNION
+  SELECT 'ABC' COLLATE NOCASE
+  UNION
+  SELECT 'def';
+} {ABC
+def}
+
+# Test INTERSECT ALL (if supported) with collations
+do_execsql_test_on_specific_db {:memory:} collate-compound-15 {
+  CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+  SELECT 'test' COLLATE NOCASE
+  INTERSECT
+  SELECT 'TEST' COLLATE NOCASE;
+} {test}

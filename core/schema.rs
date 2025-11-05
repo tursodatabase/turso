@@ -7,8 +7,9 @@ use crate::translate::expr::{
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
+use turso_macros::AtomicEnum;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, AtomicEnum)]
 pub enum ViewState {
     Ready,
     InProgress,
@@ -21,7 +22,7 @@ pub struct View {
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
-    pub state: Mutex<ViewState>,
+    pub state: AtomicViewState,
 }
 
 impl View {
@@ -31,28 +32,28 @@ impl View {
             sql,
             select_stmt,
             columns,
-            state: Mutex::new(ViewState::Ready),
+            state: AtomicViewState::new(ViewState::Ready),
         }
     }
 
     pub fn process(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+        let state = self.state.get();
+        match state {
             ViewState::InProgress => {
                 bail_parse_error!("view {} is circularly defined", self.name)
             }
             ViewState::Ready => {
-                *state = ViewState::InProgress;
+                self.state.set(ViewState::InProgress);
                 Ok(())
             }
         }
     }
 
     pub fn done(&self) {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+        let state = self.state.get();
+        match state {
             ViewState::InProgress => {
-                *state = ViewState::Ready;
+                self.state.set(ViewState::Ready);
             }
             ViewState::Ready => {}
         }
@@ -66,7 +67,7 @@ impl Clone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.clone(),
-            state: Mutex::new(ViewState::Ready),
+            state: AtomicViewState::new(ViewState::Ready),
         }
     }
 }
@@ -545,8 +546,8 @@ impl Schema {
                         table.name
                     )));
                 };
-                if column.primary_key && unique_set.is_primary_key {
-                    if column.is_rowid_alias {
+                if column.primary_key() && unique_set.is_primary_key {
+                    if column.is_rowid_alias() {
                         // rowid alias, no index needed
                         continue;
                     }
@@ -950,7 +951,7 @@ impl Schema {
                         let pk_name = &parent_tbl.primary_key_columns[0].0;
                         // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
                         parent_tbl.columns.iter().any(|c| {
-                            c.is_rowid_alias
+                            c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
                                     .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
@@ -1056,7 +1057,7 @@ impl Schema {
                 let c = parent_cols[0].as_str();
                 ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c))
                     || parent_tbl.columns.iter().any(|col| {
-                        col.is_rowid_alias
+                        col.is_rowid_alias()
                             && col
                                 .name
                                 .as_deref()
@@ -1325,7 +1326,7 @@ impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         if self.primary_key_columns.len() == 1 {
             let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias {
+            if col.is_rowid_alias() {
                 return Some((idx, col));
             }
         }
@@ -1384,14 +1385,14 @@ impl BTreeTable {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
             }
-            if column.notnull {
+            if column.notnull() {
                 sql.push_str(" NOT NULL");
             }
 
-            if column.unique {
+            if column.unique() {
                 sql.push_str(" UNIQUE");
             }
-            if needs_pk_inline && column.primary_key {
+            if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
             }
 
@@ -1462,8 +1463,11 @@ impl BTreeTable {
         sql
     }
 
-    pub fn column_collations(&self) -> Vec<Option<CollationSeq>> {
-        self.columns.iter().map(|column| column.collation).collect()
+    pub fn column_collations(&self) -> Vec<CollationSeq> {
+        self.columns
+            .iter()
+            .map(|column| column.collation())
+            .collect()
     }
 }
 
@@ -1826,20 +1830,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
-                cols.push(Column {
-                    name: Some(normalize_ident(&name)),
-                    ty,
+                cols.push(Column::new(
+                    Some(normalize_ident(&name)),
                     ty_str,
-                    primary_key,
-                    is_rowid_alias: typename_exactly_integer
-                        && primary_key
-                        && !primary_key_desc_columns_constraint,
-                    notnull,
                     default,
-                    unique,
+                    ty,
                     collation,
-                    hidden: false,
-                });
+                    primary_key,
+                    typename_exactly_integer && primary_key && !primary_key_desc_columns_constraint,
+                    notnull,
+                    unique,
+                    false,
+                ));
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
                 has_rowid = false;
@@ -1852,7 +1854,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     // or if the table has no rowid
     if !has_rowid || primary_key_columns.len() > 1 {
         for col in cols.iter_mut() {
-            col.is_rowid_alias = false;
+            col.set_rowid_alias(false);
         }
     }
 
@@ -1865,14 +1867,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
 
         if let Some(col) = pk_col {
-            if col.ty != Type::Integer {
+            if col.ty() != Type::Integer {
                 crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
             }
         }
     }
 
     for col in cols.iter() {
-        if col.is_rowid_alias {
+        if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
             // However, an index IS created for a rowid alias UNIQUE, e.g. CREATE TABLE t(x INTEGER PRIMARY KEY, UNIQUE(x))
             let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
@@ -2025,7 +2027,7 @@ impl ResolvedFkRef {
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(_, c)| c.is_rowid_alias)
+                .find(|(_, c)| c.is_rowid_alias())
             {
                 return updated_parent_positions.contains(&idx);
             }
@@ -2053,7 +2055,7 @@ impl ResolvedFkRef {
         // special case: if FK uses a rowid alias on child, and rowid changed
         if self.child_cols.len() == 1 {
             let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
-            if col.is_rowid_alias && updated_child_positions.contains(&i) {
+            if col.is_rowid_alias() && updated_child_positions.contains(&i) {
                 return true;
             }
         }
@@ -2064,21 +2066,193 @@ impl ResolvedFkRef {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: Option<String>,
-    pub ty: Type,
-    // many sqlite operations like table_info retain the original string
     pub ty_str: String,
-    pub primary_key: bool,
-    pub is_rowid_alias: bool,
-    pub notnull: bool,
     pub default: Option<Box<Expr>>,
-    pub unique: bool,
-    pub collation: Option<CollationSeq>,
-    pub hidden: bool,
+    raw: u16,
 }
+
+// flags
+const F_PRIMARY_KEY: u16 = 1;
+const F_ROWID_ALIAS: u16 = 2;
+const F_NOTNULL: u16 = 4;
+const F_UNIQUE: u16 = 8;
+const F_HIDDEN: u16 = 16;
+
+// pack Type and Collation in the remaining bits
+const TYPE_SHIFT: u16 = 5;
+const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
+const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
+const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
 
 impl Column {
     pub fn affinity(&self) -> Affinity {
         affinity(&self.ty_str)
+    }
+    pub const fn new_default_text(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+    ) -> Self {
+        Self::new(
+            name,
+            ty_str,
+            default,
+            Type::Text,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+    pub const fn new_default_integer(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+    ) -> Self {
+        Self::new(
+            name,
+            ty_str,
+            default,
+            Type::Integer,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        name: Option<String>,
+        ty_str: String,
+        default: Option<Box<Expr>>,
+        ty: Type,
+        col: Option<CollationSeq>,
+        primary_key: bool,
+        rowid_alias: bool,
+        notnull: bool,
+        unique: bool,
+        hidden: bool,
+    ) -> Self {
+        let mut raw = 0u16;
+        raw |= (ty as u16) << TYPE_SHIFT;
+        if let Some(c) = col {
+            raw |= (c as u16) << COLL_SHIFT;
+        }
+        if primary_key {
+            raw |= F_PRIMARY_KEY
+        }
+        if rowid_alias {
+            raw |= F_ROWID_ALIAS
+        }
+        if notnull {
+            raw |= F_NOTNULL
+        }
+        if unique {
+            raw |= F_UNIQUE
+        }
+        if hidden {
+            raw |= F_HIDDEN
+        }
+        Self {
+            name,
+            ty_str,
+            default,
+            raw,
+        }
+    }
+    #[inline]
+    pub const fn ty(&self) -> Type {
+        let v = ((self.raw & TYPE_MASK) >> TYPE_SHIFT) as u8;
+        Type::from_bits(v)
+    }
+
+    #[inline]
+    pub const fn set_ty(&mut self, ty: Type) {
+        self.raw = (self.raw & !TYPE_MASK) | (((ty as u16) << TYPE_SHIFT) & TYPE_MASK);
+    }
+
+    #[inline]
+    pub const fn collation_opt(&self) -> Option<CollationSeq> {
+        if self.has_explicit_collation() {
+            Some(self.collation())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn collation(&self) -> CollationSeq {
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
+        CollationSeq::from_bits(v)
+    }
+
+    #[inline]
+    pub const fn has_explicit_collation(&self) -> bool {
+        let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u8;
+        v != CollationSeq::Unset as u8
+    }
+
+    #[inline]
+    pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
+        if let Some(c) = c {
+            self.raw = (self.raw & !COLL_MASK) | (((c as u16) << COLL_SHIFT) & COLL_MASK);
+        }
+    }
+
+    #[inline]
+    pub fn primary_key(&self) -> bool {
+        self.raw & F_PRIMARY_KEY != 0
+    }
+    #[inline]
+    pub const fn is_rowid_alias(&self) -> bool {
+        self.raw & F_ROWID_ALIAS != 0
+    }
+    #[inline]
+    pub const fn notnull(&self) -> bool {
+        self.raw & F_NOTNULL != 0
+    }
+    #[inline]
+    pub const fn unique(&self) -> bool {
+        self.raw & F_UNIQUE != 0
+    }
+    #[inline]
+    pub const fn hidden(&self) -> bool {
+        self.raw & F_HIDDEN != 0
+    }
+
+    #[inline]
+    pub const fn set_primary_key(&mut self, v: bool) {
+        self.set_flag(F_PRIMARY_KEY, v);
+    }
+    #[inline]
+    pub const fn set_rowid_alias(&mut self, v: bool) {
+        self.set_flag(F_ROWID_ALIAS, v);
+    }
+    #[inline]
+    pub const fn set_notnull(&mut self, v: bool) {
+        self.set_flag(F_NOTNULL, v);
+    }
+    #[inline]
+    pub const fn set_unique(&mut self, v: bool) {
+        self.set_flag(F_UNIQUE, v);
+    }
+    #[inline]
+    pub const fn set_hidden(&mut self, v: bool) {
+        self.set_flag(F_HIDDEN, v);
+    }
+
+    #[inline]
+    const fn set_flag(&mut self, mask: u16, val: bool) {
+        if val {
+            self.raw |= mask
+        } else {
+            self.raw &= !mask
+        }
     }
 }
 
@@ -2125,18 +2299,18 @@ impl From<&ColumnDefinition> for Column {
 
         let hidden = ty_str.contains("HIDDEN");
 
-        Column {
-            name: Some(normalize_ident(name)),
-            ty,
-            default,
-            notnull,
+        Column::new(
+            Some(normalize_ident(name)),
             ty_str,
-            primary_key,
-            is_rowid_alias: primary_key && matches!(ty, Type::Integer),
-            unique,
+            default,
+            ty,
             collation,
+            primary_key,
+            primary_key && matches!(ty, Type::Integer),
+            notnull,
+            unique,
             hidden,
-        }
+        )
     }
 }
 
@@ -2181,14 +2355,30 @@ pub fn affinity(datatype: &str) -> Affinity {
     Affinity::Numeric
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
-    Null,
-    Text,
-    Numeric,
-    Integer,
-    Real,
-    Blob,
+    Null = 0,
+    Text = 1,
+    Numeric = 2,
+    Integer = 3,
+    Real = 4,
+    Blob = 5,
+}
+
+impl Type {
+    #[inline]
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => Type::Null,
+            1 => Type::Text,
+            2 => Type::Numeric,
+            3 => Type::Integer,
+            4 => Type::Real,
+            5 => Type::Blob,
+            _ => Type::Null,
+        }
+    }
 }
 
 /// # SQLite Column Type Affinities
@@ -2341,66 +2531,11 @@ pub fn sqlite_schema_table() -> BTreeTable {
         has_autoincrement: false,
         primary_key_columns: vec![],
         columns: vec![
-            Column {
-                name: Some("type".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("name".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("tbl_name".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("rootpage".to_string()),
-                ty: Type::Integer,
-                ty_str: "INT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
-            Column {
-                name: Some("sql".to_string()),
-                ty: Type::Text,
-                ty_str: "TEXT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            },
+            Column::new_default_text(Some("type".to_string()), "TEXT".to_string(), None),
+            Column::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
+            Column::new_default_text(Some("tbl_name".to_string()), "TEXT".to_string(), None),
+            Column::new_default_integer(Some("rootpage".to_string()), "INT".to_string(), None),
+            Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
         ],
         foreign_keys: vec![],
         unique_sets: vec![],
@@ -2540,7 +2675,7 @@ impl Index {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
-                collation: column.collation,
+                collation: column.collation_opt(),
                 default: column.default.clone(),
             });
         }
@@ -2579,7 +2714,7 @@ impl Index {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
                     pos_in_table: *pos_in_table,
-                    collation: col.collation,
+                    collation: col.collation_opt(),
                     default: col.default.clone(),
                 })
             })
@@ -2741,7 +2876,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ has type different than INTEGER so can't be a rowid alias"
         );
         Ok(())
@@ -2752,7 +2887,10 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
+        assert!(
+            column.is_rowid_alias(),
+            "column 'a´ should be a rowid alias"
+        );
         Ok(())
     }
 
@@ -2762,7 +2900,10 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, PRIMARY KEY(a));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.is_rowid_alias, "column 'a´ should be a rowid alias");
+        assert!(
+            column.is_rowid_alias(),
+            "column 'a´ should be a rowid alias"
+        );
         Ok(())
     }
 
@@ -2773,7 +2914,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2785,7 +2926,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has no rowid"
         );
         Ok(())
@@ -2808,7 +2949,7 @@ mod tests {
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
         assert!(
-            !column.is_rowid_alias,
+            !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has composite primary key"
         );
         Ok(())
@@ -2819,11 +2960,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2848,11 +2995,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Desc)],
             table.primary_key_columns,
@@ -2866,11 +3019,14 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY(a, b desc));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(column.primary_key, "column 'b' shouldn be a primary key");
+        assert!(column.primary_key(), "column 'b' shouldn be a primary key");
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![
                 ("a".to_string(), SortOrder::Asc),
@@ -2887,11 +3043,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY('a'));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2904,11 +3066,17 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER, b TEXT, c REAL, PRIMARY KEY("a"));"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.primary_key, "column 'a' should be a primary key");
+        assert!(column.primary_key(), "column 'a' should be a primary key");
         let column = table.get_column("b").unwrap().1;
-        assert!(!column.primary_key, "column 'b' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'b' shouldn't be a primary key"
+        );
         let column = table.get_column("c").unwrap().1;
-        assert!(!column.primary_key, "column 'c' shouldn't be a primary key");
+        assert!(
+            !column.primary_key(),
+            "column 'c' shouldn't be a primary key"
+        );
         assert_eq!(
             vec![("a".to_string(), SortOrder::Asc)],
             table.primary_key_columns,
@@ -2932,7 +3100,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER NOT NULL);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(column.notnull);
+        assert!(column.notnull());
         Ok(())
     }
 
@@ -2941,7 +3109,7 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert!(!column.notnull);
+        assert!(!column.notnull());
         Ok(())
     }
 
@@ -3029,18 +3197,11 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
-            columns: vec![Column {
-                name: Some("a".to_string()),
-                ty: Type::Integer,
-                ty_str: "INT".to_string(),
-                primary_key: false,
-                is_rowid_alias: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
-            }],
+            columns: vec![Column::new_default_integer(
+                Some("a".to_string()),
+                "INT".to_string(),
+                None,
+            )],
             unique_sets: vec![],
             foreign_keys: vec![],
         };

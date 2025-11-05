@@ -24,6 +24,15 @@ do_execsql_test_on_specific_db {:memory:} strict-basic-creation {
     SELECT * FROM test1;
 } {1|item1|10.5}
 
+do_execsql_test_on_specific_db {:memory:} self-insert-sum-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t(b) VALUES(1),(2);
+    INSERT INTO t(b) SELECT sum(b) FROM t;
+    SELECT a, b FROM t ORDER BY a;
+} {1|1
+2|2
+3|3}
+
 # Reproducer for https://github.com/tursodatabase/turso/issues/2822
 do_execsql_test_on_specific_db {:memory:} strict-type-case-insensitivity {
     CREATE TABLE test1 (id integer, name text, price real) STRICT;
@@ -304,6 +313,20 @@ do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_where {
 5
 6
 8}
+
+do_execsql_test_on_specific_db {:memory:} insert_from_select_union_all_values {
+    CREATE TABLE t(a, b);
+    INSERT INTO t(a, b) SELECT * FROM (VALUES(3, 3)) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM t ORDER BY rowid;
+} {3|3
+4|4}
+
+do_execsql_test_on_specific_db {:memory:} values-union-all {
+    CREATE TABLE test (a INTEGER NOT NULL, b INTEGER NOT NULL);
+    INSERT INTO test(a, b) VALUES(3, 3) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM test ORDER BY rowid;
+} {3|3
+4|4}
 
 do_execsql_test_on_specific_db {:memory:} insert_from_select_same_table {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
@@ -775,3 +798,70 @@ do_execsql_test_on_specific_db {:memory:} ignore-intra-statement-dups {
     SELECT a,b FROM t ORDER BY a;
 } {5|first
 6|x}
+
+# Tests for incorrect provided column count
+
+do_execsql_test_in_memory_any_error wrong-column-count-values-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 2);
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-values-too-many {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2, 3);
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-values-specified-columns-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(a, b, c) VALUES (1, 2);
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-values-specified-columns-too-many {
+    CREATE TABLE t(a, b);
+    INSERT INTO t(a, b) VALUES (1, 2, 3);
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-select-named-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+    INSERT INTO dst SELECT x, y FROM src;
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-select-named-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+    INSERT INTO dst SELECT x, y, z FROM src;
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-select-star-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+    INSERT INTO dst SELECT * FROM src;
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-select-star-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+    INSERT INTO dst SELECT * FROM src;
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-specified-columns-select-mismatch {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b, c, d);
+    INSERT INTO dst(a, b) SELECT x, y, z FROM src;
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-partial-columns-values-too-few {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(b, c) VALUES (2);
+}
+
+do_execsql_test_in_memory_any_error wrong-column-count-partial-columns-values-too-many {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t(a) VALUES (1, 2);
+}

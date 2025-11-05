@@ -225,7 +225,7 @@ fn emit_compound_select(
                     } => (cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most, schema)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -281,10 +281,18 @@ fn emit_compound_select(
                 }
 
                 let (left_cursor_id, left_index) =
-                    create_dedupe_index(program, &right_most, schema)?;
+                    create_dedupe_index(program, &plan, &right_most, schema)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
+                    is_delete: false,
+                };
+
+                let (right_cursor_id, right_index) =
+                    create_dedupe_index(program, &plan, &right_most, schema)?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: right_cursor_id,
+                    index: right_index,
                     is_delete: false,
                 };
                 let compound_select = Plan::CompoundSelect {
@@ -305,13 +313,6 @@ fn emit_compound_select(
                     reg_result_cols_start,
                 )?;
 
-                let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, &right_most, schema)?;
-                right_most.query_destination = QueryDestination::EphemeralIndex {
-                    cursor_id: right_cursor_id,
-                    index: right_index,
-                    is_delete: false,
-                };
                 emit_explain!(program, true, "INTERSECT USING TEMP B-TREE".to_owned());
                 emit_query(program, &mut right_most, &mut right_most_ctx)?;
                 program.pop_current_parent_explain();
@@ -334,7 +335,7 @@ fn emit_compound_select(
                     } => (cursor_id, index),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, &right_most, schema)?
+                        create_dedupe_index(program, &plan, &right_most, schema)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -397,19 +398,20 @@ fn emit_compound_select(
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
-    select: &SelectPlan,
+    left_select: &SelectPlan,
+    right_select: &SelectPlan,
     schema: &Schema,
 ) -> crate::Result<(usize, Arc<Index>)> {
     if !schema.indexes_enabled {
         crate::bail_parse_error!("UNION OR INTERSECT or EXCEPT is not supported without indexes");
     }
 
-    let mut dedupe_columns = select
+    let mut dedupe_columns = right_select
         .result_columns
         .iter()
         .map(|c| IndexColumn {
             name: c
-                .name(&select.table_references)
+                .name(&right_select.table_references)
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             order: SortOrder::Asc,
@@ -419,8 +421,21 @@ fn create_dedupe_index(
         })
         .collect::<Vec<_>>();
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        column.collation =
-            get_collseq_from_expr(&select.result_columns[i].expr, &select.table_references)?;
+        let left_collation = get_collseq_from_expr(
+            &left_select.result_columns[i].expr,
+            &left_select.table_references,
+        )?;
+        let right_collation = get_collseq_from_expr(
+            &right_select.result_columns[i].expr,
+            &right_select.table_references,
+        )?;
+        // Left precedence
+        let collation = match (left_collation, right_collation) {
+            (None, None) => None,
+            (Some(coll), None) | (None, Some(coll)) => Some(coll),
+            (Some(coll), Some(_)) => Some(coll),
+        };
+        column.collation = collation;
     }
 
     let dedupe_index = Arc::new(Index {

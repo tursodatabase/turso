@@ -522,7 +522,7 @@ pub fn resolve_sorted_columns(
             name: col.1.name.as_ref().unwrap().clone(),
             order: sc.order.unwrap_or(SortOrder::Asc),
             pos_in_table: col.0,
-            collation: col.1.collation,
+            collation: col.1.collation_opt(),
             default: col.1.default.clone(),
         });
     }

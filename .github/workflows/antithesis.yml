@@ -24,8 +24,11 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    - name: Publish workload 
+    - name: Publish workload
       run: bash ./scripts/antithesis/publish-workload.sh
+
+    - name: Publish config
+      run: bash ./scripts/antithesis/publish-config.sh
 
     - name: Launch experiment
       run: bash ./scripts/antithesis/launch.sh

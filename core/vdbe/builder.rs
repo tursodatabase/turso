@@ -1028,7 +1028,7 @@ impl ProgramBuilder {
                 .columns
                 .get(column)
                 .expect("column index out of bounds");
-            if column_def.is_rowid_alias {
+            if column_def.is_rowid_alias() {
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,

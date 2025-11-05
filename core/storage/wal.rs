@@ -1139,7 +1139,7 @@ impl Wal for WalFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
-        tracing::debug!("read_frame({})", frame_id);
+        tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let (frame_ptr, frame_len) = (frame.as_mut_ptr(), frame.len());
 
@@ -1511,6 +1511,7 @@ impl Wal for WalFile {
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         // Build every frame in order, updating the rolling checksum
         for (idx, page) in pages.iter().enumerate() {
+            tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
 

@@ -512,7 +512,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 .columns()
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| !col.hidden)
+                .filter(|(_, col)| !col.hidden())
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
@@ -532,7 +532,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         database: None,
                         table: table.internal_id,
                         column: i,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     },
                     contains_aggregates: false,
                 }),
@@ -913,23 +913,27 @@ impl JoinedTable {
         let mut columns = plan
             .result_columns
             .iter()
-            .map(|rc| Column {
-                name: rc.name(&plan.table_references).map(String::from),
-                ty: Type::Blob, // FIXME: infer proper type
-                ty_str: "BLOB".to_string(),
-                is_rowid_alias: false,
-                primary_key: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
+            .map(|rc| {
+                Column::new(
+                    rc.name(&plan.table_references).map(String::from),
+                    "BLOB".to_string(),
+                    None,
+                    Type::Blob, // FIXME: infer proper type
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
             })
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
-            column.collation =
-                get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
+            column.set_collation(get_collseq_from_expr(
+                &plan.result_columns[i].expr,
+                &plan.table_references,
+            )?);
         }
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {
@@ -1390,7 +1394,7 @@ pub enum SubqueryState {
     Evaluated { evaluated_at: EvalAt },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubqueryPosition {
     ResultColumn,
     Where,
@@ -1398,6 +1402,30 @@ pub enum SubqueryPosition {
     Having,
     OrderBy,
     LimitOffset,
+}
+
+impl SubqueryPosition {
+    /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
+    /// FIXME: HAVING and ORDER BY should allow correlated subqueries, but our translation system currently does not support this well.
+    /// Subqueries in these positions should be evaluated after the main loop, AND they should also have access to aggregations computed
+    /// in the main query.
+    pub fn allow_correlated(&self) -> bool {
+        matches!(
+            self,
+            SubqueryPosition::ResultColumn | SubqueryPosition::Where | SubqueryPosition::GroupBy
+        )
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            SubqueryPosition::ResultColumn => "SELECT list",
+            SubqueryPosition::Where => "WHERE",
+            SubqueryPosition::GroupBy => "GROUP BY",
+            SubqueryPosition::Having => "HAVING",
+            SubqueryPosition::OrderBy => "ORDER BY",
+            SubqueryPosition::LimitOffset => "LIMIT/OFFSET",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

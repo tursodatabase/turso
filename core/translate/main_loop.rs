@@ -1240,6 +1240,20 @@ pub fn close_loop(
                             cursor_id: *cursor_id,
                         });
                     });
+                if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
+                    if let Some(start_reg) = from_clause_subquery.result_columns_start_reg {
+                        let column_count = from_clause_subquery.columns.len();
+                        if column_count > 0 {
+                            // Subqueries materialize their row into registers rather than being read back
+                            // through a cursor. NullRow only affects cursor reads, so we also have to
+                            // explicitly null out the cached registers or stale values would be re-emitted.
+                            program.emit_insn(Insn::Null {
+                                dest: start_reg,
+                                dest_end: Some(start_reg + column_count - 1),
+                            });
+                        }
+                    }
+                }
                 // Then we jump to setting the left join match flag to 1 again,
                 // but this time the right table cursor will set everything to null.
                 // This leads to emitting a row with cols from the left + nulls from the right,
@@ -1474,9 +1488,10 @@ fn emit_seek_termination(
         affinity = if let Some(table_ref) = tables
             .joined_tables()
             .iter()
-            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias))
+            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias()))
         {
-            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias) {
+            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias())
+            {
                 Some(table_ref.columns()[rowid_col_idx].affinity())
             } else {
                 Some(Affinity::Numeric)

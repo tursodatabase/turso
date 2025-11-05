@@ -1,4 +1,3 @@
-import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -8,19 +7,19 @@ import scienceplots  # noqa: F401
 
 plt.style.use(["science"])
 
-# Get CSV filename from command line argument
+# Get CSV filenames from command line arguments
 if len(sys.argv) < 2:
-    print("Usage: python script.py <csv_filename>")
+    print("Usage: python script.py <csv_filename> [<csv_filename> ...]")
     sys.exit(1)
 
-csv_filename = sys.argv[1]
+csv_filenames = sys.argv[1:]
 
-# Get basename without extension for output filename
-basename = os.path.splitext(csv_filename)[0]
-output_filename = f"{basename}-write.png"
+# Output filename
+output_filename = "thread-scaling.pdf"
 
-# Read data from CSV file
-df = pd.read_csv(csv_filename)
+# Read data from all CSV files and concatenate
+dfs = [pd.read_csv(filename) for filename in csv_filenames]
+df = pd.concat(dfs, ignore_index=True)
 
 # Filter for compute time = 0
 df_filtered = df[df["compute"] == 0].sort_values("threads")

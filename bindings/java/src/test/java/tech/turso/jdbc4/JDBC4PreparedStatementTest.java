@@ -339,6 +339,56 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
+  void testSetObjectCoversAllSupportedTypes() throws SQLException {
+    connection
+        .prepareStatement(
+            "CREATE TABLE test ("
+                + "col1 INTEGER, "
+                + "col2 REAL, "
+                + "col3 TEXT, "
+                + "col4 BLOB, "
+                + "col5 INTEGER, "
+                + "col6 TEXT, "
+                + "col7 TEXT, "
+                + "col8 TEXT, "
+                + "col9 TEXT"
+                + ")")
+        .execute();
+
+    PreparedStatement stmt =
+        connection.prepareStatement("INSERT INTO test VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    stmt.setObject(1, 42);
+    stmt.setObject(2, 3.141592d);
+    stmt.setObject(3, "string_value");
+    stmt.setObject(4, new byte[] {1, 2, 3});
+    stmt.setObject(5, 1L);
+    stmt.setObject(6, java.sql.Date.valueOf("2025-10-30"));
+    stmt.setObject(7, java.sql.Time.valueOf("10:45:00"));
+    stmt.setObject(8, java.sql.Timestamp.valueOf("2025-10-30 10:45:00"));
+    stmt.setObject(9, new java.math.BigDecimal("12345.6789"));
+
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT * FROM test;");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(42, rs.getInt(1));
+    assertEquals(3.141592d, rs.getDouble(2), 0.000001);
+    assertEquals("string_value", rs.getString(3));
+    assertArrayEquals(new byte[] {1, 2, 3}, rs.getBytes(4));
+    assertTrue(rs.getBoolean(5));
+    assertEquals(java.sql.Date.valueOf("2025-10-30"), rs.getDate(6));
+    assertEquals(java.sql.Time.valueOf("10:45:00"), rs.getTime(7));
+    assertEquals(java.sql.Timestamp.valueOf("2025-10-30 10:45:00"), rs.getTimestamp(8));
+    String decimalText = rs.getString(9);
+    assertEquals(
+        new java.math.BigDecimal("12345.6789").stripTrailingZeros(),
+        new java.math.BigDecimal(decimalText).stripTrailingZeros());
+  }
+
+  @Test
   void execute_insert_should_return_number_of_inserted_elements() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
     PreparedStatement prepareStatement =

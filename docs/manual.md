@@ -42,6 +42,7 @@ Welcome to Turso database manual!
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [CDC](#cdc-early-preview)
+  - [Index Method](#index-method-experimental)
   - [Appendix A: Turso Internals](#appendix-a-turso-internals)
     - [Frontend](#frontend)
       - [Parser](#parser)
@@ -878,6 +879,75 @@ turso>
 ```
 
 If you modify your table schema (adding/dropping columns), the `table_columns_json_array()` function returns the current schema, not the historical one. This can lead to incorrect results when decoding older CDC records. Manually track schema versions by storing the output of `table_columns_json_array()` before making schema changes.
+
+## Index Method (Experimental)
+
+`tursodb` allows developers to implement custom data access methods and integrate them seamlessly with the query planner. This feature is conceptually similar to [VTable](https://www.sqlite.org/vtab.html) but provides greater flexibility and automatic query planner integration. The feature is experimental and currently gated behind the `--experimental-index-method` flag.
+
+### DDL
+
+Index Methods can be created using standard `CREATE INDEX` statements by specifying a custom module name:
+
+```sql
+CREATE INDEX t_idx ON t USING index_method_name (column1, column2);
+```
+
+Index Methods can also include optional parameters whose values may be numeric, floating-point, string, or blob literals:
+
+```sql
+CREATE INDEX t_idx ON t USING index_method_name (c) WITH (a = 1, b = 1.2, c = 'text', d = x'deadbeef');
+```
+
+To remove an index, use the standard `DROP INDEX t_idx` statement.
+
+### DML
+
+Data modification operations for Index Methods are executed implicitly for every modification of the base table (similarly to native B-tree indices):
+
+1. Each `INSERT` operation on the table executes an `IdxInsert` opcode for the Index Method, passing the relevant column values and the `rowid` of the inserted row.
+2. Each `DELETE` operation executes an `IdxDelete` opcode with the corresponding column values and the deleted row's `rowid`.
+3. Each `UPDATE` operation is internally translated into a pair of `DELETE` + `INSERT` operations.
+
+### DQL
+
+At present, Index Methods can only be used implicitly if the query planner decides to apply them. This decision depends on whether the query matches one of the suitable patterns provided by the Index Method implementation. If parts of a query align with a registered pattern, the planner may substitute default table access method with the Index Method.
+
+For example, an Index Method can define the following query pattern:
+
+```sql
+SELECT vector_distance_jaccard(embedding, ?) AS distance FROM documents ORDER BY distance LIMIT ?;
+```
+
+This pattern describes the shape of the output (a single `distance` column), the parameter placeholders (query embedding and limit), and the type of query it can optimize (an ordered retrieval by distance).
+
+The planner can match this pattern against a user query like:
+
+```sql
+SELECT id, content, created_at FROM documents ORDER BY vector_distance_jaccard(embedding, ?) LIMIT 10;
+```
+
+Because the query is a *superset* of the pattern, the planner can safely apply the Index Method, enriching its output (`distance`) with data from the main table (`id`, `content`, `created_at`), using the `rowid` provided by each row from the Index Method.
+
+The query planner is conservative and will avoid using an Index Method if doing so would alter the query's semantics. Consider:
+
+```sql
+SELECT id, content, created_at FROM documents WHERE user = ? ORDER BY vector_distance_jaccard(embedding, ?) LIMIT 10;
+```
+
+The additional filter `WHERE user = ?` does not fit the Index Method's query pattern, so the planner correctly falls back to the default plan.
+
+### Internals
+
+Each Index Method consists of three traits that work together (for details, see the index method module [root](../core/index_method/mod.rs)):
+
+* **`IndexMethod`** — the root trait for all Index Methods, responsible for creating `IndexMethodAttachment` instances for a given table.
+* **`IndexMethodAttachment`** — represents an Index Method instance bound to a specific table. It can create cursors for query execution and defines the metadata needed for integration with the query planner.
+* **`IndexMethodCursor`** — provides methods for accessing and updating data, as well as for managing the underlying storage during `CREATE INDEX` and `DROP INDEX` operations.
+
+While Index Methods can implement arbitrary logic internally, it's generally recommended to use a B-tree as the underlying storage mechanism. To support this, `tursodb` provides a special `backing_btree` Index Method that other Index Methods can use to create auxiliary tables for storing supporting data.
+
+For more details, see [`toy_vector_sparse_ivf`](../core/index_method/toy_vector_sparse_ivf.rs) implementation.
+
 ## Appendix A: Turso Internals
 
 Turso's architecture resembles SQLite's but differs primarily in its

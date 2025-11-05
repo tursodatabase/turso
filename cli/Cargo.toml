@@ -49,12 +49,13 @@ serde_json = "1.0"
 termimad = "0.30"
 include_dir = "0.7"
 rand = "0.8"
-mimalloc = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 
 [features]
-default = ["io_uring"]
+default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 tracing_release = ["turso_core/tracing_release"]
+mimalloc = ["dep:mimalloc"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }

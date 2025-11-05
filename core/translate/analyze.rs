@@ -161,7 +161,7 @@ pub fn translate_analyze(
         });
     };
 
-    if target_schema.columns().iter().any(|c| c.primary_key) {
+    if target_schema.columns().iter().any(|c| c.primary_key()) {
         bail_parse_error!("ANALYZE on tables with primary key is not supported");
     }
     if !target_btree.has_rowid {

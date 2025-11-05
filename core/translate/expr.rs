@@ -2133,7 +2133,7 @@ pub fn translate_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 };
                 // Counter intuitive but a column always needs to have a collation
-                program.set_collation(Some((table_column.collation.unwrap_or_default(), false)));
+                program.set_collation(Some((table_column.collation(), false)));
             }
 
             // If we are reading a column from a table, we find the cursor that corresponds to
@@ -2222,7 +2222,7 @@ pub fn translate_expr(
                         let Some(column) = table.get_column_at(*column) else {
                             crate::bail_parse_error!("column index out of bounds");
                         };
-                        maybe_apply_affinity(column.ty, target_register, program);
+                        maybe_apply_affinity(column.ty(), target_register, program);
                     }
                     Ok(target_register)
                 }
@@ -3701,7 +3701,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     joined_table.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         // only if we haven't found a match, check for explicit rowid reference
@@ -3743,7 +3743,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 match_result = Some((
                                     outer_ref.internal_id,
                                     col_idx.unwrap(),
-                                    col.is_rowid_alias,
+                                    col.is_rowid_alias(),
                                 ));
                             }
                         }
@@ -3822,7 +3822,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         database: None, // TODO: support different databases
                         table: tbl_id,
                         column: col_idx,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     };
                     tracing::debug!("rewritten to column");
                     referenced_tables.mark_column_used(tbl_id, col_idx);
@@ -3882,7 +3882,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     let col = table.columns().get(col_idx).unwrap();
 
                     // Check if this is a rowid alias
-                    let is_rowid_alias = col.is_rowid_alias;
+                    let is_rowid_alias = col.is_rowid_alias();
 
                     // Convert to Column expression - since this is a cross-database reference,
                     // we need to create a synthetic table reference for it
@@ -4543,4 +4543,169 @@ pub(crate) fn emit_returning_results(
     });
 
     Ok(())
+}
+
+/// Get the number of values returned by an expression
+pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
+    Ok(match unwrap_parens(expr)? {
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            let evs_left = expr_vector_size(lhs)?;
+            let evs_start = expr_vector_size(start)?;
+            let evs_end = expr_vector_size(end)?;
+            if evs_left != evs_start || evs_left != evs_end {
+                crate::bail_parse_error!("all arguments to BETWEEN must return the same number of values. Got: ({evs_left}) BETWEEN ({evs_start}) AND ({evs_end})");
+            }
+            1
+        }
+        Expr::Binary(expr, operator, expr1) => {
+            let evs_left = expr_vector_size(expr)?;
+            let evs_right = expr_vector_size(expr1)?;
+            if evs_left != evs_right {
+                crate::bail_parse_error!("all arguments to binary operator {operator} must return the same number of values. Got: ({evs_left}) {operator} ({evs_right})");
+            }
+            1
+        }
+        Expr::Register(_) => 1,
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            if let Some(base) = base {
+                let evs_base = expr_vector_size(base)?;
+                if evs_base != 1 {
+                    crate::bail_parse_error!(
+                        "base expression in CASE must return 1 value. Got: ({evs_base})"
+                    );
+                }
+            }
+            for (when, then) in when_then_pairs {
+                let evs_when = expr_vector_size(when)?;
+                if evs_when != 1 {
+                    crate::bail_parse_error!(
+                        "when expression in CASE must return 1 value. Got: ({evs_when})"
+                    );
+                }
+                let evs_then = expr_vector_size(then)?;
+                if evs_then != 1 {
+                    crate::bail_parse_error!(
+                        "then expression in CASE must return 1 value. Got: ({evs_then})"
+                    );
+                }
+            }
+            if let Some(else_expr) = else_expr {
+                let evs_else_expr = expr_vector_size(else_expr)?;
+                if evs_else_expr != 1 {
+                    crate::bail_parse_error!(
+                        "else expression in CASE must return 1 value. Got: ({evs_else_expr})"
+                    );
+                }
+            }
+            1
+        }
+        Expr::Cast { expr, .. } => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!("argument to CAST must return 1 value. Got: ({evs_expr})");
+            }
+            1
+        }
+        Expr::Collate(expr, _) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to COLLATE must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::DoublyQualified(..) => 1,
+        Expr::Exists(_) => todo!(),
+        Expr::FunctionCall { name, args, .. } => {
+            for (pos, arg) in args.iter().enumerate() {
+                let evs_arg = expr_vector_size(arg)?;
+                if evs_arg != 1 {
+                    crate::bail_parse_error!(
+                        "argument {} to function call {name} must return 1 value. Got: ({evs_arg})",
+                        pos + 1
+                    );
+                }
+            }
+            1
+        }
+        Expr::FunctionCallStar { .. } => 1,
+        Expr::Id(_) => 1,
+        Expr::Column { .. } => 1,
+        Expr::RowId { .. } => 1,
+        Expr::InList { lhs, rhs, .. } => {
+            let evs_lhs = expr_vector_size(lhs)?;
+            for rhs in rhs.iter() {
+                let evs_rhs = expr_vector_size(rhs)?;
+                if evs_lhs != evs_rhs {
+                    crate::bail_parse_error!("all arguments to IN list must return the same number of values, got: ({evs_lhs}) IN ({evs_rhs})");
+                }
+            }
+            1
+        }
+        Expr::InSelect { .. } => {
+            crate::bail_parse_error!("InSelect is not supported in this position")
+        }
+        Expr::InTable { .. } => {
+            crate::bail_parse_error!("InTable is not supported in this position")
+        }
+        Expr::IsNull(expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to IS NULL must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            let evs_lhs = expr_vector_size(lhs)?;
+            if evs_lhs != 1 {
+                crate::bail_parse_error!(
+                    "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
+                );
+            }
+            let evs_rhs = expr_vector_size(rhs)?;
+            if evs_rhs != 1 {
+                crate::bail_parse_error!(
+                    "right operand of LIKE must return 1 value. Got: ({evs_rhs})"
+                );
+            }
+            1
+        }
+        Expr::Literal(_) => 1,
+        Expr::Name(_) => 1,
+        Expr::NotNull(expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!(
+                    "argument to NOT NULL must return 1 value. Got: ({evs_expr})"
+                );
+            }
+            1
+        }
+        Expr::Parenthesized(exprs) => exprs.len(),
+        Expr::Qualified(..) => 1,
+        Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
+        Expr::Subquery(_) => todo!(),
+        Expr::Unary(unary_operator, expr) => {
+            let evs_expr = expr_vector_size(expr)?;
+            if evs_expr != 1 {
+                crate::bail_parse_error!("argument to unary operator {unary_operator} must return 1 value. Got: ({evs_expr})");
+            }
+            1
+        }
+        Expr::Variable(_) => 1,
+        Expr::SubqueryResult { query_type, .. } => match query_type {
+            SubqueryType::Exists { .. } => 1,
+            SubqueryType::In { .. } => 1,
+            SubqueryType::RowValue { num_regs, .. } => *num_regs,
+        },
+    })
 }

@@ -958,7 +958,7 @@ impl Program {
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
-            tracing::trace!(
+            tracing::debug!(
                 "Halt auto_commit {}, state={:?}",
                 auto_commit,
                 program_state.commit_state

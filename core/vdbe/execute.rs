@@ -1920,14 +1920,15 @@ pub fn op_type_check(
         .zip(table_reference.columns.iter())
         .try_for_each(|(reg, col)| {
             // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias && col.primary_key && matches!(reg.get_value(), Value::Null) {
+            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
+            {
                 bail_constraint_error!(
                     "NOT NULL constraint failed: {}.{} ({})",
                     &table_reference.name,
                     col.name.as_deref().unwrap_or(""),
                     SQLITE_CONSTRAINT
                 )
-            } else if col.is_rowid_alias && matches!(reg.get_value(), Value::Null) {
+            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
                 return Ok(());
             }
@@ -2967,7 +2968,7 @@ pub fn op_seek_rowid(
                             match temp_reg.get_value() {
                                 Value::Integer(i) => Some(*i),
                                 Value::Float(f) => Some(*f as i64),
-                                _ => unreachable!("apply_affinity_char with Numeric should produce an integer if it returns true"),
+                                _ => None,
                             }
                         } else {
                             None
@@ -6011,7 +6012,7 @@ pub fn op_insert(
                                 // Fix rowid alias columns: replace Null with actual rowid value
                                 if let Some(table) = schema.get_table(table_name) {
                                     for (i, col) in table.columns().iter().enumerate() {
-                                        if col.is_rowid_alias && i < values.len() {
+                                        if col.is_rowid_alias() && i < values.len() {
                                             values[i] = Value::Integer(key);
                                         }
                                     }
@@ -6162,7 +6163,7 @@ pub fn op_insert(
                     let schema = program.connection.schema.read();
                     if let Some(table) = schema.get_table(table_name) {
                         for (i, col) in table.columns().iter().enumerate() {
-                            if col.is_rowid_alias && i < new_values.len() {
+                            if col.is_rowid_alias() && i < new_values.len() {
                                 new_values[i] = Value::Integer(key);
                             }
                         }
@@ -6280,7 +6281,7 @@ pub fn op_delete(
                         // Fix rowid alias columns: replace Null with actual rowid value
                         if let Some(table) = schema.get_table(table_name) {
                             for (i, col) in table.columns().iter().enumerate() {
-                                if col.is_rowid_alias && i < values.len() {
+                                if col.is_rowid_alias() && i < values.len() {
                                     values[i] = Value::Integer(key);
                                 }
                             }
@@ -8666,7 +8667,7 @@ pub fn op_alter_column(
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
         if !*rename {
             // recompute alias from `new_column`
-            btree.columns[*column_index].is_rowid_alias = new_column.is_rowid_alias;
+            btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
         // Update this table’s OWN foreign keys

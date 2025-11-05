@@ -241,6 +241,14 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::AutoVacuum => {
+            // Check if autovacuum is enabled in database opts
+            if !connection.db.opts.enable_autovacuum {
+                return Err(LimboError::InvalidArgument(
+                    "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
+                        .to_string(),
+                ));
+            }
+
             let is_empty = is_database_empty(resolver.schema, &pager)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
@@ -735,7 +743,7 @@ fn emit_columns_for_table_info(
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
     // Therefore, we enumerate only after filtering out hidden columns.
-    for (i, column) in columns.iter().filter(|col| !col.hidden).enumerate() {
+    for (i, column) in columns.iter().filter(|col| !col.hidden()).enumerate() {
         // cid
         program.emit_int(i as i64, base_reg);
         // name
@@ -745,7 +753,7 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
 
         // notnull
-        program.emit_bool(column.notnull, base_reg + 3);
+        program.emit_bool(column.notnull(), base_reg + 3);
 
         // dflt_value
         match &column.default {
@@ -758,7 +766,7 @@ fn emit_columns_for_table_info(
         }
 
         // pk
-        program.emit_bool(column.primary_key, base_reg + 5);
+        program.emit_bool(column.primary_key(), base_reg + 5);
 
         program.emit_result_row(base_reg, 6);
     }

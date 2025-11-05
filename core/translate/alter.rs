@@ -110,13 +110,13 @@ pub fn translate_alter_table(
             // The column is used in the expression of a generated column.
             // The column appears in a trigger or view.
 
-            if column.primary_key {
+            if column.primary_key() {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
                 )));
             }
 
-            if column.unique
+            if column.unique()
                 || btree.unique_sets.iter().any(|set| {
                     set.columns
                         .iter()

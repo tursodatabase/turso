@@ -245,7 +245,7 @@ pub fn stabilize_new_row_for_fk(
             .get_column(pk_name)
             .ok_or_else(|| crate::LimboError::InternalError(format!("pk col {pk_name} missing")))?;
         if !set_cols.contains(&pos) {
-            if col.is_rowid_alias {
+            if col.is_rowid_alias() {
                 program.emit_insn(Insn::Copy {
                     src_reg: rowid_new_reg,
                     dst_reg: start + pos,
@@ -388,7 +388,7 @@ pub fn emit_parent_index_key_change_checks(
     for (i, index_col) in index.columns.iter().enumerate() {
         let pos_in_table = index_col.pos_in_table;
         let column = &table_btree.columns[pos_in_table];
-        if column.is_rowid_alias {
+        if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: old_rowid_reg,
                 dst_reg: old_key + i,
@@ -407,7 +407,7 @@ pub fn emit_parent_index_key_change_checks(
     for (i, index_col) in index.columns.iter().enumerate() {
         let pos_in_table = index_col.pos_in_table;
         let column = &table_btree.columns[pos_in_table];
-        let src = if column.is_rowid_alias {
+        let src = if column.is_rowid_alias() {
             new_rowid_reg
         } else {
             new_values_start + pos_in_table
@@ -565,7 +565,7 @@ fn build_parent_key(
             let (pos, col) = parent_bt
                 .get_column(pcol)
                 .ok_or_else(|| crate::LimboError::InternalError(format!("col {pcol} missing")))?;
-            if col.is_rowid_alias {
+            if col.is_rowid_alias() {
                 parent_rowid_reg
             } else {
                 program.emit_insn(Insn::Column {
@@ -716,7 +716,7 @@ pub fn emit_fk_child_update_counters(
         let fk_ok = program.allocate_label();
         for cname in &fk_ref.fk.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias {
+            let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
                 new_start_reg + i
@@ -736,7 +736,7 @@ pub fn emit_fk_child_update_counters(
 
             // Take the first child column value from NEW image
             let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
-            let val_reg = if col_child.is_rowid_alias {
+            let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
                 new_start_reg + i_child
@@ -781,7 +781,7 @@ pub fn emit_fk_child_update_counters(
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
-                        src_reg: if col.is_rowid_alias {
+                        src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
                         } else {
                             new_start_reg + i

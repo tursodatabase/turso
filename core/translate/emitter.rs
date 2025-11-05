@@ -544,7 +544,7 @@ pub fn emit_fk_child_decrement_on_delete(
         let null_skip = program.allocate_label();
         for cname in &fk_ref.child_cols {
             let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias {
+            let src = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
                 let tmp = program.alloc_register();
@@ -571,7 +571,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let pcur = open_read_table(program, &parent_tbl);
 
             let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
-            let val = if col.is_rowid_alias {
+            let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
                 let tmp = program.alloc_register();
@@ -624,7 +624,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let probe = program.alloc_registers(n);
             for (i, cname) in fk_ref.child_cols.iter().enumerate() {
                 let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias {
+                let src = if col.is_rowid_alias() {
                     child_rowid_reg
                 } else {
                     let r = program.alloc_register();
@@ -1136,7 +1136,7 @@ fn emit_update_insns(
         .table
         .columns()
         .iter()
-        .position(|c| c.is_rowid_alias);
+        .position(|c| c.is_rowid_alias());
 
     let has_direct_rowid_update = plan
         .set_clauses
@@ -1232,7 +1232,7 @@ fn emit_update_insns(
                 continue;
             }
             if has_user_provided_rowid
-                && (table_column.primary_key || table_column.is_rowid_alias)
+                && (table_column.primary_key() || table_column.is_rowid_alias())
                 && !is_virtual
             {
                 let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
@@ -1257,7 +1257,7 @@ fn emit_update_insns(
                     target_reg,
                     &t_ctx.resolver,
                 )?;
-                if table_column.notnull {
+                if table_column.notnull() {
                     use crate::error::SQLITE_CONSTRAINT_NOTNULL;
                     program.emit_insn(Insn::HaltIfNull {
                         target_reg,
@@ -1303,7 +1303,7 @@ fn emit_update_insns(
 
             // don't emit null for pkey of virtual tables. they require first two args
             // before the 'record' to be explicitly non-null
-            if table_column.is_rowid_alias && !is_virtual {
+            if table_column.is_rowid_alias() && !is_virtual {
                 program.emit_null(target_reg, None);
             } else if is_virtual {
                 program.emit_insn(Insn::VColumn {
@@ -1511,7 +1511,7 @@ fn emit_update_insns(
                 .get(col.pos_in_table)
                 .expect("column index out of bounds");
             program.emit_insn(Insn::Copy {
-                src_reg: if col_in_table.is_rowid_alias {
+                src_reg: if col_in_table.is_rowid_alias() {
                     rowid_reg
                 } else {
                     start + col.pos_in_table
@@ -1892,7 +1892,7 @@ pub fn emit_cdc_patch_record(
     rowid_reg: usize,
 ) -> usize {
     let columns = table.columns();
-    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias);
+    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias());
     if let Some(rowid_alias_position) = rowid_alias_position {
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::Copy {
@@ -1927,7 +1927,7 @@ pub fn emit_cdc_full_record(
 ) -> usize {
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
-        if column.is_rowid_alias {
+        if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
                 dst_reg: columns_reg + 1 + i,
@@ -2181,7 +2181,7 @@ fn rewrite_where_for_update_registers(
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    if c.is_rowid_alias {
+                    if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
                         *e = Expr::Register(columns_start_reg + idx);
@@ -2200,7 +2200,7 @@ fn rewrite_where_for_update_registers(
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    if c.is_rowid_alias {
+                    if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
                         *e = Expr::Register(columns_start_reg + idx);
