@@ -47,14 +47,14 @@ pub enum VectorSparseInvertedIndexInsertState {
         rowid: i64,
         idx: usize,
     },
-    SeekScratch {
+    SeekInverted {
         vector: Option<Vector<'static>>,
         sum: f64,
         key: Option<ImmutableRecord>,
         rowid: i64,
         idx: usize,
     },
-    InsertScratch {
+    InsertInverted {
         vector: Option<Vector<'static>>,
         sum: f64,
         key: Option<ImmutableRecord>,
@@ -92,20 +92,20 @@ pub enum VectorSparseInvertedIndexDeleteState {
         rowid: i64,
         idx: usize,
     },
-    SeekScratch {
+    SeekInverted {
         vector: Option<Vector<'static>>,
         sum: f64,
         key: Option<ImmutableRecord>,
         rowid: i64,
         idx: usize,
     },
-    NextScratch {
+    NextInverted {
         vector: Option<Vector<'static>>,
         sum: f64,
         rowid: i64,
         idx: usize,
     },
-    DeleteScratch {
+    DeleteInverted {
         vector: Option<Vector<'static>>,
         sum: f64,
         rowid: i64,
@@ -196,25 +196,25 @@ struct ComponentRow {
     rowid: i64,
 }
 
-fn parse_scratch_row(record: Option<&ImmutableRecord>) -> Result<ComponentRow> {
+fn parse_inverted_index_row(record: Option<&ImmutableRecord>) -> Result<ComponentRow> {
     let Some(record) = record else {
         return Err(LimboError::Corrupt(
-            "scratch index corrupted: expected row".to_string(),
+            "inverted index corrupted: expected row".to_string(),
         ));
     };
     let ValueRef::Integer(position) = record.get_value(0)? else {
         return Err(LimboError::Corrupt(
-            "scratch index corrupted: expected integer".to_string(),
+            "inverted index corrupted: expected integer".to_string(),
         ));
     };
     let ValueRef::Float(sum) = record.get_value(1)? else {
         return Err(LimboError::Corrupt(
-            "scratch index corrupted: expected float".to_string(),
+            "inverted index corrupted: expected float".to_string(),
         ));
     };
     let ValueRef::Integer(rowid) = record.get_value(2)? else {
         return Err(LimboError::Corrupt(
-            "scratch index corrupted: expected integer".to_string(),
+            "inverted index corrupted: expected integer".to_string(),
         ));
     };
     Ok(ComponentRow {
@@ -303,8 +303,8 @@ pub struct VectorSparseInvertedIndexMethodCursor {
     delta: f64,
     scan_portion: f64,
     scan_order: ScanOrder,
-    scratch_btree: String,
-    scratch_cursor: Option<BTreeCursor>,
+    inverted_index_btree: String,
+    inverted_index_cursor: Option<BTreeCursor>,
     stats_btree: String,
     stats_cursor: Option<BTreeCursor>,
     main_btree: Option<BTreeCursor>,
@@ -352,7 +352,7 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
 
 impl VectorSparseInvertedIndexMethodCursor {
     pub fn new(configuration: IndexMethodConfiguration) -> Self {
-        let scratch_btree = format!("{}_scratch", configuration.index_name);
+        let inverted_index_btree = format!("{}_inverted_index", configuration.index_name);
         let stats_btree = format!("{}_stats", configuration.index_name);
         let delta = match configuration.parameters.get("delta") {
             Some(&Value::Float(delta)) => delta,
@@ -376,8 +376,8 @@ impl VectorSparseInvertedIndexMethodCursor {
             delta,
             scan_portion,
             scan_order,
-            scratch_btree,
-            scratch_cursor: None,
+            inverted_index_btree,
+            inverted_index_cursor: None,
             stats_btree,
             stats_cursor: None,
             main_btree: None,
@@ -402,9 +402,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
 
         let columns = &self.configuration.columns;
         let columns = columns.iter().map(|x| x.name.as_str()).collect::<Vec<_>>();
-        let scratch_index_create = format!(
+        let inverted_index_create = format!(
             "CREATE INDEX {} ON {} USING {} ({})",
-            self.scratch_btree,
+            self.inverted_index_btree,
             self.configuration.table_name,
             BACKING_BTREE_INDEX_METHOD_NAME,
             columns.join(", ")
@@ -416,7 +416,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             BACKING_BTREE_INDEX_METHOD_NAME,
             columns.join(", ")
         );
-        for sql in [scratch_index_create, stats_index_create] {
+        for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
             connection.start_nested();
             let result = stmt.run_ignore_rows();
@@ -428,9 +428,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn destroy(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
-        let scratch_index_drop = format!("DROP INDEX {}", self.scratch_btree);
+        let inverted_index_drop = format!("DROP INDEX {}", self.inverted_index_btree);
         let stats_index_drop = format!("DROP INDEX {}", self.stats_btree);
-        for sql in [scratch_index_drop, stats_index_drop] {
+        for sql in [inverted_index_drop, stats_index_drop] {
             let mut stmt = connection.prepare(&sql)?;
             connection.start_nested();
             let result = stmt.run_ignore_rows();
@@ -442,10 +442,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn open_read(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
-        self.scratch_cursor = Some(open_index_cursor(
+        self.inverted_index_cursor = Some(open_index_cursor(
             connection,
             &self.configuration.table_name,
-            &self.scratch_btree,
+            &self.inverted_index_btree,
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
@@ -464,10 +464,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn open_write(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
-        self.scratch_cursor = Some(open_index_cursor(
+        self.inverted_index_cursor = Some(open_index_cursor(
             connection,
             &self.configuration.table_name,
-            &self.scratch_btree,
+            &self.inverted_index_btree,
             // component, length, rowid
             vec![key_info(), key_info(), key_info()],
         )?);
@@ -482,9 +482,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        let Some(scratch_cursor) = &mut self.scratch_cursor else {
+        let Some(inverted_cursor) = &mut self.inverted_index_cursor else {
             return Err(LimboError::InternalError(
-                "scratch cursor must be opened".to_string(),
+                "inverted cursor must be opened".to_string(),
             ));
         };
         let Some(stats_cursor) = &mut self.stats_cursor else {
@@ -546,7 +546,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         *sum,
                         *rowid,
                     );
-                    self.insert_state = VectorSparseInvertedIndexInsertState::SeekScratch {
+                    self.insert_state = VectorSparseInvertedIndexInsertState::SeekInverted {
                         vector: vector.take(),
                         sum: *sum,
                         idx: *idx,
@@ -554,7 +554,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         key: Some(key),
                     };
                 }
-                VectorSparseInvertedIndexInsertState::SeekScratch {
+                VectorSparseInvertedIndexInsertState::SeekInverted {
                     vector,
                     sum,
                     rowid,
@@ -562,11 +562,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     key,
                 } => {
                     let k = key.as_ref().unwrap();
-                    let result = return_if_io!(
-                        scratch_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
-                    );
+                    let result =
+                        return_if_io!(inverted_cursor
+                            .seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true }));
                     tracing::debug!("insert_state: seek: result={:?}", result);
-                    self.insert_state = VectorSparseInvertedIndexInsertState::InsertScratch {
+                    self.insert_state = VectorSparseInvertedIndexInsertState::InsertInverted {
                         vector: vector.take(),
                         sum: *sum,
                         idx: *idx,
@@ -574,7 +574,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         key: key.take(),
                     };
                 }
-                VectorSparseInvertedIndexInsertState::InsertScratch {
+                VectorSparseInvertedIndexInsertState::InsertInverted {
                     vector,
                     sum,
                     rowid,
@@ -582,7 +582,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     key,
                 } => {
                     let k = key.as_ref().unwrap();
-                    return_if_io!(scratch_cursor.insert(&BTreeKey::IndexKey(k)));
+                    return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k)));
 
                     let v = vector.as_ref().unwrap();
                     let position = v.as_f32_sparse().idx[*idx];
@@ -702,7 +702,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        let Some(cursor) = &mut self.scratch_cursor else {
+        let Some(cursor) = &mut self.inverted_index_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
             ));
@@ -760,7 +760,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ],
                         3,
                     );
-                    self.delete_state = VectorSparseInvertedIndexDeleteState::SeekScratch {
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::SeekInverted {
                         vector: vector.take(),
                         idx: *idx,
                         sum: *sum,
@@ -768,7 +768,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         key: Some(key),
                     };
                 }
-                VectorSparseInvertedIndexDeleteState::SeekScratch {
+                VectorSparseInvertedIndexDeleteState::SeekInverted {
                     vector,
                     sum,
                     rowid,
@@ -788,7 +788,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     match result {
                         SeekResult::Found => {
                             self.delete_state =
-                                VectorSparseInvertedIndexDeleteState::DeleteScratch {
+                                VectorSparseInvertedIndexDeleteState::DeleteInverted {
                                     vector: vector.take(),
                                     sum: *sum,
                                     idx: *idx,
@@ -796,7 +796,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 };
                         }
                         SeekResult::TryAdvance => {
-                            self.delete_state = VectorSparseInvertedIndexDeleteState::NextScratch {
+                            self.delete_state = VectorSparseInvertedIndexDeleteState::NextInverted {
                                 vector: vector.take(),
                                 sum: *sum,
                                 idx: *idx,
@@ -808,7 +808,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         }
                     }
                 }
-                VectorSparseInvertedIndexDeleteState::NextScratch {
+                VectorSparseInvertedIndexDeleteState::NextInverted {
                     vector,
                     sum,
                     rowid,
@@ -817,14 +817,14 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     if !return_if_io!(cursor.next()) {
                         return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
                     }
-                    self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteScratch {
+                    self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteInverted {
                         vector: vector.take(),
                         sum: *sum,
                         idx: *idx,
                         rowid: *rowid,
                     };
                 }
-                VectorSparseInvertedIndexDeleteState::DeleteScratch {
+                VectorSparseInvertedIndexDeleteState::DeleteInverted {
                     vector,
                     sum,
                     rowid,
@@ -925,7 +925,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>> {
-        let Some(scratch) = &mut self.scratch_cursor else {
+        let Some(inverted) = &mut self.inverted_index_cursor else {
             return Err(LimboError::InternalError(
                 "cursor must be opened".to_string(),
             ));
@@ -1139,7 +1139,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     }
                     let k = key.as_ref().unwrap();
                     let result = return_if_io!(
-                        scratch.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
+                        inverted.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
                     );
                     match result {
                         SeekResult::Found => {
@@ -1178,8 +1178,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     component,
                     current,
                 } => {
-                    let record = return_if_io!(scratch.record());
-                    let row = parse_scratch_row(record.as_deref())?;
+                    let record = return_if_io!(inverted.record());
+                    let row = parse_inverted_index_row(record.as_deref())?;
                     if row.position != *component
                         || (sum_threshold.is_some() && row.sum > sum_threshold.unwrap())
                     {
@@ -1222,7 +1222,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     component,
                     current,
                 } => {
-                    let result = return_if_io!(scratch.next());
+                    let result = return_if_io!(inverted.next());
                     if !result {
                         let mut current = current.take().unwrap();
                         current.sort();
