@@ -220,9 +220,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         new_position
     }
 
-    /// If page id is negative, it means the btree is not allocated.
     fn is_btree_allocated(&self) -> bool {
-        self.table_id.is_btree_allocated()
+        let maybe_root_page = self.db.table_id_to_rootpage.get(&self.table_id);
+        maybe_root_page.is_some_and(|entry| entry.value().is_some())
     }
 }
 
