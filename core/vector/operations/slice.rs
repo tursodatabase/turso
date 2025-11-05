@@ -37,7 +37,7 @@ pub fn vector_slice(vector: &Vector, start: usize, end: usize) -> Result<Vector<
                     continue;
                 }
                 values.extend_from_slice(&value.to_le_bytes());
-                idx.extend_from_slice(&i.to_le_bytes());
+                idx.extend_from_slice(&((i - start) as u32).to_le_bytes());
             }
             values.extend_from_slice(&idx);
             Ok(Vector {
