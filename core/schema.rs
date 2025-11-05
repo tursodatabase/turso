@@ -442,36 +442,33 @@ impl Schema {
             let mut record_cursor = cursor.record_cursor.borrow_mut();
             // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
             let ty_value = record_cursor.get_value(&row, 0)?;
-            let ValueRef::Text(ty, _) = ty_value else {
+            let ValueRef::Text(ty) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let ty = String::from_utf8_lossy(ty);
-            let ValueRef::Text(name, _) = record_cursor.get_value(&row, 1)? else {
+            let ValueRef::Text(name) = record_cursor.get_value(&row, 1)? else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let name = String::from_utf8_lossy(name);
             let table_name_value = record_cursor.get_value(&row, 2)?;
-            let ValueRef::Text(table_name, _) = table_name_value else {
+            let ValueRef::Text(table_name) = table_name_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let table_name = String::from_utf8_lossy(table_name);
             let root_page_value = record_cursor.get_value(&row, 3)?;
             let ValueRef::Integer(root_page) = root_page_value else {
                 return Err(LimboError::ConversionError("Expected integer value".into()));
             };
             let sql_value = record_cursor.get_value(&row, 4)?;
             let sql_textref = match sql_value {
-                ValueRef::Text(sql, _) => Some(sql),
+                ValueRef::Text(sql) => Some(sql),
                 _ => None,
             };
-            let sql = sql_textref.map(|s| String::from_utf8_lossy(s));
+            let sql = sql_textref.map(|s| s.as_str());
 
             self.handle_schema_row(
                 &ty,
                 &name,
                 &table_name,
                 root_page,
-                sql.as_deref(),
+                sql,
                 syms,
                 &mut from_sql_indexes,
                 &mut automatic_indices,

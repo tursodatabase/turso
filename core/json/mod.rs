@@ -11,7 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{Text, TextSubtype, Value, ValueType};
+use crate::types::{Text, TextRef, TextSubtype, Value, ValueType};
 use crate::vdbe::Register;
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
@@ -109,7 +109,9 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
             Value::Null => ValueRef::Null,
             Value::Integer(x) => ValueRef::Integer(*x),
             Value::Float(x) => ValueRef::Float(*x),
-            Value::Text(text) => ValueRef::Text(text.as_str().as_bytes(), text.subtype),
+            Value::Text(text) => {
+                ValueRef::Text(TextRef::new(text.as_str().as_bytes(), text.subtype))
+            }
             Value::Blob(items) => ValueRef::Blob(items.as_slice()),
         },
         strict,
@@ -124,12 +126,12 @@ fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
-        ValueRef::Text(text, subtype) => {
-            let res = if subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                Jsonb::from_str_with_mode(&String::from_utf8_lossy(text), strict)
+        ValueRef::Text(text) => {
+            let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
+                Jsonb::from_str_with_mode(&text, strict)
             } else {
                 // Handle as a string literal otherwise
-                let mut str = String::from_utf8_lossy(text).replace('"', "\\\"");
+                let mut str = text.replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');

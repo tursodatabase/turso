@@ -539,8 +539,10 @@ pub fn op_compare(
 
     // (https://github.com/tursodatabase/turso/issues/2304): reusing logic from compare_immutable().
     // TODO: There are tons of cases like this where we could reuse this in a similar vein
-    let a_range = (start_reg_a..start_reg_a + count + 1).map(|idx| state.registers[idx].get_value());
-    let b_range = (start_reg_b..start_reg_b + count + 1).map(|idx| state.registers[idx].get_value());
+    let a_range =
+        (start_reg_a..start_reg_a + count + 1).map(|idx| state.registers[idx].get_value());
+    let b_range =
+        (start_reg_b..start_reg_b + count + 1).map(|idx| state.registers[idx].get_value());
     let cmp = compare_immutable(a_range, b_range, key_info);
 
     state.last_compare = Some(cmp);
@@ -5100,9 +5102,11 @@ pub fn op_function(
 
                     let mut json = json::jsonb::Jsonb::make_empty_array(table.columns().len() * 10);
                     for column in table.columns() {
+                        use crate::types::TextRef;
+
                         let name = column.name.as_ref().unwrap();
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(name.as_bytes(), TextSubtype::Text),
+                            ValueRef::Text(TextRef::new(name.as_bytes(), TextSubtype::Text)),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());
