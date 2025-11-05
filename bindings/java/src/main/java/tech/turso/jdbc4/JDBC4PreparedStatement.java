@@ -2,6 +2,7 @@ package tech.turso.jdbc4;
 
 import static java.util.Objects.requireNonNull;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
@@ -24,7 +25,6 @@ import java.sql.SQLException;
 import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
-import java.util.Arrays;
 import java.util.Calendar;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
@@ -186,7 +186,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         offset += read;
       }
       if (offset == 0) {
-        this.statement.bindNull(parameterIndex);
+        this.statement.bindText(parameterIndex, "");
       } else {
         String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
         this.statement.bindText(parameterIndex, ascii);
@@ -222,8 +222,8 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
         this.statement.bindText(parameterIndex, text);
       }
-    } catch (IOException ioe) {
-      throw new SQLException("Error reading Unicode stream", ioe);
+    } catch (IOException e) {
+      throw new SQLException("Error reading Unicode stream", e);
     }
   }
 
@@ -237,22 +237,22 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     if (length < 0) {
       throw new SQLException("setBinaryStream length must be non-negative");
     }
-    try {
-      byte[] buffer = new byte[length];
-      int offset = 0;
-      while (offset < length) {
-        int read = x.read(buffer, offset, length - offset);
-        if (read == -1) {
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+      byte[] buffer = new byte[8192];
+      int bytesRead;
+      int totalRead = 0;
+      while ((bytesRead = x.read(buffer, 0, Math.min(buffer.length, length - totalRead))) != -1) {
+        baos.write(buffer, 0, bytesRead);
+        totalRead += bytesRead;
+        if (totalRead >= length) {
           break;
         }
-        offset += read;
       }
-      if (offset == 0) {
-        this.statement.bindNull(parameterIndex);
-      } else if (offset == buffer.length) {
-        this.statement.bindBlob(parameterIndex, buffer);
+      byte[] data = baos.toByteArray();
+      if (data.length == 0) {
+        this.statement.bindBlob(parameterIndex, new byte[0]);
       } else {
-        this.statement.bindBlob(parameterIndex, Arrays.copyOf(buffer, offset));
+        this.statement.bindBlob(parameterIndex, data);
       }
     } catch (IOException e) {
       throw new SQLException("Error reading binary stream", e);

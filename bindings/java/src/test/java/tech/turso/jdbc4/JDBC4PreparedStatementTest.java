@@ -3,6 +3,7 @@ package tech.turso.jdbc4;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -443,7 +444,7 @@ class JDBC4PreparedStatementTest {
     ResultSet rs = stmt2.executeQuery();
 
     assertTrue(rs.next());
-    assertNull(rs.getString(1));
+    assertEquals("", rs.getString(1));
   }
 
   @Test
@@ -508,7 +509,11 @@ class JDBC4PreparedStatementTest {
     ResultSet rs = stmt2.executeQuery();
 
     assertTrue(rs.next());
-    assertNull(rs.getBytes(1));
+
+    byte[] result = rs.getBytes(1);
+    assertNotNull(result);
+    assertEquals(0, result.length);
+    assertArrayEquals(new byte[0], result);
   }
 
   @Test
@@ -573,7 +578,7 @@ class JDBC4PreparedStatementTest {
     ResultSet rs = stmt2.executeQuery();
 
     assertTrue(rs.next());
-    assertNull(rs.getString(1));
+    assertEquals("", rs.getString(1));
   }
 
   @Test
