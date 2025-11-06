@@ -142,6 +142,7 @@ impl Affinity {
     /// Otherwise, the affinity is NUMERIC.
     ///
     /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
+    #[expect(clippy::self_named_constructors)]
     pub fn affinity(datatype: &str) -> Self {
         let datatype = datatype.to_ascii_uppercase();
 
@@ -169,6 +170,7 @@ impl Affinity {
         Affinity::Numeric
     }
 
+    #[expect(clippy::type_complexity)]
     pub fn convert<'a, V1: AsValueRef, V2: AsValueRef>(
         &self,
         lhs: &'a V1,

@@ -2093,13 +2093,12 @@ where
             data_pos += serial_type.size();
         }
     }
-    // assumes that that the `unpacked' iterator was not skipped outside this function call`
-    let mut unpacked = unpacked.skip(skip);
 
     let mut field_idx = skip;
     let field_limit = unpacked.len().min(index_info.key_info.len());
 
-    while let Some(rhs_value) = unpacked.next() {
+    // assumes that that the `unpacked' iterator was not skipped outside this function call`
+    for rhs_value in unpacked.skip(skip) {
         let rhs_value = &rhs_value.as_value_ref();
         if field_idx >= field_limit || header_pos >= header_end {
             break;
@@ -3188,7 +3187,7 @@ mod tests {
             Value::Integer(2),
             Value::Integer(3),
         ]);
-        let unpacked = vec![
+        let unpacked = [
             ValueRef::Integer(1),
             ValueRef::Integer(99),
             ValueRef::Integer(3),
