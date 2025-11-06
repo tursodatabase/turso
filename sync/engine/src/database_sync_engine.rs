@@ -45,7 +45,7 @@ pub struct DatabaseSyncEngineOpts {
 pub struct DatabaseSyncEngine<P: ProtocolIO> {
     io: Arc<dyn turso_core::IO>,
     protocol: Arc<P>,
-    db_file: turso_core::storage::database::DatabaseFile,
+    db_file: Arc<dyn turso_core::storage::database::DatabaseStorage>,
     main_tape: DatabaseTape,
     main_db_wal_path: String,
     revert_db_wal_path: String,
@@ -156,7 +156,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         }
 
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
-        let db_file = turso_core::storage::database::DatabaseFile::new(db_file);
+        let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
 
         let main_db = turso_core::Database::open_with_flags(
             io.clone(),

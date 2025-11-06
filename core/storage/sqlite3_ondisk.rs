@@ -58,7 +58,7 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
@@ -900,7 +900,7 @@ impl PageContent {
 /// if allow_empty_read is set, than empty read will be raise error for the page, but will not panic
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_read_page(
-    db_file: DatabaseFile,
+    db_file: &dyn DatabaseStorage,
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
     page_idx: usize,
@@ -1077,7 +1077,7 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: DatabaseFile, syncing: Arc<AtomicBool>) -> Result<Completion> {
+pub fn begin_sync(db_file: &dyn DatabaseStorage, syncing: Arc<AtomicBool>) -> Result<Completion> {
     assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {

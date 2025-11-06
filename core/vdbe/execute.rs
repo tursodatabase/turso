@@ -37,7 +37,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Connection, MvCursor};
+use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
 use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
@@ -7897,7 +7897,7 @@ pub fn op_open_ephemeral(
             let conn = program.connection.clone();
             let io = conn.pager.load().io.clone();
             let rand_num = io.generate_random_number();
-            let db_file;
+            let db_file: Arc<dyn DatabaseStorage>;
             let db_file_io: Arc<dyn crate::IO>;
 
             // we support OPFS in WASM - but it require files to be pre-opened in the browser before use
@@ -7909,7 +7909,7 @@ pub fn op_open_ephemeral(
 
                 db_file_io = Arc::new(MemoryIO::new());
                 let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
-                db_file = DatabaseFile::new(file);
+                db_file = Arc::new(DatabaseFile::new(file));
             }
             #[cfg(not(target_family = "wasm"))]
             {
@@ -7922,7 +7922,7 @@ pub fn op_open_ephemeral(
                     ));
                 };
                 let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                db_file = DatabaseFile::new(file);
+                db_file = Arc::new(DatabaseFile::new(file));
                 db_file_io = io;
             }
 
