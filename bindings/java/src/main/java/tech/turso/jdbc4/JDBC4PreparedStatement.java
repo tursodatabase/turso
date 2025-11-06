@@ -237,6 +237,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     if (length < 0) {
       throw new SQLException("setBinaryStream length must be non-negative");
     }
+    if (length == 0) {
+      this.statement.bindBlob(parameterIndex, new byte[0]);
+      return;
+    }
     try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
       byte[] buffer = new byte[8192];
       int bytesRead;
@@ -249,11 +253,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         }
       }
       byte[] data = baos.toByteArray();
-      if (data.length == 0) {
-        this.statement.bindBlob(parameterIndex, new byte[0]);
-      } else {
-        this.statement.bindBlob(parameterIndex, data);
-      }
+      this.statement.bindBlob(parameterIndex, data);
     } catch (IOException e) {
       throw new SQLException("Error reading binary stream", e);
     }
