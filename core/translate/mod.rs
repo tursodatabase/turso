@@ -231,7 +231,7 @@ pub fn translate_inner(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program)?,
+        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView {
             if_exists,

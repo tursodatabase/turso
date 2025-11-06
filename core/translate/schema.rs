@@ -13,7 +13,7 @@ use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{CmpInsFlags, Cookie, InsertFlags, Insn};
 use crate::Connection;
-use crate::{bail_parse_error, Result};
+use crate::{bail_constraint_error, bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 
@@ -608,6 +608,7 @@ pub fn translate_drop_table(
     resolver: &Resolver,
     if_exists: bool,
     mut program: ProgramBuilder,
+    connection: &Connection,
 ) -> Result<ProgramBuilder> {
     if tbl_name
         .name
@@ -656,6 +657,15 @@ pub fn translate_drop_table(
             "Cannot DROP TABLE on materialized view {}. Use DROP VIEW instead.",
             tbl_name.name.as_str()
         );
+    }
+
+    // Check if foreign keys are enabled and if this table is referenced by foreign keys
+    if connection.foreign_keys_enabled()
+        && resolver
+            .schema
+            .any_resolved_fks_referencing(table.get_name())
+    {
+        bail_constraint_error!("FOREIGN KEY constraint failed");
     }
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
