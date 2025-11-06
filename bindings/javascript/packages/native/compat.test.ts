@@ -42,7 +42,7 @@ test('readonly-db', () => {
 
 test('file-must-exist', () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
-    expect(() => new Database(path, { fileMustExist: true })).toThrowError(/failed to open file/);
+    expect(() => new Database(path, { fileMustExist: true })).toThrowError(/failed to open database/);
 })
 
 test('on-disk db', () => {
