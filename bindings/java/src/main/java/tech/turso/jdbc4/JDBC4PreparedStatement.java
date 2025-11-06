@@ -245,12 +245,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
       byte[] buffer = new byte[8192];
       int bytesRead;
       int totalRead = 0;
-      while ((bytesRead = x.read(buffer, 0, Math.min(buffer.length, length - totalRead))) != -1) {
+      while (totalRead < length
+          && (bytesRead = x.read(buffer, 0, Math.min(buffer.length, length - totalRead))) > 0) {
         baos.write(buffer, 0, bytesRead);
         totalRead += bytesRead;
-        if (totalRead >= length) {
-          break;
-        }
       }
       byte[] data = baos.toByteArray();
       this.statement.bindBlob(parameterIndex, data);
