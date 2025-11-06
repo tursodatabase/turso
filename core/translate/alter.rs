@@ -6,7 +6,7 @@ use turso_parser::{
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::{Column, Table, RESERVED_TABLE_PREFIXES},
+    schema::{Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
@@ -308,8 +308,63 @@ pub fn translate_alter_table(
                 ));
             }
 
+            let mut column_foreign_keys = Vec::new();
+            for constraint in &col_def.constraints {
+                if let ast::ColumnConstraint::ForeignKey {
+                    clause,
+                    defer_clause,
+                } = &constraint.constraint
+                {
+                    let foreign_key = ForeignKey {
+                        child_columns: vec![new_column_name.clone()],
+                        parent_table: normalize_ident(clause.tbl_name.as_str()),
+                        parent_columns: clause
+                            .columns
+                            .iter()
+                            .map(|c| normalize_ident(c.col_name.as_str()))
+                            .collect(),
+                        on_delete: clause
+                            .args
+                            .iter()
+                            .find_map(|arg| {
+                                if let ast::RefArg::OnDelete(act) = arg {
+                                    Some(*act)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(ast::RefAct::NoAction),
+                        on_update: clause
+                            .args
+                            .iter()
+                            .find_map(|arg| {
+                                if let ast::RefArg::OnUpdate(act) = arg {
+                                    Some(*act)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(ast::RefAct::NoAction),
+                        deferred: match defer_clause {
+                            Some(defer_clause) => {
+                                defer_clause.deferrable
+                                    && matches!(
+                                        defer_clause.init_deferred,
+                                        Some(ast::InitDeferredPred::InitiallyDeferred)
+                                    )
+                            }
+                            None => false,
+                        },
+                    };
+                    column_foreign_keys.push(foreign_key);
+                }
+            }
+
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
+            for foreign_key in &column_foreign_keys {
+                btree.foreign_keys.push(Arc::new(foreign_key.clone()));
+            }
 
             let sql = btree.to_sql();
             let mut escaped = String::with_capacity(sql.len());
@@ -351,6 +406,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::AddColumn {
                         table: table_name.to_owned(),
                         column,
+                        foreign_keys: column_foreign_keys,
                     });
                 },
             )?

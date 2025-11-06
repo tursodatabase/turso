@@ -5,7 +5,7 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{Affinity, BTreeTable, Column, Index},
+    schema::{Affinity, BTreeTable, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
@@ -1149,6 +1149,7 @@ pub enum Insn {
     AddColumn {
         table: String,
         column: Column,
+        foreign_keys: Vec<ForeignKey>,
     },
     AlterColumn {
         table: String,

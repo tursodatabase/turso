@@ -8561,7 +8561,14 @@ pub fn op_add_column(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AddColumn { table, column }, insn);
+    load_insn!(
+        AddColumn {
+            table,
+            column,
+            foreign_keys
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
@@ -8578,7 +8585,10 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push(column.clone())
+        btree.columns.push(column.clone());
+        for fk in foreign_keys {
+            btree.foreign_keys.push(Arc::new(fk.clone()));
+        }
     });
 
     state.pc += 1;

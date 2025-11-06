@@ -1742,14 +1742,21 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { table, column } => (
+            Insn::AddColumn {
+                table,
+                column,
+                foreign_keys,
+            } => (
                 "AddColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("add_column({table}, {column:?})"),
+                format!(
+                    "add_column({table}, {column:?}, fks={})",
+                    foreign_keys.len()
+                ),
             ),
             Insn::AlterColumn { table, column_index, definition: column, rename } => (
                 "AlterColumn",
