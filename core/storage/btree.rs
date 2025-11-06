@@ -7798,8 +7798,7 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, DatabaseStorage, IOContext, StepResult, WalFile,
-        WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
     use std::{
         cell::RefCell,
@@ -9064,8 +9063,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let buffer_pool = BufferPool::begin_init(&io, page_size * 128);
 
-        let db_file =
-            DatabaseFile::new(io.open_file(":memory:", OpenFlags::Create, false).unwrap());
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
