@@ -24,7 +24,6 @@ use std::{
 };
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
-use turso_core::storage::database::DatabaseFile;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -176,15 +175,9 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         }
     }
     let io = &db.io;
-    let file = io
-        .open_file(&db.path, flags, false)
-        .map_err(|e| to_generic_error(&format!("failed to open file {}", db.path), e))?;
-
-    let db_file = DatabaseFile::new(file);
-    let db_core = turso_core::Database::open_with_flags(
+    let db_core = turso_core::Database::open_file_with_flags(
         io.clone(),
         &db.path,
-        db_file,
         flags,
         turso_core::DatabaseOpts::new()
             .with_mvcc(false)

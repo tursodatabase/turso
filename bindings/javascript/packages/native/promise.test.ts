@@ -62,7 +62,7 @@ test('readonly-db', async () => {
 
 test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
-    await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open file/);
+    await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open database/);
 })
 
 test('implicit connect', async () => {

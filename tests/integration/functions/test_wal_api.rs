@@ -864,7 +864,7 @@ fn test_db_share_same_file() {
     let db_file = io
         .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
         .unwrap();
-    let db_file = turso_core::storage::database::DatabaseFile::new(db_file);
+    let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
     let db1 = turso_core::Database::open_with_flags(
         io.clone(),
         path.to_str().unwrap(),
