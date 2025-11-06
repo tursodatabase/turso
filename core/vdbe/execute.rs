@@ -19,6 +19,7 @@ use crate::types::{
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
@@ -5476,14 +5477,42 @@ pub fn op_function(
                                 if_not_exists,
                                 body,
                             } => {
-                                let table_name = normalize_ident(tbl_name.name.as_str());
+                                let this_table = normalize_ident(tbl_name.name.as_str());
 
-                                if rename_from != table_name {
-                                    break 'sql None;
+                                let ast::CreateTableBody::ColumnsAndConstraints {
+                                    mut columns,
+                                    mut constraints,
+                                    options,
+                                } = body
+                                else {
+                                    todo!()
+                                };
+
+                                let mut any_change = false;
+
+                                // Rewrite FK targets in both paths
+                                for c in &mut constraints {
+                                    if let ast::TableConstraint::ForeignKey { clause, .. } =
+                                        &mut c.constraint
+                                    {
+                                        any_change |= rewrite_fk_parent_table_if_needed(
+                                            clause,
+                                            &rename_from,
+                                            original_rename_to.as_str(),
+                                        );
+                                    }
+                                }
+                                for col in &mut columns {
+                                    any_change |= rewrite_inline_col_fk_target_if_needed(
+                                        col,
+                                        &rename_from,
+                                        original_rename_to.as_str(),
+                                    );
                                 }
 
-                                Some(
-                                    ast::Stmt::CreateTable {
+                                if this_table == rename_from {
+                                    // Rebuild with new table identifier so SQL persists the new name.
+                                    let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
                                             name: ast::Name::exact(original_rename_to.to_string()),
@@ -5491,12 +5520,34 @@ pub fn op_function(
                                         },
                                         temporary,
                                         if_not_exists,
-                                        body,
+                                        body: ast::CreateTableBody::ColumnsAndConstraints {
+                                            columns,
+                                            constraints,
+                                            options,
+                                        },
+                                    };
+                                    Some(new_stmt.to_string())
+                                } else {
+                                    // Other tables: only emit if we actually changed their FK targets.
+                                    if !any_change {
+                                        break 'sql None;
                                     }
-                                    .to_string(),
-                                )
+                                    Some(
+                                        ast::Stmt::CreateTable {
+                                            tbl_name,
+                                            temporary,
+                                            if_not_exists,
+                                            body: ast::CreateTableBody::ColumnsAndConstraints {
+                                                columns,
+                                                constraints,
+                                                options,
+                                            },
+                                        }
+                                        .to_string(),
+                                    )
+                                }
                             }
-                            _ => todo!(),
+                            _ => None,
                         }
                     };
 
@@ -8443,12 +8494,35 @@ pub fn op_rename_table(
             let Table::BTree(btree) = table else {
                 panic!("only btree tables can be renamed");
             };
-
             let btree = Arc::make_mut(btree);
+            // update this table's own foreign keys
+            for fk_arc in &mut btree.foreign_keys {
+                let fk = Arc::make_mut(fk_arc);
+                if normalize_ident(&fk.parent_table) == normalized_from {
+                    fk.parent_table = normalized_to.clone();
+                }
+            }
+
             btree.name = normalized_to.to_owned();
         }
 
         schema.tables.insert(normalized_to.to_owned(), table);
+
+        for (tname, t_arc) in schema.tables.iter_mut() {
+            // skip the table we just renamed
+            if normalize_ident(tname) == normalized_to {
+                continue;
+            }
+            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
+                let child_btree = Arc::make_mut(child_btree_arc);
+                for fk_arc in &mut child_btree.foreign_keys {
+                    if normalize_ident(&fk_arc.parent_table) == normalized_from {
+                        let fk = Arc::make_mut(fk_arc);
+                        fk.parent_table = normalized_to.clone();
+                    }
+                }
+            }
+        }
     });
 
     state.pc += 1;

@@ -1498,6 +1498,38 @@ pub fn rewrite_column_references_if_needed(
     }
 }
 
+/// If a FK REFERENCES targets `old_tbl`, change it to `new_tbl`
+pub fn rewrite_fk_parent_table_if_needed(
+    clause: &mut ast::ForeignKeyClause,
+    old_tbl: &str,
+    new_tbl: &str,
+) -> bool {
+    if normalize_ident(clause.tbl_name.as_str()) == normalize_ident(old_tbl) {
+        clause.tbl_name = ast::Name::exact(new_tbl.to_owned());
+        return true;
+    }
+    false
+}
+
+/// For inline REFERENCES tbl in a column definition.
+pub fn rewrite_inline_col_fk_target_if_needed(
+    col: &mut ast::ColumnDefinition,
+    old_tbl: &str,
+    new_tbl: &str,
+) -> bool {
+    let mut changed = false;
+    for cc in &mut col.constraints {
+        if let ast::NamedColumnConstraint {
+            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
+            ..
+        } = cc
+        {
+            changed |= rewrite_fk_parent_table_if_needed(clause, old_tbl, new_tbl);
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
