@@ -1,3 +1,4 @@
+use crate::storage::btree::PinnedPage;
 use crate::storage::database::DatabaseFile;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::IOV_MAX;
@@ -588,13 +589,13 @@ enum AllocatePageState {
     /// - If there are more trunk pages, use the current first trunk page as the new allocation,
     ///   and set the next trunk page as the database's "first freelist trunk page".
     SearchAvailableFreeListLeaf {
-        trunk_page: PageRef,
+        trunk_page: PinnedPage,
         current_db_size: u32,
     },
     /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
     ReuseFreelistLeaf {
-        trunk_page: PageRef,
-        leaf_page: PageRef,
+        trunk_page: PinnedPage,
+        leaf_page: PinnedPage,
         number_of_freelist_leaves: u32,
     },
     /// If a suitable freelist leaf is not found, allocate an entirely new page.
@@ -2508,7 +2509,7 @@ impl Pager {
                     }
                     let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
                     *state = AllocatePageState::SearchAvailableFreeListLeaf {
-                        trunk_page,
+                        trunk_page: PinnedPage::new(&trunk_page),
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
@@ -2546,7 +2547,7 @@ impl Pager {
 
                         *state = AllocatePageState::ReuseFreelistLeaf {
                             trunk_page: trunk_page.clone(),
-                            leaf_page,
+                            leaf_page: PinnedPage::new(&leaf_page),
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
@@ -2587,7 +2588,7 @@ impl Pager {
                     }
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(trunk_page));
+                    return Ok(IOResult::Done(trunk_page.unpin_and_take()));
                 }
                 AllocatePageState::ReuseFreelistLeaf {
                     trunk_page,
@@ -2643,7 +2644,7 @@ impl Pager {
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     let leaf_page = leaf_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(leaf_page));
+                    return Ok(IOResult::Done(leaf_page.unpin_and_take()));
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
