@@ -90,6 +90,27 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-quoted-column {
     "CREATE TABLE test (a, [b c])"
 }
 
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-foreign-key {
+    CREATE TABLE parent(a PRIMARY KEY);
+    CREATE TABLE child(a);
+
+    ALTER TABLE child ADD COLUMN b REFERENCES parent(a);
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+    PRAGMA foreign_keys = ON;
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+} {
+    "CREATE TABLE child (a, b, FOREIGN KEY (b) REFERENCES parent(a))"
+}
+
+do_execsql_test_in_memory_any_error alter-table-add-column-foreign-key-enforced {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(a PRIMARY KEY);
+    CREATE TABLE child(a);
+    ALTER TABLE child ADD COLUMN b REFERENCES parent(a);
+    INSERT INTO child VALUES (2, 2);
+}
+
 do_execsql_test_on_specific_db {:memory:} alter-table-drop-column {
     CREATE TABLE t (a, b);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
