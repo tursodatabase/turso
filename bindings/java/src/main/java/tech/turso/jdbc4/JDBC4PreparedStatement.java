@@ -175,22 +175,19 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     if (length < 0) {
       throw new SQLException("setAsciiStream length must be non-negative");
     }
+    if (length == 0) {
+      this.statement.bindText(parameterIndex, "");
+      return;
+    }
     try {
       byte[] buffer = new byte[length];
       int offset = 0;
-      while (offset < length) {
-        int read = x.read(buffer, offset, length - offset);
-        if (read == -1) {
-          break;
-        }
+      int read;
+      while (offset < length && (read = x.read(buffer, offset, length - offset)) > 0) {
         offset += read;
       }
-      if (offset == 0) {
-        this.statement.bindText(parameterIndex, "");
-      } else {
-        String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
-        this.statement.bindText(parameterIndex, ascii);
-      }
+      String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
+      this.statement.bindText(parameterIndex, ascii);
     } catch (IOException e) {
       throw new SQLException("Error reading ASCII stream", e);
     }
@@ -206,22 +203,19 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     if (length < 0) {
       throw new SQLException("setUnicodeStream length must be non-negative");
     }
+    if (length == 0) {
+      this.statement.bindText(parameterIndex, "");
+      return;
+    }
     try {
       byte[] buffer = new byte[length];
       int offset = 0;
-      while (offset < length) {
-        int readBytes = x.read(buffer, offset, length - offset);
-        if (readBytes == -1) {
-          break;
-        }
-        offset += readBytes;
+      int read;
+      while (offset < length && (read = x.read(buffer, offset, length - offset)) > 0) {
+        offset += read;
       }
-      if (offset == 0) {
-        this.statement.bindText(parameterIndex, "");
-      } else {
-        String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
-        this.statement.bindText(parameterIndex, text);
-      }
+      String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
+      this.statement.bindText(parameterIndex, text);
     } catch (IOException e) {
       throw new SQLException("Error reading Unicode stream", e);
     }
