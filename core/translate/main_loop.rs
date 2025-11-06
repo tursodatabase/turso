@@ -1375,6 +1375,15 @@ fn emit_seek(
         }
     }
     let num_regs = seek_def.size(&seek_def.start);
+
+    program.emit_insn(Insn::Affinity {
+        start_reg,
+        count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+        affinities: seek_def
+            .iter_affinity(&seek_def.start)
+            .map(|affinity| affinity.aff_mask())
+            .collect(),
+    });
     match seek_def.start.op {
         SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,

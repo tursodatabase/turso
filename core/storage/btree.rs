@@ -2198,7 +2198,6 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-
         (cmp, found)
     }
 
