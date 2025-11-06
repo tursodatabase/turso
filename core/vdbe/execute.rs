@@ -800,7 +800,7 @@ pub fn op_comparison(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let (new_lhs, new_rhs) = affinity.convert(lhs_value, rhs_value);
+    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
 
     let should_jump = op.compare(
         new_lhs

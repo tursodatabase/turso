@@ -1,4 +1,5 @@
 use either::Either;
+use turso_parser::ast::{Expr, Literal};
 
 use crate::{types::AsValueRef, Value, ValueRef};
 
@@ -70,11 +71,11 @@ use crate::{types::AsValueRef, Value, ValueRef};
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
-    Integer,
-    Text,
-    Blob,
-    Real,
-    Numeric,
+    Blob = 0,
+    Text = 1,
+    Numeric = 2,
+    Integer = 3,
+    Real = 4,
 }
 
 pub const SQLITE_AFF_NONE: char = 'A'; // Historically called NONE, but it's the same as BLOB
@@ -170,70 +171,71 @@ impl Affinity {
         Affinity::Numeric
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn convert<'a, V1: AsValueRef, V2: AsValueRef>(
-        &self,
-        lhs: &'a V1,
-        rhs: &'a V2,
-    ) -> (
-        Option<Either<ValueRef<'a>, Value>>,
-        Option<Either<ValueRef<'a>, Value>>,
-    ) {
-        let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        let lhs_is_text = matches!(lhs, ValueRef::Text(_));
-        let rhs_is_text = matches!(rhs, ValueRef::Text(_));
+    pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
+        let val = val.as_value_ref();
+        let is_text = matches!(val, ValueRef::Text(_));
         // Apply affinity conversions
         match self {
-            Affinity::Numeric | Affinity::Integer => {
-                let left = lhs_is_text
-                    .then(|| apply_numeric_affinity(lhs, false))
-                    .flatten()
-                    .map(Either::Left);
-                let right = rhs_is_text
-                    .then(|| apply_numeric_affinity(rhs, false))
-                    .flatten()
-                    .map(Either::Left);
-
-                (left, right)
-            }
+            Affinity::Numeric | Affinity::Integer => is_text
+                .then(|| apply_numeric_affinity(val, false))
+                .flatten()
+                .map(Either::Left),
 
             Affinity::Text => {
-                if lhs_is_text || rhs_is_text {
-                    let left = is_numeric_value(lhs)
-                        .then(|| stringify_register(lhs))
+                if is_text {
+                    is_numeric_value(val)
+                        .then(|| stringify_register(val))
                         .flatten()
-                        .map(Either::Right);
-                    let right = is_numeric_value(rhs)
-                        .then(|| stringify_register(rhs))
-                        .flatten()
-                        .map(Either::Right);
-
-                    (left, right)
+                        .map(Either::Right)
                 } else {
-                    (None, None)
+                    None
                 }
             }
 
             Affinity::Real => {
-                let mut left = lhs_is_text
-                    .then(|| apply_numeric_affinity(lhs, false))
-                    .flatten();
-                let mut right = rhs_is_text
-                    .then(|| apply_numeric_affinity(rhs, false))
+                let mut left = is_text
+                    .then(|| apply_numeric_affinity(val, false))
                     .flatten();
 
-                if let ValueRef::Integer(i) = left.unwrap_or(lhs) {
+                if let ValueRef::Integer(i) = left.unwrap_or(val) {
                     left = Some(ValueRef::Float(i as f64));
                 }
 
-                if let ValueRef::Integer(i) = right.unwrap_or(rhs) {
-                    right = Some(ValueRef::Float(i as f64));
-                }
-
-                (left.map(Either::Left), right.map(Either::Left))
+                left.map(Either::Left)
             }
 
-            Affinity::Blob => (None, None), // Do nothing for blob affinity.
+            Affinity::Blob => None, // Do nothing for blob affinity.
+        }
+    }
+
+    /// Return TRUE if the given expression is a constant which would be
+    /// unchanged by OP_Affinity with the affinity given in the second
+    /// argument.
+    ///
+    /// This routine is used to determine if the OP_Affinity operation
+    /// can be omitted.  When in doubt return FALSE.  A false negative
+    /// is harmless.  A false positive, however, can result in the wrong
+    /// answer.
+    ///
+    /// reference https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000
+    pub fn expr_needs_no_affinity_change(&self, expr: &Expr) -> bool {
+        if !self.has_affinity() {
+            return true;
+        }
+        // TODO: check for unary minus in the expr, as it may be an additional optimization.
+        // This involves mostly likely walking the expression
+        match expr {
+            Expr::Literal(literal) => match literal {
+                Literal::Numeric(_) => self.is_numeric(),
+                Literal::String(_) => matches!(self, Affinity::Text),
+                Literal::Blob(_) => true,
+                _ => false,
+            },
+            Expr::Column {
+                is_rowid_alias: true,
+                ..
+            } => self.is_numeric(),
+            _ => false,
         }
     }
 }
