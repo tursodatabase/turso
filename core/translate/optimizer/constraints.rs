@@ -83,9 +83,16 @@ impl Constraint {
         if op.is_comparison() {
             affinity = comparison_affinity(lhs, rhs, referenced_tables);
         }
+
         if side == BinaryExprSide::Lhs {
+            if affinity.expr_needs_no_affinity_change(lhs) {
+                affinity = Affinity::Blob;
+            }
             (self.operator, lhs.clone(), affinity)
         } else {
+            if affinity.expr_needs_no_affinity_change(rhs) {
+                affinity = Affinity::Blob;
+            }
             (self.operator, rhs.clone(), affinity)
         }
     }
