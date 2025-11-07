@@ -16,7 +16,7 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Completion, CompletionError, Result, IO};
+use crate::{Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
 use std::task::Waker;
 
@@ -1594,9 +1594,21 @@ pub fn compare_immutable(
     r: &[ValueRef],
     column_info: &[KeyInfo],
 ) -> std::cmp::Ordering {
-    assert_eq!(l.len(), r.len());
-    turso_assert!(column_info.len() >= l.len(), "column_info.len() < l.len()");
-    for (i, (l, r)) in l.iter().zip(r).enumerate() {
+    assert!(
+        l.len() >= column_info.len(),
+        "{} < {}",
+        l.len(),
+        column_info.len()
+    );
+    assert!(
+        r.len() >= column_info.len(),
+        "{} < {}",
+        r.len(),
+        column_info.len()
+    );
+    let l_values = l.iter().take(column_info.len());
+    let r_values = r.iter().take(column_info.len());
+    for (i, (l, r)) in l_values.zip(r_values).enumerate() {
         let column_order = column_info[i].sort_order;
         let collation = column_info[i].collation;
         let cmp = match (l, r) {
@@ -1720,10 +1732,6 @@ fn compare_records_int(
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
     let payload = serialized.get_payload();
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
@@ -1813,10 +1821,6 @@ fn compare_records_string(
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
     let payload = serialized.get_payload();
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
@@ -1926,10 +1930,6 @@ pub fn compare_records_generic(
     skip: usize,
     tie_breaker: std::cmp::Ordering,
 ) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
     let payload = serialized.get_payload();
     if payload.is_empty() {
         return Ok(std::cmp::Ordering::Less);
@@ -1960,7 +1960,8 @@ pub fn compare_records_generic(
     }
 
     let mut field_idx = skip;
-    while field_idx < unpacked.len() && header_pos < header_end {
+    let field_limit = unpacked.len().min(index_info.key_info.len());
+    while field_idx < field_limit && header_pos < header_end {
         let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
 
