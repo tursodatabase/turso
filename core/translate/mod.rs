@@ -259,9 +259,7 @@ pub fn translate_inner(
             )?
             .program
         }
-        ast::Stmt::Update(mut update) => {
-            translate_update(&mut update, resolver, program, connection)?
-        }
+        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
         ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert {
             with,

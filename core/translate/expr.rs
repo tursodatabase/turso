@@ -3563,28 +3563,6 @@ where
     Ok(WalkControl::Continue)
 }
 
-pub struct ParamState {
-    // flag which allow or forbid usage of parameters during translation of AST to the program
-    //
-    // for example, parameters are not allowed in the partial index definition
-    // so tursodb set allowed to false when it parsed WHERE clause of partial index definition
-    pub allowed: bool,
-}
-
-impl Default for ParamState {
-    fn default() -> Self {
-        Self { allowed: true }
-    }
-}
-impl ParamState {
-    pub fn is_valid(&self) -> bool {
-        self.allowed
-    }
-    pub fn disallow() -> Self {
-        Self { allowed: false }
-    }
-}
-
 /// The precedence of binding identifiers to columns.
 ///
 /// TryResultColumnsFirst means that result columns (e.g. SELECT x AS y, ...) take precedence over canonical columns (e.g. SELECT x, y AS z, ...). This is the default behavior.
@@ -3610,18 +3588,12 @@ pub fn bind_and_rewrite_expr<'a>(
     mut referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
     connection: &'a Arc<crate::Connection>,
-    param_state: &mut ParamState,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
             match expr {
-                ast::Expr::Variable(_) => {
-                    if !param_state.is_valid() {
-                        crate::bail_parse_error!("Parameters are not allowed in this context");
-                    }
-                }
                 ast::Expr::Between {
                     lhs,
                     not,
@@ -4422,7 +4394,6 @@ pub fn process_returning_clause(
                     Some(&mut table_references),
                     None,
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
