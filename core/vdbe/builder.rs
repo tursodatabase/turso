@@ -14,7 +14,6 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
-        expr::ParamState,
         plan::{ResultSetColumn, TableReferences},
     },
     CaptureDataChangesMode, Connection, Value, VirtualTable,
@@ -123,7 +122,6 @@ pub struct ProgramBuilder {
     query_mode: QueryMode,
     /// Current parent explain address, if any.
     current_parent_explain_idx: Option<usize>,
-    pub param_ctx: ParamState,
     pub(crate) reg_result_cols_start: Option<usize>,
     /// Whether the program needs to use statement subtransactions,
     /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
@@ -215,7 +213,6 @@ impl ProgramBuilder {
             rollback: false,
             query_mode,
             current_parent_explain_idx: None,
-            param_ctx: ParamState::default(),
             reg_result_cols_start: None,
             needs_stmt_subtransactions: false,
         }

@@ -202,13 +202,12 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next_cmd().unwrap()
-            else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
                 unreachable!();
             };
 
             translate_update_for_schema_change(
-                &mut update,
+                update,
                 resolver,
                 program,
                 connection,
@@ -330,13 +329,12 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next_cmd().unwrap()
-            else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
                 unreachable!();
             };
 
             translate_update_for_schema_change(
-                &mut update,
+                update,
                 resolver,
                 program,
                 connection,

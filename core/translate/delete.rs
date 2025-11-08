@@ -129,13 +129,11 @@ pub fn prepare_delete_plan(
         None,
         &mut where_predicates,
         connection,
-        &mut program.param_ctx,
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (resolved_limit, resolved_offset) = limit.map_or(Ok((None, None)), |mut l| {
-        parse_limit(&mut l, connection, &mut program.param_ctx)
-    })?;
+    let (resolved_limit, resolved_offset) =
+        limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     let plan = DeletePlan {
         table_references,

@@ -5,9 +5,7 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, BindingBehavior, ParamState,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -149,9 +147,9 @@ pub fn prepare_select_plan(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select.limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, &mut program.param_ctx)
-            })?;
+            let (limit, offset) = select
+                .limit
+                .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -290,7 +288,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -300,7 +297,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -363,7 +359,6 @@ fn prepare_one_select_plan(
                             Some(&mut plan.table_references),
                             None,
                             connection,
-                            &mut program.param_ctx,
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
@@ -387,12 +382,7 @@ fn prepare_one_select_plan(
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
-            add_vtab_predicates_to_where_clause(
-                &mut vtab_predicates,
-                &mut plan,
-                connection,
-                &mut program.param_ctx,
-            )?;
+            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, connection)?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
@@ -401,7 +391,6 @@ fn prepare_one_select_plan(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 connection,
-                &mut program.param_ctx,
             )?;
 
             if let Some(mut group_by) = group_by {
@@ -412,7 +401,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -429,7 +417,6 @@ fn prepare_one_select_plan(
                                 Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
                                 connection,
-                                &mut program.param_ctx,
                                 BindingBehavior::TryResultColumnsFirst,
                             )?;
                             let contains_aggregates = resolve_window_and_aggregate_functions(
@@ -468,7 +455,6 @@ fn prepare_one_select_plan(
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
                 resolve_window_and_aggregate_functions(
@@ -493,9 +479,8 @@ fn prepare_one_select_plan(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, &mut program.param_ctx)
-            })?;
+            (plan.limit, plan.offset) =
+                limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
             if !windows.is_empty() {
                 plan_windows(
@@ -538,7 +523,6 @@ fn prepare_one_select_plan(
                         None,
                         None,
                         connection,
-                        &mut program.param_ctx,
                         // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
                         BindingBehavior::AllowUnboundIdentifiers,
                     )?;
@@ -657,7 +641,6 @@ fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
     connection: &Arc<Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
         bind_and_rewrite_expr(
@@ -665,7 +648,6 @@ fn add_vtab_predicates_to_where_clause(
             Some(&mut plan.table_references),
             Some(&plan.result_columns),
             connection,
-            param_ctx,
             BindingBehavior::TryCanonicalColumnsFirst,
         )?;
     }

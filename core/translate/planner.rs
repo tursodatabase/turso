@@ -24,7 +24,7 @@ use crate::{
 };
 use crate::{
     function::{AggFunc, ExtFunc},
-    translate::expr::{bind_and_rewrite_expr, ParamState},
+    translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
     translate::plan::{Window, WindowFunction},
@@ -755,7 +755,6 @@ pub fn parse_where(
     result_columns: Option<&[ResultSetColumn]>,
     out_where_clause: &mut Vec<WhereTerm>,
     connection: &Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
@@ -766,7 +765,6 @@ pub fn parse_where(
                 Some(table_references),
                 result_columns,
                 connection,
-                param_ctx,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
@@ -1135,7 +1133,6 @@ fn parse_join(
                         Some(table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -1277,16 +1274,14 @@ where
 
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
-    limit: &mut Limit,
+    mut limit: Limit,
     connection: &std::sync::Arc<crate::Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,
         None,
         None,
         connection,
-        param_ctx,
         BindingBehavior::TryResultColumnsFirst,
     )?;
     if let Some(ref mut off_expr) = limit.offset {
@@ -1295,9 +1290,8 @@ pub fn parse_limit(
             None,
             None,
             connection,
-            param_ctx,
             BindingBehavior::TryResultColumnsFirst,
         )?;
     }
-    Ok((Some(limit.expr.clone()), limit.offset.clone()))
+    Ok((Some(limit.expr), limit.offset))
 }

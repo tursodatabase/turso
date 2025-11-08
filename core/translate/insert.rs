@@ -959,7 +959,6 @@ fn bind_insert(
                                 None,
                                 None,
                                 connection,
-                                &mut program.param_ctx,
                                 BindingBehavior::ResultColumnsNotAllowed,
                             )?;
                         }
@@ -1003,7 +1002,6 @@ fn bind_insert(
                     None,
                     None,
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
             }
@@ -1013,7 +1011,6 @@ fn bind_insert(
                     None,
                     None,
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
             }

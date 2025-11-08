@@ -1,9 +1,7 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
 use parking_lot::RwLock;
@@ -2835,14 +2833,12 @@ impl Index {
         let Some(where_clause) = &self.where_clause else {
             return None;
         };
-        let mut params = ParamState::disallow();
         let mut expr = where_clause.clone();
         bind_and_rewrite_expr(
             &mut expr,
             table_refs,
             None,
             connection,
-            &mut params,
             BindingBehavior::ResultColumnsNotAllowed,
         )
         .ok()?;
