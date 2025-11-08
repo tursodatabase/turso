@@ -8389,7 +8389,7 @@ pub fn op_integrity_check(
                         crate::storage::pager::AutoVacuumMode::None
                     ) {
                         tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
-                        let page_size = pager.get_page_size_unchecked().get() as usize;
+                        let page_size = pager.get_page_size_checked()?.get() as usize;
 
                         for page_number in 2..=integrity_check_state.db_size {
                             if crate::storage::pager::ptrmap::is_ptrmap_page(

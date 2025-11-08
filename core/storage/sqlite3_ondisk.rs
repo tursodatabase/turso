@@ -58,7 +58,7 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::encryption::TURSO_HEADER_PREFIX;
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
@@ -1047,7 +1047,7 @@ pub fn write_pages_vectored(
         return Ok(Vec::new());
     }
 
-    let page_sz = pager.get_page_size_unchecked().get() as usize;
+    let page_sz = pager.get_page_size_checked()?.get() as usize;
     // Count expected number of runs to create the atomic counter we need to track each batch
     let mut run_count = 0;
     let mut prev_id = None;

@@ -294,7 +294,7 @@ impl PageCache {
         // However, if we do not evict that page from the page cache, we will return an unloaded page later which will trigger
         // assertions later on. This is worsened by the fact that page cache is not per `Statement`, so you can abort a completion
         // in one Statement, and trigger some error in the next one if we don't evict the page here.
-        if !page.is_loaded() && !page.is_locked() {
+        if (!page.is_loaded() || page.get().contents.is_none()) && !page.is_locked() {
             self.delete(*key)?;
             return Ok(None);
         }
