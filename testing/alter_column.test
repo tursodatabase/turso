@@ -299,3 +299,37 @@ do_execsql_test_on_specific_db {:memory:} rename-parent-3-composite {
   SELECT sql  FROM sqlite_schema WHERE type='table' AND name='c3';
 } {{CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))}}
 
+# Adding a generated column via ALTER TABLE should error
+do_execsql_test_in_memory_error_content alter-table-add-generated-column-error {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b AS (NULL);
+} {
+    "Parse error: Alter table does not support adding generated columns"
+}
+
+# Add column with a foreign key reference and verify schema SQL
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-fk-updates-schema {
+    CREATE TABLE t(a);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-self-ref-fk-updates-schema {
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES s(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-composite-fk-updates-schema {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))"
+}
