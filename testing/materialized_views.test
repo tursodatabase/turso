@@ -74,10 +74,10 @@ do_execsql_test_on_specific_db {:memory:} matview-filter-with-groupby {
     CREATE TABLE t(a INTEGER, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
 
-    CREATE MATERIALIZED VIEW v AS 
-        SELECT b as yourb, SUM(a) as mysum, COUNT(a) as mycount 
-        FROM t 
-        WHERE b > 2 
+    CREATE MATERIALIZED VIEW v AS
+        SELECT b as yourb, SUM(a) as mysum, COUNT(a) as mycount
+        FROM t
+        WHERE b > 2
         GROUP BY b;
 
     SELECT * FROM v ORDER BY yourb;
@@ -87,10 +87,10 @@ do_execsql_test_on_specific_db {:memory:} matview-filter-with-groupby {
 
 do_execsql_test_on_specific_db {:memory:} matview-insert-maintenance {
     CREATE TABLE t(a INTEGER, b INTEGER);
-    CREATE MATERIALIZED VIEW v AS 
-        SELECT b, SUM(a) as total, COUNT(*) as cnt 
-        FROM t 
-        WHERE b > 2 
+    CREATE MATERIALIZED VIEW v AS
+        SELECT b, SUM(a) as total, COUNT(*) as cnt
+        FROM t
+        WHERE b > 2
         GROUP BY b;
 
     INSERT INTO t VALUES (3,3), (6,6);
@@ -110,7 +110,7 @@ do_execsql_test_on_specific_db {:memory:} matview-insert-maintenance {
 
 do_execsql_test_on_specific_db {:memory:} matview-delete-maintenance {
     CREATE TABLE items(id INTEGER, category TEXT, amount INTEGER);
-    INSERT INTO items VALUES 
+    INSERT INTO items VALUES
         (1, 'A', 10),
         (2, 'B', 20),
         (3, 'A', 30),
@@ -166,7 +166,7 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-basic {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
 
-    CREATE MATERIALIZED VIEW v AS 
+    CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 2;
 
     SELECT * FROM v ORDER BY a;
@@ -178,7 +178,7 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-row
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
 
-    CREATE MATERIALIZED VIEW v AS 
+    CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 2;
 
     SELECT * FROM v ORDER BY a;
@@ -202,7 +202,7 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-val
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
     INSERT INTO t(a,b) VALUES (2,2), (3,3), (6,6), (7,7);
 
-    CREATE MATERIALIZED VIEW v AS 
+    CREATE MATERIALIZED VIEW v AS
         SELECT * FROM t WHERE b > 2;
 
     SELECT * FROM v ORDER BY a;
@@ -223,7 +223,7 @@ do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-update-val
 
 do_execsql_test_on_specific_db {:memory:} matview-integer-primary-key-with-aggregation {
     CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
-    INSERT INTO t VALUES 
+    INSERT INTO t VALUES
         (1, 10, 100),
         (2, 10, 200),
         (3, 20, 300),
@@ -2494,3 +2494,68 @@ do_execsql_test_on_specific_db {:memory:} matview-count-distinct-global-aggregat
 3
 5
 4}
+
+# Test that dropping a materialized view cleans up the DBSP state table
+do_execsql_test_on_specific_db {:memory:} matview-drop-cleans-up-dbsp-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE MATERIALIZED VIEW v AS
+        SELECT val, COUNT(*) as cnt
+        FROM t
+        GROUP BY val;
+
+    -- Verify the view exists
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
+
+    -- Verify the DBSP state table exists (name pattern: __turso_internal_dbsp_state_v*_v)
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
+
+    -- Verify the DBSP state index exists
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+
+    -- Drop the materialized view
+    DROP VIEW v;
+
+    -- Verify the view is gone
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
+
+    -- Verify the DBSP state table is gone
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
+
+    -- Verify the DBSP state index is gone
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+} {1
+1
+1
+0
+0
+0}
+
+# Test that a materialized view can be recreated after dropping
+do_execsql_test_on_specific_db {:memory:} matview-recreate-after-drop {
+    CREATE TABLE data(x INTEGER, y INTEGER);
+    INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE MATERIALIZED VIEW mv AS
+        SELECT x, SUM(y) as total
+        FROM data
+        GROUP BY x;
+
+    SELECT * FROM mv ORDER BY x;
+
+    -- Drop the view
+    DROP VIEW mv;
+
+    -- Verify it can be recreated with a different definition
+    CREATE MATERIALIZED VIEW mv AS
+        SELECT x + 1 as modified_x, y * 2 as doubled_y
+        FROM data
+        WHERE x > 1;
+
+    SELECT * FROM mv ORDER BY modified_x;
+} {1|10.0
+2|20.0
+3|30.0
+3|40
+4|60}

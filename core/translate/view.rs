@@ -326,12 +326,45 @@ pub fn translate_drop_view(
     }
 
     // If this is a materialized view, we need to destroy its btree as well
-    if is_materialized_view {
+    // and also clean up the associated DBSP state table and index
+    let dbsp_table_name = if is_materialized_view {
         if let Some(table) = schema.get_table(&normalized_view_name) {
             if let Some(btree_table) = table.btree() {
                 // Destroy the btree for the materialized view
                 program.emit_insn(Insn::Destroy {
                     root: btree_table.root_page,
+                    former_root_reg: 0, // No autovacuum
+                    is_temp: 0,
+                });
+            }
+        }
+
+        // Construct the DBSP state table name
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        Some(format!(
+            "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
+        ))
+    } else {
+        None
+    };
+
+    // Destroy DBSP state table and index btrees if this is a materialized view
+    if let Some(ref dbsp_table_name) = dbsp_table_name {
+        // Destroy DBSP indexes first
+        let dbsp_indexes: Vec<_> = schema.get_indices(dbsp_table_name).collect();
+        for index in dbsp_indexes {
+            program.emit_insn(Insn::Destroy {
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+
+        // Destroy DBSP state table btree
+        if let Some(dbsp_table) = schema.get_table(dbsp_table_name) {
+            if let Some(dbsp_btree_table) = dbsp_table.btree() {
+                program.emit_insn(Insn::Destroy {
+                    root: dbsp_btree_table.root_page,
                     former_root_reg: 0, // No autovacuum
                     is_temp: 0,
                 });
@@ -374,7 +407,7 @@ pub fn translate_drop_view(
     });
     program.preassign_label_to_next_insn(loop_start_label);
 
-    // Check if this row is the view we're looking for
+    // Check if this row should be deleted
     // Column 0 is type, Column 1 is name, Column 2 is tbl_name
     let col0_reg = program.alloc_register();
     let col1_reg = program.alloc_register();
@@ -382,10 +415,10 @@ pub fn translate_drop_view(
     program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
     program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
 
-    // Check if type == 'view' and name == view_name
+    // Check if this row matches the view, DBSP table, or DBSP index
     let skip_delete_label = program.allocate_label();
 
-    // Both regular and materialized views are stored as type='view' in sqlite_schema
+    // Check if this is the view entry (type='view' and name=view_name)
     program.emit_insn(Insn::Ne {
         lhs: col0_reg,
         rhs: type_reg,
@@ -393,7 +426,6 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: view_name_reg,
@@ -401,8 +433,7 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-
-    // Get the rowid and delete this row
+    // Matches view - delete it
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: rowid_reg,
@@ -422,6 +453,122 @@ pub fn translate_drop_view(
     });
 
     program.preassign_label_to_next_insn(end_loop_label);
+
+    // If this is a materialized view, delete DBSP table and index entries in a second pass
+    // We do this in a separate loop to ensure we catch all entries even if they come
+    // in different orders in sqlite_schema
+    if let Some(ref dbsp_table_name) = dbsp_table_name {
+        // Set up registers for DBSP table name and types (outside the loop for efficiency)
+        let dbsp_table_name_reg_2 = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: dbsp_table_name_reg_2,
+            value: dbsp_table_name.clone(),
+        });
+        let table_type_reg_2 = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: table_type_reg_2,
+            value: "table".to_string(),
+        });
+        let index_type_reg_2 = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: index_type_reg_2,
+            value: "index".to_string(),
+        });
+        let dbsp_index_name_reg_2 = program.alloc_register();
+        let dbsp_index_name_2 =
+            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{dbsp_table_name}_1");
+        program.emit_insn(Insn::String8 {
+            dest: dbsp_index_name_reg_2,
+            value: dbsp_index_name_2.clone(),
+        });
+
+        // Allocate column registers once (outside the loop)
+        let dbsp_col0_reg = program.alloc_register();
+        let dbsp_col1_reg = program.alloc_register();
+
+        // Second pass: delete DBSP table and index entries
+        let dbsp_end_loop_label = program.allocate_label();
+        let dbsp_loop_start_label = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: sqlite_schema_cursor_id,
+            pc_if_empty: dbsp_end_loop_label,
+        });
+        program.preassign_label_to_next_insn(dbsp_loop_start_label);
+
+        // Read columns for this row (reusing the same registers)
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, dbsp_col0_reg);
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, dbsp_col1_reg);
+
+        let dbsp_skip_delete_label = program.allocate_label();
+
+        // Check if this is the DBSP table entry (type='table' and name=dbsp_table_name)
+        let check_dbsp_index_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: dbsp_col0_reg,
+            rhs: table_type_reg_2,
+            target_pc: check_dbsp_index_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: dbsp_col1_reg,
+            rhs: dbsp_table_name_reg_2,
+            target_pc: check_dbsp_index_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        // Matches DBSP table - delete it
+        program.emit_insn(Insn::RowId {
+            cursor_id: sqlite_schema_cursor_id,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: sqlite_schema_cursor_id,
+            table_name: "sqlite_schema".to_string(),
+            is_part_of_update: false,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: dbsp_skip_delete_label,
+        });
+
+        // Check if this is the DBSP index entry (type='index' and name=dbsp_index_name)
+        program.preassign_label_to_next_insn(check_dbsp_index_label);
+        program.emit_insn(Insn::Ne {
+            lhs: dbsp_col0_reg,
+            rhs: index_type_reg_2,
+            target_pc: dbsp_skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: dbsp_col1_reg,
+            rhs: dbsp_index_name_reg_2,
+            target_pc: dbsp_skip_delete_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        // Matches DBSP index - delete it
+        program.emit_insn(Insn::RowId {
+            cursor_id: sqlite_schema_cursor_id,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: sqlite_schema_cursor_id,
+            table_name: "sqlite_schema".to_string(),
+            is_part_of_update: false,
+        });
+
+        program.resolve_label(dbsp_skip_delete_label, program.offset());
+
+        // Move to next row
+        program.emit_insn(Insn::Next {
+            cursor_id: sqlite_schema_cursor_id,
+            pc_if_next: dbsp_loop_start_label,
+        });
+
+        program.preassign_label_to_next_insn(dbsp_end_loop_label);
+    }
 
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
