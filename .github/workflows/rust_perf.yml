@@ -39,7 +39,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: true
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -79,7 +79,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: true
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -145,7 +145,7 @@ jobs:
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
           comment-on-alert: true
-          comment-always: true
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
