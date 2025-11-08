@@ -3619,9 +3619,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
                     };
                 }
-                _ => {}
-            }
-            match expr {
                 Expr::Id(id) => {
                     let Some(referenced_tables) = &mut referenced_tables else {
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
