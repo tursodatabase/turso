@@ -54,6 +54,9 @@ pub struct HeaderRef(PageRef);
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
+            if let Some(page) = pager.cached_header_page() {
+                return Ok(IOResult::Done(Self(page)));
+            }
             let state = pager.header_ref_state.read().clone();
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
@@ -74,6 +77,8 @@ impl HeaderRef {
                         page.get().id == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
+                    Pager::validate_header_page(&page)?;
+                    pager.set_cached_header_page(&page);
                     *pager.header_ref_state.write() = HeaderRefState::Start;
                     break Ok(IOResult::Done(Self(page)));
                 }
@@ -94,6 +99,10 @@ pub struct HeaderRefMut(PageRef);
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         loop {
+            if let Some(page) = pager.cached_header_page() {
+                pager.add_dirty(page.as_ref())?;
+                return Ok(IOResult::Done(Self(page)));
+            }
             let state = pager.header_ref_state.read().clone();
             tracing::trace!(?state);
             match state {
@@ -114,6 +123,8 @@ impl HeaderRefMut {
                         page.get().id == DatabaseHeader::PAGE_ID,
                         "incorrect header page id"
                     );
+                    Pager::validate_header_page(&page)?;
+                    pager.set_cached_header_page(&page);
 
                     pager.add_dirty(&page)?;
                     *pager.header_ref_state.write() = HeaderRefState::Start;
@@ -546,6 +557,7 @@ pub struct Pager {
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
+    header_page: RwLock<Option<PageRef>>,
     #[cfg(not(feature = "omit_autovacuum"))]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
@@ -660,6 +672,7 @@ impl Pager {
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             header_ref_state: RwLock::new(HeaderRefState::Start),
+            header_page: RwLock::new(None),
             #[cfg(not(feature = "omit_autovacuum"))]
             vacuum_state: RwLock::new(VacuumState {
                 ptrmap_get_state: PtrMapGetState::Start,
@@ -675,6 +688,53 @@ impl Pager {
         self.open_subjournal()?;
         self.open_savepoint(db_size)?;
         Ok(())
+    }
+
+    fn cached_header_page(&self) -> Option<PageRef> {
+        let maybe_page = self.header_page.read().clone();
+        if let Some(page) = maybe_page {
+            if page.get().contents.is_some() {
+                Some(page)
+            } else {
+                drop(page);
+                self.clear_cached_header_page();
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn set_cached_header_page(&self, page: &PageRef) {
+        let mut guard = self.header_page.write();
+        if guard
+            .as_ref()
+            .map(|cached| Arc::ptr_eq(cached, page))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some(old) = guard.take() {
+            if old.is_pinned() {
+                old.unpin();
+            }
+        }
+        page.pin();
+        *guard = Some(page.clone());
+    }
+
+    fn clear_cached_header_page(&self) {
+        let mut guard = self.header_page.write();
+        if let Some(page) = guard.take() {
+            if page.is_pinned() {
+                page.unpin();
+            }
+        }
+    }
+
+    fn validate_header_page(page: &PageRef) -> Result<()> {
+        let content: &PageContent = page.get_contents();
+        DatabaseHeader::validate_bytes(&content.buffer.as_slice()[0..DatabaseHeader::SIZE])
     }
 
     /// Open the subjournal if not yet open.
@@ -2120,6 +2180,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        self.clear_cached_header_page();
         let dirty_pages = self.dirty_pages.read();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
@@ -2713,6 +2774,9 @@ impl Pager {
         })?;
         page.set_loaded();
         page.clear_wal_tag();
+        if id == DatabaseHeader::PAGE_ID {
+            self.set_cached_header_page(&page);
+        }
         Ok(())
     }
 

@@ -58,7 +58,8 @@ use crate::storage::btree::offset::{
 };
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
-use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::database::{DatabaseFile, DatabaseStorage, EncryptionOrChecksum};
+use crate::storage::encryption::TURSO_HEADER_PREFIX;
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
@@ -295,6 +296,7 @@ pub struct DatabaseHeader {
 }
 
 impl DatabaseHeader {
+    pub const MAGIC: [u8; 16] = *b"SQLite format 3\0";
     pub const PAGE_ID: usize = 1;
     pub const SIZE: usize = size_of::<Self>();
 
@@ -305,12 +307,51 @@ impl DatabaseHeader {
     pub fn usable_space(self) -> usize {
         (self.page_size.get() as usize) - (self.reserved_space as usize)
     }
+
+    pub fn validate_bytes(header: &[u8]) -> Result<()> {
+        if header.len() < Self::SIZE {
+            return Err(LimboError::NotADB);
+        }
+
+        let has_sqlite_magic = header.starts_with(&Self::MAGIC);
+        let has_turso_magic = header.starts_with(TURSO_HEADER_PREFIX);
+        if !has_sqlite_magic && !has_turso_magic {
+            return Err(LimboError::NotADB);
+        }
+
+        let write_version = header[18];
+        let read_version = header[19];
+        if !matches!(write_version, 1 | 2) || !matches!(read_version, 1 | 2) {
+            return Err(LimboError::NotADB);
+        }
+
+        if header[21] != 64 || header[22] != 32 || header[23] != 32 {
+            return Err(LimboError::NotADB);
+        }
+
+        let page_size_raw = u16::from_be_bytes([header[16], header[17]]);
+        let page_size = match PageSize::new_from_header_u16(page_size_raw) {
+            Ok(size) => size.get() as usize,
+            Err(_) => return Err(LimboError::NotADB),
+        };
+
+        let reserved_bytes = header[20] as usize;
+        if reserved_bytes >= page_size {
+            return Err(LimboError::NotADB);
+        }
+
+        if page_size - reserved_bytes < 480 {
+            return Err(LimboError::NotADB);
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for DatabaseHeader {
     fn default() -> Self {
         Self {
-            magic: *b"SQLite format 3\0",
+            magic: Self::MAGIC,
             page_size: Default::default(),
             write_version: Version::Wal,
             read_version: Version::Wal,

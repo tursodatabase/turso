@@ -90,7 +90,7 @@ pub use storage::database::IOContext;
 pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
 use storage::pager::{AtomicDbState, DbState};
-use storage::sqlite3_ondisk::PageSize;
+use storage::sqlite3_ondisk::{DatabaseHeader, PageSize};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -662,41 +662,36 @@ impl Database {
         self.open_flags.get().contains(OpenFlags::ReadOnly)
     }
 
-    /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
-    /// we need to read the page_size from the database header.
-    fn read_page_size_from_db_header(&self) -> Result<PageSize> {
+    /// Read the first page-size block from disk and verify it looks like a database header.
+    fn read_db_header_block(&self) -> Result<Arc<Buffer>> {
         turso_assert!(
             self.db_state.get().is_initialized(),
-            "read_page_size_from_db_header called on uninitialized database"
+            "read_db_header_block called on uninitialized database"
         );
         turso_assert!(
-            PageSize::MIN % 512 == 0,
+            PageSize::MIN.is_multiple_of(512),
             "header read must be a multiple of 512 for O_DIRECT"
         );
         let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
         let c = Completion::new_read(buf.clone(), move |_res| {});
         let c = self.db_file.read_header(c)?;
         self.io.wait_for_completion(c)?;
+        DatabaseHeader::validate_bytes(buf.as_slice())?;
+        Ok(buf)
+    }
+
+    /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
+    /// we need to read the page_size from the database header.
+    fn read_page_size_from_db_header(&self) -> Result<PageSize> {
+        let buf = self.read_db_header_block()?;
         let page_size = u16::from_be_bytes(buf.as_slice()[16..18].try_into().unwrap());
         let page_size = PageSize::new_from_header_u16(page_size)?;
         Ok(page_size)
     }
 
     fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
-        turso_assert!(
-            self.db_state.get().is_initialized(),
-            "read_reserved_space_bytes_from_db_header called on uninitialized database"
-        );
-        turso_assert!(
-            PageSize::MIN % 512 == 0,
-            "header read must be a multiple of 512 for O_DIRECT"
-        );
-        let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
-        let c = Completion::new_read(buf.clone(), move |_res| {});
-        let c = self.db_file.read_header(c)?;
-        self.io.wait_for_completion(c)?;
-        let reserved_bytes = u8::from_be_bytes(buf.as_slice()[20..21].try_into().unwrap());
-        Ok(reserved_bytes)
+        let buf = self.read_db_header_block()?;
+        Ok(buf.as_slice()[20])
     }
 
     /// Read the page size in order of preference:
