@@ -1179,7 +1179,7 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
     fk_deferred_violations: AtomicIsize,
-    /// Whether each virtual table module is currently in transaction.
+    /// Track when each virtual table instance is currently in transaction.
     vtab_txn_states: RwLock<HashSet<u64>>,
 }
 
