@@ -497,24 +497,6 @@ pub fn insn_to_row(
                 0,
                 "".into()
               ),
-            Insn::VRollback{cursor_id} => (
-               "VRollback",
-                *cursor_id as i32,
-                 0,
-                 0,
-                Value::build_text(""),
-                 0,
-                 "".into(),
-            ),
-            Insn::VCommit{cursor_id} => (
-               "VCommit",
-                *cursor_id as i32,
-                 0,
-                 0,
-                Value::build_text(""),
-                 0,
-                 "".into(),
-            ),
             Insn::VRename{cursor_id, new_name_reg} => (
                "VRename",
                 *cursor_id as i32,

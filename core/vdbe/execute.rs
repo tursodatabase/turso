@@ -1435,54 +1435,6 @@ pub fn op_vbegin(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_vcommit(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-    mv_store: Option<&Arc<MvStore>>,
-) -> Result<InsnFunctionStepResult> {
-    load_insn!(VCommit { cursor_id }, insn);
-    let cursor = state.get_cursor(*cursor_id);
-    let cursor = cursor.as_virtual_mut();
-    let vtab_id = cursor
-        .vtab_id()
-        .expect("VCommit on non ext-virtual table cursor");
-    let vtabs = &program.connection.syms.read().vtabs;
-    let vtab = vtabs
-        .iter()
-        .find(|p| p.1.id().eq(&vtab_id))
-        .expect("Could not find virtual table for VCommit");
-    program.connection.vtab_txn_states.write().remove(&vtab_id);
-    vtab.1.commit()?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-pub fn op_vrollback(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-    mv_store: Option<&Arc<MvStore>>,
-) -> Result<InsnFunctionStepResult> {
-    load_insn!(VRollback { cursor_id }, insn);
-    let cursor = state.get_cursor(*cursor_id);
-    let cursor = cursor.as_virtual_mut();
-    let vtabs = &program.connection.syms.read().vtabs;
-    let vtab = vtabs
-        .iter()
-        .find(|p| {
-            p.1.id().eq(&cursor
-                .vtab_id()
-                .expect("non ext-virtual table used in VRollback"))
-        })
-        .expect("Could not find virtual table for VRollback");
-    vtab.1.rollback()?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
 pub fn op_vrename(
     program: &Program,
     state: &mut ProgramState,

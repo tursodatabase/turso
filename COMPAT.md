@@ -564,8 +564,6 @@ Modifiers:
 | VColumn        | Yes    |         |
 | VCreate        | Yes    |         |
 | VDestroy       | Yes    |         |
-| VRollback      | Yes    |         |
-| VCommit        | Yes    |         |
 | VFilter        | Yes    |         |
 | VNext          | Yes    |         |
 | VOpen          | Yes    |         |
