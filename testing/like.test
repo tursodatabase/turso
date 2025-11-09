@@ -138,3 +138,10 @@ do_execsql_test like-fn-esc-13 {
 do_execsql_test like-fn-esc-14 { 
     SELECT like('abcXX', 'abcXX', 'X') 
 } 0
+
+do_execsql_test unicode-like-case-sensitivity-1 {
+    SELECT like('ä', 'Ä');
+} {0}
+do_execsql_test unicode-like-case-sensitivity-2 {
+    SELECT like('a', 'A');
+} {1}

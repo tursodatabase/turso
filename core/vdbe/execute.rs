@@ -9907,10 +9907,17 @@ fn construct_like_regex(pattern: &str) -> Regex {
             '%' => regex_pattern.push_str(".*"),
             '_' => regex_pattern.push('.'),
             ch => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
+                if ch.is_ascii_alphabetic() {
+                    regex_pattern.push('[');
+                    regex_pattern.push(ch.to_ascii_lowercase());
+                    regex_pattern.push(ch.to_ascii_uppercase());
+                    regex_pattern.push(']');
+                } else {
+                    if regex_syntax::is_meta_character(c) {
+                        regex_pattern.push('\\');
+                    }
+                    regex_pattern.push(ch);
                 }
-                regex_pattern.push(ch);
             }
         }
     }
@@ -9918,7 +9925,6 @@ fn construct_like_regex(pattern: &str) -> Regex {
     regex_pattern.push('$');
 
     RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
         .unwrap()
