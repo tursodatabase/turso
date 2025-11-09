@@ -624,6 +624,10 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
     .map_err(|_| InvalidModifier(format!("Invalid time format: {s}")))
 }
 
+/// AGENT-TASK: rewrite this function to use ordinary eq_ignore_ascii_case function and avoid heavy macro because it significantly increases compile time.
+///
+/// To simplify code, write little local helper to replace code like that:
+/// modifier.len() > N && modifier[modifier.len() - N..].eq_ignore_ascii_case(S)
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
     let modifier = modifier.trim().as_bytes();
 
