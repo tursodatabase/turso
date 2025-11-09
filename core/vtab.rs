@@ -225,6 +225,54 @@ impl VirtualTableCursor {
             VirtualTableCursor::Internal(cursor) => cursor.write().filter(&args, idx_str, idx_num),
         }
     }
+
+    pub(crate) fn begin(&self) -> crate::Result<()> {
+        match self {
+            VirtualTableCursor::Pragma(_) => Err(LimboError::ExtensionError(
+                "Pragma virtual tables do not support transactions".to_string(),
+            )),
+            VirtualTableCursor::External(cursor) => cursor.begin(),
+            VirtualTableCursor::Internal(_) => Err(LimboError::ExtensionError(
+                "Internal virtual tables currently do not support transactions".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn rollback(&self) -> crate::Result<()> {
+        match self {
+            VirtualTableCursor::Pragma(_) => Err(LimboError::ExtensionError(
+                "Pragma virtual tables do not support transactions".to_string(),
+            )),
+            VirtualTableCursor::External(cursor) => cursor.rollback(),
+            VirtualTableCursor::Internal(_) => Err(LimboError::ExtensionError(
+                "Internal virtual tables currently do not support transactions".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn commit(&self) -> crate::Result<()> {
+        match self {
+            VirtualTableCursor::Pragma(_) => Err(LimboError::ExtensionError(
+                "Pragma virtual tables do not support transactions".to_string(),
+            )),
+            VirtualTableCursor::External(cursor) => cursor.commit(),
+            VirtualTableCursor::Internal(_) => Err(LimboError::ExtensionError(
+                "Internal virtual tables currently do not support transactions".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn rename(&self, new_name: &str) -> crate::Result<()> {
+        match self {
+            VirtualTableCursor::Pragma(_) => Err(LimboError::ExtensionError(
+                "Pragma virtual tables do not support renaming".to_string(),
+            )),
+            VirtualTableCursor::External(cursor) => cursor.rename(new_name),
+            VirtualTableCursor::Internal(_) => Err(LimboError::ExtensionError(
+                "Internal virtual tables currently do not support renaming".to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -372,6 +420,39 @@ impl ExtVirtualTableCursor {
 
     fn rowid(&self) -> i64 {
         unsafe { (self.implementation.rowid)(self.cursor.as_ptr()) }
+    }
+
+    fn begin(&self) -> crate::Result<()> {
+        let rc = unsafe { (self.implementation.begin)(self.cursor.as_ptr()) };
+        match rc {
+            ResultCode::OK => Ok(()),
+            _ => Err(LimboError::ExtensionError("Begin failed".to_string())),
+        }
+    }
+
+    fn rollback(&self) -> crate::Result<()> {
+        let rc = unsafe { (self.implementation.rollback)(self.cursor.as_ptr()) };
+        match rc {
+            ResultCode::OK => Ok(()),
+            _ => Err(LimboError::ExtensionError("Rollback failed".to_string())),
+        }
+    }
+
+    fn commit(&self) -> crate::Result<()> {
+        let rc = unsafe { (self.implementation.commit)(self.cursor.as_ptr()) };
+        match rc {
+            ResultCode::OK => Ok(()),
+            _ => Err(LimboError::ExtensionError("Commit failed".to_string())),
+        }
+    }
+
+    fn rename(&self, new_name: &str) -> crate::Result<()> {
+        let c_new_name = std::ffi::CString::new(new_name).unwrap();
+        let rc = unsafe { (self.implementation.rename)(self.cursor.as_ptr(), c_new_name.as_ptr()) };
+        match rc {
+            ResultCode::OK => Ok(()),
+            _ => Err(LimboError::ExtensionError("Rename failed".to_string())),
+        }
     }
 
     #[tracing::instrument(skip(self))]

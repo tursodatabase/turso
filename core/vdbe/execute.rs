@@ -1407,6 +1407,73 @@ pub fn op_vdestroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_vbegin(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(VBegin { cursor_id }, insn);
+    let cursor = state.get_cursor(*cursor_id);
+    let cursor = cursor.as_virtual_mut();
+    cursor.begin()?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vcommit(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(VCommit { cursor_id }, insn);
+    let cursor = state.get_cursor(*cursor_id);
+    let cursor = cursor.as_virtual_mut();
+    cursor.commit()?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vrollback(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(VRollback { cursor_id }, insn);
+    let cursor = state.get_cursor(*cursor_id);
+    let cursor = cursor.as_virtual_mut();
+    cursor.rollback()?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_vrename(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        VRename {
+            cursor_id,
+            new_table_name
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    let cursor = state.get_cursor(*cursor_id);
+    let cursor = cursor.as_virtual_mut();
+    cursor.rename(&new_table_name)?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_open_pseudo(
     program: &Program,
     state: &mut ProgramState,

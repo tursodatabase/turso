@@ -412,6 +412,24 @@ pub enum Insn {
         ///  The database within which this virtual table needs to be destroyed (P1).
         db: usize,
     },
+    VBegin {
+        /// The database within which this virtual table transaction needs to begin (P1).
+        cursor_id: CursorID,
+    },
+    VRollback {
+        /// The database within which this virtual table transaction needs to rollback (P1).
+        cursor_id: CursorID,
+    },
+    VCommit {
+        /// The database within which this virtual table transaction needs to commit (P1).
+        cursor_id: CursorID,
+    },
+    VRename {
+        /// The database within which this virtual table needs to be renamed (P1).
+        cursor_id: CursorID,
+        /// New name of the virtual table (P2).
+        new_table_name: String,
+    },
 
     /// Open a cursor for a pseudo-table that contains a single row.
     OpenPseudo {
@@ -1383,6 +1401,10 @@ impl InsnVariants {
             InsnVariants::SequenceTest => execute::op_sequence_test,
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
+            InsnVariants::VBegin => execute::op_vbegin,
+            InsnVariants::VCommit => execute::op_vcommit,
+            InsnVariants::VRollback => execute::op_vrollback,
+            InsnVariants::VRename => execute::op_vrename,
         }
     }
 }
