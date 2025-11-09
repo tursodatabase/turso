@@ -2867,6 +2867,11 @@ impl Statement {
         self.state.bind_at(index, value);
     }
 
+    pub fn bind_zeroblob_at(&mut self, index: NonZero<usize>, len: usize) {
+        let value = Value::build_zeroblob(len);
+        self.bind_at(index, value);
+    }
+
     pub fn clear_bindings(&mut self) {
         self.state.clear_bindings();
     }

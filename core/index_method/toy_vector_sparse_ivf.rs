@@ -1308,7 +1308,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let record = return_if_io!(main.record());
                     if let Some(record) = record {
                         let column_idx = self.configuration.columns[0].pos_in_table;
-                        let ValueRef::Blob(data) = record.get_value(column_idx)? else {
+                        let ValueRef::Blob(data, _) = record.get_value(column_idx)? else {
                             return Err(LimboError::InternalError(
                                 "table column value must be sparse vector".to_string(),
                             ));

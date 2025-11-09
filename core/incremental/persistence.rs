@@ -42,7 +42,7 @@ impl ReadRecord {
                         let blob = values[3].to_owned();
 
                         let (state, _group_key) = match blob {
-                            Value::Blob(blob) => AggregateState::from_blob(&blob),
+                            Value::Blob(blob) => AggregateState::from_blob(&blob.value),
                             Value::Null => {
                                 // For plain DISTINCT, we store null value and just track weight
                                 // Return a minimal state indicating existence

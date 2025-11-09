@@ -252,7 +252,7 @@ pub fn limbo_exec_rows(
                 turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
                 turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
-                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.value.to_vec()),
             })
             .collect();
         rows.push(row);
@@ -306,7 +306,7 @@ pub fn limbo_exec_rows_fallible(
                 turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
                 turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
-                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.value.to_vec()),
             })
             .collect();
         rows.push(row);

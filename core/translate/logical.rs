@@ -1911,7 +1911,17 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            ast::Literal::Blob(b) => {
+                let bytes = b
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let hex_byte = std::str::from_utf8(pair).unwrap();
+                        u8::from_str_radix(hex_byte, 16).unwrap()
+                    })
+                    .collect::<Vec<u8>>();
+                Ok(Value::build_blob(bytes))
+            }
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
@@ -3587,7 +3597,7 @@ mod tests {
                                 match &args[0] {
                                     LogicalExpr::Column(col) => {
                                         // When aggregate arguments are complex, they get pre-projected
-                                        assert!(col.name.starts_with("__agg_arg_proj_"), 
+                                        assert!(col.name.starts_with("__agg_arg_proj_"),
                                                "Should reference pre-projected column, got: {}", col.name);
                                     }
                                     LogicalExpr::BinaryExpr { left, op, right } => {
