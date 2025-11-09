@@ -2254,6 +2254,7 @@ pub fn halt(
     if err_code > 0 {
         // Any non-FK constraint violation causes the statement subtransaction to roll back.
         state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
+        vtab_rollback_all(&program.connection, state)?;
     }
     match err_code {
         0 => {}
@@ -2327,6 +2328,7 @@ pub fn halt(
     }
 }
 
+/// Call xCommit on all virtual tables that participated in the current transaction.
 fn vtab_commit_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
@@ -2343,6 +2345,7 @@ fn vtab_commit_all(conn: &Connection, state: &mut ProgramState) -> crate::Result
     Ok(())
 }
 
+/// Rollback all virtual tables that are part of the current transaction.
 fn vtab_rollback_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
