@@ -633,6 +633,7 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
 
     let modifier = modifier.trim();
 
+    // We intentionally avoid usage of match_ignore_ascii_case! macro here because it lead to enormous amount of LLVM code which signifnicantly increase compilation time (see https://github.com/tursodatabase/turso/pull/3929)
     // Fast path for exact matches
     if modifier.eq_ignore_ascii_case("ceiling") {
         return Ok(Modifier::Ceiling);
