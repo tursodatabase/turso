@@ -116,10 +116,12 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
     )
 }
 
-fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
-    let str = std::str::from_utf8(slice)
+fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
+    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let truncated = &slice[..zero_pos];
+    let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_with_mode(str, Conv::Strict).map_err(Into::into)
+    Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
@@ -147,14 +149,14 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             let slice = &bytes[index..];
             let json = match slice {
                 // branch with no overlapping initial byte
-                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice)?,
+                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice, strict)?,
                 _ => match JsonbHeader::from_slice(0, slice) {
                     Ok((header, header_offset)) => {
                         let payload_size = header.payload_size();
                         let total_expected = header_offset + payload_size;
 
                         if total_expected != slice.len() {
-                            parse_as_json_text(slice)?
+                            parse_as_json_text(slice, strict)?
                         } else {
                             let jsonb = Jsonb::from_raw_data(slice);
                             let is_valid_json = if payload_size <= 7 {
@@ -165,11 +167,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                             if is_valid_json {
                                 jsonb
                             } else {
-                                parse_as_json_text(slice)?
+                                parse_as_json_text(slice, strict)?
                             }
                         }
                     }
-                    Err(_) => parse_as_json_text(slice)?,
+                    Err(_) => parse_as_json_text(slice, strict)?,
                 },
             };
             json.element_type()?;
