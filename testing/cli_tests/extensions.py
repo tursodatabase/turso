@@ -493,7 +493,7 @@ def _test_kv(exec_name, ext_path):
     turso.run_test_fn("alter table t rename to renamed;", lambda res: "" == res, "can rename virtual table")
     turso.run_test_fn(
         "select sql from sqlite_schema where name = 'renamed';",
-        lambda res: "CREATE VIRTUAL TABLE t2 USING kv_store ()",
+        lambda res: "CREATE VIRTUAL TABLE renamed USING kv_store ()",
         "renamed table shows up in sqlite_schema",
     )
     turso.quit()

@@ -1422,7 +1422,6 @@ pub fn op_vbegin(
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
-        // A transaction is already active for this virtual table module
         // Only begin a new transaction if one is not already active for this virtual table module
         let vtabs = &program.connection.syms.read().vtabs;
         let vtab = vtabs
