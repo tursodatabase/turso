@@ -490,6 +490,12 @@ def _test_kv(exec_name, ext_path):
         "select * from t a, other b where b.c = 23 and a.key='100';",
         lambda res: "100|updated2|23|32|23" == res,
     )
+    turso.run_test_fn("alter table t rename to renamed;", lambda res: "" == res, "can rename virtual table")
+    turso.run_test_fn(
+        "select sql from sqlite_schema where name = 'renamed';",
+        lambda res: "CREATE VIRTUAL TABLE t2 USING kv_store ()",
+        "renamed table shows up in sqlite_schema",
+    )
     turso.quit()
 
 
