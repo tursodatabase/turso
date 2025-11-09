@@ -1,11 +1,9 @@
 use crate::LimboError::InvalidModifier;
 use crate::Result;
-use crate::{ends_with_ignore_ascii_case, eq_ignore_ascii_case, starts_with_ignore_ascii_case};
 use crate::{types::Value, vdbe::Register};
 use chrono::{
     DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
 };
-use turso_macros::match_ignore_ascii_case;
 
 /// Execution of date/time/datetime functions
 #[inline(always)]
@@ -624,128 +622,150 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
     .map_err(|_| InvalidModifier(format!("Invalid time format: {s}")))
 }
 
-/// AGENT-TASK: rewrite this function to use ordinary eq_ignore_ascii_case function and avoid heavy macro because it significantly increases compile time.
-///
-/// To simplify code, write little local helper to replace code like that:
-/// modifier.len() > N && modifier[modifier.len() - N..].eq_ignore_ascii_case(S)
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
-    let modifier = modifier.trim().as_bytes();
+    // Small helpers to check string suffix/prefix in a case-insensitive way with no allocation
+    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+    fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
 
-    #[inline(always)]
-    fn from_bytes(bytes: &[u8]) -> &str {
-        unsafe { str::from_utf8_unchecked(bytes) }
-    } // safe because input is from &str
+    let modifier = modifier.trim();
 
-    match_ignore_ascii_case!(match modifier {
-        // exact matches first
-        b"ceiling" => Ok(Modifier::Ceiling),
-        b"floor" => Ok(Modifier::Floor),
-        b"start of month" => Ok(Modifier::StartOfMonth),
-        b"start of year" => Ok(Modifier::StartOfYear),
-        b"start of day" => Ok(Modifier::StartOfDay),
-        b"unixepoch" => Ok(Modifier::UnixEpoch),
-        b"julianday" => Ok(Modifier::JulianDay),
-        b"auto" => Ok(Modifier::Auto),
-        b"localtime" => Ok(Modifier::Localtime),
-        b"utc" => Ok(Modifier::Utc),
-        b"subsec" | b"subsecond" => Ok(Modifier::Subsec),
-        _ => {
-            match modifier {
-                s if starts_with_ignore_ascii_case!(s, b"weekday ") => {
-                    let day = parse_modifier_number(from_bytes(&s[8..]))?;
-                    if !(0..=6).contains(&day) {
-                        Err(InvalidModifier(
-                            "Weekday must be between 0 and 6".to_string(),
-                        ))
-                    } else {
-                        Ok(Modifier::Weekday(day as u32))
-                    }
-                }
-                s if ends_with_ignore_ascii_case!(s, b" day") => Ok(Modifier::Days(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 4]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" days") => Ok(Modifier::Days(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" hour") => Ok(Modifier::Hours(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" hours") => Ok(Modifier::Hours(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" minute") => Ok(Modifier::Minutes(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" minutes") => Ok(Modifier::Minutes(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 8]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" second") => Ok(Modifier::Seconds(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" seconds") => Ok(Modifier::Seconds(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 8]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" month") => Ok(Modifier::Months(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" months") => Ok(Modifier::Months(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" year") => Ok(Modifier::Years(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" years") => Ok(Modifier::Years(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))? as i32,
-                )),
-                s if starts_with_ignore_ascii_case!(s, b"+")
-                    || starts_with_ignore_ascii_case!(s, b"-") =>
-                {
-                    let sign = if starts_with_ignore_ascii_case!(s, b"-") {
-                        -1
-                    } else {
-                        1
-                    };
-                    let parts: Vec<&str> = from_bytes(&s[1..]).split(' ').collect();
-                    let digits_in_date = 10;
-                    match parts.len() {
-                        1 => {
-                            if parts[0].len() == digits_in_date {
-                                let date = parse_modifier_date(parts[0])?;
-                                Ok(Modifier::DateOffset {
-                                    years: sign * date.year(),
-                                    months: sign * date.month() as i32,
-                                    days: sign * date.day() as i32,
-                                })
-                            } else {
-                                // time values are either 12, 8 or 5 digits
-                                let time = parse_modifier_time(parts[0])?;
-                                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
-                                Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
-                            }
-                        }
-                        2 => {
-                            let date = parse_modifier_date(parts[0])?;
-                            let time = parse_modifier_time(parts[1])?;
-                            // Convert time to total seconds (with sign)
-                            let time_delta = sign * (time.num_seconds_from_midnight() as i32);
-                            Ok(Modifier::DateTimeOffset {
-                                years: sign * (date.year()),
-                                months: sign * (date.month() as i32),
-                                days: sign * date.day() as i32,
-                                seconds: time_delta,
-                            })
-                        }
-                        _ => Err(InvalidModifier(
-                            "Invalid date/time offset format".to_string(),
-                        )),
-                    }
-                }
-                _ => Err(InvalidModifier(
-                    "Invalid date/time offset format".to_string(),
-                )),
-            }
+    // Fast path for exact matches
+    if modifier.eq_ignore_ascii_case("ceiling") {
+        return Ok(Modifier::Ceiling);
+    } else if modifier.eq_ignore_ascii_case("floor") {
+        return Ok(Modifier::Floor);
+    } else if modifier.eq_ignore_ascii_case("start of month") {
+        return Ok(Modifier::StartOfMonth);
+    } else if modifier.eq_ignore_ascii_case("start of year") {
+        return Ok(Modifier::StartOfYear);
+    } else if modifier.eq_ignore_ascii_case("start of day") {
+        return Ok(Modifier::StartOfDay);
+    } else if modifier.eq_ignore_ascii_case("unixepoch") {
+        return Ok(Modifier::UnixEpoch);
+    } else if modifier.eq_ignore_ascii_case("julianday") {
+        return Ok(Modifier::JulianDay);
+    } else if modifier.eq_ignore_ascii_case("auto") {
+        return Ok(Modifier::Auto);
+    } else if modifier.eq_ignore_ascii_case("localtime") {
+        return Ok(Modifier::Localtime);
+    } else if modifier.eq_ignore_ascii_case("utc") {
+        return Ok(Modifier::Utc);
+    } else if modifier.eq_ignore_ascii_case("subsec") || modifier.eq_ignore_ascii_case("subsecond")
+    {
+        return Ok(Modifier::Subsec);
+    }
+
+    // Patterns
+    if starts_with_ignore_ascii_case(modifier, "weekday ") {
+        let s = &modifier[8..];
+        let day = parse_modifier_number(s)?;
+        if !(0..=6).contains(&day) {
+            Err(InvalidModifier(
+                "Weekday must be between 0 and 6".to_string(),
+            ))
+        } else {
+            Ok(Modifier::Weekday(day as u32))
         }
-    })
+    } else if ends_with_ignore_ascii_case(modifier, " day") {
+        Ok(Modifier::Days(parse_modifier_number(
+            &modifier[..modifier.len() - 4],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " days") {
+        Ok(Modifier::Days(parse_modifier_number(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hour") {
+        Ok(Modifier::Hours(parse_modifier_number(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hours") {
+        Ok(Modifier::Hours(parse_modifier_number(
+            &modifier[..modifier.len() - 6],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minute") {
+        Ok(Modifier::Minutes(parse_modifier_number(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minutes") {
+        Ok(Modifier::Minutes(parse_modifier_number(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " second") {
+        Ok(Modifier::Seconds(parse_modifier_number(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " seconds") {
+        Ok(Modifier::Seconds(parse_modifier_number(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " month") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " months") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 7])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " year") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 5])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " years") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if starts_with_ignore_ascii_case(modifier, "+")
+        || starts_with_ignore_ascii_case(modifier, "-")
+    {
+        let sign = if starts_with_ignore_ascii_case(modifier, "-") {
+            -1
+        } else {
+            1
+        };
+        let rest = &modifier[1..];
+        let parts: Vec<&str> = rest.split(' ').collect();
+        let digits_in_date = 10;
+        match parts.len() {
+            1 => {
+                if parts[0].len() == digits_in_date {
+                    let date = parse_modifier_date(parts[0])?;
+                    Ok(Modifier::DateOffset {
+                        years: sign * date.year(),
+                        months: sign * date.month() as i32,
+                        days: sign * date.day() as i32,
+                    })
+                } else {
+                    // time values are either 12, 8 or 5 digits
+                    let time = parse_modifier_time(parts[0])?;
+                    let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+                    Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
+                }
+            }
+            2 => {
+                let date = parse_modifier_date(parts[0])?;
+                let time = parse_modifier_time(parts[1])?;
+                // Convert time to total seconds (with sign)
+                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+                Ok(Modifier::DateTimeOffset {
+                    years: sign * (date.year()),
+                    months: sign * (date.month() as i32),
+                    days: sign * date.day() as i32,
+                    seconds: time_delta,
+                })
+            }
+            _ => Err(InvalidModifier(
+                "Invalid date/time offset format".to_string(),
+            )),
+        }
+    } else {
+        Err(InvalidModifier(
+            "Invalid date/time offset format".to_string(),
+        ))
+    }
 }
 
 pub fn exec_timediff(values: &[Register]) -> Value {
