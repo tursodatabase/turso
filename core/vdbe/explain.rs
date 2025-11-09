@@ -515,12 +515,12 @@ pub fn insn_to_row(
                  0,
                  "".into(),
             ),
-            Insn::VRename{cursor_id, new_table_name} => (
-               "VCommit",
+            Insn::VRename{cursor_id, new_name_reg} => (
+               "VRename",
                 *cursor_id as i32,
+                 *new_name_reg as i32,
                  0,
-                 0,
-                Value::build_text(&new_table_name),
+                Value::build_text(""),
                  0,
                  "".into(),
             ),

@@ -428,7 +428,7 @@ pub enum Insn {
         /// The database within which this virtual table needs to be renamed (P1).
         cursor_id: CursorID,
         /// New name of the virtual table (P2).
-        new_table_name: String,
+        new_name_reg: usize,
     },
 
     /// Open a cursor for a pseudo-table that contains a single row.

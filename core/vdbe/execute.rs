@@ -1417,7 +1417,20 @@ pub fn op_vbegin(
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    cursor.begin()?;
+    let vtab_id = cursor
+        .vtab_id()
+        .expect("VBegin on non ext-virtual table cursor");
+    let mut states = program.connection.vtab_txn_states.write();
+    if states.insert(vtab_id) {
+        // A transaction is already active for this virtual table module
+        // Only begin a new transaction if one is not already active for this virtual table module
+        let vtabs = &program.connection.syms.read().vtabs;
+        let vtab = vtabs
+            .iter()
+            .find(|p| p.1.id().eq(&vtab_id))
+            .expect("Could not find virtual table for VBegin");
+        vtab.1.begin()?;
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1432,7 +1445,16 @@ pub fn op_vcommit(
     load_insn!(VCommit { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    cursor.commit()?;
+    let vtab_id = cursor
+        .vtab_id()
+        .expect("VCommit on non ext-virtual table cursor");
+    let vtabs = &program.connection.syms.read().vtabs;
+    let vtab = vtabs
+        .iter()
+        .find(|p| p.1.id().eq(&vtab_id))
+        .expect("Could not find virtual table for VCommit");
+    program.connection.vtab_txn_states.write().remove(&vtab_id);
+    vtab.1.commit()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1447,7 +1469,16 @@ pub fn op_vrollback(
     load_insn!(VRollback { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    cursor.rollback()?;
+    let vtabs = &program.connection.syms.read().vtabs;
+    let vtab = vtabs
+        .iter()
+        .find(|p| {
+            p.1.id().eq(&cursor
+                .vtab_id()
+                .expect("non ext-virtual table used in VRollback"))
+        })
+        .expect("Could not find virtual table for VRollback");
+    vtab.1.rollback()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1462,14 +1493,24 @@ pub fn op_vrename(
     load_insn!(
         VRename {
             cursor_id,
-            new_table_name
+            new_name_reg
         },
         insn
     );
+    let name = state.registers[*new_name_reg].get_value().to_string();
     let conn = program.connection.clone();
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
-    cursor.rename(&new_table_name)?;
+    let vtabs = &program.connection.syms.read().vtabs;
+    let vtab = vtabs
+        .iter()
+        .find(|p| {
+            p.1.id().eq(&cursor
+                .vtab_id()
+                .expect("non ext-virtual table used in VRollback"))
+        })
+        .expect("Could not find virtual table for VRollback");
+    vtab.1.rename(&name)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2264,6 +2305,7 @@ pub fn halt(
                 .fk_deferred_violations
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
+                vtab_rollback_all(&program.connection, state)?;
                 pager.rollback_tx(&program.connection);
                 program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
@@ -2273,6 +2315,7 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+        vtab_commit_all(&program.connection, state)?;
         program
             .commit_txn(pager.clone(), state, mv_store, false)
             .map(Into::into)
@@ -2282,6 +2325,38 @@ pub fn halt(
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         Ok(InsnFunctionStepResult::Done)
     }
+}
+
+fn vtab_commit_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
+    let mut set = conn.vtab_txn_states.write();
+    if set.is_empty() {
+        return Ok(());
+    }
+    let reg = &conn.syms.read().vtabs;
+    for id in set.drain() {
+        let vtab = reg
+            .iter()
+            .find(|(_, vtab)| vtab.id() == id)
+            .expect("vtab must exist");
+        vtab.1.commit()?;
+    }
+    Ok(())
+}
+
+fn vtab_rollback_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
+    let mut set = conn.vtab_txn_states.write();
+    if set.is_empty() {
+        return Ok(());
+    }
+    let reg = &conn.syms.read().vtabs;
+    for id in set.drain() {
+        let vtab = reg
+            .iter()
+            .find(|(_, vtab)| vtab.id() == id)
+            .expect("vtab must exist");
+        vtab.1.rollback()?;
+    }
+    Ok(())
 }
 
 pub fn op_halt(
@@ -5614,6 +5689,32 @@ pub fn op_function(
                                     )
                                 }
                             }
+                            ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
+                                tbl_name,
+                                if_not_exists,
+                                module_name,
+                                args,
+                            }) => {
+                                let this_table = normalize_ident(tbl_name.name.as_str());
+                                if this_table != rename_from {
+                                    None
+                                } else {
+                                    let new_stmt =
+                                        ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
+                                            tbl_name: ast::QualifiedName {
+                                                db_name: tbl_name.db_name,
+                                                name: ast::Name::exact(
+                                                    original_rename_to.to_string(),
+                                                ),
+                                                alias: None,
+                                            },
+                                            if_not_exists,
+                                            module_name,
+                                            args,
+                                        });
+                                    Some(new_stmt.to_string())
+                                }
+                            }
                             _ => None,
                         }
                     };
@@ -8554,23 +8655,23 @@ pub fn op_rename_table(
             .tables
             .remove(&normalized_from)
             .expect("table being renamed should be in schema");
-
-        {
-            let table = Arc::make_mut(&mut table);
-
-            let Table::BTree(btree) = table else {
-                panic!("only btree tables can be renamed");
-            };
-            let btree = Arc::make_mut(btree);
-            // update this table's own foreign keys
-            for fk_arc in &mut btree.foreign_keys {
-                let fk = Arc::make_mut(fk_arc);
-                if normalize_ident(&fk.parent_table) == normalized_from {
-                    fk.parent_table = normalized_to.clone();
+        match Arc::make_mut(&mut table) {
+            Table::BTree(btree) => {
+                let btree = Arc::make_mut(btree);
+                // update this table's own foreign keys
+                for fk_arc in &mut btree.foreign_keys {
+                    let fk = Arc::make_mut(fk_arc);
+                    if normalize_ident(&fk.parent_table) == normalized_from {
+                        fk.parent_table = normalized_to.clone();
+                    }
                 }
-            }
 
-            btree.name = normalized_to.to_owned();
+                btree.name = normalized_to.to_owned();
+            }
+            Table::Virtual(vtab) => {
+                Arc::make_mut(vtab).name = normalized_to.clone();
+            }
+            _ => panic!("only btree and virtual tables can be renamed"),
         }
 
         schema.tables.insert(normalized_to.to_owned(), table);
