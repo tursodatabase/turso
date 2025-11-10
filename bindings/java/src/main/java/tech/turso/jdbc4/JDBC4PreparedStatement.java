@@ -2,11 +2,14 @@ package tech.turso.jdbc4;
 
 import static java.util.Objects.requireNonNull;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.Clob;
@@ -164,17 +167,88 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setAsciiStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setAsciiStream length must be non-negative");
+    }
+    if (length == 0) {
+      this.statement.bindText(parameterIndex, "");
+      return;
+    }
+    try {
+      byte[] buffer = new byte[length];
+      int offset = 0;
+      int read;
+      while (offset < length && (read = x.read(buffer, offset, length - offset)) > 0) {
+        offset += read;
+      }
+      String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
+      this.statement.bindText(parameterIndex, ascii);
+    } catch (IOException e) {
+      throw new SQLException("Error reading ASCII stream", e);
+    }
   }
 
   @Override
   public void setUnicodeStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setUnicodeStream length must be non-negative");
+    }
+    if (length == 0) {
+      this.statement.bindText(parameterIndex, "");
+      return;
+    }
+    try {
+      byte[] buffer = new byte[length];
+      int offset = 0;
+      int read;
+      while (offset < length && (read = x.read(buffer, offset, length - offset)) > 0) {
+        offset += read;
+      }
+      String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
+      this.statement.bindText(parameterIndex, text);
+    } catch (IOException e) {
+      throw new SQLException("Error reading Unicode stream", e);
+    }
   }
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x, int length) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setBinaryStream length must be non-negative");
+    }
+    if (length == 0) {
+      this.statement.bindBlob(parameterIndex, new byte[0]);
+      return;
+    }
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+      byte[] buffer = new byte[8192];
+      int bytesRead;
+      int totalRead = 0;
+      while (totalRead < length
+          && (bytesRead = x.read(buffer, 0, Math.min(buffer.length, length - totalRead))) > 0) {
+        baos.write(buffer, 0, bytesRead);
+        totalRead += bytesRead;
+      }
+      byte[] data = baos.toByteArray();
+      this.statement.bindBlob(parameterIndex, data);
+    } catch (IOException e) {
+      throw new SQLException("Error reading binary stream", e);
+    }
   }
 
   @Override
