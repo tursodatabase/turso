@@ -60,7 +60,7 @@ pub enum TextSubtype {
     Json,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
     pub value: Cow<'static, str>,
@@ -93,7 +93,7 @@ impl Text {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct TextRef<'a> {
     pub value: &'a str,
     pub subtype: TextSubtype,
@@ -248,7 +248,7 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
     Integer(i64),
@@ -711,58 +711,14 @@ impl AggContext {
 
 impl PartialEq<Value> for Value {
     fn eq(&self, other: &Value) -> bool {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
-                sqlite_int_float_compare(*int, *float).is_eq()
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.eq(&text_right.value)
-            }
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
-            _ => false,
-        }
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.eq(&right)
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Float(float), Self::Integer(int)) => {
-                Some(sqlite_int_float_compare(*int, *float).reverse())
-            }
-            (Self::Integer(int), Self::Float(float)) => {
-                Some(sqlite_int_float_compare(*int, *float))
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                float_left.partial_cmp(float_right)
-            }
-            // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
-                Some(std::cmp::Ordering::Less)
-            }
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(&text_right.value)
-            }
-            // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -784,7 +740,8 @@ impl Eq for Value {}
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.cmp(&right)
     }
 }
 
@@ -1565,15 +1522,29 @@ impl Display for ValueRef<'_> {
     }
 }
 
-impl Eq for ValueRef<'_> {}
-
-impl Ord for ValueRef<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
+    fn eq(&self, other: &ValueRef<'a>) -> bool {
+        match (self, other) {
+            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
+            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
+                sqlite_int_float_compare(*int, *float).is_eq()
+            }
+            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.as_bytes() == text_right.value.as_bytes()
+            }
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
+impl<'a> Eq for ValueRef<'a> {}
+
+#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -1595,9 +1566,10 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
                 Some(std::cmp::Ordering::Greater)
             }
 
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(text_right.value)
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_left
+                .value
+                .as_bytes()
+                .partial_cmp(text_right.value.as_bytes()),
             // Text vs Blob
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
@@ -1607,6 +1579,12 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
             (_, Self::Null) => Some(std::cmp::Ordering::Greater),
         }
+    }
+}
+
+impl<'a> Ord for ValueRef<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
