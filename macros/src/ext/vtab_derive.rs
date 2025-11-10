@@ -18,6 +18,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
     let rowid_fn_name = format_ident!("rowid_{}", struct_name);
     let destroy_fn_name = format_ident!("destroy_{}", struct_name);
     let best_idx_fn_name = format_ident!("best_idx_{}", struct_name);
+    let begin_fn_name = format_ident!("begin_{}", struct_name);
+    let rollback_fn_name = format_ident!("rollback_{}", struct_name);
+    let commit_fn_name = format_ident!("commit_{}", struct_name);
+    let rename_fn_name = format_ident!("rename_{}", struct_name);
 
     let expanded = quote! {
         impl #struct_name {
@@ -228,6 +232,75 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
             }
 
             #[no_mangle]
+            pub unsafe extern "C" fn #begin_fn_name(
+                table: *mut ::std::ffi::c_void,
+            ) -> ::turso_ext::ResultCode {
+                let table = if table.is_null() {
+                    return ::turso_ext::ResultCode::Error;
+                } else {
+                    &mut *(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table)
+                };
+                if <#struct_name as ::turso_ext::VTabModule>::Table::begin(table).is_err() {
+                    return ::turso_ext::ResultCode::Error;
+                }
+                ::turso_ext::ResultCode::OK
+            }
+
+            #[no_mangle]
+            pub unsafe extern "C" fn #rollback_fn_name(
+                table: *mut ::std::ffi::c_void,
+            ) -> ::turso_ext::ResultCode {
+                let table = if table.is_null() {
+                    return ::turso_ext::ResultCode::Error;
+                } else {
+                    &mut *(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table)
+                };
+                if <#struct_name as ::turso_ext::VTabModule>::Table::rollback(table).is_err() {
+                    return ::turso_ext::ResultCode::Error;
+                }
+                ::turso_ext::ResultCode::OK
+            }
+
+            #[no_mangle]
+            pub unsafe extern "C" fn #commit_fn_name(
+                table: *mut ::std::ffi::c_void,
+            ) -> ::turso_ext::ResultCode {
+                let table = if table.is_null() {
+                    return ::turso_ext::ResultCode::Error;
+                } else {
+                    &mut *(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table)
+                };
+                if <#struct_name as ::turso_ext::VTabModule>::Table::commit(table).is_err() {
+                    return ::turso_ext::ResultCode::Error;
+                }
+                ::turso_ext::ResultCode::OK
+            }
+
+            #[no_mangle]
+            pub unsafe extern "C" fn #rename_fn_name(
+                table: *mut ::std::ffi::c_void,
+                name: *const ::std::ffi::c_char,
+            ) -> ::turso_ext::ResultCode {
+                let table = if table.is_null() {
+                    return ::turso_ext::ResultCode::Error;
+                } else {
+                    &mut *(table as *mut <#struct_name as ::turso_ext::VTabModule>::Table)
+                };
+                let name_str = if name.is_null() {
+                    return ::turso_ext::ResultCode::Error;
+                } else {
+                    match ::std::ffi::CStr::from_ptr(name).to_str() {
+                        Ok(s) => s,
+                        Err(_) => return ::turso_ext::ResultCode::Error,
+                    }
+                };
+                if <#struct_name as ::turso_ext::VTabModule>::Table::rename(table, name_str).is_err() {
+                    return ::turso_ext::ResultCode::Error;
+                }
+                ::turso_ext::ResultCode::OK
+            }
+
+            #[no_mangle]
             pub unsafe extern "C" fn #register_fn_name(
                 api: *const ::turso_ext::ExtensionApi
             ) -> ::turso_ext::ResultCode {
@@ -251,6 +324,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                     rowid: Self::#rowid_fn_name,
                     destroy: Self::#destroy_fn_name,
                     best_idx: Self::#best_idx_fn_name,
+                    begin: Self::#begin_fn_name,
+                    rollback: Self::#rollback_fn_name,
+                    commit: Self::#commit_fn_name,
+                    rename: Self::#rename_fn_name,
                 };
                 (api.register_vtab_module)(api.ctx, name_c, module, <#struct_name as ::turso_ext::VTabModule>::VTAB_KIND)
             }

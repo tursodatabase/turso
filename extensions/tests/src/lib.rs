@@ -53,6 +53,7 @@ impl VTabModule for KVStoreVTabModule {
             schema,
             KVStoreTable {
                 store: Rc::new(RefCell::new(BTreeMap::new())),
+                in_tx: false,
             },
         ))
     }
@@ -152,6 +153,7 @@ impl VTabCursor for KVStoreCursor {
 
 pub struct KVStoreTable {
     store: Store,
+    in_tx: bool,
 }
 
 impl VTable for KVStoreTable {
@@ -165,6 +167,31 @@ impl VTable for KVStoreTable {
             index: None,
             store: Rc::clone(&self.store),
         })
+    }
+
+    fn begin(&mut self) -> Result<(), Self::Error> {
+        assert!(!self.in_tx, "Already in a transaction");
+        self.in_tx = true;
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        assert!(self.in_tx, "Not in a transaction");
+        self.in_tx = false;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), Self::Error> {
+        assert!(self.in_tx, "Not in a transaction");
+        self.in_tx = false;
+        Ok(())
+    }
+
+    fn rename(&mut self, new_name: &str) -> Result<(), Self::Error> {
+        // not a real extension of course, just asserting test in
+        // testing/cli_tests/extensions.py
+        assert_eq!(new_name, "renamed");
+        Ok(())
     }
 
     fn best_index(

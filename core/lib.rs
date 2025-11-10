@@ -69,6 +69,7 @@ pub use io::{
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use schema::Schema;
+use std::collections::HashSet;
 use std::task::Waker;
 use std::{
     borrow::Cow,
@@ -649,6 +650,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            vtab_txn_states: RwLock::new(HashSet::new()),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1177,6 +1179,8 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
     fk_deferred_violations: AtomicIsize,
+    /// Track when each virtual table instance is currently in transaction.
+    vtab_txn_states: RwLock<HashSet<u64>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.

@@ -316,6 +316,9 @@ pub fn init_loop(
                     }
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::VOpen { cursor_id });
+                        if is_write {
+                            program.emit_insn(Insn::VBegin { cursor_id });
+                        }
                     }
                 }
             }

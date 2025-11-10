@@ -560,14 +560,14 @@ Modifiers:
 | TableLock      | No     |         |
 | Trace          | No     |         |
 | Transaction    | Yes    |         |
-| VBegin         | No     |         |
+| VBegin         | Yes    |         |
 | VColumn        | Yes    |         |
 | VCreate        | Yes    |         |
 | VDestroy       | Yes    |         |
 | VFilter        | Yes    |         |
 | VNext          | Yes    |         |
 | VOpen          | Yes    |         |
-| VRename        | No     |         |
+| VRename        | Yes    |         |
 | VUpdate        | Yes    |         |
 | Vacuum         | No     |         |
 | Variable       | Yes    |         |

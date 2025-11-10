@@ -488,6 +488,24 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::VBegin{cursor_id} => (
+                "VBegin",
+                *cursor_id as i32,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".into()
+              ),
+            Insn::VRename{cursor_id, new_name_reg} => (
+               "VRename",
+                *cursor_id as i32,
+                 *new_name_reg as i32,
+                 0,
+                Value::build_text(""),
+                 0,
+                 "".into(),
+            ),
             Insn::OpenPseudo {
                 cursor_id,
                 content_reg,
