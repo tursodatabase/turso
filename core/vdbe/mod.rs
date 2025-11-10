@@ -666,7 +666,7 @@ impl Program {
         state.registers[4] = Register::Value(Value::Integer(p3 as i64));
         state.registers[5] = Register::Value(p4);
         state.registers[6] = Register::Value(Value::Integer(p5 as i64));
-        state.registers[7] = Register::Value(Value::from_text(&comment));
+        state.registers[7] = Register::Value(Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
             count: EXPLAIN_COLUMNS.len(),
@@ -712,7 +712,7 @@ impl Program {
             state.registers[1] =
                 Register::Value(Value::Integer(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
             state.registers[2] = Register::Value(Value::Integer(0));
-            state.registers[3] = Register::Value(Value::from_text(detail.as_str()));
+            state.registers[3] = Register::Value(Value::from_text(detail.clone()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),

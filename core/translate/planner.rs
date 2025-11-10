@@ -241,7 +241,7 @@ fn link_with_window(
             original_expr: expr.clone(),
         });
     } else {
-        crate::bail_parse_error!("misuse of window function: {}()", func.to_string());
+        crate::bail_parse_error!("misuse of window function: {}()", func.as_str());
     }
     Ok(())
 }

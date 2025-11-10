@@ -128,7 +128,7 @@ impl From<Value> for turso_core::Value {
             Value::Null => turso_core::Value::Null,
             Value::Integer(n) => turso_core::Value::Integer(n),
             Value::Real(n) => turso_core::Value::Float(n),
-            Value::Text(t) => turso_core::Value::from_text(&t),
+            Value::Text(t) => turso_core::Value::from_text(t),
             Value::Blob(items) => turso_core::Value::from_blob(items),
         }
     }

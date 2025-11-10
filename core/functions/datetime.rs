@@ -96,14 +96,14 @@ fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOut
 
 fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Value {
     match output_type {
-        DateTimeOutput::Date => Value::from_text(dt.format("%Y-%m-%d").to_string().as_str()),
+        DateTimeOutput::Date => Value::from_text(dt.format("%Y-%m-%d").to_string()),
         DateTimeOutput::Time => {
             let t = if subsec {
                 dt.format("%H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%H:%M:%S").to_string()
             };
-            Value::from_text(t.as_str())
+            Value::from_text(t)
         }
         DateTimeOutput::DateTime => {
             let t = if subsec && dt.nanosecond() != 0 {
@@ -111,11 +111,9 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             };
-            Value::from_text(t.as_str())
+            Value::from_text(t)
         }
-        DateTimeOutput::StrfTime(format_str) => {
-            Value::from_text(strftime_format(&dt, &format_str).as_str())
-        }
+        DateTimeOutput::StrfTime(format_str) => Value::from_text(strftime_format(&dt, &format_str)),
         DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
     }
 }
@@ -832,7 +830,7 @@ mod tests {
         let test_date_str = "2024-07-21";
         let next_date_str = "2024-07-22";
 
-        let test_cases = vec![
+        let test_cases: Vec<(Value, &str)> = vec![
             // Format 1: YYYY-MM-DD (no timezone applicable)
             (Value::build_text("2024-07-21"), test_date_str),
             // Format 2: YYYY-MM-DD HH:MM
@@ -936,7 +934,7 @@ mod tests {
             let result = exec_date(&[Register::Value(input.clone())]);
             assert_eq!(
                 result,
-                Value::build_text(expected),
+                Value::build_text(expected.to_string()),
                 "Failed for input: {input:?}"
             );
         }
@@ -1428,7 +1426,7 @@ mod tests {
     }
 
     fn text(value: &str) -> Register {
-        Register::Value(Value::build_text(value))
+        Register::Value(Value::build_text(value.to_string()))
     }
 
     fn format(dt: NaiveDateTime) -> String {

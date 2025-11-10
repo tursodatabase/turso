@@ -18,7 +18,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::task::Waker;
@@ -63,7 +63,7 @@ pub enum TextSubtype {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
-    pub value: Vec<u8>,
+    pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
 }
 
@@ -74,22 +74,22 @@ impl Display for Text {
 }
 
 impl Text {
-    pub fn new(value: &str) -> Self {
+    pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            value: value.as_bytes().to_vec(),
+            value: value.into(),
             subtype: TextSubtype::Text,
         }
     }
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
-            value: value.into_bytes(),
+            value: value.into(),
             subtype: TextSubtype::Json,
         }
     }
 
     pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
+        &self.value
     }
 }
 
@@ -133,8 +133,9 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.value.clear();
-        self.value.extend_from_slice(other.as_ref().as_bytes());
+        let value = self.value.to_mut();
+        value.clear();
+        value.push_str(other.as_ref());
         self.subtype = other.subtype();
     }
 }
@@ -188,7 +189,7 @@ impl AsRef<str> for Text {
 impl From<&str> for Text {
     fn from(value: &str) -> Self {
         Text {
-            value: value.as_bytes().to_vec(),
+            value: value.to_owned().into(),
             subtype: TextSubtype::Text,
         }
     }
@@ -197,7 +198,7 @@ impl From<&str> for Text {
 impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
-            value: value.into_bytes(),
+            value: Cow::from(value),
             subtype: TextSubtype::Text,
         }
     }
@@ -205,7 +206,7 @@ impl From<String> for Text {
 
 impl From<Text> for String {
     fn from(value: Text) -> Self {
-        String::from_utf8(value.value).unwrap()
+        value.value.into_owned()
     }
 }
 
@@ -359,7 +360,7 @@ impl Value {
             Value::Integer(v) => ValueRef::Integer(*v),
             Value::Float(v) => ValueRef::Float(*v),
             Value::Text(v) => ValueRef::Text(TextRef {
-                value: &v.value,
+                value: v.value.as_bytes(),
                 subtype: v.subtype,
             }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
@@ -367,8 +368,8 @@ impl Value {
     }
 
     // A helper function that makes building a text Value easier.
-    pub fn build_text(text: impl AsRef<str>) -> Self {
-        Self::Text(Text::new(text.as_ref()))
+    pub fn build_text(text: impl Into<Cow<'static, str>>) -> Self {
+        Self::Text(Text::new(text))
     }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -424,7 +425,7 @@ impl Value {
         }
     }
 
-    pub fn from_text(text: &str) -> Self {
+    pub fn from_text(text: impl Into<Cow<'static, str>>) -> Self {
         Value::Text(Text::new(text))
     }
 
@@ -453,7 +454,7 @@ impl Value {
                 }
             }
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            Value::Text(t) => out.extend_from_slice(&t.value),
+            Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -535,7 +536,7 @@ impl Value {
                 if v.is_json() {
                     return Ok(Value::Text(Text::json(text.to_string())));
                 }
-                Ok(Value::build_text(text))
+                Ok(Value::build_text(text.to_string()))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
@@ -828,26 +829,26 @@ impl std::ops::AddAssign for Value {
                 *float_left += float_right;
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
-                string_left.value.extend_from_slice(&string_right.value);
+                string_left.value.to_mut().push_str(&string_right.value);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Text(string_left), Self::Integer(int_right)) => {
                 let string_right = int_right.to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Integer(int_left), Self::Text(string_right)) => {
                 let string_left = int_left.to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (Self::Text(string_left), Self::Float(float_right)) => {
                 let string_right = Self::Float(float_right).to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Float(float_left), Self::Text(string_right)) => {
                 let string_left = Self::Float(*float_left).to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (_, Self::Null) => {}
             (Self::Null, rhs) => *self = rhs,
@@ -1132,7 +1133,7 @@ impl ImmutableRecord {
                 }
                 Value::Float(f) => writer.extend_from_slice(&f.to_be_bytes()),
                 Value::Text(t) => {
-                    writer.extend_from_slice(&t.value);
+                    writer.extend_from_slice(t.value.as_bytes());
                 }
                 Value::Blob(b) => {
                     writer.extend_from_slice(b);
@@ -1544,7 +1545,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Float(f) => Value::Float(*f),
             ValueRef::Text(text) => Value::Text(Text {
-                value: text.value.to_vec(),
+                value: text.as_str().to_string().into(),
                 subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
@@ -2394,7 +2395,7 @@ impl Record {
                     }
                 }
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                Value::Text(t) => buf.extend_from_slice(&t.value),
+                Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
         }

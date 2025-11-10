@@ -271,7 +271,7 @@ impl CompiledExpression {
                         }
                     }
                     Literal::String(s) => {
-                        let cleaned = s.trim_matches('\'').trim_matches('"');
+                        let cleaned = s.trim_matches('\'').trim_matches('"').to_string();
                         Value::Text(Text::new(cleaned))
                     }
                     Literal::Null => Value::Null,

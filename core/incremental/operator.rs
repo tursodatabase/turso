@@ -691,7 +691,7 @@ mod tests {
                 i,
                 vec![
                     Value::Integer(i),
-                    Value::Text(Text::new(&category)),
+                    Value::Text(Text::new(category)),
                     Value::Integer(i * 10),
                 ],
             );
@@ -4442,7 +4442,7 @@ mod tests {
             .iter()
             .map(|(row, _)| {
                 let category = match &row.values[0] {
-                    Value::Text(s) => String::from_utf8(s.value.clone()).unwrap(),
+                    Value::Text(s) => s.value.clone().into_owned(),
                     _ => panic!("Expected text for category"),
                 };
                 let value = match &row.values[1] {
