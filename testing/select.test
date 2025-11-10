@@ -1227,3 +1227,245 @@ do_execsql_test_on_specific_db {:memory:} collate-compound-15 {
   INTERSECT
   SELECT 'TEST' COLLATE NOCASE;
 } {test}
+
+# Queries that use an idx and have to do an affinity conversion
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-1 {
+  CREATE TABLE t(a TEXT);
+  INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
+  CREATE INDEX idx ON t(a);
+  SELECT * FROM t WHERE a >= 2;
+} {2
+2a}
+
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-2 {
+  CREATE TABLE t(a TEXT);
+  INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
+  CREATE INDEX idx ON t(a);
+  SELECT * FROM t WHERE a == 2;
+} {2}
+
+# Test suite for SQLite affinity conversion in WHERE clauses
+
+# ============================================
+# TEST 1: TEXT column with INTEGER value
+# Should emit OP_Affinity to convert 2 → '2'
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-4 {
+  CREATE TABLE t1(a TEXT);
+  INSERT INTO t1 VALUES ('10'), ('2'), ('02'), ('2a');
+  CREATE INDEX idx1 ON t1(a);
+  SELECT * FROM t1 WHERE a >= 2;
+} {2 2a}
+
+# ============================================
+# TEST 2: TEXT column with INTEGER equality
+# Should emit OP_Affinity for equality comparison
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-5 {
+  CREATE TABLE t2(name TEXT);
+  INSERT INTO t2 VALUES ('100'), ('20'), ('abc'), ('2');
+  CREATE INDEX idx2 ON t2(name);
+  SELECT * FROM t2 WHERE name = 100;
+} {100}
+
+# ============================================
+# TEST 3: INTEGER column with convertible string
+# Should emit OP_Affinity with INTEGER affinity
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-6 {
+  CREATE TABLE t3(value INTEGER);
+  INSERT INTO t3 VALUES (100), (20), (5), (200);
+  CREATE INDEX idx3 ON t3(value);
+  SELECT * FROM t3 WHERE value >= '100';
+} {100 200}
+
+# ============================================
+# TEST 4: INTEGER column with non-convertible string
+# String 'abc' cannot convert to integer
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-7 {
+  CREATE TABLE t4(value INTEGER);
+  INSERT INTO t4 VALUES (100), (20), (5);
+  CREATE INDEX idx4 ON t4(value);
+  SELECT * FROM t4 WHERE value >= 'abc';
+} {}
+
+# ============================================
+# TEST 5: NUMERIC column with integer
+# Should emit OP_Affinity with NUMERIC affinity
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-8 {
+  CREATE TABLE t5(score NUMERIC);
+  INSERT INTO t5 VALUES (100), (20.5), ('30'), (45);
+  CREATE INDEX idx5 ON t5(score);
+  SELECT * FROM t5 WHERE score >= 50;
+} {100}
+
+# ============================================
+# TEST 6: REAL column with integer
+# Should emit OP_Affinity to convert to REAL
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-9 {
+  CREATE TABLE t6(price REAL);
+  INSERT INTO t6 VALUES (99.99), (19.99), (50.00), (25.50);
+  CREATE INDEX idx6 ON t6(price);
+  SELECT * FROM t6 WHERE price < 50;
+} {19.99 25.5}
+
+# ============================================
+# TEST 7: TEXT column with REAL value
+# Should emit OP_Affinity to convert 20.5 → '20.5'
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-10 {
+  CREATE TABLE t7(name TEXT);
+  INSERT INTO t7 VALUES ('100'), ('20.5'), ('abc'), ('30');
+  CREATE INDEX idx7 ON t7(name);
+  SELECT * FROM t7 WHERE name = 20.5;
+} {20.5}
+
+# TODO: Program does not emit correct opcodes to handle this IN query yet
+# ============================================
+# TEST 8: TEXT column with IN clause
+# Should emit OP_Affinity for batch conversion
+# ============================================
+# do_execsql_test_on_specific_db {:memory:} affinity-conversion-11 {
+#  CREATE TABLE t8(name TEXT);
+#  INSERT INTO t8 VALUES ('1'), ('2'), ('3'), ('4'), ('abc');
+#  CREATE INDEX idx8 ON t8(name);
+#  SELECT * FROM t8 WHERE name IN (1, 2, 3);
+#} {1 2 3}
+
+# ============================================
+# TEST 9: Compound index with mixed types
+# Should emit OP_Affinity with multi-char affinity string
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-12 {
+  CREATE TABLE t9(a TEXT, b INTEGER, c NUMERIC);
+  INSERT INTO t9 VALUES ('100', 200, 300);
+  INSERT INTO t9 VALUES ('50', 100, 150);
+  INSERT INTO t9 VALUES ('200', 300, 400);
+  CREATE INDEX idx9 ON t9(a, b, c);
+  SELECT * FROM t9 WHERE a = 100 AND b = '200' AND c >= 300;
+} {100|200|300}
+
+# ============================================
+# TEST 10: INTEGER PRIMARY KEY range (NO affinity)
+# Contrast: should NOT emit OP_Affinity
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-13 {
+  CREATE TABLE t10(x INTEGER PRIMARY KEY);
+  INSERT INTO t10 VALUES (1), (2), (100), (200);
+  SELECT * FROM t10 WHERE x < '100';
+} {1 2}
+
+# TODO: INDEXED BY not supported yet
+# ============================================
+# TEST 11: Same query but forcing index usage
+# Should emit OP_Affinity (takes indexed path)
+# ============================================
+# do_execsql_test_on_specific_db {:memory:} affinity-conversion-14 {
+#   CREATE TABLE t11(x INTEGER PRIMARY KEY);
+#   INSERT INTO t11 VALUES (1), (2), (100), (200);
+#   CREATE INDEX idx11 ON t11(x);
+#   SELECT * FROM t11 INDEXED BY idx11 WHERE x < '100';
+# } {1 2}
+
+# ============================================
+# TEST 12: TEXT column with string that looks numeric
+# Should apply TEXT affinity and use lexicographic order
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-15 {
+  CREATE TABLE t12(name TEXT);
+  INSERT INTO t12 VALUES ('1'), ('10'), ('2'), ('20');
+  CREATE INDEX idx12 ON t12(name);
+  SELECT * FROM t12 WHERE name >= '2' ORDER BY name;
+} {2 20}
+
+# ============================================
+# TEST 13: INTEGER column with float string
+# Should convert '50.5' to 50 (INTEGER affinity)
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-16 {
+  CREATE TABLE t13(value INTEGER);
+  INSERT INTO t13 VALUES (50), (51), (100);
+  CREATE INDEX idx13 ON t13(value);
+  SELECT * FROM t13 WHERE value >= '50.5';
+} {51 100}
+
+# ============================================
+# TEST 14: NUMERIC with text that converts
+# Should apply NUMERIC affinity
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-17 {
+  CREATE TABLE t14(score NUMERIC);
+  INSERT INTO t14 VALUES (10), (20), (30), (40);
+  CREATE INDEX idx14 ON t14(score);
+  SELECT * FROM t14 WHERE score BETWEEN '15' AND '35';
+} {20 30}
+
+# ============================================
+# TEST 15: Multiple columns, only one needs conversion
+# Should emit affinity string with mixed affinities
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-18 {
+  CREATE TABLE t15(a INTEGER, b TEXT);
+  INSERT INTO t15 VALUES (1, '100'), (2, '200'), (3, '300');
+  CREATE INDEX idx15 ON t15(a, b);
+  SELECT * FROM t15 WHERE a = '2' AND b = 200;
+} {2|200}
+
+# ============================================
+# TEST 16: BLOB column (should not convert)
+# BLOB affinity doesn't perform conversions
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-19 {
+  CREATE TABLE t16(data BLOB);
+  INSERT INTO t16 VALUES (X'48656c6c6f'), (X'576f726c64');
+  CREATE INDEX idx16 ON t16(data);
+  SELECT typeof(data) FROM t16 WHERE data >= X'48';
+} {blob blob}
+
+# ============================================
+# TEST 17: Negative numbers with TEXT affinity
+# Should convert -5 to '-5' for comparison
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-20 {
+  CREATE TABLE t17(name TEXT);
+  INSERT INTO t17 VALUES ('-10'), ('-5'), ('0'), ('5');
+  CREATE INDEX idx17 ON t17(name);
+  SELECT * FROM t17 WHERE name >= -5;
+} {-5 0 5}
+
+# ============================================
+# TEST 18: Zero with different types
+# Tests affinity with special value zero
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-21 {
+  CREATE TABLE t18(value NUMERIC);
+  INSERT INTO t18 VALUES (0), (0.0), ('0'), (1), (-1);
+  CREATE INDEX idx18 ON t18(value);
+  SELECT * FROM t18 WHERE value = 0;
+} {0 0 0}
+
+# ============================================
+# TEST 19: Large numbers requiring conversion
+# Tests affinity (B) with large integer values
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-22 {
+  CREATE TABLE t19(val TEXT);
+  INSERT INTO t19 VALUES ('1000000'), ('999999'), ('1000001');
+  CREATE INDEX idx19 ON t19(val);
+  SELECT * FROM t19 WHERE val = 1000000;
+} {1000000}
+
+# TODO: cannot use expressions yet in CREATE INDEX
+# ============================================
+# TEST 20: Mixed case with expression index
+# Expression index with affinity conversion
+# ============================================
+# do_execsql_test_on_specific_db {:memory:} affinity-conversion-23 {
+#   CREATE TABLE t20(name TEXT);
+#   INSERT INTO t20 VALUES ('ABC'), ('abc'), ('123');
+#   CREATE INDEX idx20 ON t20(lower(name));
+#   SELECT * FROM t20 WHERE lower(name) = 'abc';
+# } {ABC abc}
