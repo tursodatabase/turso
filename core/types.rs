@@ -1496,6 +1496,42 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    pub fn to_text(&self) -> Option<&'a str> {
+        match self {
+            Self::Text(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_blob(&self) -> &'a [u8] {
+        match self {
+            Self::Blob(b) => b,
+            _ => panic!("as_blob must be called only for Value::Blob"),
+        }
+    }
+
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Self::Float(f) => *f,
+            Self::Integer(i) => *i as f64,
+            _ => panic!("as_float must be called only for Value::Float or Value::Integer"),
+        }
+    }
+
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    pub fn as_uint(&self) -> u64 {
+        match self {
+            Self::Integer(i) => (*i).cast_unsigned(),
+            _ => 0,
+        }
+    }
+
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,
@@ -1506,6 +1542,16 @@ impl<'a> ValueRef<'a> {
                 subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        }
+    }
+
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Self::Null => ValueType::Null,
+            Self::Integer(_) => ValueType::Integer,
+            Self::Float(_) => ValueType::Float,
+            Self::Text(_) => ValueType::Text,
+            Self::Blob(_) => ValueType::Blob,
         }
     }
 }

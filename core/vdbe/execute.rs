@@ -5219,51 +5219,52 @@ pub fn op_function(
                 );
             }
         },
-        crate::function::Func::Vector(vector_func) => match vector_func {
-            VectorFunc::Vector => {
-                let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
+        crate::function::Func::Vector(vector_func) => {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+            match vector_func {
+                VectorFunc::Vector => {
+                    let result = vector32(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector32 => {
+                    let result = vector32(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector32Sparse => {
+                    let result = vector32_sparse(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector64 => {
+                    let result = vector64(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorExtract => {
+                    let result = vector_extract(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceCos => {
+                    let result = vector_distance_cos(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceL2 => {
+                    let result = vector_distance_l2(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceJaccard => {
+                    let result = vector_distance_jaccard(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorConcat => {
+                    let result = vector_concat(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorSlice => {
+                    let result = vector_slice(values)?;
+                    state.registers[*dest] = Register::Value(result)
+                }
             }
-            VectorFunc::Vector32 => {
-                let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::Vector32Sparse => {
-                let result = vector32_sparse(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::Vector64 => {
-                let result = vector64(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorExtract => {
-                let result = vector_extract(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceCos => {
-                let result =
-                    vector_distance_cos(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceL2 => {
-                let result =
-                    vector_distance_l2(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceJaccard => {
-                let result =
-                    vector_distance_jaccard(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorConcat => {
-                let result = vector_concat(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorSlice => {
-                let result = vector_slice(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result)
-            }
-        },
+        }
         crate::function::Func::External(f) => match f.func {
             ExtFunc::Scalar(f) => {
                 if arg_count == 0 {
