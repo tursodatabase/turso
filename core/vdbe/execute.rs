@@ -945,7 +945,6 @@ pub fn op_open_read(
                     mv_store,
                     tx_id,
                     *root_page,
-                    pager.clone(),
                     btree_cursor,
                 )?))
             } else {
@@ -7117,7 +7116,6 @@ pub fn op_open_write(
                         mv_store,
                         tx_id,
                         root_page,
-                        pager.clone(),
                         btree_cursor,
                     )?))
                 } else {
@@ -8112,13 +8110,7 @@ pub fn op_open_dup(
             let cursor: Box<dyn CursorTrait> =
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store.unwrap().clone();
-                    Box::new(MvCursor::new(
-                        mv_store,
-                        tx_id,
-                        root_page,
-                        pager.clone(),
-                        cursor,
-                    )?)
+                    Box::new(MvCursor::new(mv_store, tx_id, root_page, cursor)?)
                 } else {
                     cursor
                 };

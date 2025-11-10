@@ -60,7 +60,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
         root_page_or_table_id: i64,
-        pager: Arc<Pager>,
         btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
         assert!(
@@ -311,7 +310,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             // In End we can assume we have already called next and it returned false, so we can assume we have consumed the rowid.
             let btree_consumed = match self.get_current_pos() {
                 CursorPosition::Loaded {
-                    row_id,
+                    row_id: _,
                     in_btree: _,
                     btree_consumed,
                 } => btree_consumed,
