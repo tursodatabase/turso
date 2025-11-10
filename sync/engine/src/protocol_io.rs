@@ -3,11 +3,11 @@ use crate::{
     Result,
 };
 
-pub trait DataPollResult<T> {
+pub trait DataPollResult<T>: Send + Sync + 'static {
     fn data(&self) -> &[T];
 }
 
-pub trait DataCompletion<T> {
+pub trait DataCompletion<T>: Send + Sync + 'static {
     type DataPollResult: DataPollResult<T>;
     fn status(&self) -> Result<Option<u16>>;
     fn poll_data(&self) -> Result<Option<Self::DataPollResult>>;
@@ -30,5 +30,6 @@ pub trait ProtocolIO: Send + Sync + 'static {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<Self::DataCompletionBytes>;
-    fn register(&self, callback: Box<dyn FnMut() -> bool>);
+    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send + Sync>);
+    fn step_work(&self);
 }

@@ -107,6 +107,10 @@ export interface DatabaseOpts {
      * optional parameter to enable internal logging for the database
      */
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
+    /**
+     * optional parameter to enable partial sync for the database
+     */
+    partial?: boolean;
 }
 export interface DatabaseStats {
     /**

@@ -306,7 +306,7 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
     server_revision: &str,
     pages: &[u32],
 ) -> Result<Vec<u8>> {
-    tracing::info!("pull_pages_v1: revision={server_revision}");
+    tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
     let mut bytes = BytesMut::new();
 
     let mut bitmap = RoaringBitmap::new();
@@ -1092,15 +1092,21 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     main_db_path: &str,
     prefix: Option<usize>,
 ) -> Result<DatabasePullRevision> {
-    let mut bitmap = RoaringBitmap::new();
-    if let Some(prefix) = prefix {
-        bitmap.insert_range(0..(prefix / PAGE_SIZE) as u32);
-    }
-
-    let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
-    bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
-        Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
-    })?;
+    let bitmap_bytes = {
+        if let Some(prefix) = prefix {
+            let mut bitmap = RoaringBitmap::new();
+            bitmap.insert_range(0..(prefix / PAGE_SIZE) as u32);
+            let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+            bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
+                Error::DatabaseSyncEngineError(format!(
+                    "unable to serialize bootstrap request: {e}"
+                ))
+            })?;
+            bitmap_bytes
+        } else {
+            Vec::new()
+        }
+    };
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
@@ -1525,8 +1531,6 @@ mod tests {
         fn is_done(&self) -> crate::Result<bool> {
             Ok(self.data.borrow().is_empty())
         }
-
-        fn set_callback(&self, callback: Box<dyn FnMut() -> ()>) {}
     }
 
     #[test]

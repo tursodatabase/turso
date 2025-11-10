@@ -163,7 +163,7 @@ export declare class JsDataCompletion {
 }
 
 export declare class JsProtocolIo {
-  takeRequest(): JsProtocolRequestBytes | null
+
 }
 
 export declare class JsProtocolRequestBytes {
@@ -178,6 +178,7 @@ export declare class SyncEngine {
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
   protocolIo(): JsProtocolRequestBytes | null
+  protocolIoStep(): void
   push(): GeneratorHolder
   stats(): GeneratorHolder
   wait(): GeneratorHolder
@@ -240,6 +241,7 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
+  partial?: boolean
 }
 
 export declare const enum SyncEngineProtocolVersion {

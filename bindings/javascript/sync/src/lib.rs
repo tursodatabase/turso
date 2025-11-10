@@ -14,6 +14,7 @@ use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
     database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    protocol_io::ProtocolIO,
     types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
 };
 
@@ -302,6 +303,11 @@ impl SyncEngine {
     #[napi]
     pub fn protocol_io(&self) -> napi::Result<Option<JsProtocolRequestBytes>> {
         Ok(self.protocol()?.take_request())
+    }
+
+    #[napi]
+    pub fn protocol_io_step(&self) -> napi::Result<()> {
+        Ok(self.protocol()?.step_work())
     }
 
     #[napi]

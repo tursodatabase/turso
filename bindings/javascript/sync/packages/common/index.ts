@@ -1,7 +1,17 @@
-import { run, memoryIO, SyncEngineGuards } from "./run.js"
-import { DatabaseOpts, ProtocolIo, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, DatabaseChangeType, EncryptionOpts } from "./types.js"
+import { run, memoryIO, runner, SyncEngineGuards, Runner } from "./run.js"
+import {
+    DatabaseOpts,
+    ProtocolIo,
+    RunOpts,
+    DatabaseRowMutation,
+    DatabaseRowStatement,
+    DatabaseRowTransformResult,
+    DatabaseStats,
+    DatabaseChangeType,
+    EncryptionOpts,
+} from "./types.js"
 
-export { run, memoryIO, SyncEngineGuards }
+export { run, memoryIO, runner, SyncEngineGuards, Runner }
 export type {
     DatabaseStats,
     DatabaseOpts,
