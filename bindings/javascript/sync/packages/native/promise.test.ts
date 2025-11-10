@@ -13,6 +13,40 @@ function cleanup(path) {
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
 
+test('partial sync', async () => {
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS partial(value BLOB)");
+        await db.exec("DELETE FROM partial");
+        await db.exec("INSERT INTO partial SELECT randomblob(1024) FROM generate_series(1, 2000)");
+        await db.push();
+        await db.close();
+    }
+
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+        longPollTimeoutMs: 100,
+        partial: true,
+    });
+
+    // 128 pages plus some overhead (very rough estimation)
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (4096 + 128));
+
+    // select of one record shouldn't increase amount of received data
+    expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (4096 + 128));
+
+    await db.prepare("INSERT INTO partial VALUES (-1)").run();
+
+    expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
+    expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
+})
+
 test('concurrent-actions-consistency', async () => {
     {
         const db = await connect({

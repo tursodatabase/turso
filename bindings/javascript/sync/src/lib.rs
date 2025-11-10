@@ -333,6 +333,8 @@ impl SyncEngine {
                 last_pull_unix_time: stats.last_pull_unix_time,
                 last_push_unix_time: stats.last_push_unix_time,
                 revision: stats.revision,
+                network_sent_bytes: stats.network_sent_bytes as i64,
+                network_received_bytes: stats.network_received_bytes as i64,
             }))
         })
     }

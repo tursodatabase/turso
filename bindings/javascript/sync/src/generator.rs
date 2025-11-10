@@ -48,6 +48,8 @@ pub enum GeneratorResponse {
         last_pull_unix_time: Option<i64>,
         last_push_unix_time: Option<i64>,
         revision: Option<String>,
+        network_sent_bytes: i64,
+        network_received_bytes: i64,
     },
     SyncEngineChanges {
         changes: SyncEngineChanges,

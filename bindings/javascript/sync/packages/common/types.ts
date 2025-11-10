@@ -138,6 +138,14 @@ export interface DatabaseStats {
      * (can be used as e-tag, but string must not be interpreted in any way and must be used as opaque value)
      */
     revision: string | null;
+    /**
+     * total amount of sent bytes over the network
+     */
+    networkSentBytes: number;
+    /**
+     * total amount of received bytes over the network
+     */
+    networkReceivedBytes: number;
 }
 
 /* internal types used in the native/browser packages */
