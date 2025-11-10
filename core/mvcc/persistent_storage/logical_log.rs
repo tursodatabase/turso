@@ -640,7 +640,7 @@ mod tests {
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
-            assert_eq!(foo.value, value.as_bytes());
+            assert_eq!(foo.as_str(), value.as_str());
         }
     }
 

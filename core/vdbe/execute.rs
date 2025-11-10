@@ -5087,7 +5087,7 @@ pub fn op_function(
 
                         let name = column.name.as_ref().unwrap();
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(TextRef::new(name.as_bytes(), TextSubtype::Text)),
+                            ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());

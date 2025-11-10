@@ -95,18 +95,18 @@ impl Text {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextRef<'a> {
-    pub value: &'a [u8],
+    pub value: &'a str,
     pub subtype: TextSubtype,
 }
 
 impl<'a> TextRef<'a> {
-    pub fn new(value: &'a [u8], subtype: TextSubtype) -> Self {
+    pub fn new(value: &'a str, subtype: TextSubtype) -> Self {
         Self { value, subtype }
     }
 
     #[inline]
     pub fn as_str(&self) -> &'a str {
-        unsafe { std::str::from_utf8_unchecked(self.value) }
+        self.value
     }
 }
 
@@ -360,7 +360,7 @@ impl Value {
             Value::Integer(v) => ValueRef::Integer(*v),
             Value::Float(v) => ValueRef::Float(*v),
             Value::Text(v) => ValueRef::Text(TextRef {
-                value: v.value.as_bytes(),
+                value: &v.value,
                 subtype: v.subtype,
             }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
@@ -1545,7 +1545,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Float(f) => Value::Float(*f),
             ValueRef::Text(text) => Value::Text(Text {
-                value: text.as_str().to_string().into(),
+                value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
@@ -2906,7 +2906,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "integer_text_equal",
             ),
@@ -2914,7 +2914,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"world", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("world", TextSubtype::Text)),
                 ],
                 "integer_equal_text_different",
             ),
@@ -2944,34 +2944,34 @@ mod tests {
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_strings",
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "less_than_strings",
             ),
             (
                 vec![Value::Text(Text::new("xyz"))],
-                vec![ValueRef::Text(TextRef::new(b"abc", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("abc", TextSubtype::Text))],
                 "greater_than_strings",
             ),
             (
                 vec![Value::Text(Text::new(""))],
-                vec![ValueRef::Text(TextRef::new(b"", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("", TextSubtype::Text))],
                 "empty_strings",
             ),
             (
                 vec![Value::Text(Text::new("a"))],
-                vec![ValueRef::Text(TextRef::new(b"aa", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("aa", TextSubtype::Text))],
                 "prefix_strings",
             ),
             // Multi-field with string first
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(42),
                 ],
                 "string_integer_equal",
@@ -2979,7 +2979,7 @@ mod tests {
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(99),
                 ],
                 "string_equal_integer_different",
@@ -3015,7 +3015,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "null_vs_text",
             ),
             (
@@ -3026,12 +3026,12 @@ mod tests {
             // Numbers vs Text/Blob
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "integer_vs_text",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "float_vs_text",
             ),
             (
@@ -3095,7 +3095,7 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "desc_string_reversed",
             ),
             // Mixed sort orders
@@ -3103,7 +3103,7 @@ mod tests {
                 vec![Value::Integer(10), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(20),
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "desc_first_asc_second",
             ),
@@ -3129,7 +3129,7 @@ mod tests {
                 vec![Value::Integer(42)],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"extra", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("extra", TextSubtype::Text)),
                 ],
                 "fewer_serialized_fields",
             ),
@@ -3152,13 +3152,13 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(5)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
                 vec![Value::Text(Text::new("same")), Value::Integer(5)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"same", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("same", TextSubtype::Text)),
                     ValueRef::Integer(5),
                 ],
                 "equal_text_then_equal_int",
@@ -3220,7 +3220,7 @@ mod tests {
 
         let int_values = vec![
             ValueRef::Integer(42),
-            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
         ];
         assert!(matches!(
             find_compare(&int_values, &index_info_small),
@@ -3228,7 +3228,7 @@ mod tests {
         ));
 
         let string_values = vec![
-            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Integer(42),
         ];
         assert!(matches!(
