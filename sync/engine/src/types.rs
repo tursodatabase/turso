@@ -71,6 +71,8 @@ pub struct SyncEngineStats {
     pub last_pull_unix_time: Option<i64>,
     pub last_push_unix_time: Option<i64>,
     pub revision: Option<String>,
+    pub network_sent_bytes: usize,
+    pub network_received_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

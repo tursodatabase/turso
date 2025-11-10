@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use turso_core::{DatabaseStorage, OpenFlags};
@@ -11,7 +14,7 @@ use crate::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
         reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
-        wal_pull_to_file, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        wal_pull_to_file, ProtocolIoStats, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_sync_partial_storage::PartialDatabaseStorage,
     database_tape::{
@@ -44,9 +47,29 @@ pub struct DatabaseSyncEngineOpts {
     pub partial: bool,
 }
 
+pub struct DataStats {
+    pub written_bytes: AtomicUsize,
+    pub read_bytes: AtomicUsize,
+}
+
+impl DataStats {
+    pub fn new() -> Self {
+        Self {
+            written_bytes: AtomicUsize::new(0),
+            read_bytes: AtomicUsize::new(0),
+        }
+    }
+    pub fn write(&self, size: usize) {
+        self.written_bytes.fetch_add(size, Ordering::SeqCst);
+    }
+    pub fn read(&self, size: usize) {
+        self.read_bytes.fetch_add(size, Ordering::SeqCst);
+    }
+}
+
 pub struct DatabaseSyncEngine<P: ProtocolIO> {
     io: Arc<dyn turso_core::IO>,
-    protocol: Arc<P>,
+    protocol: ProtocolIoStats<P>,
     db_file: Arc<dyn turso_core::storage::database::DatabaseStorage>,
     main_tape: DatabaseTape,
     main_db_wal_path: String,
@@ -80,12 +103,13 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
 
         let completion = protocol.full_read(&meta_path)?;
-        let data = wait_all_results(coro, &completion).await?;
+        let data = wait_all_results(coro, &completion, None).await?;
         let meta = if data.is_empty() {
             None
         } else {
             Some(DatabaseMetadata::load(&data)?)
         };
+        let protocol = ProtocolIoStats::new(protocol);
 
         let meta = match meta {
             Some(meta) => meta,
@@ -98,7 +122,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                 };
                 let revision = bootstrap_db_file(
                     coro,
-                    protocol.as_ref(),
+                    &protocol,
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -124,7 +148,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
                 let completion = protocol.full_write(&meta_path, meta.dump()?)?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-                wait_all_results(coro, &completion).await?;
+                wait_all_results(coro, &completion, None).await?;
                 meta
             }
             None => {
@@ -154,7 +178,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
                 let completion = protocol.full_write(&meta_path, meta.dump()?)?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-                wait_all_results(coro, &completion).await?;
+                wait_all_results(coro, &completion, None).await?;
                 meta
             }
         };
@@ -342,6 +366,16 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             last_pull_unix_time,
             last_push_unix_time,
             revision,
+            network_sent_bytes: self
+                .protocol
+                .network_stats
+                .written_bytes
+                .load(Ordering::SeqCst),
+            network_received_bytes: self
+                .protocol
+                .network_stats
+                .read_bytes
+                .load(Ordering::SeqCst),
         })
     }
 
@@ -458,7 +492,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let revision = self.meta().synced_revision.clone();
         let next_revision = wal_pull_to_file(
             coro,
-            self.protocol.as_ref(),
+            &self.protocol,
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
@@ -707,13 +741,8 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
             let mut transformed = if self.opts.use_transform {
                 Some(
-                    apply_transformation(
-                        coro,
-                        self.protocol.as_ref(),
-                        &local_changes,
-                        &replay.generator,
-                    )
-                    .await?,
+                    apply_transformation(coro, &self.protocol, &local_changes, &replay.generator)
+                        .await?,
                 )
             } else {
                 None
@@ -755,7 +784,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
         let (_, change_id) = push_logical_changes(
             coro,
-            self.protocol.as_ref(),
+            &self.protocol,
             &self.main_tape,
             &self.client_unique_id,
             &self.opts,
@@ -808,7 +837,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         tracing::info!("update_meta: {meta:?}");
         let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-        wait_all_results(coro, &completion).await?;
+        wait_all_results(coro, &completion, None).await?;
         *self.meta.lock().unwrap() = meta;
         Ok(())
     }
