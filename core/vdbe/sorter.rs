@@ -680,10 +680,9 @@ impl Ord for SortableImmutableRecord {
             let collation = self.index_key_info[i].collation;
 
             let cmp = match (this_key_value, other_key_value) {
-                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
+                (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(
                     // SAFETY: these were checked to be valid UTF-8 on construction.
-                    unsafe { std::str::from_utf8_unchecked(left) },
-                    unsafe { std::str::from_utf8_unchecked(right) },
+                    &left, &right,
                 ),
                 _ => this_key_value.partial_cmp(&other_key_value).unwrap(),
             };

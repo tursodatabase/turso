@@ -17,7 +17,9 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
+use std::borrow::Borrow;
 use std::fmt::{Debug, Display};
+use std::ops::Deref;
 use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -87,6 +89,39 @@ impl Text {
 
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextRef<'a> {
+    pub value: &'a [u8],
+    pub subtype: TextSubtype,
+}
+
+impl<'a> TextRef<'a> {
+    pub fn new(value: &'a [u8], subtype: TextSubtype) -> Self {
+        Self { value, subtype }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &'a str {
+        unsafe { std::str::from_utf8_unchecked(self.value) }
+    }
+}
+
+impl<'a> Borrow<str> for TextRef<'a> {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<'a> Deref for TextRef<'a> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 
@@ -216,7 +251,7 @@ pub enum ValueRef<'a> {
     Null,
     Integer(i64),
     Float(f64),
-    Text(&'a [u8], TextSubtype),
+    Text(TextRef<'a>),
     Blob(&'a [u8]),
 }
 
@@ -226,9 +261,9 @@ impl Debug for ValueRef<'_> {
             ValueRef::Null => write!(f, "Null"),
             ValueRef::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
             ValueRef::Float(float) => f.debug_tuple("Float").field(float).finish(),
-            ValueRef::Text(text_ref, _) => {
+            ValueRef::Text(text_ref) => {
                 // truncate string to at most 256 chars
-                let text = String::from_utf8_lossy(text_ref);
+                let text = text_ref.as_str();
                 let max_len = text.len().min(256);
                 f.debug_struct("Text")
                     .field("data", &&text[0..max_len])
@@ -249,13 +284,55 @@ impl Debug for ValueRef<'_> {
     }
 }
 
+pub trait AsValueRef {
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+}
+
+impl<'b> AsValueRef for ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        *self
+    }
+}
+
+impl<'b> AsValueRef for &ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        **self
+    }
+}
+
+impl AsValueRef for Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &mut Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
 impl Value {
     pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Integer(v) => ValueRef::Integer(*v),
             Value::Float(v) => ValueRef::Float(*v),
-            Value::Text(v) => ValueRef::Text(v.value.as_slice(), v.subtype),
+            Value::Text(v) => ValueRef::Text(TextRef {
+                value: &v.value,
+                subtype: v.subtype,
+            }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
         }
     }
@@ -812,22 +889,19 @@ impl TryFrom<ValueRef<'_>> for i64 {
 impl TryFrom<ValueRef<'_>> for String {
     type Error = LimboError;
 
+    #[inline]
     fn try_from(value: ValueRef<'_>) -> Result<Self, Self::Error> {
-        match value {
-            ValueRef::Text(s, _) => Ok(String::from_utf8_lossy(s).to_string()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
-        }
+        Ok(<&str>::try_from(value)?.to_string())
     }
 }
 
 impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     type Error = LimboError;
 
+    #[inline]
     fn try_from(value: ValueRef<'a>) -> Result<Self, Self::Error> {
         match value {
-            ValueRef::Text(s, _) => Ok(str::from_utf8(s).map_err(|_| {
-                LimboError::ConversionError("Expected a valid UTF8 string".to_string())
-            })?),
+            ValueRef::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -1423,9 +1497,7 @@ impl<'a> ValueRef<'a> {
             Self::Null => ExtValue::null(),
             Self::Integer(i) => ExtValue::from_integer(*i),
             Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text, _) => {
-                ExtValue::from_text(std::str::from_utf8(text).unwrap().to_string())
-            }
+            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }
@@ -1442,9 +1514,9 @@ impl<'a> ValueRef<'a> {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Float(f) => Value::Float(*f),
-            ValueRef::Text(text, subtype) => Value::Text(Text {
-                value: text.to_vec(),
-                subtype: *subtype,
+            ValueRef::Text(text) => Value::Text(Text {
+                value: text.value.to_vec(),
+                subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
         }
@@ -1457,7 +1529,7 @@ impl Display for ValueRef<'_> {
             Self::Null => write!(f, "NULL"),
             Self::Integer(i) => write!(f, "{i}"),
             Self::Float(fl) => write!(f, "{fl:?}"),
-            Self::Text(s, _) => write!(f, "{}", String::from_utf8_lossy(s)),
+            Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
     }
@@ -1486,19 +1558,19 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
                 float_left.partial_cmp(float_right)
             }
             // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_, _) | Self::Blob(_)) => {
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
                 Some(std::cmp::Ordering::Less)
             }
-            (Self::Text(_, _) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
                 Some(std::cmp::Ordering::Greater)
             }
 
-            (Self::Text(text_left, _), Self::Text(text_right, _)) => {
-                text_left.partial_cmp(text_right)
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.partial_cmp(text_right.value)
             }
             // Text vs Blob
-            (Self::Text(_, _), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_, _)) => Some(std::cmp::Ordering::Greater),
+            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
+            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
             (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
@@ -1589,11 +1661,20 @@ impl IndexInfo {
     }
 }
 
-pub fn compare_immutable(
-    l: &[ValueRef],
-    r: &[ValueRef],
+pub fn compare_immutable<V1, V2, E1, E2, I1, I2>(
+    l: I1,
+    r: I2,
     column_info: &[KeyInfo],
-) -> std::cmp::Ordering {
+) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+    E1: ExactSizeIterator<Item = V1>,
+    E2: ExactSizeIterator<Item = V2>,
+    I1: IntoIterator<IntoIter = E1, Item = E1::Item>,
+    I2: IntoIterator<IntoIter = E2, Item = E2::Item>,
+{
+    let (l, r): (E1, E2) = (l.into_iter(), r.into_iter());
     assert!(
         l.len() >= column_info.len(),
         "{} < {}",
@@ -1606,18 +1687,11 @@ pub fn compare_immutable(
         r.len(),
         column_info.len()
     );
-    let l_values = l.iter().take(column_info.len());
-    let r_values = r.iter().take(column_info.len());
-    for (i, (l, r)) in l_values.zip(r_values).enumerate() {
+    let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
+    for (i, (l, r)) in l.zip(r).enumerate() {
         let column_order = column_info[i].sort_order;
         let collation = column_info[i].collation;
-        let cmp = match (l, r) {
-            (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                &String::from_utf8_lossy(left),
-                &String::from_utf8_lossy(right),
-            ),
-            _ => l.partial_cmp(r).unwrap(),
-        };
+        let cmp = compare_immutable_single(l, r, collation);
         if !cmp.is_eq() {
             return match column_order {
                 SortOrder::Asc => cmp,
@@ -1626,6 +1700,19 @@ pub fn compare_immutable(
         }
     }
     std::cmp::Ordering::Equal
+}
+
+pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
+        _ => l.partial_cmp(&r).unwrap(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1662,7 +1749,7 @@ pub fn find_compare(unpacked: &[ValueRef], index_info: &IndexInfo) -> RecordComp
     if !unpacked.is_empty() && index_info.num_cols <= 13 {
         match &unpacked[0] {
             ValueRef::Integer(_) => RecordCompare::Int,
-            ValueRef::Text(_, _) if index_info.key_info[0].collation == CollationSeq::Binary => {
+            ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
                 RecordCompare::String
             }
             _ => RecordCompare::Generic,
@@ -1844,7 +1931,7 @@ fn compare_records_string(
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let ValueRef::Text(rhs_text, _) = &unpacked[0] else {
+    let ValueRef::Text(rhs_text) = &unpacked[0] else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
@@ -1856,15 +1943,12 @@ fn compare_records_string(
     let serial_type = SerialType::try_from(first_serial_type)?;
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
 
-    let ValueRef::Text(lhs_text, _) = lhs_value else {
+    let ValueRef::Text(lhs_text) = lhs_value else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
     let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(
-        &String::from_utf8_lossy(lhs_text),
-        &String::from_utf8_lossy(rhs_text),
-    );
+    let comparison = collation.compare_strings(&lhs_text, rhs_text);
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -1980,12 +2064,9 @@ pub fn compare_records_generic(
         };
 
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text, _), ValueRef::Text(rhs_text, _)) => {
-                index_info.key_info[field_idx].collation.compare_strings(
-                    &String::from_utf8_lossy(lhs_text),
-                    &String::from_utf8_lossy(rhs_text),
-                )
-            }
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
+                .collation
+                .compare_strings(lhs_text, rhs_text),
 
             (ValueRef::Integer(lhs_int), ValueRef::Float(rhs_float)) => {
                 sqlite_int_float_compare(*lhs_int, *rhs_float)
@@ -2577,10 +2658,9 @@ mod tests {
             let collation = index_key_info[i].collation;
 
             let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                    &String::from_utf8_lossy(left),
-                    &String::from_utf8_lossy(right),
-                ),
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    collation.compare_strings(left, right)
+                }
                 _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
             };
 
@@ -2764,7 +2844,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
                 ],
                 "integer_text_equal",
             ),
@@ -2772,7 +2852,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"world", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"world", TextSubtype::Text)),
                 ],
                 "integer_equal_text_different",
             ),
@@ -2799,34 +2879,34 @@ mod tests {
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
                 "equal_strings",
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(b"def", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
                 "less_than_strings",
             ),
             (
                 vec![Value::Text(Text::new("xyz"))],
-                vec![ValueRef::Text(b"abc", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"abc", TextSubtype::Text))],
                 "greater_than_strings",
             ),
             (
                 vec![Value::Text(Text::new(""))],
-                vec![ValueRef::Text(b"", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"", TextSubtype::Text))],
                 "empty_strings",
             ),
             (
                 vec![Value::Text(Text::new("a"))],
-                vec![ValueRef::Text(b"aa", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"aa", TextSubtype::Text))],
                 "prefix_strings",
             ),
             // Multi-field with string first
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
                     ValueRef::Integer(42),
                 ],
                 "string_integer_equal",
@@ -2834,7 +2914,7 @@ mod tests {
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
                     ValueRef::Integer(99),
                 ],
                 "string_equal_integer_different",
@@ -2870,7 +2950,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
                 "null_vs_text",
             ),
             (
@@ -2881,12 +2961,12 @@ mod tests {
             // Numbers vs Text/Blob
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
                 "integer_vs_text",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
                 "float_vs_text",
             ),
             (
@@ -2950,7 +3030,7 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(b"def", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
                 "desc_string_reversed",
             ),
             // Mixed sort orders
@@ -2958,7 +3038,7 @@ mod tests {
                 vec![Value::Integer(10), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(20),
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
                 ],
                 "desc_first_asc_second",
             ),
@@ -2984,7 +3064,7 @@ mod tests {
                 vec![Value::Integer(42)],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"extra", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"extra", TextSubtype::Text)),
                 ],
                 "fewer_serialized_fields",
             ),
@@ -3007,13 +3087,13 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(5)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
                 vec![Value::Text(Text::new("same")), Value::Integer(5)],
                 vec![
-                    ValueRef::Text(b"same", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new(b"same", TextSubtype::Text)),
                     ValueRef::Integer(5),
                 ],
                 "equal_text_then_equal_int",
@@ -3073,7 +3153,7 @@ mod tests {
 
         let int_values = vec![
             ValueRef::Integer(42),
-            ValueRef::Text(b"hello", TextSubtype::Text),
+            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
         ];
         assert!(matches!(
             find_compare(&int_values, &index_info_small),
@@ -3081,7 +3161,7 @@ mod tests {
         ));
 
         let string_values = vec![
-            ValueRef::Text(b"hello", TextSubtype::Text),
+            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
             ValueRef::Integer(42),
         ];
         assert!(matches!(

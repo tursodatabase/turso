@@ -61,7 +61,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
-use crate::types::{SerialType, SerialTypeKind, TextSubtype, ValueRef};
+use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
@@ -1422,7 +1422,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             }
 
             Ok((
-                ValueRef::Text(&buf[..content_size], TextSubtype::Text),
+                ValueRef::Text(TextRef::new(&buf[..content_size], TextSubtype::Text)),
                 content_size,
             ))
         }
