@@ -119,6 +119,7 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<String>,
+    pub partial: Option<bool>,
 }
 
 struct SyncEngineOptsFilled {
@@ -131,6 +132,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +226,7 @@ impl SyncEngine {
                     ))
                 }
             },
+            partial: opts.partial.unwrap_or(false),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -251,6 +254,7 @@ impl SyncEngine {
                 .remote_encryption
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
+            partial: self.opts.partial,
         };
 
         let io = self.io()?;

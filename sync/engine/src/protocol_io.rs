@@ -12,7 +12,6 @@ pub trait DataCompletion<T> {
     fn status(&self) -> Result<Option<u16>>;
     fn poll_data(&self) -> Result<Option<Self::DataPollResult>>;
     fn is_done(&self) -> Result<bool>;
-    fn set_callback(&self, callback: Box<dyn FnMut() -> ()>);
 }
 
 pub trait ProtocolIO: Send + Sync + 'static {

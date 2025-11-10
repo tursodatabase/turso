@@ -241,6 +241,10 @@ impl ProtocolIO for JsProtocolIo {
                 .collect(),
         }))
     }
+
+    fn register(&self, callback: Box<dyn FnMut() -> bool>) {
+        tracing::info!("register callback in the ProtocolIo");
+    }
 }
 
 #[napi]
