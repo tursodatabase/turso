@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 use prost::Message;
+use roaring::RoaringBitmap;
 use turso_core::{
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
@@ -296,6 +297,74 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })
+}
+
+/// Pull pages from remote
+pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
+    coro: &Coro<Ctx>,
+    client: &C,
+    server_revision: &str,
+    pages: &[u32],
+) -> Result<Vec<u8>> {
+    tracing::info!("pull_pages_v1: revision={server_revision}");
+    let mut bytes = BytesMut::new();
+
+    let mut bitmap = RoaringBitmap::new();
+    bitmap.extend(pages);
+
+    let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!("unable to serialize pull page request: {e}"))
+    })?;
+
+    let request = PullUpdatesReqProtoBody {
+        encoding: PageUpdatesEncodingReq::Raw as i32,
+        server_revision: server_revision.to_string(),
+        client_revision: String::new(),
+        long_poll_timeout_ms: 0,
+        server_pages: bitmap_bytes.into(),
+        client_pages: BytesMut::new().into(),
+    };
+    let request = request.encode_to_vec();
+    let completion = client.http(
+        "POST",
+        "/pull-updates",
+        Some(request),
+        &[
+            ("content-type", "application/protobuf"),
+            ("accept-encoding", "application/protobuf"),
+        ],
+    )?;
+    let Some(header) =
+        wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(coro, &completion, &mut bytes).await?
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!("pull_pages_v1: got header={:?}", header);
+
+    let mut pages = Vec::with_capacity(PAGE_SIZE * pages.len());
+
+    let mut page_data_opt =
+        wait_proto_message::<Ctx, PageData>(coro, &completion, &mut bytes).await?;
+    while let Some(page_data) = page_data_opt.take() {
+        let page_id = page_data.page_id;
+        tracing::info!("received page {}", page_id);
+        let page = decode_page(&header, page_data)?;
+        if page.len() != PAGE_SIZE {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "page has unexpected size: {} != {}",
+                page.len(),
+                PAGE_SIZE
+            )));
+        }
+        pages.extend_from_slice(&page);
+        page_data_opt = wait_proto_message(coro, &completion, &mut bytes).await?;
+        tracing::info!("page_data_opt: {}", page_data_opt.is_some());
+    }
+
+    Ok(pages)
 }
 
 /// Pull updates from remote to the separate file
@@ -999,13 +1068,19 @@ pub async fn bootstrap_db_file<C: ProtocolIO, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
+    prefix: Option<usize>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
+            if prefix.is_some() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "can't bootstrap prefix of database with legacy protocol".to_string(),
+                ));
+            }
             bootstrap_db_file_legacy(coro, client, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(coro, client, io, main_db_path).await
+            bootstrap_db_file_v1(coro, client, io, main_db_path, prefix).await
         }
     }
 }
@@ -1015,17 +1090,37 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     client: &C,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
+    prefix: Option<usize>,
 ) -> Result<DatabasePullRevision> {
-    let mut bytes = BytesMut::new();
+    let mut bitmap = RoaringBitmap::new();
+    if let Some(prefix) = prefix {
+        bitmap.insert_range(0..(prefix / PAGE_SIZE) as u32);
+    }
+
+    let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
+    })?;
+
+    let request = PullUpdatesReqProtoBody {
+        encoding: PageUpdatesEncodingReq::Raw as i32,
+        server_revision: String::new(),
+        client_revision: String::new(),
+        long_poll_timeout_ms: 0,
+        server_pages: bitmap_bytes.into(),
+        client_pages: BytesMut::new().into(),
+    };
+    let request = request.encode_to_vec();
     let completion = client.http(
-        "GET",
+        "POST",
         "/pull-updates",
-        None,
+        Some(request),
         &[
             ("content-type", "application/protobuf"),
             ("accept-encoding", "application/protobuf"),
         ],
     )?;
+    let mut bytes = BytesMut::new();
     let Some(header) =
         wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(coro, &completion, &mut bytes).await?
     else {
@@ -1430,6 +1525,8 @@ mod tests {
         fn is_done(&self) -> crate::Result<bool> {
             Ok(self.data.borrow().is_empty())
         }
+
+        fn set_callback(&self, callback: Box<dyn FnMut() -> ()>) {}
     }
 
     #[test]

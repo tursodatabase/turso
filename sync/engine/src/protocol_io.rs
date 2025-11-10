@@ -12,9 +12,10 @@ pub trait DataCompletion<T> {
     fn status(&self) -> Result<Option<u16>>;
     fn poll_data(&self) -> Result<Option<Self::DataPollResult>>;
     fn is_done(&self) -> Result<bool>;
+    fn set_callback(&self, callback: Box<dyn FnMut() -> ()>);
 }
 
-pub trait ProtocolIO {
+pub trait ProtocolIO: Send + Sync + 'static {
     type DataCompletionBytes: DataCompletion<u8>;
     type DataCompletionTransform: DataCompletion<DatabaseRowTransformResult>;
     fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes>;
@@ -30,4 +31,5 @@ pub trait ProtocolIO {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<Self::DataCompletionBytes>;
+    fn register(&self, callback: Box<dyn FnMut() -> bool>);
 }

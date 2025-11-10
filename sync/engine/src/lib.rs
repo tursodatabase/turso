@@ -1,6 +1,7 @@
 pub mod database_replay_generator;
 pub mod database_sync_engine;
 pub mod database_sync_operations;
+pub mod database_sync_partial_storage;
 pub mod database_tape;
 pub mod errors;
 pub mod io_operations;

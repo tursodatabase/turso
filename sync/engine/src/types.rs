@@ -95,6 +95,7 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
