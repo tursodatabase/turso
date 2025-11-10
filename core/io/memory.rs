@@ -1,4 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use crate::LimboError;
 use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
@@ -232,6 +233,29 @@ impl File for MemoryFile {
     fn size(&self) -> Result<u64> {
         tracing::debug!("size(path={}): {}", self.path, self.size.get());
         Ok(self.size.get())
+    }
+
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        let (mut holes, mut pages) = (0, 0);
+        for page_no in start_page..=end_page {
+            match self.get_page(page_no) {
+                Some(_) => pages += 1,
+                None => holes += 1,
+            };
+        }
+
+        if holes == 0 {
+            Ok(false)
+        } else if pages == 0 {
+            Ok(true)
+        } else {
+            Err(LimboError::InternalError(format!(
+                "ambigous has_hole result: pos={}, len={}, pages={}, holes={}",
+                pos, len, pages, holes
+            )))
+        }
     }
 }
 

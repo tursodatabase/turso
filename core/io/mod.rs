@@ -92,6 +92,10 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
+    // todo: need to add custom completion type?
+    fn has_hole(&self, _pos: usize, _len: usize) -> Result<bool> {
+        panic!("has_hole is not supported for the given IO implementation")
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

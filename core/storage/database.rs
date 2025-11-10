@@ -85,6 +85,8 @@ pub trait DatabaseStorage: Send + Sync {
     fn sync(&self, c: Completion) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+    // todo: need to add custom completion type?
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool>;
 }
 
 #[derive(Clone)]
@@ -258,6 +260,11 @@ impl DatabaseStorage for DatabaseFile {
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let c = self.file.truncate(len as u64, c)?;
         Ok(c)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        self.file.has_hole(pos, len)
     }
 }
 
