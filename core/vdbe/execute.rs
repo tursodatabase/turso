@@ -13,14 +13,16 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, Extendable, IOCompletions, ImmutableRecord,
-    SeekResult, Text,
+    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
+    ImmutableRecord, SeekResult, Text,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
+use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
@@ -38,6 +40,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
+use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
@@ -49,10 +52,7 @@ use turso_macros::match_ignore_ascii_case;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::{
-    schema::Affinity,
-    storage::btree::{BTreeCursor, BTreeKey},
-};
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use crate::{
     storage::wal::CheckpointResult,
@@ -668,69 +668,6 @@ pub fn op_not_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ComparisonOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-impl ComparisonOp {
-    fn compare(&self, lhs: &Value, rhs: &Value, collation: &CollationSeq) -> bool {
-        match (lhs, rhs) {
-            (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-                let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
-                match self {
-                    ComparisonOp::Eq => order.is_eq(),
-                    ComparisonOp::Ne => order.is_ne(),
-                    ComparisonOp::Lt => order.is_lt(),
-                    ComparisonOp::Le => order.is_le(),
-                    ComparisonOp::Gt => order.is_gt(),
-                    ComparisonOp::Ge => order.is_ge(),
-                }
-            }
-            (_, _) => match self {
-                ComparisonOp::Eq => *lhs == *rhs,
-                ComparisonOp::Ne => *lhs != *rhs,
-                ComparisonOp::Lt => *lhs < *rhs,
-                ComparisonOp::Le => *lhs <= *rhs,
-                ComparisonOp::Gt => *lhs > *rhs,
-                ComparisonOp::Ge => *lhs >= *rhs,
-            },
-        }
-    }
-
-    fn compare_integers(&self, lhs: &Value, rhs: &Value) -> bool {
-        match self {
-            ComparisonOp::Eq => lhs == rhs,
-            ComparisonOp::Ne => lhs != rhs,
-            ComparisonOp::Lt => lhs < rhs,
-            ComparisonOp::Le => lhs <= rhs,
-            ComparisonOp::Gt => lhs > rhs,
-            ComparisonOp::Ge => lhs >= rhs,
-        }
-    }
-
-    fn handle_nulls(&self, lhs: &Value, rhs: &Value, null_eq: bool, jump_if_null: bool) -> bool {
-        match self {
-            ComparisonOp::Eq => {
-                let both_null = lhs == rhs;
-                (null_eq && both_null) || (!null_eq && jump_if_null)
-            }
-            ComparisonOp::Ne => {
-                let at_least_one_null = lhs != rhs;
-                (null_eq && at_least_one_null) || (!null_eq && jump_if_null)
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
-                jump_if_null
-            }
-        }
-    }
-}
-
 pub fn op_comparison(
     program: &Program,
     state: &mut ProgramState,
@@ -828,7 +765,7 @@ pub fn op_comparison(
 
     assert!(target_pc.is_offset());
 
-    let nulleq = flags.has_nulleq();
+    let null_eq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
 
@@ -837,7 +774,7 @@ pub fn op_comparison(
 
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
-        if op.compare_integers(lhs_value, rhs_value) {
+        if op.compare(lhs_value, rhs_value, collation) {
             state.pc = target_pc.as_offset_int();
         } else {
             state.pc += 1;
@@ -847,7 +784,15 @@ pub fn op_comparison(
 
     // Handle NULL values
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
-        if op.handle_nulls(lhs_value, rhs_value, nulleq, jump_if_null) {
+        let cmp_res = op.compare_nulls(lhs_value, rhs_value, null_eq);
+        let jump = match op {
+            ComparisonOp::Eq => cmp_res || (!null_eq && jump_if_null),
+            ComparisonOp::Ne => cmp_res || (!null_eq && jump_if_null),
+            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
+                jump_if_null
+            }
+        };
+        if jump {
             state.pc = target_pc.as_offset_int();
         } else {
             state.pc += 1;
@@ -855,96 +800,34 @@ pub fn op_comparison(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let mut lhs_temp_reg = None;
-    let mut rhs_temp_reg = None;
-
-    let mut lhs_converted = false;
-    let mut rhs_converted = false;
-
-    // Apply affinity conversions
-    match affinity {
-        Affinity::Numeric | Affinity::Integer => {
-            let lhs_is_text = matches!(state.registers[lhs].get_value(), Value::Text(_));
-            let rhs_is_text = matches!(state.registers[rhs].get_value(), Value::Text(_));
-
-            if lhs_is_text || rhs_is_text {
-                if lhs_is_text {
-                    lhs_temp_reg = Some(state.registers[lhs].clone());
-                    lhs_converted = apply_numeric_affinity(lhs_temp_reg.as_mut().unwrap(), false);
-                }
-                if rhs_is_text {
-                    rhs_temp_reg = Some(state.registers[rhs].clone());
-                    rhs_converted = apply_numeric_affinity(rhs_temp_reg.as_mut().unwrap(), false);
-                }
-            }
-        }
-
-        Affinity::Text => {
-            let lhs_is_text = matches!(state.registers[lhs].get_value(), Value::Text(_));
-            let rhs_is_text = matches!(state.registers[rhs].get_value(), Value::Text(_));
-
-            if lhs_is_text || rhs_is_text {
-                if is_numeric_value(&state.registers[lhs]) {
-                    lhs_temp_reg = Some(state.registers[lhs].clone());
-                    lhs_converted = stringify_register(lhs_temp_reg.as_mut().unwrap());
-                }
-
-                if is_numeric_value(&state.registers[rhs]) {
-                    rhs_temp_reg = Some(state.registers[rhs].clone());
-                    rhs_converted = stringify_register(rhs_temp_reg.as_mut().unwrap());
-                }
-            }
-        }
-
-        Affinity::Real => {
-            if matches!(state.registers[lhs].get_value(), Value::Text(_)) {
-                lhs_temp_reg = Some(state.registers[lhs].clone());
-                lhs_converted = apply_numeric_affinity(lhs_temp_reg.as_mut().unwrap(), false);
-            }
-
-            if matches!(state.registers[rhs].get_value(), Value::Text(_)) {
-                rhs_temp_reg = Some(state.registers[rhs].clone());
-                rhs_converted = apply_numeric_affinity(rhs_temp_reg.as_mut().unwrap(), false);
-            }
-
-            if let Value::Integer(i) =
-                (lhs_temp_reg.as_ref().unwrap_or(&state.registers[lhs])).get_value()
-            {
-                lhs_temp_reg = Some(Register::Value(Value::Float(*i as f64)));
-                lhs_converted = true;
-            }
-
-            if let Value::Integer(i) = rhs_temp_reg
-                .as_ref()
-                .unwrap_or(&state.registers[rhs])
-                .get_value()
-            {
-                rhs_temp_reg = Some(Register::Value(Value::Float(*i as f64)));
-                rhs_converted = true;
-            }
-        }
-
-        Affinity::Blob => {} // Do nothing for blob affinity.
-    }
+    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
 
     let should_jump = op.compare(
-        lhs_temp_reg
+        new_lhs
             .as_ref()
-            .unwrap_or(&state.registers[lhs])
-            .get_value(),
-        rhs_temp_reg
+            .map_or(Either::Left(lhs_value), Either::Right),
+        new_rhs
             .as_ref()
-            .unwrap_or(&state.registers[rhs])
-            .get_value(),
-        &collation,
+            .map_or(Either::Left(rhs_value), Either::Right),
+        collation,
     );
 
-    if lhs_converted {
-        state.registers[lhs] = lhs_temp_reg.unwrap();
-    }
-
-    if rhs_converted {
-        state.registers[rhs] = rhs_temp_reg.unwrap();
+    match (new_lhs, new_rhs) {
+        (Some(new_lhs), None) => {
+            state.registers[lhs] = Register::Value(new_lhs.as_value_ref().to_owned());
+        }
+        (None, Some(new_rhs)) => {
+            state.registers[rhs] = Register::Value(new_rhs.as_value_ref().to_owned());
+        }
+        (Some(new_lhs), Some(new_rhs)) => {
+            let (new_lhs, new_rhs) = (
+                new_lhs.as_value_ref().to_owned(),
+                new_rhs.as_value_ref().to_owned(),
+            );
+            state.registers[lhs] = Register::Value(new_lhs);
+            state.registers[rhs] = Register::Value(new_rhs);
+        }
+        (None, None) => {}
     }
 
     if should_jump {
@@ -3192,13 +3075,15 @@ pub fn seek_internal(
                         unreachable!("op_seek: record_source should be Unpacked for table-btree");
                     };
                     assert_eq!(num_regs, 1, "op_seek: num_regs should be 1 for table-btree");
-                    let original_value = state.registers[start_reg].get_value().clone();
+                    let original_value = state.registers[start_reg].get_value();
                     let mut temp_value = original_value.clone();
 
                     let conversion_successful = if matches!(temp_value, Value::Text(_)) {
-                        let mut temp_reg = Register::Value(temp_value);
-                        let converted = apply_numeric_affinity(&mut temp_reg, false);
-                        temp_value = temp_reg.get_value().clone();
+                        let new_val = apply_numeric_affinity(temp_value.as_value_ref(), false);
+                        let converted = new_val.is_some();
+                        if let Some(new_val) = new_val {
+                            temp_value = new_val.to_owned();
+                        }
                         converted
                     } else {
                         true // Non-text values don't need conversion
@@ -3452,7 +3337,7 @@ pub fn op_idx_ge(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,             // The serialized record from the index
-                &values,                 // The record built from registers
+                values,                  // The record built from registers
                 cursor.get_index_info(), // Sort order flags
                 0,
                 tie_breaker,
@@ -3520,7 +3405,7 @@ pub fn op_idx_le(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3571,7 +3456,7 @@ pub fn op_idx_gt(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -3623,7 +3508,7 @@ pub fn op_idx_lt(
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
                 &idx_record,
-                &values,
+                values,
                 cursor.get_index_info(),
                 0,
                 tie_breaker,
@@ -9067,24 +8952,25 @@ fn execute_turso_version(version_integer: i64) -> String {
     format!("{major}.{minor}.{release}")
 }
 
-pub fn extract_int_value(value: &Value) -> i64 {
+pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
+    let value = value.as_value_ref();
     match value {
-        Value::Integer(i) => *i,
-        Value::Float(f) => {
+        ValueRef::Integer(i) => i,
+        ValueRef::Float(f) => {
             // Use sqlite3RealToI64 equivalent
-            if *f < -9223372036854774784.0 {
+            if f < -9223372036854774784.0 {
                 i64::MIN
-            } else if *f > 9223372036854774784.0 {
+            } else if f > 9223372036854774784.0 {
                 i64::MAX
             } else {
-                *f as i64
+                f as i64
             }
         }
-        Value::Text(t) => {
+        ValueRef::Text(t) => {
             // Try to parse as integer, return 0 if failed
             t.as_str().parse::<i64>().unwrap_or(0)
         }
-        Value::Blob(b) => {
+        ValueRef::Blob(b) => {
             // Try to parse blob as string then as integer
             if let Ok(s) = std::str::from_utf8(b) {
                 s.parse::<i64>().unwrap_or(0)
@@ -9092,356 +8978,7 @@ pub fn extract_int_value(value: &Value) -> i64 {
                 0
             }
         }
-        Value::Null => 0,
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum NumericParseResult {
-    NotNumeric,      // not a valid number
-    PureInteger,     // pure integer (entire string)
-    HasDecimalOrExp, // has decimal point or exponent (entire string)
-    ValidPrefixOnly, // valid prefix but not entire string
-}
-
-#[derive(Debug)]
-enum ParsedNumber {
-    None,
-    Integer(i64),
-    Float(f64),
-}
-
-impl ParsedNumber {
-    fn as_integer(&self) -> Option<i64> {
-        match self {
-            ParsedNumber::Integer(i) => Some(*i),
-            _ => None,
-        }
-    }
-
-    fn as_float(&self) -> Option<f64> {
-        match self {
-            ParsedNumber::Float(f) => Some(*f),
-            _ => None,
-        }
-    }
-}
-
-fn try_for_float(text: &str) -> (NumericParseResult, ParsedNumber) {
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let mut pos = 0;
-    let len = bytes.len();
-
-    while pos < len && is_space(bytes[pos]) {
-        pos += 1;
-    }
-
-    if pos >= len {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let start_pos = pos;
-
-    let mut sign = 1i64;
-
-    if bytes[pos] == b'-' {
-        sign = -1;
-        pos += 1;
-    } else if bytes[pos] == b'+' {
-        pos += 1;
-    }
-
-    if pos >= len {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let mut significand = 0u64;
-    let mut digit_count = 0;
-    let mut decimal_adjust = 0i32;
-    let mut has_digits = false;
-
-    // Parse digits before decimal point
-    while pos < len && bytes[pos].is_ascii_digit() {
-        has_digits = true;
-        let digit = (bytes[pos] - b'0') as u64;
-
-        if significand <= (u64::MAX - 9) / 10 {
-            significand = significand * 10 + digit;
-            digit_count += 1;
-        } else {
-            // Skip overflow digits but adjust exponent
-            decimal_adjust += 1;
-        }
-        pos += 1;
-    }
-
-    let mut has_decimal = false;
-    let mut has_exponent = false;
-
-    // Check for decimal point
-    if pos < len && bytes[pos] == b'.' {
-        has_decimal = true;
-        pos += 1;
-
-        // Parse fractional digits
-        while pos < len && bytes[pos].is_ascii_digit() {
-            has_digits = true;
-            let digit = (bytes[pos] - b'0') as u64;
-
-            if significand <= (u64::MAX - 9) / 10 {
-                significand = significand * 10 + digit;
-                digit_count += 1;
-                decimal_adjust -= 1;
-            }
-            pos += 1;
-        }
-    }
-
-    if !has_digits {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    // Check for exponent
-    let mut exponent = 0i32;
-    if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
-        has_exponent = true;
-        pos += 1;
-
-        if pos >= len {
-            // Incomplete exponent, but we have valid digits before
-            return create_result_from_significand(
-                significand,
-                sign,
-                decimal_adjust,
-                has_decimal,
-                has_exponent,
-                NumericParseResult::ValidPrefixOnly,
-            );
-        }
-
-        let mut exp_sign = 1i32;
-        if bytes[pos] == b'-' {
-            exp_sign = -1;
-            pos += 1;
-        } else if bytes[pos] == b'+' {
-            pos += 1;
-        }
-
-        if pos >= len || !bytes[pos].is_ascii_digit() {
-            // Incomplete exponent
-            return create_result_from_significand(
-                significand,
-                sign,
-                decimal_adjust,
-                has_decimal,
-                false,
-                NumericParseResult::ValidPrefixOnly,
-            );
-        }
-
-        // Parse exponent digits
-        while pos < len && bytes[pos].is_ascii_digit() {
-            let digit = (bytes[pos] - b'0') as i32;
-            if exponent < 10000 {
-                exponent = exponent * 10 + digit;
-            } else {
-                exponent = 10000; // Cap at large value
-            }
-            pos += 1;
-        }
-        exponent *= exp_sign;
-    }
-
-    // Skip trailing whitespace
-    while pos < len && is_space(bytes[pos]) {
-        pos += 1;
-    }
-
-    // Determine if we consumed the entire string
-    let consumed_all = pos >= len;
-    let final_exponent = decimal_adjust + exponent;
-
-    let parse_result = if !consumed_all {
-        NumericParseResult::ValidPrefixOnly
-    } else if has_decimal || has_exponent {
-        NumericParseResult::HasDecimalOrExp
-    } else {
-        NumericParseResult::PureInteger
-    };
-
-    create_result_from_significand(
-        significand,
-        sign,
-        final_exponent,
-        has_decimal,
-        has_exponent,
-        parse_result,
-    )
-}
-
-fn create_result_from_significand(
-    significand: u64,
-    sign: i64,
-    exponent: i32,
-    has_decimal: bool,
-    has_exponent: bool,
-    parse_result: NumericParseResult,
-) -> (NumericParseResult, ParsedNumber) {
-    if significand == 0 {
-        match parse_result {
-            NumericParseResult::PureInteger => {
-                return (parse_result, ParsedNumber::Integer(0));
-            }
-            _ => {
-                return (parse_result, ParsedNumber::Float(0.0));
-            }
-        }
-    }
-
-    // For pure integers without exponent, try to return as integer
-    if !has_decimal && !has_exponent && exponent == 0 && significand <= i64::MAX as u64 {
-        let signed_val = (significand as i64).wrapping_mul(sign);
-        return (parse_result, ParsedNumber::Integer(signed_val));
-    }
-
-    // Convert to float
-    let mut result = significand as f64;
-
-    let mut exp = exponent;
-    match exp.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            while exp >= 100 {
-                result *= 1e100;
-                exp -= 100;
-            }
-            while exp >= 10 {
-                result *= 1e10;
-                exp -= 10;
-            }
-            while exp >= 1 {
-                result *= 10.0;
-                exp -= 1;
-            }
-        }
-        std::cmp::Ordering::Less => {
-            while exp <= -100 {
-                result *= 1e-100;
-                exp += 100;
-            }
-            while exp <= -10 {
-                result *= 1e-10;
-                exp += 10;
-            }
-            while exp <= -1 {
-                result *= 0.1;
-                exp += 1;
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-
-    if sign < 0 {
-        result = -result;
-    }
-
-    (parse_result, ParsedNumber::Float(result))
-}
-
-pub fn is_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
-}
-
-fn real_to_i64(r: f64) -> i64 {
-    if r < -9223372036854774784.0 {
-        i64::MIN
-    } else if r > 9223372036854774784.0 {
-        i64::MAX
-    } else {
-        r as i64
-    }
-}
-
-fn apply_integer_affinity(register: &mut Register) -> bool {
-    let Register::Value(Value::Float(f)) = register else {
-        return false;
-    };
-
-    let ix = real_to_i64(*f);
-
-    // Only convert if round-trip is exact and not at extreme values
-    if *f == (ix as f64) && ix > i64::MIN && ix < i64::MAX {
-        *register = Register::Value(Value::Integer(ix));
-        true
-    } else {
-        false
-    }
-}
-
-/// Try to convert a value into a numeric representation if we can
-/// do so without loss of information. In other words, if the string
-/// looks like a number, convert it into a number. If it does not
-/// look like a number, leave it alone.
-pub fn apply_numeric_affinity(register: &mut Register, try_for_int: bool) -> bool {
-    let Register::Value(Value::Text(text)) = register else {
-        return false; // Only apply to text values
-    };
-
-    let text_str = text.as_str();
-    let (parse_result, parsed_value) = try_for_float(text_str);
-
-    // Only convert if we have a complete valid number (not just a prefix)
-    match parse_result {
-        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
-            false // Leave as text
-        }
-        NumericParseResult::PureInteger => {
-            if let Some(int_val) = parsed_value.as_integer() {
-                *register = Register::Value(Value::Integer(int_val));
-                true
-            } else if let Some(float_val) = parsed_value.as_float() {
-                *register = Register::Value(Value::Float(float_val));
-                if try_for_int {
-                    apply_integer_affinity(register);
-                }
-                true
-            } else {
-                false
-            }
-        }
-        NumericParseResult::HasDecimalOrExp => {
-            if let Some(float_val) = parsed_value.as_float() {
-                *register = Register::Value(Value::Float(float_val));
-                // If try_for_int is true, try to convert float to int if exact
-                if try_for_int {
-                    apply_integer_affinity(register);
-                }
-                true
-            } else {
-                false
-            }
-        }
-    }
-}
-
-fn is_numeric_value(reg: &Register) -> bool {
-    matches!(reg.get_value(), Value::Integer(_) | Value::Float(_))
-}
-
-fn stringify_register(reg: &mut Register) -> bool {
-    match reg.get_value() {
-        Value::Integer(i) => {
-            *reg = Register::Value(Value::build_text(i.to_string()));
-            true
-        }
-        Value::Float(f) => {
-            *reg = Register::Value(Value::build_text(f.to_string()));
-            true
-        }
-        Value::Text(_) | Value::Null | Value::Blob(_) => false,
+        ValueRef::Null => 0,
     }
 }
 
@@ -9566,40 +9103,6 @@ fn get_schema_cookie(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_apply_numeric_affinity_partial_numbers() {
-        let mut reg = Register::Value(Value::Text("123abc".into()));
-        assert!(!apply_numeric_affinity(&mut reg, false));
-        assert!(matches!(reg, Register::Value(Value::Text(_))));
-
-        let mut reg = Register::Value(Value::Text("-53093015420544-15062897".into()));
-        assert!(!apply_numeric_affinity(&mut reg, false));
-        assert!(matches!(reg, Register::Value(Value::Text(_))));
-
-        let mut reg = Register::Value(Value::Text("123.45xyz".into()));
-        assert!(!apply_numeric_affinity(&mut reg, false));
-        assert!(matches!(reg, Register::Value(Value::Text(_))));
-    }
-
-    #[test]
-    fn test_apply_numeric_affinity_complete_numbers() {
-        let mut reg = Register::Value(Value::Text("123".into()));
-        assert!(apply_numeric_affinity(&mut reg, false));
-        assert_eq!(*reg.get_value(), Value::Integer(123));
-
-        let mut reg = Register::Value(Value::Text("123.45".into()));
-        assert!(apply_numeric_affinity(&mut reg, false));
-        assert_eq!(*reg.get_value(), Value::Float(123.45));
-
-        let mut reg = Register::Value(Value::Text("  -456  ".into()));
-        assert!(apply_numeric_affinity(&mut reg, false));
-        assert_eq!(*reg.get_value(), Value::Integer(-456));
-
-        let mut reg = Register::Value(Value::Text("0".into()));
-        assert!(apply_numeric_affinity(&mut reg, false));
-        assert_eq!(*reg.get_value(), Value::Integer(0));
-    }
 
     #[test]
     fn test_execute_sqlite_version() {

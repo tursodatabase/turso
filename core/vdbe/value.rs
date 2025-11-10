@@ -5,8 +5,10 @@ use regex::{Regex, RegexBuilder};
 use crate::{
     function::MathFunc,
     numeric::{NullableInteger, Numeric},
-    schema::{affinity, Affinity},
-    LimboError, Result, Value,
+    translate::collate::CollationSeq,
+    types::{compare_immutable_single, AsValueRef, SeekOp},
+    vdbe::affinity::Affinity,
+    LimboError, Result, Value, ValueRef,
 };
 
 mod cmath {
@@ -32,6 +34,69 @@ mod cmath {
         pub fn atan(x: f64) -> f64;
         pub fn atanh(x: f64) -> f64;
         pub fn atan2(x: f64, y: f64) -> f64;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ComparisonOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl ComparisonOp {
+    pub(super) fn compare<V1: AsValueRef, V2: AsValueRef>(
+        &self,
+        lhs: V1,
+        rhs: V2,
+        collation: CollationSeq,
+    ) -> bool {
+        let order = compare_immutable_single(lhs, rhs, collation);
+        match self {
+            ComparisonOp::Eq => order.is_eq(),
+            ComparisonOp::Ne => order.is_ne(),
+            ComparisonOp::Lt => order.is_lt(),
+            ComparisonOp::Le => order.is_le(),
+            ComparisonOp::Gt => order.is_gt(),
+            ComparisonOp::Ge => order.is_ge(),
+        }
+    }
+
+    pub(super) fn compare_nulls<V1: AsValueRef, V2: AsValueRef>(
+        &self,
+        lhs: V1,
+        rhs: V2,
+        null_eq: bool,
+    ) -> bool {
+        let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
+        assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
+
+        match self {
+            ComparisonOp::Eq => {
+                let both_null = lhs == rhs;
+                null_eq && both_null
+            }
+            ComparisonOp::Ne => {
+                let at_least_one_null = lhs != rhs;
+                null_eq && at_least_one_null
+            }
+            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => false,
+        }
+    }
+}
+
+impl From<SeekOp> for ComparisonOp {
+    fn from(value: SeekOp) -> Self {
+        match value {
+            SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true } => ComparisonOp::Eq,
+            SeekOp::GE { eq_only: false } => ComparisonOp::Ge,
+            SeekOp::GT => ComparisonOp::Gt,
+            SeekOp::LE { eq_only: false } => ComparisonOp::Le,
+            SeekOp::LT => ComparisonOp::Lt,
+        }
     }
 }
 
@@ -548,7 +613,7 @@ impl Value {
         if matches!(self, Value::Null) {
             return Value::Null;
         }
-        match affinity(datatype) {
+        match Affinity::affinity(datatype) {
             // NONE	Casting a value to a type-name with no affinity causes the value to be converted into a BLOB. Casting to a BLOB consists of first casting the value to TEXT in the encoding of the database connection, then interpreting the resulting byte sequence as a BLOB instead of as TEXT.
             // Historically called NONE, but it's the same as BLOB
             Affinity::Blob => {

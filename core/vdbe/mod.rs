@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+pub mod affinity;
 pub mod builder;
 pub mod execute;
 pub mod explain;
@@ -1092,11 +1093,10 @@ fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> Immu
     ImmutableRecord::from_registers(regs, regs.len())
 }
 
-pub fn registers_to_ref_values<'a>(registers: &'a [Register]) -> Vec<ValueRef<'a>> {
-    registers
-        .iter()
-        .map(|reg| reg.get_value().as_ref())
-        .collect()
+pub fn registers_to_ref_values<'a>(
+    registers: &'a [Register],
+) -> impl ExactSizeIterator<Item = ValueRef<'a>> {
+    registers.iter().map(|reg| reg.get_value().as_ref())
 }
 
 #[instrument(skip(program), level = Level::DEBUG)]

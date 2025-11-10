@@ -18,15 +18,8 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
-use crate::translate::{
-    collate::get_collseq_from_expr,
-    emitter::UpdateRowSource,
-    plan::{EvalAt, NonFromClauseSubquery},
-    subquery::emit_non_from_clause_subquery,
-    window::emit_window_loop_source,
-};
 use crate::{
-    schema::{Affinity, Index, IndexColumn, Table},
+    schema::{Index, IndexColumn, Table},
     translate::{
         emitter::prepare_cdc_if_necessary,
         plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
@@ -39,6 +32,16 @@ use crate::{
         BranchOffset, CursorID,
     },
     Result,
+};
+use crate::{
+    translate::{
+        collate::get_collseq_from_expr,
+        emitter::UpdateRowSource,
+        plan::{EvalAt, NonFromClauseSubquery},
+        subquery::emit_non_from_clause_subquery,
+        window::emit_window_loop_source,
+    },
+    vdbe::affinity::Affinity,
 };
 
 // Metadata for handling LEFT JOIN operations
