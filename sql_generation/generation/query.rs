@@ -283,23 +283,25 @@ impl Arbitrary for Insert {
             })
         };
 
-        let _gen_select = |rng: &mut R| {
-            // Find a non-empty table
-            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
-            let row = pick(&select_table.rows, rng);
-            let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
-            // Pick another table to insert into
-            let select = Select::simple(select_table.name.clone(), predicate);
+        let gen_self_select = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+            if table.rows.is_empty() {
+                return None;
+            }
+            let predicate = Predicate::true_();
+            let select = Select::simple(table.name.clone(), predicate);
+
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
             })
         };
 
-        // TODO: Add back gen_select when https://github.com/tursodatabase/turso/issues/2129 is fixed.
-        // Backtrack here cannot return None
-        backtrack(vec![(1, Box::new(gen_values))], rng).unwrap()
+        backtrack(
+            vec![(1, Box::new(gen_values)), (1, Box::new(gen_self_select))],
+            rng,
+        )
+            .expect("backtrack with these arguments should not return None")
     }
 }
 
