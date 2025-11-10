@@ -28,7 +28,6 @@ use crate::{Connection, Pager};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -1314,10 +1313,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        let versions = self.rows.get(&RowID {
-            table_id,
-            row_id: row_id,
-        });
+        let versions = self.rows.get(&RowID { table_id, row_id });
         if versions.is_none() {
             return RowVersionState::NotFound;
         }
@@ -1325,30 +1321,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let versions = versions.value().read();
         let last_version = versions.last().unwrap();
         if last_version.is_visible_to(tx, &self.txs) {
-            return RowVersionState::LiveVersion;
+            RowVersionState::LiveVersion
         } else {
-            return RowVersionState::Deleted;
+            RowVersionState::Deleted
         }
     }
 
     fn find_last_visible_version(
-        &self,
-        tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<
-            '_,
-            RowID,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
-    ) -> Option<RowID> {
-        row.value()
-            .read()
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs))
-            .map(|_| *row.key())
-    }
-
-    fn find_last_visible_version_with_deleted(
         &self,
         tx: &Transaction,
         row: crossbeam_skiplist::map::Entry<
