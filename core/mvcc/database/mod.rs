@@ -124,6 +124,11 @@ pub struct RowVersion {
     pub row: Row,
 }
 
+pub enum RowVersionState {
+    LiveVersion,
+    NotFound,
+    Deleted,
+}
 pub type TxID = u64;
 
 /// A log record contains all the versions inserted and deleted by a transaction.
@@ -1295,7 +1300,55 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    pub fn find_row_last_version_state(
+        &self,
+        table_id: MVTableId,
+        row_id: i64,
+        tx_id: TxID,
+    ) -> RowVersionState {
+        tracing::trace!(
+            "find_row_last_version_state(table_id={}, row_id={})",
+            table_id,
+            row_id,
+        );
+
+        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = tx.value();
+        let versions = self.rows.get(&RowID {
+            table_id,
+            row_id: row_id,
+        });
+        if versions.is_none() {
+            return RowVersionState::NotFound;
+        }
+        let versions = versions.unwrap();
+        let versions = versions.value().read();
+        let last_version = versions.last().unwrap();
+        if last_version.is_visible_to(tx, &self.txs) {
+            return RowVersionState::LiveVersion;
+        } else {
+            return RowVersionState::Deleted;
+        }
+    }
+
     fn find_last_visible_version(
+        &self,
+        tx: &Transaction,
+        row: crossbeam_skiplist::map::Entry<
+            '_,
+            RowID,
+            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
+        >,
+    ) -> Option<RowID> {
+        row.value()
+            .read()
+            .iter()
+            .rev()
+            .find(|version| version.is_visible_to(tx, &self.txs))
+            .map(|_| *row.key())
+    }
+
+    fn find_last_visible_version_with_deleted(
         &self,
         tx: &Transaction,
         row: crossbeam_skiplist::map::Entry<
