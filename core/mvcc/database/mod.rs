@@ -1902,12 +1902,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let row_data = row.data.clone();
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
-                        let record_values = record_cursor.get_values(&record).unwrap();
-                        let ValueRef::Integer(root_page) = record_values[3] else {
-                            panic!(
-                                "Expected integer value for root page, got {:?}",
-                                record_values[3]
-                            );
+                        let mut record_values = record_cursor.get_values(&record);
+                        let val = record_values.nth(3).unwrap()?;
+                        let ValueRef::Integer(root_page) = val else {
+                            panic!("Expected integer value for root page, got {val:?}");
                         };
                         if root_page < 0 {
                             let table_id = self.get_table_id_from_root_page(root_page);

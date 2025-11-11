@@ -1618,7 +1618,7 @@ impl BTreeCursor {
                 .index_info
                 .as_ref()
                 .expect("indexbtree_move_to without index_info");
-            find_compare(&key_values, index_info)
+            find_compare(key_values.iter().peekable(), index_info)
         };
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
@@ -2002,7 +2002,7 @@ impl BTreeCursor {
                 .index_info
                 .as_ref()
                 .expect("indexbtree_seek without index_info");
-            find_compare(&key_values, index_info)
+            find_compare(key_values.iter().peekable(), index_info)
         };
 
         tracing::debug!(
