@@ -4442,7 +4442,8 @@ pub fn op_function(
             | JsonFunc::JsonObject
             | JsonFunc::JsonbArray
             | JsonFunc::JsonbObject => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_func = match json_func {
                     JsonFunc::JsonArray => json_array,
@@ -4463,7 +4464,9 @@ pub fn op_function(
                     0 => Ok(Value::Null),
                     _ => {
                         let val = &state.registers[*start_reg];
-                        let reg_values = &state.registers[*start_reg + 1..*start_reg + arg_count];
+                        let reg_values = registers_to_ref_values(
+                            &state.registers[*start_reg + 1..*start_reg + arg_count],
+                        );
 
                         json_extract(val.get_value(), reg_values, &state.json_cache)
                     }
@@ -4479,7 +4482,9 @@ pub fn op_function(
                     0 => Ok(Value::Null),
                     _ => {
                         let val = &state.registers[*start_reg];
-                        let reg_values = &state.registers[*start_reg + 1..*start_reg + arg_count];
+                        let reg_values = registers_to_ref_values(
+                            &state.registers[*start_reg + 1..*start_reg + arg_count],
+                        );
 
                         jsonb_extract(val.get_value(), reg_values, &state.json_cache)
                     }
@@ -4565,7 +4570,7 @@ pub fn op_function(
             }
             JsonFunc::JsonRemove => {
                 if let Ok(json) = json_remove(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4575,7 +4580,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbRemove => {
                 if let Ok(json) = jsonb_remove(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4585,7 +4590,7 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if let Ok(json) = json_replace(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4595,7 +4600,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if let Ok(json) = jsonb_replace(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4605,7 +4610,7 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if let Ok(json) = json_insert(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4615,7 +4620,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if let Ok(json) = jsonb_insert(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4654,7 +4659,8 @@ pub fn op_function(
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_set() needs an odd number of arguments")
                 }
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_result = json_set(reg_values, &state.json_cache);
 
@@ -4667,7 +4673,8 @@ pub fn op_function(
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_set() needs an odd number of arguments")
                 }
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_result = jsonb_set(reg_values, &state.json_cache);
 

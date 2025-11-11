@@ -1,4 +1,7 @@
-use crate::{types::Value, vdbe::Register};
+use crate::{
+    types::{AsValueRef, Value},
+    ValueRef,
+};
 
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
@@ -12,16 +15,22 @@ use super::{
 /// * If the patch contains a scalar value, the target is replaced with that value
 /// * If both target and patch are objects, the patch is recursively applied
 /// * null values in the patch result in property removal from the target
-pub fn json_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate::Result<Value> {
+pub fn json_patch(
+    target: impl AsValueRef,
+    patch: impl AsValueRef,
+    cache: &JsonCacheCell,
+) -> crate::Result<Value> {
+    let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
     match (target, patch) {
-        (Value::Blob(_), _) | (_, Value::Blob(_)) => {
+        (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
         _ => (),
     }
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut target = cache.get_or_insert_with(target, &make_jsonb)?;
-    let patch = cache.get_or_insert_with(patch, &make_jsonb)?;
+    let mut target = cache.get_or_insert_with(target, make_jsonb)?;
+    let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
     target.patch(&patch)?;
 
@@ -30,16 +39,22 @@ pub fn json_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate
     json_string_to_db_type(target, element_type, OutputVariant::ElementType)
 }
 
-pub fn jsonb_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crate::Result<Value> {
+pub fn jsonb_patch(
+    target: impl AsValueRef,
+    patch: impl AsValueRef,
+    cache: &JsonCacheCell,
+) -> crate::Result<Value> {
+    let (target, patch) = (target.as_value_ref(), patch.as_value_ref());
     match (target, patch) {
-        (Value::Blob(_), _) | (_, Value::Blob(_)) => {
+        (ValueRef::Blob(_), _) | (_, ValueRef::Blob(_)) => {
             crate::bail_constraint_error!("blob is not supported!");
         }
         _ => (),
     }
     let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut target = cache.get_or_insert_with(target, &make_jsonb)?;
-    let patch = cache.get_or_insert_with(patch, &make_jsonb)?;
+    let mut target = cache.get_or_insert_with(target, make_jsonb)?;
+    let make_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let patch = cache.get_or_insert_with(patch, make_jsonb)?;
 
     target.patch(&patch)?;
 
@@ -48,15 +63,21 @@ pub fn jsonb_patch(target: &Value, patch: &Value, cache: &JsonCacheCell) -> crat
     json_string_to_db_type(target, element_type, OutputVariant::Binary)
 }
 
-pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn json_remove<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    for arg in &args[1..] {
-        if let Some(path) = json_path_from_db_value(arg.get_value(), true)? {
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    for arg in args {
+        if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
         }
@@ -67,15 +88,21 @@ pub fn json_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
 
-pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn jsonb_remove<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    for arg in &args[1..] {
-        if let Some(path) = json_path_from_db_value(arg.get_value(), true)? {
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    for arg in args {
+        if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
             let _ = json.operate_on_path(&path, &mut op);
         }
@@ -84,18 +111,26 @@ pub fn jsonb_remove(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     Ok(Value::Blob(json.data()))
 }
 
-pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn json_replace<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
+        let path = json_path_from_db_value(&first, true)?;
 
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
 
@@ -108,17 +143,26 @@ pub fn json_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Res
     json_string_to_db_type(json, el_type, super::OutputVariant::String)
 }
 
-pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn jsonb_replace<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
+        let path = json_path_from_db_value(&first, true)?;
+
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
 
@@ -131,17 +175,27 @@ pub fn jsonb_replace(args: &[Register], json_cache: &JsonCacheCell) -> crate::Re
     json_string_to_db_type(json, el_type, OutputVariant::Binary)
 }
 
-pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn json_insert<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
+        let path = json_path_from_db_value(&first, true)?;
+
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
 
@@ -154,17 +208,27 @@ pub fn json_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Resu
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
 
-pub fn jsonb_insert(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn jsonb_insert<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
+        let path = json_path_from_db_value(&first, true)?;
+
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
 
@@ -282,17 +346,14 @@ mod tests {
 
     #[test]
     fn test_json_remove_empty_args() {
-        let args = vec![];
+        let args: [Value; 0] = [];
         let json_cache = JsonCacheCell::new();
         assert_eq!(json_remove(&args, &json_cache).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_json_remove_array_element() {
-        let args = vec![
-            Register::Value(create_json(r#"[1,2,3,4,5]"#)),
-            Register::Value(create_text("$[2]")),
-        ];
+        let args = [create_json(r#"[1,2,3,4,5]"#), create_text("$[2]")];
 
         let json_cache = JsonCacheCell::new();
         let result = json_remove(&args, &json_cache).unwrap();
@@ -304,10 +365,10 @@ mod tests {
 
     #[test]
     fn test_json_remove_multiple_paths() {
-        let args = vec![
-            Register::Value(create_json(r#"{"a": 1, "b": 2, "c": 3}"#)),
-            Register::Value(create_text("$.a")),
-            Register::Value(create_text("$.c")),
+        let args = [
+            create_json(r#"{"a": 1, "b": 2, "c": 3}"#),
+            create_text("$.a"),
+            create_text("$.c"),
         ];
 
         let json_cache = JsonCacheCell::new();
@@ -320,9 +381,9 @@ mod tests {
 
     #[test]
     fn test_json_remove_nested_paths() {
-        let args = vec![
-            Register::Value(create_json(r#"{"a": {"b": {"c": 1, "d": 2}}}"#)),
-            Register::Value(create_text("$.a.b.c")),
+        let args = [
+            create_json(r#"{"a": {"b": {"c": 1, "d": 2}}}"#),
+            create_text("$.a.b.c"),
         ];
 
         let json_cache = JsonCacheCell::new();
@@ -335,9 +396,9 @@ mod tests {
 
     #[test]
     fn test_json_remove_duplicate_keys() {
-        let args = vec![
-            Register::Value(create_json(r#"{"a": 1, "a": 2, "a": 3}"#)),
-            Register::Value(create_text("$.a")),
+        let args = [
+            create_json(r#"{"a": 1, "a": 2, "a": 3}"#),
+            create_text("$.a"),
         ];
 
         let json_cache = JsonCacheCell::new();
@@ -350,9 +411,9 @@ mod tests {
 
     #[test]
     fn test_json_remove_invalid_path() {
-        let args = vec![
-            Register::Value(create_json(r#"{"a": 1}"#)),
-            Register::Value(Value::Integer(42)), // Invalid path type
+        let args = [
+            create_json(r#"{"a": 1}"#),
+            Value::Integer(42), // Invalid path type
         ];
 
         let json_cache = JsonCacheCell::new();
@@ -361,13 +422,11 @@ mod tests {
 
     #[test]
     fn test_json_remove_complex_case() {
-        let args = vec![
-            Register::Value(create_json(
-                r#"{"a":[1,2,3],"b":{"x":1,"x":2},"c":[{"y":1},{"y":2}]}"#,
-            )),
-            Register::Value(create_text("$.a[1]")),
-            Register::Value(create_text("$.b.x")),
-            Register::Value(create_text("$.c[0].y")),
+        let args = [
+            create_json(r#"{"a":[1,2,3],"b":{"x":1,"x":2},"c":[{"y":1},{"y":2}]}"#),
+            create_text("$.a[1]"),
+            create_text("$.b.x"),
+            create_text("$.c[0].y"),
         ];
 
         let json_cache = JsonCacheCell::new();

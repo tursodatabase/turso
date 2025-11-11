@@ -1566,6 +1566,13 @@ impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
     }
 }
 
+impl<'a> PartialEq<Value> for ValueRef<'a> {
+    fn eq(&self, other: &Value) -> bool {
+        let other = other.as_value_ref();
+        self.eq(&other)
+    }
+}
+
 impl<'a> Eq for ValueRef<'a> {}
 
 #[expect(clippy::non_canonical_partial_ord_impl)]
