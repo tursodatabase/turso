@@ -1071,7 +1071,7 @@ impl Optimizable for ast::Expr {
             Expr::Register(..) => false, // Register values can be null
         }
     }
-    /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
+    /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
             Expr::SubqueryResult { .. } => false,
@@ -1142,8 +1142,8 @@ impl Optimizable for ast::Expr {
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => false,
-            Expr::Register(_) => false, // Register values are not constants
+            Expr::Variable(_) => true,
+            Expr::Register(_) => true,
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
