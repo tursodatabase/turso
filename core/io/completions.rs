@@ -23,7 +23,6 @@ pub struct Completion {
     pub(super) inner: Option<Arc<CompletionInner>>,
 }
 
-
 #[derive(Debug, Default)]
 struct ContextInner {
     waker: Option<Waker>,
