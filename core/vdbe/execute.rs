@@ -4967,7 +4967,7 @@ pub fn op_function(
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff(&[start, end]);
+                    let result = crate::functions::datetime::exec_timediff([start, end]);
 
                     state.registers[*dest] = Register::Value(result);
                 }

@@ -325,7 +325,7 @@ where
     }
 }
 
-impl<'b, V: AsValueRef> AsValueRef for &'b V {
+impl<V: AsValueRef> AsValueRef for &V {
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
         (*self).as_value_ref()
     }

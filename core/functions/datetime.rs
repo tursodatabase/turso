@@ -80,7 +80,7 @@ where
 {
     let values = values.into_iter();
     if values.len() == 0 {
-        let now = parse_naive_date_time(&Value::build_text("now")).unwrap();
+        let now = parse_naive_date_time(Value::build_text("now")).unwrap();
         return format_dt(now, output_type, false);
     }
     let mut values = values.peekable();
@@ -1023,7 +1023,7 @@ mod tests {
         ];
 
         for case in invalid_cases.iter() {
-            let result = exec_date(&[case]);
+            let result = exec_date([case]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),

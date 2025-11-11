@@ -1031,7 +1031,7 @@ mod tests {
     fn test_json_extract_missing_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
-            &Value::build_text("{\"a\":2}"),
+            Value::build_text("{\"a\":2}"),
             &[Value::build_text("$.x")],
             &json_cache,
         );
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn test_json_extract_null_path() {
         let json_cache = JsonCacheCell::new();
-        let result = json_extract(&Value::build_text("{\"a\":2}"), &[Value::Null], &json_cache);
+        let result = json_extract(Value::build_text("{\"a\":2}"), &[Value::Null], &json_cache);
 
         match result {
             Ok(Value::Null) => (),
@@ -1056,7 +1056,7 @@ mod tests {
     fn test_json_path_invalid() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
-            &Value::build_text("{\"a\":2}"),
+            Value::build_text("{\"a\":2}"),
             &[Value::Float(1.1)],
             &json_cache,
         );
