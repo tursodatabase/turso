@@ -829,7 +829,6 @@ fn test_lazy_scan_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.load().clone(),
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -837,7 +836,7 @@ fn test_lazy_scan_cursor_basic() {
     // Check first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 1);
 
     // Iterate through all rows
@@ -851,7 +850,7 @@ fn test_lazy_scan_cursor_basic() {
             break;
         }
         count += 1;
-        let row = cursor.current_row().unwrap().unwrap();
+        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
     }
 
@@ -872,7 +871,6 @@ fn test_lazy_scan_cursor_with_gaps() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.load().clone(),
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -880,7 +878,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     // Check first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 5);
 
     // Test moving forward and checking IDs
@@ -924,7 +922,6 @@ fn test_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.load().clone(),
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -933,7 +930,7 @@ fn test_cursor_basic() {
 
     // Check first row
     assert!(!cursor.is_empty());
-    let row = cursor.current_row().unwrap().unwrap();
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id, 1);
 
     // Iterate through all rows
@@ -947,7 +944,7 @@ fn test_cursor_basic() {
             break;
         }
         count += 1;
-        let row = cursor.current_row().unwrap().unwrap();
+        let row = cursor.read_mvcc_current_row().unwrap().unwrap();
         assert_eq!(row.id.row_id, count);
     }
 
@@ -979,7 +976,6 @@ fn test_cursor_with_empty_table() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.load().clone(),
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -997,14 +993,13 @@ fn test_cursor_modification_during_scan() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        db.conn.pager.load().clone(),
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
 
     // Read first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
-    let first_row = cursor.current_row().unwrap().unwrap();
+    let first_row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(first_row.id.row_id, 1);
 
     // Insert a new row with ID between existing rows
@@ -1589,4 +1584,52 @@ fn test_select_empty_table() {
         .unwrap();
     let rows = get_rows(&conn, "SELECT * FROM t where x > 100");
     assert!(rows.is_empty());
+}
+
+#[test]
+fn test_cursor_with_btree_and_mvcc() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![Value::Integer(1)]);
+    assert_eq!(rows[1], vec![Value::Integer(2)]);
+}
+
+#[test]
+fn test_cursor_with_btree_and_mvcc_2() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    println!("getting rows");
+    let rows = get_rows(&conn, "SELECT * FROM t");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], vec![Value::Integer(1)]);
+    assert_eq!(rows[1], vec![Value::Integer(2)]);
+    assert_eq!(rows[2], vec![Value::Integer(3)]);
 }
