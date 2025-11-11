@@ -4,7 +4,10 @@ use crate::generation::{
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
-use crate::model::query::select::{CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody, SelectInner, SelectTable};
+use crate::model::query::select::{
+    CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
+    SelectInner, SelectTable,
+};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
@@ -81,7 +84,10 @@ impl Arbitrary for FromClause {
                 })
             })
             .collect();
-        FromClause { table: SelectTable::Table(name), joins }
+        FromClause {
+            table: SelectTable::Table(name),
+            joins,
+        }
     }
 }
 
@@ -146,6 +152,7 @@ impl Arbitrary for SelectInner {
 }
 
 impl ArbitrarySized for SelectInner {
+    //FIXME this can generate SELECT statements containing fewer columns than the num_result_columns parameter.
     fn arbitrary_sized<R: Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         env: &C,
@@ -282,13 +289,35 @@ impl Arbitrary for Insert {
             })
         };
 
-        let gen_self_select = |rng: &mut R| {
+        let gen_nested_self_insert = |rng: &mut R| {
             let table = pick(env.tables(), rng);
-            if table.rows.is_empty() {
-                return None;
+
+            const MAX_SELF_INSERT_DEPTH: i32 = 5;
+            let nesting_depth = rng.random_range(1..=MAX_SELF_INSERT_DEPTH);
+
+            let mut select = Select::simple(
+                table.name.clone(),
+                Predicate::arbitrary_from(rng, env, table),
+            );
+
+            for _ in 1..nesting_depth {
+                select = Select {
+                    body: SelectBody {
+                        select: Box::new(SelectInner {
+                            distinctness: Distinctness::All,
+                            columns: vec![ResultColumn::Star],
+                            from: Some(FromClause {
+                                table: SelectTable::Select(select),
+                                joins: Vec::new(),
+                            }),
+                            where_clause: Predicate::true_(),
+                            order_by: None,
+                        }),
+                        compounds: Vec::new(),
+                    },
+                    limit: None,
+                };
             }
-            let predicate = Predicate::true_();
-            let select = Select::simple(table.name.clone(), predicate);
 
             Some(Insert::Select {
                 table: table.name.clone(),
@@ -297,10 +326,13 @@ impl Arbitrary for Insert {
         };
 
         backtrack(
-            vec![(1, Box::new(gen_values)), (1, Box::new(gen_self_select))],
+            vec![
+                (1, Box::new(gen_values)),
+                (1, Box::new(gen_nested_self_insert)),
+            ],
             rng,
         )
-            .expect("backtrack with these arguments should not return None")
+        .expect("backtrack with these arguments should not return None")
     }
 }
 

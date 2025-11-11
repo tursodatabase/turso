@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
-        alter_table::{AlterTable, AlterTableType}, pragma::Pragma, select::{CompoundOperator, FromClause, ResultColumn, SelectInner}, transaction::{Begin, Commit, Rollback}, update::Update, Create, CreateIndex,
-        Delete,
-        Drop,
-        DropIndex,
-        Insert,
-        Select,
+        Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
+        alter_table::{AlterTable, AlterTableType},
+        pragma::Pragma,
+        select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
+        transaction::{Begin, Commit, Rollback},
+        update::Update,
     },
     table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
@@ -323,6 +323,7 @@ impl Shadow for Drop {
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
+    //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
@@ -380,7 +381,6 @@ impl Shadow for FromClause {
                 }
             }
         };
-
 
         for join in &self.joins {
             let joined_table = tables
