@@ -4,10 +4,7 @@ use crate::generation::{
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
-use crate::model::query::select::{
-    CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner,
-};
+use crate::model::query::select::{CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody, SelectInner, SelectTable};
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
@@ -84,7 +81,7 @@ impl Arbitrary for FromClause {
                 })
             })
             .collect();
-        FromClause { table: name, joins }
+        FromClause { table: SelectTable::Table(name), joins }
     }
 }
 
@@ -98,11 +95,12 @@ impl Arbitrary for SelectInner {
         let order_by = rng
             .random_bool(env.opts().query.select.order_by_prob)
             .then(|| {
+                let dependencies = &from.table.dependencies();
                 let order_by_table_candidates = from
                     .joins
                     .iter()
                     .map(|j| &j.table)
-                    .chain(std::iter::once(&from.table))
+                    .chain(dependencies)
                     .collect::<Vec<_>>();
                 let order_by_col_count =
                     (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
@@ -155,11 +153,12 @@ impl ArbitrarySized for SelectInner {
     ) -> Self {
         let mut select_inner = SelectInner::arbitrary(rng, env);
         let select_from = &select_inner.from.as_ref().unwrap();
+        let dependencies = select_from.table.dependencies();
         let table_names = select_from
             .joins
             .iter()
             .map(|j| &j.table)
-            .chain(std::iter::once(&select_from.table));
+            .chain(&dependencies);
 
         let flat_columns_names = table_names
             .flat_map(|t| {

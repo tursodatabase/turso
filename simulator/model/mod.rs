@@ -4,6 +4,7 @@ use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
         alter_table::{AlterTable, AlterTableType}, pragma::Pragma, select::{CompoundOperator, FromClause, ResultColumn, SelectInner}, transaction::{Begin, Commit, Rollback}, update::Update, Create, CreateIndex,
@@ -236,7 +237,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
 }
 
 impl QueryDiscriminants {
-    pub const ALL_NO_TRANSACTION: &[QueryDiscriminants] = &[
+    pub const ALL_NO_TRANSACTION: &'_ [QueryDiscriminants] = &[
         QueryDiscriminants::Select,
         QueryDiscriminants::Create,
         QueryDiscriminants::Insert,
@@ -354,15 +355,32 @@ impl Shadow for Insert {
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let first_table = tables
-            .iter()
-            .find(|t| t.name == self.table)
-            .context("Table not found")?;
-
-        let mut join_table = JoinTable {
-            tables: vec![first_table.clone()],
-            rows: first_table.rows.clone(),
+        let mut join_table = match &self.table {
+            SelectTable::Table(table) => {
+                let first_table = tables
+                    .iter()
+                    .find(|t| t.name == *table)
+                    .context("Table not found")?;
+                JoinTable {
+                    tables: vec![first_table.clone()],
+                    rows: first_table.rows.clone(),
+                }
+            }
+            SelectTable::Select(select) => {
+                let select_dependencies = select.dependencies();
+                let result_tables = tables
+                    .iter()
+                    .filter(|shadow_table| select_dependencies.contains(shadow_table.name.as_str()))
+                    .cloned()
+                    .collect();
+                let rows = select.shadow(tables)?;
+                JoinTable {
+                    tables: result_tables,
+                    rows,
+                }
+            }
         };
+
 
         for join in &self.joins {
             let joined_table = tables
