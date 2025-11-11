@@ -23,6 +23,10 @@ pub struct Completion {
     pub(super) inner: Option<Arc<CompletionInner>>,
 }
 
+// Completion can be Sent between threads in case of async IO (like io_uring) when arbitrary thread
+// can start to execute completion for CQE arrived from the kernel in the ring
+unsafe impl Send for Completion {}
+
 #[derive(Debug, Default)]
 struct ContextInner {
     waker: Option<Waker>,
