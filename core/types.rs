@@ -297,21 +297,7 @@ impl<'b> AsValueRef for ValueRef<'b> {
     }
 }
 
-impl<'b> AsValueRef for &ValueRef<'b> {
-    #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
-        **self
-    }
-}
-
 impl AsValueRef for Value {
-    #[inline]
-    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
-        self.as_ref()
-    }
-}
-
-impl AsValueRef for &Value {
     #[inline]
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
         self.as_ref()
@@ -339,17 +325,9 @@ where
     }
 }
 
-impl<V1, V2> AsValueRef for &Either<V1, V2>
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    #[inline]
+impl<'b, V: AsValueRef> AsValueRef for &'b V {
     fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
-        match self {
-            Either::Left(left) => left.as_value_ref(),
-            Either::Right(right) => right.as_value_ref(),
-        }
+        (*self).as_value_ref()
     }
 }
 

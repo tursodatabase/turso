@@ -4942,11 +4942,14 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Date => {
-                let result = exec_date(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_date(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Time => {
-                let values = &state.registers[*start_reg..*start_reg + arg_count];
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_time(values);
                 state.registers[*dest] = Register::Value(result);
             }
@@ -4954,13 +4957,10 @@ pub fn op_function(
                 if arg_count != 2 {
                     state.registers[*dest] = Register::Value(Value::Null);
                 } else {
-                    let start = state.registers[*start_reg].get_value().clone();
-                    let end = state.registers[*start_reg + 1].get_value().clone();
+                    let start = state.registers[*start_reg].get_value();
+                    let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff(&[
-                        Register::Value(start),
-                        Register::Value(end),
-                    ]);
+                    let result = crate::functions::datetime::exec_timediff(&[start, end]);
 
                     state.registers[*dest] = Register::Value(result);
                 }
@@ -4971,12 +4971,15 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
             ScalarFunc::DateTime => {
-                let result =
-                    exec_datetime_full(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_datetime_full(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::JulianDay => {
-                let result = exec_julianday(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_julianday(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::UnixEpoch => {
@@ -5042,7 +5045,9 @@ pub fn op_function(
                 program.connection.load_extension(ext)?;
             }
             ScalarFunc::StrfTime => {
-                let result = exec_strftime(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_strftime(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Printf => {
