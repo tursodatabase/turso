@@ -242,7 +242,7 @@ impl ProtocolIO for JsProtocolIo {
         }))
     }
 
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send + Sync>) {
+    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>) {
         let mut work = self.work.lock().unwrap();
         work.push_back(callback);
     }
@@ -270,7 +270,7 @@ impl ProtocolIO for JsProtocolIo {
 #[napi]
 pub struct JsProtocolIo {
     requests: Mutex<Vec<JsProtocolRequestBytes>>,
-    work: Mutex<VecDeque<Box<dyn FnMut() -> bool + Send + Sync>>>,
+    work: Mutex<VecDeque<Box<dyn FnMut() -> bool + Send>>>,
 }
 
 impl Default for JsProtocolIo {

@@ -52,6 +52,12 @@ pub struct DataStats {
     pub read_bytes: AtomicUsize,
 }
 
+impl Default for DataStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DataStats {
     pub fn new() -> Self {
         Self {

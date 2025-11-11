@@ -23,9 +23,6 @@ pub struct Completion {
     pub(super) inner: Option<Arc<CompletionInner>>,
 }
 
-unsafe impl Send for Completion {}
-unsafe impl Sync for Completion {}
-
 #[derive(Debug, Default)]
 struct ContextInner {
     waker: Option<Waker>,

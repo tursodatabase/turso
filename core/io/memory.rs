@@ -252,8 +252,7 @@ impl File for MemoryFile {
             Ok(true)
         } else {
             Err(LimboError::InternalError(format!(
-                "ambigous has_hole result: pos={}, len={}, pages={}, holes={}",
-                pos, len, pages, holes
+                "ambigous has_hole result: pos={pos}, len={len}, pages={pages}, holes={holes}"
             )))
         }
     }

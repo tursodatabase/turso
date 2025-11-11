@@ -1585,6 +1585,8 @@ mod tests {
         chunk: usize,
     }
 
+    unsafe impl Sync for TestCompletion {}
+
     impl DataCompletion<u8> for TestCompletion {
         type DataPollResult = TestPollResult;
         fn status(&self) -> crate::Result<Option<u16>> {
@@ -1626,7 +1628,7 @@ mod tests {
                 let coro: Coro<()> = coro.into();
                 let mut bytes = BytesMut::new();
                 let mut count = 0;
-                let mut network_stats = DataStats::new();
+                let network_stats = DataStats::new();
                 while wait_proto_message::<(), PageData>(
                     &coro,
                     &completion,

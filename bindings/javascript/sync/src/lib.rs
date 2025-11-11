@@ -307,7 +307,8 @@ impl SyncEngine {
 
     #[napi]
     pub fn protocol_io_step(&self) -> napi::Result<()> {
-        Ok(self.protocol()?.step_work())
+        self.protocol()?.step_work();
+        Ok(())
     }
 
     #[napi]
