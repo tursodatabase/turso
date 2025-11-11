@@ -11,10 +11,10 @@ use parking_lot::Mutex;
 
 use crate::{Buffer, CompletionError};
 
-pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send;
-pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send;
-pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send;
-pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send;
+pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync;
+pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -23,9 +23,6 @@ pub struct Completion {
     pub(super) inner: Option<Arc<CompletionInner>>,
 }
 
-// Completion can be Sent between threads in case of async IO (like io_uring) when arbitrary thread
-// can start to execute completion for CQE arrived from the kernel in the ring
-unsafe impl Send for Completion {}
 
 #[derive(Debug, Default)]
 struct ContextInner {
@@ -279,7 +276,7 @@ impl Completion {
 
     pub fn new_write_linked<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -288,7 +285,7 @@ impl Completion {
 
     pub fn new_write<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -297,7 +294,7 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + 'static,
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -306,7 +303,7 @@ impl Completion {
     }
     pub fn new_sync<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
             complete,
@@ -315,7 +312,7 @@ impl Completion {
 
     pub fn new_trunc<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + Send + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
             complete,
