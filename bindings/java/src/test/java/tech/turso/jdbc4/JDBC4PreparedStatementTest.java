@@ -595,6 +595,159 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
+  void testSetAsciiStream_longLength_insert_and_select() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "test";
+    byte[] bytes = text.getBytes(StandardCharsets.US_ASCII);
+    InputStream stream = new ByteArrayInputStream(bytes);
+
+    stmt.setAsciiStream(1, stream, (long) bytes.length);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(text, rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_longLength_nullStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setAsciiStream(1, null, 0L);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_longLength_emptyStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream empty = new ByteArrayInputStream(new byte[0]);
+
+    stmt.setAsciiStream(1, empty, 0L);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals("", rs.getString(1));
+  }
+
+  @Test
+  void testSetAsciiStream_longLength_negative() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream stream = new ByteArrayInputStream("test".getBytes(StandardCharsets.US_ASCII));
+
+    assertThrows(SQLFeatureNotSupportedException.class, () -> stmt.setAsciiStream(1, stream, -1L));
+  }
+
+  @Test
+  void testSetAsciiStream_longLength_overflow() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream stream = new ByteArrayInputStream("test".getBytes(StandardCharsets.US_ASCII));
+
+    assertThrows(
+        SQLFeatureNotSupportedException.class,
+        () -> stmt.setAsciiStream(1, stream, (long) Integer.MAX_VALUE + 1));
+  }
+
+  @Test
+  void testSetBinaryStream_longLength_insert_and_select() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    byte[] data = {1, 2, 3, 4, 5};
+    InputStream stream = new ByteArrayInputStream(data);
+
+    stmt.setBinaryStream(1, stream, (long) data.length);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertArrayEquals(data, rs.getBytes(1));
+  }
+
+  @Test
+  void testSetBinaryStream_longLength_nullStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setBinaryStream(1, null, 0L);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getBytes(1));
+  }
+
+  @Test
+  void testSetBinaryStream_longLength_emptyStream() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream empty = new ByteArrayInputStream(new byte[0]);
+
+    stmt.setBinaryStream(1, empty, 0L);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+
+    byte[] result = rs.getBytes(1);
+    assertNotNull(result);
+    assertEquals(0, result.length);
+    assertArrayEquals(new byte[0], result);
+  }
+
+  @Test
+  void testSetBinaryStream_longLength_negative() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream stream = new ByteArrayInputStream(new byte[] {1, 2, 3});
+
+    assertThrows(SQLFeatureNotSupportedException.class, () -> stmt.setBinaryStream(1, stream, -1L));
+  }
+
+  @Test
+  void testSetBinaryStream_longLength_overflow() throws SQLException {
+    connection.prepareStatement("CREATE TABLE test (col BLOB)").execute();
+
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+    InputStream stream = new ByteArrayInputStream(new byte[] {1, 2, 3});
+
+    assertThrows(
+        SQLFeatureNotSupportedException.class,
+        () -> stmt.setBinaryStream(1, stream, (long) Integer.MAX_VALUE + 1));
+  }
+
+  @Test
   void execute_insert_should_return_number_of_inserted_elements() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
     PreparedStatement prepareStatement =
