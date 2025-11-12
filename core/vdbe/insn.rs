@@ -761,6 +761,32 @@ pub enum Insn {
         pc_if_next: BranchOffset,
     },
 
+    /// Insert the integer value held by register P2 into a RowSet object held in register P1.
+    /// An assertion fails if P2 is not an integer.
+    RowSetAdd {
+        rowset_reg: usize, // P1 - register holding RowSet
+        value_reg: usize,  // P2 - register holding integer value to add
+    },
+
+    /// Extract the smallest value from the RowSet object in P1 and put that value into register P3.
+    /// Or, if RowSet object P1 is initially empty, leave P3 unchanged and jump to instruction P2.
+    RowSetRead {
+        rowset_reg: usize,         // P1 - register holding RowSet
+        pc_if_empty: BranchOffset, // P2 - jump target if empty
+        dest_reg: usize,           // P3 - register to store smallest value
+    },
+
+    /// Register P3 is assumed to hold a 64-bit integer value. If register P1 contains a RowSet object
+    /// and that RowSet object contains the value held in P3, jump to register P2. Otherwise, insert
+    /// the integer in P3 into the RowSet and continue on to the next opcode.
+    /// P4 is the batch identifier (0 for first set, -1 for final set, >0 for other sets).
+    RowSetTest {
+        rowset_reg: usize,         // P1 - register holding RowSet
+        pc_if_found: BranchOffset, // P2 - jump target if value found
+        value_reg: usize,          // P3 - register holding integer value to test/insert
+        batch: i32,                // P4 - batch identifier
+    },
+
     /// Function
     Function {
         constant_mask: i32, // P1
@@ -1330,6 +1356,9 @@ impl InsnVariants {
             InsnVariants::SorterData => execute::op_sorter_data,
             InsnVariants::SorterNext => execute::op_sorter_next,
             InsnVariants::SorterCompare => execute::op_sorter_compare,
+            InsnVariants::RowSetAdd => execute::op_rowset_add,
+            InsnVariants::RowSetRead => execute::op_rowset_read,
+            InsnVariants::RowSetTest => execute::op_rowset_test,
             InsnVariants::Function => execute::op_function,
             InsnVariants::Cast => execute::op_cast,
             InsnVariants::InitCoroutine => execute::op_init_coroutine,

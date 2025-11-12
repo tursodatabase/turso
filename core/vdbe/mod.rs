@@ -24,6 +24,7 @@ pub mod explain;
 pub mod insn;
 pub mod likeop;
 pub mod metrics;
+pub mod rowset;
 pub mod sorter;
 pub mod value;
 
@@ -63,6 +64,7 @@ use execute::{
     OpOpenEphemeralState,
 };
 
+use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
@@ -318,6 +320,8 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    /// RowSet objects stored by register index
+    rowsets: HashMap<usize, RowSet>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -373,6 +377,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            rowsets: HashMap::new(),
         }
     }
 
@@ -465,6 +470,7 @@ impl ProgramState {
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
+        self.rowsets.clear();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
