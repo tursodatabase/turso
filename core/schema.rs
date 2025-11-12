@@ -249,6 +249,12 @@ impl Schema {
             // Remove from tables
             self.tables.remove(&name);
 
+            // Remove DBSP state table and its indexes from in-memory schema
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
+            self.tables.remove(&dbsp_table_name);
+            self.remove_indices_for_table(&dbsp_table_name);
+
             // Remove from materialized view tracking
             self.materialized_view_names.remove(&name);
             self.materialized_view_sql.remove(&name);
