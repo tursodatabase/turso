@@ -44,8 +44,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -86,8 +86,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -107,7 +107,7 @@ jobs:
           output-file-path: clickbench-sqlite3.txt
           fail-on-alert: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          comment-on-alert: true
+          comment-on-alert: false
           comment-always: false
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
           never-fail: true
@@ -154,8 +154,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
