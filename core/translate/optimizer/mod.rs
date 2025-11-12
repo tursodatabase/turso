@@ -1143,7 +1143,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => true,
+            Expr::Register(_) => false,
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
