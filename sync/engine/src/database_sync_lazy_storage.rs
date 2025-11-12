@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use turso_core::{
-    turso_assert, Buffer, Completion, CompletionError, DatabaseStorage, File, LimboError,
-};
+use turso_core::{Buffer, Completion, CompletionError, DatabaseStorage, File, LimboError};
 
 use crate::{
     database_sync_operations::{pull_pages_v1, ProtocolIoStats, PAGE_SIZE},
@@ -76,7 +74,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
             let check_buffer = Arc::new(Buffer::new_temporary(size));
             let check_c =
                 dirty_file.pread(pos, Completion::new_read(check_buffer.clone(), |_| {}))?;
-            turso_assert!(
+            assert!(
                 check_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
@@ -85,7 +83,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
             let clean_c = self
                 .clean_file
                 .pread(pos, Completion::new_read(clean_buffer.clone(), |_| {}))?;
-            turso_assert!(
+            assert!(
                 clean_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
@@ -121,7 +119,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
                                 buf.clone(),
                                 Completion::new_write(|_| {}),
                             )?;
-                            turso_assert!(
+                            assert!(
                                 dirty_c.finished(),
                                 "LazyDatabaseStorage works only with sync IO"
                             );
@@ -129,7 +127,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
 
                         let clean_c =
                             clean_file.pwrite(pos, buf.clone(), Completion::new_write(|_| {}))?;
-                        turso_assert!(
+                        assert!(
                             clean_c.finished(),
                             "LazyDatabaseStorage works only with sync IO"
                         );
@@ -218,7 +216,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
         if let Some(dirty_file) = &self.dirty_file {
             let dirty_c = dirty_file.sync(Completion::new_sync(|_| {}))?;
-            turso_assert!(
+            assert!(
                 dirty_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
@@ -238,7 +236,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
     ) -> turso_core::Result<turso_core::Completion> {
         if let Some(dirty_file) = &self.dirty_file {
             let dirty_c = dirty_file.truncate(len as u64, Completion::new_trunc(|_| {}))?;
-            turso_assert!(
+            assert!(
                 dirty_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
