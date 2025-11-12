@@ -31,7 +31,7 @@ test('partial sync', async () => {
         path: ':memory:',
         url: process.env.VITE_TURSO_DB_URL,
         longPollTimeoutMs: 100,
-        partial: true,
+        partialBootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
     });
 
     // 128 pages plus some overhead (very rough estimation)

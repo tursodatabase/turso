@@ -50,6 +50,17 @@ class Database extends DatabasePromise {
             return;
         }
 
+        let partialBoostrapStrategy = undefined;
+        if (opts.partialBootstrapStrategy != null) {
+            switch (opts.partialBootstrapStrategy.kind) {
+                case "prefix":
+                    partialBoostrapStrategy = { type: "Prefix", length: opts.partialBootstrapStrategy.length };
+                    break;
+                case "query":
+                    partialBoostrapStrategy = { type: "Query", length: opts.partialBootstrapStrategy.query };
+                    break;
+            }
+        }
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -59,7 +70,7 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
-            partial: opts.partial,
+            partialBoostrapStrategy: partialBoostrapStrategy
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);

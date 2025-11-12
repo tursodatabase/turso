@@ -224,6 +224,10 @@ export type GeneratorResponse =
   | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
+export type JsPartialBootstrapStrategy =
+  | { type: 'Prefix', length: number }
+  | { type: 'Query', query: string }
+
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
   | { type: 'FullRead', path: string }
@@ -241,7 +245,7 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
-  partial?: boolean
+  partialBoostrapStrategy?: JsPartialBootstrapStrategy
 }
 
 export declare const enum SyncEngineProtocolVersion {

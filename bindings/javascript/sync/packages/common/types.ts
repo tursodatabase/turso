@@ -110,7 +110,7 @@ export interface DatabaseOpts {
     /**
      * optional parameter to enable partial sync for the database
      */
-    partial?: boolean;
+    partialBootstrapStrategy?: { kind: 'prefix', length: number } | { kind: 'query', query: string };
 }
 export interface DatabaseStats {
     /**
