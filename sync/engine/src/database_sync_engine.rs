@@ -10,13 +10,13 @@ use turso_core::{DatabaseStorage, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
+    database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
         reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
         wal_pull_to_file, ProtocolIoStats, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
-    database_sync_partial_storage::PartialDatabaseStorage,
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
         DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
@@ -35,6 +35,12 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
+pub enum PartialBootstrapStrategy {
+    Prefix { length: usize },
+    Query { query: String },
+}
+
+#[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
     pub client_name: String,
     pub tables_ignore: Vec<String>,
@@ -44,7 +50,7 @@ pub struct DatabaseSyncEngineOpts {
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
-    pub partial: bool,
+    pub partial_bootstrap_strategy: Option<PartialBootstrapStrategy>,
 }
 
 pub struct DataStats {
@@ -99,7 +105,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         io: Arc<dyn turso_core::IO>,
         protocol: Arc<P>,
         main_db_path: &str,
-        opts: DatabaseSyncEngineOpts,
+        mut opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
         let main_db_wal_path = format!("{main_db_path}-wal");
         let revert_db_wal_path = format!("{main_db_path}-wal-revert");
@@ -116,23 +122,20 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             Some(DatabaseMetadata::load(&data)?)
         };
         let protocol = ProtocolIoStats::new(protocol);
+        let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.take();
+        let partial = partial_bootstrap_strategy.is_some();
 
         let meta = match meta {
             Some(meta) => meta,
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
-                let prefix = if opts.partial {
-                    Some(128 * PAGE_SIZE)
-                } else {
-                    None
-                };
                 let revision = bootstrap_db_file(
                     coro,
                     &protocol,
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
-                    prefix,
+                    partial_bootstrap_strategy,
                 )
                 .await?;
                 let meta = DatabaseMetadata {
@@ -145,7 +148,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                     last_pushed_pull_gen_hint: 0,
                     last_pull_unix_time: Some(io.now().secs),
                     last_push_unix_time: None,
-                    partial_bootstrap_server_revision: if opts.partial {
+                    partial_bootstrap_server_revision: if partial {
                         Some(revision.clone())
                     } else {
                         None
@@ -163,7 +166,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                         "deferred bootstrap is not supported for legacy protocol".to_string(),
                     ));
                 }
-                if opts.partial {
+                if partial {
                     return Err(Error::DatabaseSyncEngineError(
                         "deferred bootstrap is not supported for partial sync".to_string(),
                     ));
@@ -205,9 +208,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         }
 
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
-        let mut db_file: Arc<dyn DatabaseStorage> =
-            Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
-        if opts.partial {
+        let db_file: Arc<dyn DatabaseStorage> = if partial {
             let Some(partial_bootstrap_server_revision) = &meta.partial_bootstrap_server_revision
             else {
                 return Err(Error::DatabaseSyncEngineError(
@@ -219,12 +220,15 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                     "partial sync is supported only for V1 protocol".to_string(),
                 ));
             };
-            db_file = Arc::new(PartialDatabaseStorage::new(
+            Arc::new(LazyDatabaseStorage::new(
                 db_file,
+                None, // todo(sivukhin): allocate dirty file for FS IO
                 protocol.clone(),
                 revision.to_string(),
-            ));
-        }
+            ))
+        } else {
+            Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
+        };
 
         let main_db = turso_core::Database::open_with_flags(
             io.clone(),

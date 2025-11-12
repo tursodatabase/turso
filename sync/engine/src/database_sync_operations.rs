@@ -13,7 +13,7 @@ use turso_core::{
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
-    database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
+    database_sync_engine::{DataStats, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
     database_tape::{
         run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
         DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
@@ -256,7 +256,8 @@ pub async fn wal_pull_to_file_v1<C: ProtocolIO, Ctx>(
         server_revision: String::new(),
         client_revision: revision.to_string(),
         long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
-        server_pages: BytesMut::new().into(),
+        server_pages_selector: BytesMut::new().into(),
+        server_query_selector: String::new(),
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
@@ -366,7 +367,8 @@ pub async fn pull_pages_v1<C: ProtocolIO, Ctx>(
         server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
-        server_pages: bitmap_bytes.into(),
+        server_pages_selector: bitmap_bytes.into(),
+        server_query_selector: String::new(),
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
@@ -1122,11 +1124,11 @@ pub async fn bootstrap_db_file<C: ProtocolIO, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
-    prefix: Option<usize>,
+    partial_bootstrap_strategy: Option<PartialBootstrapStrategy>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if prefix.is_some() {
+            if partial_bootstrap_strategy.is_some() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
@@ -1134,7 +1136,7 @@ pub async fn bootstrap_db_file<C: ProtocolIO, Ctx>(
             bootstrap_db_file_legacy(coro, client, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(coro, client, io, main_db_path, prefix).await
+            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_bootstrap_strategy).await
         }
     }
 }
@@ -1144,22 +1146,25 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
     client: &ProtocolIoStats<C>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
-    prefix: Option<usize>,
+    bootstrap: Option<PartialBootstrapStrategy>,
 ) -> Result<DatabasePullRevision> {
-    let bitmap_bytes = {
-        if let Some(prefix) = prefix {
-            let mut bitmap = RoaringBitmap::new();
-            bitmap.insert_range(0..(prefix / PAGE_SIZE) as u32);
-            let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
-            bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
-                Error::DatabaseSyncEngineError(format!(
-                    "unable to serialize bootstrap request: {e}"
-                ))
-            })?;
-            bitmap_bytes
-        } else {
-            Vec::new()
-        }
+    let server_pages_selector = if let Some(PartialBootstrapStrategy::Prefix { length }) =
+        &bootstrap
+    {
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
+        let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
+        bitmap.serialize_into(&mut bitmap_bytes).map_err(|e| {
+            Error::DatabaseSyncEngineError(format!("unable to serialize bootstrap request: {e}"))
+        })?;
+        bitmap_bytes
+    } else {
+        Vec::new()
+    };
+    let server_query_selector = if let Some(PartialBootstrapStrategy::Query { query }) = bootstrap {
+        query
+    } else {
+        String::new()
     };
 
     let request = PullUpdatesReqProtoBody {
@@ -1167,7 +1172,8 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         server_revision: String::new(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
-        server_pages: bitmap_bytes.into(),
+        server_pages_selector: server_pages_selector.into(),
+        server_query_selector: server_query_selector,
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();

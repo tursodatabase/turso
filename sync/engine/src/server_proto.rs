@@ -23,7 +23,9 @@ pub struct PullUpdatesReqProtoBody {
     #[prost(uint32, tag = "4")]
     pub long_poll_timeout_ms: u32,
     #[prost(bytes, tag = "5")]
-    pub server_pages: Bytes,
+    pub server_pages_selector: Bytes,
+    #[prost(string, tag = "7")]
+    pub server_query_selector: String,
     #[prost(bytes, tag = "6")]
     pub client_pages: Bytes,
 }
