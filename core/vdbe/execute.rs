@@ -1743,8 +1743,9 @@ pub fn op_column(
                                             // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
                                             let text =
                                                 unsafe { std::str::from_utf8_unchecked(buf) };
-                                            state.registers[*dest] =
-                                                Register::Value(Value::Text(Text::new(text)));
+                                            state.registers[*dest] = Register::Value(Value::Text(
+                                                Text::new(text.to_string()),
+                                            ));
                                         }
                                     }
                                 }
@@ -2678,7 +2679,7 @@ pub fn op_string8(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::build_text(value));
+    state.registers[*dest] = Register::Value(Value::build_text(value.clone()));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -5086,7 +5087,7 @@ pub fn op_function(
 
                         let name = column.name.as_ref().unwrap();
                         let name_json = json::convert_ref_dbtype_to_jsonb(
-                            ValueRef::Text(TextRef::new(name.as_bytes(), TextSubtype::Text)),
+                            ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
                             json::Conv::ToString,
                         )?;
                         json.append_jsonb_to_end(name_json.data());

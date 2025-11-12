@@ -425,7 +425,7 @@ impl Value {
                         end_byte_idx = ceil_char_boundary(s, end_byte_idx + 1);
                         end -= 1;
                     }
-                    Value::build_text(&s[start_byte_idx..end_byte_idx])
+                    Value::build_text(s[start_byte_idx..end_byte_idx].to_string())
                 } else {
                     Value::Null
                 }
@@ -570,9 +570,11 @@ impl Value {
             (Value::Text(_) | Value::Integer(_) | Value::Float(_), Some(pattern)) => {
                 let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
                 let text = self.to_string();
-                Value::build_text(trim_type.trim(&text, &pattern_chars))
+                Value::build_text(trim_type.trim(&text, &pattern_chars).to_string())
             }
-            (Value::Text(t), None) => Value::build_text(trim_type.trim(t.as_str(), &[' '])),
+            (Value::Text(t), None) => {
+                Value::build_text(trim_type.trim(t.as_str(), &[' ']).to_string())
+            }
             (reg, _) => reg.to_owned(),
         }
     }
@@ -900,9 +902,9 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::build_text(String::from_utf8_lossy(
-                &[lhs.as_slice(), rhs.as_slice()].concat(),
-            ));
+            return Value::build_text(
+                String::from_utf8_lossy(&[lhs.as_slice(), rhs.as_slice()].concat()).into_owned(),
+            );
         }
 
         let Some(lhs) = self.cast_text() else {

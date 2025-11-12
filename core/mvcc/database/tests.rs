@@ -104,7 +104,7 @@ impl MvccTestDbNoConn {
 }
 
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
-    let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
+    let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
     Row {
         id: RowID {
             table_id,
@@ -116,7 +116,7 @@ pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &st
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
-    ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1)
+    ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1)
 }
 
 #[test]
@@ -740,7 +740,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
 
     for (row_id, data) in test_rows.iter() {
         let id = RowID::new(table_id, *row_id);
-        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
+        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
         let row = Row::new(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
@@ -765,7 +765,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
     for i in initial_keys {
         let id = RowID::new(table_id.into(), *i);
         let data = format!("row{i}");
-        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(&data))], 1);
+        let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
         let row = Row::new(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }

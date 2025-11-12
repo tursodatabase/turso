@@ -173,7 +173,7 @@ mod tests {
     // Helper function to create test Value and Jsonb from JSON string
     fn create_test_pair(json_str: &str) -> (Value, Jsonb) {
         // Create Value as text representation of JSON
-        let key = Value::build_text(json_str);
+        let key = Value::build_text(json_str.to_string());
 
         // Create Jsonb from the same JSON string
         let value = Jsonb::from_str(json_str).unwrap();

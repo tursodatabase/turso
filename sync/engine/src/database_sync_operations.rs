@@ -514,7 +514,10 @@ pub async fn has_table<Ctx>(
 ) -> Result<bool> {
     let mut stmt =
         conn.prepare("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?")?;
-    stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(table_name)));
+    stmt.bind_at(
+        1.try_into().unwrap(),
+        Value::Text(Text::new(table_name.to_string())),
+    );
 
     let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
         Some(row) => row[0]
@@ -557,7 +560,7 @@ pub async fn update_last_change_id<Ctx>(
     let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
     select_stmt.bind_at(
         1.try_into().unwrap(),
-        turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+        turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
     );
     let row = run_stmt_expect_one_row(coro, &mut select_stmt).await?;
     tracing::info!("update_last_change_id(client_id={client_id}): selected client row if any");
@@ -568,7 +571,7 @@ pub async fn update_last_change_id<Ctx>(
         update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(change_id));
         update_stmt.bind_at(
             3.try_into().unwrap(),
-            turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+            turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
         );
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
         tracing::info!("update_last_change_id(client_id={client_id}): updated row for the client");
@@ -576,7 +579,7 @@ pub async fn update_last_change_id<Ctx>(
         let mut update_stmt = conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
         update_stmt.bind_at(
             1.try_into().unwrap(),
-            turso_core::Value::Text(turso_core::types::Text::new(client_id)),
+            turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
         );
         update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
         update_stmt.bind_at(3.try_into().unwrap(), turso_core::Value::Integer(change_id));
@@ -603,7 +606,10 @@ pub async fn read_last_change_id<Ctx>(
         Err(err) => return Err(err.into()),
     };
 
-    select_last_change_id_stmt.bind_at(1.try_into().unwrap(), Value::Text(Text::new(client_id)));
+    select_last_change_id_stmt.bind_at(
+        1.try_into().unwrap(),
+        Value::Text(Text::new(client_id.to_string())),
+    );
 
     match run_stmt_expect_one_row(coro, &mut select_last_change_id_stmt).await? {
         Some(row) => {

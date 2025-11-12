@@ -10292,10 +10292,7 @@ mod tests {
         for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let regs = &[Register::Value(Value::Text(Text {
-                value: huge_text.as_bytes().to_vec(),
-                subtype: crate::types::TextSubtype::Text,
-            }))];
+            let regs = &[Register::Value(Value::Text(Text::new(huge_text.clone())))];
             let value = ImmutableRecord::from_registers(regs, regs.len());
             tracing::trace!("before insert {}", i);
             tracing::debug!(

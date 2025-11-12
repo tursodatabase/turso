@@ -250,7 +250,7 @@ impl AggFunc {
         }
     }
 
-    pub fn to_string(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Avg => "avg",
             Self::Count0 => "count",
@@ -617,7 +617,7 @@ pub enum Func {
 impl Display for Func {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Agg(agg_func) => write!(f, "{}", agg_func.to_string()),
+            Self::Agg(agg_func) => write!(f, "{}", agg_func.as_str()),
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),

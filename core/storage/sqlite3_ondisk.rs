@@ -1421,8 +1421,10 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 );
             }
 
+            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+            let val = unsafe { str::from_utf8_unchecked(&buf[..content_size]) };
             Ok((
-                ValueRef::Text(TextRef::new(&buf[..content_size], TextSubtype::Text)),
+                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
             ))
         }

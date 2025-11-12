@@ -236,7 +236,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindText<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::build_text(text.as_str()),
+        Value::build_text(text),
     );
     SQLITE_OK
 }

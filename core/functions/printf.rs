@@ -257,7 +257,7 @@ mod tests {
     use super::*;
 
     fn text(value: &str) -> Register {
-        Register::Value(Value::build_text(value))
+        Register::Value(Value::build_text(value.to_string()))
     }
 
     fn integer(value: i64) -> Register {

@@ -316,7 +316,7 @@ impl PragmaVirtualTableCursor {
             0 => self
                 .arg
                 .as_ref()
-                .map_or(Value::Null, |arg| Value::from_text(arg)),
+                .map_or(Value::Null, |arg| Value::from_text(arg.to_string())),
             _ => Value::Null,
         };
         Ok(value)

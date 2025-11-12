@@ -18,7 +18,7 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::task::Waker;
@@ -60,10 +60,10 @@ pub enum TextSubtype {
     Json,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
-    pub value: Vec<u8>,
+    pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
 }
 
@@ -74,39 +74,39 @@ impl Display for Text {
 }
 
 impl Text {
-    pub fn new(value: &str) -> Self {
+    pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            value: value.as_bytes().to_vec(),
+            value: value.into(),
             subtype: TextSubtype::Text,
         }
     }
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
-            value: value.into_bytes(),
+            value: value.into(),
             subtype: TextSubtype::Json,
         }
     }
 
     pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
+        &self.value
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct TextRef<'a> {
-    pub value: &'a [u8],
+    pub value: &'a str,
     pub subtype: TextSubtype,
 }
 
 impl<'a> TextRef<'a> {
-    pub fn new(value: &'a [u8], subtype: TextSubtype) -> Self {
+    pub fn new(value: &'a str, subtype: TextSubtype) -> Self {
         Self { value, subtype }
     }
 
     #[inline]
     pub fn as_str(&self) -> &'a str {
-        unsafe { std::str::from_utf8_unchecked(self.value) }
+        self.value
     }
 }
 
@@ -133,8 +133,9 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.value.clear();
-        self.value.extend_from_slice(other.as_ref().as_bytes());
+        let value = self.value.to_mut();
+        value.clear();
+        value.push_str(other.as_ref());
         self.subtype = other.subtype();
     }
 }
@@ -188,7 +189,7 @@ impl AsRef<str> for Text {
 impl From<&str> for Text {
     fn from(value: &str) -> Self {
         Text {
-            value: value.as_bytes().to_vec(),
+            value: value.to_owned().into(),
             subtype: TextSubtype::Text,
         }
     }
@@ -197,7 +198,7 @@ impl From<&str> for Text {
 impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
-            value: value.into_bytes(),
+            value: Cow::from(value),
             subtype: TextSubtype::Text,
         }
     }
@@ -205,7 +206,7 @@ impl From<String> for Text {
 
 impl From<Text> for String {
     fn from(value: Text) -> Self {
-        String::from_utf8(value.value).unwrap()
+        value.value.into_owned()
     }
 }
 
@@ -247,7 +248,7 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
     Integer(i64),
@@ -367,8 +368,8 @@ impl Value {
     }
 
     // A helper function that makes building a text Value easier.
-    pub fn build_text(text: impl AsRef<str>) -> Self {
-        Self::Text(Text::new(text.as_ref()))
+    pub fn build_text(text: impl Into<Cow<'static, str>>) -> Self {
+        Self::Text(Text::new(text))
     }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -424,7 +425,7 @@ impl Value {
         }
     }
 
-    pub fn from_text(text: &str) -> Self {
+    pub fn from_text(text: impl Into<Cow<'static, str>>) -> Self {
         Value::Text(Text::new(text))
     }
 
@@ -453,7 +454,7 @@ impl Value {
                 }
             }
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            Value::Text(t) => out.extend_from_slice(&t.value),
+            Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -535,7 +536,7 @@ impl Value {
                 if v.is_json() {
                     return Ok(Value::Text(Text::json(text.to_string())));
                 }
-                Ok(Value::build_text(text))
+                Ok(Value::build_text(text.to_string()))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
@@ -710,58 +711,14 @@ impl AggContext {
 
 impl PartialEq<Value> for Value {
     fn eq(&self, other: &Value) -> bool {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
-                sqlite_int_float_compare(*int, *float).is_eq()
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.eq(&text_right.value)
-            }
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
-            _ => false,
-        }
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.eq(&right)
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Float(float), Self::Integer(int)) => {
-                Some(sqlite_int_float_compare(*int, *float).reverse())
-            }
-            (Self::Integer(int), Self::Float(float)) => {
-                Some(sqlite_int_float_compare(*int, *float))
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                float_left.partial_cmp(float_right)
-            }
-            // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
-                Some(std::cmp::Ordering::Less)
-            }
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(&text_right.value)
-            }
-            // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -783,7 +740,8 @@ impl Eq for Value {}
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.cmp(&right)
     }
 }
 
@@ -828,26 +786,26 @@ impl std::ops::AddAssign for Value {
                 *float_left += float_right;
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
-                string_left.value.extend_from_slice(&string_right.value);
+                string_left.value.to_mut().push_str(&string_right.value);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Text(string_left), Self::Integer(int_right)) => {
                 let string_right = int_right.to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Integer(int_left), Self::Text(string_right)) => {
                 let string_left = int_left.to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (Self::Text(string_left), Self::Float(float_right)) => {
                 let string_right = Self::Float(float_right).to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Float(float_left), Self::Text(string_right)) => {
                 let string_left = Self::Float(*float_left).to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (_, Self::Null) => {}
             (Self::Null, rhs) => *self = rhs,
@@ -1132,7 +1090,7 @@ impl ImmutableRecord {
                 }
                 Value::Float(f) => writer.extend_from_slice(&f.to_be_bytes()),
                 Value::Text(t) => {
-                    writer.extend_from_slice(&t.value);
+                    writer.extend_from_slice(t.value.as_bytes());
                 }
                 Value::Blob(b) => {
                     writer.extend_from_slice(b);
@@ -1544,7 +1502,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Float(f) => Value::Float(*f),
             ValueRef::Text(text) => Value::Text(Text {
-                value: text.value.to_vec(),
+                value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
@@ -1564,15 +1522,29 @@ impl Display for ValueRef<'_> {
     }
 }
 
-impl Eq for ValueRef<'_> {}
-
-impl Ord for ValueRef<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
+    fn eq(&self, other: &ValueRef<'a>) -> bool {
+        match (self, other) {
+            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
+            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
+                sqlite_int_float_compare(*int, *float).is_eq()
+            }
+            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.as_bytes() == text_right.value.as_bytes()
+            }
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
+impl<'a> Eq for ValueRef<'a> {}
+
+#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -1594,9 +1566,10 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
                 Some(std::cmp::Ordering::Greater)
             }
 
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(text_right.value)
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_left
+                .value
+                .as_bytes()
+                .partial_cmp(text_right.value.as_bytes()),
             // Text vs Blob
             (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
@@ -1606,6 +1579,12 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
             (_, Self::Null) => Some(std::cmp::Ordering::Greater),
         }
+    }
+}
+
+impl<'a> Ord for ValueRef<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -2394,7 +2373,7 @@ impl Record {
                     }
                 }
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                Value::Text(t) => buf.extend_from_slice(&t.value),
+                Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
         }
@@ -2905,7 +2884,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "integer_text_equal",
             ),
@@ -2913,7 +2892,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"world", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("world", TextSubtype::Text)),
                 ],
                 "integer_equal_text_different",
             ),
@@ -2943,34 +2922,34 @@ mod tests {
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_strings",
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "less_than_strings",
             ),
             (
                 vec![Value::Text(Text::new("xyz"))],
-                vec![ValueRef::Text(TextRef::new(b"abc", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("abc", TextSubtype::Text))],
                 "greater_than_strings",
             ),
             (
                 vec![Value::Text(Text::new(""))],
-                vec![ValueRef::Text(TextRef::new(b"", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("", TextSubtype::Text))],
                 "empty_strings",
             ),
             (
                 vec![Value::Text(Text::new("a"))],
-                vec![ValueRef::Text(TextRef::new(b"aa", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("aa", TextSubtype::Text))],
                 "prefix_strings",
             ),
             // Multi-field with string first
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(42),
                 ],
                 "string_integer_equal",
@@ -2978,7 +2957,7 @@ mod tests {
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(99),
                 ],
                 "string_equal_integer_different",
@@ -3014,7 +2993,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "null_vs_text",
             ),
             (
@@ -3025,12 +3004,12 @@ mod tests {
             // Numbers vs Text/Blob
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "integer_vs_text",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "float_vs_text",
             ),
             (
@@ -3094,7 +3073,7 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(TextRef::new(b"def", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "desc_string_reversed",
             ),
             // Mixed sort orders
@@ -3102,7 +3081,7 @@ mod tests {
                 vec![Value::Integer(10), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(20),
-                    ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "desc_first_asc_second",
             ),
@@ -3128,7 +3107,7 @@ mod tests {
                 vec![Value::Integer(42)],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(TextRef::new(b"extra", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("extra", TextSubtype::Text)),
                 ],
                 "fewer_serialized_fields",
             ),
@@ -3151,13 +3130,13 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(5)],
-                vec![ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text))],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
                 vec![Value::Text(Text::new("same")), Value::Integer(5)],
                 vec![
-                    ValueRef::Text(TextRef::new(b"same", TextSubtype::Text)),
+                    ValueRef::Text(TextRef::new("same", TextSubtype::Text)),
                     ValueRef::Integer(5),
                 ],
                 "equal_text_then_equal_int",
@@ -3219,7 +3198,7 @@ mod tests {
 
         let int_values = vec![
             ValueRef::Integer(42),
-            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
         ];
         assert!(matches!(
             find_compare(&int_values, &index_info_small),
@@ -3227,7 +3206,7 @@ mod tests {
         ));
 
         let string_values = vec![
-            ValueRef::Text(TextRef::new(b"hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Integer(42),
         ];
         assert!(matches!(

@@ -53,10 +53,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
         Value::Blob(b) => {
             let jsonbin = Jsonb::new(b.len(), Some(b));
             jsonbin.element_type()?;
-            Ok(Value::Text(Text {
-                value: jsonbin.to_string().into_bytes(),
-                subtype: TextSubtype::Json,
-            }))
+            Ok(Value::Text(Text::json(jsonbin.to_string())))
         }
         Value::Null => Ok(Value::Null),
         _ => {
@@ -109,9 +106,7 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
             Value::Null => ValueRef::Null,
             Value::Integer(x) => ValueRef::Integer(*x),
             Value::Float(x) => ValueRef::Float(*x),
-            Value::Text(text) => {
-                ValueRef::Text(TextRef::new(text.as_str().as_bytes(), text.subtype))
-            }
+            Value::Text(text) => ValueRef::Text(TextRef::new(text.as_str(), text.subtype)),
             Value::Blob(items) => ValueRef::Blob(items.as_slice()),
         },
         strict,
@@ -480,15 +475,9 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text {
-                    value: json_string.into_bytes(),
-                    subtype: TextSubtype::Json,
-                }))
+                Ok(Value::Text(Text::json(json_string)))
             } else {
-                Ok(Value::Text(Text {
-                    value: json_string.into_bytes(),
-                    subtype: TextSubtype::Text,
-                }))
+                Ok(Value::Text(Text::new(json_string)))
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => Ok(Value::Float(
