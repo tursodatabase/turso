@@ -36,10 +36,10 @@ pub fn translate_delete(
         );
     }
 
-    // FIXME: SQLite's delete using Returning is complex. It scans the table in read mode first, building
-    // the result set, and only after that it opens the table for writing and deletes the rows. It
-    // also uses a couple of instructions that we don't implement yet (i.e.: RowSetAdd, RowSetRead,
-    // RowSetTest). So for now I'll just defer it altogether.
+    // FIXME: SQLite's DELETE ... RETURNING reads the table's rowids into a RowSet first,
+    // and only after that it opens the table for writing and deletes the rows. It uses
+    // a couple of instructions that we already implement (i.e.: RowSetAdd, RowSetRead,
+    // RowSetTest), but for now we don't have an implementation of DELETE ... RETURNING.
     if !returning.is_empty() {
         crate::bail_parse_error!("RETURNING currently not implemented for DELETE statements.");
     }
