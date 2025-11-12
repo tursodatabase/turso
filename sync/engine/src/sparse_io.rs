@@ -54,6 +54,7 @@ pub struct SparseLinuxFile {
     file: RwLock<std::fs::File>,
 }
 
+#[allow(clippy::readonly_write_lock)]
 impl File for SparseLinuxFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
