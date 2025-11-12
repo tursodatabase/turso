@@ -180,7 +180,7 @@ impl SyncEngine {
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(not(feature = "browser"))]
+            #[cfg(all(target_os = "linux", not(feature = "browser")))]
             {
                 if opts.partial_boostrap_strategy.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
@@ -199,6 +199,15 @@ impl SyncEngine {
                         )
                     })?)
                 }
+            }
+            #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
+            {
+                Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                    napi::Error::new(
+                        napi::Status::GenericFailure,
+                        format!("Failed to create platform IO: {e}"),
+                    )
+                })?)
             }
             #[cfg(feature = "browser")]
             {
