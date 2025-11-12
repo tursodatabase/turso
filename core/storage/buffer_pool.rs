@@ -26,6 +26,10 @@ pub struct ArenaBuffer {
     len: usize,
 }
 
+// Unsound: write and read from different threads can be dangerous with current ArenaBuffer implementation without some additional explicit synchronization
+unsafe impl Sync for ArenaBuffer {}
+unsafe impl Send for ArenaBuffer {}
+
 impl ArenaBuffer {
     const fn new(
         arena: Weak<Arena>,
