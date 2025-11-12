@@ -4442,7 +4442,8 @@ pub fn op_function(
             | JsonFunc::JsonObject
             | JsonFunc::JsonbArray
             | JsonFunc::JsonbObject => {
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_func = match json_func {
                     JsonFunc::JsonArray => json_array,
@@ -4463,7 +4464,9 @@ pub fn op_function(
                     0 => Ok(Value::Null),
                     _ => {
                         let val = &state.registers[*start_reg];
-                        let reg_values = &state.registers[*start_reg + 1..*start_reg + arg_count];
+                        let reg_values = registers_to_ref_values(
+                            &state.registers[*start_reg + 1..*start_reg + arg_count],
+                        );
 
                         json_extract(val.get_value(), reg_values, &state.json_cache)
                     }
@@ -4479,7 +4482,9 @@ pub fn op_function(
                     0 => Ok(Value::Null),
                     _ => {
                         let val = &state.registers[*start_reg];
-                        let reg_values = &state.registers[*start_reg + 1..*start_reg + arg_count];
+                        let reg_values = registers_to_ref_values(
+                            &state.registers[*start_reg + 1..*start_reg + arg_count],
+                        );
 
                         jsonb_extract(val.get_value(), reg_values, &state.json_cache)
                     }
@@ -4565,7 +4570,7 @@ pub fn op_function(
             }
             JsonFunc::JsonRemove => {
                 if let Ok(json) = json_remove(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4575,7 +4580,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbRemove => {
                 if let Ok(json) = jsonb_remove(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4585,7 +4590,7 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if let Ok(json) = json_replace(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4595,7 +4600,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if let Ok(json) = jsonb_replace(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4605,7 +4610,7 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if let Ok(json) = json_insert(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4615,7 +4620,7 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if let Ok(json) = jsonb_insert(
-                    &state.registers[*start_reg..*start_reg + arg_count],
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
                 ) {
                     state.registers[*dest] = Register::Value(json);
@@ -4654,7 +4659,8 @@ pub fn op_function(
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_set() needs an odd number of arguments")
                 }
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_result = json_set(reg_values, &state.json_cache);
 
@@ -4667,7 +4673,8 @@ pub fn op_function(
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_set() needs an odd number of arguments")
                 }
-                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let reg_values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
                 let json_result = jsonb_set(reg_values, &state.json_cache);
 
@@ -4942,11 +4949,14 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Date => {
-                let result = exec_date(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_date(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Time => {
-                let values = &state.registers[*start_reg..*start_reg + arg_count];
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_time(values);
                 state.registers[*dest] = Register::Value(result);
             }
@@ -4954,13 +4964,10 @@ pub fn op_function(
                 if arg_count != 2 {
                     state.registers[*dest] = Register::Value(Value::Null);
                 } else {
-                    let start = state.registers[*start_reg].get_value().clone();
-                    let end = state.registers[*start_reg + 1].get_value().clone();
+                    let start = state.registers[*start_reg].get_value();
+                    let end = state.registers[*start_reg + 1].get_value();
 
-                    let result = crate::functions::datetime::exec_timediff(&[
-                        Register::Value(start),
-                        Register::Value(end),
-                    ]);
+                    let result = crate::functions::datetime::exec_timediff([start, end]);
 
                     state.registers[*dest] = Register::Value(result);
                 }
@@ -4971,12 +4978,15 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(Value::Integer(total_changes));
             }
             ScalarFunc::DateTime => {
-                let result =
-                    exec_datetime_full(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_datetime_full(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::JulianDay => {
-                let result = exec_julianday(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_julianday(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::UnixEpoch => {
@@ -5042,7 +5052,9 @@ pub fn op_function(
                 program.connection.load_extension(ext)?;
             }
             ScalarFunc::StrfTime => {
-                let result = exec_strftime(&state.registers[*start_reg..*start_reg + arg_count]);
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_strftime(values);
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Printf => {
@@ -5219,51 +5231,52 @@ pub fn op_function(
                 );
             }
         },
-        crate::function::Func::Vector(vector_func) => match vector_func {
-            VectorFunc::Vector => {
-                let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
+        crate::function::Func::Vector(vector_func) => {
+            let values =
+                registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+            match vector_func {
+                VectorFunc::Vector => {
+                    let result = vector32(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector32 => {
+                    let result = vector32(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector32Sparse => {
+                    let result = vector32_sparse(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::Vector64 => {
+                    let result = vector64(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorExtract => {
+                    let result = vector_extract(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceCos => {
+                    let result = vector_distance_cos(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceL2 => {
+                    let result = vector_distance_l2(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceJaccard => {
+                    let result = vector_distance_jaccard(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorConcat => {
+                    let result = vector_concat(values)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorSlice => {
+                    let result = vector_slice(values)?;
+                    state.registers[*dest] = Register::Value(result)
+                }
             }
-            VectorFunc::Vector32 => {
-                let result = vector32(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::Vector32Sparse => {
-                let result = vector32_sparse(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::Vector64 => {
-                let result = vector64(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorExtract => {
-                let result = vector_extract(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceCos => {
-                let result =
-                    vector_distance_cos(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceL2 => {
-                let result =
-                    vector_distance_l2(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorDistanceJaccard => {
-                let result =
-                    vector_distance_jaccard(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorConcat => {
-                let result = vector_concat(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result);
-            }
-            VectorFunc::VectorSlice => {
-                let result = vector_slice(&state.registers[*start_reg..*start_reg + arg_count])?;
-                state.registers[*dest] = Register::Value(result)
-            }
-        },
+        }
         crate::function::Func::External(f) => match f.func {
             ExtFunc::Scalar(f) => {
                 if arg_count == 0 {

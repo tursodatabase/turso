@@ -1,40 +1,66 @@
+use crate::types::AsValueRef;
+use crate::types::Value;
 use crate::LimboError::InvalidModifier;
-use crate::Result;
-use crate::{types::Value, vdbe::Register};
+use crate::{Result, ValueRef};
 use chrono::{
     DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
 };
 
 /// Execution of date/time/datetime functions
 #[inline(always)]
-pub fn exec_date(values: &[Register]) -> Value {
+pub fn exec_date<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::Date)
 }
 
 #[inline(always)]
-pub fn exec_time(values: &[Register]) -> Value {
+pub fn exec_time<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::Time)
 }
 
 #[inline(always)]
-pub fn exec_datetime_full(values: &[Register]) -> Value {
+pub fn exec_datetime_full<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::DateTime)
 }
 
 #[inline(always)]
-pub fn exec_strftime(values: &[Register]) -> Value {
-    if values.is_empty() {
+pub fn exec_strftime<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
+    if values.len() == 0 {
         return Value::Null;
     }
 
-    let value = &values[0].get_value();
-    let format_str = if matches!(value, Value::Text(_) | Value::Integer(_) | Value::Float(_)) {
+    let value = values.next().unwrap();
+    let value = value.as_value_ref();
+    let format_str = if matches!(
+        value,
+        ValueRef::Text(_) | ValueRef::Integer(_) | ValueRef::Float(_)
+    ) {
         format!("{value}")
     } else {
         return Value::Null;
     };
 
-    exec_datetime(&values[1..], DateTimeOutput::StrfTime(format_str))
+    exec_datetime(values, DateTimeOutput::StrfTime(format_str))
 }
 
 enum DateTimeOutput {
@@ -46,14 +72,22 @@ enum DateTimeOutput {
     JuliaDay,
 }
 
-fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
-    if values.is_empty() {
-        let now = parse_naive_date_time(&Value::build_text("now")).unwrap();
+fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let values = values.into_iter();
+    if values.len() == 0 {
+        let now = parse_naive_date_time(Value::build_text("now")).unwrap();
         return format_dt(now, output_type, false);
     }
-    if let Some(mut dt) = parse_naive_date_time(values[0].get_value()) {
+    let mut values = values.peekable();
+    let first = values.peek().unwrap();
+    if let Some(mut dt) = parse_naive_date_time(first) {
         // if successful, treat subsequent entries as modifiers
-        modify_dt(&mut dt, &values[1..], output_type)
+        modify_dt(&mut dt, values.skip(1), output_type)
     } else {
         // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
         let mut dt = chrono::Local::now().to_utc().naive_utc();
@@ -61,11 +95,17 @@ fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
     }
 }
 
-fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOutput) -> Value {
+fn modify_dt<I, E, V>(dt: &mut NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mods = mods.into_iter();
     let mut n_floor: i64 = 0;
     let mut subsec_requested = false;
     for modifier in mods {
-        if let Value::Text(ref text_rc) = modifier.get_value() {
+        if let ValueRef::Text(ref text_rc) = modifier.as_value_ref() {
             // TODO: to prevent double conversion and properly support 'utc'/'localtime', we also
             // need to keep track of the current timezone and apply it to the modifier.
             let parsed = parse_modifier(text_rc.as_str());
@@ -339,7 +379,12 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
     28
 }
 
-pub fn exec_julianday(values: &[Register]) -> Value {
+pub fn exec_julianday<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::JuliaDay)
 }
 
@@ -392,11 +437,12 @@ fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
     value.and_utc().timestamp()
 }
 
-fn parse_naive_date_time(time_value: &Value) -> Option<NaiveDateTime> {
+fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<NaiveDateTime> {
+    let time_value = time_value.as_value_ref();
     match time_value {
-        Value::Text(s) => get_date_time_from_time_value_string(s.as_str()),
-        Value::Integer(i) => get_date_time_from_time_value_integer(*i),
-        Value::Float(f) => get_date_time_from_time_value_float(*f),
+        ValueRef::Text(s) => get_date_time_from_time_value_string(s.as_str()),
+        ValueRef::Integer(i) => get_date_time_from_time_value_integer(i),
+        ValueRef::Float(f) => get_date_time_from_time_value_float(f),
         _ => None,
     }
 }
@@ -767,13 +813,19 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
     }
 }
 
-pub fn exec_timediff(values: &[Register]) -> Value {
+pub fn exec_timediff<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
     if values.len() < 2 {
         return Value::Null;
     }
 
-    let start = parse_naive_date_time(values[0].get_value());
-    let end = parse_naive_date_time(values[1].get_value());
+    let start = parse_naive_date_time(values.next().unwrap());
+    let end = parse_naive_date_time(values.next().unwrap());
 
     match (start, end) {
         (Some(start), Some(end)) => {
@@ -931,7 +983,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_date(&[Register::Value(input.clone())]);
+            let result = exec_date(&[input.clone()]);
             assert_eq!(
                 result,
                 Value::build_text(expected.to_string()),
@@ -971,7 +1023,7 @@ mod tests {
         ];
 
         for case in invalid_cases.iter() {
-            let result = exec_date(&[Register::Value(case.clone())]);
+            let result = exec_date([case]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
@@ -1063,7 +1115,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_time(&[Register::Value(input)]);
+            let result = exec_time(&[input]);
             if let Value::Text(result_str) = result {
                 assert_eq!(result_str.as_str(), expected);
             } else {
@@ -1103,7 +1155,7 @@ mod tests {
         ];
 
         for case in invalid_cases {
-            let result = exec_time(&[Register::Value(case.clone())]);
+            let result = exec_time(&[case.clone()]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
@@ -1425,8 +1477,8 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 0, 0, 0));
     }
 
-    fn text(value: &str) -> Register {
-        Register::Value(Value::build_text(value.to_string()))
+    fn text(value: &str) -> Value {
+        Value::build_text(value.to_string())
     }
 
     fn format(dt: NaiveDateTime) -> String {
@@ -1444,7 +1496,7 @@ mod tests {
             &[text("2023-06-15 12:30:45"), text("-1 day")],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1459,7 +1511,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1486,7 +1538,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1505,7 +1557,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1525,7 +1577,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1537,13 +1589,12 @@ mod tests {
         );
         assert_eq!(
             result_local,
-            *text(
+            text(
                 &dt.and_utc()
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string()
             )
-            .get_value()
         );
         // TODO: utc modifier assumes time given is not already utc
         // add test when fixed in the future
@@ -1581,7 +1632,7 @@ mod tests {
             .unwrap();
         let expected = format(max);
         let result = exec_datetime(&[text("9999-12-31 23:59:59")], DateTimeOutput::DateTime);
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     // leap second
@@ -1593,7 +1644,7 @@ mod tests {
             .unwrap();
         let expected = String::new(); // SQLite ignores leap seconds
         let result = exec_datetime(&[text(&leap_second.to_string())], DateTimeOutput::DateTime);
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1816,61 +1867,40 @@ mod tests {
         let start = Value::build_text("12:00:00");
         let end = Value::build_text("14:30:45");
         let expected = Value::build_text("-0000-00-00 02:30:45.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("14:30:45");
         let end = Value::build_text("12:00:00");
         let expected = Value::build_text("+0000-00-00 02:30:45.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("12:00:01.300");
         let end = Value::build_text("12:00:00.500");
         let expected = Value::build_text("+0000-00-00 00:00:00.800");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("13:30:00");
         let end = Value::build_text("16:45:30");
         let expected = Value::build_text("-0000-00-00 03:15:30.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("2023-05-10 23:30:00");
         let end = Value::build_text("2023-05-11 01:15:00");
         let expected = Value::build_text("-0000-00-00 01:45:00.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::Null;
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("not a time");
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end.clone()]), expected);
 
         let start = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(exec_timediff(&[Register::Value(start)]), expected);
+        assert_eq!(exec_timediff(&[start, end]), expected);
     }
 }

@@ -4304,23 +4304,32 @@ pub fn emit_literal(
         }
         ast::Literal::CurrentDate => {
             program.emit_insn(Insn::String8 {
-                value: datetime::exec_date(&[]).to_string(),
+                value: datetime::exec_date::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
+                    .to_string(),
                 dest: target_register,
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTime => {
             program.emit_insn(Insn::String8 {
-                value: datetime::exec_time(&[]).to_string(),
+                value: datetime::exec_time::<&[_; 0], std::slice::Iter<'_, Value>, &Value>(&[])
+                    .to_string(),
                 dest: target_register,
             });
             Ok(target_register)
         }
         ast::Literal::CurrentTimestamp => {
-            program.emit_insn(Insn::String8 {
-                value: datetime::exec_datetime_full(&[]).to_string(),
-                dest: target_register,
-            });
+            program.emit_insn(
+                Insn::String8 {
+                    value: datetime::exec_datetime_full::<
+                        &[_; 0],
+                        std::slice::Iter<'_, Value>,
+                        &Value,
+                    >(&[])
+                    .to_string(),
+                    dest: target_register,
+                },
+            );
             Ok(target_register)
         }
     }
