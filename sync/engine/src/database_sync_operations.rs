@@ -1223,6 +1223,10 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
             .await?
     {
+        tracing::info!(
+            "bootstrap_db_file: received page page_id={}",
+            page_data.page_id
+        );
         let offset = page_data.page_id * PAGE_SIZE as u64;
         let page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
