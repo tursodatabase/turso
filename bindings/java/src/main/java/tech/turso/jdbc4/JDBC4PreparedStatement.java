@@ -22,6 +22,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.RowId;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -435,18 +436,27 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setAsciiStream(int parameterIndex, InputStream x, long length) throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setAsciiStream(parameterIndex, x, (int) length);
   }
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x, long length) throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setBinaryStream(parameterIndex, x, (int) length);
   }
 
   @Override
   public void setCharacterStream(int parameterIndex, Reader reader, long length)
       throws SQLException {
     // TODO
+  }
+
+  private void requireLengthIsPositiveInt(long length) throws SQLFeatureNotSupportedException {
+    if (length > Integer.MAX_VALUE || length < 0) {
+      throw new SQLFeatureNotSupportedException(
+          "Data must have a length between 0 and Integer.MAX_VALUE");
+    }
   }
 
   @Override
