@@ -901,9 +901,13 @@ impl Database {
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
-    pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+    pub(crate) fn clone_schema(&self, current_generation: u32) -> Arc<Schema> {
         let schema = self.schema.lock().unwrap();
-        schema.clone()
+        let cloned = schema.clone();
+        cloned
+            .generation
+            .store(current_generation + 1, Ordering::SeqCst);
+        cloned
     }
 
     pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
@@ -1218,6 +1222,11 @@ impl Connection {
             return self._prepare(sql, None);
         }
         self._prepare(sql, self.db.mv_store.clone())
+    }
+
+    pub fn refresh_schema(self: &Connection) {
+        let current_generation = self.schema.read().generation.load(Ordering::SeqCst);
+        *self.schema.write() = self.db.clone_schema(current_generation);
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -1624,7 +1633,7 @@ impl Connection {
         let current_schema_version = self.schema.read().schema_version;
         let schema = self.db.schema.lock().unwrap();
         if matches!(self.get_tx_state(), TransactionState::None)
-            && current_schema_version != schema.schema_version
+            && current_schema_version < schema.schema_version
         {
             *self.schema.write() = schema.clone();
         }
@@ -2613,13 +2622,12 @@ impl Statement {
                 self.query_mode,
                 waker,
             );
-            for attempt in 0..MAX_SCHEMA_RETRY {
+            for _ in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                let Err(LimboError::SchemaUpdated { new_schema_version }) = res else {
                     break;
-                }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
+                };
+                self.reprepare(new_schema_version)?;
                 res = self.program.step(
                     &mut self.state,
                     self.mv_store.as_ref(),
@@ -2705,11 +2713,24 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self) -> Result<()> {
-        tracing::trace!("repreparing statement");
+    fn reprepare(&mut self, target_schema_version: u32) -> Result<()> {
+        tracing::trace!(
+            "repreparing statement, target_schema_version={:?}",
+            target_schema_version
+        );
         let conn = self.program.connection.clone();
-
-        *conn.schema.write() = conn.db.clone_schema();
+        // The connection may already have the required schema version if it is using a prepared statement
+        // that was compiled with an older schema version. So: only update the connection's schema if it is
+        // actually stale.
+        if conn.schema.read().schema_version < target_schema_version {
+            conn.refresh_schema();
+            debug_assert!(
+                conn.schema.read().schema_version == target_schema_version,
+                "Tried to reprepare to schema version {}, but current global schema version is {}",
+                target_schema_version,
+                conn.schema.read().schema_version
+            );
+        }
         self.program = {
             let mut parser = Parser::new(self.program.sql.as_bytes());
             let cmd = parser.next_cmd()?;
