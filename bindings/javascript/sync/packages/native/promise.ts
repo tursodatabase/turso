@@ -57,7 +57,7 @@ class Database extends DatabasePromise {
                     partialBoostrapStrategy = { type: "Prefix", length: opts.partialBootstrapStrategy.length };
                     break;
                 case "query":
-                    partialBoostrapStrategy = { type: "Query", length: opts.partialBootstrapStrategy.query };
+                    partialBoostrapStrategy = { type: "Query", query: opts.partialBootstrapStrategy.query };
                     break;
             }
         }
