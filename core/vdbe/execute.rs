@@ -4399,6 +4399,153 @@ pub fn op_sorter_compare(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Insert the integer value held by register P2 into a RowSet object held in register P1.
+///
+/// An assertion fails if P2 is not an integer.
+pub fn op_rowset_add(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RowSetAdd {
+            rowset_reg,
+            value_reg,
+        },
+        insn
+    );
+
+    let value = state.registers[*value_reg].get_value();
+    let rowid = match value {
+        Value::Integer(i) => *i,
+        _ => {
+            return Err(LimboError::InternalError(
+                "RowSetAdd: P2 must be an integer".to_string(),
+            ));
+        }
+    };
+
+    let rowset = state
+        .rowsets
+        .entry(*rowset_reg)
+        .or_insert_with(crate::vdbe::rowset::RowSet::new);
+
+    rowset.insert(rowid);
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Extract the smallest value from the RowSet object in P1 and put that value into register P3.
+/// Or, if RowSet object P1 is initially empty, leave P3 unchanged and jump to instruction P2.
+pub fn op_rowset_read(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RowSetRead {
+            rowset_reg,
+            pc_if_empty,
+            dest_reg,
+        },
+        insn
+    );
+    assert!(pc_if_empty.is_offset());
+
+    let rowset = state.rowsets.get_mut(rowset_reg);
+
+    match rowset {
+        Some(rowset) => {
+            if rowset.is_empty() {
+                state.pc = pc_if_empty.as_offset_int();
+            } else if let Some(smallest) = rowset.smallest() {
+                state.registers[*dest_reg] = Register::Value(Value::Integer(smallest));
+                state.pc += 1;
+            } else {
+                state.pc = pc_if_empty.as_offset_int();
+            }
+        }
+        None => {
+            state.pc = pc_if_empty.as_offset_int();
+        }
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Register P3 is assumed to hold a 64-bit integer value. If register P1 contains a RowSet object
+/// and that RowSet object contains the value held in P3, jump to register P2. Otherwise, insert
+/// the integer in P3 into the RowSet and continue on to the next opcode.
+///
+/// The RowSet object is optimized for the case where sets of integers are inserted in distinct
+/// phases, which each set contains no duplicates. Each set is identified by a unique P4 value.
+/// The first set must have P4==0, the final set must have P4==-1, and for all other sets must
+/// have P4>0.
+///
+/// This allows optimizations: (a) when P4==0 there is no need to test the RowSet object for P3,
+/// as it is guaranteed not to contain it, (b) when P4==-1 there is no need to insert the value,
+/// as it will never be tested for, and (c) when a value that is part of set X is inserted, there
+/// is no need to search to see if the same value was previously inserted as part of set X (only
+/// if it was previously inserted as part of some other set).
+pub fn op_rowset_test(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        RowSetTest {
+            rowset_reg,
+            pc_if_found,
+            value_reg,
+            batch,
+        },
+        insn
+    );
+    assert!(pc_if_found.is_offset());
+
+    let value = state.registers[*value_reg].get_value();
+    let rowid = match value {
+        Value::Integer(i) => *i,
+        _ => {
+            return Err(LimboError::InternalError(
+                "RowSetTest: P3 must be an integer".to_string(),
+            ));
+        }
+    };
+
+    let rowset = state
+        .rowsets
+        .entry(*rowset_reg)
+        .or_insert_with(crate::vdbe::rowset::RowSet::new);
+
+    let found = if *batch == 0 {
+        // SQLite rowsets assume that in each batch, the caller makes sure no
+        // duplicates are inserted. Hence if batch==0, we can return false without
+        // checking.
+        false
+    } else {
+        rowset.test(rowid, *batch)
+    };
+
+    if found {
+        state.pc = pc_if_found.as_offset_int();
+    } else {
+        if *batch != -1 {
+            rowset.insert(rowid);
+        }
+        state.pc += 1;
+    }
+
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
