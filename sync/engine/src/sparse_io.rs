@@ -1,6 +1,5 @@
 use std::{
-    io::{Read, Seek, Write},
-    os::fd::AsRawFd,
+    os::{fd::AsRawFd, unix::fs::FileExt},
     sync::{Arc, RwLock},
 };
 
@@ -57,7 +56,7 @@ pub struct SparseLinuxFile {
 
 impl File for SparseLinuxFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn lock_file(&self, exclusive: bool) -> Result<()> {
+    fn lock_file(&self, _exclusive: bool) -> Result<()> {
         Ok(())
     }
 
@@ -68,13 +67,12 @@ impl File for SparseLinuxFile {
 
     #[instrument(skip(self, c), level = Level::TRACE)]
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let mut file = self.file.write().unwrap();
-        file.seek(std::io::SeekFrom::Start(pos))?;
+        let file = self.file.read().unwrap();
         let nr = {
             let r = c.as_read();
             let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read_exact(buf)?;
+            file.read_exact_at(buf, pos)?;
             buf.len() as i32
         };
         c.complete(nr);
@@ -83,10 +81,9 @@ impl File for SparseLinuxFile {
 
     #[instrument(skip(self, c, buffer), level = Level::TRACE)]
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
-        let mut file = self.file.write().unwrap();
-        file.seek(std::io::SeekFrom::Start(pos))?;
+        let file = self.file.write().unwrap();
         let buf = buffer.as_slice();
-        file.write_all(buf)?;
+        file.write_all_at(buf, pos)?;
         c.complete(buffer.len() as i32);
         Ok(c)
     }
@@ -109,7 +106,7 @@ impl File for SparseLinuxFile {
 
     fn size(&self) -> Result<u64> {
         let file = self.file.read().unwrap();
-        Ok(file.metadata().unwrap().len())
+        Ok(file.metadata()?.len())
     }
 
     fn has_hole(&self, pos: usize, len: usize) -> turso_core::Result<bool> {
@@ -128,13 +125,14 @@ impl File for SparseLinuxFile {
                 // (see https://man7.org/linux/man-pages/man2/lseek.2.html#ERRORS)
                 return Ok(true);
             } else {
-                return Err(turso_core::LimboError::InternalError(format!(
-                    "failed to check hole in the sparse file: {}",
-                    std::io::Error::from_raw_os_error(res as i32)
-                )));
+                return Err(turso_core::LimboError::CompletionError(
+                    turso_core::CompletionError::IOError(
+                        std::io::Error::from_raw_os_error(errno).kind(),
+                    ),
+                ));
             }
         }
-        // lseek succeeded - the hole is here if next data is strictly before pos + len - 1 (the last byte of the checked region)
+        // lseek succeeded - the hole is here if next data is strictly before pos + len - 1 (the last byte of the checked region
         Ok(res as usize >= pos + len)
     }
 
@@ -148,11 +146,13 @@ impl File for SparseLinuxFile {
                 len as i64,
             )
         };
-        if res < 0 {
-            Err(turso_core::LimboError::InternalError(format!(
-                "failed to punch hole in the sparse file: {}",
-                std::io::Error::from_raw_os_error(res)
-            )))
+        if res == -1 {
+            let errno = unsafe { *libc::__errno_location() };
+            Err(turso_core::LimboError::CompletionError(
+                turso_core::CompletionError::IOError(
+                    std::io::Error::from_raw_os_error(errno).kind(),
+                ),
+            ))
         } else {
             Ok(())
         }
