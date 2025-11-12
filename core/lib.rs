@@ -10,7 +10,7 @@ mod functions;
 mod incremental;
 pub mod index_method;
 mod info;
-mod io;
+pub mod io;
 #[cfg(feature = "json")]
 mod json;
 pub mod mvcc;

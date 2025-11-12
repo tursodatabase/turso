@@ -1,6 +1,6 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::LimboError;
 use crate::{io::clock::DefaultClock, Result};
+use crate::{turso_assert, LimboError};
 
 use crate::io::clock::Instant;
 use std::{
@@ -238,23 +238,25 @@ impl File for MemoryFile {
     fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
         let start_page = pos / PAGE_SIZE;
         let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
-        let (mut holes, mut pages) = (0, 0);
         for page_no in start_page..=end_page {
-            match self.get_page(page_no) {
-                Some(_) => pages += 1,
-                None => holes += 1,
-            };
+            if self.get_page(page_no).is_some() {
+                return Ok(false);
+            }
         }
+        Ok(true)
+    }
 
-        if holes == 0 {
-            Ok(false)
-        } else if pages == 0 {
-            Ok(true)
-        } else {
-            Err(LimboError::InternalError(format!(
-                "ambigous has_hole result: pos={pos}, len={len}, pages={pages}, holes={holes}"
-            )))
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        turso_assert!(
+            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            "hole must be page aligned"
+        );
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            unsafe { (*self.pages.get()).remove(&page_no) };
         }
+        Ok(())
     }
 }
 
