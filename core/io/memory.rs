@@ -1,6 +1,6 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::{io::clock::DefaultClock, Result};
 use crate::turso_assert;
+use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
 use std::{

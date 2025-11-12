@@ -1173,7 +1173,7 @@ pub async fn bootstrap_db_file_v1<C: ProtocolIO, Ctx>(
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
         server_pages_selector: server_pages_selector.into(),
-        server_query_selector: server_query_selector,
+        server_query_selector,
         client_pages: BytesMut::new().into(),
     };
     let request = request.encode_to_vec();
