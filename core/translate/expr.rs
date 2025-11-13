@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, As, Expr, SubqueryType, UnaryOperator};
+use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
@@ -22,7 +22,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{Result, Value};
+use crate::{turso_assert, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -32,16 +32,6 @@ pub struct ConditionMetadata {
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
     pub jump_target_when_null: BranchOffset,
-}
-
-/// Container for register locations of values that can be referenced in RETURNING expressions
-pub struct ReturningValueRegisters {
-    /// Register containing the rowid/primary key
-    pub rowid_register: usize,
-    /// Starting register for column values (in column order)
-    pub columns_start_register: usize,
-    /// Number of columns available
-    pub num_columns: usize,
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -4143,106 +4133,6 @@ pub fn compare_affinity(
     }
 }
 
-/// Evaluate a RETURNING expression using register-based evaluation instead of cursor-based.
-/// This is used for RETURNING clauses where we have register values instead of cursor data.
-pub fn translate_expr_for_returning(
-    program: &mut ProgramBuilder,
-    expr: &Expr,
-    value_registers: &ReturningValueRegisters,
-    target_register: usize,
-) -> Result<usize> {
-    match expr {
-        Expr::Column {
-            column,
-            is_rowid_alias,
-            ..
-        } => {
-            if *is_rowid_alias {
-                // For rowid references, copy from the rowid register
-                program.emit_insn(Insn::Copy {
-                    src_reg: value_registers.rowid_register,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
-            } else {
-                // For regular column references, copy from the appropriate column register
-                let column_idx = *column;
-                if column_idx < value_registers.num_columns {
-                    let column_reg = value_registers.columns_start_register + column_idx;
-                    program.emit_insn(Insn::Copy {
-                        src_reg: column_reg,
-                        dst_reg: target_register,
-                        extra_amount: 0,
-                    });
-                } else {
-                    crate::bail_parse_error!("Column index out of bounds in RETURNING clause");
-                }
-            }
-            Ok(target_register)
-        }
-        Expr::RowId { .. } => {
-            // For ROWID expressions, copy from the rowid register
-            program.emit_insn(Insn::Copy {
-                src_reg: value_registers.rowid_register,
-                dst_reg: target_register,
-                extra_amount: 0,
-            });
-            Ok(target_register)
-        }
-        Expr::Literal(literal) => emit_literal(program, literal, target_register),
-        Expr::Binary(lhs, op, rhs) => {
-            let lhs_reg = program.alloc_register();
-            let rhs_reg = program.alloc_register();
-
-            // Recursively evaluate left-hand side
-            translate_expr_for_returning(program, lhs, value_registers, lhs_reg)?;
-
-            // Recursively evaluate right-hand side
-            translate_expr_for_returning(program, rhs, value_registers, rhs_reg)?;
-
-            // Use the shared emit_binary_insn function
-            emit_binary_insn(
-                program,
-                op,
-                lhs_reg,
-                rhs_reg,
-                target_register,
-                lhs,
-                rhs,
-                None, // No table references needed for RETURNING
-                None, // No condition metadata needed for RETURNING
-            )?;
-
-            Ok(target_register)
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            // Evaluate arguments into registers
-            let mut arg_regs = Vec::new();
-            for arg in args.iter() {
-                let arg_reg = program.alloc_register();
-                translate_expr_for_returning(program, arg, value_registers, arg_reg)?;
-                arg_regs.push(arg_reg);
-            }
-
-            // Resolve and call the function using shared helper
-            let func = Func::resolve_function(name.as_str(), arg_regs.len())?;
-            let func_ctx = FuncCtx {
-                func,
-                arg_count: arg_regs.len(),
-            };
-
-            emit_function_call(program, func_ctx, &arg_regs, target_register)?;
-            Ok(target_register)
-        }
-        _ => {
-            crate::bail_parse_error!(
-                "Unsupported expression type in RETURNING clause: {:?}",
-                expr
-            );
-        }
-    }
-}
-
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
     program: &mut ProgramBuilder,
@@ -4363,56 +4253,40 @@ pub fn emit_function_call(
 /// with proper column binding and alias handling.
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
-    table: &Table,
-    table_name: &str,
-    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
     connection: &std::sync::Arc<crate::Connection>,
-) -> Result<(
-    Vec<super::plan::ResultSetColumn>,
-    super::plan::TableReferences,
-)> {
-    use super::plan::{ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences};
+) -> Result<Vec<ResultSetColumn>> {
+    let mut result_columns = Vec::with_capacity(returning.len());
 
-    let mut result_columns = vec![];
-
-    let internal_id = program.table_reference_counter.next();
-    let mut table_references = TableReferences::new(
-        vec![JoinedTable {
-            table: match table {
-                Table::Virtual(vtab) => Table::Virtual(vtab.clone()),
-                Table::BTree(btree_table) => Table::BTree(btree_table.clone()),
-                _ => unreachable!(),
-            },
-            identifier: table_name.to_string(),
-            internal_id,
-            op: Operation::default_scan_for(table),
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            database_id: 0,
-        }],
-        vec![],
-    );
+    let alias_to_string = |alias: &ast::As| match alias {
+        ast::As::Elided(alias) => alias.as_str().to_string(),
+        ast::As::As(alias) => alias.as_str().to_string(),
+    };
 
     for rc in returning.iter_mut() {
         match rc {
             ast::ResultColumn::Expr(expr, alias) => {
                 bind_and_rewrite_expr(
                     expr,
-                    Some(&mut table_references),
+                    Some(table_references),
                     None,
                     connection,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
 
-                let column_alias = determine_column_alias(expr, alias, table);
-
                 result_columns.push(ResultSetColumn {
-                    expr: *expr.clone(),
-                    alias: column_alias,
+                    expr: expr.as_ref().clone(),
+                    alias: alias.as_ref().map(alias_to_string),
                     contains_aggregates: false,
                 });
             }
             ast::ResultColumn::Star => {
+                let table = table_references
+                    .joined_tables()
+                    .first()
+                    .expect("RETURNING clause must reference at least one table");
+                let internal_id = table.internal_id;
+
                 // Handle RETURNING * by expanding to all table columns
                 // Use the shared internal_id for all columns
                 for (column_index, column) in table.columns().iter().enumerate() {
@@ -4420,7 +4294,7 @@ pub fn process_returning_clause(
                         database: None,
                         table: internal_id,
                         column: column_index,
-                        is_rowid_alias: false,
+                        is_rowid_alias: column.is_rowid_alias(),
                     };
 
                     result_columns.push(ResultSetColumn {
@@ -4430,90 +4304,80 @@ pub fn process_returning_clause(
                     });
                 }
             }
-            ast::ResultColumn::TableStar(_table_name) => {
-                // Handle RETURNING table.* by expanding to all table columns
-                // For single table RETURNING, this is equivalent to *
-                for (column_index, column) in table.columns().iter().enumerate() {
-                    let column_expr = Expr::Column {
-                        database: None,
-                        table: internal_id,
-                        column: column_index,
-                        is_rowid_alias: false,
-                    };
-
-                    result_columns.push(ResultSetColumn {
-                        expr: column_expr,
-                        alias: column.name.clone(),
-                        contains_aggregates: false,
-                    });
-                }
+            ast::ResultColumn::TableStar(_) => {
+                crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
             }
         }
     }
 
-    Ok((result_columns, table_references))
-}
-
-/// Determine the appropriate alias for a RETURNING column expression
-fn determine_column_alias(
-    expr: &Expr,
-    explicit_alias: &Option<ast::As>,
-    table: &Table,
-) -> Option<String> {
-    // First check for explicit alias
-    if let Some(As::As(name)) = explicit_alias {
-        return Some(name.as_str().to_string());
-    }
-
-    // For ROWID expressions, use "rowid" as the alias
-    if let Expr::RowId { .. } = expr {
-        return Some("rowid".to_string());
-    }
-
-    // For column references, always use the column name from the table
-    if let Expr::Column {
-        column,
-        is_rowid_alias,
-        ..
-    } = expr
-    {
-        if let Some(name) = table
-            .columns()
-            .get(*column)
-            .and_then(|col| col.name.clone())
-        {
-            return Some(name);
-        } else if *is_rowid_alias {
-            // If it's a rowid alias, return "rowid"
-            return Some("rowid".to_string());
-        } else {
-            return None;
-        }
-    }
-
-    // For other expressions, use the expression string representation
-    Some(expr.to_string())
+    Ok(result_columns)
 }
 
 /// Emit bytecode to evaluate RETURNING expressions and produce result rows.
-/// This function handles the actual evaluation of expressions using the values
-/// from the DML operation.
-pub(crate) fn emit_returning_results(
+/// RETURNING result expressions are otherwise evaluated as normal, but the columns of the target table
+/// are added to [Resolver::expr_to_reg_cache], meaning a reference to e.g tbl.col will effectively
+/// refer to a register where the OLD/NEW value of tbl.col is stored after an INSERT/UPDATE/DELETE.
+pub(crate) fn emit_returning_results<'a>(
     program: &mut ProgramBuilder,
+    table_references: &TableReferences,
     result_columns: &[super::plan::ResultSetColumn],
-    value_registers: &ReturningValueRegisters,
+    reg_columns_start: usize,
+    rowid_reg: usize,
+    resolver: &mut Resolver<'a>,
 ) -> Result<()> {
     if result_columns.is_empty() {
         return Ok(());
+    }
+
+    turso_assert!(table_references.joined_tables().len() == 1, "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table");
+    let table = table_references.joined_tables().first().unwrap();
+
+    resolver.enable_expr_to_reg_cache();
+    let expr = Expr::RowId {
+        database: None,
+        table: table.internal_id,
+    };
+    let cache_len = resolver.expr_to_reg_cache.len();
+    resolver
+        .expr_to_reg_cache
+        .push((std::borrow::Cow::Owned(expr), rowid_reg));
+    for (i, column) in table.columns().iter().enumerate() {
+        let reg = if column.is_rowid_alias() {
+            rowid_reg
+        } else {
+            reg_columns_start + i
+        };
+        let expr = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: i,
+            is_rowid_alias: column.is_rowid_alias(),
+        };
+        resolver
+            .expr_to_reg_cache
+            .push((std::borrow::Cow::Owned(expr), reg));
     }
 
     let result_start_reg = program.alloc_registers(result_columns.len());
 
     for (i, result_column) in result_columns.iter().enumerate() {
         let reg = result_start_reg + i;
-
-        translate_expr_for_returning(program, &result_column.expr, value_registers, reg)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &result_column.expr,
+            reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
     }
+
+    // Bit of a hack: this is required in case of e.g. INSERT ... ON CONFLICT DO UPDATE ... RETURNING
+    // where the result column values may either be the ones that were inserted, or the ones that were updated,
+    // depending on the row in question.
+    // meaning: emit_returning_results() may be called twice during translation and the cached expression values
+    // must be distinct for each call.
+    resolver.expr_to_reg_cache.truncate(cache_len);
 
     program.emit_insn(Insn::ResultRow {
         start_reg: result_start_reg,

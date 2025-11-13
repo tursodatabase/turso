@@ -93,14 +93,14 @@ pub fn translate(
     );
 
     program.prologue();
-    let resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(schema, syms);
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
             pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
         }
-        stmt => translate_inner(stmt, &resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -113,7 +113,7 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 pub fn translate_inner(
     stmt: ast::Stmt,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     program: ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,

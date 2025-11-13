@@ -266,13 +266,8 @@ pub fn prepare_update_plan(
         }
     }
 
-    let (result_columns, _table_references) = process_returning_clause(
-        &mut body.returning,
-        &table,
-        body.tbl_name.name.as_str(),
-        program,
-        connection,
-    )?;
+    let result_columns =
+        process_returning_clause(&mut body.returning, &mut table_references, connection)?;
 
     let order_by = body
         .order_by
