@@ -40,7 +40,7 @@ test('explain', async () => {
         },
         {
             "name": "p4",
-            "type": "INTEGER",
+            "type": "TEXT",
         },
         {
             "name": "p5",
