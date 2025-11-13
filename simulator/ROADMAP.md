@@ -1,0 +1,72 @@
+# Simulator Roadmap
+
+This document describes the current roadmap for the simulator. There
+are 5 crucial aspects in the development of the simulator:
+
+1. Coverage: The reliability provided by random testing
+is as strong as the input space of the random generation. We keep a detailed
+[`COVERAGE.md`](./COVERAGE.md) file that describes how each feature of Turso is
+covered by the simulator testing.
+2. Input generation: For an input space as large as SQL, and a system as complex as
+Turso, we cannot naively generate the whole input space, we must be selective and smart.
+3. Correctness: What does it mean for Turso to be correct? We primarily rely on
+[*properties*](#properties) as well as several [oracles](#oracles).
+4. Debugging: Finding bugs is only the first half of testing a system, we must also
+aim to help fix them. This is why simulator provides input shrinking as well as interactive
+debugging capabilities.
+5. Fault Injection: The simulator natively supports fault injection into the system,
+simulating low level failures in the network or file system layer.
+
+## Coverage
+
+For detailed information about how much of the input space we currently cover, please
+check the [`COVERAGE.md`](./COVERAGE.md) file. Currently, most of SQLite query language
+is either not supported or partial, and functions aren't supported.
+
+Actionable items:
+
+- [ ] Implement generation and/or shadowing for one of the languages features in [COVERAGE.md](./COVERAGE.md)
+- [ ] At the moment, implementing a feature requires both adding a generation for it as well as
+      a shadow operation for keeping track. For some oracles such as `doublecheck` or `differential`, we do not
+      need the shadowing. So we should separate the generation into `shadowable/not shadowable` paths, and generate
+      based on the current oracle.
+
+## Input Generation
+
+- [x] Single client generation: TODO
+- [ ] Multi-client generation: TODO
+- [ ] LLM-guided generation: TODO
+- [ ] Custom feedback guided generation: TODO
+- [ ] Coverage-guided generation: TODO
+
+## Correctness
+
+- [ ] External property language: TODO
+- [ ] SQL with Contracts (SQL-C): TODO
+- [ ] SQLancer Properties: TODO
+
+### Properties
+
+TODO
+
+### Oracles
+
+TODO
+
+## Debugging
+
+- [ ] Automated Shrinking
+  - [x] Statement Removal
+    - [x] Heuristic removal
+    - [x] Backtracking removal
+  - [ ] Statement shrinking
+    - [ ] Value removal
+      - [ ] Removing inserted values from `INSERT` statements
+    - [ ] Value shrinking
+      - [ ] Removing parts of SQL expressions (e.g `x AND y` into `x` or `y`)
+- [ ] Interactive debugging (currently broken)
+- [ ] Fault localization
+
+## Fault Injection
+
+- [ ] TODO
