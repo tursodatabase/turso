@@ -182,6 +182,13 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
+    if order_by
+        .iter()
+        .filter_map(|o| o.nulls)
+        .any(|n| n == ast::NullsOrder::Last)
+    {
+        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
+    }
     match select {
         ast::OneSelect::Select {
             mut columns,
