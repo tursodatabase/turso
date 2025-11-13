@@ -898,14 +898,14 @@ struct RecordParserInner<'a> {
 impl<'a> RecordParserInner<'a> {
     fn new() -> Self {
         Self {
-            values: FxHashMap::with_capacity_and_hasher(0, FxBuildHasher::default()),
+            values: FxHashMap::with_capacity_and_hasher(0, FxBuildHasher),
             cursor: RecordCursor::new(),
         }
     }
 
     fn with_capacity(len: usize) -> Self {
         Self {
-            values: FxHashMap::with_capacity_and_hasher(len, FxBuildHasher::default()),
+            values: FxHashMap::with_capacity_and_hasher(len, FxBuildHasher),
             cursor: RecordCursor::new(),
         }
     }
