@@ -34,11 +34,21 @@ Actionable items:
 
 ## Input Generation
 
-- [x] Single client generation: TODO
-- [ ] Multi-client generation: TODO
-- [ ] LLM-guided generation: TODO
-- [ ] Custom feedback guided generation: TODO
-- [ ] Coverage-guided generation: TODO
+- [x] Single client generation: In the current form, we generate a single client, although that may interact with Turso
+from multiple connections.
+- [ ] Multi-client generation: Instead of a single client making multiple connections, what would be more manageable is
+having multiple clients, and the orchestrator picking a next client. This would also follow into concurrent client
+generation in the future.
+- [ ] Invalid Input generation: With the default oracle that relies on properties, invalid inputs did not make much sense.
+For other oracles such as `differential` or `doublecheck`, they do make sense, because even in the case of errors the database
+state should be equivalent with SQLite. It would make sense to deliberately break working queries to construct possibly
+invalid inputs for testing unhappy paths.
+- [ ] LLM-guided generation: There's quite a bit of potential in pushing an LLM to guide the generation. We had some
+preliminary discussions on this, but a well-planned proposal will be necessary for implementing it.
+- [ ] Custom feedback guided generation: SQLancer analyzes the `EXPLAIN PLAN`s to decide if a database state isn't diverse
+enough for constructing interesting DQLs and instead starts to generate DMLs. We can use a similar approach.
+- [ ] Coverage-guided generation: Coverage guidance has been a striking force in the last decade of random testing. Any
+proposal on advancing the simulator in this area will be welcomed.
 
 ## Correctness
 
