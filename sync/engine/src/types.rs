@@ -1,24 +1,27 @@
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
 pub struct Coro<Ctx> {
-    pub ctx: RefCell<Ctx>,
+    pub ctx: Mutex<Ctx>,
     gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>,
 }
 
 impl<Ctx> Coro<Ctx> {
     pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>) -> Self {
         Self {
-            ctx: RefCell::new(ctx),
+            ctx: Mutex::new(ctx),
             gen,
         }
     }
     pub async fn yield_(&self, value: ProtocolCommand) -> Result<()> {
         let ctx = self.gen.yield_(value).await?;
-        self.ctx.replace(ctx);
+        *self.ctx.lock().unwrap() = ctx;
         Ok(())
     }
 }
@@ -27,7 +30,7 @@ impl From<genawaiter::sync::Co<ProtocolCommand, Result<()>>> for Coro<()> {
     fn from(value: genawaiter::sync::Co<ProtocolCommand, Result<()>>) -> Self {
         Self {
             gen: value,
-            ctx: RefCell::new(()),
+            ctx: Mutex::new(()),
         }
     }
 }
@@ -68,6 +71,8 @@ pub struct SyncEngineStats {
     pub last_pull_unix_time: Option<i64>,
     pub last_push_unix_time: Option<i64>,
     pub revision: Option<String>,
+    pub network_sent_bytes: usize,
+    pub network_received_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,6 +100,7 @@ pub struct DatabaseMetadata {
     pub last_push_unix_time: Option<i64>,
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
+    pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

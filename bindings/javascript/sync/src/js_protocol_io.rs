@@ -241,24 +241,48 @@ impl ProtocolIO for JsProtocolIo {
                 .collect(),
         }))
     }
+
+    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>) {
+        let mut work = self.work.lock().unwrap();
+        work.push_back(callback);
+    }
+
+    fn step_work(&self) {
+        let mut items = {
+            let mut work = self.work.lock().unwrap();
+            work.drain(..).collect::<VecDeque<_>>()
+        };
+        let length = items.len();
+        for _ in 0..length {
+            let mut item = items.pop_front().unwrap();
+            if item() {
+                continue;
+            }
+            items.push_back(item);
+        }
+        {
+            let mut work = self.work.lock().unwrap();
+            work.extend(items);
+        }
+    }
 }
 
 #[napi]
 pub struct JsProtocolIo {
     requests: Mutex<Vec<JsProtocolRequestBytes>>,
+    work: Mutex<VecDeque<Box<dyn FnMut() -> bool + Send>>>,
 }
 
 impl Default for JsProtocolIo {
     fn default() -> Self {
         Self {
             requests: Mutex::new(Vec::new()),
+            work: Mutex::new(VecDeque::new()),
         }
     }
 }
 
-#[napi]
 impl JsProtocolIo {
-    #[napi]
     pub fn take_request(&self) -> Option<JsProtocolRequestBytes> {
         self.requests.lock().unwrap().pop()
     }

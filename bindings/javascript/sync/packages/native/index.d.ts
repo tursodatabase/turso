@@ -163,7 +163,7 @@ export declare class JsDataCompletion {
 }
 
 export declare class JsProtocolIo {
-  takeRequest(): JsProtocolRequestBytes | null
+
 }
 
 export declare class JsProtocolRequestBytes {
@@ -178,6 +178,7 @@ export declare class SyncEngine {
   /** Runs the I/O loop asynchronously, returning a Promise. */
   ioLoopAsync(): Promise<void>
   protocolIo(): JsProtocolRequestBytes | null
+  protocolIoStep(): void
   push(): GeneratorHolder
   stats(): GeneratorHolder
   wait(): GeneratorHolder
@@ -220,8 +221,12 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string }
+  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
+
+export type JsPartialBootstrapStrategy =
+  | { type: 'Prefix', length: number }
+  | { type: 'Query', query: string }
 
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
@@ -240,6 +245,7 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
+  partialBoostrapStrategy?: JsPartialBootstrapStrategy
 }
 
 export declare const enum SyncEngineProtocolVersion {

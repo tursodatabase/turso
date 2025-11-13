@@ -92,6 +92,22 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
+
+    /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
+    /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
+    ///
+    /// The hole is the contiguous file region which is not allocated by the file-system
+    /// If there is a single byte which is allocated within a given range - method must return false in this case
+    // todo: need to add custom completion type?
+    fn has_hole(&self, _pos: usize, _len: usize) -> Result<bool> {
+        panic!("has_hole is not supported for the given IO implementation")
+    }
+    /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
+    /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
+    // todo: need to add custom completion type?
+    fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
+        panic!("punch_hole is not supported for the given IO implementation")
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

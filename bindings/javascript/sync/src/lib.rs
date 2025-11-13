@@ -13,7 +13,8 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
+    protocol_io::ProtocolIO,
     types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
 };
 
@@ -107,6 +108,13 @@ pub enum DatabaseRowTransformResultJs {
     Rewrite { stmt: DatabaseRowStatementJs },
 }
 
+#[napi(discriminant = "type")]
+#[derive(Debug)]
+pub enum JsPartialBootstrapStrategy {
+    Prefix { length: i64 },
+    Query { query: String },
+}
+
 #[napi(object, object_to_js = false)]
 pub struct SyncEngineOpts {
     pub path: String,
@@ -119,6 +127,7 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<String>,
+    pub partial_boostrap_strategy: Option<JsPartialBootstrapStrategy>,
 }
 
 struct SyncEngineOptsFilled {
@@ -131,6 +140,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
+    pub partial_boostrap_strategy: Option<PartialBootstrapStrategy>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,12 +180,32 @@ impl SyncEngine {
         let io: Arc<dyn turso_core::IO> = if is_memory {
             Arc::new(turso_core::MemoryIO::new())
         } else {
-            #[cfg(not(feature = "browser"))]
+            #[cfg(all(target_os = "linux", not(feature = "browser")))]
+            {
+                if opts.partial_boostrap_strategy.is_none() {
+                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                        napi::Error::new(
+                            napi::Status::GenericFailure,
+                            format!("Failed to create platform IO: {e}"),
+                        )
+                    })?)
+                } else {
+                    use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+                    Arc::new(SparseLinuxIo::new().map_err(|e| {
+                        napi::Error::new(
+                            napi::Status::GenericFailure,
+                            format!("Failed to create sparse IO: {e}"),
+                        )
+                    })?)
+                }
+            }
+            #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
             {
                 Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
-                        format!("Failed to create IO: {e}"),
+                        format!("Failed to create platform IO: {e}"),
                     )
                 })?)
             }
@@ -224,6 +254,14 @@ impl SyncEngine {
                     ))
                 }
             },
+            partial_boostrap_strategy: opts.partial_boostrap_strategy.map(|s| match s {
+                JsPartialBootstrapStrategy::Prefix { length } => PartialBootstrapStrategy::Prefix {
+                    length: length as usize,
+                },
+                JsPartialBootstrapStrategy::Query { query } => {
+                    PartialBootstrapStrategy::Query { query }
+                }
+            }),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -251,6 +289,7 @@ impl SyncEngine {
                 .remote_encryption
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
+            partial_bootstrap_strategy: self.opts.partial_boostrap_strategy.clone(),
         };
 
         let io = self.io()?;
@@ -301,6 +340,12 @@ impl SyncEngine {
     }
 
     #[napi]
+    pub fn protocol_io_step(&self) -> napi::Result<()> {
+        self.protocol()?.step_work();
+        Ok(())
+    }
+
+    #[napi]
     pub fn push(&self) -> GeneratorHolder {
         self.run(async move |coro, guard| {
             let sync_engine = try_read(guard)?;
@@ -323,6 +368,8 @@ impl SyncEngine {
                 last_pull_unix_time: stats.last_pull_unix_time,
                 last_push_unix_time: stats.last_push_unix_time,
                 revision: stats.revision,
+                network_sent_bytes: stats.network_sent_bytes as i64,
+                network_received_bytes: stats.network_received_bytes as i64,
             }))
         })
     }

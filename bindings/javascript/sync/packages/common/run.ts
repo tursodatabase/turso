@@ -116,9 +116,28 @@ export function memoryIO(): ProtocolIo {
     }
 };
 
+export interface Runner {
+    wait(): Promise<void>;
+}
 
-export async function run(opts: RunOpts, io: ProtocolIo, engine: any, generator: any): Promise<any> {
+export function runner(opts: RunOpts, io: ProtocolIo, engine: any): Runner {
     let tasks = [];
+    return {
+        async wait() {
+            for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {
+                tasks.push(trackPromise(process(opts, io, request)));
+            }
+            const tasksRace = tasks.length == 0 ? Promise.resolve() : Promise.race([timeoutMs(opts.preemptionMs), ...tasks.map(t => t.promise)]);
+            await Promise.all([engine.ioLoopAsync(), tasksRace]);
+
+            tasks = tasks.filter(t => !t.finished);
+
+            engine.protocolIoStep();
+        },
+    }
+}
+
+export async function run(runner: Runner, generator: any): Promise<any> {
     while (true) {
         const { type, ...rest }: GeneratorResponse = await generator.resumeAsync(null);
         if (type == 'Done') {
@@ -131,14 +150,7 @@ export async function run(opts: RunOpts, io: ProtocolIo, engine: any, generator:
             //@ts-ignore
             return rest.changes;
         }
-        for (let request = engine.protocolIo(); request != null; request = engine.protocolIo()) {
-            tasks.push(trackPromise(process(opts, io, request)));
-        }
-
-        const tasksRace = tasks.length == 0 ? Promise.resolve() : Promise.race([timeoutMs(opts.preemptionMs), ...tasks.map(t => t.promise)]);
-        await Promise.all([engine.ioLoopAsync(), tasksRace]);
-
-        tasks = tasks.filter(t => !t.finished);
+        await runner.wait();
     }
 }
 

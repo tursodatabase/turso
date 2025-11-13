@@ -1,6 +1,6 @@
 import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common"
 import { DatabasePromise } from "@tursodatabase/database-common"
-import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards } from "@tursodatabase/sync-common";
+import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-bundle.js";
 
 let BrowserIO: ProtocolIo = {
@@ -39,7 +39,7 @@ async function init(): Promise<Worker> {
 }
 
 class Database extends DatabasePromise {
-    #runOpts: RunOpts;
+    #runner: Runner;
     #engine: any;
     #io: ProtocolIo;
     #guards: SyncEngineGuards;
@@ -61,7 +61,6 @@ class Database extends DatabasePromise {
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
         });
-        super(engine.db() as unknown as any);
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
         if (typeof opts.authToken == "function") {
@@ -83,14 +82,21 @@ class Database extends DatabasePromise {
                 })
             };
         }
-        this.#runOpts = {
+        const runOpts = {
             url: opts.url,
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
         };
+        const db = engine.db() as unknown as any;
+        const memory = db.memory;
+        const io = memory ? memoryIO() : BrowserIO;
+        const run = runner(runOpts, io, engine);
+        super(engine.db() as unknown as any, () => run.wait());
+
+        this.#runner = run;
         this.#engine = engine;
-        this.#io = this.memory ? memoryIO() : BrowserIO;
+        this.#io = io;
         this.#guards = new SyncEngineGuards();
     }
     /**
@@ -112,7 +118,7 @@ class Database extends DatabasePromise {
                     registerFileAtWorker(this.#worker, `${this.name}-changes`),
                 ]);
             }
-            await run(this.#runOpts, this.#io, this.#engine, this.#engine.connect());
+            await run(this.#runner, this.#engine.connect());
         }
         this.connected = true;
     }
@@ -125,11 +131,11 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        const changes = await this.#guards.wait(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.wait()));
+        const changes = await this.#guards.wait(async () => await run(this.#runner, this.#engine.wait()));
         if (changes.empty()) {
             return false;
         }
-        await this.#guards.apply(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.apply(changes)));
+        await this.#guards.apply(async () => await run(this.#runner, this.#engine.apply(changes)));
         return true;
     }
     /**
@@ -140,7 +146,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.push(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.push()));
+        await this.#guards.push(async () => await run(this.#runner, this.#engine.push()));
     }
     /**
      * checkpoint WAL for local database
@@ -149,7 +155,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        await this.#guards.checkpoint(async () => await run(this.#runOpts, this.#io, this.#engine, this.#engine.checkpoint()));
+        await this.#guards.checkpoint(async () => await run(this.#runner, this.#engine.checkpoint()));
     }
     /**
      * @returns statistic of current local database
@@ -158,7 +164,7 @@ class Database extends DatabasePromise {
         if (this.#engine == null) {
             throw new Error("sync is disabled as database was opened without sync support")
         }
-        return (await run(this.#runOpts, this.#io, this.#engine, this.#engine.stats()));
+        return (await run(this.#runner, this.#engine.stats()));
     }
     /**
      * close the database and relevant files

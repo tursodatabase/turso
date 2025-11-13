@@ -1,4 +1,5 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use crate::turso_assert;
 use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
@@ -232,6 +233,30 @@ impl File for MemoryFile {
     fn size(&self) -> Result<u64> {
         tracing::debug!("size(path={}): {}", self.path, self.size.get());
         Ok(self.size.get())
+    }
+
+    fn has_hole(&self, pos: usize, len: usize) -> Result<bool> {
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            if self.get_page(page_no).is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+        turso_assert!(
+            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            "hole must be page aligned"
+        );
+        let start_page = pos / PAGE_SIZE;
+        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        for page_no in start_page..=end_page {
+            unsafe { (*self.pages.get()).remove(&page_no) };
+        }
+        Ok(())
     }
 }
 
