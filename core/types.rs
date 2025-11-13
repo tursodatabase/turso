@@ -21,6 +21,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
+use std::collections::hash_map::Entry;
 use std::fmt::{Debug, Display};
 use std::iter::Peekable;
 use std::ops::Deref;
@@ -915,14 +916,26 @@ impl<'a> RecordParserInner<'a> {
     }
 
     fn get_value(&mut self, record: &'a ImmutableRecord, idx: usize) -> Result<ValueRef<'a>> {
-        self.cursor.get_value(record, idx)
+        let val = match self.values.entry(idx) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let val = self.cursor.get_value(record, idx)?;
+                entry.insert(val);
+                val
+            }
+        };
+        Ok(val)
     }
 
-    fn get_values<'b>(
+    fn get_values(
         &mut self,
         record: &'a ImmutableRecord,
-    ) -> Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, '_>> {
-        self.cursor.get_values(record)
+    ) -> Result<Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, '_>>> {
+        self.cursor.parse_full_header(record)?;
+        // Assumes the entire header is parsed
+        Ok((0..(self.cursor.serial_types.len()))
+            .map(|idx| self.get_value(record, idx))
+            .peekable())
     }
 }
 
@@ -960,10 +973,9 @@ impl<'a> RecordParser<'a> {
 
     fn get_values(&self, record: &'a ImmutableRecord) -> Vec<ValueRef<'a>> {
         let mut cursor = self.inner.lock();
-        cursor
-            .get_values(record)
-            .collect::<Result<Vec<_>>>()
-            .unwrap_or_default()
+        cursor.get_values(record).map_or(Vec::new(), |val| {
+            val.collect::<Result<Vec<_>>>().unwrap_or_default()
+        })
     }
 }
 
@@ -1079,16 +1091,6 @@ impl ImmutableRecord {
             payload: Value::Blob(payload),
             record_parser: RecordParser::new(),
         }
-    }
-
-    // TODO: inline the complete record parsing code here.
-    // Its probably more efficient.
-    // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
-    // it always deserializes the columns
-    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        let record: &'static Self = unsafe { std::mem::transmute(self) };
-        let values: Vec<ValueRef<'a>> = self.record_parser.get_values(record);
-        values
     }
 
     pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -1229,6 +1231,16 @@ impl ImmutableRecord {
         Some(record_cursor.get_value(self, last_idx))
     }
 
+    // TODO: inline the complete record parsing code here.
+    // Its probably more efficient.
+    // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
+    // it always deserializes the columns
+    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
+        let record: &'static Self = unsafe { std::mem::transmute(self) };
+        let values: Vec<ValueRef<'a>> = self.record_parser.get_values(record);
+        values
+    }
+
     pub fn get_value<'a>(&'a self, idx: usize) -> Result<ValueRef<'a>> {
         let record: &'static Self = unsafe { std::mem::transmute(self) };
         self.record_parser.get_value(record, idx)
@@ -1239,18 +1251,8 @@ impl ImmutableRecord {
             return None;
         }
 
-        let mut cursor = RecordCursor::new();
-
-        match cursor.ensure_parsed_upto(self, idx) {
-            Ok(()) => {
-                if idx >= cursor.serial_types.len() {
-                    return None;
-                }
-
-                cursor.deserialize_column(self, idx).ok()
-            }
-            Err(_) => None,
-        }
+        let record: &'static Self = unsafe { std::mem::transmute(self) };
+        self.record_parser.get_value(record, idx).ok()
     }
 
     pub fn column_count(&self) -> usize {
