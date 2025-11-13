@@ -1,4 +1,6 @@
 use either::Either;
+use parking_lot::Mutex;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
@@ -53,7 +55,7 @@ impl Display for ValueType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
     Text,
@@ -94,7 +96,7 @@ impl Text {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct TextRef<'a> {
     pub value: &'a str,
     pub subtype: TextSubtype,
@@ -256,6 +258,19 @@ pub enum ValueRef<'a> {
     Float(f64),
     Text(TextRef<'a>),
     Blob(&'a [u8]),
+}
+
+impl std::hash::Hash for ValueRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            ValueRef::Null => {}
+            ValueRef::Integer(i) => i.hash(state),
+            ValueRef::Float(f) => (f.to_bits()).hash(state),
+            ValueRef::Text(text_ref) => text_ref.hash(state),
+            ValueRef::Blob(items) => items.hash(state),
+        }
+    }
 }
 
 impl Debug for ValueRef<'_> {
@@ -873,11 +888,90 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     }
 }
 
+#[derive(Debug)]
+struct RecordParserInner<'a> {
+    values: FxHashMap<usize, ValueRef<'a>>,
+    cursor: RecordCursor,
+}
+
+impl<'a> RecordParserInner<'a> {
+    fn new() -> Self {
+        Self {
+            values: FxHashMap::with_capacity_and_hasher(0, FxBuildHasher::default()),
+            cursor: RecordCursor::new(),
+        }
+    }
+
+    fn with_capacity(len: usize) -> Self {
+        Self {
+            values: FxHashMap::with_capacity_and_hasher(len, FxBuildHasher::default()),
+            cursor: RecordCursor::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.cursor.invalidate();
+    }
+
+    fn get_value(&mut self, record: &'a ImmutableRecord, idx: usize) -> Result<ValueRef<'a>> {
+        self.cursor.get_value(record, idx)
+    }
+
+    fn get_values<'b>(
+        &mut self,
+        record: &'a ImmutableRecord,
+    ) -> Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, '_>> {
+        self.cursor.get_values(record)
+    }
+}
+
+#[derive(Debug)]
+struct RecordParser<'a> {
+    inner: Mutex<RecordParserInner<'a>>,
+}
+
+impl<'a> Clone for RecordParser<'a> {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> RecordParser<'a> {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(RecordParserInner::new()),
+        }
+    }
+
+    fn with_capacity(len: usize) -> Self {
+        Self {
+            inner: Mutex::new(RecordParserInner::with_capacity(len)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.inner.get_mut().clear();
+    }
+
+    fn get_value(&self, record: &'a ImmutableRecord, idx: usize) -> Result<ValueRef<'a>> {
+        self.inner.lock().get_value(record, idx)
+    }
+
+    fn get_values(&self, record: &'a ImmutableRecord) -> Vec<ValueRef<'a>> {
+        let mut cursor = self.inner.lock();
+        cursor
+            .get_values(record)
+            .collect::<Result<Vec<_>>>()
+            .unwrap_or_default()
+    }
+}
+
 /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
 /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone)]
 pub struct ImmutableRecord {
     // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
     // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
@@ -885,6 +979,9 @@ pub struct ImmutableRecord {
     //
     // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
     payload: Value,
+    /// This is a self referential borrow from the values inside the Payload.
+    /// Always be sure to invalidate this when starting a new serialization or invalidating
+    record_parser: RecordParser<'static>,
 }
 
 impl std::fmt::Debug for ImmutableRecord {
@@ -912,41 +1009,31 @@ impl std::fmt::Debug for ImmutableRecord {
     }
 }
 
+impl PartialEq for ImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload
+    }
+}
+
+impl Eq for ImmutableRecord {}
+
+impl Ord for ImmutableRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.payload.cmp(&other.payload)
+    }
+}
+
+impl PartialOrd for ImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.payload.partial_cmp(&other.payload)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Record {
     values: Vec<Value>,
 }
 
-impl Record {
-    // pub fn get<'a, T: FromValue<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-    //     let value = &self.values[idx];
-    //     T::from_value(value)
-    // }
-
-    pub fn count(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn last_value(&self) -> Option<&Value> {
-        self.values.last()
-    }
-
-    pub fn get_values(&self) -> &Vec<Value> {
-        &self.values
-    }
-
-    pub fn get_value(&self, idx: usize) -> &Value {
-        &self.values[idx]
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
 struct AppendWriter<'a> {
     buf: &'a mut Vec<u8>,
     pos: usize,
@@ -983,12 +1070,14 @@ impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
             payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            record_parser: RecordParser::new(),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
             payload: Value::Blob(payload),
+            record_parser: RecordParser::new(),
         }
     }
 
@@ -997,11 +1086,9 @@ impl ImmutableRecord {
     // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
     // it always deserializes the columns
     pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
-        cursor
-            .get_values(self)
-            .collect::<Result<Vec<_>>>()
-            .unwrap_or_default()
+        let record: &'static Self = unsafe { std::mem::transmute(self) };
+        let values: Vec<ValueRef<'a>> = self.record_parser.get_values(record);
+        values
     }
 
     pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -1086,6 +1173,7 @@ impl ImmutableRecord {
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
+            record_parser: RecordParser::with_capacity(len),
         }
     }
 
@@ -1096,7 +1184,7 @@ impl ImmutableRecord {
         }
     }
 
-    pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
+    fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
             Value::Blob(b) => b,
             _ => panic!("payload must be a blob"),
@@ -1108,10 +1196,12 @@ impl ImmutableRecord {
     }
 
     pub fn start_serialization(&mut self, payload: &[u8]) {
+        self.record_parser.clear();
         self.as_blob_mut().extend_from_slice(payload);
     }
 
     pub fn invalidate(&mut self) {
+        self.record_parser.clear();
         self.as_blob_mut().clear();
     }
 
@@ -1140,8 +1230,8 @@ impl ImmutableRecord {
     }
 
     pub fn get_value<'a>(&'a self, idx: usize) -> Result<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
-        cursor.get_value(self, idx)
+        let record: &'static Self = unsafe { std::mem::transmute(self) };
+        self.record_parser.get_value(record, idx)
     }
 
     pub fn get_value_opt<'a>(&'a self, idx: usize) -> Option<ValueRef<'a>> {
