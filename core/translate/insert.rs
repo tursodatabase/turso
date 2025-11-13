@@ -94,7 +94,7 @@ pub struct InsertEmitCtx<'a> {
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
-    pub idx_cursors: Vec<(&'a String, i64, usize)>,
+    pub idx_cursors: Vec<(String, i64, usize)>,
 
     /// Context for if the insert values are materialized first
     /// into a temporary table
@@ -146,7 +146,7 @@ impl<'a> InsertEmitCtx<'a> {
         let mut idx_cursors = Vec::new();
         for idx in indices {
             idx_cursors.push((
-                &idx.name,
+                idx.name.clone(),
                 idx.root_page,
                 program.alloc_cursor_index(None, idx)?,
             ));
