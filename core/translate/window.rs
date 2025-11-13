@@ -526,10 +526,10 @@ pub fn init_window<'a>(
     let reg_acc_start = program.alloc_registers(window_function_count);
     let reg_acc_result_start = program.alloc_registers(window_function_count);
     for (i, func) in window.functions.iter().enumerate() {
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((&func.original_expr, reg_acc_result_start + i));
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(&func.original_expr),
+            reg_acc_result_start + i,
+        ));
     }
 
     // The same approach applies to expressions referencing the subquery (columns).
@@ -543,7 +543,7 @@ pub fn init_window<'a>(
         t_ctx
             .resolver
             .expr_to_reg_cache
-            .push((expr, reg_col_start + i));
+            .push((std::borrow::Cow::Borrowed(expr), reg_col_start + i));
     }
 
     t_ctx.meta_window = Some(WindowMetadata {

@@ -38,10 +38,10 @@ pub fn emit_ungrouped_aggregation<'a>(
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
     // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((&agg.original_expr, agg_start_reg + i));
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(&agg.original_expr),
+            agg_start_reg + i,
+        ));
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
