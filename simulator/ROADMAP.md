@@ -30,6 +30,7 @@ Actionable items:
       a shadow operation for keeping track. For some oracles such as `doublecheck` or `differential`, we do not
       need the shadowing. So we should separate the generation into `shadowable/not shadowable` paths, and generate
       based on the current oracle.
+- [ ] Run the simulator with coverage measurement, highlighting parts of Turso not touched by the simulator.
 
 ## Input Generation
 
@@ -47,17 +48,33 @@ Actionable items:
 
 ### Properties
 
-TODO
+- [ ] InsertValuesSelect: TODO
+- [ ] ReadYourUpdatesBack: TODO
+- [ ] TableHasExpectedContent: TODO
+- [ ] AllTableHaveExpectedContent: TODO
+- [ ] DoubleCreateFailure: TODO
+- [ ] SelectLimit: TODO
+- [ ] DeleteSelect: TODO
+- [ ] DropSelect: TODO
+- [ ] SelectSelectOptimizer: TODO
+- [ ] WhereTrueFalseNull: TODO
+- [ ] UNIONAllPreservesCardinality: TODO
+- [ ] FsyncNoWait: TODO
+- [ ] FaultyQuery: TODO
 
 ### Oracles
 
-TODO
+- [ ] Default: TODO
+- [ ] Differential: TODO
+- [ ] Doublecheck: TODO
 
 ## Debugging
 
 - [ ] Automated Shrinking
   - [x] Statement Removal
-    - [x] Heuristic removal
+    - [ ] Heuristic removal
+      - [x] Removing unused tables
+      - [ ] Removing all DQLs
     - [x] Backtracking removal
   - [ ] Statement shrinking
     - [ ] Value removal
