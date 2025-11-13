@@ -186,7 +186,14 @@ pub fn execute_interaction_turso(
                 return Err(err.clone());
             }
             if let Some(name) = interaction.binding.as_ref() {
-                println!("Binding results {:?} to '{}'", results, name);
+                println!(
+                    "Binding '{}' := {}",
+                    name,
+                    match &results {
+                        Ok(res) => format!("{}", res),
+                        Err(err) => format!("Error: {:?}", err),
+                    },
+                );
                 bindings.insert(name.clone(), results);
             }
             // TODO: skip integrity check with mvcc
@@ -255,8 +262,6 @@ pub fn execute_interaction_turso(
             }
         }
     }
-    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
-    println!("{}", env.get_conn_tables(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 

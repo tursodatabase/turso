@@ -23,6 +23,7 @@ use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::generation::parser::parse_plan_file;
 use crate::generation::plan::{ConnectionState, InteractionPlanIterator};
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
@@ -183,7 +184,8 @@ fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
                         std::panic::catch_unwind(move || {
                             let mut env = env;
                             let plan_path = env.get_plan_path();
-                            let plan = InteractionPlan::compute_via_diff(&plan_path);
+                            let plan_owned = parse_plan_file(&plan_path);
+                            let plan = plan_owned.static_iterator();
                             env.clear();
 
                             let env = Arc::new(Mutex::new(env.clone_without_connections()));

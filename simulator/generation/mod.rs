@@ -1,9 +1,10 @@
 use turso_core::Value;
-use turso_parser::ast::{Expr, Literal};
+use turso_parser::ast::Literal;
 
 use crate::runner::env::ShadowTablesMut;
 
 pub mod assertion;
+pub mod parser;
 pub mod plan;
 pub mod property;
 pub mod query;
