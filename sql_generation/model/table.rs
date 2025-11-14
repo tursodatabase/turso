@@ -2,7 +2,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{numeric::Numeric, types, ExecValue};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;

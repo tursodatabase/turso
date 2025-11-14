@@ -115,13 +115,132 @@ impl TrimType {
     }
 }
 
-impl Value {
-    pub fn exec_lower(&self) -> Option<Self> {
+pub trait ExecValue: Sized {
+    fn exec_lower(&self) -> Option<Self>;
+
+    fn exec_length(&self) -> Self;
+
+    fn exec_octet_length(&self) -> Self;
+
+    fn exec_upper(&self) -> Option<Self>;
+
+    fn exec_sign(&self) -> Option<Value>;
+
+    /// Generates the Soundex code for a given word
+    fn exec_soundex(&self) -> Value;
+
+    fn exec_abs(&self) -> Result<Self>;
+
+    fn exec_random<F>(generate_random_number: F) -> Self
+    where
+        F: Fn() -> i64;
+
+    fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    where
+        F: Fn(&mut [u8]);
+
+    fn exec_quote(&self) -> Self;
+
+    fn exec_nullif(&self, second_value: &Self) -> Self;
+
+    fn exec_substring(value: &Value, start_value: &Value, length_value: Option<&Value>) -> Value;
+
+    fn exec_instr(&self, pattern: &Value) -> Value;
+
+    fn exec_typeof(&self) -> Value;
+
+    fn exec_hex(&self) -> Value;
+
+    fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value;
+
+    fn exec_unicode(&self) -> Value;
+
+    fn exec_round(&self, precision: Option<&Value>) -> Value;
+
+    fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value;
+
+    // Implements TRIM pattern matching.
+    fn exec_trim(&self, pattern: Option<&Value>) -> Value;
+    // Implements RTRIM pattern matching.
+    fn exec_rtrim(&self, pattern: Option<&Value>) -> Value;
+
+    // Implements LTRIM pattern matching.
+    fn exec_ltrim(&self, pattern: Option<&Value>) -> Value;
+
+    fn exec_zeroblob(&self) -> Value;
+
+    // exec_if returns whether you should jump
+    fn exec_if(&self, jump_if_null: bool, not: bool) -> bool;
+
+    fn exec_cast(&self, datatype: &str) -> Value;
+
+    fn exec_replace(source: &Value, pattern: &Value, replacement: &Value) -> Value;
+
+    fn exec_math_unary(&self, function: &MathFunc) -> Value;
+
+    fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value;
+
+    fn exec_math_log(&self, base: Option<&Value>) -> Value;
+
+    fn exec_add(&self, rhs: &Value) -> Value;
+
+    fn exec_subtract(&self, rhs: &Value) -> Value;
+
+    fn exec_multiply(&self, rhs: &Value) -> Value;
+
+    fn exec_divide(&self, rhs: &Value) -> Value;
+
+    fn exec_bit_and(&self, rhs: &Value) -> Value;
+
+    fn exec_bit_or(&self, rhs: &Value) -> Value;
+
+    fn exec_remainder(&self, rhs: &Value) -> Value;
+
+    fn exec_bit_not(&self) -> Value;
+
+    fn exec_shift_left(&self, rhs: &Value) -> Value;
+
+    fn exec_shift_right(&self, rhs: &Value) -> Value;
+
+    fn exec_boolean_not(&self) -> Value;
+
+    fn exec_concat(&self, rhs: &Value) -> Value;
+
+    fn exec_and(&self, rhs: &Value) -> Value;
+
+    fn exec_or(&self, rhs: &Value) -> Value;
+
+    // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
+    fn exec_like(
+        regex_cache: Option<&mut HashMap<String, Regex>>,
+        pattern: &str,
+        text: &str,
+    ) -> bool;
+
+    fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value;
+
+    fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value;
+
+    fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self
+    where
+        Self: 'a;
+
+    fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(registers: T) -> Self
+    where
+        Self: 'a;
+
+    fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self
+    where
+        Self: 'a;
+}
+
+impl ExecValue for Value {
+    fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_lowercase()))
     }
 
-    pub fn exec_length(&self) -> Self {
+    fn exec_length(&self) -> Self {
         match self {
             Value::Text(t) => {
                 let s = t.as_str();
@@ -140,7 +259,7 @@ impl Value {
         }
     }
 
-    pub fn exec_octet_length(&self) -> Self {
+    fn exec_octet_length(&self) -> Self {
         match self {
             Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
                 Value::Integer(self.to_string().into_bytes().len() as i64)
@@ -150,12 +269,12 @@ impl Value {
         }
     }
 
-    pub fn exec_upper(&self) -> Option<Self> {
+    fn exec_upper(&self) -> Option<Self> {
         self.cast_text()
             .map(|s| Value::build_text(s.to_ascii_uppercase()))
     }
 
-    pub fn exec_sign(&self) -> Option<Value> {
+    fn exec_sign(&self) -> Option<Value> {
         let v = Numeric::from_value_strict(self).try_into_f64()?;
 
         Some(Value::Integer(if v > 0.0 {
@@ -168,7 +287,7 @@ impl Value {
     }
 
     /// Generates the Soundex code for a given word
-    pub fn exec_soundex(&self) -> Value {
+    fn exec_soundex(&self) -> Value {
         let s = match self {
             Value::Null => return Value::build_text("?000"),
             Value::Text(s) => {
@@ -258,7 +377,7 @@ impl Value {
         Value::build_text(result.to_uppercase())
     }
 
-    pub fn exec_abs(&self) -> Result<Self> {
+    fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
             Value::Integer(v) => {
@@ -279,14 +398,14 @@ impl Value {
         })
     }
 
-    pub fn exec_random<F>(generate_random_number: F) -> Self
+    fn exec_random<F>(generate_random_number: F) -> Self
     where
         F: Fn() -> i64,
     {
         Value::Integer(generate_random_number())
     }
 
-    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
     where
         F: Fn(&mut [u8]),
     {
@@ -303,7 +422,7 @@ impl Value {
         Value::Blob(blob)
     }
 
-    pub fn exec_quote(&self) -> Self {
+    fn exec_quote(&self) -> Self {
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Integer(_) | Value::Float(_) => self.to_owned(),
@@ -327,7 +446,7 @@ impl Value {
         }
     }
 
-    pub fn exec_nullif(&self, second_value: &Self) -> Self {
+    fn exec_nullif(&self, second_value: &Self) -> Self {
         if self != second_value {
             self.clone()
         } else {
@@ -335,11 +454,7 @@ impl Value {
         }
     }
 
-    pub fn exec_substring(
-        value: &Value,
-        start_value: &Value,
-        length_value: Option<&Value>,
-    ) -> Value {
+    fn exec_substring(value: &Value, start_value: &Value, length_value: Option<&Value>) -> Value {
         /// Function is stabilized but not released for version 1.88 \
         /// https://doc.rust-lang.org/src/core/str/mod.rs.html#453
         const fn ceil_char_boundary(s: &str, index: usize) -> usize {
@@ -433,7 +548,7 @@ impl Value {
         }
     }
 
-    pub fn exec_instr(&self, pattern: &Value) -> Value {
+    fn exec_instr(&self, pattern: &Value) -> Value {
         if self == &Value::Null || pattern == &Value::Null {
             return Value::Null;
         }
@@ -470,7 +585,7 @@ impl Value {
         }
     }
 
-    pub fn exec_typeof(&self) -> Value {
+    fn exec_typeof(&self) -> Value {
         match self {
             Value::Null => Value::build_text("null"),
             Value::Integer(_) => Value::build_text("integer"),
@@ -480,7 +595,7 @@ impl Value {
         }
     }
 
-    pub fn exec_hex(&self) -> Value {
+    fn exec_hex(&self) -> Value {
         match self {
             Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
                 let text = self.to_string();
@@ -491,7 +606,7 @@ impl Value {
         }
     }
 
-    pub fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value {
+    fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value {
         match self {
             Value::Null => Value::Null,
             _ => match ignored_chars {
@@ -521,7 +636,7 @@ impl Value {
         }
     }
 
-    pub fn exec_unicode(&self) -> Value {
+    fn exec_unicode(&self) -> Value {
         match self {
             Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
                 let text = self.to_string();
@@ -535,7 +650,7 @@ impl Value {
         }
     }
 
-    pub fn exec_round(&self, precision: Option<&Value>) -> Value {
+    fn exec_round(&self, precision: Option<&Value>) -> Value {
         let Some(f) = Numeric::from(self).try_into_f64() else {
             return Value::Null;
         };
@@ -579,20 +694,20 @@ impl Value {
     }
 
     // Implements TRIM pattern matching.
-    pub fn exec_trim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_trim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::All)
     }
     // Implements RTRIM pattern matching.
-    pub fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_rtrim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::Right)
     }
 
     // Implements LTRIM pattern matching.
-    pub fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
+    fn exec_ltrim(&self, pattern: Option<&Value>) -> Value {
         self._exec_trim(pattern, TrimType::Left)
     }
 
-    pub fn exec_zeroblob(&self) -> Value {
+    fn exec_zeroblob(&self) -> Value {
         let length: i64 = match self {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
@@ -603,14 +718,14 @@ impl Value {
     }
 
     // exec_if returns whether you should jump
-    pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
+    fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
         Numeric::from(self)
             .try_into_bool()
             .map(|jump| if not { !jump } else { jump })
             .unwrap_or(jump_if_null)
     }
 
-    pub fn exec_cast(&self, datatype: &str) -> Value {
+    fn exec_cast(&self, datatype: &str) -> Value {
         if matches!(self, Value::Null) {
             return Value::Null;
         }
@@ -700,7 +815,7 @@ impl Value {
         }
     }
 
-    pub fn exec_replace(source: &Value, pattern: &Value, replacement: &Value) -> Value {
+    fn exec_replace(source: &Value, pattern: &Value, replacement: &Value) -> Value {
         // The replace(X,Y,Z) function returns a string formed by substituting string Z for every occurrence of
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
@@ -733,7 +848,7 @@ impl Value {
         }
     }
 
-    pub fn exec_math_unary(&self, function: &MathFunc) -> Value {
+    fn exec_math_unary(&self, function: &MathFunc) -> Value {
         let v = Numeric::from_value_strict(self);
 
         // In case of some functions and integer input, return the input as is
@@ -785,7 +900,7 @@ impl Value {
         }
     }
 
-    pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
+    fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
         let Some(lhs) = Numeric::from_value_strict(self).try_into_f64() else {
             return Value::Null;
         };
@@ -808,7 +923,7 @@ impl Value {
         }
     }
 
-    pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
+    fn exec_math_log(&self, base: Option<&Value>) -> Value {
         let Some(f) = Numeric::from_value_strict(self).try_into_f64() else {
             return Value::Null;
         };
@@ -840,31 +955,31 @@ impl Value {
         Value::Float(result)
     }
 
-    pub fn exec_add(&self, rhs: &Value) -> Value {
+    fn exec_add(&self, rhs: &Value) -> Value {
         (Numeric::from(self) + Numeric::from(rhs)).into()
     }
 
-    pub fn exec_subtract(&self, rhs: &Value) -> Value {
+    fn exec_subtract(&self, rhs: &Value) -> Value {
         (Numeric::from(self) - Numeric::from(rhs)).into()
     }
 
-    pub fn exec_multiply(&self, rhs: &Value) -> Value {
+    fn exec_multiply(&self, rhs: &Value) -> Value {
         (Numeric::from(self) * Numeric::from(rhs)).into()
     }
 
-    pub fn exec_divide(&self, rhs: &Value) -> Value {
+    fn exec_divide(&self, rhs: &Value) -> Value {
         (Numeric::from(self) / Numeric::from(rhs)).into()
     }
 
-    pub fn exec_bit_and(&self, rhs: &Value) -> Value {
+    fn exec_bit_and(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) & NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_bit_or(&self, rhs: &Value) -> Value {
+    fn exec_bit_or(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) | NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_remainder(&self, rhs: &Value) -> Value {
+    fn exec_remainder(&self, rhs: &Value) -> Value {
         let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
             || matches!(Numeric::from(rhs), Numeric::Float(_));
 
@@ -880,26 +995,26 @@ impl Value {
         }
     }
 
-    pub fn exec_bit_not(&self) -> Value {
+    fn exec_bit_not(&self) -> Value {
         (!NullableInteger::from(self)).into()
     }
 
-    pub fn exec_shift_left(&self, rhs: &Value) -> Value {
+    fn exec_shift_left(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) << NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_shift_right(&self, rhs: &Value) -> Value {
+    fn exec_shift_right(&self, rhs: &Value) -> Value {
         (NullableInteger::from(self) >> NullableInteger::from(rhs)).into()
     }
 
-    pub fn exec_boolean_not(&self) -> Value {
+    fn exec_boolean_not(&self) -> Value {
         match Numeric::from(self).try_into_bool() {
             None => Value::Null,
             Some(v) => Value::Integer(!v as i64),
         }
     }
 
-    pub fn exec_concat(&self, rhs: &Value) -> Value {
+    fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
             return Value::build_text(
                 String::from_utf8_lossy(&[lhs.as_slice(), rhs.as_slice()].concat()).into_owned(),
@@ -917,7 +1032,7 @@ impl Value {
         Value::build_text(lhs + &rhs)
     }
 
-    pub fn exec_and(&self, rhs: &Value) -> Value {
+    fn exec_and(&self, rhs: &Value) -> Value {
         match (
             Numeric::from(self).try_into_bool(),
             Numeric::from(rhs).try_into_bool(),
@@ -928,7 +1043,7 @@ impl Value {
         }
     }
 
-    pub fn exec_or(&self, rhs: &Value) -> Value {
+    fn exec_or(&self, rhs: &Value) -> Value {
         match (
             Numeric::from(self).try_into_bool(),
             Numeric::from(rhs).try_into_bool(),
@@ -940,7 +1055,7 @@ impl Value {
     }
 
     // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
-    pub fn exec_like(
+    fn exec_like(
         regex_cache: Option<&mut HashMap<String, Regex>>,
         pattern: &str,
         text: &str,
@@ -961,15 +1076,15 @@ impl Value {
         }
     }
 
-    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         regs.min().map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+    fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         regs.max().map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
-    pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
+    fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
         let mut result = String::new();
         for val in registers {
             match val {
@@ -981,7 +1096,7 @@ impl Value {
         Value::build_text(result)
     }
 
-    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
+    fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
         if registers.len() == 0 {
             return Value::Null;
         }
@@ -1000,7 +1115,7 @@ impl Value {
         Value::build_text(result)
     }
 
-    pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
+    fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
             .filter_map(|x| {
                 if let Value::Integer(i) = x {
@@ -1045,6 +1160,7 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 #[cfg(test)]
 mod tests {
     use crate::types::Value;
+    use crate::vdbe::value::ExecValue;
     use crate::vdbe::{Bitfield, Register};
 
     use rand::{Rng, RngCore};

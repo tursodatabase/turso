@@ -38,7 +38,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
+use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, ExecValue, MvCursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
