@@ -1,0 +1,313 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic CREATE TRIGGER
+do_execsql_test_on_specific_db {:memory:} trigger-create-basic {
+  CREATE TABLE test1 (x INTEGER, y TEXT);
+  CREATE TRIGGER t1 BEFORE INSERT ON test1 BEGIN INSERT INTO test1 VALUES (100, 'triggered'); END;
+  INSERT INTO test1 VALUES (1, 'hello');
+  SELECT * FROM test1 ORDER BY rowid;
+} {100|triggered
+1|hello}
+
+# CREATE TRIGGER IF NOT EXISTS
+do_execsql_test_on_specific_db {:memory:} trigger-create-if-not-exists {
+  CREATE TABLE test2 (x INTEGER PRIMARY KEY);
+  CREATE TRIGGER IF NOT EXISTS t2 BEFORE INSERT ON test2 BEGIN SELECT 1; END;
+  CREATE TRIGGER IF NOT EXISTS t2 BEFORE INSERT ON test2 BEGIN SELECT 1; END;
+  SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t2';
+} {t2}
+
+# DROP TRIGGER
+do_execsql_test_on_specific_db {:memory:} trigger-drop-basic {
+  CREATE TABLE test3 (x INTEGER PRIMARY KEY);
+  CREATE TRIGGER t3 BEFORE INSERT ON test3 BEGIN SELECT 1; END;
+  DROP TRIGGER t3;
+  SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t3';
+} {}
+
+# DROP TRIGGER IF EXISTS
+do_execsql_test_on_specific_db {:memory:} trigger-drop-if-exists {
+  CREATE TABLE test4 (x INTEGER PRIMARY KEY);
+  DROP TRIGGER IF EXISTS nonexistent;
+  CREATE TRIGGER t4 BEFORE INSERT ON test4 BEGIN SELECT 1; END;
+  DROP TRIGGER IF EXISTS t4;
+  SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t4';
+} {}
+
+# BEFORE INSERT trigger
+do_execsql_test_on_specific_db {:memory:} trigger-before-insert {
+  CREATE TABLE test5 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TRIGGER t5 BEFORE INSERT ON test5 BEGIN UPDATE test5 SET y = 'before_' || y WHERE x = NEW.x; END;
+  INSERT INTO test5 VALUES (1, 'hello');
+  SELECT * FROM test5;
+} {1|hello}
+
+# AFTER INSERT trigger
+do_execsql_test_on_specific_db {:memory:} trigger-after-insert {
+  CREATE TABLE test6 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log6 (x INTEGER, y TEXT);
+  CREATE TRIGGER t6 AFTER INSERT ON test6 BEGIN INSERT INTO log6 VALUES (NEW.x, NEW.y); END;
+  INSERT INTO test6 VALUES (1, 'hello');
+  SELECT * FROM log6;
+} {1|hello}
+
+# BEFORE UPDATE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-before-update {
+  CREATE TABLE test7 (x INTEGER PRIMARY KEY, y TEXT);
+  INSERT INTO test7 VALUES (1, 'hello');
+  CREATE TRIGGER t7 BEFORE UPDATE ON test7 BEGIN UPDATE test7 SET y = 'before_' || NEW.y WHERE x = OLD.x; END;
+  UPDATE test7 SET y = 'world' WHERE x = 1;
+  SELECT * FROM test7;
+} {1|world}
+
+# AFTER UPDATE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-after-update {
+  CREATE TABLE test8 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log8 (old_x INTEGER, old_y TEXT, new_x INTEGER, new_y TEXT);
+  INSERT INTO test8 VALUES (1, 'hello');
+  CREATE TRIGGER t8 AFTER UPDATE ON test8 BEGIN INSERT INTO log8 VALUES (OLD.x, OLD.y, NEW.x, NEW.y); END;
+  UPDATE test8 SET y = 'world' WHERE x = 1;
+  SELECT * FROM log8;
+} {1|hello|1|world}
+
+# BEFORE DELETE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-before-delete {
+  CREATE TABLE test9 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log9 (x INTEGER, y TEXT);
+  INSERT INTO test9 VALUES (1, 'hello');
+  CREATE TRIGGER t9 BEFORE DELETE ON test9 BEGIN INSERT INTO log9 VALUES (OLD.x, OLD.y); END;
+  DELETE FROM test9 WHERE x = 1;
+  SELECT * FROM log9;
+} {1|hello}
+
+# AFTER DELETE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-after-delete {
+  CREATE TABLE test10 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log10 (x INTEGER, y TEXT);
+  INSERT INTO test10 VALUES (1, 'hello');
+  CREATE TRIGGER t10 AFTER DELETE ON test10 BEGIN INSERT INTO log10 VALUES (OLD.x, OLD.y); END;
+  DELETE FROM test10 WHERE x = 1;
+  SELECT * FROM log10;
+} {1|hello}
+
+# Trigger with WHEN clause
+do_execsql_test_on_specific_db {:memory:} trigger-when-clause {
+  CREATE TABLE test11 (x INTEGER PRIMARY KEY, y INTEGER);
+  CREATE TABLE log11 (x INTEGER);
+  CREATE TRIGGER t11 AFTER INSERT ON test11 WHEN NEW.y > 10 BEGIN INSERT INTO log11 VALUES (NEW.x); END;
+  INSERT INTO test11 VALUES (1, 5);
+  INSERT INTO test11 VALUES (2, 15);
+  SELECT * FROM log11;
+} {2}
+
+# Multiple triggers on same event
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-same-event {
+  CREATE TABLE test12 (x INTEGER PRIMARY KEY);
+  CREATE TABLE log12 (msg TEXT);
+  CREATE TRIGGER t12a BEFORE INSERT ON test12 BEGIN INSERT INTO log12 VALUES ('trigger1'); END;
+  CREATE TRIGGER t12b BEFORE INSERT ON test12 BEGIN INSERT INTO log12 VALUES ('trigger2'); END;
+  INSERT INTO test12 VALUES (1);
+  SELECT * FROM log12 ORDER BY msg;
+} {trigger1
+trigger2}
+
+# Triggers dropped when table is dropped
+do_execsql_test_on_specific_db {:memory:} trigger-drop-table-drops-triggers {
+  CREATE TABLE test13 (x INTEGER PRIMARY KEY);
+  CREATE TRIGGER t13 BEFORE INSERT ON test13 BEGIN SELECT 1; END;
+  DROP TABLE test13;
+  SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t13';
+} {}
+
+# NEW and OLD references
+do_execsql_test_on_specific_db {:memory:} trigger-new-old-references {
+  CREATE TABLE test14 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log14 (msg TEXT);
+  INSERT INTO test14 VALUES (1, 'hello');
+  CREATE TRIGGER t14 AFTER UPDATE ON test14 BEGIN INSERT INTO log14 VALUES ('old=' || OLD.y || ' new=' || NEW.y); END;
+  UPDATE test14 SET y = 'world' WHERE x = 1;
+  SELECT * FROM log14;
+} {"old=hello new=world"}
+
+# Trigger with UPDATE OF clause
+do_execsql_test_on_specific_db {:memory:} trigger-update-of {
+  CREATE TABLE test15 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
+  CREATE TABLE log15 (msg TEXT);
+  INSERT INTO test15 VALUES (1, 'hello', 'world');
+  CREATE TRIGGER t15 AFTER UPDATE OF y ON test15 BEGIN INSERT INTO log15 VALUES ('y changed'); END;
+  UPDATE test15 SET z = 'foo' WHERE x = 1;
+  SELECT * FROM log15;
+  UPDATE test15 SET y = 'bar' WHERE x = 1;
+  SELECT * FROM log15;
+} {"y changed"}
+
+# Recursive trigger - AFTER INSERT inserting into same table
+do_execsql_test_on_specific_db {:memory:} trigger-recursive-after-insert {
+  CREATE TABLE test16 (x INTEGER PRIMARY KEY);
+  CREATE TRIGGER t16 AFTER INSERT ON test16 BEGIN INSERT INTO test16 VALUES (NEW.x + 1); END;
+  INSERT INTO test16 VALUES (1);
+  SELECT * FROM test16 ORDER BY x;
+} {1
+2}
+
+# Multiple UPDATE OF columns
+do_execsql_test_on_specific_db {:memory:} trigger-update-of-multiple {
+  CREATE TABLE test17 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
+  CREATE TABLE log17 (msg TEXT);
+  INSERT INTO test17 VALUES (1, 'a', 'b');
+  CREATE TRIGGER t17 AFTER UPDATE OF y, z ON test17 BEGIN INSERT INTO log17 VALUES ('updated'); END;
+  UPDATE test17 SET y = 'c' WHERE x = 1;
+  SELECT COUNT(*) FROM log17;
+  UPDATE test17 SET x = 2 WHERE x = 1;
+  SELECT COUNT(*) FROM log17;
+} {1
+1}
+
+# Complex WHEN clause with AND
+do_execsql_test_on_specific_db {:memory:} trigger-when-complex {
+  CREATE TABLE test18 (x INTEGER PRIMARY KEY, y INTEGER);
+  CREATE TABLE log18 (x INTEGER);
+  CREATE TRIGGER t18 BEFORE INSERT ON test18 WHEN NEW.y > 5 AND NEW.y < 10 BEGIN INSERT INTO log18 VALUES (NEW.x); END;
+  INSERT INTO test18 VALUES (1, 3);
+  INSERT INTO test18 VALUES (2, 7);
+  INSERT INTO test18 VALUES (3, 12);
+  SELECT * FROM log18;
+} {2}
+
+# Nested triggers - trigger firing another trigger
+do_execsql_test_on_specific_db {:memory:} trigger-nested {
+  CREATE TABLE test19 (x INTEGER PRIMARY KEY);
+  CREATE TABLE test20 (x INTEGER PRIMARY KEY);
+  CREATE TABLE log19 (msg TEXT);
+  CREATE TRIGGER t19 AFTER INSERT ON test19 BEGIN INSERT INTO test20 VALUES (NEW.x); END;
+  CREATE TRIGGER t20 AFTER INSERT ON test20 BEGIN INSERT INTO log19 VALUES ('t20 inserted: ' || NEW.x); END;
+  INSERT INTO test19 VALUES (1);
+  SELECT * FROM log19;
+} {"t20 inserted: 1"}
+
+# BEFORE INSERT inserting into same table (recursive)
+do_execsql_test_on_specific_db {:memory:} trigger-recursive-before-insert {
+  CREATE TABLE test21 (x INTEGER PRIMARY KEY);
+  CREATE TRIGGER t21 BEFORE INSERT ON test21 BEGIN INSERT INTO test21 VALUES (NEW.x + 100); END;
+  INSERT INTO test21 VALUES (1);
+  SELECT * FROM test21 ORDER BY x;
+} {1
+101}
+
+# AFTER UPDATE with WHEN clause and UPDATE OF
+do_execsql_test_on_specific_db {:memory:} trigger-update-of-when {
+  CREATE TABLE test22 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TRIGGER t22 AFTER UPDATE OF y ON test22 WHEN OLD.y != NEW.y BEGIN UPDATE test22 SET y = UPPER(NEW.y) WHERE x = NEW.x; END;
+  INSERT INTO test22 VALUES (1, 'hello');
+  UPDATE test22 SET y = 'world' WHERE x = 1;
+  SELECT * FROM test22;
+} {1|WORLD}
+
+# Multiple statements in BEFORE INSERT trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-before-insert {
+  CREATE TABLE test23 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log23a (msg TEXT);
+  CREATE TABLE log23b (msg TEXT);
+  CREATE TRIGGER t23 BEFORE INSERT ON test23 BEGIN INSERT INTO log23a VALUES ('before1'); INSERT INTO log23b VALUES ('before2'); END;
+  INSERT INTO test23 VALUES (1, 'hello');
+  SELECT * FROM log23a;
+  SELECT * FROM log23b;
+} {before1
+before2}
+
+# Multiple statements in AFTER INSERT trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-after-insert {
+  CREATE TABLE test24 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log24a (msg TEXT);
+  CREATE TABLE log24b (msg TEXT);
+  CREATE TRIGGER t24 AFTER INSERT ON test24 BEGIN INSERT INTO log24a VALUES ('after1'); INSERT INTO log24b VALUES ('after2'); END;
+  INSERT INTO test24 VALUES (1, 'hello');
+  SELECT * FROM log24a;
+  SELECT * FROM log24b;
+} {after1
+after2}
+
+# Multiple statements in BEFORE UPDATE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-before-update {
+  CREATE TABLE test25 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log25a (msg TEXT);
+  CREATE TABLE log25b (msg TEXT);
+  INSERT INTO test25 VALUES (1, 'hello');
+  CREATE TRIGGER t25 BEFORE UPDATE ON test25 BEGIN INSERT INTO log25a VALUES ('before_update1'); INSERT INTO log25b VALUES ('before_update2'); END;
+  UPDATE test25 SET y = 'world' WHERE x = 1;
+  SELECT * FROM log25a;
+  SELECT * FROM log25b;
+} {before_update1
+before_update2}
+
+# Multiple statements in AFTER UPDATE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-after-update {
+  CREATE TABLE test26 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log26a (msg TEXT);
+  CREATE TABLE log26b (msg TEXT);
+  INSERT INTO test26 VALUES (1, 'hello');
+  CREATE TRIGGER t26 AFTER UPDATE ON test26 BEGIN INSERT INTO log26a VALUES ('after_update1'); INSERT INTO log26b VALUES ('after_update2'); END;
+  UPDATE test26 SET y = 'world' WHERE x = 1;
+  SELECT * FROM log26a;
+  SELECT * FROM log26b;
+} {after_update1
+after_update2}
+
+# Multiple statements in BEFORE DELETE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-before-delete {
+  CREATE TABLE test27 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log27a (msg TEXT);
+  CREATE TABLE log27b (msg TEXT);
+  INSERT INTO test27 VALUES (1, 'hello');
+  CREATE TRIGGER t27 BEFORE DELETE ON test27 BEGIN INSERT INTO log27a VALUES ('before_delete1'); INSERT INTO log27b VALUES ('before_delete2'); END;
+  DELETE FROM test27 WHERE x = 1;
+  SELECT * FROM log27a;
+  SELECT * FROM log27b;
+} {before_delete1
+before_delete2}
+
+# Multiple statements in AFTER DELETE trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-after-delete {
+  CREATE TABLE test28 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log28a (msg TEXT);
+  CREATE TABLE log28b (msg TEXT);
+  INSERT INTO test28 VALUES (1, 'hello');
+  CREATE TRIGGER t28 AFTER DELETE ON test28 BEGIN INSERT INTO log28a VALUES ('after_delete1'); INSERT INTO log28b VALUES ('after_delete2'); END;
+  DELETE FROM test28 WHERE x = 1;
+  SELECT * FROM log28a;
+  SELECT * FROM log28b;
+} {after_delete1
+after_delete2}
+
+# Multiple statements with mixed operations in BEFORE INSERT trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-mixed-before-insert {
+  CREATE TABLE test29 (x INTEGER PRIMARY KEY, y TEXT);
+  CREATE TABLE log29 (x INTEGER, y TEXT);
+  CREATE TABLE counter29 (cnt INTEGER);
+  INSERT INTO counter29 VALUES (0);
+  CREATE TRIGGER t29 BEFORE INSERT ON test29 BEGIN INSERT INTO log29 VALUES (NEW.x, NEW.y); UPDATE counter29 SET cnt = cnt + 1; END;
+  INSERT INTO test29 VALUES (1, 'hello');
+  INSERT INTO test29 VALUES (2, 'world');
+  SELECT * FROM log29 ORDER BY x;
+  SELECT * FROM counter29;
+} {1|hello
+2|world
+2}
+
+# Multiple statements with conditional logic in trigger
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-statements-conditional {
+  CREATE TABLE test30 (x INTEGER PRIMARY KEY, y INTEGER);
+  CREATE TABLE log30 (msg TEXT);
+  CREATE TRIGGER t30 AFTER INSERT ON test30 BEGIN INSERT INTO log30 VALUES ('inserted: ' || NEW.x); INSERT INTO log30 VALUES ('value: ' || NEW.y); INSERT INTO log30 VALUES ('done'); END;
+  INSERT INTO test30 VALUES (1, 10);
+  INSERT INTO test30 VALUES (2, 20);
+  SELECT * FROM log30 ORDER BY msg;
+} {done
+done
+"inserted: 1"
+"inserted: 2"
+"value: 10"
+"value: 20"}

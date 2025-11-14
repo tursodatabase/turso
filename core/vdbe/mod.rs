@@ -33,6 +33,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
     return_if_io,
+    schema::Trigger,
     state_machine::StateMachine,
     storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
@@ -41,7 +42,7 @@ use crate::{
         execute::{
             OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
             OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
-            OpRowIdState, OpSeekState, OpTransactionState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
@@ -77,6 +78,7 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
+use turso_parser::ast::ResolveType;
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -296,6 +298,7 @@ pub struct ProgramState {
     /// Metrics collected during statement execution
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
+    op_program_state: OpProgramState,
     op_new_rowid_state: OpNewRowidState,
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
@@ -360,6 +363,7 @@ impl ProgramState {
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
+            op_program_state: OpProgramState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
             op_idx_insert_state: OpIdxInsertState::MaybeSeek,
             op_insert_state: OpInsertState {
@@ -515,7 +519,12 @@ impl ProgramState {
         match end_statement {
             EndStatement::ReleaseSavepoint => pager.release_savepoint(),
             EndStatement::RollbackSavepoint => {
-                pager.rollback_to_newest_savepoint()?;
+                let stmt_was_rolled_back = pager.rollback_to_newest_savepoint()?;
+                if !stmt_was_rolled_back {
+                    // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                    // caused the error or not. If it didn't, don't reset any FK violation counters.
+                    return Ok(());
+                }
                 // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                 // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
                 connection.fk_deferred_violations.store(
@@ -605,6 +614,14 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
+    pub trigger: Option<Arc<Trigger>>,
+    pub resolve_type: ResolveType,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Program").finish()
+    }
 }
 
 impl Program {
@@ -747,7 +764,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
-                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
+                self.abort(mv_store, &pager, None, state);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -757,7 +774,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -799,7 +816,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
             }
@@ -1059,10 +1076,21 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
-        cleanup: &mut TxnCleanup,
+        state: &mut ProgramState,
     ) {
+        if self.is_trigger_subprogram() {
+            self.connection.end_trigger_execution();
+        }
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() {
+        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            if err.is_some() {
+                // Any error apart from deferred FK volations causes the statement subtransaction to roll back.
+                let res =
+                    state.end_statement(&self.connection, pager, EndStatement::RollbackSavepoint);
+                if let Err(e) = res {
+                    tracing::error!("Error rolling back statement: {}", e);
+                }
+            }
             match err {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
@@ -1075,7 +1103,7 @@ impl Program {
                 // and op_halt.
                 Some(LimboError::Constraint(_)) => {}
                 _ => {
-                    if *cleanup != TxnCleanup::None || err.is_some() {
+                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = mv_store {
                             if let Some(tx_id) = self.connection.get_mv_tx_id() {
                                 self.connection.auto_commit.store(true, Ordering::SeqCst);
@@ -1090,7 +1118,11 @@ impl Program {
                 }
             }
         }
-        *cleanup = TxnCleanup::None;
+        state.auto_txn_cleanup = TxnCleanup::None;
+    }
+
+    pub fn is_trigger_subprogram(&self) -> bool {
+        self.trigger.is_some()
     }
 }
 
