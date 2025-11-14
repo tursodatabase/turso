@@ -22,6 +22,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.RowId;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLXML;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -435,12 +436,14 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setAsciiStream(int parameterIndex, InputStream x, long length) throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setAsciiStream(parameterIndex, x, (int) length);
   }
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x, long length) throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setBinaryStream(parameterIndex, x, (int) length);
   }
 
   @Override
@@ -449,14 +452,60 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     // TODO
   }
 
+  private void requireLengthIsPositiveInt(long length) throws SQLFeatureNotSupportedException {
+    if (length > Integer.MAX_VALUE || length < 0) {
+      throw new SQLFeatureNotSupportedException(
+          "Data must have a length between 0 and Integer.MAX_VALUE");
+    }
+  }
+
   @Override
   public void setAsciiStream(int parameterIndex, InputStream x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    byte[] data = readBytes(x);
+    String ascii = new String(data, StandardCharsets.US_ASCII);
+    this.statement.bindText(parameterIndex, ascii);
   }
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (x == null) {
+      this.statement.bindNull(parameterIndex);
+      return;
+    }
+    byte[] data = readBytes(x);
+    this.statement.bindBlob(parameterIndex, data);
+  }
+
+  /**
+   * Reads all bytes from the given input stream.
+   *
+   * @param x the input stream to read
+   * @return a byte array containing the data
+   * @throws SQLException if an I/O error occurs while reading
+   */
+  private byte[] readBytes(InputStream x) throws SQLException {
+    try {
+      int firstByte = x.read();
+      if (firstByte == -1) {
+        return new byte[0];
+      }
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      baos.write(firstByte);
+      byte[] buffer = new byte[8192];
+      int bytesRead;
+      while ((bytesRead = x.read(buffer)) > 0) {
+        baos.write(buffer, 0, bytesRead);
+      }
+      return baos.toByteArray();
+    } catch (IOException e) {
+      throw new SQLException("Error reading InputStream", e);
+    }
   }
 
   @Override
