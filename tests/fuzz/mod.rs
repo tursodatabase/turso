@@ -651,16 +651,21 @@ mod fuzz_tests {
 
     #[test]
     #[allow(unused_assignments)]
-    pub fn fk_deferred_constraints_fuzz() {
+    pub fn fk_deferred_constraints_and_triggers_fuzz() {
+        let _ = tracing_subscriber::fmt::try_init();
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
-        println!("fk_deferred_constraints_fuzz seed: {seed}");
+        println!("fk_deferred_constraints_and_triggers_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!(
+                "fk_deferred_constraints_and_triggers_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
 
             let limbo_db = TempDatabase::new_empty();
             let sqlite_db = TempDatabase::new_empty();
@@ -755,6 +760,99 @@ mod fuzz_tests {
                     limbo_exec_rows(&limbo_db, &limbo, &stmt);
                     sqlite.execute(&stmt, params![]).unwrap();
                 }
+            }
+
+            // Add triggers on every outer iteration (max 2 triggers)
+            // Create a log table for trigger operations
+            let s = log_and_exec(
+                "CREATE TABLE trigger_log(action TEXT, table_name TEXT, id_val INT, extra_val INT)",
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Create a stats table for tracking operations
+            let s = log_and_exec("CREATE TABLE trigger_stats(op_type TEXT PRIMARY KEY, count INT)");
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Define all available trigger types
+            let trigger_definitions: Vec<&str> = vec![
+                // BEFORE INSERT trigger on parent - logs and potentially creates a child
+                "CREATE TRIGGER trig_parent_before_insert BEFORE INSERT ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'parent', NEW.id, NEW.a);
+                 INSERT INTO trigger_stats VALUES ('parent_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Sometimes create a deferred child referencing this parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 10000, NEW.id, NEW.a);
+                END",
+                // AFTER INSERT trigger on child_deferred - logs and updates parent
+                "CREATE TRIGGER trig_child_deferred_after_insert AFTER INSERT ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_INSERT', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column if parent exists
+                 UPDATE parent SET a = a + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE UPDATE OF 'a' on parent - logs and modifies the update
+                "CREATE TRIGGER trig_parent_before_update_a BEFORE UPDATE OF a ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_UPDATE_A', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_update_a', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Also update 'b' column when 'a' is updated
+                 UPDATE parent SET b = NEW.a * 2 WHERE id = NEW.id;
+                END",
+                // AFTER UPDATE OF 'pid' on child_deferred - logs and creates/updates related records
+                "CREATE TRIGGER trig_child_deferred_after_update_pid AFTER UPDATE OF pid ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_PID', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_update_pid', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create a child_immediate referencing the new parent
+                 INSERT INTO child_immediate VALUES (NEW.id + 20000, NEW.pid, NEW.x);
+                 -- Update parent's 'b' column
+                 UPDATE parent SET b = b + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE DELETE on parent - logs and cascades to children
+                "CREATE TRIGGER trig_parent_before_delete BEFORE DELETE ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_DELETE', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Delete all children that reference the deleted parent
+                 DELETE FROM child_deferred WHERE pid = OLD.id;
+                END",
+                // AFTER DELETE on child_deferred - logs and updates parent stats
+                "CREATE TRIGGER trig_child_deferred_after_delete AFTER DELETE ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_DELETE', 'child_deferred', OLD.id, OLD.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a - 1 WHERE id = OLD.pid;
+                END",
+                // BEFORE INSERT on child_immediate - logs, creates parent if needed, updates stats
+                "CREATE TRIGGER trig_child_immediate_before_insert BEFORE INSERT ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'child_immediate', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create parent if it doesn't exist (with a default value)
+                 INSERT OR IGNORE INTO parent VALUES (NEW.pid, NEW.y, NEW.y * 2);
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a + NEW.y WHERE id = NEW.pid;
+                END",
+                // AFTER UPDATE OF 'y' on child_immediate - logs and cascades updates
+                "CREATE TRIGGER trig_child_immediate_after_update_y AFTER UPDATE OF y ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_Y', 'child_immediate', NEW.id, NEW.y);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_update_y', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' based on the change
+                 UPDATE parent SET a = a + (NEW.y - OLD.y) WHERE id = NEW.pid;
+                 -- Also create a deferred child referencing the same parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 30000, NEW.pid, NEW.y);
+                END",
+            ];
+
+            // Randomly select up to 2 triggers from the list
+            let num_triggers = rng.random_range(1..=2);
+            let mut selected_indices = std::collections::HashSet::new();
+            while selected_indices.len() < num_triggers {
+                selected_indices.insert(rng.random_range(0..trigger_definitions.len()));
+            }
+
+            // Create the selected triggers
+            for &idx in selected_indices.iter() {
+                let s = log_and_exec(trigger_definitions[idx]);
+                limbo_exec_rows(&limbo_db, &limbo, &s);
+                sqlite.execute(&s, params![]).unwrap();
             }
 
             // Transaction-based mutations with mix of deferred and immediate operations
@@ -1856,16 +1954,128 @@ mod fuzz_tests {
             }
         }
     }
-
     #[test]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz() {
+        /// Format a nice diff between two result sets for better error messages
+        #[allow(clippy::too_many_arguments)]
+        fn format_rows_diff(
+            sqlite_rows: &[Vec<Value>],
+            limbo_rows: &[Vec<Value>],
+            seed: u64,
+            query: &str,
+            table_def: &str,
+            indexes: &[String],
+            trigger: Option<&String>,
+            dml_statements: &[String],
+        ) -> String {
+            let mut diff = String::new();
+            let sqlite_rows_len = sqlite_rows.len();
+            let limbo_rows_len = limbo_rows.len();
+            diff.push_str(&format!(
+            "\n\n=== Row Count Difference ===\nSQLite: {sqlite_rows_len} rows, Limbo: {limbo_rows_len} rows\n",
+        ));
+
+            // Find rows that differ at the same index
+            let max_len = sqlite_rows.len().max(limbo_rows.len());
+            let mut diff_indices = Vec::new();
+            for i in 0..max_len {
+                let sqlite_row = sqlite_rows.get(i);
+                let limbo_row = limbo_rows.get(i);
+                if sqlite_row != limbo_row {
+                    diff_indices.push(i);
+                }
+            }
+
+            if !diff_indices.is_empty() {
+                diff.push_str("\n=== Rows Differing at Same Index (showing first 10) ===\n");
+                for &idx in diff_indices.iter().take(10) {
+                    diff.push_str(&format!("\nIndex {idx}:\n"));
+                    if let Some(sqlite_row) = sqlite_rows.get(idx) {
+                        diff.push_str(&format!("  SQLite: {sqlite_row:?}\n"));
+                    } else {
+                        diff.push_str("  SQLite: <missing>\n");
+                    }
+                    if let Some(limbo_row) = limbo_rows.get(idx) {
+                        diff.push_str(&format!("  Limbo:  {limbo_row:?}\n"));
+                    } else {
+                        diff.push_str("  Limbo:  <missing>\n");
+                    }
+                }
+                if diff_indices.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more differences\n",
+                        diff_indices.len() - 10
+                    ));
+                }
+            }
+
+            // Find rows that are in one but not the other (using linear search since Value doesn't implement Hash)
+            let mut only_in_sqlite = Vec::new();
+            for sqlite_row in sqlite_rows.iter() {
+                if !limbo_rows.iter().any(|limbo_row| limbo_row == sqlite_row) {
+                    only_in_sqlite.push(sqlite_row);
+                }
+            }
+
+            let mut only_in_limbo = Vec::new();
+            for limbo_row in limbo_rows.iter() {
+                if !sqlite_rows.iter().any(|sqlite_row| sqlite_row == limbo_row) {
+                    only_in_limbo.push(limbo_row);
+                }
+            }
+
+            if !only_in_sqlite.is_empty() {
+                diff.push_str("\n=== Rows Only in SQLite (showing first 10) ===\n");
+                for row in only_in_sqlite.iter().take(10) {
+                    diff.push_str(&format!("  {row:?}\n"));
+                }
+                if only_in_sqlite.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more rows\n",
+                        only_in_sqlite.len() - 10
+                    ));
+                }
+            }
+
+            if !only_in_limbo.is_empty() {
+                diff.push_str("\n=== Rows Only in Limbo (showing first 10) ===\n");
+                for row in only_in_limbo.iter().take(10) {
+                    diff.push_str(&format!("  {row:?}\n"));
+                }
+                if only_in_limbo.len() > 10 {
+                    diff.push_str(&format!(
+                        "\n... and {} more rows\n",
+                        only_in_limbo.len() - 10
+                    ));
+                }
+            }
+
+            diff.push_str(&format!(
+                "\n=== Context ===\nSeed: {seed}\nQuery: {query}\n",
+            ));
+
+            diff.push_str("\n=== DDL/DML to Reproduce ===\n");
+            diff.push_str(&format!("{table_def};\n"));
+            for idx in indexes.iter() {
+                diff.push_str(&format!("{idx};\n"));
+            }
+            if let Some(trigger) = trigger {
+                diff.push_str(&format!("{trigger};\n"));
+            }
+            for dml in dml_statements.iter() {
+                diff.push_str(&format!("{dml};\n"));
+            }
+
+            diff
+        }
+
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("table_index_mutation_fuzz seed: {seed}");
 
-        const OUTER_ITERATIONS: usize = 100;
+        const OUTER_ITERATIONS: usize = 30;
         for i in 0..OUTER_ITERATIONS {
             println!(
                 "table_index_mutation_fuzz iteration {}/{}",
@@ -1926,8 +2136,16 @@ mod fuzz_tests {
                 sqlite_conn.execute(t, params![]).unwrap();
             }
 
+            let use_trigger = rng.random_bool(1.0);
+
             // Generate initial data
-            let num_inserts = rng.random_range(10..=1000);
+            // Triggers can cause quadratic complexity to the tested operations so limit total row count
+            // whenever we have one to make the test runtime reasonable.
+            let num_inserts = if use_trigger {
+                rng.random_range(10..=100)
+            } else {
+                rng.random_range(10..=1000)
+            };
             let mut tuples = HashSet::new();
             while tuples.len() < num_inserts {
                 tuples.insert(
@@ -1953,13 +2171,15 @@ mod fuzz_tests {
                 .map(|i| format!("c{i}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let insert_type = match rng.random_range(0..3) {
+                0 => "",
+                1 => "OR REPLACE",
+                2 => "OR IGNORE",
+                _ => unreachable!(),
+            };
             let insert = format!(
                 "INSERT {} INTO t ({}) VALUES {}",
-                if rng.random_bool(0.4) {
-                    "OR IGNORE"
-                } else {
-                    ""
-                },
+                insert_type,
                 col_names,
                 insert_values.join(", ")
             );
@@ -1969,6 +2189,145 @@ mod fuzz_tests {
             sqlite_conn.execute(&insert, params![]).unwrap();
             limbo_exec_rows(&limbo_db, &limbo_conn, &insert);
 
+            // Self-affecting triggers (e.g CREATE TRIGGER t BEFORE DELETE ON t BEGIN UPDATE t ... END) are
+            // an easy source of bugs, so create one some of the time.
+            let trigger = if use_trigger {
+                // Create a random trigger
+                let trigger_time = if rng.random_bool(0.5) {
+                    "BEFORE"
+                } else {
+                    "AFTER"
+                };
+                let trigger_event = match rng.random_range(0..3) {
+                    0 => "INSERT".to_string(),
+                    1 => {
+                        // Optionally specify columns for UPDATE trigger
+                        if rng.random_bool(0.5) {
+                            let update_col = rng.random_range(0..num_cols);
+                            format!("UPDATE OF c{update_col}")
+                        } else {
+                            "UPDATE".to_string()
+                        }
+                    }
+                    2 => "DELETE".to_string(),
+                    _ => unreachable!(),
+                };
+
+                // Determine if OLD/NEW references are available based on trigger event
+                let has_old =
+                    trigger_event.starts_with("UPDATE") || trigger_event.starts_with("DELETE");
+                let has_new =
+                    trigger_event.starts_with("UPDATE") || trigger_event.starts_with("INSERT");
+
+                // Generate trigger action (INSERT, UPDATE, or DELETE)
+                let trigger_action = match rng.random_range(0..3) {
+                    0 => {
+                        // INSERT action
+                        let values = (0..num_cols)
+                            .map(|i| {
+                                // Randomly use OLD/NEW values if available
+                                if has_old && rng.random_bool(0.3) {
+                                    format!("OLD.c{i}")
+                                } else if has_new && rng.random_bool(0.3) {
+                                    format!("NEW.c{i}")
+                                } else {
+                                    rng.random_range(0..1000).to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let insert_conflict_action = match rng.random_range(0..3) {
+                            0 => "",
+                            1 => " OR REPLACE",
+                            2 => " OR IGNORE",
+                            _ => unreachable!(),
+                        };
+                        format!(
+                            "INSERT{insert_conflict_action} INTO t ({col_names}) VALUES ({values})"
+                        )
+                    }
+                    1 => {
+                        // UPDATE action
+                        let update_col = rng.random_range(0..num_cols);
+                        let new_value = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            // Sometimes make it a function of the OLD column
+                            if rng.random_bool(0.5) {
+                                let operator = *["+", "-", "*"].choose(&mut rng).unwrap();
+                                let amount = rng.random_range(1..100);
+                                format!("OLD.c{ref_col} {operator} {amount}")
+                            } else {
+                                format!("OLD.c{ref_col}")
+                            }
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            // Sometimes make it a function of the NEW column
+                            if rng.random_bool(0.5) {
+                                let operator = *["+", "-", "*"].choose(&mut rng).unwrap();
+                                let amount = rng.random_range(1..100);
+                                format!("NEW.c{ref_col} {operator} {amount}")
+                            } else {
+                                format!("NEW.c{ref_col}")
+                            }
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        let op = match rng.random_range(0..=3) {
+                            0 => "<",
+                            1 => "<=",
+                            2 => ">",
+                            3 => ">=",
+                            _ => unreachable!(),
+                        };
+                        let threshold = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("OLD.c{ref_col}")
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("NEW.c{ref_col}")
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        format!("UPDATE t SET c{update_col} = {new_value} WHERE c{update_col} {op} {threshold}")
+                    }
+                    2 => {
+                        // DELETE action
+                        let delete_col = rng.random_range(0..num_cols);
+                        let op = match rng.random_range(0..=3) {
+                            0 => "<",
+                            1 => "<=",
+                            2 => ">",
+                            3 => ">=",
+                            _ => unreachable!(),
+                        };
+                        let threshold = if has_old && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("OLD.c{ref_col}")
+                        } else if has_new && rng.random_bool(0.3) {
+                            let ref_col = rng.random_range(0..num_cols);
+                            format!("NEW.c{ref_col}")
+                        } else {
+                            rng.random_range(0..1000).to_string()
+                        };
+                        format!("DELETE FROM t WHERE c{delete_col} {op} {threshold}")
+                    }
+                    _ => unreachable!(),
+                };
+
+                let create_trigger = format!(
+                    "CREATE TRIGGER test_trigger {trigger_time} {trigger_event} ON t BEGIN {trigger_action}; END;",
+                );
+
+                sqlite_conn.execute(&create_trigger, params![]).unwrap();
+                limbo_exec_rows(&limbo_db, &limbo_conn, &create_trigger);
+                Some(create_trigger)
+            } else {
+                None
+            };
+            if let Some(ref trigger) = trigger {
+                println!("{trigger};");
+            }
+
             const COMPARISONS: [&str; 3] = ["=", "<", ">"];
             const INNER_ITERATIONS: usize = 20;
 
@@ -1976,7 +2335,6 @@ mod fuzz_tests {
                 let do_update = rng.random_range(0..2) == 0;
 
                 let comparison = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
-                let affected_col = rng.random_range(0..num_cols);
                 let predicate_col = rng.random_range(0..num_cols);
                 let predicate_value = rng.random_range(0..1000);
 
@@ -2000,6 +2358,7 @@ mod fuzz_tests {
                 };
 
                 let query = if do_update {
+                    let affected_col = rng.random_range(0..num_cols);
                     let num_updates = rng.random_range(1..=num_cols);
                     let mut values = Vec::new();
                     for _ in 0..num_updates {
@@ -2048,16 +2407,28 @@ mod fuzz_tests {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &verify_query);
                 let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &verify_query);
 
-                assert_eq!(
-                    sqlite_rows, limbo_rows,
-                    "Different results after mutation! limbo: {limbo_rows:?}, sqlite: {sqlite_rows:?}, seed: {seed}, query: {query}",
-                );
+                if sqlite_rows != limbo_rows {
+                    let diff_msg = format_rows_diff(
+                        &sqlite_rows,
+                        &limbo_rows,
+                        seed,
+                        &query,
+                        &table_def,
+                        &indexes,
+                        trigger.as_ref(),
+                        &dml_statements,
+                    );
+                    panic!("Different results after mutation!{diff_msg}");
+                }
 
                 // Run integrity check on limbo db using rusqlite
                 if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
                     println!("{table_def};");
                     for t in indexes.iter() {
                         println!("{t};");
+                    }
+                    if let Some(trigger) = trigger {
+                        println!("{trigger};");
                     }
                     for t in dml_statements.iter() {
                         println!("{t};");

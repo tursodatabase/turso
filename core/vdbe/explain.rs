@@ -718,6 +718,23 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::Program {
+                params,
+                ..
+            } => (
+                "Program",
+                // First register that contains a param
+                params.first().map(|v| match v {
+                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1) as i32,
+                    _ => 0,
+                }).unwrap_or(0),
+                // Number of registers that contain params
+                params.len() as i32,
+                0,
+                Value::build_text(program.sql.clone()),
+                0,
+                format!("subprogram={}", program.sql),
+            ),
             Insn::Integer { value, dest } => (
                 "Integer",
                 *value as i32,
@@ -1406,6 +1423,15 @@ pub fn insn_to_row(
                 Value::build_text(table_name.clone()),
                 0,
                 format!("DROP TABLE {table_name}"),
+            ),
+            Insn::DropTrigger { db, trigger_name } => (
+                "DropTrigger",
+                *db as i32,
+                0,
+                0,
+                Value::build_text(trigger_name.clone()),
+                0,
+                format!("DROP TRIGGER {trigger_name}"),
             ),
             Insn::DropView { db, view_name } => (
                 "DropView",

@@ -41,6 +41,7 @@ pub mod numeric;
 mod numeric;
 
 use crate::index_method::IndexMethod;
+use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::pager::{AutoVacuumMode, HeaderRef};
@@ -642,6 +643,8 @@ impl Database {
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
+            compiling_triggers: RwLock::new(Vec::new()),
+            executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(None),
             encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
@@ -1167,6 +1170,11 @@ pub struct Connection {
     /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
     /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     nestedness: AtomicI32,
+    /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
+    compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
+    /// Stack of currently executing triggers to prevent recursive trigger execution
+    /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
+    executing_triggers: RwLock<Vec<Arc<Trigger>>>,
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
@@ -1211,6 +1219,52 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
+
+    /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
+    pub fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+        let compiling = self.compiling_triggers.read();
+        if let Some(trigger) = compiling.iter().find(|t| t.name == trigger.as_ref().name) {
+            tracing::debug!("Trigger is already compiling: {}", trigger.name);
+            return true;
+        }
+        false
+    }
+
+    pub fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
+        tracing::debug!("Starting trigger compilation: {}", trigger.name);
+        self.compiling_triggers.write().push(trigger.clone());
+    }
+
+    pub fn end_trigger_compilation(&self) {
+        tracing::debug!(
+            "Ending trigger compilation: {:?}",
+            self.compiling_triggers.read().last().map(|t| &t.name)
+        );
+        self.compiling_triggers.write().pop();
+    }
+
+    /// Check if a specific trigger is currently executing (for recursive trigger prevention)
+    pub fn is_trigger_executing(&self, trigger: impl AsRef<Trigger>) -> bool {
+        let executing = self.executing_triggers.read();
+        if let Some(trigger) = executing.iter().find(|t| t.name == trigger.as_ref().name) {
+            tracing::debug!("Trigger is already executing: {}", trigger.name);
+            return true;
+        }
+        false
+    }
+
+    pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
+        tracing::debug!("Starting trigger execution: {}", trigger.name);
+        self.executing_triggers.write().push(trigger.clone());
+    }
+
+    pub fn end_trigger_execution(&self) {
+        tracing::debug!(
+            "Ending trigger execution: {:?}",
+            self.executing_triggers.read().last().map(|t| &t.name)
+        );
+        self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_mvcc_bootstrap_connection() {
@@ -2053,6 +2107,10 @@ impl Connection {
         self.db.mvcc_enabled()
     }
 
+    pub fn mv_store(&self) -> Option<&Arc<MvStore>> {
+        self.db.mv_store.as_ref()
+    }
+
     /// Query the current value(s) of `pragma_name` associated to
     /// `pragma_value`.
     ///
@@ -2536,6 +2594,12 @@ pub struct Statement {
     busy_timeout: Option<BusyTimeout>,
 }
 
+impl std::fmt::Debug for Statement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statement").finish()
+    }
+}
+
 impl Drop for Statement {
     fn drop(&mut self) {
         self.reset();
@@ -2567,6 +2631,11 @@ impl Statement {
             busy_timeout: None,
         }
     }
+
+    pub fn get_trigger(&self) -> Option<Arc<Trigger>> {
+        self.program.trigger.clone()
+    }
+
     pub fn get_query_mode(&self) -> QueryMode {
         self.query_mode
     }
@@ -2881,12 +2950,8 @@ impl Statement {
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(
-            self.mv_store.as_ref(),
-            &self.pager,
-            None,
-            &mut self.state.auto_txn_cleanup,
-        );
+        self.program
+            .abort(self.mv_store.as_ref(), &self.pager, None, &mut self.state);
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_timeout = None;

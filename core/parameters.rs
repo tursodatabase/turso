@@ -93,6 +93,28 @@ impl Parameters {
                     }
                 }
             }
+            name if name.starts_with("__trigger_param_") => {
+                // Extract numeric index from __trigger_param_{idx}
+                let idx_str = &name["__trigger_param_".len()..];
+                let index: NonZero<usize> = idx_str
+                    .parse()
+                    .unwrap_or_else(|_| panic!("Invalid trigger parameter name: {name}"));
+                // Register as a named parameter so we can look it up later
+                if let Some(existing) = self
+                    .list
+                    .iter()
+                    .find(|p| matches!(p, Parameter::Named(n, _) if n == name))
+                {
+                    existing.index()
+                } else {
+                    if index >= self.next_index {
+                        self.next_index = index.checked_add(1).unwrap();
+                    }
+                    self.list.push(Parameter::Named(name.to_owned(), index));
+                    tracing::trace!("trigger parameter at {index} as {name}");
+                    index
+                }
+            }
             index => {
                 // SAFETY: Guaranteed from parser that the index is bigger than 0.
                 let index: NonZero<usize> = index.parse().unwrap();

@@ -10,8 +10,9 @@ use crate::{
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
     vdbe::affinity::Affinity,
-    Value,
+    Statement, Value,
 };
+use parking_lot::RwLock;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
@@ -530,6 +531,18 @@ pub enum Insn {
         can_fallthrough: bool,
     },
 
+    /// Invoke a trigger subprogram.
+    ///
+    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// "The Program opcode invokes the trigger subprogram. The Program instruction
+    /// allocates and initializes a fresh register set for each invocation of the
+    /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
+    /// is used by subprograms to access content in registers of the calling bytecode program."
+    Program {
+        params: Vec<Value>,
+        program: Arc<RwLock<Statement>>,
+    },
+
     /// Write an integer value into a register.
     Integer {
         value: i64,
@@ -980,6 +993,13 @@ pub enum Insn {
         //  The name of the index being dropped
         index: Arc<Index>,
     },
+    /// Drop a trigger
+    DropTrigger {
+        /// The database within which this trigger needs to be dropped (P1).
+        db: usize,
+        /// The name of the trigger being dropped
+        trigger_name: String,
+    },
 
     /// Close a cursor.
     Close {
@@ -1328,6 +1348,7 @@ impl InsnVariants {
             InsnVariants::Goto => execute::op_goto,
             InsnVariants::Gosub => execute::op_gosub,
             InsnVariants::Return => execute::op_return,
+            InsnVariants::Program => execute::op_program,
             InsnVariants::Integer => execute::op_integer,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
@@ -1384,6 +1405,7 @@ impl InsnVariants {
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
             InsnVariants::DropView => execute::op_drop_view,
+            InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
             InsnVariants::CollSeq => execute::op_coll_seq,

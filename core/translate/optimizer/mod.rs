@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -13,7 +13,7 @@ use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder};
+use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
@@ -27,6 +27,7 @@ use crate::{
             ColumnUsedMask, IndexMethodQuery, NonFromClauseSubquery, OuterQueryReference,
             QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
         },
+        trigger_exec::has_relevant_triggers_type_only,
     },
     types::SeekOp,
     util::{
@@ -118,6 +119,10 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(rowset_plan) = plan.rowset_plan.as_mut() {
+        optimize_select_plan(rowset_plan, schema)?;
+    }
+
     let _ = optimize_table_access(
         schema,
         &mut plan.result_columns,
@@ -161,14 +166,31 @@ fn optimize_update_plan(
 
     let table_ref = &mut plan.table_references.joined_tables_mut()[0];
 
-    // An ephemeral table is required if the UPDATE modifies any column that is present in the key of the
-    // btree used to iterate over the table.
-    // For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
-    // For index scans and seeks, this is any column in the index used.
+    // An ephemeral table is required if:
+    // 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
+    //    For regular table scans or seeks, this is just the rowid or the rowid alias column (INTEGER PRIMARY KEY)
+    //    For index scans and seeks, this is any column in the index used.
+    // 2. There are UPDATE triggers on the table. This is done in SQLite for all UPDATE triggers on
+    //    the affected table even if the trigger would not have an impact on the target table --
+    //    presumably due to lack of static analysis capabilities to determine whether it's safe
+    //    to skip the rowset materialization.
     let requires_ephemeral_table = 'requires: {
-        let Some(btree_table) = table_ref.table.btree() else {
+        let Some(btree_table_arc) = table_ref.table.btree() else {
             break 'requires false;
         };
+        let btree_table = btree_table_arc.as_ref();
+
+        // Check if there are UPDATE triggers
+        let updated_cols: HashSet<usize> = plan.set_clauses.iter().map(|(i, _)| *i).collect();
+        if has_relevant_triggers_type_only(
+            schema,
+            TriggerEvent::Update,
+            Some(&updated_cols),
+            btree_table,
+        ) {
+            break 'requires true;
+        }
+
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
                 accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
@@ -198,10 +220,11 @@ fn optimize_update_plan(
     add_ephemeral_table_to_update_plan(program, plan)
 }
 
-/// An ephemeral table is required if the UPDATE modifies any column that is present in the key of the
-/// btree used to iterate over the table.
-/// For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
-/// For index scans and seeks, the key is any column in the index used.
+/// An ephemeral table is required if:
+/// 1. The UPDATE modifies any column that is present in the key of the btree used to iterate over the table.
+///    For regular table scans or seeks, the key is the rowid or the rowid alias column (INTEGER PRIMARY KEY).
+///    For index scans and seeks, the key is any column in the index used.
+/// 2. There are UPDATE triggers on the table (SQLite always uses ephemeral tables when triggers exist).
 ///
 /// The ephemeral table will accumulate all the rowids of the rows that are affected by the UPDATE,
 /// and then the temp table will be iterated over and the actual row updates performed.
