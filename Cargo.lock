@@ -4895,6 +4895,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_common"
+version = "0.4.0-pre.1"
+dependencies = [
+ "either",
+ "miette",
+ "serde",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.16",
+ "turso_parser",
+ "uncased",
+]
+
+[[package]]
 name = "turso_core"
 version = "0.4.0-pre.1"
 dependencies = [

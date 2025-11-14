@@ -32,7 +32,8 @@ members = [
     "whopper",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
-    "perf/encryption"
+    "perf/encryption",
+    "common",
 ]
 exclude = [
     "perf/latency/limbo",
@@ -62,6 +63,7 @@ limbo_regexp = { path = "extensions/regexp", version = "0.4.0-pre.1" }
 limbo_uuid = { path = "extensions/uuid", version = "0.4.0-pre.1" }
 turso_parser = { path = "parser", version = "0.4.0-pre.1" }
 limbo_fuzzy = { path = "extensions/fuzzy", version = "0.4.0-pre.1" }
+turso_common = { path = "common", version = "0.4.0-pre.1" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
