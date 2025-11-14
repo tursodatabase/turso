@@ -1,4 +1,5 @@
 use thiserror::Error;
+use turso_common::schema::collate::CollateError;
 
 use crate::storage::page_cache::CacheError;
 
@@ -77,6 +78,14 @@ pub enum LimboError {
     InvalidBlobSize(usize),
     #[error("Planning error: {0}")]
     PlanningError(String),
+}
+
+impl From<CollateError> for LimboError {
+    fn from(value: CollateError) -> Self {
+        match value {
+            CollateError::NotFound(msg) => LimboError::ParseError(msg),
+        }
+    }
 }
 
 // We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper

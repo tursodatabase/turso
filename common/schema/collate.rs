@@ -18,10 +18,15 @@ pub enum CollationSeq {
     Rtrim = 3,
 }
 
+#[derive(Debug)]
+pub enum CollateError {
+    NotFound(String),
+}
+
 impl CollationSeq {
-    pub fn new(collation: &str) -> Result<Self, String> {
+    pub fn new(collation: &str) -> Result<Self, CollateError> {
         CollationSeq::from_str(collation)
-            .map_err(|_| format!("no such collation sequence: {collation}"))
+            .map_err(|_| CollateError::NotFound(format!("no such collation sequence: {collation}")))
     }
     #[inline]
     /// Returns the collation, defaulting to BINARY if unset

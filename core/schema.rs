@@ -90,9 +90,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::trace;
-use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
-};
+use turso_parser::ast::{self, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions};
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
     parser::Parser,
@@ -2061,64 +2059,6 @@ impl ResolvedFkRef {
             }
         }
         false
-    }
-}
-
-// TODO: This might replace some of util::columns_from_create_table_body
-impl From<&ColumnDefinition> for Column {
-    fn from(value: &ColumnDefinition) -> Self {
-        let name = value.col_name.as_str();
-
-        let mut default = None;
-        let mut notnull = false;
-        let mut primary_key = false;
-        let mut unique = false;
-        let mut collation = None;
-
-        for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
-            match constraint {
-                ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
-                ast::ColumnConstraint::NotNull { .. } => notnull = true,
-                ast::ColumnConstraint::Unique(..) => unique = true,
-                ast::ColumnConstraint::Default(expr) => {
-                    default
-                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
-                }
-                ast::ColumnConstraint::Collate { collation_name } => {
-                    collation.replace(
-                        CollationSeq::new(collation_name.as_str())
-                            .expect("collation should have been set correctly in create table"),
-                    );
-                }
-                _ => {}
-            };
-        }
-
-        let ty = match value.col_type {
-            Some(ref data_type) => type_from_name(&data_type.name).0,
-            None => Type::Null,
-        };
-
-        let ty_str = value
-            .col_type
-            .as_ref()
-            .map(|t| t.name.to_string())
-            .unwrap_or_default();
-
-        let hidden = ty_str.contains("HIDDEN");
-
-        Column::new(
-            Some(normalize_ident(name)),
-            ty_str,
-            default,
-            ty,
-            collation,
-            primary_key,
-            primary_key && matches!(ty, Type::Integer),
-            notnull,
-            unique,
-            hidden,
-        )
     }
 }
 

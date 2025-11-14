@@ -5,7 +5,7 @@ use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 
 use crate::{
     contains_ignore_ascii_case, eq_ignore_ascii_case,
-    schema::{affinity::Affinity, collation::CollationSeq},
+    schema::{affinity::Affinity, collate::CollationSeq},
     utils::normalize_ident,
 };
 

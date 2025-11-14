@@ -1,5 +1,5 @@
 pub mod affinity;
-pub mod collation;
+pub mod collate;
 pub mod column;
 
 #[macro_export]
