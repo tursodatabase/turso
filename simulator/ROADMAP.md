@@ -52,29 +52,71 @@ proposal on advancing the simulator in this area will be welcomed.
 
 ## Correctness
 
-- [ ] External property language: TODO
-- [ ] SQL with Contracts (SQL-C): TODO
-- [ ] SQLancer Properties: TODO
+- [ ] External property language: Currently, properties are hardcoded into the simulator as new variants that define
+how to generate a sequence of database interactions and assertions that will be used by the simulator for testing
+correctness properties defined in [#properties](#properties). There's a sketch of an external language for expressing
+properties using [*generation actions*](https://alperenkeles.com/documents/d4.pdf) in our previous paper submission.
+Ideally, we'll implement this language as a frontend for expressing properties, after which we'll be able to dynamically
+include/exclude certain properties, change them in small ways based on the requirements.
+- [ ] SQL with Contracts (SQL-C): There's a work-in-progress pull request ([https://github.com/tursodatabase/turso/pull/3715](https://github.com/tursodatabase/turso/pull/3715))
+for a SQL extension that includes inline bindings and assertions reasoning about dataframes. As this is done, the simulator will
+output SQL-C files, which can be consumed by any SQL-C executor, decoupling the generation/execution in the simulator.
+- [ ] SQLite as shadow state: Currently, we have a custom shadow state implementation that mimics Turso's behavior.
+Another approach would be to use SQLite as the shadow state, using SQLite to be the source of truth for the contents
+of the database. We can generally rely on this fact because Turso binary format is compatible with SQLite, but
+the ephemeral state that's in-process will be an issue.
 
 ### Properties
 
-- [ ] InsertValuesSelect: TODO
-- [ ] ReadYourUpdatesBack: TODO
-- [ ] TableHasExpectedContent: TODO
-- [ ] AllTableHaveExpectedContent: TODO
-- [ ] DoubleCreateFailure: TODO
-- [ ] SelectLimit: TODO
-- [ ] DeleteSelect: TODO
-- [ ] DropSelect: TODO
-- [ ] SelectSelectOptimizer: TODO
-- [ ] WhereTrueFalseNull: TODO
-- [ ] UNIONAllPreservesCardinality: TODO
-- [ ] FsyncNoWait: TODO
-- [ ] FaultyQuery: TODO
+There are a number of properties currently implemented. We implement existing properties from literature (mainly SQLancer),
+as well as bespoke properties that is specific and niche. We also have a number of properties that rely on fault injection,
+which is a unique feature of the simulator.
+
+#### SQLancer Properties
+
+SQLancer has a number of properties implemented for testing various database systems.
+We have ported some of them to the simulator, and we plan to port more in the future. The current list of
+ported properties is as follows:
+
+- [ ] InsertSelect: This property is a variation of the Pivoted Query Synthesis paper, where we first
+insert some values into the database, and try to read them back by crafting a SELECT query that should return
+the values.
+  - [x] `INSERT VALUES ...; SELECT ...:`: We can currently test inserting some literal values and reading them back.
+  - [ ] `INSERT SELECT ...; SELECT ...;`: We cannot test using the result of another SELECT for picking the inserted values.
+  - [ ] TODO: (there are other variants we currently do not support)
+- [x] SelectSelectOptimizer: This is another SQLancer-inspired property, where we check that `SELECT * from t WHERE p` is equivalent to
+`SELECT p from t` by asserting that the number of returned rows in the first one is equal to the number of `TRUE` values in the second one.
+The SQLancer version of this property is presented in [CERT: Finding Performance Issues in Database Systems Through
+the Lens of Cardinality Estimation](https://arxiv.org/pdf/2306.00355).
+- [x] WhereTrueFalseNull: This property relies on the three-valued logic of SQL, where `p OR (NOT P) OR (p IS NULL)` should always be `TRUE`.
+The SQLancer version of this property is presented in [Automatic Testing of Database Management Systems](https://arxiv.org/pdf/1801.10275).
+- [x] UNIONAllPreservesCardinality: TODO
+
+#### Bespoke Properties
+
+- [x] ReadYourUpdatesBack: This property is similar to InsertSelect, the main difference being we use UPDATE for changing some existing
+values in the database and then checking the result of the UPDATE.
+- [x] DeleteSelect: This property is similar to ReadYourUpdatesBack, the main difference being we use DELETE for removing some existing
+values in the database and then checking the result of the DELETE, mainly by checking that the deleted values are not present anymore.
+- [x] DropSelect: This is a failure property, where we drop a table and then check that any SELECT queries on the dropped table fail as expected.
+- [x] DoubleCreateFailure: This is a failure property, where we try to create a table that already exists and check that the operation fails as expected.
+- [x] SelectLimit: This property checks that the LIMIT clause in SELECT statements is respected by checking the cardinality of the returned results.
+
+#### Shadow State Properties
+
+These properties are invariants that check the consistency between Turso and the shadow state.
+
+- [x] TableHasExpectedContent: This property checks that a specific table in Turso has the same content as the shadow state.
+- [x] AllTableHaveExpectedContent: This property checks that all tables in Turso have the same content as the shadow state.
+
+#### Fault Injection Properties
+
+- [x] FsyncNoWait: TODO
+- [x] FaultyQuery: TODO
 
 ### Oracles
 
-- [ ] Default: TODO
+- [ ] Property: TODO
 - [ ] Differential: TODO
 - [ ] Doublecheck: TODO
 
