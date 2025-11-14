@@ -65,7 +65,7 @@ use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 /// ```
 ///
 /// constants used for the Turso page header in the encrypted dbs.
-const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
+pub const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
 const TURSO_VERSION: u8 = 0x00;
 const VERSION_OFFSET: usize = 5;
 const CIPHER_OFFSET: usize = 6;
