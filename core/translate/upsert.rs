@@ -10,6 +10,7 @@ use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::Connection;
@@ -23,7 +24,7 @@ use crate::{
         },
         expr::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            NoConstantOptReason, ReturningValueRegisters,
+            NoConstantOptReason,
         },
         insert::Insertion,
         plan::ResultSetColumn,
@@ -332,6 +333,7 @@ pub fn resolve_upsert_target(
 /// Semantics reference: https://sqlite.org/lang_upsert.html
 /// Column references in the DO UPDATE expressions refer to the original
 /// (unchanged) row. To refer to would-be inserted values, use `excluded.x`.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_upsert(
     program: &mut ProgramBuilder,
     table: &Table,
@@ -339,9 +341,10 @@ pub fn emit_upsert(
     insertion: &Insertion,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
+    table_references: &TableReferences,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -823,12 +826,14 @@ pub fn emit_upsert(
 
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
-        let regs = ReturningValueRegisters {
-            rowid_register: new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            columns_start_register: new_start,
-            num_columns: num_cols,
-        };
-        emit_returning_results(program, returning, &regs)?;
+        emit_returning_results(
+            program,
+            table_references,
+            returning,
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            resolver,
+        )?;
     }
 
     program.emit_insn(Insn::Goto {

@@ -13,13 +13,15 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    BindingBehavior, ReturningValueRegisters, WalkControl,
+    BindingBehavior, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
     open_read_index, open_read_table,
 };
-use crate::translate::plan::{ResultSetColumn, TableReferences};
+use crate::translate::plan::{
+    ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::upsert::{
     collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
@@ -94,7 +96,7 @@ pub struct InsertEmitCtx<'a> {
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
-    pub idx_cursors: Vec<(&'a String, i64, usize)>,
+    pub idx_cursors: Vec<(String, i64, usize)>,
 
     /// Context for if the insert values are materialized first
     /// into a temporary table
@@ -134,7 +136,7 @@ pub struct InsertEmitCtx<'a> {
 impl<'a> InsertEmitCtx<'a> {
     fn new(
         program: &mut ProgramBuilder,
-        resolver: &'a Resolver,
+        resolver: &Resolver,
         table: &'a Arc<BTreeTable>,
         on_conflict: Option<ResolveType>,
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
@@ -146,7 +148,7 @@ impl<'a> InsertEmitCtx<'a> {
         let mut idx_cursors = Vec::new();
         for idx in indices {
             idx_cursors.push((
-                &idx.name,
+                idx.name.clone(),
                 idx.root_page,
                 program.alloc_cursor_index(None, idx)?,
             ));
@@ -181,7 +183,7 @@ impl<'a> InsertEmitCtx<'a> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     on_conflict: Option<ResolveType>,
     tbl_name: QualifiedName,
     columns: Vec<ast::Name>,
@@ -240,14 +242,26 @@ pub fn translate_insert(
 
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
 
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            table: Table::BTree(
+                table
+                    .btree()
+                    .expect("we shouldn't have got here without a BTree table"),
+            ),
+            identifier: table_name.to_string(),
+            internal_id: program.table_reference_counter.next(),
+            op: Operation::default_scan_for(&table),
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            database_id: 0,
+        }],
+        vec![],
+    );
+
     // Process RETURNING clause using shared module
-    let (mut result_columns, _) = process_returning_clause(
-        &mut returning,
-        &table,
-        table_name.as_str(),
-        &mut program,
-        connection,
-    )?;
+    let mut result_columns =
+        process_returning_clause(&mut returning, &mut table_references, connection)?;
     let has_fks = fk_enabled
         && (resolver.schema.has_child_fks(table_name.as_str())
             || resolver
@@ -460,32 +474,37 @@ pub fn translate_insert(
 
     // Emit RETURNING results if specified
     if !result_columns.is_empty() {
-        let value_registers = ReturningValueRegisters {
-            rowid_register: insertion.key_register(),
-            columns_start_register: insertion.first_col_register(),
-            num_columns: table.columns().len(),
-        };
-
-        emit_returning_results(&mut program, &result_columns, &value_registers)?;
+        emit_returning_results(
+            &mut program,
+            &table_references,
+            &result_columns,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+        )?;
     }
     program.emit_insn(Insn::Goto {
         target_pc: ctx.row_done_label,
     });
-
-    resolve_upserts(
-        &mut program,
-        resolver,
-        &mut upsert_actions,
-        &ctx,
-        &insertion,
-        &table,
-        &mut result_columns,
-        connection,
-    )?;
+    if !upsert_actions.is_empty() {
+        resolve_upserts(
+            &mut program,
+            resolver,
+            &mut upsert_actions,
+            &ctx,
+            &insertion,
+            &table,
+            &mut result_columns,
+            connection,
+            &table_references,
+        )?;
+    }
 
     emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
 
     program.set_needs_stmt_subtransactions(true);
+    program.result_columns = result_columns;
+    program.table_references.extend(table_references);
     Ok(program)
 }
 
@@ -544,7 +563,7 @@ fn emit_commit_phase(
         let idx_cursor_id = ctx
             .idx_cursors
             .iter()
-            .find(|(name, _, _)| *name == &index.name)
+            .find(|(name, _, _)| name == &index.name)
             .map(|(_, _, c_id)| *c_id)
             .expect("no cursor found for index");
 
@@ -739,13 +758,14 @@ fn emit_rowid_generation(
 #[allow(clippy::too_many_arguments)]
 fn resolve_upserts(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     upsert_actions: &mut [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     table: &Table,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
+    table_references: &TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -768,6 +788,7 @@ fn resolve_upserts(
                 resolver,
                 result_columns,
                 connection,
+                table_references,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1708,7 +1729,7 @@ fn emit_preflight_constraint_checks(
                 let idx_cursor_id = ctx
                     .idx_cursors
                     .iter()
-                    .find(|(name, _, _)| *name == &index.name)
+                    .find(|(name, _, _)| name == &index.name)
                     .map(|(_, _, c_id)| *c_id)
                     .expect("no cursor found for index");
 
