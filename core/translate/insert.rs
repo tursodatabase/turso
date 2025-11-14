@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use turso_common::schema::affinity::Affinity;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, Upsert, UpsertDo,
 };
@@ -27,7 +28,7 @@ use crate::translate::upsert::{
     collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
 };
 use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
+
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;

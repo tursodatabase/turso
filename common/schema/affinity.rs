@@ -1,7 +1,7 @@
 use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::value::{AsValueRef, Value, ValueRef};
 
 /// # SQLite Column Type Affinities
 ///

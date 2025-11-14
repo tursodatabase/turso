@@ -9,11 +9,11 @@ use crate::{
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
-    vdbe::affinity::Affinity,
     Value,
 };
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
+use turso_common::schema::affinity::Affinity;
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
 

@@ -1,0 +1,25 @@
+[package]
+name = "turso_common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["json"]
+serde = ["dep:serde"]
+json = []
+
+[dependencies]
+either.workspace = true
+miette.workspace = true
+serde = { workspace = true, optional = true }
+strum.workspace = true
+strum_macros.workspace = true
+thiserror.workspace = true
+turso_parser.workspace = true
+uncased = "0.9.10"
