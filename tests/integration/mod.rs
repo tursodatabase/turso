@@ -5,6 +5,7 @@ mod index_method;
 mod pragma;
 mod query_processing;
 mod storage;
+mod trigger;
 mod wal;
 
 #[cfg(test)]

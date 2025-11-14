@@ -1,7 +1,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use turso_parser::ast::{
-    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, Upsert, UpsertDo,
+    self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
+    TriggerTime, Upsert, UpsertDo,
 };
 
 use crate::error::{
@@ -44,6 +45,7 @@ use super::emitter::Resolver;
 use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 use super::plan::QueryDestination;
 use super::select::translate_select;
+use super::trigger_exec::{fire_triggers, has_relevant_triggers, TriggerContext};
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
@@ -311,6 +313,36 @@ pub fn translate_insert(
         init_autoincrement(&mut program, &mut ctx, resolver)?;
     }
 
+    // Fire BEFORE INSERT triggers
+    // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
+    let new_registers: Vec<usize> = insertion
+        .col_mappings
+        .iter()
+        .map(|col_mapping| {
+            if col_mapping.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                col_mapping.register
+            }
+        })
+        .collect();
+    let trigger_ctx = TriggerContext::new(
+        btree_table.clone(),
+        Some(new_registers),
+        None, // No OLD for INSERT
+        insertion.key_register(),
+    );
+    let must_seek = fire_triggers(
+        &mut program,
+        resolver,
+        table_name.as_str(),
+        TriggerEvent::Insert,
+        TriggerTime::Before,
+        &trigger_ctx,
+        connection,
+        None, // INSERT doesn't update columns
+    )?;
+
     if has_user_provided_rowid {
         let must_be_int_label = program.allocate_label();
 
@@ -405,9 +437,43 @@ pub fn translate_insert(
         cursor: ctx.cursor_id,
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
-        flag: InsertFlags::new(),
+        flag: if must_seek {
+            InsertFlags::new().require_seek()
+        } else {
+            InsertFlags::new()
+        },
         table_name: table_name.to_string(),
     });
+
+    // Fire AFTER INSERT triggers
+    // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
+    let new_registers_after: Vec<usize> = insertion
+        .col_mappings
+        .iter()
+        .map(|col_mapping| {
+            if col_mapping.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                col_mapping.register
+            }
+        })
+        .collect();
+    let trigger_ctx_after = TriggerContext::new(
+        btree_table.clone(),
+        Some(new_registers_after),
+        None,
+        insertion.key_register(),
+    );
+    fire_triggers(
+        &mut program,
+        resolver,
+        table_name.as_str(),
+        TriggerEvent::Insert,
+        TriggerTime::After,
+        &trigger_ctx_after,
+        connection,
+        None, // INSERT doesn't update columns
+    )?;
 
     if has_fks {
         // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
@@ -996,6 +1062,7 @@ fn bind_insert(
     }
     match on_conflict {
         ResolveType::Ignore => {
+            program.set_resolve_type(ResolveType::Ignore);
             upsert.replace(Box::new(ast::Upsert {
                 do_clause: UpsertDo::Nothing,
                 index: None,
@@ -1092,6 +1159,14 @@ fn init_source_emission<'a>(
             );
         }
     }
+    // Check if INSERT triggers exist - if so, we need to use ephemeral table for VALUES with more than one row
+    let has_insert_triggers = has_relevant_triggers(
+        resolver.schema,
+        TriggerEvent::Insert,
+        None,
+        ctx.table.as_ref(),
+    );
+
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
             // Simple common case of INSERT INTO <table> VALUES (...) without compounds.
@@ -1145,7 +1220,7 @@ fn init_source_emission<'a>(
                  ** of the tables being read by the SELECT statement.  Also use a
                  ** temp table in the case of row triggers.
                  */
-                if program.is_table_open(table) {
+                if program.is_table_open(table) || has_insert_triggers {
                     let temp_cursor_id =
                         program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
                     ctx.temp_table_ctx = Some(TempTableCtx {

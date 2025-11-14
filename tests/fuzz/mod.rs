@@ -651,16 +651,21 @@ mod fuzz_tests {
 
     #[test]
     #[allow(unused_assignments)]
-    pub fn fk_deferred_constraints_fuzz() {
+    pub fn fk_deferred_constraints_and_triggers_fuzz() {
+        let _ = tracing_subscriber::fmt::try_init();
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
-        println!("fk_deferred_constraints_fuzz seed: {seed}");
+        println!("fk_deferred_constraints_and_triggers_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_deferred_constraints_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!(
+                "fk_deferred_constraints_and_triggers_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
 
             let limbo_db = TempDatabase::new_empty();
             let sqlite_db = TempDatabase::new_empty();
@@ -755,6 +760,99 @@ mod fuzz_tests {
                     limbo_exec_rows(&limbo_db, &limbo, &stmt);
                     sqlite.execute(&stmt, params![]).unwrap();
                 }
+            }
+
+            // Add triggers on every outer iteration (max 2 triggers)
+            // Create a log table for trigger operations
+            let s = log_and_exec(
+                "CREATE TABLE trigger_log(action TEXT, table_name TEXT, id_val INT, extra_val INT)",
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Create a stats table for tracking operations
+            let s = log_and_exec("CREATE TABLE trigger_stats(op_type TEXT PRIMARY KEY, count INT)");
+            limbo_exec_rows(&limbo_db, &limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Define all available trigger types
+            let trigger_definitions: Vec<&str> = vec![
+                // BEFORE INSERT trigger on parent - logs and potentially creates a child
+                "CREATE TRIGGER trig_parent_before_insert BEFORE INSERT ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'parent', NEW.id, NEW.a);
+                 INSERT INTO trigger_stats VALUES ('parent_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Sometimes create a deferred child referencing this parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 10000, NEW.id, NEW.a);
+                END",
+                // AFTER INSERT trigger on child_deferred - logs and updates parent
+                "CREATE TRIGGER trig_child_deferred_after_insert AFTER INSERT ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_INSERT', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column if parent exists
+                 UPDATE parent SET a = a + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE UPDATE OF 'a' on parent - logs and modifies the update
+                "CREATE TRIGGER trig_parent_before_update_a BEFORE UPDATE OF a ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_UPDATE_A', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_update_a', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Also update 'b' column when 'a' is updated
+                 UPDATE parent SET b = NEW.a * 2 WHERE id = NEW.id;
+                END",
+                // AFTER UPDATE OF 'pid' on child_deferred - logs and creates/updates related records
+                "CREATE TRIGGER trig_child_deferred_after_update_pid AFTER UPDATE OF pid ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_PID', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_update_pid', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create a child_immediate referencing the new parent
+                 INSERT INTO child_immediate VALUES (NEW.id + 20000, NEW.pid, NEW.x);
+                 -- Update parent's 'b' column
+                 UPDATE parent SET b = b + 1 WHERE id = NEW.pid;
+                END",
+                // BEFORE DELETE on parent - logs and cascades to children
+                "CREATE TRIGGER trig_parent_before_delete BEFORE DELETE ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_DELETE', 'parent', OLD.id, OLD.a);
+                 INSERT INTO trigger_stats VALUES ('parent_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Delete all children that reference the deleted parent
+                 DELETE FROM child_deferred WHERE pid = OLD.id;
+                END",
+                // AFTER DELETE on child_deferred - logs and updates parent stats
+                "CREATE TRIGGER trig_child_deferred_after_delete AFTER DELETE ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_DELETE', 'child_deferred', OLD.id, OLD.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a - 1 WHERE id = OLD.pid;
+                END",
+                // BEFORE INSERT on child_immediate - logs, creates parent if needed, updates stats
+                "CREATE TRIGGER trig_child_immediate_before_insert BEFORE INSERT ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_INSERT', 'child_immediate', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Create parent if it doesn't exist (with a default value)
+                 INSERT OR IGNORE INTO parent VALUES (NEW.pid, NEW.y, NEW.y * 2);
+                 -- Update parent's 'a' column
+                 UPDATE parent SET a = a + NEW.y WHERE id = NEW.pid;
+                END",
+                // AFTER UPDATE OF 'y' on child_immediate - logs and cascades updates
+                "CREATE TRIGGER trig_child_immediate_after_update_y AFTER UPDATE OF y ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_UPDATE_Y', 'child_immediate', NEW.id, NEW.y);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_update_y', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Update parent's 'a' based on the change
+                 UPDATE parent SET a = a + (NEW.y - OLD.y) WHERE id = NEW.pid;
+                 -- Also create a deferred child referencing the same parent
+                 INSERT INTO child_deferred VALUES (NEW.id + 30000, NEW.pid, NEW.y);
+                END",
+            ];
+
+            // Randomly select up to 2 triggers from the list
+            let num_triggers = rng.random_range(1..=2);
+            let mut selected_indices = std::collections::HashSet::new();
+            while selected_indices.len() < num_triggers {
+                selected_indices.insert(rng.random_range(0..trigger_definitions.len()));
+            }
+
+            // Create the selected triggers
+            for &idx in selected_indices.iter() {
+                let s = log_and_exec(trigger_definitions[idx]);
+                limbo_exec_rows(&limbo_db, &limbo, &s);
+                sqlite.execute(&s, params![]).unwrap();
             }
 
             // Transaction-based mutations with mix of deferred and immediate operations

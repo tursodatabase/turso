@@ -34,6 +34,9 @@ pub fn emit_values(
         QueryDestination::RowValueSubqueryResult { .. } => {
             emit_toplevel_values(program, plan, t_ctx)?
         }
+        QueryDestination::RowSet { .. } => {
+            unreachable!("RowSet query destination should not be used in values emission")
+        }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     };
     Ok(reg_result_cols_start)
@@ -211,6 +214,9 @@ fn emit_values_to_destination(
                 dst_reg: *result_reg_start,
                 extra_amount: num_regs - 1,
             });
+        }
+        QueryDestination::RowSet { .. } => {
+            unreachable!("RowSet query destination should not be used in values emission")
         }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }

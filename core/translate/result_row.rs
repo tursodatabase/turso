@@ -160,6 +160,18 @@ pub fn emit_result_row_and_limit(
                 extra_amount: num_regs - 1,
             });
         }
+        QueryDestination::RowSet { rowset_reg } => {
+            // For RowSet, we add the rowid (which should be the only result column) to the RowSet
+            assert_eq!(
+                plan.result_columns.len(),
+                1,
+                "RowSet should only have one result column (rowid)"
+            );
+            program.emit_insn(Insn::RowSetAdd {
+                rowset_reg: *rowset_reg,
+                value_reg: result_columns_start_reg,
+            });
+        }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
 

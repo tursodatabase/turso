@@ -718,6 +718,18 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::Program {
+                params,
+                ..
+            } => (
+                "Program",
+                params.len() as i32,
+                0,
+                0,
+                Value::build_text(program.sql.clone()),
+                0,
+                format!("subprogram={}", program.sql),
+            ),
             Insn::Integer { value, dest } => (
                 "Integer",
                 *value as i32,
