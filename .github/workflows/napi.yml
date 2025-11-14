@@ -57,6 +57,14 @@ jobs:
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
+          - host: macos-13
+            target: x86_64-apple-darwin
+            artifact: db-bindings-x86_64-apple-darwin
+            build: yarn workspace @tursodatabase/database napi-build --target x86_64-apple-darwin
+          - host: macos-13
+            target: x86_64-apple-darwin
+            artifact: sync-bindings-x86_64-apple-darwin
+            build: yarn workspace @tursodatabase/sync napi-build --target x86_64-apple-darwin
           - host: blacksmith-2vcpu-ubuntu-2404-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
