@@ -1,6 +1,6 @@
 pub use turso_common::value::{
-    sqlite_int_float_compare, AsValueRef, Extendable, Text, TextRef, TextSubtype, Value, ValueRef,
-    ValueType,
+    sqlite_int_float_compare, AsValueRef, Extendable, FromValue, Text, TextRef, TextSubtype, Value,
+    ValueRef, ValueType,
 };
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
@@ -292,7 +292,7 @@ impl ImmutableRecord {
         let mut serial_type_buf = [0; 9];
         // write serial types
         for value in values.clone() {
-            let serial_type = SerialType::from(value.as_value_ref());
+            let serial_type = SerialType::from_value(value);
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
             serials.push((serial_type_buf, n));
 
@@ -325,7 +325,7 @@ impl ImmutableRecord {
             match value {
                 ValueRef::Null => {}
                 ValueRef::Integer(i) => {
-                    let serial_type = SerialType::from(value);
+                    let serial_type = SerialType::from_value(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
                         SerialTypeKind::I8 => writer.extend_from_slice(&(i as i8).to_be_bytes()),
@@ -1417,10 +1417,8 @@ impl SerialType {
             SerialTypeKind::Blob => (self.0 as usize - 12) / 2,
         }
     }
-}
 
-impl<T: AsValueRef> From<T> for SerialType {
-    fn from(value: T) -> Self {
+    pub fn from_value(value: impl AsValueRef) -> Self {
         let value = value.as_value_ref();
         match value {
             ValueRef::Null => SerialType::null(),
@@ -1499,7 +1497,7 @@ impl Record {
 
         // write serial types
         for value in &self.values {
-            let serial_type = SerialType::from(value);
+            let serial_type = SerialType::from_value(value);
             buf.resize(buf.len() + 9, 0); // Ensure space for varint (1-9 bytes in length)
             let len = buf.len();
             let n = write_varint(&mut buf[len - 9..], serial_type.into());
@@ -1512,7 +1510,7 @@ impl Record {
             match value {
                 Value::Null => {}
                 Value::Integer(i) => {
-                    let serial_type = SerialType::from(value);
+                    let serial_type = SerialType::from_value(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
                         SerialTypeKind::I8 => buf.extend_from_slice(&(*i as i8).to_be_bytes()),

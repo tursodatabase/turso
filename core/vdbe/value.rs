@@ -99,7 +99,7 @@ impl From<SeekOp> for ComparisonOp {
     }
 }
 
-enum TrimType {
+pub enum TrimType {
     All,
     Left,
     Right,
