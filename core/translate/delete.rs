@@ -1,5 +1,6 @@
 use crate::schema::{Schema, Table};
 use crate::translate::emitter::{emit_program, Resolver};
+use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{DeletePlan, Operation, Plan};
 use crate::translate::planner::{parse_limit, parse_where};
@@ -36,22 +37,13 @@ pub fn translate_delete(
         );
     }
 
-    // FIXME: SQLite's DELETE ... RETURNING reads the table's rowids into a RowSet first,
-    // and only after that it opens the table for writing and deletes the rows. It uses
-    // a couple of instructions that we already implement (i.e.: RowSetAdd, RowSetRead,
-    // RowSetTest), but for now we don't have an implementation of DELETE ... RETURNING.
-    if !returning.is_empty() {
-        crate::bail_parse_error!("RETURNING currently not implemented for DELETE statements.");
-    }
-    let result_columns = vec![];
-
     let mut delete_plan = prepare_delete_plan(
         &mut program,
         resolver.schema,
         tbl_name,
         where_clause,
         limit,
-        result_columns,
+        returning,
         connection,
     )?;
     optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
@@ -74,7 +66,7 @@ pub fn prepare_delete_plan(
     tbl_name: String,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
-    result_columns: Vec<super::plan::ResultSetColumn>,
+    mut returning: Vec<ResultColumn>,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
     let table = match schema.get_table(&tbl_name) {
@@ -130,6 +122,9 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         connection,
     )?;
+
+    let result_columns =
+        process_returning_clause(&mut returning, &mut table_references, connection)?;
 
     // Parse the LIMIT/OFFSET clause
     let (resolved_limit, resolved_offset) =
