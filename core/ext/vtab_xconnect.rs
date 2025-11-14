@@ -1,4 +1,7 @@
-use crate::{types::Value, Connection, Statement, StepResult};
+use crate::{
+    types::{FromExtValue, ToExtValue, Value},
+    Connection, Statement, StepResult,
+};
 use std::{
     boxed::Box,
     ffi::{c_char, c_void, CStr, CString},
