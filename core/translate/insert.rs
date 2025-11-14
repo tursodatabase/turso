@@ -1446,7 +1446,9 @@ fn build_insertion<'a>(
                         register: rowid_register,
                     });
                 } else {
-                    column_mappings[idx_in_table].value_index = Some(value_index);
+                    if column_mappings[idx_in_table].value_index.is_none() {
+                        column_mappings[idx_in_table].value_index = Some(value_index);
+                    }
                 }
             } else if ROWID_STRS
                 .iter()
