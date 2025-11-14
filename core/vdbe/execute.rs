@@ -6690,6 +6690,17 @@ pub fn op_idx_insert(
         *insn
     );
 
+    // remove this after getting sanity, before merging
+    let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+    if let CursorType::BTreeIndex(index_meta) = cursor_type {
+        tracing::debug!(
+            "Executing OP_IdxInsert: cursor={}, index='{}', record_reg={}",
+            cursor_id,
+            index_meta.name,
+            record_reg
+        );
+    }
+
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
             return Err(LimboError::InternalError(
