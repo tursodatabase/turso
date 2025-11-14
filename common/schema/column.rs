@@ -1,8 +1,13 @@
 use core::fmt;
 
-use turso_parser::ast::Expr;
+use turso_macros::match_ignore_ascii_case;
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 
-use crate::schema::{affinity::Affinity, collation::CollationSeq};
+use crate::{
+    contains_ignore_ascii_case, eq_ignore_ascii_case,
+    schema::{affinity::Affinity, collation::CollationSeq},
+    utils::normalize_ident,
+};
 
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -197,6 +202,64 @@ impl Column {
     }
 }
 
+// TODO: This might replace some of util::columns_from_create_table_body
+impl From<&ColumnDefinition> for Column {
+    fn from(value: &ColumnDefinition) -> Self {
+        let name = value.col_name.as_str();
+
+        let mut default = None;
+        let mut notnull = false;
+        let mut primary_key = false;
+        let mut unique = false;
+        let mut collation = None;
+
+        for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
+            match constraint {
+                ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
+                ast::ColumnConstraint::NotNull { .. } => notnull = true,
+                ast::ColumnConstraint::Unique(..) => unique = true,
+                ast::ColumnConstraint::Default(expr) => {
+                    default
+                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
+                }
+                ast::ColumnConstraint::Collate { collation_name } => {
+                    collation.replace(
+                        CollationSeq::new(collation_name.as_str())
+                            .expect("collation should have been set correctly in create table"),
+                    );
+                }
+                _ => {}
+            };
+        }
+
+        let ty = match value.col_type {
+            Some(ref data_type) => type_from_name(&data_type.name).0,
+            None => Type::Null,
+        };
+
+        let ty_str = value
+            .col_type
+            .as_ref()
+            .map(|t| t.name.to_string())
+            .unwrap_or_default();
+
+        let hidden = ty_str.contains("HIDDEN");
+
+        Column::new(
+            Some(normalize_ident(name)),
+            ty_str,
+            default,
+            ty,
+            collation,
+            primary_key,
+            primary_key && matches!(ty, Type::Integer),
+            notnull,
+            unique,
+            hidden,
+        )
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
@@ -235,4 +298,41 @@ impl fmt::Display for Type {
         };
         write!(f, "{s}")
     }
+}
+
+pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
+    match expr {
+        Expr::Name(name) => Some(Box::new(Expr::Literal(Literal::String(name.as_literal())))),
+        _ => None,
+    }
+}
+
+// this function returns the affinity type and whether the type name was exactly "INTEGER"
+// https://www.sqlite.org/datatype3.html
+pub fn type_from_name(type_name: &str) -> (Type, bool) {
+    let type_name = type_name.as_bytes();
+    if type_name.is_empty() {
+        return (Type::Blob, false);
+    }
+
+    if eq_ignore_ascii_case!(type_name, b"INTEGER") {
+        return (Type::Integer, true);
+    }
+
+    if contains_ignore_ascii_case!(type_name, b"INT") {
+        return (Type::Integer, false);
+    }
+
+    if let Some(ty) = type_name.windows(4).find_map(|s| {
+        match_ignore_ascii_case!(match s {
+            b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
+            b"BLOB" => Some(Type::Blob),
+            b"REAL" | b"FLOA" | b"DOUB" => Some(Type::Real),
+            _ => None,
+        })
+    }) {
+        return (ty, false);
+    }
+
+    (Type::Numeric, false)
 }

@@ -4904,6 +4904,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "thiserror 2.0.16",
+ "turso_macros",
  "turso_parser",
  "uncased",
 ]

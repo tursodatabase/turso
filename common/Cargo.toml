@@ -21,5 +21,6 @@ serde = { workspace = true, optional = true }
 strum.workspace = true
 strum_macros.workspace = true
 thiserror.workspace = true
+turso_macros.workspace = true
 turso_parser.workspace = true
 uncased = "0.9.10"
