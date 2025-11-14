@@ -4,8 +4,8 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
-use crate::vdbe::affinity::Affinity;
 use parking_lot::RwLock;
+use turso_common::schema::affinity::Affinity;
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]

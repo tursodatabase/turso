@@ -20,7 +20,6 @@ use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
-use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
@@ -47,6 +46,9 @@ use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
     sync::{atomic::Ordering, Arc, Mutex},
+};
+use turso_common::schema::affinity::{
+    apply_numeric_affinity, try_for_float, Affinity, ParsedNumber,
 };
 use turso_macros::match_ignore_ascii_case;
 

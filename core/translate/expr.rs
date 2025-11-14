@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
+use turso_common::schema::affinity::Affinity;
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 
 use super::emitter::Resolver;
@@ -15,7 +16,7 @@ use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
-use crate::vdbe::affinity::Affinity;
+
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::{
     builder::ProgramBuilder,

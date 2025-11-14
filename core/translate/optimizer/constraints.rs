@@ -13,9 +13,9 @@ use crate::{
         planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
-    vdbe::affinity::Affinity,
     Result,
 };
+use turso_common::schema::affinity::Affinity;
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 

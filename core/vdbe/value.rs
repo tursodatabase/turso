@@ -1,13 +1,12 @@
-use std::collections::HashMap;
-
 use regex::{Regex, RegexBuilder};
+use std::collections::HashMap;
+use turso_common::schema::affinity::Affinity;
 
 use crate::{
     function::MathFunc,
     numeric::{NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
-    vdbe::affinity::Affinity,
     LimboError, Result, Value, ValueRef,
 };
 

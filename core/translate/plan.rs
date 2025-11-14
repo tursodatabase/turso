@@ -1,4 +1,5 @@
 use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
+use turso_common::schema::affinity::Affinity;
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
 };
@@ -11,7 +12,6 @@ use crate::{
         optimizer::constraints::SeekRangeConstraint,
     },
     vdbe::{
-        affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
         BranchOffset, CursorID,
