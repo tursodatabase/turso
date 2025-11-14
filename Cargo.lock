@@ -4962,6 +4962,7 @@ dependencies = [
  "test-log",
  "thiserror 2.0.16",
  "tracing",
+ "turso_common",
  "turso_ext",
  "turso_macros",
  "turso_parser",

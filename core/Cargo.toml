@@ -86,6 +86,7 @@ simsimd = "6.5.3"
 arc-swap = "1.7"
 rustc-hash = "2.0"
 either = { workspace = true }
+turso_common = { workspace = true, features = ["serde"] }
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }
