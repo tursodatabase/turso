@@ -35,10 +35,10 @@ pub mod vector;
 mod vtab;
 
 #[cfg(feature = "fuzz")]
-pub mod numeric;
+pub use turso_common::numeric;
 
 #[cfg(not(feature = "fuzz"))]
-mod numeric;
+use turso_common::numeric;
 
 use crate::index_method::IndexMethod;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
