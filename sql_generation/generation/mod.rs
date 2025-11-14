@@ -184,6 +184,7 @@ pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
     }
 }
 
+//FIXME this can hang if count > items.len() or if there are duplicates
 pub fn pick_unique<'a, T: PartialEq, R: Rng + ?Sized>(
     items: &'a [T],
     count: usize,

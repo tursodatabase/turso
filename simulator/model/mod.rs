@@ -3,8 +3,8 @@ use std::fmt::Display;
 use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
@@ -237,7 +237,7 @@ impl From<QueryDiscriminants> for QueryCapabilities {
 }
 
 impl QueryDiscriminants {
-    pub const ALL_NO_TRANSACTION: &[QueryDiscriminants] = &[
+    pub const ALL_NO_TRANSACTION: &'_ [QueryDiscriminants] = &[
         QueryDiscriminants::Select,
         QueryDiscriminants::Create,
         QueryDiscriminants::Insert,
@@ -323,6 +323,7 @@ impl Shadow for Drop {
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
+    //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
@@ -355,14 +356,30 @@ impl Shadow for Insert {
 impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let first_table = tables
-            .iter()
-            .find(|t| t.name == self.table)
-            .context("Table not found")?;
-
-        let mut join_table = JoinTable {
-            tables: vec![first_table.clone()],
-            rows: Vec::new(),
+        let mut join_table = match &self.table {
+            SelectTable::Table(table) => {
+                let first_table = tables
+                    .iter()
+                    .find(|t| t.name == *table)
+                    .context("Table not found")?;
+                JoinTable {
+                    tables: vec![first_table.clone()],
+                    rows: first_table.rows.clone(),
+                }
+            }
+            SelectTable::Select(select) => {
+                let select_dependencies = select.dependencies();
+                let result_tables = tables
+                    .iter()
+                    .filter(|shadow_table| select_dependencies.contains(shadow_table.name.as_str()))
+                    .cloned()
+                    .collect();
+                let rows = select.shadow(tables)?;
+                JoinTable {
+                    tables: result_tables,
+                    rows,
+                }
+            }
         };
 
         for join in &self.joins {
@@ -375,29 +392,18 @@ impl Shadow for FromClause {
 
             match join.join_type {
                 JoinType::Inner => {
-                    // Implement inner join logic
-                    let join_rows = joined_table
-                        .rows
-                        .iter()
-                        .filter(|row| join.on.test(row, joined_table))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    // take a cartesian product of the rows
-                    let all_row_pairs = join_table
-                        .rows
-                        .clone()
-                        .into_iter()
-                        .cartesian_product(join_rows.iter());
-
-                    for (row1, row2) in all_row_pairs {
-                        let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
-
-                        let is_in = join.on.test(&row, &join_table);
-
-                        if is_in {
-                            join_table.rows.push(row);
+                    let prev_rows = std::mem::take(&mut join_table.rows);
+                    let mut new_rows = Vec::new();
+                    for row1 in prev_rows.into_iter() {
+                        for row2 in joined_table.rows.iter() {
+                            let combined_row =
+                                row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
+                            if join.on.test(&combined_row, &join_table) {
+                                new_rows.push(combined_row);
+                            }
                         }
                     }
+                    join_table.rows = new_rows;
                 }
                 _ => todo!(),
             }
