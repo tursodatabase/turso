@@ -865,3 +865,10 @@ do_execsql_test_in_memory_any_error wrong-column-count-partial-columns-values-to
     CREATE TABLE t(a, b, c);
     INSERT INTO t(a) VALUES (1, 2);
 }
+
+# https://github.com/tursodatabase/turso/issues/3951
+do_execsql_test_on_specific_db {:memory:} insert-999999999 {
+    create table t(a);
+    insert into t(a, a) values (2, 3);
+    select * from t;
+} {2}
