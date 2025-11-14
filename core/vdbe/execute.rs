@@ -13,8 +13,8 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
+    compare_immutable, compare_records_generic, AsValueRef, Extendable, FromExtValue,
+    IOCompletions, ImmutableRecord, SeekResult, Text, ToExtValue,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,

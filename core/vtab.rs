@@ -1,5 +1,6 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
+use crate::types::{FromExtValue, ToExtValue};
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
 use parking_lot::RwLock;
@@ -525,7 +526,7 @@ impl ExtVirtualTableCursor {
 
     fn column(&self, column: usize) -> crate::Result<Value> {
         let val = unsafe { (self.implementation.column)(self.cursor.as_ptr(), column as u32) };
-        Value::from_ffi(val)
+        crate::Value::from_ffi(val)
     }
 
     fn next(&self) -> crate::Result<bool> {

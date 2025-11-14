@@ -35,18 +35,27 @@ pub struct ExternalAggState {
     pub finalize_fn: FinalizeFunction,
 }
 
-impl Value {
-    pub fn to_ffi(&self) -> ExtValue {
-        match self {
-            Self::Null => ExtValue::null(),
-            Self::Integer(i) => ExtValue::from_integer(*i),
-            Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
-            Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
+pub trait ToExtValue: AsValueRef {
+    fn to_ffi(&self) -> ExtValue {
+        let value = self.as_value_ref();
+        match value {
+            ValueRef::Null => ExtValue::null(),
+            ValueRef::Integer(i) => ExtValue::from_integer(i),
+            ValueRef::Float(fl) => ExtValue::from_float(fl),
+            ValueRef::Text(text) => ExtValue::from_text(text.as_str().to_string()),
+            ValueRef::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }
+}
 
-    pub fn from_ffi(v: ExtValue) -> Result<Self> {
+impl<V: AsValueRef> ToExtValue for V {}
+
+pub trait FromExtValue: Sized {
+    fn from_ffi(v: ExtValue) -> Result<Self>;
+}
+
+impl FromExtValue for Value {
+    fn from_ffi(v: ExtValue) -> Result<Self> {
         let res = match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
@@ -746,18 +755,6 @@ impl RecordCursor {
             idx: 0,
         };
         get_values.peekable()
-    }
-}
-
-impl<'a> ValueRef<'a> {
-    pub fn to_ffi(&self) -> ExtValue {
-        match self {
-            Self::Null => ExtValue::null(),
-            Self::Integer(i) => ExtValue::from_integer(*i),
-            Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
-            Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
-        }
     }
 }
 
