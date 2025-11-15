@@ -1192,9 +1192,20 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
             // if connection wasn't properly closed, decrement the connection counter
-            self.db
+            if self
+                .db
                 .n_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                .eq(&1)
+            {
+                if let Err(e) = self
+                    .pager
+                    .load()
+                    .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())
+                {
+                    tracing::error!("Error during WAL checkpoint on connection drop: {}", e);
+                }
+            }
         }
     }
 }
