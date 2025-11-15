@@ -34,7 +34,7 @@ fn test_per_page_checksum() -> anyhow::Result<()> {
 
     {
         let metadata = std::fs::metadata(&db_path)?;
-        assert_eq!(metadata.len(), 4096, "db file should be exactly 4096 bytes");
+        assert_eq!(metadata.len(), 8192, "db file should be exactly 8kb");
     }
 
     // let's test that page actually contains checksum bytes
@@ -42,13 +42,13 @@ fn test_per_page_checksum() -> anyhow::Result<()> {
         let file_contents = std::fs::read(&db_path)?;
         assert_eq!(
             file_contents.len(),
-            4096,
+            8192,
             "file contents should be 4096 bytes"
         );
 
         // split the page: first 4088 bytes are actual page, last 8 bytes are checksum
         let actual_page = &file_contents[..4096 - 8];
-        let checksum_bytes = &file_contents[4096 - 8..];
+        let checksum_bytes = &file_contents[4096 - 8..4096];
         let stored_checksum = u64::from_le_bytes(checksum_bytes.try_into().unwrap());
 
         let expected_checksum = twox_hash::XxHash3_64::oneshot(actual_page);

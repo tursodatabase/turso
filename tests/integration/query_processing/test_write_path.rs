@@ -781,6 +781,9 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
         conn.execute("INSERT INTO t2(x) VALUES (1)")?;
         conn.execute("INSERT INTO t3(x) VALUES (1)")?;
         conn.execute("COMMIT")?;
+        // disalbe auto checkpoint so we keep the state of the WAL file on disk and prevent
+        // truncate checkpoint automatically on connection drop
+        conn.wal_auto_checkpoint_disable();
         common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
             let x = row.get::<i64>(0).unwrap();
             assert_eq!(x, 1);
@@ -791,6 +794,7 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
             assert_eq!(x, 1);
         })
         .unwrap();
+
         // Now let's modify last frame record
         let path = tmp_db.path.clone();
         let path = path.with_extension("db-wal");
