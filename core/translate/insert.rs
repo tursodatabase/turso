@@ -401,6 +401,10 @@ pub fn translate_insert(
         has_user_provided_rowid,
     );
 
+    let notnull_resume_label: Option<BranchOffset> = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
+
+    emit_check_constraints(&mut program, &ctx, &insertion, resolver, connection)?;
+
     // We need to separate index handling and insertion into a `preflight` and a
     // `commit` phase, because in UPSERT mode we might need to skip the actual insertion, as we can
     // have a naked ON CONFLICT DO NOTHING, so if we eagerly insert any indexes, we could insert
@@ -414,10 +418,6 @@ pub fn translate_insert(
         &constraints,
         connection,
     )?;
-
-    let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
-
-    emit_check_constraints(&mut program, &ctx, &insertion, resolver, connection)?;
 
     // Create and insert the record
     let affinity_str = insertion
