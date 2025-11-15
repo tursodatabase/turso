@@ -102,7 +102,8 @@ pub struct InsertEmitCtx<'a> {
     /// into a temporary table
     pub temp_table_ctx: Option<TempTableCtx>,
     /// on conflict, default to ABORT
-    pub on_conflict: ResolveType,
+    pub on_conflict: Option<ResolveType>,
+    pub rewrote_on_conflict: bool,
     /// Arity of the insert values
     pub num_values: usize,
     /// The yield register, if a coroutine is used to yield multiple rows
@@ -142,6 +143,7 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
+        rewrote_on_conflict: bool,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices = resolver.schema.get_indices(table.name.as_str());
@@ -163,7 +165,7 @@ impl<'a> InsertEmitCtx<'a> {
             table,
             idx_cursors,
             temp_table_ctx,
-            on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
+            on_conflict,
             yield_reg_opt: None,
             conflict_rowid_reg: program.alloc_register(),
             select_exhausted_label: None,
@@ -177,6 +179,7 @@ impl<'a> InsertEmitCtx<'a> {
             key_ready_for_uniqueness_check_label,
             key_generation_label,
             autoincrement_meta: None,
+            rewrote_on_conflict,
         })
     }
 }
@@ -227,13 +230,14 @@ pub fn translate_insert(
         mut values,
         mut upsert_actions,
         inserting_multiple_rows,
+        rewrote_on_conflict,
     } = bind_insert(
         &mut program,
         resolver,
         &table,
         &mut body,
         connection,
-        on_conflict.unwrap_or(ResolveType::Abort),
+        on_conflict,
     )?;
 
     if inserting_multiple_rows && btree_table.has_autoincrement {
@@ -276,6 +280,7 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
+        rewrote_on_conflict,
     )?;
 
     program = init_source_emission(
@@ -287,6 +292,7 @@ pub fn translate_insert(
         &mut values,
         body,
         &columns,
+        &upsert_actions,
     )?;
     let has_upsert = !upsert_actions.is_empty();
 
@@ -920,6 +926,7 @@ struct BoundInsertResult {
     values: Vec<Box<Expr>>,
     upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
     inserting_multiple_rows: bool,
+    rewrote_on_conflict: bool,
 }
 
 fn bind_insert(
@@ -928,12 +935,13 @@ fn bind_insert(
     table: &Table,
     body: &mut InsertBody,
     connection: &Arc<Connection>,
-    on_conflict: ResolveType,
+    on_conflict: Option<ResolveType>,
 ) -> Result<BoundInsertResult> {
     let mut values: Vec<Box<Expr>> = vec![];
     let mut upsert: Option<Box<Upsert>> = None;
     let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = Vec::new();
     let mut inserting_multiple_rows = false;
+    let mut rewrote_on_conflict = false;
     match body {
         InsertBody::DefaultValues => {
             // Generate default values for the table
@@ -995,22 +1003,24 @@ fn bind_insert(
         }
     }
     match on_conflict {
-        ResolveType::Ignore => {
+        Some(ResolveType::Ignore) => {
+            rewrote_on_conflict = true;
             upsert.replace(Box::new(ast::Upsert {
                 do_clause: UpsertDo::Nothing,
                 index: None,
                 next: None,
             }));
         }
-        ResolveType::Abort => {
+        Some(ResolveType::Abort) => {
             // This is the default conflict resolution strategy for INSERT in SQLite.
         }
-        _ => {
+        Some(on_conflict) => {
             crate::bail_parse_error!(
                 "INSERT OR {} is only supported with UPSERT",
                 on_conflict.to_string()
             );
         }
+        _ => {}
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
@@ -1050,6 +1060,7 @@ fn bind_insert(
         values,
         upsert_actions,
         inserting_multiple_rows,
+        rewrote_on_conflict,
     })
 }
 
@@ -1077,6 +1088,7 @@ fn init_source_emission<'a>(
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
     columns: &'a [ast::Name],
+    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
 ) -> Result<ProgramBuilder> {
     let required_column_count = if columns.is_empty() {
         table.columns().len()
@@ -1126,6 +1138,10 @@ fn init_source_emission<'a>(
                         "{} values for {required_column_count} columns",
                         result.num_result_cols,
                     );
+                } else if !upsert_actions.is_empty() && !ctx.rewrote_on_conflict {
+                    // since we rewrite OnConflict::Ignore -> Upsert::DoNothing, we need to check to
+                    // make sure the disallowed UPSERT clause was not simply an OnConflict::Ignore
+                    crate::bail_parse_error!("INSERT ... SELECT with ON CONFLICT not allowed");
                 }
                 program = result.program;
                 program.decr_nesting();
