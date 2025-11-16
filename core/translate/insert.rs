@@ -2365,24 +2365,6 @@ fn emit_replace_delete_conflicting_row(
         target_pc: ctx.halt_label,
     });
 
-    emit_delete_single_row(
-        connection,
-        program,
-        ctx,
-        resolver,
-        ctx.conflict_rowid_reg,
-        true,
-    )
-}
-
-fn emit_delete_single_row(
-    connection: &Arc<Connection>,
-    program: &mut ProgramBuilder,
-    ctx: &mut InsertEmitCtx,
-    resolver: &Resolver,
-    rowid_reg: usize,
-    is_part_of_update: bool,
-) -> Result<()> {
     let table = &ctx.table;
     let table_name = table.name.as_str();
     let main_cursor_id = ctx.cursor_id;
@@ -2394,7 +2376,7 @@ fn emit_delete_single_row(
                 resolver,
                 table_name,
                 main_cursor_id,
-                rowid_reg,
+                ctx.conflict_rowid_reg,
             )?;
         }
         if resolver.schema.has_child_fks(table_name) {
@@ -2404,7 +2386,7 @@ fn emit_delete_single_row(
                 table,
                 table_name,
                 main_cursor_id,
-                rowid_reg,
+                ctx.conflict_rowid_reg,
             )?;
         }
     }
@@ -2448,7 +2430,7 @@ fn emit_delete_single_row(
             );
         }
         program.emit_insn(Insn::Copy {
-            src_reg: rowid_reg,
+            src_reg: ctx.conflict_rowid_reg,
             dst_reg: start_reg + num_regs - 1,
             extra_amount: 0,
         });
@@ -2472,7 +2454,7 @@ fn emit_delete_single_row(
                 program,
                 &table.columns,
                 main_cursor_id,
-                rowid_reg,
+                ctx.conflict_rowid_reg,
             ))
         } else {
             None
@@ -2482,7 +2464,7 @@ fn emit_delete_single_row(
             resolver,
             OperationMode::DELETE,
             cdc_cursor_id,
-            rowid_reg,
+            ctx.conflict_rowid_reg,
             before_record_reg,
             None,
             None,
@@ -2492,7 +2474,7 @@ fn emit_delete_single_row(
     program.emit_insn(Insn::Delete {
         cursor_id: main_cursor_id,
         table_name: table_name.to_string(),
-        is_part_of_update,
+        is_part_of_update: true,
     });
     Ok(())
 }
