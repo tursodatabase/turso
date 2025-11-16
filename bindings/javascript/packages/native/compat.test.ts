@@ -99,3 +99,9 @@ test('blobs', () => {
     const rows = db.prepare("SELECT x'1020' as x").all();
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
 })
+
+test('explain column types', () => {
+    const db = new Database(":memory:");
+    const column_types = db.prepare("EXPLAIN SELECT 123123123123").columns().map(c => c.type);
+    expect(column_types).toEqual(["INTEGER", "TEXT", "INTEGER", "INTEGER", "INTEGER", "TEXT", "INTEGER", "TEXT"]);
+})
