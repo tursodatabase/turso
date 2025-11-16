@@ -968,8 +968,6 @@ impl Schema {
                     None
                 } else {
                     find_parent_unique(&parent_cols)
-                        .ok_or_else(|| fk_mismatch_err(&child.name, &parent_tbl.name))?
-                        .into()
                 };
                 fk.validate()?;
                 out.push(ResolvedFkRef {
