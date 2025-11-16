@@ -393,33 +393,103 @@ pub fn translate_condition_expr(
             )?;
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, if the left-hand side is FALSE or NULL, we must evaluate the right-hand side.
-            // Therefore, for the LHS evaluation, we create a local "fallthrough" label and instruct
-            // the recursive call to jump to it for both FALSE and NULL outcomes.
-            let fallthrough_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                lhs,
-                ConditionMetadata {
+            let where_clause_cntxt = condition_metadata.jump_target_when_false
+                == condition_metadata.jump_target_when_null;
+
+            if where_clause_cntxt {
+                tracing::trace!(
+                    context = "WHERE-like",
+                    ?condition_metadata,
+                    "Translating OR with unified NULL/FALSE logic"
+                );
+
+                let fallthrough_label = program.allocate_label();
+                translate_condition_expr(
+                    program,
+                    referenced_tables,
+                    lhs,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: true,
+                        jump_target_when_true: condition_metadata.jump_target_when_true,
+                        jump_target_when_false: fallthrough_label,
+                        jump_target_when_null: fallthrough_label,
+                    },
+                    resolver,
+                )?;
+                program.preassign_label_to_next_insn(fallthrough_label);
+                translate_condition_expr(
+                    program,
+                    referenced_tables,
+                    rhs,
+                    condition_metadata,
+                    resolver,
+                )?;
+            } else {
+                let lhs_is_false_label = program.allocate_label();
+                let lhs_is_null_label = program.allocate_label();
+                let end_label = program.allocate_label();
+
+                let lhs_metadata = ConditionMetadata {
                     jump_if_condition_is_true: true,
                     jump_target_when_true: condition_metadata.jump_target_when_true,
-                    jump_target_when_false: fallthrough_label,
-                    jump_target_when_null: fallthrough_label,
-                },
-                resolver,
-            )?;
+                    jump_target_when_false: lhs_is_false_label,
+                    jump_target_when_null: lhs_is_null_label,
+                };
 
-            program.preassign_label_to_next_insn(fallthrough_label);
+                tracing::trace!(
+                    context = "CHECK-like",
+                    ?condition_metadata,
+                    ?lhs_metadata,
+                    "Translating OR LHS"
+                );
 
-            translate_condition_expr(
-                program,
-                referenced_tables,
-                rhs,
-                condition_metadata,
-                resolver,
-            )?;
+                translate_condition_expr(program, referenced_tables, lhs, lhs_metadata, resolver)?;
+
+                program.preassign_label_to_next_insn(lhs_is_false_label);
+                tracing::trace!(
+                    context = "CHECK-like",
+                    ?condition_metadata,
+                    "Translating OR RHS (after LHS was FALSE)"
+                );
+                translate_condition_expr(
+                    program,
+                    referenced_tables,
+                    rhs,
+                    condition_metadata,
+                    resolver,
+                )?;
+                program.emit_insn(Insn::Goto {
+                    target_pc: end_label,
+                });
+
+                program.preassign_label_to_next_insn(lhs_is_null_label);
+
+                let rhs_metadata_for_null_lhs = ConditionMetadata {
+                    jump_if_condition_is_true: true,
+                    jump_target_when_true: condition_metadata.jump_target_when_true,
+                    jump_target_when_false: condition_metadata.jump_target_when_null,
+                    jump_target_when_null: condition_metadata.jump_target_when_null,
+                };
+
+                tracing::trace!(
+                    context = "CHECK-like",
+                    original_metadata = ?condition_metadata,
+                    modified_metadata = ?rhs_metadata_for_null_lhs,
+                    "Translating OR RHS (after LHS was NULL)"
+                );
+
+                translate_condition_expr(
+                    program,
+                    referenced_tables,
+                    rhs,
+                    rhs_metadata_for_null_lhs,
+                    resolver,
+                )?;
+
+                program.preassign_label_to_next_insn(end_label);
+            }
         }
+
         ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
             binary_expr_shared(
@@ -494,25 +564,19 @@ pub fn translate_condition_expr(
                 });
             }
         }
-        ast::Expr::Like { not, .. } => {
-            let cur_reg = program.alloc_register();
-            translate_like_base(program, Some(referenced_tables), expr, cur_reg, resolver)?;
-            if !*not {
-                emit_cond_jump(program, condition_metadata, cur_reg);
-            } else if condition_metadata.jump_if_condition_is_true {
-                program.emit_insn(Insn::IfNot {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_true,
-                    jump_if_null: false,
-                });
-            } else {
-                program.emit_insn(Insn::If {
-                    reg: cur_reg,
-                    target_pc: condition_metadata.jump_target_when_false,
-                    jump_if_null: true,
-                });
-            }
+        ast::Expr::Like { .. } => {
+            tracing::trace!(
+                context = "LIKE/NOT LIKE",
+                ?condition_metadata,
+                "Translating LIKE expression in conditional context."
+            );
+
+            let result_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
+
+            emit_cond_jump(program, condition_metadata, result_reg);
         }
+
         ast::Expr::Parenthesized(exprs) => {
             if exprs.len() == 1 {
                 let _ = translate_condition_expr(
@@ -2938,6 +3002,13 @@ fn emit_binary_condition_insn(
     referenced_tables: Option<&TableReferences>,
     condition_metadata: Option<ConditionMetadata>,
 ) -> Result<()> {
+    tracing::trace!(
+        context = "emit_binary_condition_insn",
+        ?op,
+        ?condition_metadata,
+        "Translating binary comparison with conditional jump"
+    );
+
     let condition_metadata = condition_metadata
         .expect("condition metadata must be provided for emit_binary_insn_conditional");
     let mut affinity = Affinity::Blob;
@@ -2990,6 +3061,31 @@ fn emit_binary_condition_insn(
     let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
         emit_cond_jump(program, condition_metadata, result_reg);
     };
+    if matches!(
+        op,
+        ast::Operator::Equals
+            | ast::Operator::NotEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+    ) && condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_false
+        && condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_true
+    {
+        tracing::trace!(
+            context = "Binary comparison NULL check",
+            ?op,
+            "CHECK-like logic detected for standard comparison. Adding explicit NULL checks before comparison."
+        );
+        program.emit_insn(Insn::IsNull {
+            reg: lhs,
+            target_pc: condition_metadata.jump_target_when_null,
+        });
+        program.emit_insn(Insn::IsNull {
+            reg: rhs,
+            target_pc: condition_metadata.jump_target_when_null,
+        });
+    }
 
     match op_to_use {
         ast::Operator::NotEquals => {
@@ -3180,6 +3276,15 @@ fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         other_unimplemented => todo!("{:?}", other_unimplemented),
+    }
+    if condition_metadata.jump_if_condition_is_true {
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_false,
+        });
+    } else {
+        program.emit_insn(Insn::Goto {
+            target_pc: condition_metadata.jump_target_when_true,
+        });
     }
 
     Ok(())
