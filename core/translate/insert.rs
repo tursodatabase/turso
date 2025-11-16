@@ -371,7 +371,7 @@ pub fn translate_insert(
         connection,
     )?;
 
-    emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
+    let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -379,6 +379,10 @@ pub fn translate_insert(
         .iter()
         .map(|col_mapping| col_mapping.column.affinity().aff_mask())
         .collect::<String>();
+
+    if let Some(lbl) = notnull_resume_label {
+        program.preassign_label_to_next_insn(lbl);
+    }
     program.emit_insn(Insn::MakeRecord {
         start_reg: insertion.first_col_register(),
         count: insertion.col_mappings.len(),
@@ -886,8 +890,9 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
-) -> Result<()> {
+) -> Result<Option<BranchOffset>> {
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+    let mut pending_resume_label = None;
     for column_mapping in insertion
         .col_mappings
         .iter()
@@ -897,31 +902,47 @@ fn emit_notnulls(
         if column_mapping.column.is_rowid_alias() {
             continue;
         }
+
+        // If a NOT NULL constraint violation occurs, the REPLACE conflict resolution replaces the NULL value with the default value for that column,
+        // or if the column has no default value, then the ABORT algorithm is used
         if on_replace {
             if let Some(default_expr) = column_mapping.column.default.as_ref() {
-                // OR REPLACE + NOT NULL + DEFAULT:
-                // if reg IS NOT NULL -> skip
-                // if reg IS NULL -> evaluate DEFAULT into this register
-                let ok = program.allocate_label();
+                let default_label = {
+                    if let Some(lbl) = pending_resume_label {
+                        lbl
+                    } else {
+                        program.allocate_label()
+                    }
+                };
+                let resume_label = program.allocate_label();
 
-                program.emit_insn(Insn::NotNull {
+                program.emit_insn(Insn::IsNull {
                     reg: column_mapping.register,
-                    target_pc: ok,
+                    target_pc: default_label,
                 });
 
-                // At this point, value is NULL: overwrite with default expression
-                translate_expr(
+                program.emit_insn(Insn::Goto {
+                    target_pc: resume_label,
+                });
+
+                program.resolve_label(default_label, program.offset());
+
+                // Evaluate default expression into the column register.
+                translate_expr_no_constant_opt(
                     program,
                     None,
                     default_expr,
                     column_mapping.register,
                     resolver,
+                    NoConstantOptReason::RegisterReuse,
                 )?;
 
-                program.preassign_label_to_next_insn(ok);
-                continue;
+                program.emit_insn(Insn::Goto {
+                    target_pc: resume_label,
+                });
+                pending_resume_label = Some(resume_label);
             }
-            // OR REPLACE but no DEFAULT: fall through to ABORT behavior below
+            // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
         program.emit_insn(Insn::HaltIfNull {
             target_reg: column_mapping.register,
@@ -950,7 +971,7 @@ fn emit_notnulls(
             },
         });
     }
-    Ok(())
+    Ok(pending_resume_label)
 }
 
 struct BoundInsertResult {
@@ -1746,12 +1767,7 @@ fn emit_preflight_constraint_checks(
                             dst_reg: ctx.conflict_rowid_reg,
                             extra_amount: 0,
                         });
-                        emit_replace_delete_conflicting_row(
-                            program,
-                            resolver,
-                            connection,
-                            ctx,
-                        )?;
+                        emit_replace_delete_conflicting_row(program, resolver, connection, ctx)?;
                         program.emit_insn(Insn::Goto {
                             target_pc: make_record_label,
                         });
@@ -1911,10 +1927,7 @@ fn emit_preflight_constraint_checks(
                                 dest: ctx.conflict_rowid_reg,
                             });
                             emit_replace_delete_conflicting_row(
-                                program,
-                                resolver,
-                                connection,
-                                ctx,
+                                program, resolver, connection, ctx,
                             )?;
                             program.emit_insn(Insn::Goto { target_pc: ok });
                         } else {
