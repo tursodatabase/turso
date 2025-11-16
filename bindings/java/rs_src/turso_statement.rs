@@ -301,6 +301,23 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_changes<'local>(
     stmt.connection.conn.changes()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoStatement_parameterCount<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    stmt_ptr: jlong,
+) -> jint {
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, SQLITE_ERROR, e.to_string());
+            return -1;
+        }
+    };
+
+    stmt.stmt.parameters_count() as jint
+}
+
 /// Converts an optional `JObject` into Java's `TursoStepResult`.
 ///
 /// This function takes an optional `JObject` and converts it into a Java object
