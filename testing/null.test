@@ -26,3 +26,9 @@ do_execsql_test sel-true {
 do_execsql_test sel-false {
 	select false;
 } {0}
+
+do_execsql_test_on_specific_db {:memory:} not-null-just-cuz-unique {
+    create table t (a int, x int unique);
+    insert into t(a) values(1);
+    select * from t;
+} {1|}
