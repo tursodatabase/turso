@@ -1417,6 +1417,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             has_autoincrement: false,
+            checks: vec![],
         };
 
         // Create orders table
@@ -1460,6 +1461,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            checks: vec![],
         };
 
         // Create products table
@@ -1499,6 +1501,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            checks: vec![],
         };
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
@@ -1535,6 +1538,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            checks: vec![],
         };
 
         schema
