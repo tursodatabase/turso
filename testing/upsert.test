@@ -380,7 +380,19 @@ do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
     SELECT phonenumber, validDate FROM phonebook;
 } {704-111-1111|2018-10-20}
 
+# disallow plain INSERT INTO SELECT FROM with ON CONFLICT if it doesnt contain WHERE clause to match sqlite's parsing ambiguity
+do_execsql_test_in_memory_any_error insert-select-from-on-conflict {
+    CREATE TABLE t(a integer primary key, b);
+    INSERT INTO t SELECT value, value+1 FROM generate_series(1,10) ON CONFLICT DO UPDATE SET a=a+100;
+}
 
+# allow the same thing when a WHERE clause is present
+do_execsql_test_on_specific_db {:memory:} insert-select-from-on-conflict-with-where-works {
+    CREATE TABLE t(a integer primary key, b);
+    INSERT INTO t SELECT value, value+1 FROM generate_series(1,10) WHERE value < 5 ON CONFLICT DO UPDATE SET a=a+100;
+	SELECT * FROM t ORDER BY a LIMIT 2;
+} {1|2
+2|3}
 # TODO: uncomment these when we support collations in indexes 
 # (right now it errors on Parse Error: cannot use expressions in CREATE INDEX)
 #

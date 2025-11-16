@@ -1065,6 +1065,34 @@ fn bind_insert(
     })
 }
 
+/// This function checks whether we should disallow INSERT INTO SELECT when an ON CONFLICT
+/// is present based on SQLite's unique rules/parsing ambiguity.
+fn select_reads_from_sources_without_pred(select: &ast::Select) -> bool {
+    if select.body.compounds.is_empty() {
+        match &select.body.select {
+            OneSelect::Values(_) => return false, // INSERT ... VALUES ...
+            OneSelect::Select {
+                from, where_clause, ..
+            } => {
+                return from.is_some() && !where_clause.is_some();
+            }
+        }
+    }
+    for core in
+        std::iter::once(&select.body.select).chain(select.body.compounds.iter().map(|c| &c.select))
+    {
+        if let OneSelect::Select {
+            from, where_clause, ..
+        } = core
+        {
+            if from.is_some() && !where_clause.is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Depending on the InsertBody, we begin to initialize the source of the insert values
 /// into registers using the following methods:
 ///
@@ -1131,6 +1159,7 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
+                let special_parsing_edgecase = select_reads_from_sources_without_pred(&select);
                 program.incr_nesting();
                 let result =
                     translate_select(select, resolver, program, query_destination, connection)?;
@@ -1139,10 +1168,14 @@ fn init_source_emission<'a>(
                         "{} values for {required_column_count} columns",
                         result.num_result_cols,
                     );
-                } else if !upsert_actions.is_empty() && !ctx.rewrote_on_conflict {
-                    // since we rewrite OnConflict::Ignore -> Upsert::DoNothing, we need to check to
-                    // make sure the disallowed UPSERT clause was not simply an OnConflict::Ignore
-                    crate::bail_parse_error!("INSERT ... SELECT with ON CONFLICT not allowed");
+                }
+                // INSERT INTO SELECT .. fails in SQLite with ON CONFLICT, only if the select is
+                // selecting from another table and there is no WHERE clause
+                if !upsert_actions.is_empty()
+                    && !ctx.rewrote_on_conflict
+                    && special_parsing_edgecase
+                {
+                    crate::bail_parse_error!("near \"DO\": syntax error");
                 }
                 program = result.program;
                 program.decr_nesting();
