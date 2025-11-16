@@ -1383,7 +1383,7 @@ impl IncrementalView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
@@ -1404,11 +1404,13 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
             ],
@@ -1431,11 +1433,13 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
                 ),
                 SchemaColumn::new(
                     Some("customer_id".to_string()),
@@ -1443,11 +1447,7 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 ),
                 SchemaColumn::new_default_integer(
                     Some("total".to_string()),
@@ -1474,11 +1474,13 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        unique: false,
+                        hidden: false,
+                    },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
                 SchemaColumn::new(
@@ -1487,11 +1489,7 @@ mod tests {
                     None,
                     Type::Real,
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 ),
             ],
             has_rowid: true,
@@ -1513,11 +1511,7 @@ mod tests {
                     None,
                     Type::Text,
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 ),
                 SchemaColumn::new_default_integer(
                     Some("level".to_string()),

@@ -7,7 +7,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, BTreeTable, Index, ResolvedFkRef, Table};
+use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
 };
@@ -1282,11 +1282,13 @@ pub const ROWID_COLUMN: Column = Column::new(
     None,          // default
     schema::Type::Integer,
     None,
-    true,  // primary key
-    true,  // rowid alias
-    true,  // notnull
-    false, // unique
-    false, // hidden
+    ColDef {
+        primary_key: true,
+        rowid_alias: true,
+        notnull: true,
+        hidden: false,
+        unique: false,
+    },
 );
 
 /// Represents how a table should be populated during an INSERT.

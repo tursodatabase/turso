@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;
-use crate::schema::{create_table, BTreeTable, Column, Table, Type, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    create_table, BTreeTable, ColDef, Column, Table, Type, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
@@ -848,11 +850,7 @@ pub fn translate_drop_table(
                 None,
                 Type::Integer,
                 None,
-                false,
-                false,
-                false,
-                false,
-                false,
+                ColDef::default(),
             )],
             is_strict: false,
             unique_sets: vec![],
