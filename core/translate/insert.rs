@@ -29,7 +29,7 @@ use crate::translate::upsert::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::ProgramBuilderOpts;
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
@@ -94,6 +94,7 @@ pub struct TempTableCtx {
 pub struct InsertEmitCtx<'a> {
     /// Parent table being inserted into
     pub table: &'a Arc<BTreeTable>,
+    pub table_references: &'a mut TableReferences,
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
@@ -134,6 +135,7 @@ pub struct InsertEmitCtx<'a> {
 }
 
 impl<'a> InsertEmitCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         program: &mut ProgramBuilder,
         resolver: &Resolver,
@@ -142,6 +144,7 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
+        table_references: &'a mut TableReferences,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices = resolver.schema.get_indices(table.name.as_str());
@@ -161,6 +164,7 @@ impl<'a> InsertEmitCtx<'a> {
         let key_generation_label = program.allocate_label();
         Ok(Self {
             table,
+            table_references,
             idx_cursors,
             temp_table_ctx,
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
@@ -276,6 +280,7 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
+        &mut table_references,
     )?;
 
     program = init_source_emission(
@@ -363,7 +368,7 @@ pub fn translate_insert(
     // invalid index entries before we hit a conflict down the line.
     emit_preflight_constraint_checks(
         &mut program,
-        &ctx,
+        &mut ctx,
         resolver,
         &insertion,
         &upsert_actions,
@@ -485,7 +490,7 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         emit_returning_results(
             &mut program,
-            &table_references,
+            ctx.table_references,
             &result_columns,
             insertion.first_col_register(),
             insertion.key_register(),
@@ -505,7 +510,6 @@ pub fn translate_insert(
             &table,
             &mut result_columns,
             connection,
-            &table_references,
         )?;
     }
 
@@ -774,7 +778,6 @@ fn resolve_upserts(
     table: &Table,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
-    table_references: &TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -797,7 +800,6 @@ fn resolve_upserts(
                 resolver,
                 result_columns,
                 connection,
-                table_references,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1061,10 +1063,10 @@ fn bind_insert(
                 next: None,
             }));
         }
-        ResolveType::Abort => {
-            // This is the default conflict resolution strategy for INSERT in SQLite.
+        ResolveType::Abort | ResolveType::Replace => {
+            // Abort is the default conflict resolution strategy for INSERT in SQLite,
+            // and we implement Replace.
         }
-        ResolveType::Replace => {}
         _ => {
             crate::bail_parse_error!(
                 "INSERT OR {} is only supported with UPSERT",
@@ -1160,7 +1162,10 @@ fn init_source_emission<'a>(
             {
                 (
                     values.len(),
-                    program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone())),
+                    program.alloc_cursor_id_keyed(
+                        CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                        CursorType::BTreeTable(ctx.table.clone()),
+                    ),
                 )
             } else {
                 // Multiple rows - use coroutine for value population
@@ -1192,8 +1197,10 @@ fn init_source_emission<'a>(
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
                 program.preassign_label_to_next_insn(jump_on_definition_label);
-
-                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
+                let cursor_id = program.alloc_cursor_id_keyed(
+                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorType::BTreeTable(ctx.table.clone()),
+                );
 
                 // From SQLite
                 /* Set useTempTable to TRUE if the result of the SELECT statement
@@ -1320,7 +1327,10 @@ fn init_source_emission<'a>(
             }));
             (
                 num_values,
-                program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone())),
+                program.alloc_cursor_id_keyed(
+                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorType::BTreeTable(ctx.table.clone()),
+                ),
             )
         }
     };
@@ -1738,7 +1748,7 @@ fn translate_column(
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
-    ctx: &InsertEmitCtx,
+    ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
     insertion: &Insertion,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
@@ -2347,7 +2357,7 @@ fn emit_replace_delete_conflicting_row(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-    ctx: &InsertEmitCtx,
+    ctx: &mut InsertEmitCtx,
 ) -> Result<()> {
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -2368,7 +2378,7 @@ fn emit_replace_delete_conflicting_row(
 fn emit_delete_single_row(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
-    ctx: &InsertEmitCtx,
+    ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
     rowid_reg: usize,
     is_part_of_update: bool,
@@ -2405,13 +2415,13 @@ fn emit_delete_single_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(None, connection)
+                .bind_where_expr(Some(ctx.table_references), connection)
                 .expect("where clause to exist");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
-                None,
+                Some(ctx.table_references),
                 &where_copy,
                 reg,
                 resolver,
