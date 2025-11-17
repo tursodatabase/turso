@@ -14,7 +14,11 @@ use crate::{
 use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 #[inline]
-pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset, deferred: bool) {
+pub fn emit_guarded_fk_decrement(
+    program: &mut ProgramBuilder,
+    label: BranchOffset,
+    deferred: bool,
+) {
     program.emit_insn(Insn::FkIfZero {
         deferred,
         target_pc: label,
