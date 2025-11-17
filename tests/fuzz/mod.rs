@@ -1088,16 +1088,20 @@ mod fuzz_tests {
     }
 
     #[test]
-    pub fn fk_single_pk_mutation_fuzz() {
+    pub fn fk_and_check_constraints_fuzz() {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
-        println!("fk_single_pk_mutation_fuzz seed: {seed}");
+        println!("fk_and_check_constraints_fuzz seed: {seed}");
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
 
         for outer in 0..OUTER_ITERS {
-            println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
+            println!(
+                "fk_and_check_constraints_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
 
             let limbo_db = TempDatabase::new_empty();
             let sqlite_db = TempDatabase::new_empty();
@@ -1116,13 +1120,45 @@ mod fuzz_tests {
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
-            let s = log_and_exec("CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT)");
+            // Generate random CHECK constraints for parent and child tables.
+            let p_check = match rng.random_range(0..4) {
+                0 => "CHECK(a > 0)".to_string(),
+                1 => "CHECK(a + b < 50)".to_string(),
+                2 => "CHECK(a != b)".to_string(),
+                _ => "".to_string(), // No check constraint
+            };
+
+            let c_check = match rng.random_range(0..4) {
+                0 => "CHECK(y > 0)".to_string(),
+                1 => "CHECK(y < 100)".to_string(),
+                2 => "CHECK(x != y)".to_string(),
+                _ => "".to_string(), // No check constraint
+            };
+            let p_check_sql = if !p_check.is_empty() {
+                format!(", {}", p_check)
+            } else {
+                "".to_string()
+            };
+
+            let s = log_and_exec(&format!(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT{} )",
+                p_check_sql
+            ));
+
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
-            let s = log_and_exec(
-            "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id))",
-        );
+            let c_check_sql = if !c_check.is_empty() {
+                format!(", {}", c_check)
+            } else {
+                "".to_string()
+            };
+
+            let s = log_and_exec(&format!(
+    "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id){} )",
+    c_check_sql
+));
+
             limbo_exec_rows(&limbo_db, &limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
@@ -1137,11 +1173,14 @@ mod fuzz_tests {
                         break;
                     }
                 }
-                let a = rng.random_range(-5..=25);
-                let b = rng.random_range(-5..=25);
+                let a = rng.random_range(-5..=30);
+                let b = rng.random_range(-5..=30);
                 let stmt = log_and_exec(&format!("INSERT INTO p VALUES ({id}, {a}, {b})"));
                 let l_res = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
                 let s_res = sqlite.execute(&stmt, params![]);
+                if s_res.is_err() {
+                    used_ids.remove(&id); // It failed, so the ID is not used.
+                }
                 match (l_res, s_res) {
                     (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
                     _ => {
@@ -1154,12 +1193,12 @@ mod fuzz_tests {
             let n_child = rng.random_range(5..=80);
             for i in 0..n_child {
                 let id = 1000 + i as i64;
-                let x = if rng.random_bool(0.8) {
+                let x = if rng.random_bool(0.8) && !used_ids.is_empty() {
                     *used_ids.iter().choose(&mut rng).unwrap()
                 } else {
-                    rng.random_range(1..=220) as i64
+                    rng.random_range(1..=220) as i64 // might fail FK
                 };
-                let y = rng.random_range(-10..=10);
+                let y = rng.random_range(-10..=110); // Adjust range to test CHECK constraint boundaries
                 let stmt = log_and_exec(&format!("INSERT INTO c VALUES ({id}, {x}, {y})"));
                 match (
                     sqlite.execute(&stmt, params![]),
@@ -1168,7 +1207,7 @@ mod fuzz_tests {
                     (Ok(_), Ok(_)) => {}
                     (Err(_), Err(_)) => {}
                     (x, y) => {
-                        eprintln!("\n=== FK fuzz failure (seeding mismatch) ===");
+                        eprintln!("\n=== FK/CHECK fuzz failure (seeding mismatch) ===");
                         eprintln!("seed: {seed}, outer: {}", outer + 1);
                         eprintln!("sqlite: {x:?}, limbo: {y:?}");
                         eprintln!("last stmt: {stmt}");
@@ -1214,8 +1253,8 @@ mod fuzz_tests {
                             let new_id = rng.random_range(1..=260);
                             format!("UPDATE p SET id={new_id} WHERE id={old}")
                         } else {
-                            let a = rng.random_range(-5..=25);
-                            let b = rng.random_range(-5..=25);
+                            let a = rng.random_range(-5..=30);
+                            let b = rng.random_range(-5..=30);
                             let tgt = rng.random_range(1..=260);
                             format!("UPDATE p SET a={a}, b={b} WHERE id={tgt}")
                         }
@@ -1228,12 +1267,8 @@ mod fuzz_tests {
                     // Child INSERT
                     3 => {
                         let id = rng.random_range(1000..=2000);
-                        let x = if rng.random_bool(0.7) {
-                            if let Some(p) = used_ids.iter().choose(&mut rng) {
-                                *p
-                            } else {
-                                rng.random_range(1..=260) as i64
-                            }
+                        let x = if rng.random_bool(0.7) && !used_ids.is_empty() {
+                            *used_ids.iter().choose(&mut rng).unwrap()
                         } else {
                             rng.random_range(1..=260) as i64
                         };
@@ -1251,33 +1286,27 @@ mod fuzz_tests {
                     4 => {
                         let pick = rng.random_range(1000..=2000);
                         if rng.random_bool(0.6) {
-                            let new_x = if rng.random_bool(0.7) {
-                                if let Some(p) = used_ids.iter().choose(&mut rng) {
-                                    *p
-                                } else {
-                                    rng.random_range(1..=260) as i64
-                                }
+                            let new_x = if rng.random_bool(0.7) && !used_ids.is_empty() {
+                                *used_ids.iter().choose(&mut rng).unwrap()
                             } else {
                                 rng.random_range(1..=260) as i64
                             };
                             format!("UPDATE c SET x={new_x} WHERE id={pick}")
                         } else {
-                            let new_y = rng.random_range(-10..=10);
+                            let new_y = rng.random_range(-10..=110);
                             format!("UPDATE c SET y={new_y} WHERE id={pick}")
                         }
                     }
                     5 => {
                         // UPSERT parent
                         let pick = rng.random_range(1..=250);
+                        let a = rng.random_range(-5..=30);
+                        let b = rng.random_range(-5..=30);
                         if rng.random_bool(0.5) {
-                            let a = rng.random_range(-5..=25);
-                            let b = rng.random_range(-5..=25);
                             format!(
                                 "INSERT INTO p VALUES({pick}, {a}, {b}) ON CONFLICT(id) DO UPDATE SET a=excluded.a, b=excluded.b"
                             )
                         } else {
-                            let a = rng.random_range(-5..=25);
-                            let b = rng.random_range(-5..=25);
                             format!(
                                 "INSERT INTO p VALUES({pick}, {a}, {b}) \
                              ON CONFLICT(id) DO NOTHING"
@@ -1287,31 +1316,19 @@ mod fuzz_tests {
                     6 => {
                         // UPSERT child
                         let pick = rng.random_range(1000..=2000);
+                        let x = if rng.random_bool(0.7) && !used_ids.is_empty() {
+                            *used_ids.iter().choose(&mut rng).unwrap()
+                        } else {
+                            rng.random_range(1..=260) as i64
+                        };
+                        let y = rng.random_range(-10..=110);
                         if rng.random_bool(0.5) {
-                            let x = if rng.random_bool(0.7) {
-                                if let Some(p) = used_ids.iter().choose(&mut rng) {
-                                    *p
-                                } else {
-                                    rng.random_range(1..=260) as i64
-                                }
-                            } else {
-                                rng.random_range(1..=260) as i64
-                            };
                             format!(
-                                "INSERT INTO c VALUES({pick}, {x}, 0) ON CONFLICT(id) DO UPDATE SET x=excluded.x"
+                                "INSERT INTO c VALUES({pick}, {x}, {y}) ON CONFLICT(id) DO UPDATE SET x=excluded.x, y=excluded.y"
                             )
                         } else {
-                            let x = if rng.random_bool(0.7) {
-                                if let Some(p) = used_ids.iter().choose(&mut rng) {
-                                    *p
-                                } else {
-                                    rng.random_range(1..=260) as i64
-                                }
-                            } else {
-                                rng.random_range(1..=260) as i64
-                            };
                             format!(
-                                "INSERT INTO c VALUES({pick}, {x}, 0) ON CONFLICT(id) DO NOTHING"
+                                "INSERT INTO c VALUES({pick}, {x}, {y}) ON CONFLICT(id) DO NOTHING"
                             )
                         }
                     }
@@ -1346,7 +1363,7 @@ mod fuzz_tests {
                             limbo_exec_rows(&limbo_db, &limbo, "SELECT id,x,y FROM c ORDER BY id");
 
                         if sp != lp || sc != lc {
-                            eprintln!("\n=== FK fuzz failure (state mismatch) ===");
+                            eprintln!("\n=== FK/CHECK fuzz failure (state mismatch) ===");
                             eprintln!("seed: {seed}, outer: {}", outer + 1);
                             eprintln!("last stmt: {stmt}");
                             eprintln!("sqlite p: {sp:?}\nsqlite c: {sc:?}");
@@ -1360,7 +1377,7 @@ mod fuzz_tests {
                     }
                     (Err(_), Err(_)) => { /* parity OK */ }
                     (ok_sqlite, ok_limbo) => {
-                        eprintln!("\n=== FK fuzz failure (outcome mismatch) ===");
+                        eprintln!("\n=== FK/CHECK fuzz failure (outcome mismatch) ===");
                         eprintln!("seed: {seed}, outer: {}", outer + 1);
                         eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
                         eprintln!("last stmt: {stmt}");
@@ -1374,15 +1391,16 @@ mod fuzz_tests {
                         eprintln!("sqlite p: {sp:?}\nsqlite c: {sc:?}");
                         eprintln!("turso p: {lp:?}\nturso c: {lc:?}");
                         eprintln!(
-                            "--- writing ({}) statements to fk_fuzz_statements.sql ---",
+                            "--- writing ({}) statements to fk_and_check_fuzz_statements.sql ---",
                             stmts.len()
                         );
-                        let mut file = std::fs::File::create("fk_fuzz_statements.sql").unwrap();
+                        let mut file =
+                            std::fs::File::create("fk_and_check_fuzz_statements.sql").unwrap();
                         for s in stmts.iter() {
                             let _ = file.write_fmt(format_args!("{s};\n"));
                         }
                         file.flush().unwrap();
-                        panic!("DML outcome mismatch, statements written to tests/fk_fuzz_statements.sql");
+                        panic!("DML outcome mismatch, statements written to tests/fk_and_check_fuzz_statements.sql");
                     }
                 }
             }
@@ -5540,6 +5558,675 @@ mod fuzz_tests {
                     "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\nSeed: {seed}",
                 );
             }
+        }
+    }
+
+    #[test]
+    pub fn advanced_check_constraint_fuzz() {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("advanced_check_constraint_fuzz seed: {seed}");
+
+        const OUTER_ITERS: usize = 100;
+        const INNER_ITERS: usize = 300;
+
+        for outer in 0..OUTER_ITERS {
+            println!(
+                "advanced_check_constraint_fuzz {}/{}",
+                outer + 1,
+                OUTER_ITERS
+            );
+
+            let limbo_db = TempDatabase::new_empty();
+            let sqlite_db = TempDatabase::new_empty();
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+            let mut stmts = Vec::new();
+
+            let log_and_exec = |s: &str, stmts: &mut Vec<String>| {
+                stmts.push(s.to_string());
+                s.to_string()
+            };
+
+            // Schema generation with multiple constraint types
+            let num_int_cols = rng.random_range(2..=4);
+            let num_text_cols = rng.random_range(1..=3);
+            let num_real_cols = rng.random_range(1..=2);
+
+            let mut col_defs = vec!["id INTEGER PRIMARY KEY".to_string()];
+            let mut int_cols = Vec::new();
+            let mut text_cols = Vec::new();
+            let mut real_cols = Vec::new();
+
+            // Generate INT columns with varying constraints
+            for i in 0..num_int_cols {
+                let col_name = format!("i{}", i);
+                int_cols.push(col_name.clone());
+                let mut parts = vec![col_name.clone(), "INT".to_string()];
+
+                // NOT NULL with 50% probability
+                let has_not_null = rng.random_bool(0.5);
+                if has_not_null {
+                    parts.push("NOT NULL".to_string());
+                }
+
+                // DEFAULT value with 40% probability (must be valid if CHECK exists)
+                let default_val = if rng.random_bool(0.4) {
+                    Some(rng.random_range(-20..20))
+                } else {
+                    None
+                };
+
+                // Inline CHECK constraint with 60% probability
+                let check_type = rng.random_range(0..10);
+                let check_constraint = match check_type {
+                    0 => {
+                        // Range check
+                        let min = rng.random_range(-50..0);
+                        let max = rng.random_range(1..50);
+                        Some(format!("CHECK({} BETWEEN {} AND {})", col_name, min, max))
+                    }
+                    1 => {
+                        // Greater than
+                        let threshold = rng.random_range(-30..30);
+                        Some(format!("CHECK({} > {})", col_name, threshold))
+                    }
+                    2 => {
+                        // Less than
+                        let threshold = rng.random_range(-30..30);
+                        Some(format!("CHECK({} < {})", col_name, threshold))
+                    }
+                    3 => {
+                        // IN set
+                        let vals: Vec<i32> = (0..rng.random_range(2..5))
+                            .map(|_| rng.random_range(-10..10))
+                            .collect();
+                        Some(format!(
+                            "CHECK({} IN ({}))",
+                            col_name,
+                            vals.iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                    4 => {
+                        // NOT IN set
+                        let vals: Vec<i32> = (0..rng.random_range(2..5))
+                            .map(|_| rng.random_range(-10..10))
+                            .collect();
+                        Some(format!(
+                            "CHECK({} NOT IN ({}))",
+                            col_name,
+                            vals.iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                    5 => {
+                        // Modulo check
+                        let divisor = rng.random_range(2..5);
+                        let remainder = rng.random_range(0..divisor);
+                        Some(format!("CHECK({} % {} = {})", col_name, divisor, remainder))
+                    }
+                    6 => {
+                        // Not equal
+                        let val = rng.random_range(-20..20);
+                        Some(format!("CHECK({} != {})", col_name, val))
+                    }
+                    _ => None,
+                };
+
+                if let Some(default) = default_val {
+                    parts.push(format!("DEFAULT {}", default));
+                }
+
+                if let Some(check) = check_constraint {
+                    parts.push(check);
+                }
+
+                // UNIQUE with 30% probability
+                if rng.random_bool(0.3) {
+                    parts.push("UNIQUE".to_string());
+                }
+
+                col_defs.push(parts.join(" "));
+            }
+
+            // Generate TEXT columns
+            for i in 0..num_text_cols {
+                let col_name = format!("t{}", i);
+                text_cols.push(col_name.clone());
+                let mut parts = vec![col_name.clone(), "TEXT".to_string()];
+
+                let has_not_null = rng.random_bool(0.4);
+                if has_not_null {
+                    parts.push("NOT NULL".to_string());
+                }
+
+                let default_val = if rng.random_bool(0.3) {
+                    if rng.random_bool(0.3) {
+                        Some("DEFAULT (NULL)".to_string())
+                    } else {
+                        Some(format!(
+                            "DEFAULT '{}'",
+                            if rng.random_bool(0.5) { "def" } else { "x" }
+                        ))
+                    }
+                } else {
+                    None
+                };
+
+                let check_type = rng.random_range(0..8);
+                let check_constraint = match check_type {
+                    0 => {
+                        let len = rng.random_range(2..10);
+                        Some(format!("CHECK(length({}) < {})", col_name, len))
+                    }
+                    1 => {
+                        let len = rng.random_range(1..5);
+                        Some(format!("CHECK(length({}) >= {})", col_name, len))
+                    }
+                    2 => Some(format!("CHECK({} LIKE '%ok%')", col_name)),
+                    3 => Some(format!("CHECK({} NOT LIKE '%bad%')", col_name)),
+                    4 => {
+                        let vals = vec!["'alpha'", "'beta'", "'gamma'"];
+                        Some(format!("CHECK({} IN ({}))", col_name, vals.join(", ")))
+                    }
+                    5 => Some(format!("CHECK({} != '')", col_name)),
+                    _ => None,
+                };
+
+                if let Some(default) = default_val {
+                    parts.push(default);
+                }
+
+                if let Some(check) = check_constraint {
+                    parts.push(check);
+                }
+
+                col_defs.push(parts.join(" "));
+            }
+
+            // Generate REAL columns
+            for i in 0..num_real_cols {
+                let col_name = format!("r{}", i);
+                real_cols.push(col_name.clone());
+                let mut parts = vec![col_name.clone(), "REAL".to_string()];
+
+                let has_not_null = rng.random_bool(0.4);
+                if has_not_null {
+                    parts.push("NOT NULL".to_string());
+                }
+
+                let default_val = if rng.random_bool(0.3) {
+                    Some(rng.random_range(-50.0..50.0))
+                } else {
+                    None
+                };
+
+                let check_type = rng.random_range(0..7);
+                let check_constraint = match check_type {
+                    0 => {
+                        let min = rng.random_range(-100.0..0.0);
+                        let max = rng.random_range(1.0..100.0);
+                        Some(format!("CHECK({} BETWEEN {} AND {})", col_name, min, max))
+                    }
+                    1 => {
+                        let threshold = rng.random_range(-50.0..50.0);
+                        Some(format!("CHECK({} > {})", col_name, threshold))
+                    }
+                    2 => {
+                        let threshold = rng.random_range(-50.0..50.0);
+                        Some(format!("CHECK({} < {})", col_name, threshold))
+                    }
+                    3 => Some(format!("CHECK({} >= 0.0)", col_name)),
+                    4 => Some(format!("CHECK({} != 0.0)", col_name)),
+                    _ => None,
+                };
+
+                if let Some(default) = default_val {
+                    parts.push(format!("DEFAULT {}", default));
+                }
+
+                if let Some(check) = check_constraint {
+                    parts.push(check);
+                }
+
+                col_defs.push(parts.join(" "));
+            }
+
+            // Add table-level CHECK constraints (cross-column)
+            let num_table_checks = rng.random_range(1..=3);
+            for _ in 0..num_table_checks {
+                let check_type = rng.random_range(0..15);
+                let constraint = match check_type {
+                    0 if int_cols.len() >= 2 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        format!("CHECK({} + {} < {})", c1, c2, rng.random_range(10..50))
+                    }
+                    1 if int_cols.len() >= 2 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        format!("CHECK({} > {})", c1, c2)
+                    }
+                    2 if int_cols.len() >= 2 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        format!("CHECK({} * {} < {})", c1, c2, rng.random_range(50..200))
+                    }
+                    3 if int_cols.len() >= 1 && text_cols.len() >= 1 => {
+                        let ic = &int_cols[0];
+                        let tc = &text_cols[0];
+                        let threshold = rng.random_range(0..10);
+                        format!(
+                            "CHECK(({} > {} AND {} IS NOT NULL) OR {} IS NULL)",
+                            ic, threshold, tc, tc
+                        )
+                    }
+                    4 if int_cols.len() >= 3 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        let c3 = &int_cols[2];
+                        format!("CHECK({} + {} + {} > 0)", c1, c2, c3)
+                    }
+                    5 if real_cols.len() >= 1 && int_cols.len() >= 1 => {
+                        let rc = &real_cols[0];
+                        let ic = &int_cols[0];
+                        format!("CHECK({} > {} * 1.0)", rc, ic)
+                    }
+                    6 if int_cols.len() >= 2 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        format!("CHECK(({} IS NULL AND {} IS NULL) OR ({} IS NOT NULL AND {} IS NOT NULL))", c1, c2, c1, c2)
+                    }
+                    7 if int_cols.len() >= 1 && text_cols.len() >= 1 => {
+                        let ic = &int_cols[0];
+                        let tc = &text_cols[0];
+                        let val = rng.random_range(0..10);
+                        format!(
+                            "CHECK(CASE WHEN {} > {} THEN {} NOT LIKE '%fail%' ELSE 1 END)",
+                            ic, val, tc
+                        )
+                    }
+                    8 if int_cols.len() >= 2 => {
+                        let c1 = &int_cols[0];
+                        let c2 = &int_cols[1];
+                        format!("CHECK(ABS({} - {}) < {})", c1, c2, rng.random_range(20..50))
+                    }
+                    9 if text_cols.len() >= 2 => {
+                        let t1 = &text_cols[0];
+                        let t2 = &text_cols[1];
+                        format!(
+                            "CHECK(length({}) + length({}) < {})",
+                            t1,
+                            t2,
+                            rng.random_range(10..30)
+                        )
+                    }
+                    10 if int_cols.len() >= 1 => {
+                        let ic = &int_cols[0];
+                        let min = rng.random_range(-20..0);
+                        let max = rng.random_range(1..20);
+                        format!(
+                            "CHECK({} BETWEEN {} AND {} OR {} IS NULL)",
+                            ic, min, max, ic
+                        )
+                    }
+                    11 if real_cols.len() >= 2 => {
+                        let r1 = &real_cols[0];
+                        let r2 = &real_cols[1];
+                        format!("CHECK({} + {} > 0.0)", r1, r2)
+                    }
+                    12 if int_cols.len() >= 2 && text_cols.len() >= 1 => {
+                        let i1 = &int_cols[0];
+                        let i2 = &int_cols[1];
+                        let tc = &text_cols[0];
+                        format!(
+                            "CHECK(({} > {} AND {} = 'valid') OR {} <= {})",
+                            i1, i2, tc, i1, i2
+                        )
+                    }
+                    _ => {
+                        // Fallback: simple constraint on first int column if available
+                        if !int_cols.is_empty() {
+                            format!(
+                                "CHECK({} IS NOT NULL OR {} IS NULL)",
+                                int_cols[0], int_cols[0]
+                            )
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                col_defs.push(constraint);
+            }
+
+            let ddl = log_and_exec(
+                &format!("CREATE TABLE t({})", col_defs.join(", ")),
+                &mut stmts,
+            );
+            limbo_exec_rows(&limbo_db, &limbo, &ddl);
+            sqlite.execute(&ddl, params![]).unwrap();
+
+            // DML operations with intentional constraint violations
+            for i in 0..INNER_ITERS {
+                let op = rng.random_range(0..10);
+                let stmt = match op {
+                    0..=4 => {
+                        // INSERT operations (50% of operations)
+                        let id = 1000 + i;
+                        let insert_mode = rng.random_range(0..10);
+
+                        match insert_mode {
+                            0..=2 => {
+                                // Omit random columns to test DEFAULTs (30%)
+                                let mut cols = vec!["id".to_string()];
+                                let mut vals = vec![id.to_string()];
+
+                                for col in int_cols.iter() {
+                                    if rng.random_bool(0.6) {
+                                        cols.push(col.clone());
+                                        vals.push(rng.random_range(-30..30).to_string());
+                                    }
+                                }
+
+                                for col in text_cols.iter() {
+                                    if rng.random_bool(0.6) {
+                                        cols.push(col.clone());
+                                        let text_choices =
+                                            vec!["'ok'", "'test'", "'valid'", "'alpha'", "'beta'"];
+                                        vals.push(
+                                            text_choices.choose(&mut rng).unwrap().to_string(),
+                                        );
+                                    }
+                                }
+
+                                for col in real_cols.iter() {
+                                    if rng.random_bool(0.6) {
+                                        cols.push(col.clone());
+                                        vals.push(rng.random_range(-50.0..50.0).to_string());
+                                    }
+                                }
+
+                                log_and_exec(
+                                    &format!(
+                                        "INSERT INTO t ({}) VALUES ({})",
+                                        cols.join(", "),
+                                        vals.join(", ")
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                            3..=5 => {
+                                // Boundary violations for INT checks (30%)
+                                let mut cols = vec!["id".to_string()];
+                                let mut vals = vec![id.to_string()];
+
+                                for col in int_cols.iter() {
+                                    cols.push(col.clone());
+                                    let boundary_val = if rng.random_bool(0.5) {
+                                        rng.random_range(-100..-50) // Very negative
+                                    } else {
+                                        rng.random_range(50..100) // Very positive
+                                    };
+                                    vals.push(boundary_val.to_string());
+                                }
+
+                                for col in text_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push("'ok'".to_string());
+                                }
+
+                                for col in real_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(rng.random_range(-10.0..10.0).to_string());
+                                }
+
+                                log_and_exec(
+                                    &format!(
+                                        "INSERT INTO t ({}) VALUES ({})",
+                                        cols.join(", "),
+                                        vals.join(", ")
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                            6..=7 => {
+                                // TEXT constraint violations (20%)
+                                let mut cols = vec!["id".to_string()];
+                                let mut vals = vec![id.to_string()];
+
+                                for col in int_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(rng.random_range(-10..10).to_string());
+                                }
+
+                                for col in text_cols.iter() {
+                                    cols.push(col.clone());
+                                    let bad_texts = vec![
+                                        "'this_is_a_very_long_string_that_will_fail_length_checks'",
+                                        "'bad'",
+                                        "''",
+                                        "'fail_keyword_present'",
+                                        "'xxxxxxxxxxxxxxxxxxxxx'",
+                                    ];
+                                    vals.push(bad_texts.choose(&mut rng).unwrap().to_string());
+                                }
+
+                                for col in real_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(rng.random_range(-10.0..10.0).to_string());
+                                }
+
+                                log_and_exec(
+                                    &format!(
+                                        "INSERT INTO t ({}) VALUES ({})",
+                                        cols.join(", "),
+                                        vals.join(", ")
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                            8 => {
+                                // NULL violations (10%)
+                                let mut cols = vec!["id".to_string()];
+                                let mut vals = vec![id.to_string()];
+
+                                for col in int_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(if rng.random_bool(0.3) {
+                                        "NULL".to_string()
+                                    } else {
+                                        rng.random_range(-10..10).to_string()
+                                    });
+                                }
+
+                                for col in text_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(if rng.random_bool(0.3) {
+                                        "NULL".to_string()
+                                    } else {
+                                        "'ok'".to_string()
+                                    });
+                                }
+
+                                for col in real_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(if rng.random_bool(0.3) {
+                                        "NULL".to_string()
+                                    } else {
+                                        rng.random_range(-10.0..10.0).to_string()
+                                    });
+                                }
+
+                                log_and_exec(
+                                    &format!(
+                                        "INSERT INTO t ({}) VALUES ({})",
+                                        cols.join(", "),
+                                        vals.join(", ")
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                            _ => {
+                                // Cross-column constraint violations (10%)
+                                let mut cols = vec!["id".to_string()];
+                                let mut vals = vec![id.to_string()];
+
+                                if int_cols.len() >= 2 {
+                                    cols.push(int_cols[0].clone());
+                                    cols.push(int_cols[1].clone());
+                                    let v1 = rng.random_range(40..60);
+                                    let v2 = rng.random_range(40..60);
+                                    vals.push(v1.to_string());
+                                    vals.push(v2.to_string());
+                                }
+
+                                for col in int_cols.iter().skip(2) {
+                                    cols.push(col.clone());
+                                    vals.push(rng.random_range(-100..-50).to_string());
+                                }
+
+                                for col in text_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push("'fail_pattern'".to_string());
+                                }
+
+                                for col in real_cols.iter() {
+                                    cols.push(col.clone());
+                                    vals.push(rng.random_range(-100.0..-50.0).to_string());
+                                }
+
+                                log_and_exec(
+                                    &format!(
+                                        "INSERT INTO t ({}) VALUES ({})",
+                                        cols.join(", "),
+                                        vals.join(", ")
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                        }
+                    }
+                    5..=7 => {
+                        // UPDATE operations (30% of operations)
+                        let target_id = 1000 + rng.random_range(0..i.max(1));
+                        let update_mode = rng.random_range(0..8);
+
+                        match update_mode {
+                            0..=2 => {
+                                // Update to violate range constraints (37.5%)
+                                let set_clauses: Vec<String> = int_cols
+                                    .iter()
+                                    .take(rng.random_range(1..=int_cols.len().min(2)))
+                                    .map(|col| format!("{}={}", col, rng.random_range(-100..-50)))
+                                    .collect();
+                                log_and_exec(
+                                    &format!(
+                                        "UPDATE t SET {} WHERE id={}",
+                                        set_clauses.join(", "),
+                                        target_id
+                                    ),
+                                    &mut stmts,
+                                )
+                            }
+                            3..=4 => {
+                                // Update to violate cross-column constraints (25%)
+                                if int_cols.len() >= 2 {
+                                    let v1 = rng.random_range(45..55);
+                                    let v2 = rng.random_range(45..55);
+                                    log_and_exec(
+                                        &format!(
+                                            "UPDATE t SET {}={}, {}={} WHERE id={}",
+                                            int_cols[0], v1, int_cols[1], v2, target_id
+                                        ),
+                                        &mut stmts,
+                                    )
+                                } else {
+                                    log_and_exec(
+                                        &format!(
+                                            "UPDATE t SET {}={} WHERE id={}",
+                                            int_cols[0],
+                                            rng.random_range(-50..-30),
+                                            target_id
+                                        ),
+                                        &mut stmts,
+                                    )
+                                }
+                            }
+                            5..=6 => {
+                                // Update TEXT to violate constraints (25%)
+                                if !text_cols.is_empty() {
+                                    let bad_text = "'this_string_is_way_too_long_for_any_reasonable_length_constraint_fail_bad'";
+                                    log_and_exec(
+                                        &format!(
+                                            "UPDATE t SET {}={} WHERE id={}",
+                                            text_cols[0], bad_text, target_id
+                                        ),
+                                        &mut stmts,
+                                    )
+                                } else {
+                                    log_and_exec(
+                                        &format!(
+                                            "UPDATE t SET {}={} WHERE id={}",
+                                            int_cols[0],
+                                            rng.random_range(-10..10),
+                                            target_id
+                                        ),
+                                        &mut stmts,
+                                    )
+                                }
+                            }
+                            _ => {
+                                // Update to NULL (12.5%)
+                                let col = if rng.random_bool(0.5) && !int_cols.is_empty() {
+                                    int_cols.choose(&mut rng).unwrap()
+                                } else if !text_cols.is_empty() {
+                                    text_cols.choose(&mut rng).unwrap()
+                                } else if !real_cols.is_empty() {
+                                    real_cols.choose(&mut rng).unwrap()
+                                } else {
+                                    &int_cols[0]
+                                };
+                                log_and_exec(
+                                    &format!("UPDATE t SET {}=NULL WHERE id={}", col, target_id),
+                                    &mut stmts,
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        // DELETE operations (20% of operations)
+                        let target_id = 1000 + rng.random_range(0..i.max(1));
+                        log_and_exec(&format!("DELETE FROM t WHERE id={}", target_id), &mut stmts)
+                    }
+                };
+
+                let s_res = sqlite.execute(&stmt, params![]);
+                let l_res = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                if s_res.is_ok() != l_res.is_ok() {
+                    eprintln!("\n=== CHECK Constraint Outcome Mismatch ===");
+                    eprintln!("seed: {seed}, outer: {outer}, inner: {i}");
+                    eprintln!("sqlite: {s_res:?}, limbo: {l_res:?}");
+                    eprintln!("Failing statement: {stmt}");
+                    eprintln!("--- Full SQL Replay ---");
+                    for s in stmts.iter() {
+                        eprintln!("{s};");
+                    }
+                    panic!("Engines disagreed on CHECK constraint outcome");
+                }
+            }
+
+            let s_data = sqlite_exec_rows(&sqlite, "SELECT * FROM t ORDER BY id");
+            let l_data = limbo_exec_rows(&limbo_db, &limbo, "SELECT * FROM t ORDER BY id");
+            assert_eq!(
+                s_data, l_data,
+                "Table state mismatch. Seed: {seed}, outer: {outer}"
+            );
         }
     }
 }

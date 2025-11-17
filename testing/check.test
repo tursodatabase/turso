@@ -217,3 +217,16 @@ do_execsql_test_on_specific_db {:memory:} check-insert-or-ignore-ok {
 #}
 
 
+do_execsql_test_on_specific_db {:memory:} check-insert-or-ignore-check {
+    DROP TABLE IF EXISTS t;
+
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        i0 INT,
+        t0 TEXT DEFAULT 'def',
+        CHECK((i0 > 5 AND t0 IS NOT NULL) OR t0 IS NULL)
+    );
+
+    INSERT INTO t (id) VALUES (1);
+    SELECT * FROM t;
+} {1||def}
