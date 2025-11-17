@@ -13,14 +13,13 @@ use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
+    compare_immutable, compare_records_generic, AsValueRef, Extendable, FromExtValue,
+    IOCompletions, ImmutableRecord, SeekResult, Text, ToExtValue,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
-use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
@@ -39,7 +38,7 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
+use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, ExecValue, MvCursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
@@ -47,6 +46,9 @@ use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
     sync::{atomic::Ordering, Arc, Mutex},
+};
+use turso_common::schema::affinity::{
+    apply_numeric_affinity, try_for_float, Affinity, ParsedNumber,
 };
 use turso_macros::match_ignore_ascii_case;
 

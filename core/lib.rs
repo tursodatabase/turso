@@ -35,10 +35,10 @@ pub mod vector;
 mod vtab;
 
 #[cfg(feature = "fuzz")]
-pub mod numeric;
+pub use turso_common::numeric;
 
 #[cfg(not(feature = "fuzz"))]
-mod numeric;
+use turso_common::numeric;
 
 use crate::index_method::IndexMethod;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
@@ -109,7 +109,8 @@ pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
-    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, Register,
+    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
+    value::ExecValue, Register,
 };
 
 /// Configuration for database features
