@@ -17,7 +17,7 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption"]
+default = ["fs", "uuid", "time", "json", "series", "encryption", "fts"]
 antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
@@ -36,6 +36,7 @@ checksum = []
 cli_only = []
 test_helper = []
 bench = []
+fts = ["dep:tantivy"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -95,6 +96,7 @@ branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
 fastbloom = "0.14.1"
+tantivy = { version = "0.25.0", optional = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }

@@ -2183,6 +2183,19 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
+                #[cfg(feature = "fts")]
+                Func::Fts(_) => {
+                    // FTS functions are handled via index method pattern matching.
+                    // If we reach here, no index matched, so translate as a regular function call.
+                    translate_function(
+                        program,
+                        args,
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
                 Func::AlterTable(_) => unreachable!(),
             }
         }
