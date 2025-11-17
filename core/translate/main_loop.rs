@@ -1,3 +1,4 @@
+use turso_common::schema::affinity::{self, Affinity};
 use turso_parser::ast::{fmt::ToTokens, SortOrder};
 
 use std::sync::Arc;
@@ -18,6 +19,13 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
+use crate::translate::{
+    collate::get_collseq_from_expr,
+    emitter::UpdateRowSource,
+    plan::{EvalAt, NonFromClauseSubquery},
+    subquery::emit_non_from_clause_subquery,
+    window::emit_window_loop_source,
+};
 use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
@@ -27,22 +35,11 @@ use crate::{
     },
     types::SeekOp,
     vdbe::{
-        affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
-};
-use crate::{
-    translate::{
-        collate::get_collseq_from_expr,
-        emitter::UpdateRowSource,
-        plan::{EvalAt, NonFromClauseSubquery},
-        subquery::emit_non_from_clause_subquery,
-        window::emit_window_loop_source,
-    },
-    vdbe::affinity::Affinity,
 };
 
 // Metadata for handling LEFT JOIN operations

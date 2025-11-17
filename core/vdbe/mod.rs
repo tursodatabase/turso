@@ -17,7 +17,6 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
-pub mod affinity;
 pub mod builder;
 pub mod execute;
 pub mod explain;
