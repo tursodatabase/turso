@@ -1207,3 +1207,34 @@ do_execsql_test_in_memory_any_error fk-update-parent-multi-col-pk-2 {
   INSERT INTO child VALUES(1, 2);
   UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
 }
+
+# https://github.com/tursodatabase/turso/issues/3965
+do_execsql_test_on_specific_db {:memory:} fk-no-val-on-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(
+    a INT,
+    b INT
+  );
+  CREATE TABLE t2(
+    x INT,
+    y INT,
+    FOREIGN KEY (x, y) REFERENCES t1(a, b)
+  );
+  INSERT INTO t1(a, b) VALUES (5, 10);
+  SELECT * FROM t1;
+ } {5|10}
+
+ do_execsql_test_in_memory_any_error fk-val-on-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t1(
+    a INT,
+    b INT
+  );
+  CREATE TABLE t2(
+    x INT,
+    y INT,
+    FOREIGN KEY (x, y) REFERENCES t1(a, b)
+  );
+  INSERT INTO t2(a, b) VALUES (5, 10);
+  SELECT * FROM t2;
+ }

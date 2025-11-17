@@ -1648,7 +1648,7 @@ fn translate_column(
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
-        let nullable = !column.notnull() && !column.primary_key() && !column.unique();
+        let nullable = !column.notnull() && !column.primary_key();
         if !nullable {
             crate::bail_parse_error!(
                 "column {} is not nullable",
