@@ -412,6 +412,9 @@ pub fn translate_insert(
     }
 
     let mut insert_flags = InsertFlags::new();
+
+    // For the case of OR REPLACE, we need to force a seek on the insert, as we may have
+    // already deleted the conflicting row and the cursor is not guaranteed to be positioned.
     if matches!(ctx.on_conflict, ResolveType::Replace) {
         insert_flags = insert_flags.require_seek();
     }
