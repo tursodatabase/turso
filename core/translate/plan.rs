@@ -5,7 +5,7 @@ use turso_parser::ast::{
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::get_collseq_from_expr, emitter::UpdateRowSource,
         optimizer::constraints::SeekRangeConstraint,
@@ -921,11 +921,7 @@ impl JoinedTable {
                     None,
                     Type::Blob, // FIXME: infer proper type
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 )
             })
             .collect::<Vec<_>>();

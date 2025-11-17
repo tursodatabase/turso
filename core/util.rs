@@ -1,6 +1,7 @@
 #![allow(unused)]
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
+use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::plan::JoinedTable;
@@ -1387,11 +1388,7 @@ pub fn extract_view_columns(
                                         None,
                                         table_column.ty(),
                                         table_column.collation_opt(),
-                                        false,
-                                        false,
-                                        false,
-                                        false,
-                                        false,
+                                        ColDef::default(),
                                     ),
                                 });
                             }
@@ -1437,11 +1434,7 @@ pub fn extract_view_columns(
                                         None,
                                         table_column.ty(),
                                         table_column.collation_opt(),
-                                        false,
-                                        false,
-                                        false,
-                                        false,
-                                        false,
+                                        ColDef::default(),
                                     ),
                                 });
                             }

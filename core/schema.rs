@@ -973,7 +973,6 @@ impl Schema {
                 out.push(ResolvedFkRef {
                     child_table: Arc::clone(&child),
                     fk: Arc::clone(fk),
-                    parent_cols,
                     child_cols,
                     child_pos,
                     parent_pos,
@@ -1089,7 +1088,6 @@ impl Schema {
             out.push(ResolvedFkRef {
                 child_table: Arc::clone(&child),
                 fk: Arc::clone(fk),
-                parent_cols,
                 child_cols,
                 child_pos,
                 parent_pos,
@@ -1836,11 +1834,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     default,
                     ty,
                     collation,
-                    primary_key,
-                    typename_exactly_integer && primary_key && !primary_key_desc_columns_constraint,
-                    notnull,
-                    unique,
-                    false,
+                    ColDef {
+                        primary_key,
+                        rowid_alias: typename_exactly_integer
+                            && primary_key
+                            && !primary_key_desc_columns_constraint,
+                        notnull,
+                        unique,
+                        hidden: false,
+                    },
                 ));
             }
             if options.contains(TableOptions::WITHOUT_ROWID) {
@@ -2000,9 +2002,7 @@ pub struct ResolvedFkRef {
     pub fk: Arc<ForeignKey>,
 
     /// Resolved, normalized column names.
-    pub parent_cols: Vec<String>,
     pub child_cols: Vec<String>,
-
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: Vec<usize>,
     pub parent_pos: Vec<usize>,
@@ -2071,6 +2071,15 @@ pub struct Column {
     raw: u16,
 }
 
+#[derive(Default)]
+pub struct ColDef {
+    pub primary_key: bool,
+    pub rowid_alias: bool,
+    pub notnull: bool,
+    pub unique: bool,
+    pub hidden: bool,
+}
+
 // flags
 const F_PRIMARY_KEY: u16 = 1;
 const F_ROWID_ALIAS: u16 = 2;
@@ -2088,25 +2097,14 @@ impl Column {
     pub fn affinity(&self) -> Affinity {
         Affinity::affinity(&self.ty_str)
     }
-    pub const fn new_default_text(
+    pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
     ) -> Self {
-        Self::new(
-            name,
-            ty_str,
-            default,
-            Type::Text,
-            None,
-            false,
-            false,
-            false,
-            false,
-            false,
-        )
+        Self::new(name, ty_str, default, Type::Text, None, ColDef::default())
     }
-    pub const fn new_default_integer(
+    pub fn new_default_integer(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
@@ -2117,45 +2115,36 @@ impl Column {
             default,
             Type::Integer,
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
+            ColDef::default(),
         )
     }
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
         ty: Type,
         col: Option<CollationSeq>,
-        primary_key: bool,
-        rowid_alias: bool,
-        notnull: bool,
-        unique: bool,
-        hidden: bool,
+        coldef: ColDef,
     ) -> Self {
         let mut raw = 0u16;
         raw |= (ty as u16) << TYPE_SHIFT;
         if let Some(c) = col {
             raw |= (c as u16) << COLL_SHIFT;
         }
-        if primary_key {
+        if coldef.primary_key {
             raw |= F_PRIMARY_KEY
         }
-        if rowid_alias {
+        if coldef.rowid_alias {
             raw |= F_ROWID_ALIAS
         }
-        if notnull {
+        if coldef.notnull {
             raw |= F_NOTNULL
         }
-        if unique {
+        if coldef.unique {
             raw |= F_UNIQUE
         }
-        if hidden {
+        if coldef.hidden {
             raw |= F_HIDDEN
         }
         Self {
@@ -2305,11 +2294,13 @@ impl From<&ColumnDefinition> for Column {
             default,
             ty,
             collation,
-            primary_key,
-            primary_key && matches!(ty, Type::Integer),
-            notnull,
-            unique,
-            hidden,
+            ColDef {
+                primary_key,
+                rowid_alias: primary_key && matches!(ty, Type::Integer),
+                notnull,
+                unique,
+                hidden,
+            },
         )
     }
 }

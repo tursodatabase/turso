@@ -2378,7 +2378,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
@@ -2397,11 +2397,12 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
                 SchemaColumn::new_default_integer(
@@ -2432,11 +2433,12 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
                 ),
                 SchemaColumn::new_default_integer(
                     Some("user_id".to_string()),
@@ -2454,11 +2456,7 @@ mod tests {
                     None,
                     Type::Real,
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 ),
             ],
             has_rowid: true,
@@ -2483,11 +2481,12 @@ mod tests {
                     None,
                     Type::Integer,
                     None,
-                    true,
-                    true,
-                    true,
-                    false,
-                    false,
+                    ColDef {
+                        primary_key: true,
+                        rowid_alias: true,
+                        notnull: true,
+                        ..Default::default()
+                    },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
                 SchemaColumn::new(
@@ -2496,11 +2495,7 @@ mod tests {
                     None,
                     Type::Real,
                     None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
+                    ColDef::default(),
                 ),
                 SchemaColumn::new_default_integer(
                     Some("product_id".to_string()),
