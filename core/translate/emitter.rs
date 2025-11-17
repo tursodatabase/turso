@@ -609,7 +609,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done);
+            emit_guarded_fk_decrement(program, done, true);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -657,7 +657,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok);
+            emit_guarded_fk_decrement(program, ok, true);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }

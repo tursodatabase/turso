@@ -872,3 +872,182 @@ do_execsql_test_on_specific_db {:memory:} insert-999999999 {
     insert into t(a, a) values (2, 3);
     select * from t;
 } {2}
+
+do_execsql_test_on_specific_db {:memory:} insert-on-conflict-do-nothing-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+    INSERT OR IGNORE INTO t values (2, 'baz');
+    SELECT * FROM t;
+} {2|foo
+3|bar}
+
+do_execsql_test_on_specific_db {:memory:} insert-on-conflict-replace-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+    INSERT OR REPLACE INTO t values (2, 'baz');
+    SELECT * FROM t ORDER BY a;
+} {2|baz
+3|bar}
+
+do_execsql_test_on_specific_db {:memory:} insert-on-conflict-do-nothing-multiple-rows {
+    CREATE TABLE t(a unique);
+    INSERT INTO t VALUES (2),(3);
+    INSERT OR IGNORE INTO t values (1),(2),(3);
+    SELECT * FROM t order by a;
+} {1
+2
+3}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-ignore-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR IGNORE INTO t VALUES (2,'yy'),(3,'z'),(2,'zzz');
+    SELECT a, b FROM t ORDER BY a;
+} {1|x
+2|y
+3|z}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-ignore-selfdup-values {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT OR IGNORE INTO t VALUES (1,'one'),(1,'two'),(1,'three');
+    SELECT a, b FROM t ORDER BY a;
+} {1|one}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-ignore-selfdup-values-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (100,1);
+    INSERT INTO t(a,b) VALUES (200,1) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+} {100|1}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-ignore-selfdup-multirow-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (1,10),(2,20);
+    INSERT INTO t(a,b) VALUES (3,30),(4,30) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+} {1|10
+2|20
+3|30}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+} {1|x
+2|yy
+3|z}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-selfdup-values-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+} {5|three}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-existing-then-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (5,'orig');
+    INSERT OR REPLACE INTO t VALUES (5,'first'),(5,'second');
+    SELECT a,b FROM t;
+} {5|second}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-pk-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,'foo'),(1,'bar');
+    SELECT a,b FROM t;
+} {1|bar}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-from-select-selfdup {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(1),(2);
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT OR REPLACE INTO t SELECT x FROM src;
+    SELECT a FROM t ORDER BY a;
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-notnull-default-existing-null {
+    CREATE TABLE t(
+      a INTEGER PRIMARY KEY,
+      b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+    SELECT a,b FROM t;
+} {1|d}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-notnull-default-existing-omit {
+    CREATE TABLE t(
+      a INTEGER PRIMARY KEY,
+      b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+    INSERT OR REPLACE INTO t(a) VALUES (1);
+    SELECT a,b FROM t;
+} {1|d}
+
+
+# need to assert row survival after failed REPLACE due to NOT NULL constraint
+# so we create table t here
+do_execsql_test 1.0 {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t VALUES (1,'x');
+} {}
+
+do_execsql_test_any_error 1.1 {
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+}
+
+do_execsql_test 1.2 {
+    SELECT a,b FROM t;
+} {1|x}
+
+# drop the table created above as not to alter the testing db
+do_execsql_test drop-t {
+	DROP TABLE t;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-composite-unique-existing {
+    CREATE TABLE t(
+      a INTEGER,
+      b INTEGER,
+      c TEXT,
+      UNIQUE(a,b)
+    );
+    INSERT INTO t VALUES (1,1,'x'),(1,2,'y');
+    INSERT OR REPLACE INTO t VALUES (1,2,'yy');
+    SELECT a,b,c FROM t ORDER BY a,b;
+} {1|1|x
+1|2|yy}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-composite-unique-selfdup-lastwins {
+    CREATE TABLE t(
+      a INTEGER,
+      b INTEGER,
+      c TEXT,
+      UNIQUE(a,b)
+    );
+    INSERT OR REPLACE INTO t VALUES
+      (1,1,'one'),
+      (1,1,'two'),
+      (1,1,'three');
+    SELECT a,b,c FROM t;
+} {1|1|three}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-unique-index-existing {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+} {1|x
+2|yy
+3|z}
+
+do_execsql_test_on_specific_db {:memory:} onconflict-replace-unique-index-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+} {5|three}
+

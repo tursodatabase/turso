@@ -10,7 +10,6 @@ use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
-use crate::translate::plan::TableReferences;
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::Connection;
@@ -344,7 +343,6 @@ pub fn emit_upsert(
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
-    table_references: &TableReferences,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT
     program.emit_insn(Insn::SeekRowid {
@@ -828,7 +826,7 @@ pub fn emit_upsert(
     if !returning.is_empty() {
         emit_returning_results(
             program,
-            table_references,
+            ctx.table_references,
             returning,
             new_start,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),

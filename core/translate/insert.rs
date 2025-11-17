@@ -9,15 +9,16 @@ use crate::error::{
 };
 use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
-    emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary, OperationMode,
+    emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
+    OperationMode,
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
     BindingBehavior, WalkControl,
 };
 use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement, index_probe,
-    open_read_index, open_read_table,
+    build_index_affinity_string, emit_fk_delete_parent_existence_checks, emit_fk_violation,
+    emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
 };
 use crate::translate::plan::{
     ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences,
@@ -28,7 +29,7 @@ use crate::translate::upsert::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::ProgramBuilderOpts;
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::BranchOffset;
 use crate::{
@@ -93,6 +94,7 @@ pub struct TempTableCtx {
 pub struct InsertEmitCtx<'a> {
     /// Parent table being inserted into
     pub table: &'a Arc<BTreeTable>,
+    pub table_references: &'a mut TableReferences,
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
@@ -126,7 +128,6 @@ pub struct InsertEmitCtx<'a> {
     pub key_generation_label: BranchOffset,
     /// Jump here when the insert value SELECT source has been fully exhausted
     pub select_exhausted_label: Option<BranchOffset>,
-
     /// CDC table info
     pub cdc_table: Option<(usize, Arc<BTreeTable>)>,
     /// Autoincrement sequence table info
@@ -134,6 +135,7 @@ pub struct InsertEmitCtx<'a> {
 }
 
 impl<'a> InsertEmitCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         program: &mut ProgramBuilder,
         resolver: &Resolver,
@@ -142,6 +144,7 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
+        table_references: &'a mut TableReferences,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices = resolver.schema.get_indices(table.name.as_str());
@@ -161,6 +164,7 @@ impl<'a> InsertEmitCtx<'a> {
         let key_generation_label = program.allocate_label();
         Ok(Self {
             table,
+            table_references,
             idx_cursors,
             temp_table_ctx,
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
@@ -276,6 +280,7 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
+        &mut table_references,
     )?;
 
     program = init_source_emission(
@@ -363,14 +368,15 @@ pub fn translate_insert(
     // invalid index entries before we hit a conflict down the line.
     emit_preflight_constraint_checks(
         &mut program,
-        &ctx,
+        &mut ctx,
         resolver,
         &insertion,
         &upsert_actions,
         &constraints,
+        connection,
     )?;
 
-    emit_notnulls(&mut program, &ctx, &insertion);
+    let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
     let affinity_str = insertion
@@ -378,6 +384,10 @@ pub fn translate_insert(
         .iter()
         .map(|col_mapping| col_mapping.column.affinity().aff_mask())
         .collect::<String>();
+
+    if let Some(lbl) = notnull_resume_label {
+        program.preassign_label_to_next_insn(lbl);
+    }
     program.emit_insn(Insn::MakeRecord {
         start_reg: insertion.first_col_register(),
         count: insertion.col_mappings.len(),
@@ -401,17 +411,33 @@ pub fn translate_insert(
         )?;
     }
 
+    let mut insert_flags = InsertFlags::new();
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+
+    // For the case of OR REPLACE, we need to force a seek on the insert, as we may have
+    // already deleted the conflicting row and the cursor is not guaranteed to be positioned.
+    if on_replace {
+        insert_flags = insert_flags.require_seek();
+    }
     program.emit_insn(Insn::Insert {
         cursor: ctx.cursor_id,
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
-        flag: InsertFlags::new(),
+        flag: insert_flags,
         table_name: table_name.to_string(),
     });
 
     if has_fks {
         // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        emit_parent_side_fk_decrement_on_insert(&mut program, resolver, &btree_table, &insertion)?;
+        // For REPLACE: delete increments counters above; the insert path should try to repay
+        // them, even for immediate/self-ref FKs.
+        emit_parent_side_fk_decrement_on_insert(
+            &mut program,
+            resolver,
+            &btree_table,
+            &insertion,
+            on_replace,
+        )?;
     }
 
     if let Some(AutoincMeta {
@@ -476,7 +502,7 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         emit_returning_results(
             &mut program,
-            &table_references,
+            ctx.table_references,
             &result_columns,
             insertion.first_col_register(),
             insertion.key_register(),
@@ -496,7 +522,6 @@ pub fn translate_insert(
             &table,
             &mut result_columns,
             connection,
-            &table_references,
         )?;
     }
 
@@ -765,7 +790,6 @@ fn resolve_upserts(
     table: &Table,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
-    table_references: &TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -788,7 +812,6 @@ fn resolve_upserts(
                 resolver,
                 result_columns,
                 connection,
-                table_references,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -876,7 +899,14 @@ fn init_autoincrement(
     Ok(())
 }
 
-fn emit_notnulls(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &Insertion) {
+fn emit_notnulls(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    insertion: &Insertion,
+    resolver: &Resolver,
+) -> Result<Option<BranchOffset>> {
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+    let mut pending_resume_label = None;
     for column_mapping in insertion
         .col_mappings
         .iter()
@@ -885,6 +915,48 @@ fn emit_notnulls(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &
         // if this is rowid alias - turso-db will emit NULL as a column value and always use rowid for the row as a column value
         if column_mapping.column.is_rowid_alias() {
             continue;
+        }
+
+        // If a NOT NULL constraint violation occurs, the REPLACE conflict resolution replaces the NULL value with the default value for that column,
+        // or if the column has no default value, then the ABORT algorithm is used
+        if on_replace {
+            if let Some(default_expr) = column_mapping.column.default.as_ref() {
+                let default_label = {
+                    if let Some(lbl) = pending_resume_label {
+                        lbl
+                    } else {
+                        program.allocate_label()
+                    }
+                };
+                let resume_label = program.allocate_label();
+
+                program.emit_insn(Insn::IsNull {
+                    reg: column_mapping.register,
+                    target_pc: default_label,
+                });
+
+                program.emit_insn(Insn::Goto {
+                    target_pc: resume_label,
+                });
+
+                program.resolve_label(default_label, program.offset());
+
+                // Evaluate default expression into the column register.
+                translate_expr_no_constant_opt(
+                    program,
+                    None,
+                    default_expr,
+                    column_mapping.register,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+
+                program.emit_insn(Insn::Goto {
+                    target_pc: resume_label,
+                });
+                pending_resume_label = Some(resume_label);
+            }
+            // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
         program.emit_insn(Insn::HaltIfNull {
             target_reg: column_mapping.register,
@@ -913,6 +985,7 @@ fn emit_notnulls(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &
             },
         });
     }
+    Ok(pending_resume_label)
 }
 
 struct BoundInsertResult {
@@ -1002,14 +1075,12 @@ fn bind_insert(
                 next: None,
             }));
         }
-        ResolveType::Abort => {
-            // This is the default conflict resolution strategy for INSERT in SQLite.
+        ResolveType::Abort | ResolveType::Replace => {
+            // Abort is the default conflict resolution strategy for INSERT in SQLite,
+            // and we implement Replace.
         }
         _ => {
-            crate::bail_parse_error!(
-                "INSERT OR {} is only supported with UPSERT",
-                on_conflict.to_string()
-            );
+            crate::bail_parse_error!("INSERT OR {} is not yet supported", on_conflict.to_string());
         }
     }
     while let Some(mut upsert_opt) = upsert.take() {
@@ -1100,7 +1171,10 @@ fn init_source_emission<'a>(
             {
                 (
                     values.len(),
-                    program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone())),
+                    program.alloc_cursor_id_keyed(
+                        CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                        CursorType::BTreeTable(ctx.table.clone()),
+                    ),
                 )
             } else {
                 // Multiple rows - use coroutine for value population
@@ -1132,8 +1206,10 @@ fn init_source_emission<'a>(
 
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
                 program.preassign_label_to_next_insn(jump_on_definition_label);
-
-                let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone()));
+                let cursor_id = program.alloc_cursor_id_keyed(
+                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorType::BTreeTable(ctx.table.clone()),
+                );
 
                 // From SQLite
                 /* Set useTempTable to TRUE if the result of the SELECT statement
@@ -1260,7 +1336,10 @@ fn init_source_emission<'a>(
             }));
             (
                 num_values,
-                program.alloc_cursor_id(CursorType::BTreeTable(ctx.table.clone())),
+                program.alloc_cursor_id_keyed(
+                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorType::BTreeTable(ctx.table.clone()),
+                ),
             )
         }
     };
@@ -1678,12 +1757,14 @@ fn translate_column(
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
-    ctx: &InsertEmitCtx,
+    ctx: &mut InsertEmitCtx,
     resolver: &Resolver,
     insertion: &Insertion,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     constraints: &ConstraintsToCheck,
+    connection: &Arc<Connection>,
 ) -> Result<()> {
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
             ResolvedUpsertTarget::PrimaryKey => {
@@ -1698,6 +1779,19 @@ fn emit_preflight_constraint_checks(
                 // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
                 // emit Halt for every case *except* when upsert handles the conflict
                 'emit_halt: {
+                    if on_replace {
+                        // copy the conflicting rowid into the key register and delete the existing row inline
+                        program.emit_insn(Insn::Copy {
+                            src_reg: insertion.key_register(),
+                            dst_reg: ctx.conflict_rowid_reg,
+                            extra_amount: 0,
+                        });
+                        emit_replace_delete_conflicting_row(program, resolver, connection, ctx)?;
+                        program.emit_insn(Insn::Goto {
+                            target_pc: make_record_label,
+                        });
+                        break 'emit_halt;
+                    }
                     if let Some(position) = position.or(constraints.upsert_catch_all_position) {
                         // PK conflict: the conflicting rowid is exactly the attempted key
                         program.emit_insn(Insn::Copy {
@@ -1804,7 +1898,6 @@ fn emit_preflight_constraint_checks(
                             record_reg: idx_start_reg,
                             num_regs: num_cols,
                         });
-
                         // Conflict detected, figure out if this UPSERT handles the conflict
                         if let Some(position) = position.or(constraints.upsert_catch_all_position) {
                             match &upsert_actions[position].2.do_clause {
@@ -1847,14 +1940,25 @@ fn emit_preflight_constraint_checks(
                             record_reg: idx_start_reg,
                             num_regs: num_cols,
                         });
-                        // Unique violation without ON CONFLICT clause -> error
-                        program.emit_insn(Insn::Halt {
-                            err_code: SQLITE_CONSTRAINT_UNIQUE,
-                            description: format_unique_violation_desc(
-                                ctx.table.name.as_str(),
-                                index,
-                            ),
-                        });
+                        if on_replace {
+                            program.emit_insn(Insn::IdxRowId {
+                                cursor_id: idx_cursor_id,
+                                dest: ctx.conflict_rowid_reg,
+                            });
+                            emit_replace_delete_conflicting_row(
+                                program, resolver, connection, ctx,
+                            )?;
+                            program.emit_insn(Insn::Goto { target_pc: ok });
+                        } else {
+                            // Unique violation without ON CONFLICT clause -> error
+                            program.emit_insn(Insn::Halt {
+                                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                                description: format_unique_violation_desc(
+                                    ctx.table.name.as_str(),
+                                    index,
+                                ),
+                            });
+                        }
                         program.preassign_label_to_next_insn(ok);
 
                         // In the non-UPSERT case, we insert the index
@@ -2258,6 +2362,124 @@ fn emit_update_sqlite_sequence(
     Ok(())
 }
 
+fn emit_replace_delete_conflicting_row(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    ctx: &mut InsertEmitCtx,
+) -> Result<()> {
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: ctx.cursor_id,
+        src_reg: ctx.conflict_rowid_reg,
+        target_pc: ctx.halt_label,
+    });
+
+    // OR REPLACE + foreign keys:
+    // SQLite does not halt on the delete side, it increments FK counters for any referencing
+    // children and lets the subsequent insert repair them (or fail if it doesn't).
+    if connection.foreign_keys_enabled() {
+        emit_fk_delete_parent_existence_checks(
+            program,
+            resolver,
+            ctx.table.name.as_str(),
+            ctx.cursor_id,
+            ctx.conflict_rowid_reg,
+        )?;
+    }
+
+    let table = &ctx.table;
+    let table_name = table.name.as_str();
+    let main_cursor_id = ctx.cursor_id;
+
+    for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
+        let index = resolver
+            .schema
+            .get_index(table_name, name)
+            .expect("index to exist");
+        let skip_delete_label = if index.where_clause.is_some() {
+            let where_copy = index
+                .bind_where_expr(Some(ctx.table_references), connection)
+                .expect("where clause to exist");
+            let skip_label = program.allocate_label();
+            let reg = program.alloc_register();
+            translate_expr_no_constant_opt(
+                program,
+                Some(ctx.table_references),
+                &where_copy,
+                reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            program.emit_insn(Insn::IfNot {
+                reg,
+                jump_if_null: true,
+                target_pc: skip_label,
+            });
+            Some(skip_label)
+        } else {
+            None
+        };
+
+        let num_regs = index.columns.len() + 1;
+        let start_reg = program.alloc_registers(num_regs);
+
+        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+            program.emit_column_or_rowid(
+                main_cursor_id,
+                column_index.pos_in_table,
+                start_reg + reg_offset,
+            );
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: ctx.conflict_rowid_reg,
+            dst_reg: start_reg + num_regs - 1,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::IdxDelete {
+            start_reg,
+            num_regs,
+            cursor_id: *index_cursor_id,
+            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+        });
+
+        if let Some(label) = skip_delete_label {
+            program.resolve_label(label, program.offset());
+        }
+    }
+
+    // CDC BEFORE, using rowid_reg
+    if let Some(cdc_cursor_id) = ctx.cdc_table.as_ref().map(|(id, _tbl)| *id) {
+        let cdc_has_before = program.capture_data_changes_mode().has_before();
+        let before_record_reg = if cdc_has_before {
+            Some(emit_cdc_full_record(
+                program,
+                &table.columns,
+                main_cursor_id,
+                ctx.conflict_rowid_reg,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            ctx.conflict_rowid_reg,
+            before_record_reg,
+            None,
+            None,
+            table_name,
+        )?;
+    }
+    program.emit_insn(Insn::Delete {
+        cursor_id: main_cursor_id,
+        table_name: table_name.to_string(),
+        is_part_of_update: true,
+    });
+    Ok(())
+}
+
 /// Child-side FK checks for INSERT of a single row:
 /// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
 /// verify that the referenced parent key exists.
@@ -2520,6 +2742,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     resolver: &Resolver,
     parent_table: &BTreeTable,
     insertion: &Insertion,
+    force_immediate: bool,
 ) -> crate::Result<()> {
     for pref in resolver
         .schema
@@ -2530,7 +2753,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             .name
             .eq_ignore_ascii_case(&parent_table.name);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !pref.fk.deferred && !is_self_ref {
+        if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
         }
         let (new_pk_start, n_cols) =
@@ -2582,7 +2805,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Found: guarded counter decrement
             program.resolve_label(found, program.offset());
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, skip);
+            emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
             program.resolve_label(skip, program.offset());
         } else {
             // fallback scan :(
@@ -2627,7 +2850,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.resolve_label(cont, program.offset());
             }
             // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row);
+            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
             program.resolve_label(next_row, program.offset());
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
