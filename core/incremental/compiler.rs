@@ -2254,7 +2254,7 @@ mod tests {
     use super::*;
     use crate::incremental::dbsp::Delta;
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
-    use crate::schema::{BTreeTable, Column as SchemaColumn, Schema, Type};
+    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use crate::storage::pager::CreateBTreeFlags;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
@@ -2278,11 +2278,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_text(
                         Some("name".to_string()),
@@ -2320,11 +2321,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_text(
                         Some("product_name".to_string()),
@@ -2362,11 +2364,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_integer(
                         Some("user_id".to_string()),
@@ -2406,11 +2409,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_text(
                         Some("name".to_string()),
@@ -2440,11 +2444,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_integer(
                         Some("customer_id".to_string()),
@@ -2484,11 +2489,12 @@ mod tests {
                         None,
                         Type::Integer,
                         None,
-                        true,
-                        true,
-                        true,
-                        false,
-                        false,
+                        ColDef {
+                            primary_key: true,
+                            rowid_alias: true,
+                            notnull: true,
+                            ..Default::default()
+                        },
                     ),
                     SchemaColumn::new_default_text(
                         Some("name".to_string()),
