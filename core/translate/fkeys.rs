@@ -14,14 +14,14 @@ use crate::{
 use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 #[inline]
-pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset) {
+pub fn emit_guarded_fk_decrement(program: &mut ProgramBuilder, label: BranchOffset, deferred: bool) {
     program.emit_insn(Insn::FkIfZero {
-        deferred: true,
+        deferred,
         target_pc: label,
     });
     program.emit_insn(Insn::FkCounter {
         increment_value: -1,
-        deferred: true,
+        deferred,
     });
 }
 
@@ -508,7 +508,7 @@ fn emit_fk_parent_key_probe(
             (true, ParentProbePass::New) => {
                 // Guard to avoid underflow if OLD pass didn't increment.
                 let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip);
+                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
                 p.preassign_label_to_next_insn(skip);
             }
             // Immediate FK on NEW pass: nothing to cancel; do nothing.
@@ -676,7 +676,7 @@ pub fn emit_fk_child_update_counters(
                     program.preassign_label_to_next_insn(miss);
                     program.emit_insn(Insn::Close { cursor_id: pcur });
                     let skip = program.allocate_label();
-                    emit_guarded_fk_decrement(program, skip);
+                    emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
                     program.preassign_label_to_next_insn(skip);
 
                     program.preassign_label_to_next_insn(join);
@@ -703,7 +703,7 @@ pub fn emit_fk_child_update_counters(
                         |_p| Ok(()),
                         |p| {
                             let skip = p.allocate_label();
-                            emit_guarded_fk_decrement(p, skip);
+                            emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
                             p.preassign_label_to_next_insn(skip);
                             Ok(())
                         },

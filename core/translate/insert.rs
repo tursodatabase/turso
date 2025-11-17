@@ -9,8 +9,8 @@ use crate::error::{
 };
 use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
 use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_fk_child_decrement_on_delete,
-    prepare_cdc_if_necessary, OperationMode,
+    emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
+    OperationMode,
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
@@ -412,10 +412,11 @@ pub fn translate_insert(
     }
 
     let mut insert_flags = InsertFlags::new();
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
 
     // For the case of OR REPLACE, we need to force a seek on the insert, as we may have
     // already deleted the conflicting row and the cursor is not guaranteed to be positioned.
-    if matches!(ctx.on_conflict, ResolveType::Replace) {
+    if on_replace {
         insert_flags = insert_flags.require_seek();
     }
     program.emit_insn(Insn::Insert {
@@ -428,7 +429,15 @@ pub fn translate_insert(
 
     if has_fks {
         // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        emit_parent_side_fk_decrement_on_insert(&mut program, resolver, &btree_table, &insertion)?;
+        // For REPLACE: delete increments counters above; the insert path should try to repay
+        // them, even for immediate/self-ref FKs.
+        emit_parent_side_fk_decrement_on_insert(
+            &mut program,
+            resolver,
+            &btree_table,
+            &insertion,
+            on_replace,
+        )?;
     }
 
     if let Some(AutoincMeta {
@@ -1071,10 +1080,7 @@ fn bind_insert(
             // and we implement Replace.
         }
         _ => {
-            crate::bail_parse_error!(
-                "INSERT OR {} is only supported with UPSERT",
-                on_conflict.to_string()
-            );
+            crate::bail_parse_error!("INSERT OR {} is not yet supported", on_conflict.to_string());
         }
     }
     while let Some(mut upsert_opt) = upsert.take() {
@@ -2368,31 +2374,23 @@ fn emit_replace_delete_conflicting_row(
         target_pc: ctx.halt_label,
     });
 
+    // OR REPLACE + foreign keys:
+    // SQLite does not halt on the delete side, it increments FK counters for any referencing
+    // children and lets the subsequent insert repair them (or fail if it doesn't).
+    if connection.foreign_keys_enabled() {
+        emit_fk_delete_parent_existence_checks(
+            program,
+            resolver,
+            ctx.table.name.as_str(),
+            ctx.cursor_id,
+            ctx.conflict_rowid_reg,
+        )?;
+    }
+
     let table = &ctx.table;
     let table_name = table.name.as_str();
     let main_cursor_id = ctx.cursor_id;
 
-    if connection.foreign_keys_enabled() {
-        if resolver.schema.any_resolved_fks_referencing(table_name) {
-            emit_fk_delete_parent_existence_checks(
-                program,
-                resolver,
-                table_name,
-                main_cursor_id,
-                ctx.conflict_rowid_reg,
-            )?;
-        }
-        if resolver.schema.has_child_fks(table_name) {
-            emit_fk_child_decrement_on_delete(
-                program,
-                resolver,
-                table,
-                table_name,
-                main_cursor_id,
-                ctx.conflict_rowid_reg,
-            )?;
-        }
-    }
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
             .schema
@@ -2744,6 +2742,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     resolver: &Resolver,
     parent_table: &BTreeTable,
     insertion: &Insertion,
+    force_immediate: bool,
 ) -> crate::Result<()> {
     for pref in resolver
         .schema
@@ -2754,7 +2753,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             .name
             .eq_ignore_ascii_case(&parent_table.name);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !pref.fk.deferred && !is_self_ref {
+        if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
         }
         let (new_pk_start, n_cols) =
@@ -2806,7 +2805,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Found: guarded counter decrement
             program.resolve_label(found, program.offset());
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, skip);
+            emit_guarded_fk_decrement(program, skip, pref.fk.deferred);
             program.resolve_label(skip, program.offset());
         } else {
             // fallback scan :(
@@ -2851,7 +2850,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.resolve_label(cont, program.offset());
             }
             // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row);
+            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
             program.resolve_label(next_row, program.offset());
             program.emit_insn(Insn::Next {
                 cursor_id: ccur,
