@@ -587,6 +587,9 @@ pub fn constraints_from_where_clause(
                 .map_or(Vec::new(), |indexes| {
                     indexes
                         .iter()
+                        // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
+                        // pattern matching rather than btree index scans
+                        .filter(|index| index.index_method.is_none())
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
@@ -846,6 +849,8 @@ pub fn constraints_from_where_clause(
             for index in available_indexes
                 .get(table_reference.table.get_name())
                 .unwrap_or(&VecDeque::new())
+                .iter()
+                .filter(|idx| idx.index_method.is_none())
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),

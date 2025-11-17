@@ -11,6 +11,8 @@ use crate::{
 };
 
 pub mod backing_btree;
+#[cfg(feature = "fts")]
+pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
