@@ -1,6 +1,9 @@
 use std::{
     cmp::Ordering,
-    sync::{atomic::AtomicI64, Arc},
+    sync::{
+        atomic::{AtomicI64, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 
 use tracing::{instrument, Level};
@@ -971,6 +974,7 @@ impl ProgramBuilder {
                     db: 0,
                     tx_mode: self.txn_mode,
                     schema_cookie: schema.schema_version,
+                    schema_generation: schema.generation.load(AtomicOrdering::SeqCst),
                 });
             }
 
