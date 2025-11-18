@@ -525,7 +525,12 @@ impl ProgramState {
         match end_statement {
             EndStatement::ReleaseSavepoint => pager.release_savepoint(),
             EndStatement::RollbackSavepoint => {
-                pager.rollback_to_newest_savepoint()?;
+                let stmt_was_rolled_back = pager.rollback_to_newest_savepoint()?;
+                if !stmt_was_rolled_back {
+                    // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                    // caused the error or not. If it didn't, don't reset any FK violation counters.
+                    return Ok(());
+                }
                 // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                 // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
                 connection.fk_deferred_violations.store(

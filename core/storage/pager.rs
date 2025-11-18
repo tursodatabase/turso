@@ -817,14 +817,14 @@ impl Pager {
 
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
-    pub fn rollback_to_newest_savepoint(&self) -> Result<()> {
+    pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let mut savepoints = self.savepoints.write();
         let Some(savepoint) = savepoints.pop() else {
-            return Ok(());
+            return Ok(false);
         };
         let journal_start_offset = savepoint.start_offset.load(Ordering::SeqCst);
 
@@ -901,7 +901,7 @@ impl Pager {
 
         self.page_cache.write().truncate(db_size as usize)?;
 
-        Ok(())
+        Ok(true)
     }
 
     #[cfg(feature = "test_helper")]
