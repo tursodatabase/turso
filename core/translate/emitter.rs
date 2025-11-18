@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::ast::{self, Expr, Literal, TriggerEvent, TriggerTime};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -39,6 +39,10 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
+    TriggerContext,
+};
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -481,6 +485,18 @@ fn emit_program_for_delete(
         });
     }
 
+    let join_order = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: false,
+        })
+        .collect::<Vec<_>>();
+
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
@@ -490,44 +506,139 @@ fn emit_program_for_delete(
         None,
         OperationMode::DELETE,
         &plan.where_clause,
-        &[JoinOrderMember::default()],
+        &join_order,
         &mut [],
     )?;
 
-    // Set up main query execution loop
-    open_loop(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &[JoinOrderMember::default()],
-        &plan.where_clause,
-        None,
-        OperationMode::DELETE,
-        &mut [],
-    )?;
+    // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
+    // to delete the rows.
+    if let Some(rowset_plan) = plan.rowset_plan.take() {
+        let rowset_reg = plan
+            .rowset_reg
+            .expect("rowset_reg must be Some if rowset_plan is Some");
 
-    emit_delete_insns(
-        connection,
-        program,
-        &mut t_ctx,
-        &mut plan.table_references,
-        &plan.result_columns,
-    )?;
+        // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
+        program.emit_insn(Insn::Null {
+            dest: rowset_reg,
+            dest_end: None,
+        });
 
-    // Clean up and close the main execution loop
-    close_loop(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &[JoinOrderMember::default()],
-        OperationMode::DELETE,
-    )?;
+        // Execute the rowset SELECT plan to populate the rowset.
+        program.incr_nesting();
+        emit_program_for_select(program, resolver, rowset_plan)?;
+        program.decr_nesting();
+
+        // Close the read cursor(s) opened by the rowset plan before opening for writing
+        let table_ref = plan.table_references.joined_tables().first().unwrap();
+        let table_cursor_id_read =
+            program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
+        program.emit_insn(Insn::Close {
+            cursor_id: table_cursor_id_read,
+        });
+
+        // Open the table cursor for writing
+        let table_cursor_id = table_cursor_id_read;
+
+        if let Some(btree_table) = table_ref.table.btree() {
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: table_cursor_id,
+                root_page: RegisterOrLiteral::Literal(btree_table.root_page),
+                db: table_ref.database_id,
+            });
+
+            // Open all indexes for writing (needed for DELETE)
+            for index in resolver.schema.get_indices(table_ref.table.get_name()) {
+                let index_cursor_id = program.alloc_cursor_index(
+                    Some(CursorKey::index(table_ref.internal_id, index.clone())),
+                    index,
+                )?;
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: index_cursor_id,
+                    root_page: RegisterOrLiteral::Literal(index.root_page),
+                    db: table_ref.database_id,
+                });
+            }
+        }
+
+        // Now iterate over the RowSet and delete each rowid
+        let rowset_loop_start = program.allocate_label();
+        let rowset_loop_end = program.allocate_label();
+        let rowid_reg = program.alloc_register();
+        if table_ref.table.virtual_table().is_some() {
+            // VUpdate requires a NULL second argument ("new rowid") for deletion
+            let new_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: new_rowid_reg,
+                dest_end: None,
+            });
+        }
+
+        program.preassign_label_to_next_insn(rowset_loop_start);
+
+        // Read next rowid from RowSet
+        // Note: rowset_loop_end will be resolved later when we assign it
+        program.emit_insn(Insn::RowSetRead {
+            rowset_reg,
+            pc_if_empty: rowset_loop_end,
+            dest_reg: rowid_reg,
+        });
+
+        emit_delete_insns_when_triggers_present(
+            connection,
+            program,
+            &mut t_ctx,
+            &mut plan.table_references,
+            &plan.result_columns,
+            rowid_reg,
+            table_cursor_id,
+        )?;
+
+        // Continue loop
+        program.emit_insn(Insn::Goto {
+            target_pc: rowset_loop_start,
+        });
+
+        // Assign the end label here, after all loop body code
+        program.preassign_label_to_next_insn(rowset_loop_end);
+    } else {
+        // Normal DELETE path without RowSet
+
+        // Set up main query execution loop
+        open_loop(
+            program,
+            &mut t_ctx,
+            &plan.table_references,
+            &join_order,
+            &plan.where_clause,
+            None,
+            OperationMode::DELETE,
+            &mut [],
+        )?;
+
+        emit_delete_insns(
+            connection,
+            program,
+            &mut t_ctx,
+            &mut plan.table_references,
+            &plan.result_columns,
+        )?;
+
+        // Clean up and close the main execution loop
+        close_loop(
+            program,
+            &mut t_ctx,
+            &plan.table_references,
+            &join_order,
+            OperationMode::DELETE,
+        )?;
+    }
     program.preassign_label_to_next_insn(after_main_loop_label);
     // Finalize program
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
     Ok(())
 }
+
 
 pub fn emit_fk_child_decrement_on_delete(
     program: &mut ProgramBuilder,
@@ -683,7 +794,6 @@ fn emit_delete_insns<'a>(
     }
     let internal_id = unsafe { (*table_reference).internal_id };
 
-    let table_name = unsafe { &*table_reference }.table.get_name();
     let cursor_id = match unsafe { &(*table_reference).op } {
         Operation::Scan { .. } => program.resolve_cursor_id(&CursorKey::table(internal_id)),
         Operation::Search(search) => match search {
@@ -698,14 +808,111 @@ fn emit_delete_insns<'a>(
             panic!("access through IndexMethod is not supported for delete statements")
         }
     };
+    let btree_table = unsafe { &*table_reference }.btree();
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
+    let has_returning = !result_columns.is_empty();
+    let has_delete_triggers = if let Some(btree_table) = btree_table {
+        has_relevant_triggers_type_only(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
+    } else {
+        false
+    };
+    let cols_len = unsafe { &*table_reference }.columns().len();
+    let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
+        // Get rowid for RETURNING
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: main_table_cursor_id,
+            dest: rowid_reg,
+        });
+        if unsafe { &*table_reference }.virtual_table().is_some() {
+            // VUpdate requires a NULL second argument ("new rowid") for deletion
+            let new_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: new_rowid_reg,
+                dest_end: None,
+            });
+        }
 
-    // Emit the instructions to delete the row
-    let key_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id: main_table_cursor_id,
-        dest: key_reg,
-    });
+        if !has_returning && !has_delete_triggers {
+            (None, rowid_reg)
+        } else {
+            // Allocate registers for column values
+            let columns_start_reg = program.alloc_registers(cols_len);
+
+            // Read all column values from the row to be deleted
+            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+            }
+
+            (Some(columns_start_reg), rowid_reg)
+        }
+    };
+
+    // Get the index that is being used to iterate the deletion loop, if there is one.
+    let iteration_index = unsafe { &*table_reference }.op.index();
+
+    emit_delete_row_common(
+        connection,
+        program,
+        t_ctx,
+        table_references,
+        result_columns,
+        table_reference,
+        rowid_reg,
+        columns_start_reg,
+        main_table_cursor_id,
+        iteration_index,
+        Some(cursor_id), // Use the cursor_id from the operation for virtual tables
+    )?;
+
+    // Delete from the iteration index after deleting from the main table
+    if let Some(index) = iteration_index {
+        let iteration_index_cursor =
+            program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
+        program.emit_insn(Insn::Delete {
+            cursor_id: iteration_index_cursor,
+            table_name: index.name.clone(),
+            is_part_of_update: false,
+        });
+    }
+    if let Some(limit_ctx) = t_ctx.limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: t_ctx.label_main_loop_end.unwrap(),
+        })
+    }
+
+    Ok(())
+}
+
+/// Common deletion logic shared between normal DELETE and RowSet-based DELETE.
+///
+/// Parameters:
+/// - `rowid_reg`: Register containing the rowid of the row to delete
+/// - `columns_start_reg`: Start register containing column values (already read)
+/// - `skip_iteration_index`: If Some(index), skip deleting from this index (used when iterating over an index)
+/// - `virtual_table_cursor_id`: If Some, use this cursor for virtual table deletion
+#[allow(clippy::too_many_arguments)]
+fn emit_delete_row_common(
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &mut TableReferences,
+    result_columns: &[super::plan::ResultSetColumn],
+    table_reference: *const JoinedTable,
+    rowid_reg: usize,
+    columns_start_reg: Option<usize>, // must be provided when there are triggers or RETURNING
+    main_table_cursor_id: usize,
+    skip_iteration_index: Option<&Arc<crate::schema::Index>>,
+    virtual_table_cursor_id: Option<usize>,
+) -> Result<()> {
+    let internal_id = unsafe { (*table_reference).internal_id };
+    let table_name = unsafe { &*table_reference }.table.get_name();
 
     if connection.foreign_keys_enabled() {
         if let Some(table) = unsafe { &*table_reference }.btree() {
@@ -719,7 +926,7 @@ fn emit_delete_insns<'a>(
                     &t_ctx.resolver,
                     table_name,
                     main_table_cursor_id,
-                    key_reg,
+                    rowid_reg,
                 )?;
             }
             if t_ctx.resolver.schema.has_child_fks(table_name) {
@@ -729,7 +936,7 @@ fn emit_delete_insns<'a>(
                     &table,
                     table_name,
                     main_table_cursor_id,
-                    key_reg,
+                    rowid_reg,
                 )?;
             }
         }
@@ -737,31 +944,24 @@ fn emit_delete_insns<'a>(
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
-        let start_reg = key_reg;
+        let cursor_id = virtual_table_cursor_id.unwrap_or(main_table_cursor_id);
 
-        let new_rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::Null {
-            dest: new_rowid_reg,
-            dest_end: None,
-        });
         program.emit_insn(Insn::VUpdate {
             cursor_id,
             arg_count: 2,
-            start_reg,
+            start_reg: rowid_reg,
             conflict_action,
         });
     } else {
         // Delete from all indexes before deleting from the main table.
         let indexes = t_ctx.resolver.schema.get_indices(table_name);
 
-        // Get the index that is being used to iterate the deletion loop, if there is one.
-        let iteration_index = unsafe { &*table_reference }.op.index();
-        // Get all indexes that are not the iteration index.
-        let other_indexes = indexes
+        // Get indexes to delete from (skip the iteration index if specified)
+        let indexes_to_delete = indexes
             .filter(|index| {
-                iteration_index
+                skip_iteration_index
                     .as_ref()
-                    .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
+                    .is_none_or(|skip_idx| !Arc::ptr_eq(skip_idx, index))
             })
             .map(|index| {
                 (
@@ -771,7 +971,7 @@ fn emit_delete_insns<'a>(
             })
             .collect::<Vec<_>>();
 
-        for (index, index_cursor_id) in other_indexes {
+        for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
                     .bind_where_expr(Some(table_references), connection)
@@ -826,11 +1026,6 @@ fn emit_delete_insns<'a>(
 
         // Emit update in the CDC table if necessary (before DELETE updated the table)
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: main_table_cursor_id,
-                dest: rowid_reg,
-            });
             let cdc_has_before = program.capture_data_changes_mode().has_before();
             let before_record_reg = if cdc_has_before {
                 Some(emit_cdc_full_record(
@@ -857,22 +1052,8 @@ fn emit_delete_insns<'a>(
 
         // Emit RETURNING results if specified (must be before DELETE)
         if !result_columns.is_empty() {
-            // Get rowid for RETURNING
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: main_table_cursor_id,
-                dest: rowid_reg,
-            });
-            let cols_len = unsafe { &*table_reference }.columns().len();
-
-            // Allocate registers for column values
-            let columns_start_reg = program.alloc_registers(cols_len);
-
-            // Read all column values from the row to be deleted
-            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
-            }
-
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
             // Emit RETURNING results using the values we just read
             emit_returning_results(
                 program,
@@ -889,23 +1070,157 @@ fn emit_delete_insns<'a>(
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+    }
 
-        if let Some(index) = iteration_index {
-            let iteration_index_cursor =
-                program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
-            program.emit_insn(Insn::Delete {
-                cursor_id: iteration_index_cursor,
-                table_name: index.name.clone(),
-                is_part_of_update: false,
-            });
+    Ok(())
+}
+
+/// Helper function to delete a row when we've already seeked to it (e.g., from a RowSet).
+/// This is similar to emit_delete_insns but assumes the cursor is already positioned at the row.
+fn emit_delete_insns_when_triggers_present(
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &mut TableReferences,
+    result_columns: &[super::plan::ResultSetColumn],
+    rowid_reg: usize,
+    main_table_cursor_id: usize,
+) -> Result<()> {
+    // Seek to the rowid and delete it
+    let skip_not_found_label = program.allocate_label();
+
+    // Skip if row with rowid pulled from the rowset does not exist in the table.
+    program.emit_insn(Insn::NotExists {
+        cursor: main_table_cursor_id,
+        rowid_reg,
+        target_pc: skip_not_found_label,
+    });
+
+    let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
+    if unsafe { &*table_reference }
+        .virtual_table()
+        .is_some_and(|t| t.readonly())
+    {
+        return Err(crate::LimboError::ReadOnly);
+    }
+    let btree_table = unsafe { &*table_reference }.btree();
+    let has_returning = !result_columns.is_empty();
+    let has_delete_triggers = if let Some(btree_table) = btree_table {
+        has_relevant_triggers_type_only(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
+    } else {
+        false
+    };
+    let cols_len = unsafe { &*table_reference }.columns().len();
+
+    let columns_start_reg = if !has_returning && !has_delete_triggers {
+        None
+    } else {
+        let columns_start_reg = program.alloc_registers(cols_len);
+        for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+            program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+        }
+        Some(columns_start_reg)
+    };
+
+    let cols_len = unsafe { &*table_reference }.columns().len();
+
+    // Fire BEFORE DELETE triggers
+    if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+        let relevant_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::Before,
+            None,
+            &btree_table,
+        );
+        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+        if has_relevant_triggers {
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let old_registers = (0..cols_len)
+                .map(|i| columns_start_reg + i)
+                .chain(std::iter::once(rowid_reg))
+                .collect::<Vec<_>>();
+            let trigger_ctx = TriggerContext::new(
+                btree_table.clone(),
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
+
+            for trigger in relevant_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                )?;
+            }
         }
     }
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
+
+    // BEFORE DELETE Triggers may have altered the btree so we need to seek again.
+    program.emit_insn(Insn::NotExists {
+        cursor: main_table_cursor_id,
+        rowid_reg,
+        target_pc: skip_not_found_label,
+    });
+
+    emit_delete_row_common(
+        connection,
+        program,
+        t_ctx,
+        table_references,
+        result_columns,
+        table_reference,
+        rowid_reg,
+        columns_start_reg,
+        main_table_cursor_id,
+        None, // Don't skip any indexes when deleting from RowSet
+        None, // Use main_table_cursor_id for virtual tables
+    )?;
+
+    // Fire AFTER DELETE triggers
+    if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+        let relevant_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::After,
+            None,
+            &btree_table,
+        );
+        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+        if has_relevant_triggers {
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let old_registers = (0..cols_len)
+                .map(|i| columns_start_reg + i)
+                .chain(std::iter::once(rowid_reg))
+                .collect::<Vec<_>>();
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table.clone(),
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
+
+            for trigger in relevant_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx_after,
+                    connection,
+                )?;
+            }
+        }
     }
+
+    program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
 }
