@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Connection, Database, Row, StepResult, IO};
 
-#[allow(dead_code)]
+
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
@@ -15,7 +15,7 @@ pub struct TempDatabase {
 }
 unsafe impl Send for TempDatabase {}
 
-#[allow(dead_code, clippy::arc_with_non_send_sync)]
+#[allow(clippy::arc_with_non_send_sync)]
 impl TempDatabase {
     pub fn new_empty() -> Self {
         Self::new(&format!("test-{}.db", rng().next_u32()))
@@ -31,20 +31,7 @@ impl TempDatabase {
     pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
         let mut path = TempDir::new().unwrap().keep();
         path.push(db_name);
-        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            opts,
-            None,
-        )
-        .unwrap();
-        Self {
-            path: path.to_path_buf(),
-            io,
-            db,
-        }
+        Self::new_with_existent_with_opts(&path, opts)
     }
 
     pub fn new_with_existent(db_path: &Path) -> Self {
@@ -52,31 +39,32 @@ impl TempDatabase {
     }
 
     pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
-        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            opts,
-            None,
-        )
-        .unwrap();
-        Self {
-            path: db_path.to_path_buf(),
-            io,
-            db,
-        }
+        Self::_new(db_path, Some(opts), None)
     }
 
     pub fn new_with_existent_with_flags(db_path: &Path, flags: turso_core::OpenFlags) -> Self {
-        let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        Self::_new(db_path, None, Some(flags))
+    }
+
+    fn _new(
+        db_path: &Path,
+        opts: Option<turso_core::DatabaseOpts>,
+        flags: Option<turso_core::OpenFlags>,
+    ) -> Self {
+        let opts = opts.unwrap_or_else(|| {
+            turso_core::DatabaseOpts::new()
+                .with_indexes(true)
+                .with_encryption(true)
+        });
+
+        let flags = flags.unwrap_or_default();
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
-            turso_core::DatabaseOpts::new()
-                .with_indexes(true)
-                .with_encryption(true),
+            opts,
             None,
         )
         .unwrap();
@@ -89,7 +77,8 @@ impl TempDatabase {
 
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
         let mut path = TempDir::new().unwrap().keep();
-        path.push("test.db");
+        let db_name = "test.db";
+        path.push(db_name);
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
             connection
@@ -97,19 +86,7 @@ impl TempDatabase {
                 .unwrap();
             connection.execute(table_sql, ()).unwrap();
         }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_indexes(true)
-                .with_index_method(true),
-            None,
-        )
-        .unwrap();
-
-        Self { path, io, db }
+        Self::new_with_existent(&path)
     }
 
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
