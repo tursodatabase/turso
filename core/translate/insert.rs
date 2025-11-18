@@ -320,19 +320,6 @@ pub fn translate_insert(
     }
 
     // Fire BEFORE INSERT triggers
-    // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
-    let new_registers: Vec<usize> = insertion
-        .col_mappings
-        .iter()
-        .map(|col_mapping| {
-            if col_mapping.column.is_rowid_alias() {
-                insertion.key_register()
-            } else {
-                col_mapping.register
-            }
-        })
-        .chain(std::iter::once(insertion.key_register()))
-        .collect();
 
     let relevant_before_triggers = get_relevant_triggers_type_and_time(
         resolver.schema,
@@ -343,6 +330,19 @@ pub fn translate_insert(
     );
     let has_relevant_before_triggers = relevant_before_triggers.clone().count() > 0;
     if has_relevant_before_triggers {
+        // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
+        let new_registers: Vec<usize> = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| {
+                if col_mapping.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    col_mapping.register
+                }
+            })
+            .chain(std::iter::once(insertion.key_register()))
+            .collect();
         let trigger_ctx = TriggerContext::new(
             btree_table.clone(),
             Some(new_registers),
