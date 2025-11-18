@@ -145,3 +145,9 @@ do_execsql_test unicode-like-case-sensitivity-1 {
 do_execsql_test unicode-like-case-sensitivity-2 {
     SELECT like('a', 'A');
 } {1}
+do_execsql_test unicode-like-with-escape-1 {
+    SELECT like('ÄX%', 'ä%', 'X');
+} {0}
+do_execsql_test unicode-like-with-escape-2 {
+    SELECT like('ÄX%', 'Ä%', 'X');
+} {1}
