@@ -536,22 +536,26 @@ fn execute_trigger_commands(
     subprogram_builder.epilogue(resolver.schema);
     let built_subprogram = subprogram_builder.build(connection.clone(), true, "trigger subprogram");
 
-    let mut param_register_indices = Vec::new();
+    let mut params = Vec::with_capacity(
+        ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0)
+            + ctx.old_registers.as_ref().map(|r| r.len()).unwrap_or(0),
+    );
     if let Some(new_regs) = &ctx.new_registers {
-        param_register_indices.extend(new_regs.iter().copied());
+        params.extend(
+            new_regs
+                .iter()
+                .copied()
+                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+        );
     }
     if let Some(old_regs) = &ctx.old_registers {
-        param_register_indices.extend(old_regs.iter().copied());
+        params.extend(
+            old_regs
+                .iter()
+                .copied()
+                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+        );
     }
-
-    let params: Vec<crate::types::Value> = param_register_indices
-        .iter()
-        .map(|&reg_idx| {
-            // Use a special encoding: negative integer represents register index
-            // This is a hack - ideally we'd modify Program to accept register indices directly
-            crate::types::Value::Integer(-(reg_idx as i64 + 1))
-        })
-        .collect();
 
     let turso_stmt = Statement::new(
         built_subprogram,

@@ -2689,23 +2689,18 @@ pub fn op_program(
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
                 for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Integer(reg_idx_encoded) = param_value {
-                        if *reg_idx_encoded < 0 {
-                            // This is a register index encoded as negative integer
-                            let actual_reg_idx = (-reg_idx_encoded - 1) as usize;
-                            if actual_reg_idx < state.registers.len() {
-                                let value = state.registers[actual_reg_idx].get_value().clone();
-                                let param_index = NonZero::<usize>::new(param_idx + 1).unwrap();
-                                statement.bind_at(param_index, value);
-                            } else {
-                                crate::bail_corrupt_error!(
-                                    "Register index {} out of bounds (len={})",
-                                    actual_reg_idx,
-                                    state.registers.len()
-                                );
-                            }
+                    if let Value::Integer(reg_idx) = param_value {
+                        let reg_idx = *reg_idx as usize;
+                        if reg_idx < state.registers.len() {
+                            let value = state.registers[reg_idx].get_value().clone();
+                            let param_index = NonZero::<usize>::new(param_idx + 1).unwrap();
+                            statement.bind_at(param_index, value);
                         } else {
-                            crate::bail_parse_error!("Register indices for triggers should be encoded as negative integers, got {}", reg_idx_encoded);
+                            crate::bail_corrupt_error!(
+                                "Register index {} out of bounds (len={})",
+                                reg_idx,
+                                state.registers.len()
+                            );
                         }
                     } else {
                         crate::bail_parse_error!(
