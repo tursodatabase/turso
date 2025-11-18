@@ -385,23 +385,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 in_btree: _,
                 btree_consumed: _,
             } => Some(row_id.row_id),
-            CursorPosition::BeforeFirst => {
-                // If we are before first, we need to try and find the first row.
-                let maybe_rowid =
-                    self.db
-                        .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id);
-                if let Some(id) = maybe_rowid {
-                    self.current_pos.replace(CursorPosition::Loaded {
-                        row_id: id,
-                        in_btree: false,
-                        btree_consumed: true,
-                    });
-                    Some(id.row_id)
-                } else {
-                    self.current_pos.replace(CursorPosition::BeforeFirst);
-                    None
-                }
-            }
+            CursorPosition::BeforeFirst => None,
             CursorPosition::End => None,
         };
         Ok(IOResult::Done(rowid))
