@@ -1722,7 +1722,7 @@ impl Limbo {
             Value::Float(f) => write!(out, "{f}").map(|_| ()),
             Value::Text(s) => {
                 out.write_all(b"'")?;
-                let bytes = &s.value;
+                let bytes = s.value.as_bytes();
                 let mut i = 0;
                 while i < bytes.len() {
                     let b = bytes[i];

@@ -13,6 +13,77 @@ function cleanup(path) {
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
 
+test('partial sync (prefix bootstrap strategy)', async () => {
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS partial(value BLOB)");
+        await db.exec("DELETE FROM partial");
+        await db.exec("INSERT INTO partial SELECT randomblob(1024) FROM generate_series(1, 2000)");
+        await db.push();
+        await db.close();
+    }
+
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+        longPollTimeoutMs: 100,
+        partialBootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
+    });
+
+    // 128 pages plus some overhead (very rough estimation)
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (4096 + 128));
+
+    // select of one record shouldn't increase amount of received data
+    expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(128 * (4096 + 128));
+
+    await db.prepare("INSERT INTO partial VALUES (-1)").run();
+
+    expect(await db.prepare("SELECT COUNT(*) as cnt FROM partial").all()).toEqual([{ cnt: 2001 }]);
+    expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
+})
+
+test('partial sync (query bootstrap strategy)', async () => {
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS partial_keyed(key INTEGER PRIMARY KEY, value BLOB)");
+        await db.exec("DELETE FROM partial_keyed");
+        await db.exec("INSERT INTO partial_keyed SELECT value, randomblob(1024) FROM generate_series(1, 2000)");
+        await db.push();
+        await db.close();
+    }
+
+    const db = await connect({
+        path: ':memory:',
+        url: process.env.VITE_TURSO_DB_URL,
+        longPollTimeoutMs: 100,
+        partialBootstrapStrategy: { kind: 'query', query: 'SELECT * FROM partial_keyed WHERE key = 1000' },
+    });
+
+    // we must sync only few pages
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * (4096 + 128));
+
+    // select of one record shouldn't increase amount of received data by a lot
+    expect(await db.prepare("SELECT length(value) as length FROM partial_keyed LIMIT 1").all()).toEqual([{ length: 1024 }]);
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * (4096 + 128));
+
+    await db.prepare("INSERT INTO partial_keyed VALUES (-1, -1)").run();
+    const n1 = await db.stats();
+
+    // same as bootstrap query - we shouldn't bring any more pages
+    expect(await db.prepare("SELECT length(value) as length FROM partial_keyed WHERE key = 1000").all()).toEqual([{ length: 1024 }]);
+    const n2 = await db.stats();
+    expect(n1.networkReceivedBytes).toEqual(n2.networkReceivedBytes);
+})
+
 test('concurrent-actions-consistency', async () => {
     {
         const db = await connect({

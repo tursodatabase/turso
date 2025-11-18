@@ -1100,7 +1100,14 @@ mod fuzz_tests {
                         }
                         let a = rng.random_range(-5..=25);
                         let b = rng.random_range(-5..=25);
-                        format!("INSERT INTO p VALUES({id}, {a}, {b})")
+                        format!(
+                            "INSERT {} INTO p VALUES({id}, {a}, {b})",
+                            if rng.random_bool(0.4) {
+                                "OR REPLACE "
+                            } else {
+                                ""
+                            }
+                        )
                     }
                     // Parent UPDATE
                     1 => {
@@ -1133,7 +1140,14 @@ mod fuzz_tests {
                             rng.random_range(1..=260) as i64
                         };
                         let y = rng.random_range(-10..=10);
-                        format!("INSERT INTO c VALUES({id}, {x}, {y})")
+                        format!(
+                            "INSERT {} INTO c VALUES({id}, {x}, {y})",
+                            if rng.random_bool(0.4) {
+                                "OR REPLACE "
+                            } else {
+                                ""
+                            }
+                        )
                     }
                     // Child UPDATE
                     4 => {
@@ -1940,7 +1954,12 @@ mod fuzz_tests {
                 .collect::<Vec<_>>()
                 .join(", ");
             let insert = format!(
-                "INSERT INTO t ({}) VALUES {}",
+                "INSERT {} INTO t ({}) VALUES {}",
+                if rng.random_bool(0.4) {
+                    "OR IGNORE"
+                } else {
+                    ""
+                },
                 col_names,
                 insert_values.join(", ")
             );
@@ -2259,7 +2278,14 @@ mod fuzz_tests {
                             }
                         }
                         format!(
-                            "INSERT INTO t({}) VALUES({})",
+                            "INSERT {} INTO t({}) VALUES({})",
+                            if rng.random_bool(0.3) {
+                                "OR REPLACE"
+                            } else if rng.random_bool(0.3) {
+                                "OR IGNORE"
+                            } else {
+                                ""
+                            },
                             cols_list.join(","),
                             vals_list.join(",")
                         )

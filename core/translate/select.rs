@@ -5,7 +5,7 @@ use super::plan::{
 };
 use crate::schema::Table;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior, ParamState};
+use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
@@ -147,9 +147,9 @@ pub fn prepare_select_plan(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select.limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, &mut program.param_ctx)
-            })?;
+            let (limit, offset) = select
+                .limit
+                .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
@@ -182,6 +182,13 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
+    if order_by
+        .iter()
+        .filter_map(|o| o.nulls)
+        .any(|n| n == ast::NullsOrder::Last)
+    {
+        crate::bail_parse_error!("NULLS LAST is not supported yet in ORDER BY");
+    }
     match select {
         ast::OneSelect::Select {
             mut columns,
@@ -236,14 +243,14 @@ fn prepare_one_select_plan(
                         ResultColumn::Star => table_references
                             .joined_tables()
                             .iter()
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
+                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
                             .sum(),
                         // Guess 5 columns if we can't find the table using the identifier (maybe it's in [brackets] or `tick_quotes`, or miXeDcAse)
                         ResultColumn::TableStar(n) => table_references
                             .joined_tables()
                             .iter()
                             .find(|t| t.identifier == n.as_str())
-                            .map(|t| t.columns().iter().filter(|col| !col.hidden).count())
+                            .map(|t| t.columns().iter().filter(|col| !col.hidden()).count())
                             .unwrap_or(5),
                         // Otherwise allocate space for 1 column
                         ResultColumn::Expr(_, _) => 1,
@@ -288,7 +295,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -298,7 +304,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         None,
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::ResultColumnsNotAllowed,
                     )?;
                 }
@@ -317,7 +322,7 @@ fn prepare_one_select_plan(
                         for table in plan.table_references.joined_tables_mut() {
                             for idx in 0..table.columns().len() {
                                 let column = &table.columns()[idx];
-                                if column.hidden {
+                                if column.hidden() {
                                     continue;
                                 }
                                 table.mark_column_used(idx);
@@ -339,7 +344,7 @@ fn prepare_one_select_plan(
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
                             let column = &table.columns()[idx];
-                            if column.hidden {
+                            if column.hidden() {
                                 continue;
                             }
                             plan.result_columns.push(ResultSetColumn {
@@ -347,7 +352,7 @@ fn prepare_one_select_plan(
                                     database: None, // TODO: support different databases
                                     table: table.internal_id,
                                     column: idx,
-                                    is_rowid_alias: column.is_rowid_alias,
+                                    is_rowid_alias: column.is_rowid_alias(),
                                 },
                                 alias: None,
                                 contains_aggregates: false,
@@ -361,7 +366,6 @@ fn prepare_one_select_plan(
                             Some(&mut plan.table_references),
                             None,
                             connection,
-                            &mut program.param_ctx,
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
@@ -385,12 +389,7 @@ fn prepare_one_select_plan(
             // This step can only be performed at this point, because all table references are now available.
             // Virtual table predicates may depend on column bindings from tables to the right in the join order,
             // so we must wait until the full set of references has been collected.
-            add_vtab_predicates_to_where_clause(
-                &mut vtab_predicates,
-                &mut plan,
-                connection,
-                &mut program.param_ctx,
-            )?;
+            add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, connection)?;
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
@@ -399,7 +398,6 @@ fn prepare_one_select_plan(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
                 connection,
-                &mut program.param_ctx,
             )?;
 
             if let Some(mut group_by) = group_by {
@@ -410,7 +408,6 @@ fn prepare_one_select_plan(
                         Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         connection,
-                        &mut program.param_ctx,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
@@ -427,7 +424,6 @@ fn prepare_one_select_plan(
                                 Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
                                 connection,
-                                &mut program.param_ctx,
                                 BindingBehavior::TryResultColumnsFirst,
                             )?;
                             let contains_aggregates = resolve_window_and_aggregate_functions(
@@ -466,7 +462,6 @@ fn prepare_one_select_plan(
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
                     connection,
-                    &mut program.param_ctx,
                     BindingBehavior::TryResultColumnsFirst,
                 )?;
                 resolve_window_and_aggregate_functions(
@@ -491,9 +486,8 @@ fn prepare_one_select_plan(
             }
 
             // Parse the LIMIT/OFFSET clause
-            (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |mut l| {
-                parse_limit(&mut l, connection, &mut program.param_ctx)
-            })?;
+            (plan.limit, plan.offset) =
+                limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
             if !windows.is_empty() {
                 plan_windows(
@@ -505,6 +499,8 @@ fn prepare_one_select_plan(
             }
 
             plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+
+            validate_expr_correct_column_counts(&plan)?;
 
             // Return the unoptimized query plan
             Ok(plan)
@@ -534,7 +530,6 @@ fn prepare_one_select_plan(
                         None,
                         None,
                         connection,
-                        &mut program.param_ctx,
                         // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
                         BindingBehavior::AllowUnboundIdentifiers,
                     )?;
@@ -562,16 +557,97 @@ fn prepare_one_select_plan(
                 non_from_clause_subqueries: vec![],
             };
 
+            validate_expr_correct_column_counts(&plan)?;
+
             Ok(plan)
         }
     }
+}
+
+/// Validate that all expressions in the plan return the correct number of values;
+/// generally this only applies to parenthesized lists and subqueries.
+fn validate_expr_correct_column_counts(plan: &SelectPlan) -> Result<()> {
+    for result_column in plan.result_columns.iter() {
+        let vec_size = expr_vector_size(&result_column.expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("result column must return 1 value, got {}", vec_size);
+        }
+    }
+    for (expr, _) in plan.order_by.iter() {
+        let vec_size = expr_vector_size(expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("order by expression must return 1 value, got {}", vec_size);
+        }
+    }
+    if let Some(group_by) = &plan.group_by {
+        for expr in group_by.exprs.iter() {
+            let vec_size = expr_vector_size(expr)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!(
+                    "group by expression must return 1 value, got {}",
+                    vec_size
+                );
+            }
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having.iter() {
+                let vec_size = expr_vector_size(expr)?;
+                if vec_size != 1 {
+                    crate::bail_parse_error!(
+                        "having expression must return 1 value, got {}",
+                        vec_size
+                    );
+                }
+            }
+        }
+    }
+    for aggregate in plan.aggregates.iter() {
+        for arg in aggregate.args.iter() {
+            let vec_size = expr_vector_size(arg)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!(
+                    "aggregate argument must return 1 value, got {}",
+                    vec_size
+                );
+            }
+        }
+    }
+    for term in plan.where_clause.iter() {
+        let vec_size = expr_vector_size(&term.expr)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!(
+                "where clause expression must return 1 value, got {}",
+                vec_size
+            );
+        }
+    }
+    for expr in plan.values.iter() {
+        for value in expr.iter() {
+            let vec_size = expr_vector_size(value)?;
+            if vec_size != 1 {
+                crate::bail_parse_error!("value must return 1 value, got {}", vec_size);
+            }
+        }
+    }
+    if let Some(limit) = &plan.limit {
+        let vec_size = expr_vector_size(limit)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("limit expression must return 1 value, got {}", vec_size);
+        }
+    }
+    if let Some(offset) = &plan.offset {
+        let vec_size = expr_vector_size(offset)?;
+        if vec_size != 1 {
+            crate::bail_parse_error!("offset expression must return 1 value, got {}", vec_size);
+        }
+    }
+    Ok(())
 }
 
 fn add_vtab_predicates_to_where_clause(
     vtab_predicates: &mut Vec<Expr>,
     plan: &mut SelectPlan,
     connection: &Arc<Connection>,
-    param_ctx: &mut ParamState,
 ) -> Result<()> {
     for expr in vtab_predicates.iter_mut() {
         bind_and_rewrite_expr(
@@ -579,7 +655,6 @@ fn add_vtab_predicates_to_where_clause(
             Some(&mut plan.table_references),
             Some(&plan.result_columns),
             connection,
-            param_ctx,
             BindingBehavior::TryCanonicalColumnsFirst,
         )?;
     }

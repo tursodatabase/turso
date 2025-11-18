@@ -38,10 +38,10 @@ pub fn emit_ungrouped_aggregation<'a>(
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
     // result column expression matches a) a group by column or b) an aggregation result.
     for (i, agg) in plan.aggregates.iter().enumerate() {
-        t_ctx
-            .resolver
-            .expr_to_reg_cache
-            .push((&agg.original_expr, agg_start_reg + i));
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(&agg.original_expr),
+            agg_start_reg + i,
+        ));
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
@@ -109,10 +109,10 @@ fn emit_collseq_if_needed(
     if let ast::Expr::Column { table, column, .. } = expr {
         if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
             if let Some(table_column) = table_ref.get_column_at(*column) {
-                if let Some(collation) = &table_column.collation {
+                if let Some(c) = table_column.collation_opt() {
                     program.emit_insn(Insn::CollSeq {
                         reg: None,
-                        collation: *collation,
+                        collation: c,
                     });
                 }
             }

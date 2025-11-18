@@ -6,7 +6,7 @@ use turso_parser::{
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::{Column, Table, RESERVED_TABLE_PREFIXES},
+    schema::{Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
@@ -17,6 +17,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{Cookie, Insn, RegisterOrLiteral},
     },
+    vtab::VirtualTable,
     LimboError, Result,
 };
 
@@ -62,14 +63,25 @@ pub fn translate_alter_table(
         );
     }
 
-    let Some(original_btree) = resolver
-        .schema
-        .get_table(table_name)
-        .and_then(|table| table.btree())
-    else {
+    let Some(table) = resolver.schema.get_table(table_name) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"
         )));
+    };
+    if let Some(tbl) = table.virtual_table() {
+        if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
+            let new_name_norm = normalize_ident(new_name.as_str());
+            return translate_rename_virtual_table(
+                program,
+                tbl,
+                table_name,
+                new_name_norm,
+                resolver,
+            );
+        }
+    }
+    let Some(original_btree) = table.btree() else {
+        crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
 
     // Check if this table has dependent materialized views
@@ -110,13 +122,13 @@ pub fn translate_alter_table(
             // The column is used in the expression of a generated column.
             // The column appears in a trigger or view.
 
-            if column.primary_key {
+            if column.primary_key() {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
                 )));
             }
 
-            if column.unique
+            if column.unique()
                 || btree.unique_sets.iter().any(|set| {
                     set.columns
                         .iter()
@@ -202,13 +214,12 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next_cmd().unwrap()
-            else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
                 unreachable!();
             };
 
             translate_update_for_schema_change(
-                &mut update,
+                update,
                 resolver,
                 program,
                 connection,
@@ -281,6 +292,16 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            if col_def
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }))
+            {
+                return Err(LimboError::ParseError(
+                    "Alter table does not support adding generated columns".to_string(),
+                ));
+            }
+            let constraints = col_def.constraints.clone();
             let column = Column::from(&col_def);
 
             if let Some(default) = &column.default {
@@ -311,6 +332,58 @@ pub fn translate_alter_table(
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 
+            // Add foreign key constraints to the btree table
+            for constraint in constraints {
+                if let ast::ColumnConstraint::ForeignKey {
+                    clause,
+                    defer_clause,
+                } = constraint.constraint
+                {
+                    let fk = ForeignKey {
+                        parent_table: normalize_ident(clause.tbl_name.as_str()),
+                        parent_columns: clause
+                            .columns
+                            .iter()
+                            .map(|c| normalize_ident(c.col_name.as_str()))
+                            .collect(),
+                        on_delete: clause
+                            .args
+                            .iter()
+                            .find_map(|arg| {
+                                if let ast::RefArg::OnDelete(act) = arg {
+                                    Some(*act)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(ast::RefAct::NoAction),
+                        on_update: clause
+                            .args
+                            .iter()
+                            .find_map(|arg| {
+                                if let ast::RefArg::OnUpdate(act) = arg {
+                                    Some(*act)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(ast::RefAct::NoAction),
+                        child_columns: vec![new_column_name.to_string()],
+                        deferred: match defer_clause {
+                            Some(d) => {
+                                d.deferrable
+                                    && matches!(
+                                        d.init_deferred,
+                                        Some(ast::InitDeferredPred::InitiallyDeferred)
+                                    )
+                            }
+                            None => false,
+                        },
+                    };
+                    btree.foreign_keys.push(Arc::new(fk));
+                }
+            }
+
             let sql = btree.to_sql();
             let mut escaped = String::with_capacity(sql.len());
 
@@ -330,13 +403,12 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(mut update))) = parser.next_cmd().unwrap()
-            else {
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
                 unreachable!();
             };
 
             translate_update_for_schema_change(
-                &mut update,
+                update,
                 resolver,
                 program,
                 connection,
@@ -590,4 +662,103 @@ pub fn translate_alter_table(
             program
         }
     })
+}
+
+fn translate_rename_virtual_table(
+    mut program: ProgramBuilder,
+    vtab: Arc<VirtualTable>,
+    old_name: &str,
+    new_name_norm: String,
+    resolver: &Resolver,
+) -> Result<ProgramBuilder> {
+    program.begin_write_operation();
+    let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab.clone()));
+    program.emit_insn(Insn::VOpen {
+        cursor_id: vtab_cur,
+    });
+
+    let new_name_reg = program.emit_string8_new_reg(new_name_norm.clone());
+    program.emit_insn(Insn::VRename {
+        cursor_id: vtab_cur,
+        new_name_reg,
+    });
+    // Rewrite sqlite_schema entry
+    let sqlite_schema = resolver
+        .schema
+        .get_btree_table(SQLITE_TABLEID)
+        .expect("sqlite_schema should be on schema");
+
+    let schema_cur = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: schema_cur,
+        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+        db: 0,
+    });
+
+    program.cursor_loop(schema_cur, |program, rowid| {
+        let ncols = sqlite_schema.columns.len();
+        assert_eq!(ncols, 5);
+
+        let first_col = program.alloc_registers(ncols);
+        for i in 0..ncols {
+            program.emit_column_or_rowid(schema_cur, i, first_col + i);
+        }
+
+        program.emit_string8_new_reg(old_name.to_string());
+        program.mark_last_insn_constant();
+
+        program.emit_string8_new_reg(new_name_norm.clone());
+        program.mark_last_insn_constant();
+
+        let out = program.alloc_registers(ncols);
+
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: first_col,
+            dest: out,
+            func: crate::function::FuncCtx {
+                func: Func::AlterTable(AlterTableFunc::RenameTable),
+                arg_count: 7,
+            },
+        });
+
+        let rec = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: out,
+            count: ncols,
+            dest_reg: rec,
+            index_name: None,
+            affinity_str: None,
+        });
+
+        program.emit_insn(Insn::Insert {
+            cursor: schema_cur,
+            key_reg: rowid,
+            record_reg: rec,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: old_name.to_string(),
+        });
+    });
+
+    // Bump schema cookie
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: resolver.schema.schema_version as i32 + 1,
+        p5: 0,
+    });
+
+    program.emit_insn(Insn::RenameTable {
+        from: old_name.to_owned(),
+        to: new_name_norm,
+    });
+
+    program.emit_insn(Insn::Close {
+        cursor_id: schema_cur,
+    });
+    program.emit_insn(Insn::Close {
+        cursor_id: vtab_cur,
+    });
+
+    Ok(program)
 }

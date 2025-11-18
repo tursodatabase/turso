@@ -11,10 +11,10 @@ use parking_lot::Mutex;
 
 use crate::{Buffer, CompletionError};
 
-pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>);
-pub type WriteComplete = dyn Fn(Result<i32, CompletionError>);
-pub type SyncComplete = dyn Fn(Result<i32, CompletionError>);
-pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>);
+pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync;
+pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 
 #[must_use]
 #[derive(Debug, Clone)]
@@ -55,6 +55,12 @@ impl ContextInner {
         } else {
             self.waker = Some(waker.clone());
         }
+    }
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -275,7 +281,7 @@ impl Completion {
 
     pub fn new_write_linked<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -284,7 +290,7 @@ impl Completion {
 
     pub fn new_write<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
             complete,
@@ -293,7 +299,7 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + 'static,
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -302,7 +308,7 @@ impl Completion {
     }
     pub fn new_sync<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
             complete,
@@ -311,7 +317,7 @@ impl Completion {
 
     pub fn new_trunc<F>(complete: F) -> Self
     where
-        F: Fn(Result<i32, CompletionError>) + 'static,
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
     {
         Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
             complete,

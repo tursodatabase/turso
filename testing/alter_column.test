@@ -238,3 +238,98 @@ do_execsql_test_on_specific_db {:memory:} alter-table-rename-pk-and-fk {
 } {
     "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_ref INTEGER, FOREIGN KEY (id) REFERENCES parent (pid), FOREIGN KEY (parent_ref) REFERENCES parent (pid))"
 }
+
+do_execsql_test_on_specific_db {:memory:} rename-self-1 {
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE s1(id INTEGER PRIMARY KEY, parent INTEGER,
+    FOREIGN KEY(parent) REFERENCES s1(id));
+  INSERT INTO s1 VALUES (1,NULL);
+  INSERT INTO s1 VALUES (2,1);
+  ALTER TABLE s1 RENAME TO s1_new;
+  SELECT name, tbl_name, sql LIKE '%REFERENCES s1_new%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
+} {s1_new|s1_new|1}
+
+do_execsql_test_on_specific_db {:memory:} rename-self-2-composite {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE sc(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
+    PRIMARY KEY(id,vr),
+    FOREIGN KEY(parent_id, parent_vr) REFERENCES sc(id,vr));
+  INSERT INTO sc VALUES(1,1,NULL,NULL);
+  INSERT INTO sc VALUES(2,1,1,1);
+
+  ALTER TABLE sc RENAME TO sc_new;
+
+  SELECT sql FROM sqlite_schema WHERE type='table' AND name='sc_new';
+} {{CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))}}
+
+do_execsql_test_on_specific_db {:memory:} rename-parent-1 {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p(id INTEGER PRIMARY KEY);
+  CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER,
+    FOREIGN KEY(pid) REFERENCES p(id));
+  INSERT INTO p VALUES(1);
+  INSERT INTO c VALUES(10,1);
+
+  ALTER TABLE p RENAME TO p_new;
+  INSERT INTO p_new VALUES(2);
+  INSERT INTO c VALUES(20,2);
+  SELECT c.id, c.pid FROM c JOIN p_new ON p_new.id=c.pid ORDER BY c.id;
+} {10|1
+20|2}
+
+do_execsql_test_on_specific_db {:memory:} rename-parent-2-inline {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p2(id INTEGER PRIMARY KEY);
+  CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2(id));
+  ALTER TABLE p2 RENAME TO p2_new;
+
+  -- child create SQL must have p2_new
+  SELECT sql FROM sqlite_schema WHERE type='table' AND name='c2';
+} {{CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))}}
+
+do_execsql_test_on_specific_db {:memory:} rename-parent-3-composite {
+  PRAGMA foreign_keys=ON;
+  CREATE TABLE p3(a INTEGER, b INTEGER, PRIMARY KEY(a,b));
+  CREATE TABLE c3(x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER,
+    FOREIGN KEY(fa,fb) REFERENCES p3(a,b));
+  INSERT INTO p3 VALUES(1,1);
+  INSERT INTO c3 VALUES(1,1,1);
+
+  ALTER TABLE p3 RENAME TO p3_new;
+  SELECT sql  FROM sqlite_schema WHERE type='table' AND name='c3';
+} {{CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))}}
+
+# Adding a generated column via ALTER TABLE should error
+do_execsql_test_in_memory_error_content alter-table-add-generated-column-error {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b AS (NULL);
+} {
+    "Parse error: Alter table does not support adding generated columns"
+}
+
+# Add column with a foreign key reference and verify schema SQL
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-fk-updates-schema {
+    CREATE TABLE t(a);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-self-ref-fk-updates-schema {
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES s(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-composite-fk-updates-schema {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+} {
+    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))"
+}

@@ -1,7 +1,6 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -24,18 +23,20 @@ use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Schema, Table, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, Column, Index, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
-    ReturningValueRegisters, WalkControl,
+    WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters,
     emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
-use crate::translate::plan::{DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, Search};
+use crate::translate::plan::{
+    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::values::emit_values;
@@ -51,7 +52,7 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(&'a ast::Expr, usize)>,
+    pub expr_to_reg_cache: Vec<(std::borrow::Cow<'a, ast::Expr>, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -544,7 +545,7 @@ pub fn emit_fk_child_decrement_on_delete(
         let null_skip = program.allocate_label();
         for cname in &fk_ref.child_cols {
             let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias {
+            let src = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
                 let tmp = program.alloc_register();
@@ -571,7 +572,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let pcur = open_read_table(program, &parent_tbl);
 
             let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
-            let val = if col.is_rowid_alias {
+            let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
                 let tmp = program.alloc_register();
@@ -608,7 +609,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Parent MISSING, decrement is guarded by FkIfZero to avoid underflow
             program.preassign_label_to_next_insn(missing);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_guarded_fk_decrement(program, done);
+            emit_guarded_fk_decrement(program, done, true);
             program.preassign_label_to_next_insn(done);
         } else {
             // Probe parent unique index
@@ -624,7 +625,7 @@ pub fn emit_fk_child_decrement_on_delete(
             let probe = program.alloc_registers(n);
             for (i, cname) in fk_ref.child_cols.iter().enumerate() {
                 let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias {
+                let src = if col.is_rowid_alias() {
                     child_rowid_reg
                 } else {
                     let r = program.alloc_register();
@@ -656,7 +657,7 @@ pub fn emit_fk_child_decrement_on_delete(
                 num_regs: n,
             });
             program.emit_insn(Insn::Close { cursor_id: icur });
-            emit_guarded_fk_decrement(program, ok);
+            emit_guarded_fk_decrement(program, ok, true);
             program.preassign_label_to_next_insn(ok);
             program.emit_insn(Insn::Close { cursor_id: icur });
         }
@@ -665,12 +666,12 @@ pub fn emit_fk_child_decrement_on_delete(
     Ok(())
 }
 
-fn emit_delete_insns(
+fn emit_delete_insns<'a>(
     connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
+    t_ctx: &mut TranslateCtx<'a>,
     table_references: &mut TableReferences,
-    result_columns: &[super::plan::ResultSetColumn],
+    result_columns: &'a [super::plan::ResultSetColumn],
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
     let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
@@ -873,13 +874,14 @@ fn emit_delete_insns(
             }
 
             // Emit RETURNING results using the values we just read
-            let value_registers = ReturningValueRegisters {
-                rowid_register: rowid_reg,
-                columns_start_register: columns_start_reg,
-                num_columns: cols_len,
-            };
-
-            emit_returning_results(program, result_columns, &value_registers)?;
+            emit_returning_results(
+                program,
+                table_references,
+                result_columns,
+                columns_start_reg,
+                rowid_reg,
+                &mut t_ctx.resolver,
+            )?;
         }
 
         program.emit_insn(Insn::Delete {
@@ -1042,8 +1044,13 @@ fn emit_program_for_update(
     // Emit update instructions
     emit_update_insns(
         connection,
-        &mut plan,
-        &t_ctx,
+        &mut plan.table_references,
+        &plan.set_clauses,
+        plan.cdc_update_alter_statement.as_deref(),
+        &plan.indexes_to_update,
+        plan.returning.as_ref(),
+        plan.ephemeral_plan.as_ref(),
+        &mut t_ctx,
         program,
         index_cursors,
         iteration_cursor_id,
@@ -1077,10 +1084,16 @@ fn emit_program_for_update(
 /// `target_table_cursor_id` is the cursor id of the table that is being updated.
 ///
 /// `target_table` is the table that is being updated.
-fn emit_update_insns(
+#[allow(clippy::too_many_arguments)]
+fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
-    plan: &mut UpdatePlan,
-    t_ctx: &TranslateCtx,
+    table_references: &mut TableReferences,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    cdc_update_alter_statement: Option<&str>,
+    indexes_to_update: &[Arc<Index>],
+    returning: Option<&'a Vec<ResultSetColumn>>,
+    ephemeral_plan: Option<&SelectPlan>,
+    t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
     index_cursors: Vec<(usize, usize)>,
     iteration_cursor_id: usize,
@@ -1089,7 +1102,7 @@ fn emit_update_insns(
 ) -> crate::Result<()> {
     let internal_id = target_table.internal_id;
     let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let source_table = plan.table_references.joined_tables().first().unwrap();
+    let source_table = table_references.joined_tables().first().unwrap();
     let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
@@ -1136,15 +1149,12 @@ fn emit_update_insns(
         .table
         .columns()
         .iter()
-        .position(|c| c.is_rowid_alias);
+        .position(|c| c.is_rowid_alias());
 
-    let has_direct_rowid_update = plan
-        .set_clauses
-        .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL);
+    let has_direct_rowid_update = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL);
 
     let has_user_provided_rowid = if let Some(index) = rowid_alias_index {
-        plan.set_clauses.iter().any(|(idx, _)| *idx == index)
+        set_clauses.iter().any(|(idx, _)| *idx == index)
     } else {
         has_direct_rowid_update
     };
@@ -1210,11 +1220,11 @@ fn emit_update_insns(
     let start = if is_virtual { beg + 2 } else { beg + 1 };
 
     if has_direct_rowid_update {
-        if let Some((_, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
+        if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
             let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
             translate_expr(
                 program,
-                Some(&plan.table_references),
+                Some(table_references),
                 expr,
                 rowid_set_clause_reg,
                 &t_ctx.resolver,
@@ -1226,19 +1236,19 @@ fn emit_update_insns(
     }
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         let target_reg = start + idx;
-        if let Some((col_idx, expr)) = plan.set_clauses.iter().find(|(i, _)| *i == idx) {
+        if let Some((col_idx, expr)) = set_clauses.iter().find(|(i, _)| *i == idx) {
             // Skip if this is the sentinel value
             if *col_idx == ROWID_SENTINEL {
                 continue;
             }
             if has_user_provided_rowid
-                && (table_column.primary_key || table_column.is_rowid_alias)
+                && (table_column.primary_key() || table_column.is_rowid_alias())
                 && !is_virtual
             {
                 let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
                 translate_expr(
                     program,
-                    Some(&plan.table_references),
+                    Some(table_references),
                     expr,
                     rowid_set_clause_reg,
                     &t_ctx.resolver,
@@ -1252,12 +1262,12 @@ fn emit_update_insns(
             } else {
                 translate_expr(
                     program,
-                    Some(&plan.table_references),
+                    Some(table_references),
                     expr,
                     target_reg,
                     &t_ctx.resolver,
                 )?;
-                if table_column.notnull {
+                if table_column.notnull() {
                     use crate::error::SQLITE_CONSTRAINT_NOTNULL;
                     program.emit_insn(Insn::HaltIfNull {
                         target_reg,
@@ -1280,9 +1290,9 @@ fn emit_update_insns(
                 program.emit_bool(true, change_reg);
                 program.mark_last_insn_constant();
                 let mut updated = false;
-                if let Some(ddl_query_for_cdc_update) = &plan.cdc_update_alter_statement {
+                if let Some(ddl_query_for_cdc_update) = &cdc_update_alter_statement {
                     if table_column.name.as_deref() == Some("sql") {
-                        program.emit_string8(ddl_query_for_cdc_update.clone(), value_reg);
+                        program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
                         updated = true;
                     }
                 }
@@ -1303,7 +1313,7 @@ fn emit_update_insns(
 
             // don't emit null for pkey of virtual tables. they require first two args
             // before the 'record' to be explicitly non-null
-            if table_column.is_rowid_alias && !is_virtual {
+            if table_column.is_rowid_alias() && !is_virtual {
                 program.emit_null(target_reg, None);
             } else if is_virtual {
                 program.emit_insn(Insn::VColumn {
@@ -1346,7 +1356,7 @@ fn emit_update_insns(
             stabilize_new_row_for_fk(
                 program,
                 &table_btree,
-                &plan.set_clauses,
+                set_clauses,
                 target_table_cursor_id,
                 start,
                 rowid_new_reg,
@@ -1362,11 +1372,10 @@ fn emit_update_insns(
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
-                    &plan
-                        .set_clauses
+                    &set_clauses
                         .iter()
                         .map(|(i, _)| *i)
-                        .collect::<HashSet<_>>(),
+                        .collect::<std::collections::HashSet<_>>(),
                 )?;
             }
             // Parent-side checks:
@@ -1382,19 +1391,19 @@ fn emit_update_insns(
                     program,
                     &t_ctx.resolver,
                     &table_btree,
-                    plan.indexes_to_update.iter(),
+                    indexes_to_update.iter(),
                     target_table_cursor_id,
                     beg,
                     start,
                     rowid_new_reg,
                     rowid_set_clause_reg,
-                    &plan.set_clauses,
+                    set_clauses,
                 )?;
             }
         }
     }
 
-    for (index, (idx_cursor_id, record_reg)) in plan.indexes_to_update.iter().zip(&index_cursors) {
+    for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(&index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
         // as well as whether or not the NEW values satisfy the predicate, to determine whether
@@ -1403,12 +1412,12 @@ fn emit_update_insns(
             // This means that we need to bind the column references to a copy of the index Expr,
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
-                .bind_where_expr(Some(&mut plan.table_references), connection)
+                .bind_where_expr(Some(table_references), connection)
                 .expect("where clause to exist");
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
-                Some(&plan.table_references),
+                Some(table_references),
                 &where_clause,
                 old_satisfied_reg,
                 &t_ctx.resolver,
@@ -1511,7 +1520,7 @@ fn emit_update_insns(
                 .get(col.pos_in_table)
                 .expect("column index out of bounds");
             program.emit_insn(Insn::Copy {
-                src_reg: if col_in_table.is_rowid_alias {
+                src_reg: if col_in_table.is_rowid_alias() {
                     rowid_reg
                 } else {
                     start + col.pos_in_table
@@ -1744,15 +1753,16 @@ fn emit_update_insns(
         });
 
         // Emit RETURNING results if specified
-        if let Some(returning_columns) = &plan.returning {
+        if let Some(returning_columns) = &returning {
             if !returning_columns.is_empty() {
-                let value_registers = ReturningValueRegisters {
-                    rowid_register: rowid_set_clause_reg.unwrap_or(beg),
-                    columns_start_register: start,
-                    num_columns: col_len,
-                };
-
-                emit_returning_results(program, returning_columns, &value_registers)?;
+                emit_returning_results(
+                    program,
+                    table_references,
+                    returning_columns,
+                    start,
+                    rowid_set_clause_reg.unwrap_or(beg),
+                    &mut t_ctx.resolver,
+                )?;
             }
         }
 
@@ -1814,7 +1824,7 @@ fn emit_update_insns(
                 emit_cdc_insns(
                     program,
                     &t_ctx.resolver,
-                    OperationMode::UPDATE(if plan.ephemeral_plan.is_some() {
+                    OperationMode::UPDATE(if ephemeral_plan.is_some() {
                         UpdateRowSource::PrebuiltEphemeralTable {
                             ephemeral_table_cursor_id: iteration_cursor_id,
                             target_table: target_table.clone(),
@@ -1892,7 +1902,7 @@ pub fn emit_cdc_patch_record(
     rowid_reg: usize,
 ) -> usize {
     let columns = table.columns();
-    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias);
+    let rowid_alias_position = columns.iter().position(|x| x.is_rowid_alias());
     if let Some(rowid_alias_position) = rowid_alias_position {
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::Copy {
@@ -1927,7 +1937,7 @@ pub fn emit_cdc_full_record(
 ) -> usize {
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
-        if column.is_rowid_alias {
+        if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
                 dst_reg: columns_reg + 1 + i,
@@ -2181,7 +2191,7 @@ fn rewrite_where_for_update_registers(
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    if c.is_rowid_alias {
+                    if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
                         *e = Expr::Register(columns_start_reg + idx);
@@ -2200,7 +2210,7 @@ fn rewrite_where_for_update_registers(
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&normalized))
                 }) {
-                    if c.is_rowid_alias {
+                    if c.is_rowid_alias() {
                         *e = Expr::Register(rowid_reg);
                     } else {
                         *e = Expr::Register(columns_start_reg + idx);

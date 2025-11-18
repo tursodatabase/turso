@@ -37,13 +37,15 @@ class Database {
   inTransaction: boolean;
 
   private db: NativeDatabase;
+  private ioStep: () => Promise<void>;
   private execLock: AsyncLock;
   private _inTransaction: boolean = false;
   protected connected: boolean = false;
 
-  constructor(db: NativeDatabase) {
+  constructor(db: NativeDatabase, ioStep?: () => Promise<void>) {
     this.db = db;
     this.execLock = new AsyncLock();
+    this.ioStep = ioStep ?? (async () => { });
     Object.defineProperties(this, {
       name: { get: () => this.db.path },
       readonly: { get: () => this.db.readonly },
@@ -74,9 +76,9 @@ class Database {
 
     try {
       if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock);
+        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock)
+        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep)
       }
     } catch (err) {
       throw convertError(err);
@@ -185,6 +187,7 @@ class Database {
         const stepResult = exec.stepSync();
         if (stepResult === STEP_IO) {
           await this.db.ioLoopAsync();
+          await this.ioStep();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -280,11 +283,13 @@ class Statement {
   private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
   private execLock: AsyncLock;
+  private ioStep: () => Promise<void>;
 
-  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: AsyncLock) {
+  constructor(stmt: MaybeLazy<NativeStatement>, db: NativeDatabase, execLock: AsyncLock, ioStep: () => Promise<void>) {
     this.stmt = stmt;
     this.db = db;
     this.execLock = execLock;
+    this.ioStep = ioStep;
   }
 
   /**
@@ -352,7 +357,7 @@ class Statement {
       while (true) {
         const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -389,7 +394,7 @@ class Statement {
       while (true) {
         const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -453,7 +458,7 @@ class Statement {
       while (true) {
         const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -469,6 +474,11 @@ class Statement {
       stmt.reset();
       this.execLock.release();
     }
+  }
+
+  async io() {
+    await this.db.ioLoopAsync();
+    await this.ioStep();
   }
 
   /**

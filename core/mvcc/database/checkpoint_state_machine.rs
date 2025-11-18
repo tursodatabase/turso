@@ -450,11 +450,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
                     let mut record_cursor = RecordCursor::new();
                     record_cursor.parse_full_header(&record).unwrap();
-                    let values = record_cursor.get_values(&record)?;
+                    let values = record_cursor.get_values(&record);
                     let mut values = values
                         .into_iter()
-                        .map(|value| value.to_owned())
-                        .collect::<Vec<_>>();
+                        .map(|value| value.map(|v| v.to_owned()))
+                        .collect::<Result<Vec<_>>>()?;
                     values[3] = Value::Integer(root_page as i64);
                     let record = ImmutableRecord::from_values(&values, values.len());
                     row_version.row.data = record.get_payload().to_owned();

@@ -16,8 +16,9 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder};
 
 use crate::{
-    schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, Type, ROWID_SENTINEL},
+    schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
+        insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
@@ -31,7 +32,10 @@ use crate::{
     util::{
         exprs_are_equivalent, simple_bind_expr, try_capture_parameters, try_substitute_parameters,
     },
-    vdbe::builder::{CursorKey, CursorType, ProgramBuilder},
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, CursorType, ProgramBuilder},
+    },
     LimboError, Result,
 };
 
@@ -167,7 +171,7 @@ fn optimize_update_plan(
         };
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
-                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias)
+                accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
             });
             if rowid_alias_used {
                 break 'requires true;
@@ -217,18 +221,7 @@ fn add_ephemeral_table_to_update_plan(
         has_rowid: true,
         has_autoincrement: false,
         primary_key_columns: vec![],
-        columns: vec![Column {
-            name: Some("rowid".to_string()),
-            ty: Type::Integer,
-            ty_str: "INTEGER".to_string(),
-            primary_key: true,
-            is_rowid_alias: false,
-            notnull: true,
-            default: None,
-            unique: false,
-            collation: None,
-            hidden: false,
-        }],
+        columns: vec![ROWID_COLUMN],
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
@@ -621,8 +614,6 @@ fn optimize_table_access(
         best_ordered_plan,
     } = best_join_order_result;
 
-    let joined_tables = table_references.joined_tables_mut();
-
     // See if best_ordered_plan is better than the overall best_plan if we add a sorting penalty
     // to the unordered plan's cost.
     let best_plan = if let Some(best_ordered_plan) = best_ordered_plan {
@@ -645,7 +636,7 @@ fn optimize_table_access(
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
             &access_methods_arena,
-            joined_tables,
+            table_references.joined_tables_mut(),
             &order_target,
         );
         if satisfies_order_target {
@@ -672,9 +663,9 @@ fn optimize_table_access(
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .into_iter()
         .map(|table_number| JoinOrderMember {
-            table_id: joined_tables[table_number].internal_id,
+            table_id: table_references.joined_tables_mut()[table_number].internal_id,
             original_idx: table_number,
-            is_outer: joined_tables[table_number]
+            is_outer: table_references.joined_tables_mut()[table_number]
                 .join_info
                 .as_ref()
                 .is_some_and(|join_info| join_info.outer),
@@ -685,7 +676,6 @@ fn optimize_table_access(
     for (i, join_order_member) in best_join_order.iter().enumerate() {
         let table_idx = join_order_member.original_idx;
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
-
         match &access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir,
@@ -702,10 +692,11 @@ fn optimize_table_access(
                     };
 
                     if !try_to_build_ephemeral_index {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     }
                     // This branch means we have a full table scan for a non-outermost table.
@@ -714,10 +705,11 @@ fn optimize_table_access(
                         .iter()
                         .find(|c| c.table_id == join_order_member.table_id);
                     let Some(table_constraints) = table_constraints else {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     };
                     let usable_constraints = table_constraints
@@ -741,26 +733,31 @@ fn optimize_table_access(
                         &best_join_order[..=i],
                     );
                     if usable_constraint_refs.is_empty() {
-                        joined_tables[table_idx].op = Operation::Scan(Scan::BTreeTable {
-                            iter_dir: *iter_dir,
-                            index: index.clone(),
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
                         continue;
                     }
-                    let ephemeral_index =
-                        ephemeral_index_build(&joined_tables[table_idx], &usable_constraint_refs);
+                    let ephemeral_index = ephemeral_index_build(
+                        &table_references.joined_tables_mut()[table_idx],
+                        &usable_constraint_refs,
+                    );
                     let ephemeral_index = Arc::new(ephemeral_index);
-                    joined_tables[table_idx].op = Operation::Search(Search::Seek {
-                        index: Some(ephemeral_index),
-                        seek_def: build_seek_def_from_constraints(
-                            &table_constraints.constraints,
-                            &usable_constraint_refs,
-                            *iter_dir,
-                            where_clause,
-                        )?,
-                    });
+                    table_references.joined_tables_mut()[table_idx].op =
+                        Operation::Search(Search::Seek {
+                            index: Some(ephemeral_index),
+                            seek_def: build_seek_def_from_constraints(
+                                &table_constraints.constraints,
+                                &usable_constraint_refs,
+                                *iter_dir,
+                                where_clause,
+                                Some(table_references),
+                            )?,
+                        });
                 } else {
-                    let is_outer_join = joined_tables[table_idx]
+                    let is_outer_join = table_references.joined_tables_mut()[table_idx]
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.outer);
@@ -790,38 +787,42 @@ fn optimize_table_access(
                         }
                     }
                     if let Some(index) = &index {
-                        joined_tables[table_idx].op = Operation::Search(Search::Seek {
-                            index: Some(index.clone()),
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints_per_table[table_idx].constraints,
-                                constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                            )?,
-                        });
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Search(Search::Seek {
+                                index: Some(index.clone()),
+                                seek_def: build_seek_def_from_constraints(
+                                    &constraints_per_table[table_idx].constraints,
+                                    constraint_refs,
+                                    *iter_dir,
+                                    where_clause,
+                                    Some(table_references),
+                                )?,
+                            });
                         continue;
                     }
                     assert!(
                         constraint_refs.len() == 1,
                         "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
                     );
-                    joined_tables[table_idx].op = if let Some(eq) = constraint_refs[0].eq {
-                        Operation::Search(Search::RowidEq {
-                            cmp_expr: constraints_per_table[table_idx].constraints[eq]
-                                .get_constraining_expr(where_clause)
-                                .1,
-                        })
-                    } else {
-                        Operation::Search(Search::Seek {
-                            index: None,
-                            seek_def: build_seek_def_from_constraints(
-                                &constraints_per_table[table_idx].constraints,
-                                constraint_refs,
-                                *iter_dir,
-                                where_clause,
-                            )?,
-                        })
-                    };
+                    table_references.joined_tables_mut()[table_idx].op =
+                        if let Some(eq) = constraint_refs[0].eq {
+                            Operation::Search(Search::RowidEq {
+                                cmp_expr: constraints_per_table[table_idx].constraints[eq]
+                                    .get_constraining_expr(where_clause, Some(table_references))
+                                    .1,
+                            })
+                        } else {
+                            Operation::Search(Search::Seek {
+                                index: None,
+                                seek_def: build_seek_def_from_constraints(
+                                    &constraints_per_table[table_idx].constraints,
+                                    constraint_refs,
+                                    *iter_dir,
+                                    where_clause,
+                                    Some(table_references),
+                                )?,
+                            })
+                        };
                 }
             }
             AccessMethodParams::VirtualTable {
@@ -830,17 +831,19 @@ fn optimize_table_access(
                 constraints,
                 constraint_usages,
             } => {
-                joined_tables[table_idx].op = build_vtab_scan_op(
+                table_references.joined_tables_mut()[table_idx].op = build_vtab_scan_op(
                     where_clause,
                     &constraints_per_table[table_idx],
                     idx_num,
                     idx_str,
                     constraints,
                     constraint_usages,
+                    Some(table_references),
                 )?;
             }
             AccessMethodParams::Subquery => {
-                joined_tables[table_idx].op = Operation::Scan(Scan::Subquery);
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Scan(Scan::Subquery);
             }
         }
     }
@@ -855,6 +858,7 @@ fn build_vtab_scan_op(
     idx_str: &Option<String>,
     vtab_constraints: &[ConstraintInfo],
     constraint_usages: &[ConstraintUsage],
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<Operation> {
     if constraint_usages.len() != vtab_constraints.len() {
         return Err(LimboError::ExtensionError(format!(
@@ -892,7 +896,7 @@ fn build_vtab_scan_op(
         if usage.omit {
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
-        let (_, expr) = constraint.get_constraining_expr(where_clause);
+        let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);
         constraints[zero_based_argv_index] = Some(expr);
         arg_count += 1;
     }
@@ -1034,7 +1038,7 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key || column.notnull
+                column.primary_key() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
@@ -1067,7 +1071,7 @@ impl Optimizable for ast::Expr {
             Expr::Register(..) => false, // Register values can be null
         }
     }
-    /// Returns true if the expression is a constant i.e. does not depend on variables or columns etc.
+    /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
         match self {
             Expr::SubqueryResult { .. } => false,
@@ -1138,8 +1142,8 @@ impl Optimizable for ast::Expr {
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => false,
-            Expr::Register(_) => false, // Register values are not constants
+            Expr::Variable(_) => true,
+            Expr::Register(_) => false,
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
@@ -1265,7 +1269,7 @@ fn ephemeral_index_build(
             name: c.name.clone().unwrap(),
             order: SortOrder::Asc,
             pos_in_table: i,
-            collation: c.collation,
+            collation: c.collation_opt(),
             default: c.default.clone(),
         })
         // only include columns that are used in the query
@@ -1316,6 +1320,7 @@ pub fn build_seek_def_from_constraints(
     constraint_refs: &[RangeConstraintRef],
     iter_dir: IterationDirection,
     where_clause: &[WhereTerm],
+    referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
     assert!(
         !constraint_refs.is_empty(),
@@ -1324,7 +1329,7 @@ pub fn build_seek_def_from_constraints(
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
-        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause))
+        .map(|cref| cref.as_seek_range_constraint(constraints, where_clause, referenced_tables))
         .collect();
 
     let seek_def = build_seek_def(iter_dir, key)?;
@@ -1375,10 +1380,12 @@ fn build_seek_def(
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: start_op,
+                affinity: Affinity::Blob,
             },
             end: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: end_op,
+                affinity: Affinity::Blob,
             },
         });
     }
@@ -1402,46 +1409,52 @@ fn build_seek_def(
                     let start = match last.lower_bound {
                         // Forwards, Asc, GT: (x=10 AND y>20)
                         // Start key: start from the first GT(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, GE: (x=10 AND y>=20)
                         // Start key: start from the first GE(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y<30)
                         // Start key: start from the first GE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.upper_bound {
                         // Forwards, Asc, LT, (x=10 AND y<30)
                         // End key: end at first GE(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, LE, (x=10 AND y<=30)
                         // End key: end at first GT(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y>20)
                         // End key: end at first GT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1451,46 +1464,52 @@ fn build_seek_def(
                     let start = match last.upper_bound {
                         // Forwards, Desc, LT: (x=10 AND y<30)
                         // Start key: start from the first GT(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Desc, LE: (x=10 AND y<=30)
                         // Start key: start from the first GE(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Desc, None: (x=10 AND y>20)
                         // Start key: start from the first GE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.lower_bound {
                         // Forwards, Asc, GT, (x=10 AND y>20)
                         // End key: end at first GE(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GE { eq_only: false },
+                            affinity,
                         },
                         // Forwards, Asc, GE, (x=10 AND y>=20)
                         // End key: end at first GT(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::GT,
+                            affinity,
                         },
                         // Forwards, Asc, None, (x=10 AND y<30)
                         // End key: end at first GT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::GT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1510,46 +1529,52 @@ fn build_seek_def(
                     let start = match last.upper_bound {
                         // Backwards, Asc, LT: (x=10 AND y<30)
                         // Start key: start from the first LT(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Asc, LT: (x=10 AND y<=30)
                         // Start key: start from the first LE(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Asc, None: (x=10 AND y>20)
                         // Start key: start from the first LE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op)
                         }
                     };
                     let end = match last.lower_bound {
                         // Backwards, Asc, GT, (x=10 AND y>20)
                         // End key: end at first LE(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Asc, GT, (x=10 AND y>=20)
                         // End key: end at first LT(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Asc, None, (x=10 AND y<30)
                         // End key: end at first LT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
@@ -1559,46 +1584,52 @@ fn build_seek_def(
                     let start = match last.lower_bound {
                         // Backwards, Desc, LT: (x=10 AND y>20)
                         // Start key: start from the first LT(x:10, y:20)
-                        Some((ast::Operator::Greater, bound)) => SeekKey {
+                        Some((ast::Operator::Greater, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Desc, LE: (x=10 AND y>=20)
                         // Start key: start from the first LE(x:10, y:20)
-                        Some((ast::Operator::GreaterEquals, bound)) => SeekKey {
+                        Some((ast::Operator::GreaterEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Desc, LE: (x=10 AND y<30)
                         // Start key: start from the first LE(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LE { eq_only: false },
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };
                     let end = match last.upper_bound {
                         // Backwards, Desc, LT, (x=10 AND y<30)
                         // End key: end at first LE(x:10, y:30)
-                        Some((ast::Operator::Less, bound)) => SeekKey {
+                        Some((ast::Operator::Less, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LE { eq_only: false },
+                            affinity,
                         },
                         // Backwards, Desc, LT, (x=10 AND y<=30)
                         // End key: end at first LT(x:10, y:30)
-                        Some((ast::Operator::LessEquals, bound)) => SeekKey {
+                        Some((ast::Operator::LessEquals, bound, affinity)) => SeekKey {
                             last_component: SeekKeyComponent::Expr(bound),
                             op: SeekOp::LT,
+                            affinity,
                         },
                         // Backwards, Desc, LT, (x=10 AND y>20)
                         // End key: end at first LT(x:10)
                         None => SeekKey {
                             last_component: SeekKeyComponent::None,
                             op: SeekOp::LT,
+                            affinity: Affinity::Blob,
                         },
-                        Some((op, _)) => {
+                        Some((op, _, _)) => {
                             crate::bail_parse_error!("build_seek_def: invalid operator: {:?}", op,)
                         }
                     };

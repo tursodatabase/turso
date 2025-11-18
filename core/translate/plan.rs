@@ -1,16 +1,17 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
 };
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
         collate::get_collseq_from_expr, emitter::UpdateRowSource,
         optimizer::constraints::SeekRangeConstraint,
     },
     vdbe::{
+        affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
         BranchOffset, CursorID,
@@ -512,7 +513,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                 .columns()
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| !col.hidden)
+                .filter(|(_, col)| !col.hidden())
                 .filter(|(_, col)| {
                     // If we are joining with USING, we need to deduplicate the columns from the right table
                     // that are also present in the USING clause.
@@ -532,7 +533,7 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         database: None,
                         table: table.internal_id,
                         column: i,
-                        is_rowid_alias: col.is_rowid_alias,
+                        is_rowid_alias: col.is_rowid_alias(),
                     },
                     contains_aggregates: false,
                 }),
@@ -913,23 +914,23 @@ impl JoinedTable {
         let mut columns = plan
             .result_columns
             .iter()
-            .map(|rc| Column {
-                name: rc.name(&plan.table_references).map(String::from),
-                ty: Type::Blob, // FIXME: infer proper type
-                ty_str: "BLOB".to_string(),
-                is_rowid_alias: false,
-                primary_key: false,
-                notnull: false,
-                default: None,
-                unique: false,
-                collation: None,
-                hidden: false,
+            .map(|rc| {
+                Column::new(
+                    rc.name(&plan.table_references).map(String::from),
+                    "BLOB".to_string(),
+                    None,
+                    Type::Blob, // FIXME: infer proper type
+                    None,
+                    ColDef::default(),
+                )
             })
             .collect::<Vec<_>>();
 
         for (i, column) in columns.iter_mut().enumerate() {
-            column.collation =
-                get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
+            column.set_collation(get_collseq_from_expr(
+                &plan.result_columns[i].expr,
+                &plan.table_references,
+            )?);
         }
 
         let table = Table::FromClauseSubquery(FromClauseSubquery {
@@ -1124,13 +1125,14 @@ pub struct SeekDef {
     pub iter_dir: IterationDirection,
 }
 
-pub struct SeekDefKeyIterator<'a> {
+pub struct SeekDefKeyIterator<'a, T> {
     seek_def: &'a SeekDef,
     seek_key: &'a SeekKey,
     pos: usize,
+    _t: PhantomData<T>,
 }
 
-impl<'a> Iterator for SeekDefKeyIterator<'a> {
+impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
     type Item = SeekKeyComponent<&'a ast::Expr>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1141,6 +1143,25 @@ impl<'a> Iterator for SeekDefKeyIterator<'a> {
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(expr) => Some(SeekKeyComponent::Expr(expr)),
+                SeekKeyComponent::None => None,
+            }
+        } else {
+            None
+        };
+        self.pos += 1;
+        result
+    }
+}
+
+impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
+    type Item = Affinity;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = if self.pos < self.seek_def.prefix.len() {
+            Some(self.seek_def.prefix[self.pos].eq.as_ref().unwrap().2)
+        } else if self.pos == self.seek_def.prefix.len() {
+            match &self.seek_key.last_component {
+                SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
                 SeekKeyComponent::None => None,
             }
         } else {
@@ -1162,11 +1183,25 @@ impl SeekDef {
             }
     }
     /// iterate over value expressions in the given seek key
-    pub fn iter<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a> {
+    pub fn iter<'a>(
+        &'a self,
+        key: &'a SeekKey,
+    ) -> SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
         SeekDefKeyIterator {
             seek_def: self,
             seek_key: key,
             pos: 0,
+            _t: PhantomData,
+        }
+    }
+
+    /// iterate over affinity in the given seek key
+    pub fn iter_affinity<'a>(&'a self, key: &'a SeekKey) -> SeekDefKeyIterator<'a, Affinity> {
+        SeekDefKeyIterator {
+            seek_def: self,
+            seek_key: key,
+            pos: 0,
+            _t: PhantomData,
         }
     }
 }
@@ -1192,6 +1227,9 @@ pub struct SeekKey {
 
     /// The comparison operator to use when seeking.
     pub op: SeekOp,
+
+    /// Affinity of the comparison
+    pub affinity: Affinity,
 }
 
 /// Represents the type of table scan performed during query execution.

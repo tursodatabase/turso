@@ -1019,7 +1019,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
     };
 
     if ptr_val == transient_ptr {
-        let val = Value::from_text(&str_value);
+        let val = Value::from_text(str_value);
         stmt_ref
             .stmt
             .bind_at(NonZero::new_unchecked(idx as usize), val);

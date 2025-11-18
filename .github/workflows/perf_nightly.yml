@@ -36,6 +36,7 @@ jobs:
           name: nightly/turso
           tool: criterion
           output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
@@ -43,8 +44,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -78,14 +79,15 @@ jobs:
           name: nightly/clickbench/turso
           tool: time
           output-file-path: clickbench-tursodb.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
           # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
@@ -104,7 +106,8 @@ jobs:
           tool: time
           output-file-path: clickbench-sqlite3.txt
           fail-on-alert: false
-          comment-on-alert: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment-on-alert: false
           comment-always: false
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
           never-fail: true
@@ -143,6 +146,7 @@ jobs:
           name: nightly/tpc-h
           tool: criterion
           output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
           # What to do if a change is immediately detected by Nyrkiö.
           # Note that smaller changes are only detected with delay, usually after a change
@@ -150,8 +154,8 @@ jobs:
           # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
           # on pull events isn't compatible with this workflow being required to pass branch protection.
           fail-on-alert: false
-          comment-on-alert: true
-          comment-always: true
+          comment-on-alert: false
+          comment-always: false
           # Nyrkiö configuration
           # Get yours from https://nyrkio.com/docs/getting-started
           nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}

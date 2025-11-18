@@ -120,6 +120,17 @@ do_execsql_test nested-subquery-cte {
     select sub.loudest_hat from sub;
 } {HAT!!!}
 
+do_execsql_test_on_specific_db {:memory:} correlated-left-join-exists {
+    create table t(a);
+    create table s(a);
+    insert into t values (1);
+    select t.a
+      from t
+      left join s
+        on t.a = s.a
+     where exists (select 1 where s.a is null);
+} {1}
+
 do_execsql_test subquery-orderby-limit {
     select upper(sub.loud_name) as loudest_name 
     from (
@@ -805,3 +816,186 @@ do_execsql_test_on_specific_db {:memory:} subquery-in-offset {
     select * from items limit 2 offset (select skip_count from config);
 } {2|b
 3|c}
+
+### INCORRECT NUMBER OF RETURNED VALUES - ERROR TESTS ###
+
+# Subquery returning multiple columns in SELECT clause (should error)
+do_execsql_test_in_memory_any_error subquery-multiple-columns-in-select {
+    create table t(x, y);
+    insert into t values (1, 2);
+    select (select x, y from t) as result;
+}
+
+# Subquery returning multiple columns in WHERE clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-where {
+    create table t1(x,y);
+    create table t2(y);
+    insert into t1 values (1,1);
+    insert into t2 values (1);
+    select * from t2 where y = (select x,y from t1);
+}
+
+# Subquery returning multiple columns in HAVING clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-having {
+    create table orders(customer_id, amount);
+    create table thresholds(min_amount, max_amount);
+    insert into orders values (100, 50), (100, 150);
+    insert into thresholds values (100, 200);
+    select customer_id, sum(amount) as total 
+    from orders 
+    group by customer_id 
+    having total > (select min_amount, max_amount from thresholds);
+}
+
+# Subquery returning multiple columns in LIMIT clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-limit {
+    create table items(id);
+    create table config(max_results, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (2, 3);
+    select * from items limit (select max_results, other_col from config);
+}
+
+# Subquery returning multiple columns in OFFSET clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-offset {
+    create table items(id);
+    create table config(skip_count, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (1, 2);
+    select * from items limit 1 offset (select skip_count, other_col from config);
+}
+
+# Subquery returning multiple columns in ORDER BY clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-order-by {
+    create table items(id, name);
+    create table sort_order(priority, other_col);
+    insert into items values (1, 'a'), (2, 'b');
+    insert into sort_order values (1, 2);
+    select * from items order by (select priority, other_col from sort_order);
+}
+
+# Subquery returning multiple columns in GROUP BY clause (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-group-by {
+    create table sales(product_id, amount);
+    create table grouping(category, other_col);
+    insert into sales values (1, 100), (2, 200);
+    insert into grouping values (1, 2);
+    select sum(amount) from sales group by (select category, other_col from grouping);
+}
+
+# Subquery returning multiple columns in CASE WHEN (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-case-when {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when (select y, z from t2) then 'yes' else 'no' end from t1;
+}
+
+# Subquery returning multiple columns in CASE THEN (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-case-then {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when x = 1 then (select y, z from t2) else 0 end from t1;
+}
+
+# Subquery returning multiple columns in CASE ELSE (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-case-else {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when x = 2 then 0 else (select y, z from t2) end from t1;
+}
+
+# Subquery returning multiple columns in aggregate function argument (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-aggregate-arg {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select max((select y, z from t2)) from t1;
+}
+
+# Subquery returning multiple columns in binary expression (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-binary-expr {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select x + (select y, z from t2) from t1;
+}
+
+# Subquery returning multiple columns in BETWEEN (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-between {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (5);
+    insert into t2 values (1, 2);
+    select * from t1 where x between (select y, z from t2) and 10;
+}
+
+# Subquery returning multiple columns in CAST (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-cast {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select cast((select y, z from t2) as integer) from t1;
+}
+
+# Subquery returning multiple columns in COLLATE (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-collate {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+    select (select y, z from t2) collate nocase from t1;
+}
+
+# Subquery returning multiple columns in IS NULL (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-is-null {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select * from t1 where (select y, z from t2) is null;
+}
+
+# Subquery returning multiple columns in NOT NULL (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-not-null {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select * from t1 where (select y, z from t2) not null;
+}
+
+# Subquery returning multiple columns in LIKE (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-like {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+    select * from t1 where (select y, z from t2) like 'a%';
+}
+
+# Subquery returning multiple columns in unary operator (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-unary {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select -(select y, z from t2) from t1;
+}
+
+# Subquery returning multiple columns in function call (should error)
+do_execsql_test_in_memory_any_error subquery-vector-in-function-call {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select abs((select y, z from t2)) from t1;
+}

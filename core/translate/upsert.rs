@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use turso_parser::ast::{self, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::ROWID_SENTINEL;
+use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
@@ -16,14 +16,14 @@ use crate::Connection;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
-    schema::{Index, IndexColumn, Schema, Table},
+    schema::{Index, Schema, Table},
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
             emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            NoConstantOptReason, ReturningValueRegisters,
+            NoConstantOptReason,
         },
         insert::Insertion,
         plan::ResultSetColumn,
@@ -114,11 +114,7 @@ fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> St
     // Otherwise use the table default, or default to BINARY
     table
         .get_column_by_name(&idx_col.name)
-        .map(|s| {
-            s.1.collation
-                .map(|c| c.to_string().to_ascii_lowercase())
-                .unwrap_or_else(|| "binary".to_string())
-        })
+        .map(|s| s.1.collation().to_string())
         .unwrap_or_else(|| "binary".to_string())
 }
 
@@ -132,7 +128,7 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
         return false;
     }
     // Only treat as PK if the PK is the rowid alias (INTEGER PRIMARY KEY)
-    let pk = table.columns().iter().find(|c| c.is_rowid_alias);
+    let pk = table.columns().iter().find(|c| c.is_rowid_alias());
     if let Some(pkcol) = pk {
         extract_target_key(&t.targets[0].expr).is_some_and(|tk| {
             tk.col_name
@@ -152,7 +148,7 @@ fn collect_changed_cols(
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
         if let Some(c) = table.columns().get(*col_idx) {
-            if c.is_rowid_alias {
+            if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
                 cols_changed.insert(*col_idx);
@@ -336,6 +332,7 @@ pub fn resolve_upsert_target(
 /// Semantics reference: https://sqlite.org/lang_upsert.html
 /// Column references in the DO UPDATE expressions refer to the original
 /// (unchanged) row. To refer to would-be inserted values, use `excluded.x`.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_upsert(
     program: &mut ProgramBuilder,
     table: &Table,
@@ -343,7 +340,7 @@ pub fn emit_upsert(
     insertion: &Insertion,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
     where_clause: &mut Option<Box<ast::Expr>>,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
     connection: &Arc<Connection>,
 ) -> crate::Result<()> {
@@ -356,7 +353,7 @@ pub fn emit_upsert(
     let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
     for (i, col) in ctx.table.columns.iter().enumerate() {
-        if col.is_rowid_alias {
+        if col.is_rowid_alias() {
             program.emit_insn(Insn::RowId {
                 cursor_id: ctx.cursor_id,
                 dest: current_start + i,
@@ -433,14 +430,14 @@ pub fn emit_upsert(
             NoConstantOptReason::RegisterReuse,
         )?;
         let col = &table.columns()[*col_idx];
-        if col.notnull && !col.is_rowid_alias {
+        if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: new_start + *col_idx,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + col.name.as_ref().unwrap(),
             });
         }
-        if col.is_rowid_alias {
+        if col.is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
             let r = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -465,7 +462,7 @@ pub fn emit_upsert(
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
-    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias);
+    let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs
         .iter()
         .any(|(idx, _)| *idx == rowid_alias_idx.unwrap_or(ROWID_SENTINEL));
@@ -713,7 +710,7 @@ pub fn emit_upsert(
                 table
                     .columns()
                     .iter()
-                    .find(|c| c.is_rowid_alias)
+                    .find(|c| c.is_rowid_alias())
                     .and_then(|c| c.name.as_ref())
                     .unwrap_or(&"rowid".to_string())
             ),
@@ -827,12 +824,14 @@ pub fn emit_upsert(
 
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
-        let regs = ReturningValueRegisters {
-            rowid_register: new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            columns_start_register: new_start,
-            num_columns: num_cols,
-        };
-        emit_returning_results(program, returning, &regs)?;
+        emit_returning_results(
+            program,
+            ctx.table_references,
+            returning,
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            resolver,
+        )?;
     }
 
     program.emit_insn(Insn::Goto {
@@ -943,7 +942,7 @@ fn rewrite_expr_to_registers(
             return Some(rowid_reg);
         }
         let (idx, c) = table.get_column_by_name(name)?;
-        if c.is_rowid_alias {
+        if c.is_rowid_alias() {
             Some(rowid_reg)
         } else {
             Some(base_start + idx)

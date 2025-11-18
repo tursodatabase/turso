@@ -565,10 +565,10 @@ mod tests {
         let record = ImmutableRecord::from_bin_record(row.data.clone());
         let values = record.get_values();
         let foo = values.first().unwrap();
-        let ValueRef::Text(foo, _) = foo else {
+        let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
-        assert_eq!(foo, b"foo");
+        assert_eq!(foo.as_str(), "foo");
     }
 
     #[test]
@@ -637,10 +637,10 @@ mod tests {
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let ValueRef::Text(foo, _) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
-            assert_eq!(*foo, value.as_bytes());
+            assert_eq!(foo.as_str(), value.as_str());
         }
     }
 
@@ -758,14 +758,11 @@ mod tests {
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
-            let ValueRef::Text(foo, _) = foo else {
+            let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
 
-            assert_eq!(
-                String::from_utf8_lossy(foo),
-                format!("row_{}", present_rowid.row_id as u64)
-            );
+            assert_eq!(foo.as_str(), format!("row_{}", present_rowid.row_id as u64));
         }
 
         // Check rowids that were deleted

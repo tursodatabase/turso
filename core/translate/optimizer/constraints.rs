@@ -8,11 +8,12 @@ use crate::{
     schema::{Column, Index},
     translate::{
         collate::get_collseq_from_expr,
-        expr::as_binary_components,
+        expr::{as_binary_components, comparison_affinity},
         plan::{JoinOrderMember, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
+    vdbe::affinity::Affinity,
     Result,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -68,16 +69,31 @@ pub enum BinaryExprSide {
 
 impl Constraint {
     /// Get the constraining expression and operator, e.g. ('>=', '2+3') from 't.x >= 2+3'
-    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> (ast::Operator, ast::Expr) {
+    pub fn get_constraining_expr(
+        &self,
+        where_clause: &[WhereTerm],
+        referenced_tables: Option<&TableReferences>,
+    ) -> (ast::Operator, ast::Expr, Affinity) {
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
-        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             panic!("Expected a valid binary expression");
         };
+        let mut affinity = Affinity::Blob;
+        if op.is_comparison() {
+            affinity = comparison_affinity(lhs, rhs, referenced_tables);
+        }
+
         if side == BinaryExprSide::Lhs {
-            (self.operator, lhs.clone())
+            if affinity.expr_needs_no_affinity_change(lhs) {
+                affinity = Affinity::Blob;
+            }
+            (self.operator, lhs.clone(), affinity)
         } else {
-            (self.operator, rhs.clone())
+            if affinity.expr_needs_no_affinity_change(rhs) {
+                affinity = Affinity::Blob;
+            }
+            (self.operator, rhs.clone(), affinity)
         }
     }
 
@@ -165,7 +181,7 @@ const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABL
 fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_rowid_alias || column.primary_key {
+            if column.is_rowid_alias() || column.primary_key() {
                 SELECTIVITY_UNIQUE_EQUALITY
             } else {
                 SELECTIVITY_EQ
@@ -197,7 +213,7 @@ pub fn constraints_from_where_clause(
         let rowid_alias_column = table_reference
             .columns()
             .iter()
-            .position(|c| c.is_rowid_alias);
+            .position(|c| c.is_rowid_alias());
 
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
@@ -313,7 +329,7 @@ pub fn constraints_from_where_clause(
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
             let constrained_column = &table_reference.table.columns()[constraint.table_col_pos];
-            let column_collation = constrained_column.collation.unwrap_or_default();
+            let column_collation = constrained_column.collation();
             let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
             // Index seek keys must use the same collation as the constrained column.
             match get_collseq_from_expr(constraining_expr, table_references)? {
@@ -416,13 +432,13 @@ pub struct RangeConstraintRef {
 /// Represent seek range which can be used in query planning to emit range scan over table or index
 pub struct SeekRangeConstraint {
     pub sort_order: SortOrder,
-    pub eq: Option<(ast::Operator, ast::Expr)>,
-    pub lower_bound: Option<(ast::Operator, ast::Expr)>,
-    pub upper_bound: Option<(ast::Operator, ast::Expr)>,
+    pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
 }
 
 impl SeekRangeConstraint {
-    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr)) -> Self {
+    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
         Self {
             sort_order,
             eq: Some(eq),
@@ -432,8 +448,8 @@ impl SeekRangeConstraint {
     }
     pub fn new_range(
         sort_order: SortOrder,
-        lower_bound: Option<(ast::Operator, ast::Expr)>,
-        upper_bound: Option<(ast::Operator, ast::Expr)>,
+        lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
+        upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
         assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
@@ -451,19 +467,20 @@ impl RangeConstraintRef {
         &self,
         constraints: &[Constraint],
         where_clause: &[WhereTerm],
+        referenced_tables: Option<&TableReferences>,
     ) -> SeekRangeConstraint {
         if let Some(eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
-                constraints[eq].get_constraining_expr(where_clause),
+                constraints[eq].get_constraining_expr(where_clause, referenced_tables),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
             self.lower_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
             self.upper_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause)),
+                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
         )
     }
 }

@@ -231,7 +231,13 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
             if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty() && text.value.windows(3).any(|chars| chars == b"[#-") {
+                if !text.value.is_empty()
+                    && text
+                        .value
+                        .as_bytes()
+                        .windows(3)
+                        .any(|chars| chars == b"[#-")
+                {
                     return Err(LimboError::InvalidArgument(
                         "Json paths with negative indices in json_tree are not supported yet"
                             .to_owned(),
@@ -495,7 +501,7 @@ mod columns {
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::Integer(*i),
-                Key::String(ref s) => Value::Text(Text::new(&s.to_owned().replace("\\\"", "\""))),
+                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
                 Key::None => Value::Null,
             }
         }
@@ -572,7 +578,7 @@ mod columns {
                 | jsonb::ElementType::TEXTRAW => {
                     let s = value.to_string();
                     let s = (s[1..s.len() - 1]).to_string();
-                    Ok(Value::Text(Text::new(&s)))
+                    Ok(Value::Text(Text::new(s)))
                 }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
@@ -599,11 +605,11 @@ mod columns {
         }
 
         pub(super) fn fullkey(&self) -> Value {
-            Value::Text(Text::new(&self.fullkey))
+            Value::Text(Text::new(self.fullkey.clone()))
         }
 
         pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new(&self.innermost_container_path))
+            Value::Text(Text::new(self.innermost_container_path.clone()))
         }
 
         pub(super) fn parent(&self) -> Value {

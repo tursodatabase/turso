@@ -11,8 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{Text, TextSubtype, Value, ValueType};
-use crate::vdbe::Register;
+use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
@@ -53,10 +52,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
         Value::Blob(b) => {
             let jsonbin = Jsonb::new(b.len(), Some(b));
             jsonbin.element_type()?;
-            Ok(Value::Text(Text {
-                value: jsonbin.to_string().into_bytes(),
-                subtype: TextSubtype::Json,
-            }))
+            Ok(Value::Text(Text::json(jsonbin.to_string())))
         }
         Value::Null => Ok(Value::Null),
         _ => {
@@ -103,33 +99,27 @@ pub fn json_from_raw_bytes_agg(data: &[u8], raw: bool) -> crate::Result<Value> {
     }
 }
 
-pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb> {
-    convert_ref_dbtype_to_jsonb(
-        match val {
-            Value::Null => ValueRef::Null,
-            Value::Integer(x) => ValueRef::Integer(*x),
-            Value::Float(x) => ValueRef::Float(*x),
-            Value::Text(text) => ValueRef::Text(text.as_str().as_bytes(), text.subtype),
-            Value::Blob(items) => ValueRef::Blob(items.as_slice()),
-        },
-        strict,
-    )
+pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Result<Jsonb> {
+    let val = val.as_value_ref();
+    convert_ref_dbtype_to_jsonb(val, strict)
 }
 
-fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
-    let str = std::str::from_utf8(slice)
+fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
+    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let truncated = &slice[..zero_pos];
+    let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_with_mode(str, Conv::Strict).map_err(Into::into)
+    Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
 pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Result<Jsonb> {
     match val {
-        ValueRef::Text(text, subtype) => {
-            let res = if subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
-                Jsonb::from_str_with_mode(&String::from_utf8_lossy(text), strict)
+        ValueRef::Text(text) => {
+            let res = if text.subtype == TextSubtype::Json || matches!(strict, Conv::Strict) {
+                Jsonb::from_str_with_mode(&text, strict)
             } else {
                 // Handle as a string literal otherwise
-                let mut str = String::from_utf8_lossy(text).replace('"', "\\\"");
+                let mut str = text.replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -147,14 +137,14 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             let slice = &bytes[index..];
             let json = match slice {
                 // branch with no overlapping initial byte
-                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice)?,
+                [b'"', ..] | [b'-', ..] | [b'0'..=b'2', ..] => parse_as_json_text(slice, strict)?,
                 _ => match JsonbHeader::from_slice(0, slice) {
                     Ok((header, header_offset)) => {
                         let payload_size = header.payload_size();
                         let total_expected = header_offset + payload_size;
 
                         if total_expected != slice.len() {
-                            parse_as_json_text(slice)?
+                            parse_as_json_text(slice, strict)?
                         } else {
                             let jsonb = Jsonb::from_raw_data(slice);
                             let is_valid_json = if payload_size <= 7 {
@@ -165,11 +155,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                             if is_valid_json {
                                 jsonb
                             } else {
-                                parse_as_json_text(slice)?
+                                parse_as_json_text(slice, strict)?
                             }
                         }
                     }
-                    Err(_) => parse_as_json_text(slice)?,
+                    Err(_) => parse_as_json_text(slice, strict)?,
                 },
             };
             json.element_type()?;
@@ -188,18 +178,27 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
     }
 }
 
-pub fn curry_convert_dbtype_to_jsonb(strict: Conv) -> impl Fn(&Value) -> crate::Result<Jsonb> {
+pub fn curry_convert_dbtype_to_jsonb(
+    strict: Conv,
+) -> impl FnOnce(ValueRef) -> crate::Result<Jsonb> {
     move |val| convert_dbtype_to_jsonb(val, strict)
 }
 
-pub fn json_array(values: &[Register]) -> crate::Result<Value> {
+pub fn json_array<I, E, V>(values: I) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let values = values.into_iter();
     let mut json = Jsonb::make_empty_array(values.len());
 
-    for value in values.iter() {
-        if matches!(value.get_value(), Value::Blob(_)) {
+    for value in values {
+        let value = value.as_value_ref();
+        if matches!(value, ValueRef::Blob(_)) {
             crate::bail_constraint_error!("JSON cannot hold BLOB values")
         }
-        let value = convert_dbtype_to_jsonb(value.get_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
     json.finalize_unsafe(ElementType::ARRAY)?;
@@ -207,14 +206,21 @@ pub fn json_array(values: &[Register]) -> crate::Result<Value> {
     json_string_to_db_type(json, ElementType::ARRAY, OutputVariant::ElementType)
 }
 
-pub fn jsonb_array(values: &[Register]) -> crate::Result<Value> {
+pub fn jsonb_array<I, E, V>(values: I) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let values = values.into_iter();
     let mut json = Jsonb::make_empty_array(values.len());
 
-    for value in values.iter() {
-        if matches!(value.get_value(), Value::Blob(_)) {
+    for value in values {
+        let value = value.as_value_ref();
+        if matches!(value, ValueRef::Blob(_)) {
             crate::bail_constraint_error!("JSON cannot hold BLOB values")
         }
-        let value = convert_dbtype_to_jsonb(value.get_value(), Conv::NotStrict)?;
+        let value = convert_dbtype_to_jsonb(value, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
     json.finalize_unsafe(ElementType::ARRAY)?;
@@ -247,19 +253,27 @@ pub fn json_array_length(
     Ok(Value::Null)
 }
 
-pub fn json_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn json_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
-
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
 
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
 
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+        let path = json_path_from_db_value(&first, true)?;
+
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -271,19 +285,27 @@ pub fn json_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<
     json_string_to_db_type(json, el_type, OutputVariant::String)
 }
 
-pub fn jsonb_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result<Value> {
-    if args.is_empty() {
+pub fn jsonb_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut args = args.into_iter();
+    if args.len() == 0 {
         return Ok(Value::Null);
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args[0].get_value(), make_jsonb_fn)?;
-    let other = args[1..].chunks_exact(2);
+    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
 
-    for chunk in other {
-        let path = json_path_from_db_value(chunk[0].get_value(), true)?;
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while args.len() > 1 {
+        let first = args.next().unwrap();
+        let path = json_path_from_db_value(&first, true)?;
 
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+        let second = args.next().unwrap();
+        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
             let _ = json.operate_on_path(&path, &mut op);
@@ -298,15 +320,16 @@ pub fn jsonb_set(args: &[Register], json_cache: &JsonCacheCell) -> crate::Result
 /// Implements the -> operator. Always returns a proper JSON value.
 /// https://sqlite.org/json1.html#the_and_operators
 pub fn json_arrow_extract(
-    value: &Value,
-    path: &Value,
+    value: impl AsValueRef,
+    path: impl AsValueRef,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
-    if let Value::Null = value {
+    let value = value.as_value_ref();
+    if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
 
-    if let Some(path) = json_path_from_db_value(path, false)? {
+    if let Some(path) = json_path_from_db_value(&path, false)? {
         let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
         let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len());
@@ -325,14 +348,15 @@ pub fn json_arrow_extract(
 /// Implements the ->> operator. Always returns a SQL representation of the JSON subcomponent.
 /// https://sqlite.org/json1.html#the_and_operators
 pub fn json_arrow_shift_extract(
-    value: &Value,
-    path: &Value,
+    value: impl AsValueRef,
+    path: impl AsValueRef,
     json_cache: &JsonCacheCell,
 ) -> crate::Result<Value> {
-    if let Value::Null = value {
+    let value = value.as_value_ref();
+    if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
-    if let Some(path) = json_path_from_db_value(path, false)? {
+    if let Some(path) = json_path_from_db_value(&path, false)? {
         let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
         let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
         let mut op = SearchOperation::new(json.len());
@@ -360,16 +384,23 @@ pub fn json_arrow_shift_extract(
 /// Extracts a JSON value from a JSON object or array.
 /// If there's only a single path, the return value might be either a TEXT or a database type.
 /// https://sqlite.org/json1.html#the_json_extract_function
-pub fn json_extract(
-    value: &Value,
-    paths: &[Register],
+pub fn json_extract<I, E, V>(
+    value: impl AsValueRef,
+    paths: I,
     json_cache: &JsonCacheCell,
-) -> crate::Result<Value> {
-    if let Value::Null = value {
+) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let value = value.as_value_ref();
+    if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
 
-    if paths.is_empty() {
+    let paths = paths.into_iter();
+    if paths.len() == 0 {
         return Ok(Value::Null);
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -381,16 +412,22 @@ pub fn json_extract(
     Ok(result)
 }
 
-pub fn jsonb_extract(
+pub fn jsonb_extract<I, E, V>(
     value: &Value,
-    paths: &[Register],
+    paths: I,
     json_cache: &JsonCacheCell,
-) -> crate::Result<Value> {
+) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     if let Value::Null = value {
         return Ok(Value::Null);
     }
 
-    if paths.is_empty() {
+    let paths = paths.into_iter();
+    if paths.len() == 0 {
         return Ok(Value::Null);
     }
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -402,10 +439,14 @@ pub fn jsonb_extract(
     Ok(result)
 }
 
-fn jsonb_extract_internal(value: Jsonb, paths: &[Register]) -> crate::Result<(Jsonb, ElementType)> {
+fn jsonb_extract_internal<E, V>(value: Jsonb, mut paths: E) -> crate::Result<(Jsonb, ElementType)>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+{
     let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
     if paths.len() == 1 {
-        if let Some(path) = json_path_from_db_value(paths[0].get_value(), true)? {
+        if let Some(path) = json_path_from_db_value(&paths.next().unwrap(), true)? {
             let mut json = value;
 
             let mut op = SearchOperation::new(json.len());
@@ -429,10 +470,8 @@ fn jsonb_extract_internal(value: Jsonb, paths: &[Register]) -> crate::Result<(Js
     let mut result = Jsonb::make_empty_array(json.len());
 
     // TODO: make an op to avoid creating new json for every path element
-    let paths = paths
-        .iter()
-        .map(|p| json_path_from_db_value(p.get_value(), true));
     for path in paths {
+        let path = json_path_from_db_value(&path, true);
         if let Some(path) = path? {
             let mut op = SearchOperation::new(json.len());
             let res = json.operate_on_path(&path, &mut op);
@@ -476,15 +515,9 @@ pub fn json_string_to_db_type(
             if matches!(flag, OutputVariant::ElementType) {
                 json_string.remove(json_string.len() - 1);
                 json_string.remove(0);
-                Ok(Value::Text(Text {
-                    value: json_string.into_bytes(),
-                    subtype: TextSubtype::Json,
-                }))
+                Ok(Value::Text(Text::json(json_string)))
             } else {
-                Ok(Value::Text(Text {
-                    value: json_string.into_bytes(),
-                    subtype: TextSubtype::Text,
-                }))
+                Ok(Value::Text(Text::new(json_string)))
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => Ok(Value::Float(
@@ -509,8 +542,9 @@ pub fn json_string_to_db_type(
     }
 }
 
-pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
-    if let Value::Null = value {
+pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate::Result<Value> {
+    let value = value.as_value_ref();
+    if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
     if path.is_none() {
@@ -519,7 +553,7 @@ pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
 
         return Ok(Value::Text(Text::json(element_type.into())));
     }
-    if let Some(path) = json_path_from_db_value(path.unwrap(), true)? {
+    if let Some(path) = json_path_from_db_value(&path.unwrap(), true)? {
         let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
         if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {
@@ -538,16 +572,20 @@ pub fn json_type(value: &Value, path: Option<&Value>) -> crate::Result<Value> {
     }
 }
 
-fn json_path_from_db_value(path: &Value, strict: bool) -> crate::Result<Option<JsonPath<'_>>> {
+fn json_path_from_db_value<'a>(
+    path: &'a (impl AsValueRef + 'a),
+    strict: bool,
+) -> crate::Result<Option<JsonPath<'a>>> {
+    let path = path.as_value_ref();
     let json_path = if strict {
         match path {
-            Value::Text(t) => json_path(t.as_str())?,
-            Value::Null => return Ok(None),
+            ValueRef::Text(t) => json_path(t.as_str())?,
+            ValueRef::Null => return Ok(None),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
     } else {
         match path {
-            Value::Text(t) => {
+            ValueRef::Text(t) => {
                 if t.as_str().starts_with("$") {
                     json_path(t.as_str())?
                 } else {
@@ -559,14 +597,14 @@ fn json_path_from_db_value(path: &Value, strict: bool) -> crate::Result<Option<J
                     }
                 }
             }
-            Value::Null => return Ok(None),
-            Value::Integer(i) => JsonPath {
+            ValueRef::Null => return Ok(None),
+            ValueRef::Integer(i) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
-                    PathElement::ArrayLocator(Some(*i as i32)),
+                    PathElement::ArrayLocator(Some(i as i32)),
                 ],
             },
-            Value::Float(f) => JsonPath {
+            ValueRef::Float(f) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
                     PathElement::Key(Cow::Owned(f.to_string()), false),
@@ -579,9 +617,9 @@ fn json_path_from_db_value(path: &Value, strict: bool) -> crate::Result<Option<J
     Ok(Some(json_path))
 }
 
-pub fn json_error_position(json: &Value) -> crate::Result<Value> {
-    match json {
-        Value::Text(t) => match Jsonb::from_str(t.as_str()) {
+pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
+    match json.as_value_ref() {
+        ValueRef::Text(t) => match Jsonb::from_str(t.as_str()) {
             Ok(_) => Ok(Value::Integer(0)),
             Err(JsonError::Message { location, .. }) => {
                 if let Some(loc) = location {
@@ -594,10 +632,10 @@ pub fn json_error_position(json: &Value) -> crate::Result<Value> {
                 }
             }
         },
-        Value::Blob(_) => {
+        ValueRef::Blob(_) => {
             bail_parse_error!("Unsupported")
         }
-        Value::Null => Ok(Value::Null),
+        ValueRef::Null => Ok(Value::Null),
         _ => Ok(Value::Integer(0)),
     }
 }
@@ -605,19 +643,30 @@ pub fn json_error_position(json: &Value) -> crate::Result<Value> {
 /// Constructs a JSON object from a list of values that represent key-value pairs.
 /// The number of values must be even, and the first value of each pair (which represents the map key)
 /// must be a TEXT value. The second value of each pair can be any JSON value (which represents the map value)
-pub fn json_object(values: &[Register]) -> crate::Result<Value> {
+pub fn json_object<I, E, V>(values: I) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
     if values.len() % 2 != 0 {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);
 
-    for chunk in values.chunks_exact(2) {
-        if chunk[0].get_value().value_type() != ValueType::Text {
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while values.len() > 1 {
+        let first = values.next().unwrap();
+        let first = first.as_value_ref();
+        if first.value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
         }
-        let key = convert_dbtype_to_jsonb(chunk[0].get_value(), Conv::ToString)?;
+        let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+
+        let second = values.next().unwrap();
+        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
 
@@ -626,19 +675,30 @@ pub fn json_object(values: &[Register]) -> crate::Result<Value> {
     json_string_to_db_type(json, ElementType::OBJECT, OutputVariant::String)
 }
 
-pub fn jsonb_object(values: &[Register]) -> crate::Result<Value> {
+pub fn jsonb_object<I, E, V>(values: I) -> crate::Result<Value>
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
     if values.len() % 2 != 0 {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);
 
-    for chunk in values.chunks_exact(2) {
-        if chunk[0].get_value().value_type() != ValueType::Text {
+    // TODO: when `array_chunks` is stabilized we can chunk by 2 here
+    while values.len() > 1 {
+        let first = values.next().unwrap();
+        let first = first.as_value_ref();
+        if first.value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
         }
-        let key = convert_dbtype_to_jsonb(chunk[0].get_value(), Conv::ToString)?;
+        let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
-        let value = convert_dbtype_to_jsonb(chunk[1].get_value(), Conv::NotStrict)?;
+
+        let second = values.next().unwrap();
+        let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
 
@@ -649,8 +709,9 @@ pub fn jsonb_object(values: &[Register]) -> crate::Result<Value> {
 
 /// Tries to convert the value to jsonb. Returns Value::Integer(1) if it the conversion
 /// succeeded, and Value::Integer(0) if it didn't.
-pub fn is_json_valid(json_value: &Value) -> Value {
-    if matches!(json_value, Value::Null) {
+pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
+    let json_value = json_value.as_value_ref();
+    if matches!(json_value, ValueRef::Null) {
         return Value::Null;
     }
     convert_dbtype_to_jsonb(json_value, Conv::Strict)
@@ -658,9 +719,10 @@ pub fn is_json_valid(json_value: &Value) -> Value {
         .unwrap_or(Value::Integer(0))
 }
 
-pub fn json_quote(value: &Value) -> crate::Result<Value> {
+pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
+    let value = value.as_value_ref();
     match value {
-        Value::Text(ref t) => {
+        ValueRef::Text(ref t) => {
             // If X is a JSON value returned by another JSON function,
             // then this function is a no-op
             if t.subtype == TextSubtype::Json {
@@ -685,10 +747,10 @@ pub fn json_quote(value: &Value) -> crate::Result<Value> {
             Ok(Value::build_text(escaped_value))
         }
         // Numbers are unquoted in json
-        Value::Integer(ref int) => Ok(Value::Integer(int.to_owned())),
-        Value::Float(ref float) => Ok(Value::Float(float.to_owned())),
-        Value::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
-        Value::Null => Ok(Value::build_text("null")),
+        ValueRef::Integer(int) => Ok(Value::Integer(int)),
+        ValueRef::Float(float) => Ok(Value::Float(float)),
+        ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
+        ValueRef::Null => Ok(Value::build_text("null")),
     }
 }
 
@@ -815,14 +877,9 @@ mod tests {
 
     #[test]
     fn test_json_array_simple() {
-        let text = Register::Value(Value::build_text("value1"));
-        let json = Register::Value(Value::Text(Text::json("\"value2\"".to_string())));
-        let input = vec![
-            text,
-            json,
-            Register::Value(Value::Integer(1)),
-            Register::Value(Value::Float(1.1)),
-        ];
+        let text = Value::build_text("value1");
+        let json = Value::Text(Text::json("\"value2\"".to_string()));
+        let input = [text, json, Value::Integer(1), Value::Float(1.1)];
 
         let result = json_array(&input).unwrap();
         if let Value::Text(res) = result {
@@ -835,9 +892,9 @@ mod tests {
 
     #[test]
     fn test_json_array_empty() {
-        let input = vec![];
+        let input: [Value; 0] = [];
 
-        let result = json_array(&input).unwrap();
+        let result = json_array(input).unwrap();
         if let Value::Text(res) = result {
             assert_eq!(res.as_str(), "[]");
             assert_eq!(res.subtype, TextSubtype::Json);
@@ -848,9 +905,9 @@ mod tests {
 
     #[test]
     fn test_json_array_blob_invalid() {
-        let blob = Register::Value(Value::Blob("1".as_bytes().to_vec()));
+        let blob = Value::Blob("1".as_bytes().to_vec());
 
-        let input = vec![blob];
+        let input = [blob];
 
         let result = json_array(&input);
 
@@ -974,8 +1031,8 @@ mod tests {
     fn test_json_extract_missing_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
-            &Value::build_text("{\"a\":2}"),
-            &[Register::Value(Value::build_text("$.x"))],
+            Value::build_text("{\"a\":2}"),
+            &[Value::build_text("$.x")],
             &json_cache,
         );
 
@@ -987,11 +1044,7 @@ mod tests {
     #[test]
     fn test_json_extract_null_path() {
         let json_cache = JsonCacheCell::new();
-        let result = json_extract(
-            &Value::build_text("{\"a\":2}"),
-            &[Register::Value(Value::Null)],
-            &json_cache,
-        );
+        let result = json_extract(Value::build_text("{\"a\":2}"), &[Value::Null], &json_cache);
 
         match result {
             Ok(Value::Null) => (),
@@ -1003,8 +1056,8 @@ mod tests {
     fn test_json_path_invalid() {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
-            &Value::build_text("{\"a\":2}"),
-            &[Register::Value(Value::Float(1.1))],
+            Value::build_text("{\"a\":2}"),
+            &[Value::Float(1.1)],
             &json_cache,
         );
 
@@ -1065,9 +1118,9 @@ mod tests {
 
     #[test]
     fn test_json_object_simple() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::build_text("value"));
-        let input = vec![key, value];
+        let key = Value::build_text("key");
+        let value = Value::build_text("value");
+        let input = [key, value];
 
         let result = json_object(&input).unwrap();
         let Value::Text(json_text) = result else {
@@ -1089,17 +1142,17 @@ mod tests {
         let null_key = Value::build_text("null_key");
         let null_value = Value::Null;
 
-        let input = vec![
-            Register::Value(text_key),
-            Register::Value(text_value),
-            Register::Value(json_key),
-            Register::Value(json_value),
-            Register::Value(integer_key),
-            Register::Value(integer_value),
-            Register::Value(float_key),
-            Register::Value(float_value),
-            Register::Value(null_key),
-            Register::Value(null_value),
+        let input = [
+            text_key,
+            text_value,
+            json_key,
+            json_value,
+            integer_key,
+            integer_value,
+            float_key,
+            float_value,
+            null_key,
+            null_value,
         ];
 
         let result = json_object(&input).unwrap();
@@ -1114,9 +1167,9 @@ mod tests {
 
     #[test]
     fn test_json_object_json_value_is_rendered_as_json() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::Text(Text::json(r#"{"json":"value"}"#.to_string())));
-        let input = vec![key, value];
+        let key = Value::build_text("key");
+        let value = Value::Text(Text::json(r#"{"json":"value"}"#.to_string()));
+        let input = [key, value];
 
         let result = json_object(&input).unwrap();
         let Value::Text(json_text) = result else {
@@ -1127,9 +1180,9 @@ mod tests {
 
     #[test]
     fn test_json_object_json_text_value_is_rendered_as_regular_text() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::Text(Text::new(r#"{"json":"value"}"#)));
-        let input = vec![key, value];
+        let key = Value::build_text("key");
+        let value = Value::Text(Text::new(r#"{"json":"value"}"#));
+        let input = [key, value];
 
         let result = json_object(&input).unwrap();
         let Value::Text(json_text) = result else {
@@ -1140,13 +1193,13 @@ mod tests {
 
     #[test]
     fn test_json_object_nested() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::build_text("value"));
-        let input = vec![key, value];
+        let key = Value::build_text("key");
+        let value = Value::build_text("value");
+        let input = [key, value];
 
-        let parent_key = Register::Value(Value::build_text("parent_key"));
-        let parent_value = Register::Value(json_object(&input).unwrap());
-        let parent_input = vec![parent_key, parent_value];
+        let parent_key = Value::build_text("parent_key");
+        let parent_value = json_object(&input).unwrap();
+        let parent_input = [parent_key, parent_value];
 
         let result = json_object(&parent_input).unwrap();
 
@@ -1158,9 +1211,9 @@ mod tests {
 
     #[test]
     fn test_json_object_duplicated_keys() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::build_text("value"));
-        let input = vec![key.clone(), value.clone(), key, value];
+        let key = Value::build_text("key");
+        let value = Value::build_text("value");
+        let input = [key.clone(), value.clone(), key, value];
 
         let result = json_object(&input).unwrap();
         let Value::Text(json_text) = result else {
@@ -1171,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_json_object_empty() {
-        let input = vec![];
+        let input: [Value; 0] = [];
 
         let result = json_object(&input).unwrap();
         let Value::Text(json_text) = result else {
@@ -1182,9 +1235,9 @@ mod tests {
 
     #[test]
     fn test_json_object_non_text_key() {
-        let key = Register::Value(Value::Integer(1));
-        let value = Register::Value(Value::build_text("value"));
-        let input = vec![key, value];
+        let key = Value::Integer(1);
+        let value = Value::build_text("value");
+        let input = [key, value];
 
         match json_object(&input) {
             Ok(_) => panic!("Expected error for non-TEXT key"),
@@ -1194,9 +1247,9 @@ mod tests {
 
     #[test]
     fn test_json_odd_number_of_values() {
-        let key = Register::Value(Value::build_text("key"));
-        let value = Register::Value(Value::build_text("value"));
-        let input = vec![key.clone(), value, key];
+        let key = Value::build_text("key");
+        let value = Value::build_text("value");
+        let input = [key.clone(), value, key];
 
         assert!(json_object(&input).is_err());
     }
@@ -1333,9 +1386,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.field")),
-                Register::Value(Value::build_text("value")),
+                Value::build_text("{}"),
+                Value::build_text("$.field"),
+                Value::build_text("value"),
             ],
             &json_cache,
         );
@@ -1350,9 +1403,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text(r#"{"field":"old_value"}"#)),
-                Register::Value(Value::build_text("$.field")),
-                Register::Value(Value::build_text("new_value")),
+                Value::build_text(r#"{"field":"old_value"}"#),
+                Value::build_text("$.field"),
+                Value::build_text("new_value"),
             ],
             &json_cache,
         );
@@ -1370,9 +1423,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.object.doesnt.exist")),
-                Register::Value(Value::build_text("value")),
+                Value::build_text("{}"),
+                Value::build_text("$.object.doesnt.exist"),
+                Value::build_text("value"),
             ],
             &json_cache,
         );
@@ -1390,9 +1443,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("[]")),
-                Register::Value(Value::build_text("$[0]")),
-                Register::Value(Value::build_text("value")),
+                Value::build_text("[]"),
+                Value::build_text("$[0]"),
+                Value::build_text("value"),
             ],
             &json_cache,
         );
@@ -1407,9 +1460,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.some_array[0]")),
-                Register::Value(Value::Integer(123)),
+                Value::build_text("{}"),
+                Value::build_text("$.some_array[0]"),
+                Value::Integer(123),
             ],
             &json_cache,
         );
@@ -1427,9 +1480,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("[123]")),
-                Register::Value(Value::build_text("$[1]")),
-                Register::Value(Value::Integer(456)),
+                Value::build_text("[123]"),
+                Value::build_text("$[1]"),
+                Value::Integer(456),
             ],
             &json_cache,
         );
@@ -1444,9 +1497,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("[123]")),
-                Register::Value(Value::build_text("$[200]")),
-                Register::Value(Value::Integer(456)),
+                Value::build_text("[123]"),
+                Value::build_text("$[200]"),
+                Value::Integer(456),
             ],
             &json_cache,
         );
@@ -1461,9 +1514,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("[123]")),
-                Register::Value(Value::build_text("$[0]")),
-                Register::Value(Value::Integer(456)),
+                Value::build_text("[123]"),
+                Value::build_text("$[0]"),
+                Value::Integer(456),
             ],
             &json_cache,
         );
@@ -1477,11 +1530,7 @@ mod tests {
     fn test_json_set_null_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
-            &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::Null),
-                Register::Value(Value::Integer(456)),
-            ],
+            &[Value::build_text("{}"), Value::Null, Value::Integer(456)],
             &json_cache,
         );
 
@@ -1495,11 +1544,11 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("[123]")),
-                Register::Value(Value::build_text("$[0]")),
-                Register::Value(Value::Integer(456)),
-                Register::Value(Value::build_text("$[1]")),
-                Register::Value(Value::Integer(789)),
+                Value::build_text("[123]"),
+                Value::build_text("$[0]"),
+                Value::Integer(456),
+                Value::build_text("$[1]"),
+                Value::Integer(789),
             ],
             &json_cache,
         );
@@ -1514,9 +1563,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.object[0].field")),
-                Register::Value(Value::Integer(123)),
+                Value::build_text("{}"),
+                Value::build_text("$.object[0].field"),
+                Value::Integer(123),
             ],
             &json_cache,
         );
@@ -1534,9 +1583,9 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.object[0][0]")),
-                Register::Value(Value::Integer(123)),
+                Value::build_text("{}"),
+                Value::build_text("$.object[0][0]"),
+                Value::Integer(123),
             ],
             &json_cache,
         );
@@ -1551,11 +1600,11 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
             &[
-                Register::Value(Value::build_text("{}")),
-                Register::Value(Value::build_text("$.object[123].another")),
-                Register::Value(Value::build_text("value")),
-                Register::Value(Value::build_text("$.field")),
-                Register::Value(Value::build_text("value")),
+                Value::build_text("{}"),
+                Value::build_text("$.object[123].another"),
+                Value::build_text("value"),
+                Value::build_text("$.field"),
+                Value::build_text("value"),
             ],
             &json_cache,
         );

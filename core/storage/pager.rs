@@ -1,4 +1,3 @@
-use crate::storage::database::DatabaseFile;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -502,7 +501,7 @@ impl Savepoint {
 /// transaction management.
 pub struct Pager {
     /// Source of the database pages.
-    pub db_file: DatabaseFile,
+    pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
@@ -619,7 +618,7 @@ enum FreePageState {
 
 impl Pager {
     pub fn new(
-        db_file: DatabaseFile,
+        db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
@@ -1595,7 +1594,7 @@ impl Pager {
         io_ctx: &IOContext,
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
-            self.db_file.clone(),
+            self.db_file.as_ref(),
             self.buffer_pool.clone(),
             page,
             page_idx,
@@ -1963,7 +1962,7 @@ impl Pager {
                 }
                 CommitState::SyncDbFile => {
                     let sync_result =
-                        sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone());
+                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone());
                     self.commit_info
                         .write()
                         .completions
@@ -2100,7 +2099,8 @@ impl Pager {
                     *self.checkpoint_state.write() = CheckpointState::SyncDbFile { res };
                 }
                 CheckpointState::SyncDbFile { res } => {
-                    let c = sqlite3_ondisk::begin_sync(self.db_file.clone(), self.syncing.clone())?;
+                    let c =
+                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
                     *self.checkpoint_state.write() = CheckpointState::CheckpointDone { res };
                     io_yield_one!(c);
                 }
@@ -3110,8 +3110,9 @@ mod ptrmap_tests {
     // Helper to create a Pager for testing
     fn test_pager_setup(page_size: u32, initial_db_pages: u32) -> Pager {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db_file: DatabaseFile =
-            DatabaseFile::new(io.open_file("test.db", OpenFlags::Create, true).unwrap());
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(
+            io.open_file("test.db", OpenFlags::Create, true).unwrap(),
+        ));
 
         //  Construct interfaces for the pager
         let pages = initial_db_pages + 10;

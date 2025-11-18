@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{
-    bind_and_rewrite_expr, walk_expr, BindingBehavior, ParamState, WalkControl,
-};
+use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
@@ -53,7 +51,7 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 18    Goto           0     1     0                    0
 */
 pub fn translate_update(
-    body: &mut ast::Update,
+    body: ast::Update,
     resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -71,7 +69,7 @@ pub fn translate_update(
 }
 
 pub fn translate_update_for_schema_change(
-    body: &mut ast::Update,
+    body: ast::Update,
     resolver: &Resolver,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -100,7 +98,7 @@ pub fn translate_update_for_schema_change(
 pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
     schema: &Schema,
-    body: &mut ast::Update,
+    mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
@@ -211,7 +209,6 @@ pub fn prepare_update_plan(
             Some(&mut table_references),
             None,
             connection,
-            &mut program.param_ctx,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
 
@@ -241,7 +238,7 @@ pub fn prepare_update_plan(
                             .columns()
                             .iter()
                             .enumerate()
-                            .find(|(_i, c)| c.is_rowid_alias)
+                            .find(|(_i, c)| c.is_rowid_alias())
                         {
                             // Use the rowid alias column index
                             match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
@@ -269,13 +266,8 @@ pub fn prepare_update_plan(
         }
     }
 
-    let (result_columns, _table_references) = process_returning_clause(
-        &mut body.returning,
-        &table,
-        body.tbl_name.name.as_str(),
-        program,
-        connection,
-    )?;
+    let result_columns =
+        process_returning_clause(&mut body.returning, &mut table_references, connection)?;
 
     let order_by = body
         .order_by
@@ -286,7 +278,6 @@ pub fn prepare_update_plan(
                 Some(&mut table_references),
                 Some(&result_columns),
                 connection,
-                &mut program.param_ctx,
                 BindingBehavior::ResultColumnsNotAllowed,
             );
             (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc))
@@ -306,13 +297,12 @@ pub fn prepare_update_plan(
         Some(&result_columns),
         &mut where_clause,
         connection,
-        &mut program.param_ctx,
     )?;
 
     // Parse the LIMIT/OFFSET clause
-    let (limit, offset) = body.limit.as_mut().map_or(Ok((None, None)), |l| {
-        parse_limit(l, connection, &mut program.param_ctx)
-    })?;
+    let (limit, offset) = body
+        .limit
+        .map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
     // Check what indexes will need to be updated by checking set_clauses and see
     // if a column is contained in an index.
@@ -320,7 +310,7 @@ pub fn prepare_update_plan(
     let updated_cols: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
     let rowid_alias_used = set_clauses
         .iter()
-        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias);
+        .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()
@@ -337,7 +327,6 @@ pub fn prepare_update_plan(
                 if !needs {
                     if let Some(w) = &idx.where_clause {
                         let mut where_copy = w.as_ref().clone();
-                        let mut param = ParamState::disallow();
                         let mut tr =
                             TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
                         bind_and_rewrite_expr(
@@ -345,7 +334,6 @@ pub fn prepare_update_plan(
                             Some(&mut tr),
                             None,
                             connection,
-                            &mut param,
                             BindingBehavior::ResultColumnsNotAllowed,
                         )
                         .ok()?;

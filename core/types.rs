@@ -1,3 +1,4 @@
+use either::Either;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
@@ -16,8 +17,11 @@ use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
-use crate::{turso_assert, Completion, CompletionError, Result, IO};
+use crate::{Completion, CompletionError, Result, IO};
+use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
+use std::iter::Peekable;
+use std::ops::Deref;
 use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -57,10 +61,10 @@ pub enum TextSubtype {
     Json,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
-    pub value: Vec<u8>,
+    pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
 }
 
@@ -71,22 +75,55 @@ impl Display for Text {
 }
 
 impl Text {
-    pub fn new(value: &str) -> Self {
+    pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            value: value.as_bytes().to_vec(),
+            value: value.into(),
             subtype: TextSubtype::Text,
         }
     }
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
-            value: value.into_bytes(),
+            value: value.into(),
             subtype: TextSubtype::Json,
         }
     }
 
     pub fn as_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.value.as_ref()) }
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TextRef<'a> {
+    pub value: &'a str,
+    pub subtype: TextSubtype,
+}
+
+impl<'a> TextRef<'a> {
+    pub fn new(value: &'a str, subtype: TextSubtype) -> Self {
+        Self { value, subtype }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &'a str {
+        self.value
+    }
+}
+
+impl<'a> Borrow<str> for TextRef<'a> {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<'a> Deref for TextRef<'a> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 
@@ -97,8 +134,9 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.value.clear();
-        self.value.extend_from_slice(other.as_ref().as_bytes());
+        let value = self.value.to_mut();
+        value.clear();
+        value.push_str(other.as_ref());
         self.subtype = other.subtype();
     }
 }
@@ -152,7 +190,7 @@ impl AsRef<str> for Text {
 impl From<&str> for Text {
     fn from(value: &str) -> Self {
         Text {
-            value: value.as_bytes().to_vec(),
+            value: value.to_owned().into(),
             subtype: TextSubtype::Text,
         }
     }
@@ -161,7 +199,7 @@ impl From<&str> for Text {
 impl From<String> for Text {
     fn from(value: String) -> Self {
         Text {
-            value: value.into_bytes(),
+            value: Cow::from(value),
             subtype: TextSubtype::Text,
         }
     }
@@ -169,7 +207,7 @@ impl From<String> for Text {
 
 impl From<Text> for String {
     fn from(value: Text) -> Self {
-        String::from_utf8(value.value).unwrap()
+        value.value.into_owned()
     }
 }
 
@@ -211,12 +249,12 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
     Integer(i64),
     Float(f64),
-    Text(&'a [u8], TextSubtype),
+    Text(TextRef<'a>),
     Blob(&'a [u8]),
 }
 
@@ -226,9 +264,9 @@ impl Debug for ValueRef<'_> {
             ValueRef::Null => write!(f, "Null"),
             ValueRef::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
             ValueRef::Float(float) => f.debug_tuple("Float").field(float).finish(),
-            ValueRef::Text(text_ref, _) => {
+            ValueRef::Text(text_ref) => {
                 // truncate string to at most 256 chars
-                let text = String::from_utf8_lossy(text_ref);
+                let text = text_ref.as_str();
                 let max_len = text.len().min(256);
                 f.debug_struct("Text")
                     .field("data", &&text[0..max_len])
@@ -249,20 +287,68 @@ impl Debug for ValueRef<'_> {
     }
 }
 
+pub trait AsValueRef {
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a>;
+}
+
+impl<'b> AsValueRef for ValueRef<'b> {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        *self
+    }
+}
+
+impl AsValueRef for Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl AsValueRef for &mut Value {
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        self.as_ref()
+    }
+}
+
+impl<V1, V2> AsValueRef for Either<V1, V2>
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    #[inline]
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        match self {
+            Either::Left(left) => left.as_value_ref(),
+            Either::Right(right) => right.as_value_ref(),
+        }
+    }
+}
+
+impl<V: AsValueRef> AsValueRef for &V {
+    fn as_value_ref<'a>(&'a self) -> ValueRef<'a> {
+        (*self).as_value_ref()
+    }
+}
+
 impl Value {
     pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
         match self {
             Value::Null => ValueRef::Null,
             Value::Integer(v) => ValueRef::Integer(*v),
             Value::Float(v) => ValueRef::Float(*v),
-            Value::Text(v) => ValueRef::Text(v.value.as_slice(), v.subtype),
+            Value::Text(v) => ValueRef::Text(TextRef {
+                value: &v.value,
+                subtype: v.subtype,
+            }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
         }
     }
 
     // A helper function that makes building a text Value easier.
-    pub fn build_text(text: impl AsRef<str>) -> Self {
-        Self::Text(Text::new(text.as_ref()))
+    pub fn build_text(text: impl Into<Cow<'static, str>>) -> Self {
+        Self::Text(Text::new(text))
     }
 
     pub fn to_blob(&self) -> Option<&[u8]> {
@@ -318,7 +404,7 @@ impl Value {
         }
     }
 
-    pub fn from_text(text: &str) -> Self {
+    pub fn from_text(text: impl Into<Cow<'static, str>>) -> Self {
         Value::Text(Text::new(text))
     }
 
@@ -347,7 +433,7 @@ impl Value {
                 }
             }
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
-            Value::Text(t) => out.extend_from_slice(&t.value),
+            Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -429,7 +515,7 @@ impl Value {
                 if v.is_json() {
                     return Ok(Value::Text(Text::json(text.to_string())));
                 }
-                Ok(Value::build_text(text))
+                Ok(Value::build_text(text.to_string()))
             }
             ExtValueType::Blob => {
                 let Some(blob) = v.to_blob() else {
@@ -604,58 +690,14 @@ impl AggContext {
 
 impl PartialEq<Value> for Value {
     fn eq(&self, other: &Value) -> bool {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
-                sqlite_int_float_compare(*int, *float).is_eq()
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.eq(&text_right.value)
-            }
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
-            _ => false,
-        }
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.eq(&right)
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd<Value> for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Float(float), Self::Integer(int)) => {
-                Some(sqlite_int_float_compare(*int, *float).reverse())
-            }
-            (Self::Integer(int), Self::Float(float)) => {
-                Some(sqlite_int_float_compare(*int, *float))
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                float_left.partial_cmp(float_right)
-            }
-            // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
-                Some(std::cmp::Ordering::Less)
-            }
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
-            (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.partial_cmp(&text_right.value)
-            }
-            // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
-        }
+        Some(self.cmp(other))
     }
 }
 
@@ -677,7 +719,8 @@ impl Eq for Value {}
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        let (left, right) = (self.as_value_ref(), other.as_value_ref());
+        left.cmp(&right)
     }
 }
 
@@ -722,26 +765,26 @@ impl std::ops::AddAssign for Value {
                 *float_left += float_right;
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
-                string_left.value.extend_from_slice(&string_right.value);
+                string_left.value.to_mut().push_str(&string_right.value);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Text(string_left), Self::Integer(int_right)) => {
                 let string_right = int_right.to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Integer(int_left), Self::Text(string_right)) => {
                 let string_left = int_left.to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (Self::Text(string_left), Self::Float(float_right)) => {
                 let string_right = Self::Float(float_right).to_string();
-                string_left.value.extend_from_slice(string_right.as_bytes());
+                string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
             (Self::Float(float_left), Self::Text(string_right)) => {
                 let string_left = Self::Float(*float_left).to_string();
-                *self = Self::build_text(&(string_left + string_right.as_str()));
+                *self = Self::build_text(string_left + string_right.as_str());
             }
             (_, Self::Null) => {}
             (Self::Null, rhs) => *self = rhs,
@@ -812,22 +855,19 @@ impl TryFrom<ValueRef<'_>> for i64 {
 impl TryFrom<ValueRef<'_>> for String {
     type Error = LimboError;
 
+    #[inline]
     fn try_from(value: ValueRef<'_>) -> Result<Self, Self::Error> {
-        match value {
-            ValueRef::Text(s, _) => Ok(String::from_utf8_lossy(s).to_string()),
-            _ => Err(LimboError::ConversionError("Expected text value".into())),
-        }
+        Ok(<&str>::try_from(value)?.to_string())
     }
 }
 
 impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     type Error = LimboError;
 
+    #[inline]
     fn try_from(value: ValueRef<'a>) -> Result<Self, Self::Error> {
         match value {
-            ValueRef::Text(s, _) => Ok(str::from_utf8(s).map_err(|_| {
-                LimboError::ConversionError("Expected a valid UTF8 string".to_string())
-            })?),
+            ValueRef::Text(s) => Ok(s.as_str()),
             _ => Err(LimboError::ConversionError("Expected text value".into())),
         }
     }
@@ -954,9 +994,14 @@ impl ImmutableRecord {
 
     // TODO: inline the complete record parsing code here.
     // Its probably more efficient.
+    // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
+    // it always deserializes the columns
     pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
         let mut cursor = RecordCursor::new();
-        cursor.get_values(self).unwrap_or_default()
+        cursor
+            .get_values(self)
+            .collect::<Result<Vec<_>>>()
+            .unwrap_or_default()
     }
 
     pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -971,7 +1016,7 @@ impl ImmutableRecord {
     }
 
     pub fn from_values<'a>(
-        values: impl IntoIterator<Item = &'a Value> + Clone,
+        values: impl IntoIterator<Item = impl AsValueRef + 'a> + Clone,
         len: usize,
     ) -> Self {
         let mut serials = Vec::with_capacity(len);
@@ -981,7 +1026,7 @@ impl ImmutableRecord {
         let mut serial_type_buf = [0; 9];
         // write serial types
         for value in values.clone() {
-            let serial_type = SerialType::from(value);
+            let serial_type = SerialType::from(value.as_value_ref());
             let n = write_varint(&mut serial_type_buf[0..], serial_type.into());
             serials.push((serial_type_buf, n));
 
@@ -1010,28 +1055,29 @@ impl ImmutableRecord {
 
         // write content
         for value in values {
+            let value = value.as_value_ref();
             match value {
-                Value::Null => {}
-                Value::Integer(i) => {
+                ValueRef::Null => {}
+                ValueRef::Integer(i) => {
                     let serial_type = SerialType::from(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
-                        SerialTypeKind::I8 => writer.extend_from_slice(&(*i as i8).to_be_bytes()),
-                        SerialTypeKind::I16 => writer.extend_from_slice(&(*i as i16).to_be_bytes()),
+                        SerialTypeKind::I8 => writer.extend_from_slice(&(i as i8).to_be_bytes()),
+                        SerialTypeKind::I16 => writer.extend_from_slice(&(i as i16).to_be_bytes()),
                         SerialTypeKind::I24 => {
-                            writer.extend_from_slice(&(*i as i32).to_be_bytes()[1..])
+                            writer.extend_from_slice(&(i as i32).to_be_bytes()[1..])
                         } // remove most significant byte
-                        SerialTypeKind::I32 => writer.extend_from_slice(&(*i as i32).to_be_bytes()),
+                        SerialTypeKind::I32 => writer.extend_from_slice(&(i as i32).to_be_bytes()),
                         SerialTypeKind::I48 => writer.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialTypeKind::I64 => writer.extend_from_slice(&i.to_be_bytes()),
                         other => panic!("Serial type is not an integer: {other:?}"),
                     }
                 }
-                Value::Float(f) => writer.extend_from_slice(&f.to_be_bytes()),
-                Value::Text(t) => {
-                    writer.extend_from_slice(&t.value);
+                ValueRef::Float(f) => writer.extend_from_slice(&f.to_be_bytes()),
+                ValueRef::Text(t) => {
+                    writer.extend_from_slice(t.value.as_bytes());
                 }
-                Value::Blob(b) => {
+                ValueRef::Blob(b) => {
                     writer.extend_from_slice(b);
                 }
             };
@@ -1401,19 +1447,48 @@ impl RecordCursor {
     /// * `Ok(Vec<RefValue>)` - All values in column order
     /// * `Err(LimboError)` - Parsing or deserialization failed
     ///
-    pub fn get_values<'a>(&mut self, record: &'a ImmutableRecord) -> Result<Vec<ValueRef<'a>>> {
-        if record.is_invalidated() {
-            return Ok(Vec::new());
+    pub fn get_values<'a, 'b>(
+        &'b mut self,
+        record: &'a ImmutableRecord,
+    ) -> Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, 'b>> {
+        struct GetValues<'a, 'b> {
+            cursor: &'b mut RecordCursor,
+            record: &'a ImmutableRecord,
+            idx: usize,
         }
 
-        self.parse_full_header(record)?;
-        let mut result = Vec::with_capacity(self.serial_types.len());
+        impl<'a, 'b> Iterator for GetValues<'a, 'b> {
+            type Item = Result<ValueRef<'a>>;
 
-        for i in 0..self.serial_types.len() {
-            result.push(self.deserialize_column(record, i)?);
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.idx == 0 {
+                    // So that we can have the full length of serial types
+                    if let Err(err) = self.cursor.parse_full_header(self.record) {
+                        return Some(Err(err));
+                    }
+                }
+                if !self.record.is_invalidated() && self.idx < self.cursor.serial_types.len() {
+                    let res = self.cursor.deserialize_column(self.record, self.idx);
+                    self.idx += 1;
+                    Some(res)
+                } else {
+                    None
+                }
+            }
         }
 
-        Ok(result)
+        impl<'a, 'b> ExactSizeIterator for GetValues<'a, 'b> {
+            fn len(&self) -> usize {
+                self.cursor.serial_types.len() - self.idx
+            }
+        }
+
+        let get_values = GetValues {
+            cursor: self,
+            record,
+            idx: 0,
+        };
+        get_values.peekable()
     }
 }
 
@@ -1423,9 +1498,7 @@ impl<'a> ValueRef<'a> {
             Self::Null => ExtValue::null(),
             Self::Integer(i) => ExtValue::from_integer(*i),
             Self::Float(fl) => ExtValue::from_float(*fl),
-            Self::Text(text, _) => {
-                ExtValue::from_text(std::str::from_utf8(text).unwrap().to_string())
-            }
+            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }
@@ -1437,16 +1510,62 @@ impl<'a> ValueRef<'a> {
         }
     }
 
+    pub fn to_text(&self) -> Option<&'a str> {
+        match self {
+            Self::Text(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_blob(&self) -> &'a [u8] {
+        match self {
+            Self::Blob(b) => b,
+            _ => panic!("as_blob must be called only for Value::Blob"),
+        }
+    }
+
+    pub fn as_float(&self) -> f64 {
+        match self {
+            Self::Float(f) => *f,
+            Self::Integer(i) => *i as f64,
+            _ => panic!("as_float must be called only for Value::Float or Value::Integer"),
+        }
+    }
+
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    pub fn as_uint(&self) -> u64 {
+        match self {
+            Self::Integer(i) => (*i).cast_unsigned(),
+            _ => 0,
+        }
+    }
+
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Float(f) => Value::Float(*f),
-            ValueRef::Text(text, subtype) => Value::Text(Text {
-                value: text.to_vec(),
-                subtype: *subtype,
+            ValueRef::Text(text) => Value::Text(Text {
+                value: text.value.to_string().into(),
+                subtype: text.subtype,
             }),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        }
+    }
+
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Self::Null => ValueType::Null,
+            Self::Integer(_) => ValueType::Integer,
+            Self::Float(_) => ValueType::Float,
+            Self::Text(_) => ValueType::Text,
+            Self::Blob(_) => ValueType::Blob,
         }
     }
 }
@@ -1457,21 +1576,42 @@ impl Display for ValueRef<'_> {
             Self::Null => write!(f, "NULL"),
             Self::Integer(i) => write!(f, "{i}"),
             Self::Float(fl) => write!(f, "{fl:?}"),
-            Self::Text(s, _) => write!(f, "{}", String::from_utf8_lossy(s)),
+            Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
     }
 }
 
-impl Eq for ValueRef<'_> {}
-
-impl Ord for ValueRef<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
+    fn eq(&self, other: &ValueRef<'a>) -> bool {
+        match (self, other) {
+            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
+            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
+                sqlite_int_float_compare(*int, *float).is_eq()
+            }
+            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.as_bytes() == text_right.value.as_bytes()
+            }
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
     }
 }
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
+impl<'a> PartialEq<Value> for ValueRef<'a> {
+    fn eq(&self, other: &Value) -> bool {
+        let other = other.as_value_ref();
+        self.eq(&other)
+    }
+}
+
+impl<'a> Eq for ValueRef<'a> {}
+
+#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -1486,25 +1626,32 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
                 float_left.partial_cmp(float_right)
             }
             // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_, _) | Self::Blob(_)) => {
+            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
                 Some(std::cmp::Ordering::Less)
             }
-            (Self::Text(_, _) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
+            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
                 Some(std::cmp::Ordering::Greater)
             }
 
-            (Self::Text(text_left, _), Self::Text(text_right, _)) => {
-                text_left.partial_cmp(text_right)
-            }
+            (Self::Text(text_left), Self::Text(text_right)) => text_left
+                .value
+                .as_bytes()
+                .partial_cmp(text_right.value.as_bytes()),
             // Text vs Blob
-            (Self::Text(_, _), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_, _)) => Some(std::cmp::Ordering::Greater),
+            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
+            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
             (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
             (Self::Null, _) => Some(std::cmp::Ordering::Less),
             (_, Self::Null) => Some(std::cmp::Ordering::Greater),
         }
+    }
+}
+
+impl<'a> Ord for ValueRef<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -1589,23 +1736,37 @@ impl IndexInfo {
     }
 }
 
-pub fn compare_immutable(
-    l: &[ValueRef],
-    r: &[ValueRef],
+pub fn compare_immutable<V1, V2, E1, E2, I1, I2>(
+    l: I1,
+    r: I2,
     column_info: &[KeyInfo],
-) -> std::cmp::Ordering {
-    assert_eq!(l.len(), r.len());
-    turso_assert!(column_info.len() >= l.len(), "column_info.len() < l.len()");
-    for (i, (l, r)) in l.iter().zip(r).enumerate() {
+) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+    E1: ExactSizeIterator<Item = V1>,
+    E2: ExactSizeIterator<Item = V2>,
+    I1: IntoIterator<IntoIter = E1, Item = E1::Item>,
+    I2: IntoIterator<IntoIter = E2, Item = E2::Item>,
+{
+    let (l, r): (E1, E2) = (l.into_iter(), r.into_iter());
+    assert!(
+        l.len() >= column_info.len(),
+        "{} < {}",
+        l.len(),
+        column_info.len()
+    );
+    assert!(
+        r.len() >= column_info.len(),
+        "{} < {}",
+        r.len(),
+        column_info.len()
+    );
+    let (l, r) = (l.take(column_info.len()), r.take(column_info.len()));
+    for (i, (l, r)) in l.zip(r).enumerate() {
         let column_order = column_info[i].sort_order;
         let collation = column_info[i].collation;
-        let cmp = match (l, r) {
-            (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                &String::from_utf8_lossy(left),
-                &String::from_utf8_lossy(right),
-            ),
-            _ => l.partial_cmp(r).unwrap(),
-        };
+        let cmp = compare_immutable_single(l, r, collation);
         if !cmp.is_eq() {
             return match column_order {
                 SortOrder::Asc => cmp,
@@ -1616,6 +1777,19 @@ pub fn compare_immutable(
     std::cmp::Ordering::Equal
 }
 
+pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
+where
+    V1: AsValueRef,
+    V2: AsValueRef,
+{
+    let l = l.as_value_ref();
+    let r = r.as_value_ref();
+    match (l, r) {
+        (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
+        _ => l.partial_cmp(&r).unwrap(),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RecordCompare {
     Int,
@@ -1624,14 +1798,20 @@ pub enum RecordCompare {
 }
 
 impl RecordCompare {
-    pub fn compare(
+    pub fn compare<V, E, I>(
         &self,
         serialized: &ImmutableRecord,
-        unpacked: &[ValueRef],
+        unpacked: I,
         index_info: &IndexInfo,
         skip: usize,
         tie_breaker: std::cmp::Ordering,
-    ) -> Result<std::cmp::Ordering> {
+    ) -> Result<std::cmp::Ordering>
+    where
+        V: AsValueRef,
+        E: ExactSizeIterator<Item = V>,
+        I: IntoIterator<IntoIter = E, Item = E::Item>,
+    {
+        let unpacked = unpacked.into_iter();
         match self {
             RecordCompare::Int => {
                 compare_records_int(serialized, unpacked, index_info, tie_breaker)
@@ -1646,11 +1826,18 @@ impl RecordCompare {
     }
 }
 
-pub fn find_compare(unpacked: &[ValueRef], index_info: &IndexInfo) -> RecordCompare {
-    if !unpacked.is_empty() && index_info.num_cols <= 13 {
-        match &unpacked[0] {
+pub fn find_compare<I, E, V>(unpacked: I, index_info: &IndexInfo) -> RecordCompare
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = Peekable<E>, Item = V>,
+{
+    let mut unpacked = unpacked.into_iter();
+    if unpacked.len() != 0 && index_info.num_cols <= 13 {
+        let val = unpacked.peek().unwrap();
+        match val.as_value_ref() {
             ValueRef::Integer(_) => RecordCompare::Int,
-            ValueRef::Text(_, _) if index_info.key_info[0].collation == CollationSeq::Binary => {
+            ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
                 RecordCompare::String
             }
             _ => RecordCompare::Generic,
@@ -1714,16 +1901,16 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// 4. **Sort order**: Applies ascending/descending order to comparison result
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_int(
+fn compare_records_int<V, I>(
     serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
+    unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
-) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V>,
+{
     let payload = serialized.get_payload();
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
@@ -1750,7 +1937,9 @@ fn compare_records_int(
     let data_start = header_size;
 
     let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
-    let ValueRef::Integer(rhs_int) = unpacked[0] else {
+    let mut unpacked = unpacked.peekable();
+    // Do not consume iterator here
+    let ValueRef::Integer(rhs_int) = unpacked.peek().unwrap().as_value_ref() else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
     let comparison = match index_info.key_info[0].sort_order {
@@ -1807,16 +1996,16 @@ fn compare_records_int(
 /// 4. **Length comparison**: If strings are equal, compares lengths
 /// 5. **Remaining fields**: If first field is equal and more fields exist,
 ///    delegates to `compare_records_generic()` with `skip=1`
-fn compare_records_string(
+fn compare_records_string<V, I>(
     serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
+    unpacked: I,
     index_info: &IndexInfo,
     tie_breaker: std::cmp::Ordering,
-) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V>,
+{
     let payload = serialized.get_payload();
     if payload.len() < 2 {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
@@ -1840,7 +2029,9 @@ fn compare_records_string(
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let ValueRef::Text(rhs_text, _) = &unpacked[0] else {
+    let mut unpacked = unpacked.peekable();
+
+    let ValueRef::Text(rhs_text) = unpacked.peek().unwrap().as_value_ref() else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
@@ -1852,15 +2043,12 @@ fn compare_records_string(
     let serial_type = SerialType::try_from(first_serial_type)?;
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
 
-    let ValueRef::Text(lhs_text, _) = lhs_value else {
+    let ValueRef::Text(lhs_text) = lhs_value else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
     let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(
-        &String::from_utf8_lossy(lhs_text),
-        &String::from_utf8_lossy(rhs_text),
-    );
+    let comparison = collation.compare_strings(&lhs_text, &rhs_text);
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -1919,17 +2107,17 @@ fn compare_records_string(
 /// The serialized and unpacked records do not have to contain the same number
 /// of fields. If all fields that appear in both records are equal, then
 /// `tie_breaker` is returned.
-pub fn compare_records_generic(
+pub fn compare_records_generic<V, I>(
     serialized: &ImmutableRecord,
-    unpacked: &[ValueRef],
+    unpacked: I,
     index_info: &IndexInfo,
     skip: usize,
     tie_breaker: std::cmp::Ordering,
-) -> Result<std::cmp::Ordering> {
-    turso_assert!(
-        index_info.key_info.len() >= unpacked.len(),
-        "index_info.key_info.len() < unpacked.len()"
-    );
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    I: ExactSizeIterator<Item = V>,
+{
     let payload = serialized.get_payload();
     if payload.is_empty() {
         return Ok(std::cmp::Ordering::Less);
@@ -1960,12 +2148,18 @@ pub fn compare_records_generic(
     }
 
     let mut field_idx = skip;
-    while field_idx < unpacked.len() && header_pos < header_end {
+    let field_limit = unpacked.len().min(index_info.key_info.len());
+
+    // assumes that that the `unpacked' iterator was not skipped outside this function call`
+    for rhs_value in unpacked.skip(skip) {
+        let rhs_value = &rhs_value.as_value_ref();
+        if field_idx >= field_limit || header_pos >= header_end {
+            break;
+        }
         let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
-        let rhs_value = &unpacked[field_idx];
 
         let lhs_value = match serial_type.kind() {
             SerialTypeKind::ConstInt0 => ValueRef::Integer(0),
@@ -1979,12 +2173,9 @@ pub fn compare_records_generic(
         };
 
         let comparison = match (&lhs_value, rhs_value) {
-            (ValueRef::Text(lhs_text, _), ValueRef::Text(rhs_text, _)) => {
-                index_info.key_info[field_idx].collation.compare_strings(
-                    &String::from_utf8_lossy(lhs_text),
-                    &String::from_utf8_lossy(rhs_text),
-                )
-            }
+            (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => index_info.key_info[field_idx]
+                .collation
+                .compare_strings(lhs_text, rhs_text),
 
             (ValueRef::Integer(lhs_int), ValueRef::Float(rhs_float)) => {
                 sqlite_int_float_compare(*lhs_int, *rhs_float)
@@ -2149,23 +2340,24 @@ impl SerialType {
     }
 }
 
-impl From<&Value> for SerialType {
-    fn from(value: &Value) -> Self {
+impl<T: AsValueRef> From<T> for SerialType {
+    fn from(value: T) -> Self {
+        let value = value.as_value_ref();
         match value {
-            Value::Null => SerialType::null(),
-            Value::Integer(i) => match i {
+            ValueRef::Null => SerialType::null(),
+            ValueRef::Integer(i) => match i {
                 0 => SerialType::const_int0(),
                 1 => SerialType::const_int1(),
-                i if *i >= I8_LOW && *i <= I8_HIGH => SerialType::i8(),
-                i if *i >= I16_LOW && *i <= I16_HIGH => SerialType::i16(),
-                i if *i >= I24_LOW && *i <= I24_HIGH => SerialType::i24(),
-                i if *i >= I32_LOW && *i <= I32_HIGH => SerialType::i32(),
-                i if *i >= I48_LOW && *i <= I48_HIGH => SerialType::i48(),
+                i if (I8_LOW..=I8_HIGH).contains(&i) => SerialType::i8(),
+                i if (I16_LOW..=I16_HIGH).contains(&i) => SerialType::i16(),
+                i if (I24_LOW..=I24_HIGH).contains(&i) => SerialType::i24(),
+                i if (I32_LOW..=I32_HIGH).contains(&i) => SerialType::i32(),
+                i if (I48_LOW..=I48_HIGH).contains(&i) => SerialType::i48(),
                 _ => SerialType::i64(),
             },
-            Value::Float(_) => SerialType::f64(),
-            Value::Text(t) => SerialType::text(t.value.len() as u64),
-            Value::Blob(b) => SerialType::blob(b.len() as u64),
+            ValueRef::Float(_) => SerialType::f64(),
+            ValueRef::Text(t) => SerialType::text(t.value.len() as u64),
+            ValueRef::Blob(b) => SerialType::blob(b.len() as u64),
         }
     }
 }
@@ -2256,7 +2448,7 @@ impl Record {
                     }
                 }
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
-                Value::Text(t) => buf.extend_from_slice(&t.value),
+                Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
         }
@@ -2576,10 +2768,9 @@ mod tests {
             let collation = index_key_info[i].collation;
 
             let cmp = match (&l[i], &r[i]) {
-                (ValueRef::Text(left, _), ValueRef::Text(right, _)) => collation.compare_strings(
-                    &String::from_utf8_lossy(left),
-                    &String::from_utf8_lossy(right),
-                ),
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    collation.compare_strings(left, right)
+                }
                 _ => l[i].partial_cmp(&r[i]).unwrap_or(std::cmp::Ordering::Equal),
             };
 
@@ -2638,7 +2829,7 @@ mod tests {
             tie_breaker,
         );
 
-        let comparer = find_compare(&unpacked_values, index_info);
+        let comparer = find_compare(unpacked_values.iter().peekable(), index_info);
         let optimized_result = comparer
             .compare(&serialized, &unpacked_values, index_info, 0, tie_breaker)
             .unwrap();
@@ -2648,12 +2839,17 @@ mod tests {
             "Test '{test_name}' failed: Full Comparison: {gold_result:?}, Optimized: {optimized_result:?}, Strategy: {comparer:?}"
         );
 
-        let generic_result =
-            compare_records_generic(&serialized, &unpacked_values, index_info, 0, tie_breaker)
-                .unwrap();
+        let generic_result = compare_records_generic(
+            &serialized,
+            unpacked_values.iter(),
+            index_info,
+            0,
+            tie_breaker,
+        )
+        .unwrap();
         assert_eq!(
             gold_result, generic_result,
-            "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}"
+            "Test '{test_name}' failed with generic: Full Comparison: {gold_result:?}, Generic: {generic_result:?}\n LHS: {serialized_values:?}\n RHS: {unpacked_values:?}"
         );
     }
 
@@ -2763,7 +2959,7 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "integer_text_equal",
             ),
@@ -2771,13 +2967,16 @@ mod tests {
                 vec![Value::Integer(42), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"world", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("world", TextSubtype::Text)),
                 ],
                 "integer_equal_text_different",
             ),
         ];
 
         for (serialized_values, unpacked_values, test_name) in test_cases {
+            println!(
+                "Testing integer fast path `{test_name}`\nLHS: {serialized_values:?}\nRHS: {unpacked_values:?}"
+            );
             assert_compare_matches_full_comparison(
                 serialized_values,
                 unpacked_values,
@@ -2798,34 +2997,34 @@ mod tests {
         let test_cases = vec![
             (
                 vec![Value::Text(Text::new("hello"))],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_strings",
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(b"def", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "less_than_strings",
             ),
             (
                 vec![Value::Text(Text::new("xyz"))],
-                vec![ValueRef::Text(b"abc", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("abc", TextSubtype::Text))],
                 "greater_than_strings",
             ),
             (
                 vec![Value::Text(Text::new(""))],
-                vec![ValueRef::Text(b"", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("", TextSubtype::Text))],
                 "empty_strings",
             ),
             (
                 vec![Value::Text(Text::new("a"))],
-                vec![ValueRef::Text(b"aa", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("aa", TextSubtype::Text))],
                 "prefix_strings",
             ),
             // Multi-field with string first
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(42),
                 ],
                 "string_integer_equal",
@@ -2833,7 +3032,7 @@ mod tests {
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(42)],
                 vec![
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                     ValueRef::Integer(99),
                 ],
                 "string_equal_integer_different",
@@ -2869,7 +3068,7 @@ mod tests {
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "null_vs_text",
             ),
             (
@@ -2880,12 +3079,12 @@ mod tests {
             // Numbers vs Text/Blob
             (
                 vec![Value::Integer(42)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "integer_vs_text",
             ),
             (
                 vec![Value::Float(64.4)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "float_vs_text",
             ),
             (
@@ -2949,7 +3148,7 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("abc"))],
-                vec![ValueRef::Text(b"def", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("def", TextSubtype::Text))],
                 "desc_string_reversed",
             ),
             // Mixed sort orders
@@ -2957,7 +3156,7 @@ mod tests {
                 vec![Value::Integer(10), Value::Text(Text::new("hello"))],
                 vec![
                     ValueRef::Integer(20),
-                    ValueRef::Text(b"hello", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "desc_first_asc_second",
             ),
@@ -2983,7 +3182,7 @@ mod tests {
                 vec![Value::Integer(42)],
                 vec![
                     ValueRef::Integer(42),
-                    ValueRef::Text(b"extra", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("extra", TextSubtype::Text)),
                 ],
                 "fewer_serialized_fields",
             ),
@@ -3006,13 +3205,13 @@ mod tests {
             ),
             (
                 vec![Value::Text(Text::new("hello")), Value::Integer(5)],
-                vec![ValueRef::Text(b"hello", TextSubtype::Text)],
+                vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
                 vec![Value::Text(Text::new("same")), Value::Integer(5)],
                 vec![
-                    ValueRef::Text(b"same", TextSubtype::Text),
+                    ValueRef::Text(TextRef::new("same", TextSubtype::Text)),
                     ValueRef::Integer(5),
                 ],
                 "equal_text_then_equal_int",
@@ -3042,7 +3241,7 @@ mod tests {
             Value::Integer(2),
             Value::Integer(3),
         ]);
-        let unpacked = vec![
+        let unpacked = [
             ValueRef::Integer(1),
             ValueRef::Integer(99),
             ValueRef::Integer(3),
@@ -3050,9 +3249,11 @@ mod tests {
 
         let tie_breaker = std::cmp::Ordering::Equal;
         let result_skip_0 =
-            compare_records_generic(&serialized, &unpacked, &index_info, 0, tie_breaker).unwrap();
+            compare_records_generic(&serialized, unpacked.iter(), &index_info, 0, tie_breaker)
+                .unwrap();
         let result_skip_1 =
-            compare_records_generic(&serialized, &unpacked, &index_info, 1, tie_breaker).unwrap();
+            compare_records_generic(&serialized, unpacked.iter(), &index_info, 1, tie_breaker)
+                .unwrap();
 
         assert_eq!(result_skip_0, std::cmp::Ordering::Less);
 
@@ -3070,33 +3271,33 @@ mod tests {
         );
         let index_info_large = create_index_info(15, vec![SortOrder::Asc; 15], collations_large);
 
-        let int_values = vec![
+        let int_values = [
             ValueRef::Integer(42),
-            ValueRef::Text(b"hello", TextSubtype::Text),
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
         ];
         assert!(matches!(
-            find_compare(&int_values, &index_info_small),
+            find_compare(int_values.iter().peekable(), &index_info_small),
             RecordCompare::Int
         ));
 
-        let string_values = vec![
-            ValueRef::Text(b"hello", TextSubtype::Text),
+        let string_values = [
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
             ValueRef::Integer(42),
         ];
         assert!(matches!(
-            find_compare(&string_values, &index_info_small),
+            find_compare(string_values.iter().peekable(), &index_info_small),
             RecordCompare::String
         ));
 
         let large_values: Vec<ValueRef> = (0..15).map(ValueRef::Integer).collect();
         assert!(matches!(
-            find_compare(&large_values, &index_info_large),
+            find_compare(large_values.iter().peekable(), &index_info_large),
             RecordCompare::Generic
         ));
 
-        let blob_values = vec![ValueRef::Blob(&[1, 2, 3])];
+        let blob_values = [ValueRef::Blob(&[1, 2, 3])];
         assert!(matches!(
-            find_compare(&blob_values, &index_info_small),
+            find_compare(blob_values.iter().peekable(), &index_info_small),
             RecordCompare::Generic
         ));
     }

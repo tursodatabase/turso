@@ -1,42 +1,66 @@
+use crate::types::AsValueRef;
+use crate::types::Value;
 use crate::LimboError::InvalidModifier;
-use crate::Result;
-use crate::{ends_with_ignore_ascii_case, eq_ignore_ascii_case, starts_with_ignore_ascii_case};
-use crate::{types::Value, vdbe::Register};
+use crate::{Result, ValueRef};
 use chrono::{
     DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
 };
-use turso_macros::match_ignore_ascii_case;
 
 /// Execution of date/time/datetime functions
 #[inline(always)]
-pub fn exec_date(values: &[Register]) -> Value {
+pub fn exec_date<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::Date)
 }
 
 #[inline(always)]
-pub fn exec_time(values: &[Register]) -> Value {
+pub fn exec_time<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::Time)
 }
 
 #[inline(always)]
-pub fn exec_datetime_full(values: &[Register]) -> Value {
+pub fn exec_datetime_full<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::DateTime)
 }
 
 #[inline(always)]
-pub fn exec_strftime(values: &[Register]) -> Value {
-    if values.is_empty() {
+pub fn exec_strftime<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
+    if values.len() == 0 {
         return Value::Null;
     }
 
-    let value = &values[0].get_value();
-    let format_str = if matches!(value, Value::Text(_) | Value::Integer(_) | Value::Float(_)) {
+    let value = values.next().unwrap();
+    let value = value.as_value_ref();
+    let format_str = if matches!(
+        value,
+        ValueRef::Text(_) | ValueRef::Integer(_) | ValueRef::Float(_)
+    ) {
         format!("{value}")
     } else {
         return Value::Null;
     };
 
-    exec_datetime(&values[1..], DateTimeOutput::StrfTime(format_str))
+    exec_datetime(values, DateTimeOutput::StrfTime(format_str))
 }
 
 enum DateTimeOutput {
@@ -48,14 +72,22 @@ enum DateTimeOutput {
     JuliaDay,
 }
 
-fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
-    if values.is_empty() {
-        let now = parse_naive_date_time(&Value::build_text("now")).unwrap();
+fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let values = values.into_iter();
+    if values.len() == 0 {
+        let now = parse_naive_date_time(Value::build_text("now")).unwrap();
         return format_dt(now, output_type, false);
     }
-    if let Some(mut dt) = parse_naive_date_time(values[0].get_value()) {
+    let mut values = values.peekable();
+    let first = values.peek().unwrap();
+    if let Some(mut dt) = parse_naive_date_time(first) {
         // if successful, treat subsequent entries as modifiers
-        modify_dt(&mut dt, &values[1..], output_type)
+        modify_dt(&mut dt, values.skip(1), output_type)
     } else {
         // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
         let mut dt = chrono::Local::now().to_utc().naive_utc();
@@ -63,11 +95,17 @@ fn exec_datetime(values: &[Register], output_type: DateTimeOutput) -> Value {
     }
 }
 
-fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOutput) -> Value {
+fn modify_dt<I, E, V>(dt: &mut NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mods = mods.into_iter();
     let mut n_floor: i64 = 0;
     let mut subsec_requested = false;
     for modifier in mods {
-        if let Value::Text(ref text_rc) = modifier.get_value() {
+        if let ValueRef::Text(ref text_rc) = modifier.as_value_ref() {
             // TODO: to prevent double conversion and properly support 'utc'/'localtime', we also
             // need to keep track of the current timezone and apply it to the modifier.
             let parsed = parse_modifier(text_rc.as_str());
@@ -98,14 +136,14 @@ fn modify_dt(dt: &mut NaiveDateTime, mods: &[Register], output_type: DateTimeOut
 
 fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Value {
     match output_type {
-        DateTimeOutput::Date => Value::from_text(dt.format("%Y-%m-%d").to_string().as_str()),
+        DateTimeOutput::Date => Value::from_text(dt.format("%Y-%m-%d").to_string()),
         DateTimeOutput::Time => {
             let t = if subsec {
                 dt.format("%H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%H:%M:%S").to_string()
             };
-            Value::from_text(t.as_str())
+            Value::from_text(t)
         }
         DateTimeOutput::DateTime => {
             let t = if subsec && dt.nanosecond() != 0 {
@@ -113,11 +151,9 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             };
-            Value::from_text(t.as_str())
+            Value::from_text(t)
         }
-        DateTimeOutput::StrfTime(format_str) => {
-            Value::from_text(strftime_format(&dt, &format_str).as_str())
-        }
+        DateTimeOutput::StrfTime(format_str) => Value::from_text(strftime_format(&dt, &format_str)),
         DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
     }
 }
@@ -343,7 +379,12 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
     28
 }
 
-pub fn exec_julianday(values: &[Register]) -> Value {
+pub fn exec_julianday<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
     exec_datetime(values, DateTimeOutput::JuliaDay)
 }
 
@@ -396,11 +437,12 @@ fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
     value.and_utc().timestamp()
 }
 
-fn parse_naive_date_time(time_value: &Value) -> Option<NaiveDateTime> {
+fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<NaiveDateTime> {
+    let time_value = time_value.as_value_ref();
     match time_value {
-        Value::Text(s) => get_date_time_from_time_value_string(s.as_str()),
-        Value::Integer(i) => get_date_time_from_time_value_integer(*i),
-        Value::Float(f) => get_date_time_from_time_value_float(*f),
+        ValueRef::Text(s) => get_date_time_from_time_value_string(s.as_str()),
+        ValueRef::Integer(i) => get_date_time_from_time_value_integer(i),
+        ValueRef::Float(f) => get_date_time_from_time_value_float(f),
         _ => None,
     }
 }
@@ -625,132 +667,165 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
 }
 
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
-    let modifier = modifier.trim().as_bytes();
+    // Small helpers to check string suffix/prefix in a case-insensitive way with no allocation
+    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+    fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
 
-    #[inline(always)]
-    fn from_bytes(bytes: &[u8]) -> &str {
-        unsafe { str::from_utf8_unchecked(bytes) }
-    } // safe because input is from &str
+    let modifier = modifier.trim();
 
-    match_ignore_ascii_case!(match modifier {
-        // exact matches first
-        b"ceiling" => Ok(Modifier::Ceiling),
-        b"floor" => Ok(Modifier::Floor),
-        b"start of month" => Ok(Modifier::StartOfMonth),
-        b"start of year" => Ok(Modifier::StartOfYear),
-        b"start of day" => Ok(Modifier::StartOfDay),
-        b"unixepoch" => Ok(Modifier::UnixEpoch),
-        b"julianday" => Ok(Modifier::JulianDay),
-        b"auto" => Ok(Modifier::Auto),
-        b"localtime" => Ok(Modifier::Localtime),
-        b"utc" => Ok(Modifier::Utc),
-        b"subsec" | b"subsecond" => Ok(Modifier::Subsec),
-        _ => {
-            match modifier {
-                s if starts_with_ignore_ascii_case!(s, b"weekday ") => {
-                    let day = parse_modifier_number(from_bytes(&s[8..]))?;
-                    if !(0..=6).contains(&day) {
-                        Err(InvalidModifier(
-                            "Weekday must be between 0 and 6".to_string(),
-                        ))
-                    } else {
-                        Ok(Modifier::Weekday(day as u32))
-                    }
-                }
-                s if ends_with_ignore_ascii_case!(s, b" day") => Ok(Modifier::Days(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 4]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" days") => Ok(Modifier::Days(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" hour") => Ok(Modifier::Hours(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" hours") => Ok(Modifier::Hours(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" minute") => Ok(Modifier::Minutes(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" minutes") => Ok(Modifier::Minutes(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 8]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" second") => Ok(Modifier::Seconds(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" seconds") => Ok(Modifier::Seconds(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 8]))?,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" month") => Ok(Modifier::Months(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" months") => Ok(Modifier::Months(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 7]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" year") => Ok(Modifier::Years(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 5]))? as i32,
-                )),
-                s if ends_with_ignore_ascii_case!(s, b" years") => Ok(Modifier::Years(
-                    parse_modifier_number(from_bytes(&s[..s.len() - 6]))? as i32,
-                )),
-                s if starts_with_ignore_ascii_case!(s, b"+")
-                    || starts_with_ignore_ascii_case!(s, b"-") =>
-                {
-                    let sign = if starts_with_ignore_ascii_case!(s, b"-") {
-                        -1
-                    } else {
-                        1
-                    };
-                    let parts: Vec<&str> = from_bytes(&s[1..]).split(' ').collect();
-                    let digits_in_date = 10;
-                    match parts.len() {
-                        1 => {
-                            if parts[0].len() == digits_in_date {
-                                let date = parse_modifier_date(parts[0])?;
-                                Ok(Modifier::DateOffset {
-                                    years: sign * date.year(),
-                                    months: sign * date.month() as i32,
-                                    days: sign * date.day() as i32,
-                                })
-                            } else {
-                                // time values are either 12, 8 or 5 digits
-                                let time = parse_modifier_time(parts[0])?;
-                                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
-                                Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
-                            }
-                        }
-                        2 => {
-                            let date = parse_modifier_date(parts[0])?;
-                            let time = parse_modifier_time(parts[1])?;
-                            // Convert time to total seconds (with sign)
-                            let time_delta = sign * (time.num_seconds_from_midnight() as i32);
-                            Ok(Modifier::DateTimeOffset {
-                                years: sign * (date.year()),
-                                months: sign * (date.month() as i32),
-                                days: sign * date.day() as i32,
-                                seconds: time_delta,
-                            })
-                        }
-                        _ => Err(InvalidModifier(
-                            "Invalid date/time offset format".to_string(),
-                        )),
-                    }
-                }
-                _ => Err(InvalidModifier(
-                    "Invalid date/time offset format".to_string(),
-                )),
-            }
+    // We intentionally avoid usage of match_ignore_ascii_case! macro here because it lead to enormous amount of LLVM code which signifnicantly increase compilation time (see https://github.com/tursodatabase/turso/pull/3929)
+    // Fast path for exact matches
+    if modifier.eq_ignore_ascii_case("ceiling") {
+        return Ok(Modifier::Ceiling);
+    } else if modifier.eq_ignore_ascii_case("floor") {
+        return Ok(Modifier::Floor);
+    } else if modifier.eq_ignore_ascii_case("start of month") {
+        return Ok(Modifier::StartOfMonth);
+    } else if modifier.eq_ignore_ascii_case("start of year") {
+        return Ok(Modifier::StartOfYear);
+    } else if modifier.eq_ignore_ascii_case("start of day") {
+        return Ok(Modifier::StartOfDay);
+    } else if modifier.eq_ignore_ascii_case("unixepoch") {
+        return Ok(Modifier::UnixEpoch);
+    } else if modifier.eq_ignore_ascii_case("julianday") {
+        return Ok(Modifier::JulianDay);
+    } else if modifier.eq_ignore_ascii_case("auto") {
+        return Ok(Modifier::Auto);
+    } else if modifier.eq_ignore_ascii_case("localtime") {
+        return Ok(Modifier::Localtime);
+    } else if modifier.eq_ignore_ascii_case("utc") {
+        return Ok(Modifier::Utc);
+    } else if modifier.eq_ignore_ascii_case("subsec") || modifier.eq_ignore_ascii_case("subsecond")
+    {
+        return Ok(Modifier::Subsec);
+    }
+
+    // Patterns
+    if starts_with_ignore_ascii_case(modifier, "weekday ") {
+        let s = &modifier[8..];
+        let day = parse_modifier_number(s)?;
+        if !(0..=6).contains(&day) {
+            Err(InvalidModifier(
+                "Weekday must be between 0 and 6".to_string(),
+            ))
+        } else {
+            Ok(Modifier::Weekday(day as u32))
         }
-    })
+    } else if ends_with_ignore_ascii_case(modifier, " day") {
+        Ok(Modifier::Days(parse_modifier_number(
+            &modifier[..modifier.len() - 4],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " days") {
+        Ok(Modifier::Days(parse_modifier_number(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hour") {
+        Ok(Modifier::Hours(parse_modifier_number(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hours") {
+        Ok(Modifier::Hours(parse_modifier_number(
+            &modifier[..modifier.len() - 6],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minute") {
+        Ok(Modifier::Minutes(parse_modifier_number(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minutes") {
+        Ok(Modifier::Minutes(parse_modifier_number(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " second") {
+        Ok(Modifier::Seconds(parse_modifier_number(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " seconds") {
+        Ok(Modifier::Seconds(parse_modifier_number(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " month") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " months") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 7])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " year") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 5])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " years") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if starts_with_ignore_ascii_case(modifier, "+")
+        || starts_with_ignore_ascii_case(modifier, "-")
+    {
+        let sign = if starts_with_ignore_ascii_case(modifier, "-") {
+            -1
+        } else {
+            1
+        };
+        let rest = &modifier[1..];
+        let parts: Vec<&str> = rest.split(' ').collect();
+        let digits_in_date = 10;
+        match parts.len() {
+            1 => {
+                if parts[0].len() == digits_in_date {
+                    let date = parse_modifier_date(parts[0])?;
+                    Ok(Modifier::DateOffset {
+                        years: sign * date.year(),
+                        months: sign * date.month() as i32,
+                        days: sign * date.day() as i32,
+                    })
+                } else {
+                    // time values are either 12, 8 or 5 digits
+                    let time = parse_modifier_time(parts[0])?;
+                    let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+                    Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
+                }
+            }
+            2 => {
+                let date = parse_modifier_date(parts[0])?;
+                let time = parse_modifier_time(parts[1])?;
+                // Convert time to total seconds (with sign)
+                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+                Ok(Modifier::DateTimeOffset {
+                    years: sign * (date.year()),
+                    months: sign * (date.month() as i32),
+                    days: sign * date.day() as i32,
+                    seconds: time_delta,
+                })
+            }
+            _ => Err(InvalidModifier(
+                "Invalid date/time offset format".to_string(),
+            )),
+        }
+    } else {
+        Err(InvalidModifier(
+            "Invalid date/time offset format".to_string(),
+        ))
+    }
 }
 
-pub fn exec_timediff(values: &[Register]) -> Value {
+pub fn exec_timediff<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
     if values.len() < 2 {
         return Value::Null;
     }
 
-    let start = parse_naive_date_time(values[0].get_value());
-    let end = parse_naive_date_time(values[1].get_value());
+    let start = parse_naive_date_time(values.next().unwrap());
+    let end = parse_naive_date_time(values.next().unwrap());
 
     match (start, end) {
         (Some(start), Some(end)) => {
@@ -807,7 +882,7 @@ mod tests {
         let test_date_str = "2024-07-21";
         let next_date_str = "2024-07-22";
 
-        let test_cases = vec![
+        let test_cases: Vec<(Value, &str)> = vec![
             // Format 1: YYYY-MM-DD (no timezone applicable)
             (Value::build_text("2024-07-21"), test_date_str),
             // Format 2: YYYY-MM-DD HH:MM
@@ -908,10 +983,10 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_date(&[Register::Value(input.clone())]);
+            let result = exec_date(&[input.clone()]);
             assert_eq!(
                 result,
-                Value::build_text(expected),
+                Value::build_text(expected.to_string()),
                 "Failed for input: {input:?}"
             );
         }
@@ -948,7 +1023,7 @@ mod tests {
         ];
 
         for case in invalid_cases.iter() {
-            let result = exec_date(&[Register::Value(case.clone())]);
+            let result = exec_date([case]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
@@ -1040,7 +1115,7 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let result = exec_time(&[Register::Value(input)]);
+            let result = exec_time(&[input]);
             if let Value::Text(result_str) = result {
                 assert_eq!(result_str.as_str(), expected);
             } else {
@@ -1080,7 +1155,7 @@ mod tests {
         ];
 
         for case in invalid_cases {
-            let result = exec_time(&[Register::Value(case.clone())]);
+            let result = exec_time(&[case.clone()]);
             match result {
                 Value::Text(ref result_str) if result_str.value.is_empty() => (),
                 _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
@@ -1402,8 +1477,8 @@ mod tests {
         assert_eq!(dt, create_datetime(2023, 6, 15, 0, 0, 0));
     }
 
-    fn text(value: &str) -> Register {
-        Register::Value(Value::build_text(value))
+    fn text(value: &str) -> Value {
+        Value::build_text(value.to_string())
     }
 
     fn format(dt: NaiveDateTime) -> String {
@@ -1421,7 +1496,7 @@ mod tests {
             &[text("2023-06-15 12:30:45"), text("-1 day")],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1436,7 +1511,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1463,7 +1538,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1482,7 +1557,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1502,7 +1577,7 @@ mod tests {
             ],
             DateTimeOutput::DateTime,
         );
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1514,13 +1589,12 @@ mod tests {
         );
         assert_eq!(
             result_local,
-            *text(
+            text(
                 &dt.and_utc()
                     .with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string()
             )
-            .get_value()
         );
         // TODO: utc modifier assumes time given is not already utc
         // add test when fixed in the future
@@ -1558,7 +1632,7 @@ mod tests {
             .unwrap();
         let expected = format(max);
         let result = exec_datetime(&[text("9999-12-31 23:59:59")], DateTimeOutput::DateTime);
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     // leap second
@@ -1570,7 +1644,7 @@ mod tests {
             .unwrap();
         let expected = String::new(); // SQLite ignores leap seconds
         let result = exec_datetime(&[text(&leap_second.to_string())], DateTimeOutput::DateTime);
-        assert_eq!(result, *text(&expected).get_value());
+        assert_eq!(result, text(&expected));
     }
 
     #[test]
@@ -1793,61 +1867,40 @@ mod tests {
         let start = Value::build_text("12:00:00");
         let end = Value::build_text("14:30:45");
         let expected = Value::build_text("-0000-00-00 02:30:45.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("14:30:45");
         let end = Value::build_text("12:00:00");
         let expected = Value::build_text("+0000-00-00 02:30:45.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("12:00:01.300");
         let end = Value::build_text("12:00:00.500");
         let expected = Value::build_text("+0000-00-00 00:00:00.800");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("13:30:00");
         let end = Value::build_text("16:45:30");
         let expected = Value::build_text("-0000-00-00 03:15:30.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("2023-05-10 23:30:00");
         let end = Value::build_text("2023-05-11 01:15:00");
         let expected = Value::build_text("-0000-00-00 01:45:00.000");
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::Null;
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         let start = Value::build_text("not a time");
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(
-            exec_timediff(&[Register::Value(start), Register::Value(end)]),
-            expected
-        );
+        assert_eq!(exec_timediff(&[start, end.clone()]), expected);
 
         let start = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(exec_timediff(&[Register::Value(start)]), expected);
+        assert_eq!(exec_timediff(&[start, end]), expected);
     }
 }

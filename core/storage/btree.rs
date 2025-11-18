@@ -1618,7 +1618,7 @@ impl BTreeCursor {
                 .index_info
                 .as_ref()
                 .expect("indexbtree_move_to without index_info");
-            find_compare(&key_values, index_info)
+            find_compare(key_values.iter().peekable(), index_info)
         };
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
@@ -2002,7 +2002,7 @@ impl BTreeCursor {
                 .index_info
                 .as_ref()
                 .expect("indexbtree_seek without index_info");
-            find_compare(&key_values, index_info)
+            find_compare(key_values.iter().peekable(), index_info)
         };
 
         tracing::debug!(
@@ -2198,7 +2198,6 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-
         (cmp, found)
     }
 
@@ -7798,8 +7797,7 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, DatabaseStorage, IOContext, StepResult, WalFile,
-        WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
     use std::{
         cell::RefCell,
@@ -9064,8 +9062,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let buffer_pool = BufferPool::begin_init(&io, page_size * 128);
 
-        let db_file =
-            DatabaseFile::new(io.open_file(":memory:", OpenFlags::Create, false).unwrap());
+        let db_file = Arc::new(DatabaseFile::new(
+            io.open_file(":memory:", OpenFlags::Create, false).unwrap(),
+        ));
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
@@ -10293,10 +10292,7 @@ mod tests {
         for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
             let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let regs = &[Register::Value(Value::Text(Text {
-                value: huge_text.as_bytes().to_vec(),
-                subtype: crate::types::TextSubtype::Text,
-            }))];
+            let regs = &[Register::Value(Value::Text(Text::new(huge_text.clone())))];
             let value = ImmutableRecord::from_registers(regs, regs.len());
             tracing::trace!("before insert {}", i);
             tracing::debug!(

@@ -18,15 +18,8 @@ use super::{
         Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
-use crate::translate::{
-    collate::get_collseq_from_expr,
-    emitter::UpdateRowSource,
-    plan::{EvalAt, NonFromClauseSubquery},
-    subquery::emit_non_from_clause_subquery,
-    window::emit_window_loop_source,
-};
 use crate::{
-    schema::{Affinity, Index, IndexColumn, Table},
+    schema::{Index, IndexColumn, Table},
     translate::{
         emitter::prepare_cdc_if_necessary,
         plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
@@ -34,11 +27,22 @@ use crate::{
     },
     types::SeekOp,
     vdbe::{
+        affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
+};
+use crate::{
+    translate::{
+        collate::get_collseq_from_expr,
+        emitter::UpdateRowSource,
+        plan::{EvalAt, NonFromClauseSubquery},
+        subquery::emit_non_from_clause_subquery,
+        window::emit_window_loop_source,
+    },
+    vdbe::affinity::Affinity,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -313,6 +317,9 @@ pub fn init_loop(
                     }
                     if let Some(cursor_id) = table_cursor_id {
                         program.emit_insn(Insn::VOpen { cursor_id });
+                        if is_write {
+                            program.emit_insn(Insn::VBegin { cursor_id });
+                        }
                     }
                 }
             }
@@ -718,25 +725,6 @@ pub fn open_loop(
             }
         }
 
-        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            assert!(subquery.correlated, "subquery must be correlated");
-            let eval_at = subquery.get_eval_at(join_order)?;
-
-            if eval_at != EvalAt::Loop(join_index) {
-                continue;
-            }
-
-            let plan = subquery.consume_plan(eval_at);
-
-            emit_non_from_clause_subquery(
-                program,
-                t_ctx,
-                *plan,
-                &subquery.query_type,
-                subquery.correlated,
-            )?;
-        }
-
         // First emit outer join conditions, if any.
         emit_conditions(
             program,
@@ -763,6 +751,25 @@ pub fn open_loop(
                     dest: lj_meta.reg_match_flag,
                 });
             }
+        }
+
+        for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
+            assert!(subquery.correlated, "subquery must be correlated");
+            let eval_at = subquery.get_eval_at(join_order)?;
+
+            if eval_at != EvalAt::Loop(join_index) {
+                continue;
+            }
+
+            let plan = subquery.consume_plan(eval_at);
+
+            emit_non_from_clause_subquery(
+                program,
+                t_ctx,
+                *plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
         }
 
         // Now we can emit conditions from the WHERE clause.
@@ -1369,6 +1376,24 @@ fn emit_seek(
         }
     }
     let num_regs = seek_def.size(&seek_def.start);
+
+    if is_index {
+        let affinities: String = seek_def
+            .iter_affinity(&seek_def.start)
+            .map(|affinity| affinity.aff_mask())
+            .collect();
+        if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+            program.emit_insn(Insn::Affinity {
+                start_reg,
+                count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                affinities: seek_def
+                    .iter_affinity(&seek_def.start)
+                    .map(|affinity| affinity.aff_mask())
+                    .collect(),
+            });
+        }
+    }
+
     match seek_def.start.op {
         SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
@@ -1488,9 +1513,10 @@ fn emit_seek_termination(
         affinity = if let Some(table_ref) = tables
             .joined_tables()
             .iter()
-            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias))
+            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias()))
         {
-            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias) {
+            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias())
+            {
                 Some(table_ref.columns()[rowid_col_idx].affinity())
             } else {
                 Some(Affinity::Numeric)

@@ -10,7 +10,7 @@ mod functions;
 mod incremental;
 pub mod index_method;
 mod info;
-mod io;
+pub mod io;
 #[cfg(feature = "json")]
 mod json;
 pub mod mvcc;
@@ -69,6 +69,7 @@ pub use io::{
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use schema::Schema;
+use std::collections::HashSet;
 use std::task::Waker;
 use std::{
     borrow::Cow,
@@ -230,7 +231,7 @@ static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
 pub struct Database {
     mv_store: Option<Arc<MvStore>>,
     schema: Mutex<Arc<Schema>>,
-    db_file: DatabaseFile,
+    db_file: Arc<dyn DatabaseStorage>,
     path: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
@@ -331,7 +332,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
         let file = io.open_file(path, flags, true)?;
-        let db_file = DatabaseFile::new(file);
+        let db_file = Arc::new(DatabaseFile::new(file));
         Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
     }
 
@@ -339,7 +340,7 @@ impl Database {
     pub fn open(
         io: Arc<dyn IO>,
         path: &str,
-        db_file: DatabaseFile,
+        db_file: Arc<dyn DatabaseStorage>,
         enable_mvcc: bool,
         enable_indexes: bool,
     ) -> Result<Arc<Database>> {
@@ -359,7 +360,7 @@ impl Database {
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
-        db_file: DatabaseFile,
+        db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
@@ -407,7 +408,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         wal_path: &str,
-        db_file: DatabaseFile,
+        db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
@@ -428,7 +429,7 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         wal_path: &str,
-        db_file: DatabaseFile,
+        db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
@@ -649,6 +650,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            vtab_txn_states: RwLock::new(HashSet::new()),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1177,6 +1179,8 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     fk_pragma: AtomicBool,
     fk_deferred_violations: AtomicIsize,
+    /// Track when each virtual table instance is currently in transaction.
+    vtab_txn_states: RwLock<HashSet<u64>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -2838,7 +2842,7 @@ impl Statement {
                     .table_references
                     .find_table_by_internal_id(*table)?;
                 let table_column = table_ref.get_column_at(*column_idx)?;
-                match &table_column.ty {
+                match &table_column.ty() {
                     crate::schema::Type::Integer => Some("INTEGER".to_string()),
                     crate::schema::Type::Real => Some("REAL".to_string()),
                     crate::schema::Type::Text => Some("TEXT".to_string()),

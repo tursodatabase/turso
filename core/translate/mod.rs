@@ -93,14 +93,14 @@ pub fn translate(
     );
 
     program.prologue();
-    let resolver = Resolver::new(schema, syms);
+    let mut resolver = Resolver::new(schema, syms);
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
             pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
         }
-        stmt => translate_inner(stmt, &resolver, program, &connection, input)?,
+        stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -113,7 +113,7 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 pub fn translate_inner(
     stmt: ast::Stmt,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     program: ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
@@ -231,7 +231,7 @@ pub fn translate_inner(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program)?,
+        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView {
             if_exists,
@@ -259,9 +259,7 @@ pub fn translate_inner(
             )?
             .program
         }
-        ast::Stmt::Update(mut update) => {
-            translate_update(&mut update, resolver, program, connection)?
-        }
+        ast::Stmt::Update(update) => translate_update(update, resolver, program, connection)?,
         ast::Stmt::Vacuum { .. } => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert {
             with,

@@ -1018,3 +1018,47 @@ fn test_many_columns() {
         ]]
     );
 }
+
+#[test]
+fn test_eval_param_only_once() {
+    let tmp_db = TempDatabase::new("test_eval_param_only_once");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
+        .unwrap();
+    let mut stmt = conn
+        .query("SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?")
+        .unwrap()
+        .unwrap();
+    stmt.bind_at(
+        1.try_into().unwrap(),
+        turso_core::Value::Integer(100_000_000),
+    );
+    stmt.bind_at(
+        2.try_into().unwrap(),
+        turso_core::Value::Integer(100_000_000),
+    );
+    let start_time = std::time::Instant::now();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO => {
+                stmt.run_once().unwrap();
+            }
+            StepResult::Done => break,
+            StepResult::Row => {
+                let values = stmt
+                    .row()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(values, vec![turso_core::Value::Integer(10000)]);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let end_time = std::time::Instant::now();
+    let elapsed = end_time.duration_since(start_time);
+    // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
+    assert!(elapsed < std::time::Duration::from_millis(100));
+}

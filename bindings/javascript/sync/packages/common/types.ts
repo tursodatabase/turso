@@ -107,6 +107,10 @@ export interface DatabaseOpts {
      * optional parameter to enable internal logging for the database
      */
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
+    /**
+     * optional parameter to enable partial sync for the database
+     */
+    partialBootstrapStrategy?: { kind: 'prefix', length: number } | { kind: 'query', query: string };
 }
 export interface DatabaseStats {
     /**
@@ -134,6 +138,14 @@ export interface DatabaseStats {
      * (can be used as e-tag, but string must not be interpreted in any way and must be used as opaque value)
      */
     revision: string | null;
+    /**
+     * total amount of sent bytes over the network
+     */
+    networkSentBytes: number;
+    /**
+     * total amount of received bytes over the network
+     */
+    networkReceivedBytes: number;
 }
 
 /* internal types used in the native/browser packages */

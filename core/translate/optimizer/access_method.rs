@@ -101,7 +101,7 @@ fn find_best_access_method_for_btree(
         index: None,
         constraint_refs: vec![],
     };
-    let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias);
+    let rowid_column_idx = rhs_table.columns().iter().position(|c| c.is_rowid_alias());
 
     // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
     for candidate in rhs_constraints.candidates.iter() {
