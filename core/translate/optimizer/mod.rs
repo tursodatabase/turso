@@ -1294,6 +1294,7 @@ fn ephemeral_index_build(
             pos_in_table: i,
             collation: c.collation_opt(),
             default: c.default.clone(),
+            expr: None,
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

@@ -3,17 +3,22 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
-use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, translate_condition_expr, translate_expr, walk_expr, BindingBehavior,
+    ConditionMetadata, WalkControl,
+};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
+use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
@@ -30,7 +35,6 @@ use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_create_index(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
@@ -77,18 +81,12 @@ pub fn translate_create_index(
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| idx_name.starts_with(prefix))
+        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             original_idx_name
         );
-    }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| tbl_name.starts_with(prefix))
-    {
-        bail_parse_error!("Object name reserved for internal use: {}", tbl_name);
     }
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
@@ -287,7 +285,15 @@ pub fn translate_create_index(
 
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
-            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+            emit_index_column_value_from_cursor(
+                &mut program,
+                resolver,
+                &mut table_references,
+                connection,
+                table_cursor_id,
+                col,
+                start_reg + i,
+            )?;
         }
         let rowid_reg = start_reg + columns.len();
         program.emit_insn(Insn::RowId {
@@ -377,7 +383,15 @@ pub fn translate_create_index(
 
         let start_reg = program.alloc_registers(columns.len() + 1);
         for (i, col) in columns.iter().enumerate() {
-            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, start_reg + i);
+            emit_index_column_value_from_cursor(
+                &mut program,
+                resolver,
+                &mut table_references,
+                connection,
+                table_cursor_id,
+                col,
+                start_reg + i,
+            )?;
         }
         let rowid_reg = start_reg + columns.len();
         program.emit_insn(Insn::RowId {
@@ -506,27 +520,143 @@ pub fn resolve_sorted_columns(
 ) -> crate::Result<Vec<IndexColumn>> {
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
-        let ident = match sc.expr.as_ref() {
-            // SQLite supports indexes on arbitrary expressions, but we don't (yet).
-            // See "How to use indexes on expressions" in https://www.sqlite.org/expridx.html
-            Expr::Id(col_name) | Expr::Name(col_name) => col_name.as_str(),
-            _ => crate::bail_parse_error!("Error: cannot use expressions in CREATE INDEX"),
+        let order = sc.order.unwrap_or(SortOrder::Asc);
+        match sc.expr.as_ref() {
+            Expr::Id(col_name) | Expr::Name(col_name) => {
+                let ident = col_name.as_str();
+                let Some(col) = table.get_column(ident) else {
+                    crate::bail_parse_error!(
+                        "Error: column '{ident}' does not exist in table '{}'",
+                        table.name
+                    );
+                };
+                resolved.push(IndexColumn {
+                    name: col.1.name.as_ref().unwrap().clone(),
+                    order,
+                    pos_in_table: col.0,
+                    collation: col.1.collation_opt(),
+                    default: col.1.default.clone(),
+                    expr: None,
+                });
+            }
+            _ => {
+                if !validate_index_expression(sc.expr.as_ref(), table) {
+                    crate::bail_parse_error!(
+                        "Error: invalid expression in CREATE INDEX: {}",
+                        sc.expr
+                    );
+                }
+                resolved.push(IndexColumn {
+                    name: sc.expr.to_string(),
+                    order,
+                    pos_in_table: EXPR_INDEX_SENTINEL,
+                    collation: None,
+                    default: None,
+                    expr: Some(sc.expr.clone()),
+                });
+            }
         };
-        let Some(col) = table.get_column(ident) else {
-            crate::bail_parse_error!(
-                "Error: column '{ident}' does not exist in table '{}'",
-                table.name
-            );
-        };
-        resolved.push(IndexColumn {
-            name: col.1.name.as_ref().unwrap().clone(),
-            order: sc.order.unwrap_or(SortOrder::Asc),
-            pos_in_table: col.0,
-            collation: col.1.collation_opt(),
-            default: col.1.default.clone(),
-        });
     }
     Ok(resolved)
+}
+
+fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+    let tbl_norm = normalize_ident(table.name.as_str());
+    let has_col = |name: &str| {
+        let n = normalize_ident(name);
+        table
+            .columns
+            .iter()
+            .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+    };
+    let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+    let is_deterministic_fn = |name: &str, argc: usize| {
+        let n = normalize_ident(name);
+        Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
+    };
+
+    let mut ok = true;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if !ok {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Literal(_) | Expr::RowId { .. } => {}
+            // must be a column of the target table or ROWID
+            Expr::Id(n) | Expr::Name(n) => {
+                let n = n.as_str();
+                if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
+                    ok = false;
+                }
+            }
+            // Qualified: qualifier must match this index's table, column must exist
+            Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+                if !is_tbl(ns.as_str()) || !has_col(col.as_str()) {
+                    ok = false;
+                }
+            }
+            Expr::FunctionCall {
+                name, filter_over, ..
+            }
+            | Expr::FunctionCallStar {
+                name, filter_over, ..
+            } => {
+                // reject windowed
+                if filter_over.over_clause.is_some() {
+                    ok = false;
+                } else {
+                    let argc = match e {
+                        Expr::FunctionCall { args, .. } => args.len(),
+                        Expr::FunctionCallStar { .. } => 0,
+                        _ => unreachable!(),
+                    };
+                    if !is_deterministic_fn(name.as_str(), argc) {
+                        ok = false;
+                    }
+                }
+            }
+            // Explicitly disallowed constructs
+            Expr::Exists(_)
+            | Expr::InSelect { .. }
+            | Expr::Subquery(_)
+            | Expr::Raise { .. }
+            | Expr::Variable(_) => {
+                ok = false;
+            }
+            _ => {}
+        }
+        Ok(if ok {
+            WalkControl::Continue
+        } else {
+            WalkControl::SkipChildren
+        })
+    });
+    ok
+}
+
+fn emit_index_column_value_from_cursor(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    connection: &Arc<crate::Connection>,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> crate::Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(table_references),
+            None,
+            connection,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+    } else {
+        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+    }
+    Ok(())
 }
 
 pub fn resolve_index_method_parameters(

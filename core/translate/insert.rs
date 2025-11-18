@@ -8,7 +8,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
+use crate::schema::{self, BTreeTable, ColDef, Index, IndexColumn, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
     OperationMode,
@@ -36,6 +36,7 @@ use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLite
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
+    LimboError,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -694,16 +695,13 @@ fn emit_commit_phase(
 
         // Build [key cols..., rowid] from insertion registers
         for (i, idx_col) in index.columns.iter().enumerate() {
-            let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
-                return Err(crate::LimboError::PlanningError(
-                    "Column not found in INSERT (commit phase)".to_string(),
-                ));
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg: cm.register,
-                dst_reg: idx_start_reg + i,
-                extra_amount: 0,
-            });
+            emit_index_column_value_for_insert(
+                program,
+                resolver,
+                insertion,
+                idx_col,
+                idx_start_reg + i,
+            )?;
         }
         program.emit_insn(Insn::Copy {
             src_reg: insertion.key_register(),
@@ -1899,10 +1897,6 @@ fn emit_preflight_constraint_checks(
                 program.preassign_label_to_next_insn(make_record_label);
             }
             ResolvedUpsertTarget::Index(index) => {
-                let column_mappings = index
-                    .columns
-                    .iter()
-                    .map(|idx_col| insertion.get_col_mapping_by_name(&idx_col.name));
                 // find which cursor we opened earlier for this index
                 let idx_cursor_id = ctx
                     .idx_cursors
@@ -1940,18 +1934,14 @@ fn emit_preflight_constraint_checks(
 
                 // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
                 // copy each index column from the table's column registers into these scratch regs
-                for (i, column_mapping) in column_mappings.clone().enumerate() {
-                    // copy from the table's column register over to the index's scratch register
-                    let Some(col_mapping) = column_mapping else {
-                        return Err(crate::LimboError::PlanningError(
-                            "Column not found in INSERT".to_string(),
-                        ));
-                    };
-                    program.emit_insn(Insn::Copy {
-                        src_reg: col_mapping.register,
-                        dst_reg: idx_start_reg + i,
-                        extra_amount: 0,
-                    });
+                for (i, idx_col) in index.columns.iter().enumerate() {
+                    emit_index_column_value_for_insert(
+                        program,
+                        resolver,
+                        insertion,
+                        idx_col,
+                        idx_start_reg + i,
+                    )?;
                 }
                 // last register is the rowid
                 program.emit_insn(Insn::Copy {
@@ -1964,7 +1954,13 @@ fn emit_preflight_constraint_checks(
                     let aff = index
                         .columns
                         .iter()
-                        .map(|ic| ctx.table.columns[ic.pos_in_table].affinity().aff_mask())
+                        .map(|ic| {
+                            if ic.expr.is_some() {
+                                Affinity::Blob.aff_mask()
+                            } else {
+                                ctx.table.columns[ic.pos_in_table].affinity().aff_mask()
+                            }
+                        })
                         .collect::<String>();
                     program.emit_insn(Insn::Affinity {
                         start_reg: idx_start_reg,
@@ -2324,6 +2320,92 @@ pub fn rewrite_partial_index_where(
             Ok(WalkControl::Continue)
         },
     )
+}
+
+fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
+    let mut missing_column = None;
+    let col_reg = |name: &str| -> Option<usize> {
+        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            Some(insertion.key_register())
+        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
+            if c.column.is_rowid_alias() {
+                Some(insertion.key_register())
+            } else {
+                Some(c.register)
+            }
+        } else {
+            None
+        }
+    };
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Id(name) | Expr::Name(name) => {
+                    let normalized = normalize_ident(name.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    } else {
+                        missing_column = Some(normalized);
+                    }
+                }
+                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                    let normalized = normalize_ident(col.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    } else {
+                        missing_column = Some(normalized);
+                    }
+                }
+                _ => {}
+            }
+            Ok(if missing_column.is_some() {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        },
+    )?;
+
+    if let Some(col) = missing_column {
+        return Err(LimboError::PlanningError(format!(
+            "Column not found in INSERT: {col}"
+        )));
+    }
+    Ok(())
+}
+
+fn emit_index_column_value_for_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        rewrite_index_expr_for_insertion(&mut expr, insertion)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(&TableReferences::new_empty()),
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    } else {
+        let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
+            return Err(LimboError::PlanningError(
+                "Column not found in INSERT".to_string(),
+            ));
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg: cm.register,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
 }
 
 struct ConstraintsToCheck {

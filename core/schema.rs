@@ -147,6 +147,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
 
+/// The Position in Table for indexes which are arbitrary expressions (index.expr.is_some())
+pub const EXPR_INDEX_SENTINEL: usize = usize::MAX;
+
 /// Internal table prefixes that should be protected from CREATE/DROP
 pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
@@ -2559,6 +2562,8 @@ pub struct IndexColumn {
     pub pos_in_table: usize,
     pub collation: Option<CollationSeq>,
     pub default: Option<Box<Expr>>,
+    /// Expression for expression indexes. None for simple column indexes.
+    pub expr: Option<Box<Expr>>,
 }
 
 impl Index {
@@ -2662,6 +2667,7 @@ impl Index {
                 pos_in_table,
                 collation: column.collation_opt(),
                 default: column.default.clone(),
+                expr: None,
             });
         }
 
@@ -2701,6 +2707,7 @@ impl Index {
                     pos_in_table: *pos_in_table,
                     collation: col.collation_opt(),
                     default: col.default.clone(),
+                    expr: None,
                 })
             })
             .collect::<Vec<_>>();

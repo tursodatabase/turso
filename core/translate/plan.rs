@@ -1079,6 +1079,9 @@ impl JoinedTable {
         }
         let mut index_cols_mask = ColumnUsedMask::default();
         for col in index.columns.iter() {
+            if col.expr.is_some() {
+                continue;
+            }
             index_cols_mask.set(col.pos_in_table);
         }
 

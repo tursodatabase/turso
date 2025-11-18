@@ -372,6 +372,7 @@ fn get_subquery_parser<'a>(
                         pos_in_table: i,
                         collation: None,
                         default: None,
+                        expr: None,
                     })
                     .collect::<Vec<_>>();
 
