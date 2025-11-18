@@ -36,14 +36,49 @@ impl TriggerContext {
     }
 }
 
+#[derive(Debug)]
+struct ParamMap(Vec<NonZero<usize>>);
+
+impl ParamMap {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Context for compiling trigger subprograms - maps NEW/OLD to parameter indices
 #[derive(Debug)]
 struct TriggerSubprogramContext {
     /// Map from column index to parameter index for NEW values (1-indexed)
-    new_param_map: Option<Vec<NonZero<usize>>>,
+    new_param_map: Option<ParamMap>,
     /// Map from column index to parameter index for OLD values (1-indexed)
-    old_param_map: Option<Vec<NonZero<usize>>>,
+    old_param_map: Option<ParamMap>,
     table: Arc<BTreeTable>,
+}
+
+impl TriggerSubprogramContext {
+    pub fn get_new_param(&self, idx: usize) -> Option<NonZero<usize>> {
+        self.new_param_map
+            .as_ref()
+            .and_then(|map| map.0.get(idx).copied())
+    }
+
+    pub fn get_new_rowid_param(&self) -> Option<NonZero<usize>> {
+        self.new_param_map
+            .as_ref()
+            .and_then(|map| map.0.last().copied())
+    }
+
+    pub fn get_old_param(&self, idx: usize) -> Option<NonZero<usize>> {
+        self.old_param_map
+            .as_ref()
+            .and_then(|map| map.0.get(idx).copied())
+    }
+
+    pub fn get_old_rowid_param(&self) -> Option<NonZero<usize>> {
+        self.old_param_map
+            .as_ref()
+            .and_then(|map| map.0.last().copied())
+    }
 }
 
 /// Rewrite NEW and OLD references in trigger expressions to use Variable instructions (parameters)
@@ -70,17 +105,21 @@ fn rewrite_trigger_expr_for_subprogram(
                                 // Rowid alias columns map to the rowid parameter, not the column register
                                 *e = Expr::Variable(format!(
                                     "{}",
-                                    *ctx.new_param_map
-                                        .as_ref()
-                                        .expect("NEW parameters must be provided")
-                                        .last()
+                                    ctx.get_new_rowid_param()
                                         .expect("NEW parameters must be provided")
                                 ));
                                 return Ok(WalkControl::Continue);
                             }
                             if idx < new_params.len() {
-                                *e = Expr::Variable(format!("{}", new_params[idx].get()));
+                                *e = Expr::Variable(format!(
+                                    "{}",
+                                    ctx.get_new_param(idx)
+                                        .expect("NEW parameters must be provided")
+                                        .get()
+                                ));
                                 return Ok(WalkControl::Continue);
+                            } else {
+                                crate::bail_parse_error!("no such column in NEW: {}", col);
                             }
                         }
                         // Handle NEW.rowid
@@ -90,12 +129,8 @@ fn rewrite_trigger_expr_for_subprogram(
                         {
                             *e = Expr::Variable(format!(
                                 "{}",
-                                ctx.new_param_map
-                                    .as_ref()
+                                ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided")
-                                    .last()
-                                    .expect("NEW parameters must be provided")
-                                    .get()
                             ));
                             return Ok(WalkControl::Continue);
                         }
@@ -112,8 +147,15 @@ fn rewrite_trigger_expr_for_subprogram(
                     if let Some(old_params) = &ctx.old_param_map {
                         if let Some((idx, _)) = table.get_column(&col) {
                             if idx < old_params.len() {
-                                *e = Expr::Variable(format!("{}", old_params[idx].get()));
+                                *e = Expr::Variable(format!(
+                                    "{}",
+                                    ctx.get_old_param(idx)
+                                        .expect("OLD parameters must be provided")
+                                        .get()
+                                ));
                                 return Ok(WalkControl::Continue);
+                            } else {
+                                crate::bail_parse_error!("no such column in OLD: {}", col);
                             }
                         }
                         // Handle OLD.rowid
@@ -123,12 +165,8 @@ fn rewrite_trigger_expr_for_subprogram(
                         {
                             *e = Expr::Variable(format!(
                                 "{}",
-                                ctx.old_param_map
-                                    .as_ref()
+                                ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided")
-                                    .last()
-                                    .expect("OLD parameters must be provided")
-                                    .get()
                             ));
                             return Ok(WalkControl::Continue);
                         }
@@ -144,13 +182,23 @@ fn rewrite_trigger_expr_for_subprogram(
                 if let Some((idx, _)) = table.get_column(&col) {
                     if let Some(new_params) = &ctx.new_param_map {
                         if idx < new_params.len() {
-                            *e = Expr::Variable(format!("{}", new_params[idx].get()));
+                            *e = Expr::Variable(format!(
+                                "{}",
+                                ctx.get_new_param(idx)
+                                    .expect("NEW parameters must be provided")
+                                    .get()
+                            ));
                             return Ok(WalkControl::Continue);
                         }
                     }
                     if let Some(old_params) = &ctx.old_param_map {
                         if idx < old_params.len() {
-                            *e = Expr::Variable(format!("{}", old_params[idx].get()));
+                            *e = Expr::Variable(format!(
+                                "{}",
+                                ctx.get_old_param(idx)
+                                    .expect("OLD parameters must be provided")
+                                    .get()
+                            ));
                             return Ok(WalkControl::Continue);
                         }
                     }
@@ -361,18 +409,21 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         if col_def.is_rowid_alias() {
                             *e = Expr::Variable(format!(
                                 "{}",
-                                ctx.new_param_map
-                                    .as_ref()
+                                ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided")
-                                    .last()
-                                    .expect("NEW parameters must be provided")
-                                    .get()
                             ));
                             return Ok(());
                         }
                         if idx < new_params.len() {
-                            *e = Expr::Variable(format!("{}", new_params[idx].get()));
+                            *e = Expr::Variable(format!(
+                                "{}",
+                                ctx.get_new_param(idx)
+                                    .expect("NEW parameters must be provided")
+                                    .get()
+                            ));
                             return Ok(());
+                        } else {
+                            crate::bail_parse_error!("no such column in NEW: {}", col);
                         }
                     }
                     // Handle NEW.rowid
@@ -382,12 +433,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     {
                         *e = Expr::Variable(format!(
                             "{}",
-                            ctx.new_param_map
-                                .as_ref()
+                            ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided")
-                                .last()
-                                .expect("NEW parameters must be provided")
-                                .get()
                         ));
                         return Ok(());
                     }
@@ -406,18 +453,21 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         if col_def.is_rowid_alias() {
                             *e = Expr::Variable(format!(
                                 "{}",
-                                ctx.old_param_map
-                                    .as_ref()
+                                ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided")
-                                    .last()
-                                    .expect("OLD parameters must be provided")
-                                    .get()
                             ));
                             return Ok(());
                         }
                         if idx < old_params.len() {
-                            *e = Expr::Variable(format!("{}", old_params[idx].get()));
+                            *e = Expr::Variable(format!(
+                                "{}",
+                                ctx.get_old_param(idx)
+                                    .expect("OLD parameters must be provided")
+                                    .get()
+                            ));
                             return Ok(());
+                        } else {
+                            crate::bail_parse_error!("no such column in OLD: {}", col)
                         }
                     }
                     // Handle OLD.rowid
@@ -427,12 +477,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
                     {
                         *e = Expr::Variable(format!(
                             "{}",
-                            ctx.old_param_map
-                                .as_ref()
+                            ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided")
-                                .last()
-                                .expect("OLD parameters must be provided")
-                                .get()
                         ));
                         return Ok(());
                     }
@@ -449,24 +495,30 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if col_def.is_rowid_alias() {
                     *e = Expr::Variable(format!(
                         "{}",
-                        ctx.new_param_map
-                            .as_ref()
+                        ctx.get_new_rowid_param()
                             .expect("NEW parameters must be provided")
-                            .last()
-                            .expect("NEW parameters must be provided")
-                            .get()
                     ));
                     return Ok(());
                 }
                 if let Some(new_params) = &ctx.new_param_map {
                     if idx < new_params.len() {
-                        *e = Expr::Variable(format!("{}", new_params[idx].get()));
+                        *e = Expr::Variable(format!(
+                            "{}",
+                            ctx.get_new_param(idx)
+                                .expect("NEW parameters must be provided")
+                                .get()
+                        ));
                         return Ok(());
                     }
                 }
                 if let Some(old_params) = &ctx.old_param_map {
                     if idx < old_params.len() {
-                        *e = Expr::Variable(format!("{}", old_params[idx].get()));
+                        *e = Expr::Variable(format!(
+                            "{}",
+                            ctx.get_old_param(idx)
+                                .expect("OLD parameters must be provided")
+                                .get()
+                        ));
                         return Ok(());
                     }
                 }
@@ -496,17 +548,26 @@ fn execute_trigger_commands(
     // So if we have 2 NEW columns, 2 OLD columns: NEW params are 1,2; OLD params are 3,4; rowid is 5
     let num_new = ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0);
 
-    let new_param_map: Option<Vec<NonZero<usize>>> = ctx.new_registers.as_ref().map(|new_regs| {
-        (1..=new_regs.len())
-            .map(|i| NonZero::new(i).unwrap())
-            .collect()
-    });
+    let new_param_map = ctx
+        .new_registers
+        .as_ref()
+        .map(|new_regs| {
+            (1..=new_regs.len())
+                .map(|i| NonZero::new(i).unwrap())
+                .collect()
+        })
+        .map(ParamMap);
 
-    let old_param_map: Option<Vec<NonZero<usize>>> = ctx.old_registers.as_ref().map(|old_regs| {
-        (1..=old_regs.len())
-            .map(|i| NonZero::new(i + num_new).unwrap())
-            .collect()
-    });
+    let old_param_map = ctx
+        .old_registers
+        .as_ref()
+        .map(|old_regs| {
+            (1..=old_regs.len())
+                .map(|i| NonZero::new(i + num_new).unwrap())
+                .collect()
+        })
+        .map(ParamMap);
+
     let subprogram_ctx = TriggerSubprogramContext {
         new_param_map,
         old_param_map,
