@@ -37,8 +37,15 @@ enum NextState {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum PrevState {
+    PrevBtree {
+        new_position_in_mvcc: CursorPosition,
+    },
+}
+#[derive(Debug, Clone, Copy)]
 enum MvccLazyCursorState {
     Next(NextState),
+    Prev(PrevState),
 }
 
 pub struct MvccLazyCursor<Clock: LogicalClock> {
@@ -151,7 +158,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 btree_consumed: _,
             } => row_id.row_id + 1,
             CursorPosition::BeforeFirst => 1,
-            CursorPosition::End => i64::MAX,
+            CursorPosition::End => 1,
         }
     }
 
@@ -169,16 +176,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     /// Returns the new position of the cursor based on the new position in MVCC and the current rowid in BTree.
-    /// If we are moving forwards:
-    /// - If the new position in MVCC is less than the current rowid in BTree, the cursor will be set to the new position in MVCC.
-    /// If we are moving backwards:
-    /// - If the new position in MVCC is greater than the current rowid in BTree, the cursor will be set to the new position in MVCC.
+    /// If we are moving forwards -> choose smaller rowid (mvcc if mvcc < btree, else btree)
+    /// If we are moving backwards -> choose larger rowid (mvcc if mvcc > btree, else btree)
     fn get_new_position_from_mvcc_and_btree(
         &mut self,
         new_position_in_mvcc: &Option<i64>,
         current_rowid_in_btree: &Option<i64>,
         forwards: bool,
     ) -> CursorPosition {
+        tracing::trace!("get_new_position_from_mvcc_and_btree(new_position_in_mvcc={:?}, current_rowid_in_btree={:?}, forwards={})", new_position_in_mvcc, current_rowid_in_btree, forwards);
         match (new_position_in_mvcc, current_rowid_in_btree) {
             (Some(mvcc_rowid), Some(btree_rowid)) => {
                 // When forwards: choose smaller rowid (mvcc if mvcc < btree, else btree)
@@ -250,10 +256,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
         let position_in_mvcc = self.db.get_last_rowid(self.table_id);
         let position_in_btree = if self.is_btree_allocated() {
-            let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
+            let IOResult::Done(maybe_rowid) = self.btree_cursor.rowid()? else {
                 panic!("BTree should have returned rowid after last");
             };
-            Some(rowid)
+            maybe_rowid
         } else {
             None
         };
@@ -389,7 +395,118 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn prev(&mut self) -> Result<IOResult<bool>> {
-        todo!()
+        let current_state = *self.state.borrow();
+        if current_state.is_none() {
+            let end = matches!(self.get_current_pos(), CursorPosition::End);
+            let max_id = match *self.current_pos.borrow() {
+                CursorPosition::Loaded {
+                    row_id,
+                    in_btree: _,
+                    btree_consumed: _,
+                } => row_id.row_id,
+                CursorPosition::BeforeFirst => {
+                    return Ok(IOResult::Done(false));
+                }
+                CursorPosition::End => {
+                    i64::MAX // we need to find last row, so we look from the last id,
+                }
+            };
+
+            let new_position_in_mvcc =
+                match self
+                    .db
+                    .get_prev_row_id_for_table(self.table_id, max_id, self.tx_id)
+                {
+                    Some(id) => CursorPosition::Loaded {
+                        row_id: id,
+                        in_btree: false,
+                        btree_consumed: false,
+                    },
+                    None => CursorPosition::BeforeFirst,
+                };
+            self.state
+                .replace(Some(MvccLazyCursorState::Prev(PrevState::PrevBtree {
+                    new_position_in_mvcc,
+                })));
+        }
+        // Now we need to loop for prev rowid in btree that is valid.
+        // FIXME: this is quite unperformant, we should find a better way to do this.
+        loop {
+            let current_state = *self.state.borrow();
+            let Some(MvccLazyCursorState::Prev(PrevState::PrevBtree {
+                new_position_in_mvcc,
+            })) = current_state
+            else {
+                panic!("Invalid state {:?}", self.state.borrow());
+            };
+
+            // Check whether we have already consumed the rowid in btree. In BeforeFirst we can assume we haven't started calling next yet.
+            // In End we can assume we have already called next and it returned false, so we can assume we have consumed the rowid.
+            let btree_consumed = match self.get_current_pos() {
+                CursorPosition::Loaded {
+                    row_id: _,
+                    in_btree: _,
+                    btree_consumed,
+                } => btree_consumed,
+                CursorPosition::BeforeFirst => true,
+                CursorPosition::End => true,
+            };
+
+            let found = if self.is_btree_allocated() {
+                // If we have a functional btree, let's either find next value, or use the one pointed at by the cursor.
+                if btree_consumed {
+                    return_if_io!(self.btree_cursor.prev())
+                } else {
+                    true
+                }
+            } else {
+                // If we don't have a functional btree, we can't find next value, so we return false.
+                false
+            };
+            // get current rowid in mvcc and in btree
+            // compare both and set loaded to position of the one that is lesser
+            let new_position_in_mvcc = match new_position_in_mvcc {
+                CursorPosition::Loaded {
+                    row_id,
+                    in_btree: _,
+                    btree_consumed: _,
+                } => Some(row_id.row_id),
+                CursorPosition::BeforeFirst => None,
+                CursorPosition::End => None,
+            };
+            let current_rowid_in_btree = if found {
+                let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
+                    panic!("BTree should have returned rowid after next");
+                };
+                if self.query_btree_version_is_valid(rowid) {
+                    Some(rowid)
+                } else {
+                    // if the row is not valid, we need to continue to the next rowid in btree.
+                    //  We first set consumed to true so that next time we call next, we don't use the same rowid.
+                    if let CursorPosition::Loaded { btree_consumed, .. } =
+                        &mut *self.current_pos.borrow_mut()
+                    {
+                        *btree_consumed = true;
+                    }
+                    continue;
+                }
+            } else {
+                None
+            };
+            let new_position = self.get_new_position_from_mvcc_and_btree(
+                &new_position_in_mvcc,
+                &current_rowid_in_btree,
+                false,
+            );
+            self.current_pos.replace(new_position);
+            self.invalidate_record();
+            self.state.replace(None);
+
+            return Ok(IOResult::Done(matches!(
+                self.get_current_pos(),
+                CursorPosition::Loaded { .. }
+            )));
+        }
     }
 
     fn rowid(&self) -> Result<IOResult<Option<i64>>> {
