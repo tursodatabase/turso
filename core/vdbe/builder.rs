@@ -806,6 +806,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(end_offset, "Yield");
                 }
+                Insn::RowSetRead { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "RowSetRead");
+                }
                 Insn::SeekRowid { target_pc, .. } => {
                     resolve(target_pc, "SeekRowid");
                 }
