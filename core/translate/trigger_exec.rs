@@ -490,39 +490,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 }
             }
 
-            // Handle unqualified column references - they refer to NEW if available, else OLD
-            if let Some((idx, col_def)) = ctx.table.get_column(&col) {
-                if col_def.is_rowid_alias() {
-                    *e = Expr::Variable(format!(
-                        "{}",
-                        ctx.get_new_rowid_param()
-                            .expect("NEW parameters must be provided")
-                    ));
-                    return Ok(());
-                }
-                if let Some(new_params) = &ctx.new_param_map {
-                    if idx < new_params.len() {
-                        *e = Expr::Variable(format!(
-                            "{}",
-                            ctx.get_new_param(idx)
-                                .expect("NEW parameters must be provided")
-                                .get()
-                        ));
-                        return Ok(());
-                    }
-                }
-                if let Some(old_params) = &ctx.old_param_map {
-                    if idx < old_params.len() {
-                        *e = Expr::Variable(format!(
-                            "{}",
-                            ctx.get_old_param(idx)
-                                .expect("OLD parameters must be provided")
-                                .get()
-                        ));
-                        return Ok(());
-                    }
-                }
-            }
+            crate::bail_parse_error!("no such column: {ns}.{col}");
         }
         _ => {}
     }
@@ -836,23 +804,7 @@ fn rewrite_trigger_expr_for_when_clause(
                     }
                 }
 
-                // Handle unqualified column references - they refer to NEW if available, else OLD
-                if let Some((idx, _)) = table.get_column(&col) {
-                    if let Some(new_regs) = &ctx.new_registers {
-                        if idx < new_regs.len() {
-                            *e = Expr::Register(new_regs[idx]);
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                    if let Some(old_regs) = &ctx.old_registers {
-                        if idx < old_regs.len() {
-                            *e = Expr::Register(old_regs[idx]);
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-
-                Ok(WalkControl::Continue)
+                crate::bail_parse_error!("no such column: {ns}.{col}");
             }
             _ => Ok(WalkControl::Continue),
         }
