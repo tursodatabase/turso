@@ -2071,8 +2071,6 @@ pub fn halt(
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
-        // Any non-FK constraint violation causes the statement subtransaction to roll back.
-        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
         vtab_rollback_all(&program.connection, state)?;
     }
     match err_code {
@@ -2110,7 +2108,6 @@ pub fn halt(
             .load(Ordering::Acquire)
             > 0
     {
-        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
         return Err(LimboError::Constraint(
             "foreign key constraint failed".to_string(),
         ));
