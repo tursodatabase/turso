@@ -36,11 +36,11 @@ use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLite
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
-    LimboError,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
+    LimboError,
 };
 use crate::{Connection, Result, VirtualTable};
 
@@ -1703,7 +1703,6 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     translate_rows_base(program, insertion, translate_value_fn, resolver)
 }
 /// Populates the column registers with values for a single row
-#[allow(clippy::too_many_arguments)]
 fn translate_rows_single(
     program: &mut ProgramBuilder,
     value: &[Box<Expr>],

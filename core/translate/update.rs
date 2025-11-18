@@ -11,6 +11,7 @@ use crate::{
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
+    Connection,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -319,10 +320,16 @@ pub fn prepare_update_plan(
         // or if the colunns used in the partial index WHERE clause are being updated
         indexes
             .filter_map(|idx| {
-                let mut needs = idx
-                    .columns
-                    .iter()
-                    .any(|c| updated_cols.contains(&c.pos_in_table));
+                let mut needs = idx.columns.iter().any(|c| {
+                    c.expr.as_ref().map_or_else(
+                        || updated_cols.contains(&c.pos_in_table),
+                        |expr| {
+                            columns_used_by_index_expr(expr, &table_references, connection)
+                                .iter()
+                                .any(|cidx| updated_cols.contains(cidx))
+                        },
+                    )
+                });
 
                 if !needs {
                     if let Some(w) = &idx.where_clause {
@@ -394,4 +401,26 @@ fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
         _ => Ok(WalkControl::Continue),
     });
     acc
+}
+
+/// Returns a set of column indices used by an index expression.
+fn columns_used_by_index_expr(
+    expr: &Expr,
+    table_references: &TableReferences,
+    connection: &Arc<Connection>,
+) -> HashSet<usize> {
+    let mut expr_copy = expr.clone();
+    let mut tr = TableReferences::new(table_references.joined_tables().to_vec(), vec![]);
+    if bind_and_rewrite_expr(
+        &mut expr_copy,
+        Some(&mut tr),
+        None,
+        connection,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )
+    .is_err()
+    {
+        return HashSet::new();
+    }
+    collect_cols_used_in_expr(&expr_copy)
 }
