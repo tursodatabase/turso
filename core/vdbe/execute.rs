@@ -6682,7 +6682,6 @@ pub fn op_idx_delete(
         insn
     );
 
-    tracing::info!("idx_delete cursor: {:?}", program.cursor_ref[*cursor_id]);
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
         state.pc += 1;
@@ -7736,6 +7735,9 @@ pub fn op_close(
     load_insn!(Close { cursor_id }, insn);
     let cursors = &mut state.cursors;
     cursors.get_mut(*cursor_id).unwrap().take();
+    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
+        deferred_seek.take();
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
