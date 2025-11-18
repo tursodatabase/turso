@@ -5,7 +5,12 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    Statement, Value, schema::{BTreeTable, Column, Index}, storage::{pager::CreateBTreeFlags, wal::CheckpointMode}, translate::{collate::CollationSeq, emitter::TransactionMode}, types::KeyInfo, vdbe::affinity::Affinity
+    schema::{BTreeTable, Column, Index},
+    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
+    translate::{collate::CollationSeq, emitter::TransactionMode},
+    types::KeyInfo,
+    vdbe::affinity::Affinity,
+    Statement, Value,
 };
 use parking_lot::RwLock;
 use strum::EnumCount;

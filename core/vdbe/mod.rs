@@ -29,12 +29,24 @@ pub mod sorter;
 pub mod value;
 
 use crate::{
-    ValueRef, error::LimboError, function::{AggFunc, FuncCtx}, mvcc::{LocalClock, database::CommitStateMachine}, return_if_io, schema::Trigger, state_machine::StateMachine, storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec}, translate::{collate::CollationSeq, plan::TableReferences}, types::{IOCompletions, IOResult}, vdbe::{
+    error::LimboError,
+    function::{AggFunc, FuncCtx},
+    mvcc::{database::CommitStateMachine, LocalClock},
+    return_if_io,
+    schema::Trigger,
+    state_machine::StateMachine,
+    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
+    translate::{collate::CollationSeq, plan::TableReferences},
+    types::{IOCompletions, IOResult},
+    vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
-    }
+    },
+    ValueRef,
 };
 
 use crate::{

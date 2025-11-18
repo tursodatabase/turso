@@ -7,11 +7,16 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, TableInternalId};
 
 use crate::{
-    CaptureDataChangesMode, Connection, Value, VirtualTable, index_method::IndexMethodAttachment, numeric::Numeric, parameters::Parameters, schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger}, translate::{
+    index_method::IndexMethodAttachment,
+    numeric::Numeric,
+    parameters::Parameters,
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
+    translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
-    }
+    },
+    CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
 #[derive(Default)]

@@ -259,6 +259,12 @@ pub enum QueryDestination {
         /// The number of registers that hold the result of the subquery.
         num_regs: usize,
     },
+    /// The results of the query are stored in a RowSet (for DELETE operations with triggers).
+    /// Rowids are added to the RowSet using RowSetAdd, then read back using RowSetRead.
+    RowSet {
+        /// The register that holds the RowSet object.
+        rowset_reg: usize,
+    },
     /// Decision made at some point after query plan construction.
     Unset,
 }
@@ -474,6 +480,11 @@ pub struct DeletePlan {
     pub contains_constant_false_condition: bool,
     /// Indexes that must be updated by the delete operation.
     pub indexes: Vec<Arc<Index>>,
+    /// If there are DELETE triggers, materialize rowids into a RowSet first.
+    /// This ensures triggers see a stable set of rows to delete.
+    pub rowset_plan: Option<SelectPlan>,
+    /// Register ID for the RowSet (if rowset_plan is Some)
+    pub rowset_reg: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
