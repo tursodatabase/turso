@@ -7,7 +7,6 @@ use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{Connection, Database, Row, StepResult, IO};
 
-
 pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
