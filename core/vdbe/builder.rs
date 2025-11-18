@@ -4,19 +4,14 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast::{self, ResolveType, TableInternalId};
 
 use crate::{
-    index_method::IndexMethodAttachment,
-    numeric::Numeric,
-    parameters::Parameters,
-    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table},
-    translate::{
+    CaptureDataChangesMode, Connection, Value, VirtualTable, index_method::IndexMethodAttachment, numeric::Numeric, parameters::Parameters, schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger}, translate::{
         collate::CollationSeq,
         emitter::TransactionMode,
         plan::{ResultSetColumn, TableReferences},
-    },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    }
 };
 
 #[derive(Default)]
@@ -127,6 +122,12 @@ pub struct ProgramBuilder {
     /// i.e. the individual statement may need to be aborted due to a constraint conflict, etc.
     /// instead of the entire transaction.
     needs_stmt_subtransactions: bool,
+    /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
+    pub trigger: Option<Arc<Trigger>>,
+    /// The type of resolution to perform if a constraint violation occurs during the execution of the program.
+    /// At present this is required only for ignoring errors when there is an INSERT OR IGNORE statement that triggers a trigger subprogram
+    /// which causes a conflict.
+    pub resolve_type: ResolveType,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,22 @@ impl ProgramBuilder {
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
     ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None)
+    }
+    pub fn new_for_trigger(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+        trigger: Arc<Trigger>,
+    ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger))
+    }
+    fn _new(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+        trigger: Option<Arc<Trigger>>,
+    ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
@@ -215,7 +232,13 @@ impl ProgramBuilder {
             current_parent_explain_idx: None,
             reg_result_cols_start: None,
             needs_stmt_subtransactions: false,
+            trigger,
+            resolve_type: ResolveType::Abort,
         }
+    }
+
+    pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
+        self.resolve_type = resolve_type;
     }
 
     pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
@@ -1110,6 +1133,8 @@ impl ProgramBuilder {
             sql: sql.to_string(),
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
             needs_stmt_subtransactions: self.needs_stmt_subtransactions,
+            trigger: self.trigger,
+            resolve_type: self.resolve_type,
         }
     }
 }

@@ -727,6 +727,23 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]={value}"),
             ),
+            Insn::Program {
+                params,
+                ..
+            } => (
+                "Program",
+                // First register that contains a param
+                params.first().map(|v| match v {
+                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1) as i32,
+                    _ => 0,
+                }).unwrap_or(0),
+                // Number of registers that contain params
+                params.len() as i32,
+                0,
+                Value::build_text(program.sql.clone()),
+                0,
+                format!("subprogram={}", program.sql),
+            ),
             Insn::Real { value, dest } => (
                 "Real",
                 0,

@@ -5,13 +5,9 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, Column, Index},
-    storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
-    translate::{collate::CollationSeq, emitter::TransactionMode},
-    types::KeyInfo,
-    vdbe::affinity::Affinity,
-    Value,
+    Statement, Value, schema::{BTreeTable, Column, Index}, storage::{pager::CreateBTreeFlags, wal::CheckpointMode}, translate::{collate::CollationSeq, emitter::TransactionMode}, types::KeyInfo, vdbe::affinity::Affinity
 };
+use parking_lot::RwLock;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
@@ -528,6 +524,18 @@ pub enum Insn {
     Return {
         return_reg: usize,
         can_fallthrough: bool,
+    },
+
+    /// Invoke a trigger subprogram.
+    ///
+    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// "The Program opcode invokes the trigger subprogram. The Program instruction
+    /// allocates and initializes a fresh register set for each invocation of the
+    /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
+    /// is used by subprograms to access content in registers of the calling bytecode program."
+    Program {
+        params: Vec<Value>,
+        program: Arc<RwLock<Statement>>,
     },
 
     /// Write an integer value into a register.
@@ -1336,6 +1344,7 @@ impl InsnVariants {
             InsnVariants::Gosub => execute::op_gosub,
             InsnVariants::Return => execute::op_return,
             InsnVariants::Integer => execute::op_integer,
+            InsnVariants::Program => execute::op_program,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,

@@ -29,23 +29,12 @@ pub mod sorter;
 pub mod value;
 
 use crate::{
-    error::LimboError,
-    function::{AggFunc, FuncCtx},
-    mvcc::{database::CommitStateMachine, LocalClock},
-    return_if_io,
-    state_machine::StateMachine,
-    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
-    translate::{collate::CollationSeq, plan::TableReferences},
-    types::{IOCompletions, IOResult},
-    vdbe::{
+    ValueRef, error::LimboError, function::{AggFunc, FuncCtx}, mvcc::{LocalClock, database::CommitStateMachine}, return_if_io, schema::Trigger, state_machine::StateMachine, storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec}, translate::{collate::CollationSeq, plan::TableReferences}, types::{IOCompletions, IOResult}, vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
-            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
-            OpRowIdState, OpSeekState, OpTransactionState,
+            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState
         },
         metrics::StatementMetrics,
-    },
-    ValueRef,
+    }
 };
 
 use crate::{
@@ -63,6 +52,7 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
+use turso_parser::ast::ResolveType;
 
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -296,6 +286,7 @@ pub struct ProgramState {
     /// Metrics collected during statement execution
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
+    op_program_state: OpProgramState,
     op_new_rowid_state: OpNewRowidState,
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
@@ -322,6 +313,12 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Program").finish()
+    }
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -360,6 +357,7 @@ impl ProgramState {
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
+            op_program_state: OpProgramState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
             op_idx_insert_state: OpIdxInsertState::MaybeSeek,
             op_insert_state: OpInsertState {
@@ -605,6 +603,12 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
+    /// If this is a trigger subprogram, this is the trigger that is being executed.
+    pub trigger: Option<Arc<Trigger>>,
+    /// The type of resolution to perform if a constraint violation occurs during the execution of the program.
+    /// At present this is required only for ignoring errors when there is an INSERT OR IGNORE statement that triggers a trigger subprogram
+    /// which causes a conflict.
+    pub resolve_type: ResolveType,
 }
 
 impl Program {
@@ -747,7 +751,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
-                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
+                self.abort(mv_store, &pager, None, state);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -757,7 +761,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -799,7 +803,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
             }
@@ -1059,10 +1063,21 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
-        cleanup: &mut TxnCleanup,
+        state: &mut ProgramState,
     ) {
+        if self.is_trigger_subprogram() {
+            self.connection.end_trigger_execution();
+        }
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() {
+        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            if err.is_some() {
+                // Any error apart from deferred FK volations causes the statement subtransaction to roll back.
+                let res =
+                    state.end_statement(&self.connection, pager, EndStatement::RollbackSavepoint);
+                if let Err(e) = res {
+                    tracing::error!("Error rolling back statement: {}", e);
+                }
+            }
             match err {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
@@ -1075,7 +1090,7 @@ impl Program {
                 // and op_halt.
                 Some(LimboError::Constraint(_)) => {}
                 _ => {
-                    if *cleanup != TxnCleanup::None || err.is_some() {
+                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = mv_store {
                             if let Some(tx_id) = self.connection.get_mv_tx_id() {
                                 self.connection.auto_commit.store(true, Ordering::SeqCst);
@@ -1090,7 +1105,11 @@ impl Program {
                 }
             }
         }
-        *cleanup = TxnCleanup::None;
+        state.auto_txn_cleanup = TxnCleanup::None;
+    }
+
+    pub fn is_trigger_subprogram(&self) -> bool {
+        self.trigger.is_some()
     }
 }
 

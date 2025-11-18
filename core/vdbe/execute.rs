@@ -39,10 +39,11 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
+use crate::{CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor, StepResult, get_cursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
+use std::num::NonZero;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
@@ -75,7 +76,7 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use turso_parser::ast::{self, ForeignKeyClause, Name};
+use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -2641,6 +2642,105 @@ pub fn op_integer(
     state.registers[*dest] = Register::Value(Value::Integer(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub enum OpProgramState {
+    Start,
+    Step,
+}
+
+/// Execute a trigger subprogram (Program opcode).
+pub fn op_program(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Program {
+            params,
+            program: subprogram,
+        },
+        insn
+    );
+    loop {
+        match &mut state.op_program_state {
+            OpProgramState::Start => {
+                let mut statement = subprogram.write();
+                statement.reset();
+                let Some(ref trigger) = statement.get_trigger() else {
+                    crate::bail_parse_error!("trigger subprogram has no trigger");
+                };
+                program.connection.start_trigger_execution(trigger.clone());
+
+                // Extract register values from params (which contain register indices encoded as negative integers)
+                // and bind them to the subprogram's parameters
+                for (param_idx, param_value) in params.iter().enumerate() {
+                    if let Value::Integer(reg_idx_encoded) = param_value {
+                        if *reg_idx_encoded < 0 {
+                            // This is a register index encoded as negative integer
+                            let actual_reg_idx = (-reg_idx_encoded - 1) as usize;
+                            if actual_reg_idx < state.registers.len() {
+                                let value = state.registers[actual_reg_idx].get_value().clone();
+                                let param_index = NonZero::<usize>::new(param_idx + 1).unwrap();
+                                statement.bind_at(param_index, value);
+                            } else {
+                                crate::bail_corrupt_error!(
+                                    "Register index {} out of bounds (len={})",
+                                    actual_reg_idx,
+                                    state.registers.len()
+                                );
+                            }
+                        } else {
+                            crate::bail_parse_error!("Register indices for triggers should be encoded as negative integers, got {}", reg_idx_encoded);
+                        }
+                    } else {
+                        crate::bail_parse_error!(
+                            "Trigger parameters should be integers, got {:?}",
+                            param_value
+                        );
+                    }
+                }
+
+                state.op_program_state = OpProgramState::Step;
+            }
+            OpProgramState::Step => {
+                loop {
+                    let mut statement = subprogram.write();
+                    let res = statement.step();
+                    match res {
+                        Ok(step_result) => match step_result {
+                            StepResult::Done => break,
+                            StepResult::IO => {
+                                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                                    Completion::new_yield(),
+                                )));
+                            }
+                            StepResult::Row => continue,
+                            StepResult::Interrupt | StepResult::Busy => {
+                                return Err(LimboError::Busy);
+                            }
+                        },
+                        Err(LimboError::Constraint(constraint_err)) => {
+                            if program.resolve_type != ResolveType::Ignore {
+                                return Err(LimboError::Constraint(constraint_err));
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                program.connection.end_trigger_execution();
+
+                state.op_program_state = OpProgramState::Start;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 pub fn op_real(
