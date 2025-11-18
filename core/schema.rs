@@ -172,7 +172,7 @@ pub struct Schema {
     pub views: ViewsMap,
 
     /// table_name to list of triggers
-    pub triggers: HashMap<String, Vec<Arc<Trigger>>>,
+    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
@@ -360,10 +360,11 @@ impl Schema {
         self.check_object_name_conflict(&trigger.name)?;
         let table_name = normalize_ident(table_name);
 
+        // See [Schema::add_index] for why we push to the front of the deque.
         self.triggers
             .entry(table_name)
             .or_default()
-            .push(Arc::new(trigger));
+            .push_front(Arc::new(trigger));
 
         Ok(())
     }

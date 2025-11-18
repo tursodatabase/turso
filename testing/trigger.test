@@ -745,3 +745,17 @@ do_execsql_test_on_specific_db {:memory:} trigger-before-update-parent-expressio
   UPDATE test66 SET c0 = c1+1;
   SELECT * FROM test66;
 } {2|666|666}
+
+# Multiple BEFORE INSERT triggers - last added trigger fires first
+# SQLite evaluates triggers in reverse order of creation (LIFO)
+do_execsql_test_on_specific_db {:memory:} trigger-multiple-before-insert-lifo {
+  CREATE TABLE t67(c0 INTEGER, c1 INTEGER, c2 INTEGER, whodunnit TEXT);
+  CREATE TRIGGER t67_first BEFORE INSERT ON t67 BEGIN INSERT INTO t67 VALUES (NEW.c0+1, NEW.c1+2, NEW.c2+3, 't67_first'); END;
+  CREATE TRIGGER t67_second BEFORE INSERT ON t67 BEGIN INSERT INTO t67 VALUES (NEW.c0+2, NEW.c1+3, NEW.c2+4, 't67_second'); END;
+  INSERT INTO t67 VALUES (1, 1, 1, 'jussi');
+  SELECT rowid, * FROM t67 ORDER BY rowid;
+} {1|4|6|8|t67_first
+2|3|4|5|t67_second
+3|4|6|8|t67_second
+4|2|3|4|t67_first
+5|1|1|1|jussi}
