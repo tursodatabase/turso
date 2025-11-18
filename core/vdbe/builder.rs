@@ -954,6 +954,16 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
+        if self.trigger.is_some() {
+            // Trigger subprograms don't start transactions so their init just falls through to the next instruction
+            self.init_label = self.allocate_label();
+            self.emit_insn(Insn::Init {
+                target_pc: self.init_label,
+            });
+            self.preassign_label_to_next_insn(self.init_label);
+            self.start_offset = self.offset();
+            return;
+        }
         if self.nested_level == 0 {
             self.init_label = self.allocate_label();
 
@@ -992,6 +1002,14 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
+        if self.trigger.is_some() {
+            // Trigger subprograms don't start transactions
+            self.emit_insn(Insn::Halt {
+                err_code: 0,
+                description: "trigger".to_string(),
+            });
+            return;
+        }
         if self.nested_level == 0 {
             // "rollback" flag is used to determine if halt should rollback the transaction.
             self.emit_halt(self.rollback);
