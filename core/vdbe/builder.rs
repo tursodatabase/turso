@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use std::{
     cmp::Ordering,
     sync::{atomic::AtomicI64, Arc},
@@ -38,7 +39,7 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
+use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -89,7 +90,7 @@ pub struct ProgramBuilder {
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
-    insns: Vec<(Insn, usize)>,
+    pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
@@ -129,9 +130,6 @@ pub struct ProgramBuilder {
     needs_stmt_subtransactions: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
-    /// The type of resolution to perform if a constraint violation occurs during the execution of the program.
-    /// At present this is required only for ignoring errors when there is an INSERT OR IGNORE statement that triggers a trigger subprogram
-    /// which causes a conflict.
     pub resolve_type: ResolveType,
 }
 
@@ -806,9 +804,6 @@ impl ProgramBuilder {
                 } => {
                     resolve(end_offset, "Yield");
                 }
-                Insn::RowSetRead { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "RowSetRead");
-                }
                 Insn::SeekRowid { target_pc, .. } => {
                     resolve(target_pc, "SeekRowid");
                 }
@@ -859,6 +854,9 @@ impl ProgramBuilder {
                 }
                 Insn::VFilter { pc_if_empty, .. } => {
                     resolve(pc_if_empty, "VFilter");
+                }
+                Insn::RowSetRead { pc_if_empty, .. } => {
+                    resolve(pc_if_empty, "RowSetRead");
                 }
                 Insn::NoConflict { target_pc, .. } => {
                     resolve(target_pc, "NoConflict");
@@ -955,7 +953,6 @@ impl ProgramBuilder {
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
         if self.trigger.is_some() {
-            // Trigger subprograms don't start transactions so their init just falls through to the next instruction
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
                 target_pc: self.init_label,
@@ -1003,7 +1000,6 @@ impl ProgramBuilder {
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
         if self.trigger.is_some() {
-            // Trigger subprograms don't start transactions
             self.emit_insn(Insn::Halt {
                 err_code: 0,
                 description: "trigger".to_string(),
@@ -1159,8 +1155,9 @@ impl ProgramBuilder {
             sql: sql.to_string(),
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
             needs_stmt_subtransactions: self.needs_stmt_subtransactions,
-            trigger: self.trigger,
+            trigger: self.trigger.take(),
             resolve_type: self.resolve_type,
+            explain_state: RwLock::new(ExplainState::default()),
         }
     }
 }

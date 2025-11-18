@@ -64,6 +64,7 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
+use parking_lot::RwLock;
 use turso_parser::ast::ResolveType;
 
 use crate::vdbe::rowset::RowSet;
@@ -598,6 +599,17 @@ macro_rules! get_cursor {
     };
 }
 
+/// Tracks the state of explain mode execution, including which subprograms need to be processed.
+#[derive(Default)]
+pub struct ExplainState {
+    /// Program counter positions in the parent program where `Insn::Program` instructions occur.
+    parent_program_pcs: Vec<usize>,
+    /// Index of the subprogram currently being processed, if any.
+    current_subprogram_index: Option<usize>,
+    /// PC value when we started processing the current subprogram, to detect if we need to reset.
+    subprogram_start_pc: Option<usize>,
+}
+
 pub struct Program {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
@@ -620,12 +632,9 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
-    /// If this is a trigger subprogram, this is the trigger that is being executed.
     pub trigger: Option<Arc<Trigger>>,
-    /// The type of resolution to perform if a constraint violation occurs during the execution of the program.
-    /// At present this is required only for ignoring errors when there is an INSERT OR IGNORE statement that triggers a trigger subprogram
-    /// which causes a conflict.
     pub resolve_type: ResolveType,
+    pub explain_state: RwLock<ExplainState>,
 }
 
 impl Program {
@@ -671,11 +680,106 @@ impl Program {
         // FIXME: do we need this?
         state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
+        let mut explain_state = self.explain_state.write();
+
+        // Check if we're processing a subprogram
+        if let Some(sub_idx) = explain_state.current_subprogram_index {
+            if sub_idx >= explain_state.parent_program_pcs.len() {
+                // All subprograms processed
+                *explain_state = ExplainState::default();
+                return Ok(StepResult::Done);
+            }
+
+            let parent_pc = explain_state.parent_program_pcs[sub_idx];
+            let Insn::Program { program: p, .. } = &self.insns[parent_pc].0 else {
+                panic!("Expected program insn at pc {parent_pc}");
+            };
+            let p = &mut p.write().program;
+
+            let subprogram_insn_count = p.insns.len();
+
+            // Check if the subprogram has already finished (PC is out of bounds)
+            // This can happen if the subprogram finished in a previous call but we're being called again
+            if state.pc as usize >= subprogram_insn_count {
+                // Subprogram is done, move to next one
+                explain_state.subprogram_start_pc = None;
+                if sub_idx + 1 < explain_state.parent_program_pcs.len() {
+                    explain_state.current_subprogram_index = Some(sub_idx + 1);
+                    state.pc = 0;
+                    drop(explain_state);
+                    return self.explain_step(state, _mv_store, pager);
+                } else {
+                    *explain_state = ExplainState::default();
+                    return Ok(StepResult::Done);
+                }
+            }
+
+            // Reset PC to 0 only when starting a new subprogram (when subprogram_start_pc is None)
+            // Once we've started, let the subprogram manage its own PC through its explain_step
+            if explain_state.subprogram_start_pc.is_none() {
+                state.pc = 0;
+                explain_state.subprogram_start_pc = Some(0);
+            }
+
+            // Process the subprogram - it will handle its own explain_step internally
+            // The subprogram's explain_step will process all its instructions (including any nested subprograms)
+            // and return StepResult::Row for each instruction, then StepResult::Done when finished
+            let result = p.step(state, None, pager.clone(), QueryMode::Explain, None)?;
+
+            match result {
+                StepResult::Done => {
+                    // This subprogram is done, move to next one
+                    explain_state.subprogram_start_pc = None; // Clear the start PC marker
+                    if sub_idx + 1 < explain_state.parent_program_pcs.len() {
+                        // Move to next subprogram
+                        explain_state.current_subprogram_index = Some(sub_idx + 1);
+                        // Reset PC to 0 for the next subprogram
+                        state.pc = 0;
+                        // Recursively call to process the next subprogram
+                        drop(explain_state);
+                        return self.explain_step(state, _mv_store, pager);
+                    } else {
+                        // All subprograms done
+                        *explain_state = ExplainState::default();
+                        return Ok(StepResult::Done);
+                    }
+                }
+                StepResult::Row => {
+                    // Output a row from the subprogram
+                    // The subprogram's step already set up the registers with PC starting at 0
+                    // Don't reset subprogram_start_pc - we're still processing this subprogram
+                    drop(explain_state);
+                    return Ok(StepResult::Row);
+                }
+                other => {
+                    drop(explain_state);
+                    return Ok(other);
+                }
+            }
+        }
+
+        // We're processing the parent program
         if state.pc as usize >= self.insns.len() {
-            return Ok(StepResult::Done);
+            // Parent program is done, start processing subprograms
+            if explain_state.parent_program_pcs.is_empty() {
+                // No subprograms to process
+                *explain_state = ExplainState::default();
+                return Ok(StepResult::Done);
+            }
+
+            // Start processing the first subprogram
+            explain_state.current_subprogram_index = Some(0);
+            explain_state.subprogram_start_pc = None; // Will be set when we actually start processing
+            state.pc = 0; // Reset PC to 0 for the first subprogram
+            drop(explain_state);
+            return self.explain_step(state, _mv_store, pager);
         }
 
         let (current_insn, _) = &self.insns[state.pc as usize];
+
+        if matches!(current_insn, Insn::Program { .. }) {
+            explain_state.parent_program_pcs.push(state.pc as usize);
+        }
         let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
             self,
             current_insn,
