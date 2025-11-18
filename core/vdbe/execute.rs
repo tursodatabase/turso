@@ -23,7 +23,7 @@ use crate::util::{
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
+use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -39,16 +39,14 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{
-    get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor, StepResult,
-};
+use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
-use std::num::NonZero;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
+    num::NonZero,
     sync::{atomic::Ordering, Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
@@ -2113,6 +2111,10 @@ pub fn halt(
         ));
     }
 
+    if program.is_trigger_subprogram() {
+        return Ok(InsnFunctionStepResult::Done);
+    }
+
     if auto_commit {
         // In autocommit mode, a statement that leaves deferred violations must fail here,
         // and it also ends the transaction.
@@ -2256,6 +2258,11 @@ pub fn op_transaction_inner(
         },
         insn
     );
+    if program.is_trigger_subprogram() {
+        crate::bail_parse_error!(
+            "Transaction instruction should not be used in trigger subprograms"
+        );
+    }
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
@@ -2535,6 +2542,12 @@ pub fn op_auto_commit(
                 "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
             ));
         }
+    }
+
+    if program.is_trigger_subprogram() {
+        // Trigger subprograms never commit or rollback.
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
 
     let res = program
