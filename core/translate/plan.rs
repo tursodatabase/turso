@@ -1015,10 +1015,10 @@ impl JoinedTable {
                         } else {
                             CursorType::BTreeTable(btree.clone())
                         };
-                    Some(
-                        program
-                            .alloc_cursor_id_keyed(CursorKey::table(self.internal_id), cursor_type),
-                    )
+                    Some(program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(self.internal_id),
+                        cursor_type,
+                    ))
                 };
 
                 let index_cursor_id = index
