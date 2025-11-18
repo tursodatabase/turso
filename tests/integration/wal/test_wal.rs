@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use turso_core::{Connection, LimboError, Result, StepResult};
 
 #[allow(clippy::arc_with_non_send_sync)]
-#[test]
+#[turso_macros::test(mvcc, path = 1)]
 fn test_wal_checkpoint_result() -> Result<()> {
     maybe_setup_tracing();
     let tmp_db = TempDatabase::new("test_wal.db");

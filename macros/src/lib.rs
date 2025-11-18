@@ -1,6 +1,8 @@
-mod ext;
 extern crate proc_macro;
 mod atomic_enum;
+mod ext;
+mod test;
+
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
 
@@ -491,4 +493,9 @@ pub fn match_ignore_ascii_case(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(AtomicEnum)]
 pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
     atomic_enum::derive_atomic_enum_inner(input)
+}
+
+#[proc_macro_attribute]
+pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
+    test::test_macro_attribute(args, input)
 }

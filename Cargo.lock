@@ -846,6 +846,7 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "turso_core",
+ "turso_macros",
  "turso_parser",
  "twox-hash",
  "zerocopy 0.8.26",
