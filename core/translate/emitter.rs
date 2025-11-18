@@ -1766,8 +1766,6 @@ fn emit_update_insns<'a>(
                     Some(old_registers.clone()), // Clone for AFTER trigger
                 );
 
-                // Extract updated column indices for UPDATE OF trigger filtering
-
                 for trigger in relevant_before_update_triggers {
                     fire_trigger(
                         program,
