@@ -692,7 +692,6 @@ pub fn get_relevant_triggers_type_and_time<'a>(
         .cloned()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn fire_trigger(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
