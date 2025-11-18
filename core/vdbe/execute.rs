@@ -7596,6 +7596,24 @@ pub fn op_drop_view(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_drop_trigger(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropTrigger { db, trigger_name }, insn);
+
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| {
+        schema.remove_trigger(trigger_name)?;
+        Ok::<(), crate::LimboError>(())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_close(
     program: &Program,
     state: &mut ProgramState,

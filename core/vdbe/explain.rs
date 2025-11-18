@@ -1407,6 +1407,15 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TABLE {table_name}"),
             ),
+            Insn::DropTrigger { db, trigger_name } => (
+                "DropTrigger",
+                *db as i32,
+                0,
+                0,
+                Value::build_text(trigger_name.clone()),
+                0,
+                format!("DROP TRIGGER {trigger_name}"),
+            ),
             Insn::DropView { db, view_name } => (
                 "DropView",
                 *db as i32,

@@ -35,6 +35,7 @@ pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod subquery;
 pub(crate) mod transaction;
+pub(crate) mod trigger;
 pub(crate) mod update;
 pub(crate) mod upsert;
 mod values;
@@ -169,7 +170,40 @@ pub fn translate_inner(
             program,
             connection,
         )?,
-        ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
+        ast::Stmt::CreateTrigger {
+            temporary,
+            if_not_exists,
+            trigger_name,
+            time,
+            event,
+            tbl_name,
+            for_each_row,
+            when_clause,
+            commands,
+        } => {
+            // Reconstruct SQL for storage
+            let sql = trigger::create_trigger_to_sql(
+                temporary,
+                if_not_exists,
+                &trigger_name,
+                time,
+                &event,
+                &tbl_name,
+                for_each_row,
+                when_clause.as_deref(),
+                &commands,
+            );
+            trigger::translate_create_trigger(
+                trigger_name,
+                resolver,
+                temporary,
+                if_not_exists,
+                time,
+                tbl_name,
+                program,
+                sql,
+            )?
+        }
         ast::Stmt::CreateView {
             view_name,
             select,
@@ -232,7 +266,15 @@ pub fn translate_inner(
             if_exists,
             tbl_name,
         } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
-        ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
+        ast::Stmt::DropTrigger {
+            if_exists,
+            trigger_name,
+        } => trigger::translate_drop_trigger(
+            resolver.schema,
+            trigger_name.name.as_str(),
+            if_exists,
+            program,
+        )?,
         ast::Stmt::DropView {
             if_exists,
             view_name,

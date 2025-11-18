@@ -980,6 +980,13 @@ pub enum Insn {
         //  The name of the index being dropped
         index: Arc<Index>,
     },
+    /// Drop a trigger
+    DropTrigger {
+        /// The database within which this trigger needs to be dropped (P1).
+        db: usize,
+        /// The name of the trigger being dropped
+        trigger_name: String,
+    },
 
     /// Close a cursor.
     Close {
@@ -1383,6 +1390,7 @@ impl InsnVariants {
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
             InsnVariants::DropTable => execute::op_drop_table,
+            InsnVariants::DropTrigger => execute::op_drop_trigger,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
