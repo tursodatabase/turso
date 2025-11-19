@@ -1687,5 +1687,5 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     assert_eq!(rows[0], vec![Value::Integer(5)]);
     assert_eq!(rows[1], vec![Value::Integer(4)]);
     assert_eq!(rows[2], vec![Value::Integer(3)]);
-    assert_eq!(rows[2], vec![Value::Integer(1)]);
+    assert_eq!(rows[3], vec![Value::Integer(1)]);
 }
