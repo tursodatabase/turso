@@ -168,12 +168,12 @@ fn upsert_index_is_affected(
     if rowid_changed {
         return true;
     }
-    let km = idx
+    let km: HashSet<usize> = idx
         .columns
         .iter()
         .filter_map(|ic| ic.expr.is_none().then_some(ic.pos_in_table))
-        .collect::<Vec<_>>();
-    let pm = partial_index_cols(idx, table);
+        .collect();
+    let pm = referenced_index_cols(idx, table);
     for c in km.iter().chain(pm.iter()) {
         if changed_cols.contains(c) {
             return true;
@@ -183,21 +183,40 @@ fn upsert_index_is_affected(
 }
 
 /// Columns referenced by the partial WHERE (empty if none).
-fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    use ast::Expr;
-    let Some(expr) = &idx.where_clause else {
-        return HashSet::new();
-    };
+fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
     let mut out = HashSet::new();
+    if let Some(expr) = &idx.where_clause {
+        index_expression_cols(table, &mut out, expr);
+    }
+    for ic in &idx.columns {
+        if let Some(expr) = &ic.expr {
+            index_expression_cols(table, &mut out, expr);
+        }
+    }
+    out
+}
+
+/// Columns referenced by any expression index columns on the index.
+fn index_expression_cols(table: &Table, out: &mut HashSet<usize>, expr: &ast::Expr) {
+    use ast::Expr;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
         match e {
             Expr::Id(n) => {
                 if let Some((i, _)) = table.get_column_by_name(&normalize_ident(n.as_str())) {
                     out.insert(i);
+                } else if ROWID_STRS
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(n.as_str()))
+                {
+                    if let Some(rowid_pos) = table
+                        .btree()
+                        .and_then(|t| t.get_rowid_alias_column().map(|(p, _)| p))
+                    {
+                        out.insert(rowid_pos);
+                    }
                 }
             }
             Expr::Qualified(ns, c) | Expr::DoublyQualified(_, ns, c) => {
-                // Only count columns that belong to this table
                 let nsn = normalize_ident(ns.as_str());
                 let tname = normalize_ident(table.get_name());
                 if nsn.eq_ignore_ascii_case(&tname) {
@@ -210,7 +229,6 @@ fn partial_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
         }
         Ok(WalkControl::Continue)
     });
-    out
 }
 
 /// Match ON CONFLICT target to a UNIQUE index, *ignoring order* but requiring
@@ -868,7 +886,7 @@ pub fn emit_upsert(
     if !returning.is_empty() {
         emit_returning_results(
             program,
-            ctx.table_references,
+            table_references,
             returning,
             new_start,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
