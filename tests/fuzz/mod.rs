@@ -8,7 +8,6 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use turso_core::DatabaseOpts;
 
     use core_tester::common::{
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
@@ -21,9 +20,8 @@ mod fuzz_tests {
     use super::grammar_generator::SymbolHandle;
 
     /// [See this issue for more info](https://github.com/tursodatabase/turso/issues/1763)
-    #[test]
-    pub fn fuzz_failure_issue_1763() {
-        let db = TempDatabase::new_empty();
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_failure_issue_1763(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
@@ -35,9 +33,8 @@ mod fuzz_tests {
         );
     }
 
-    #[test]
-    pub fn arithmetic_expression_fuzz_ex1() {
-        let db = TempDatabase::new_empty();
+    #[turso_macros::test(mvcc)]
+    pub fn arithmetic_expression_fuzz_ex1(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -54,10 +51,10 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn rowid_seek_fuzz() {
-        let db =
-            TempDatabase::new_with_rusqlite("CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"); // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+    // TODO: mvcc fuzz failure
+    // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
+    #[turso_macros::test(init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)")]
+    pub fn rowid_seek_fuzz(db: TempDatabase) {
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
@@ -169,9 +166,9 @@ mod fuzz_tests {
         values
     }
 
-    #[test]
-    pub fn index_scan_fuzz() {
-        let db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x PRIMARY KEY)");
+    // TODO: mvcc indexes
+    #[turso_macros::test(init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
+    pub fn index_scan_fuzz(db: TempDatabase) {
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let insert = format!(
@@ -215,11 +212,16 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
-    pub fn index_scan_compound_key_fuzz() {
+    pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
         let (mut rng, seed) = rng_from_time_or_env();
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
         let table_defs: [&str; 8] = [
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y, z))",
@@ -231,16 +233,10 @@ mod fuzz_tests {
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y desc, z desc))",
         ];
         // Create all different 3-column primary key permutations
-        let dbs = [
-            TempDatabase::new_with_rusqlite(table_defs[0]),
-            TempDatabase::new_with_rusqlite(table_defs[1]),
-            TempDatabase::new_with_rusqlite(table_defs[2]),
-            TempDatabase::new_with_rusqlite(table_defs[3]),
-            TempDatabase::new_with_rusqlite(table_defs[4]),
-            TempDatabase::new_with_rusqlite(table_defs[5]),
-            TempDatabase::new_with_rusqlite(table_defs[6]),
-            TempDatabase::new_with_rusqlite(table_defs[7]),
-        ];
+        let dbs = table_defs
+            .iter()
+            .map(|init_sql| builder.clone().with_init_sql(init_sql).build())
+            .collect::<Vec<_>>();
         let mut pk_tuples = HashSet::new();
         while pk_tuples.len() < 100000 {
             pk_tuples.insert((
@@ -506,11 +502,16 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn collation_fuzz() {
+    // TODO: Mvcc indexes
+    #[turso_macros::test()]
+    pub fn collation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("collation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         // Build six table variants that assign BINARY/NOCASE/RTRIM across (a,b,c)
         // and include UNIQUE constraints so that auto-created indexes must honor column collations.
@@ -563,7 +564,7 @@ mod fuzz_tests {
         // Create databases for each variant using rusqlite, then open limbo on the same file.
         let dbs: Vec<TempDatabase> = table_defs
             .iter()
-            .map(|ddl| TempDatabase::new_with_rusqlite(ddl))
+            .map(|ddl| builder.clone().with_init_sql(ddl).build())
             .collect();
 
         // Seed data focuses on case and trailing spaces to exercise NOCASE and RTRIM semantics.
@@ -649,13 +650,18 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
     #[allow(unused_assignments)]
-    pub fn fk_deferred_constraints_and_triggers_fuzz() {
+    pub fn fk_deferred_constraints_and_triggers_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_deferred_constraints_and_triggers_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
@@ -667,8 +673,8 @@ mod fuzz_tests {
                 OUTER_ITERS
             );
 
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1087,11 +1093,16 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn fk_single_pk_mutation_fuzz() {
+    // TODO: mvcc state mismatch
+    #[turso_macros::test()]
+    pub fn fk_single_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_single_pk_mutation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -1099,8 +1110,8 @@ mod fuzz_tests {
         for outer in 0..OUTER_ITERS {
             println!("fk_single_pk_mutation_fuzz {}/{}", outer + 1, OUTER_ITERS);
 
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1389,11 +1400,16 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn fk_edgecases_fuzzing() {
+    // TODO: mvcc does not work
+    #[turso_macros::test()]
+    pub fn fk_edgecases_fuzzing(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_edgecases_minifuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 20;
         const INNER_ITERS: usize = 100;
@@ -1424,8 +1440,8 @@ mod fuzz_tests {
 
         // parent rowid, child textified integers -> MustBeInt coercion path
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1490,8 +1506,8 @@ mod fuzz_tests {
 
         // slf-referential rowid FK
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1553,8 +1569,8 @@ mod fuzz_tests {
 
         // self-referential UNIQUE(u,v) parent (fast-path for composite)
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1633,8 +1649,8 @@ mod fuzz_tests {
 
         // parent TEXT UNIQUE(u,v), child types differ; rely on parent-index affinities
         for outer in 0..OUTER_ITERS {
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1744,11 +1760,16 @@ mod fuzz_tests {
         println!("fk_edgecases_minifuzz complete (seed {seed})");
     }
 
-    #[test]
-    pub fn fk_composite_pk_mutation_fuzz() {
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
+    pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         println!("fk_composite_pk_mutation_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         const OUTER_ITERS: usize = 10;
         const INNER_ITERS: usize = 100;
@@ -1760,8 +1781,8 @@ mod fuzz_tests {
                 OUTER_ITERS
             );
 
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -1954,10 +1975,11 @@ mod fuzz_tests {
             }
         }
     }
-    #[test]
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
-    pub fn table_index_mutation_fuzz() {
+    pub fn table_index_mutation_fuzz(db: TempDatabase) {
         /// Format a nice diff between two result sets for better error messages
         #[allow(clippy::too_many_arguments)]
         fn format_rows_diff(
@@ -2075,6 +2097,10 @@ mod fuzz_tests {
         let (mut rng, seed) = rng_from_time_or_env();
         println!("table_index_mutation_fuzz seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         const OUTER_ITERATIONS: usize = 30;
         for i in 0..OUTER_ITERATIONS {
             println!(
@@ -2082,8 +2108,8 @@ mod fuzz_tests {
                 i + 1,
                 OUTER_ITERATIONS
             );
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -2444,20 +2470,30 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn partial_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(1.0, 4);
+    // TODO: mvcc index
+    #[turso_macros::test()]
+    pub fn partial_index_mutation_and_upsert_fuzz(db: TempDatabase) {
+        index_mutation_upsert_fuzz(db, 1.0, 4);
     }
 
-    #[test]
-    pub fn simple_index_mutation_and_upsert_fuzz() {
-        index_mutation_upsert_fuzz(0.0, 4);
+    // TODO: mvcc fails
+    #[turso_macros::test()]
+    pub fn simple_index_mutation_and_upsert_fuzz(db: TempDatabase) {
+        index_mutation_upsert_fuzz(db, 0.0, 4);
     }
 
-    fn index_mutation_upsert_fuzz(partial_index_prob: f64, conflict_chain_max_len: u32) {
+    fn index_mutation_upsert_fuzz(
+        db: TempDatabase,
+        partial_index_prob: f64,
+        conflict_chain_max_len: u32,
+    ) {
         let _ = env_logger::try_init();
         const OUTER_ITERS: usize = 5;
         const INNER_ITERS: usize = 500;
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         let (mut rng, seed) = rng_from_time_or_env();
         println!("partial_index_mutation_and_upsert_fuzz seed: {seed}");
@@ -2476,8 +2512,8 @@ mod fuzz_tests {
             );
 
             // Columns: id (rowid PK), plus a few data columns we can reference in predicates/keys.
-            let limbo_db = TempDatabase::new_empty();
-            let sqlite_db = TempDatabase::new_empty();
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
             let limbo_conn = limbo_db.connect_limbo();
             let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
 
@@ -2810,8 +2846,9 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn compound_select_fuzz() {
+    // TODO: mvcc fails
+    #[turso_macros::test()]
+    pub fn compound_select_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("compound_select_fuzz seed: {seed}");
@@ -2826,7 +2863,6 @@ mod fuzz_tests {
         const MAX_SELECTS_IN_UNION_EXTRA: usize = 2;
         const MAX_LIMIT_VALUE: usize = 50;
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -2946,13 +2982,19 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn ddl_compatibility_fuzz() {
+    // TODO: indexes
+    #[turso_macros::test()]
+    pub fn ddl_compatibility_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         const ITERATIONS: usize = 1000;
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for i in 0..ITERATIONS {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let conn = db.connect_limbo();
             let num_cols = rng.random_range(1..=5);
             let col_names: Vec<String> = (0..num_cols).map(|c| format!("c{c}")).collect();
@@ -3070,8 +3112,8 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn arithmetic_expression_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn arithmetic_expression_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -3114,7 +3156,6 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3131,10 +3172,9 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_ex() {
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_ex(db: TempDatabase) {
         let _ = env_logger::try_init();
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3158,8 +3198,8 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn math_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn math_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -3233,7 +3273,6 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3260,8 +3299,8 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn string_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn string_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let (expr, expr_builder) = g.create_handle();
@@ -3393,7 +3432,6 @@ mod fuzz_tests {
 
         let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3748,8 +3786,8 @@ mod fuzz_tests {
         handle
     }
 
-    #[test]
-    pub fn logical_expression_fuzz_run() {
+    #[turso_macros::test(mvcc)]
+    pub fn logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let builders = common_builders(&g, None);
@@ -3762,7 +3800,6 @@ mod fuzz_tests {
             .push(expr)
             .build();
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3780,9 +3817,13 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn table_logical_expression_fuzz_ex1() {
+    #[turso_macros::test(mvcc)]
+    pub fn table_logical_expression_fuzz_ex1(db: TempDatabase) {
         let _ = env_logger::try_init();
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
         for queries in [
             [
@@ -3796,7 +3837,7 @@ mod fuzz_tests {
                 "SELECT * FROM t",
             ],
         ] {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
             for query in queries.iter() {
@@ -3810,20 +3851,24 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn min_max_agg_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn min_max_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let datatypes = ["INTEGER", "TEXT", "REAL", "BLOB"];
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..1000 {
             // Create table with random datatype
             let datatype = datatypes[rng.random_range(0..datatypes.len())];
             let create_table = format!("CREATE TABLE t (x {datatype})");
 
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3866,15 +3911,19 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn affinity_fuzz() {
+    #[turso_macros::test(mvcc)]
+    pub fn affinity_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("affinity_fuzz seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for iteration in 0..500 {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -3966,16 +4015,20 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for SUM with floats
-    pub fn sum_agg_fuzz_floats() {
+    pub fn sum_agg_fuzz_floats(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4012,16 +4065,20 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for SUM with mixed numeric/non-numeric values (issue #2133)
-    pub fn sum_agg_fuzz() {
+    pub fn sum_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4057,15 +4114,19 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    fn concat_ws_fuzz() {
+    #[turso_macros::test(mvcc)]
+    fn concat_ws_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4102,16 +4163,20 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     // Simple fuzz test for TOTAL with mixed numeric/non-numeric values
-    pub fn total_agg_fuzz() {
+    pub fn total_agg_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
 
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("seed: {seed}");
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..100 {
-            let db = TempDatabase::new_empty();
+            let db = builder.clone().build();
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4147,8 +4212,9 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn table_logical_expression_fuzz_run() {
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
+    pub fn table_logical_expression_fuzz_run(db: TempDatabase) {
         let _ = env_logger::try_init();
         let g = GrammarGenerator::new();
         let tables = vec![TestTable {
@@ -4159,7 +4225,6 @@ mod fuzz_tests {
         let predicate = predicate_builders(&g, Some(&tables));
         let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         for table in tables.iter() {
@@ -4248,9 +4313,8 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_distinct() {
-        let db = TempDatabase::new_empty();
+    #[turso_macros::test(mvcc)]
+    pub fn fuzz_distinct(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -4314,25 +4378,16 @@ mod fuzz_tests {
         }
     }
 
-    #[test]
-    pub fn fuzz_long_create_table_drop_table_alter_table_normal() {
-        _fuzz_long_create_table_drop_table_alter_table(false);
-    }
-
-    #[test]
-    pub fn fuzz_long_create_table_drop_table_alter_table_mvcc() {
-        _fuzz_long_create_table_drop_table_alter_table(true);
-    }
-
-    fn _fuzz_long_create_table_drop_table_alter_table(mvcc: bool) {
-        let db = TempDatabase::new_with_opts(
-            "fuzz_long_create_table_drop_table_alter_table",
-            DatabaseOpts::new().with_mvcc(mvcc).with_indexes(!mvcc),
-        );
+    #[turso_macros::test(mvcc)]
+    fn fuzz_long_create_table_drop_table_alter_table(db: TempDatabase) {
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
+        let mvcc = db.db_opts.enable_mvcc;
+        tracing::info!(
+            "create_table_drop_table_fuzz seed: {seed}, mvcc: {}",
+            db.db_opts.enable_mvcc
+        );
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
@@ -4541,9 +4596,9 @@ mod fuzz_tests {
         );
     }
 
-    #[test]
+    #[turso_macros::test(mvcc)]
     #[cfg(feature = "test_helper")]
-    pub fn fuzz_pending_byte_database() -> anyhow::Result<()> {
+    pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
         use core_tester::common::rusqlite_integrity_check;
 
         maybe_setup_tracing();
@@ -4558,6 +4613,10 @@ mod fuzz_tests {
 
         const MAX_PAGENO: u32 = MAX_DB_SIZE_BYTES / PAGE_SIZE;
 
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
         for _ in 0..10 {
             // generate a random pending page that is smaller than the 100 MB mark
 
@@ -4569,7 +4628,7 @@ mod fuzz_tests {
             let db_path = tempfile::NamedTempFile::new()?;
 
             {
-                let db = TempDatabase::new_with_existent(db_path.path());
+                let db = builder.clone().with_db_path(db_path.path()).build();
 
                 let prev_pending_byte = TempDatabase::get_pending_byte();
                 tracing::debug!(prev_pending_byte);
@@ -4599,9 +4658,10 @@ mod fuzz_tests {
         Ok(())
     }
 
-    #[test]
+    // TODO: mvcc indexes
+    #[turso_macros::test()]
     /// Tests for correlated and uncorrelated subqueries occurring in the WHERE clause of a SELECT statement.
-    pub fn table_subquery_fuzz() {
+    pub fn table_subquery_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
         log::info!("table_subquery_fuzz seed: {seed}");
@@ -4612,7 +4672,6 @@ mod fuzz_tests {
         const MIN_ROWS_PER_TABLE: usize = 5;
         const MAX_SUBQUERY_DEPTH: usize = 4;
 
-        let db = TempDatabase::new_empty();
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
