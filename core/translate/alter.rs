@@ -620,6 +620,68 @@ pub fn translate_alter_table(
                 let target_table_name_norm = normalize_ident(table_name);
                 for trigger in resolver.schema.triggers.values().flatten() {
                     let trigger_table_name_norm = normalize_ident(&trigger.table_name);
+
+                    // SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column
+                    // Check for WHEN clause references first
+                    if trigger_table_name_norm == target_table_name_norm {
+                        if let Some(ref when_expr) = trigger.when_clause {
+                            let column_name_norm = normalize_ident(from);
+                            let trigger_table = resolver
+                                .schema
+                                .get_btree_table(&trigger_table_name_norm)
+                                .ok_or_else(|| {
+                                    LimboError::ParseError(format!(
+                                        "trigger table not found: {trigger_table_name_norm}"
+                                    ))
+                                })?;
+
+                            let mut found_in_when = false;
+                            use crate::translate::expr::walk_expr;
+                            walk_expr(when_expr, &mut |e: &ast::Expr| -> Result<
+                                crate::translate::expr::WalkControl,
+                            > {
+                                match e {
+                                    ast::Expr::Qualified(ns, col)
+                                    | ast::Expr::DoublyQualified(_, ns, col) => {
+                                        let ns_norm = normalize_ident(ns.as_str());
+                                        let col_norm = normalize_ident(col.as_str());
+
+                                        // Check NEW.column or OLD.column
+                                        if (ns_norm.eq_ignore_ascii_case("new")
+                                            || ns_norm.eq_ignore_ascii_case("old"))
+                                            && col_norm == column_name_norm
+                                        {
+                                            found_in_when = true;
+                                            return Ok(
+                                                crate::translate::expr::WalkControl::SkipChildren,
+                                            );
+                                        }
+                                    }
+                                    ast::Expr::Id(col) => {
+                                        // Unqualified column reference - check if it matches
+                                        let col_norm = normalize_ident(col.as_str());
+                                        if col_norm == column_name_norm {
+                                            // Verify this column exists in the trigger's owning table
+                                            if trigger_table.get_column(&col_norm).is_some() {
+                                                found_in_when = true;
+                                                return Ok(crate::translate::expr::WalkControl::SkipChildren);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                Ok(crate::translate::expr::WalkControl::Continue)
+                            })?;
+
+                            if found_in_when {
+                                return Err(LimboError::ParseError(format!(
+                                    "error in trigger {}: no such column: {}",
+                                    trigger.name, from
+                                )));
+                            }
+                        }
+                    }
+
                     let mut needs_rewrite = false;
 
                     // Check if trigger references the column being renamed
@@ -948,38 +1010,38 @@ fn trigger_references_column(
     }
 
     // Check all trigger commands
+    // Note: We only check NEW.x, OLD.x, and unqualified x references in expressions.
+    // INSERT column lists and UPDATE SET column lists are NOT checked here because
+    // SQLite allows DROP COLUMN even when triggers reference columns in INSERT/UPDATE
+    // column lists targeting the owning table. The error only occurs when the trigger
+    // is actually executed.
     for cmd in &trigger.commands {
         match cmd {
             ast::TriggerCmd::Update {
                 sets, where_clause, ..
             } => {
-                // Check SET assignments
+                // Check SET expressions (not column names in SET clause)
                 for set in sets {
                     walk_expr(&set.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
                         check_column_ref(e, table, &column_name_norm, &mut found)?;
                         Ok(WalkControl::Continue)
                     })?;
-                }
-                // Check WHERE clause
-                if let Some(ref where_expr) = where_clause {
-                    walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-                        check_column_ref(e, table, &column_name_norm, &mut found)?;
-                        Ok(WalkControl::Continue)
-                    })?;
-                }
-            }
-            ast::TriggerCmd::Insert {
-                select, col_names, ..
-            } => {
-                // Check column names in INSERT
-                for col_name in col_names {
-                    let col_norm = normalize_ident(col_name.as_str());
-                    if col_norm == column_name_norm {
-                        found = true;
+                    if found {
                         break;
                     }
                 }
-                // Check SELECT/VALUES expressions
+                // Check WHERE clause
+                if !found {
+                    if let Some(ref where_expr) = where_clause {
+                        walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                            check_column_ref(e, table, &column_name_norm, &mut found)?;
+                            Ok(WalkControl::Continue)
+                        })?;
+                    }
+                }
+            }
+            ast::TriggerCmd::Insert { select, .. } => {
+                // Check SELECT/VALUES expressions (not column names in INSERT clause)
                 walk_select_expressions(select, table, &column_name_norm, &mut found)?;
             }
             ast::TriggerCmd::Delete { where_clause, .. } => {
@@ -1434,22 +1496,10 @@ fn rewrite_trigger_sql_for_column_rename(
         event
     };
 
-    // Clone and rewrite expressions
-    let new_when_clause = when_clause
-        .as_ref()
-        .map(|e| {
-            rewrite_expr_for_column_rename(
-                e,
-                &trigger_table,
-                &trigger_table_name,
-                &target_table_name,
-                &old_col_norm,
-                &new_col_norm,
-                None, // WHEN clause: unqualified refs refer to trigger's owning table
-                resolver,
-            )
-        })
-        .transpose()?;
+    // Note: SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column.
+    // We check for this earlier and fail the operation immediately, matching SQLite.
+    // If we reach here, the WHEN clause doesn't reference the column, so we keep it unchanged.
+    let new_when_clause = when_clause.clone();
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -1476,7 +1526,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_event,
         &tbl_name,
         for_each_row,
-        new_when_clause.as_ref(),
+        new_when_clause.as_deref(),
         &new_commands,
     );
 

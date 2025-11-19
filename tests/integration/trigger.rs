@@ -1229,7 +1229,7 @@ fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references
 }
 
 #[test]
-fn test_alter_table_rename_column_propagates_to_trigger_when_clause() {
+fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_column() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
@@ -1245,34 +1245,17 @@ fn test_alter_table_rename_column_propagates_to_trigger_when_clause() {
     )
     .unwrap();
 
-    // Rename column y to y_new
-    conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new")
-        .unwrap();
+    // Rename column y to y_new should fail (SQLite fails if WHEN clause references the column)
+    let result = conn.execute("ALTER TABLE t RENAME COLUMN y TO y_new");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN should fail when trigger WHEN clause references the column"
+    );
 
-    // Verify trigger SQL was updated
-    let mut stmt = conn
-        .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='tu'")
-        .unwrap();
-    let mut trigger_sql = String::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                trigger_sql = row.get_value(0).cast_text().unwrap().to_string();
-            }
-            turso_core::StepResult::Done => break,
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Unexpected step result"),
-        }
-    }
-
-    // Trigger SQL WHEN clause should reference y_new
-    let normalized_sql = trigger_sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert_eq!(
-        normalized_sql,
-        "CREATE TRIGGER tu BEFORE INSERT ON t WHEN y_new > 10 BEGIN INSERT INTO t VALUES (NEW.x, 100); END"
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("error in trigger") && error_msg.contains("no such column"),
+        "Error should mention trigger and column: {error_msg}",
     );
 }
 
@@ -1828,5 +1811,109 @@ fn test_alter_table_rename_column_update_of_multiple_columns_rewritten() {
     assert!(
         !normalized_sql.contains("UPDATE OF x,") && !normalized_sql.contains("UPDATE OF x "),
         "Trigger SQL should NOT contain UPDATE OF x (x was renamed to x_new): {normalized_sql}",
+    );
+}
+
+#[test]
+fn test_alter_table_drop_column_allows_when_insert_targets_other_table() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that inserts into u(x) - this should NOT prevent dropping x from t
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO u(x) VALUES (NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (INSERT INTO u(x) refers to u.x, not t.x)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+}
+
+#[test]
+fn test_alter_table_drop_column_allows_when_update_targets_other_table() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    // Create two tables, both with column 'x'
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (x INTEGER, z INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates u SET x = ... - this should NOT prevent dropping x from t
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         UPDATE u SET x = NEW.y WHERE z = 1;
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (UPDATE u SET x refers to u.x, not t.x)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+}
+
+#[test]
+fn test_alter_table_drop_column_allows_when_insert_targets_owning_table() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that inserts into t(x) - SQLite allows DROP COLUMN here
+    // The error only occurs when the trigger is actually executed
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         INSERT INTO t(x) VALUES (NEW.y);
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (SQLite allows this)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+
+    // Verify that executing the trigger now causes an error
+    let result = conn.execute("INSERT INTO t VALUES (5)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail because trigger references dropped column"
+    );
+}
+
+#[test]
+fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    // Create table
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+
+    // Create trigger on t that updates t SET x = ... - SQLite allows DROP COLUMN here
+    // The error only occurs when the trigger is actually executed
+    conn.execute(
+        "CREATE TRIGGER tu BEFORE INSERT ON t BEGIN
+         UPDATE t SET x = NEW.y WHERE y = 1;
+        END",
+    )
+    .unwrap();
+
+    // Dropping column x from table t should succeed (SQLite allows this)
+    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+
+    // Verify that executing the trigger now causes an error
+    let result = conn.execute("INSERT INTO t VALUES (5)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail because trigger references dropped column"
     );
 }
