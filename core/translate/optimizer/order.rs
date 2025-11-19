@@ -4,17 +4,24 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
     translate::optimizer::access_method::AccessMethodParams,
-    translate::plan::{GroupBy, IterationDirection, JoinedTable},
+    translate::plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
     util::exprs_are_equivalent,
 };
 
 use super::{access_method::AccessMethod, join::JoinN};
 
+/// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
-/// A convenience struct for representing a (table_no, column_no, [SortOrder]) tuple.
+pub enum ColumnTarget {
+    Column(usize),
+    Expr(ast::Expr),
+}
+
+/// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
+#[derive(Debug, PartialEq, Clone)]
 pub struct ColumnOrder {
     pub table_id: TableInternalId,
-    pub column_no: usize,
+    pub target: ColumnTarget,
     pub order: SortOrder,
 }
 
@@ -35,31 +42,20 @@ pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSortBy);
 impl OrderTarget {
     fn maybe_from_iterator<'a>(
         list: impl Iterator<Item = (&'a ast::Expr, SortOrder)> + Clone,
+        tables: &crate::translate::plan::TableReferences,
         eliminates_sort: EliminatesSortBy,
     ) -> Option<Self> {
         if list.clone().count() == 0 {
             return None;
         }
-        if list
-            .clone()
-            .any(|(expr, _)| !matches!(expr, ast::Expr::Column { .. }))
-        {
-            return None;
+        let mut cols = Vec::new();
+        for (expr, order) in list {
+            let Some(col) = expr_to_column_order(expr, order, tables) else {
+                return None;
+            };
+            cols.push(col);
         }
-        Some(OrderTarget(
-            list.map(|(expr, order)| {
-                let ast::Expr::Column { table, column, .. } = expr else {
-                    unreachable!();
-                };
-                ColumnOrder {
-                    table_id: *table,
-                    column_no: *column,
-                    order,
-                }
-            })
-            .collect(),
-            eliminates_sort,
-        ))
+        Some(OrderTarget(cols, eliminates_sort))
     }
 }
 
@@ -73,6 +69,7 @@ impl OrderTarget {
 pub fn compute_order_target(
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by_opt: Option<&mut GroupBy>,
+    tables: &TableReferences,
 ) -> Option<OrderTarget> {
     match (order_by.is_empty(), group_by_opt) {
         // No ordering demands - we don't care what order the joined result rows are in
@@ -80,11 +77,13 @@ pub fn compute_order_target(
         // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
         (false, None) => OrderTarget::maybe_from_iterator(
             order_by.iter().map(|(expr, order)| (expr.as_ref(), *order)),
+            tables,
             EliminatesSortBy::Order,
         ),
         // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
         (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
             group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
+            tables,
             EliminatesSortBy::Group,
         ),
         // Both ORDER BY and GROUP BY:
@@ -108,6 +107,7 @@ pub fn compute_order_target(
             if !group_by_contains_all {
                 return OrderTarget::maybe_from_iterator(
                     group_by.exprs.iter().map(|expr| (expr, SortOrder::Asc)),
+                    tables,
                     EliminatesSortBy::Group,
                 );
             }
@@ -147,6 +147,7 @@ pub fn compute_order_target(
                             .iter(),
                     )
                     .map(|(expr, dir)| (expr, *dir)),
+                tables,
                 EliminatesSortBy::GroupByAndOrder,
             )
         }
@@ -164,78 +165,122 @@ pub fn plan_satisfies_order_target(
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {
-        let target_col = &order_target.0[target_col_idx];
+        let access_method = &access_methods_arena.borrow()[*access_method_index];
         let table_ref = &joined_tables[*table_index];
-        let correct_table = target_col.table_id == table_ref.internal_id;
-        if !correct_table {
-            return false;
-        }
 
         // Check if this table has an access method that provides the right ordering.
-        let access_method = &access_methods_arena.borrow()[*access_method_index];
-        match &access_method.params {
+        let consumed = match &access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir, index, ..
-            } => {
-                match index {
-                    None => {
-                        // No index, so the next required column must be the rowid alias column.
-                        let rowid_alias_col = table_ref
-                            .table
-                            .columns()
-                            .iter()
-                            .position(|c| c.is_rowid_alias());
-                        let Some(rowid_alias_col) = rowid_alias_col else {
-                            return false;
-                        };
-                        let correct_column = target_col.column_no == rowid_alias_col;
-                        if !correct_column {
-                            return false;
+            } => match index {
+                None => {
+                    // Only rowid order is available without an index.
+                    if target_col_idx >= num_cols_in_order_target {
+                        continue;
+                    }
+                    let target_col = &order_target.0[target_col_idx];
+                    if target_col.table_id != table_ref.internal_id {
+                        return false;
+                    }
+                    let rowid_alias_col = table_ref
+                        .table
+                        .columns()
+                        .iter()
+                        .position(|c| c.is_rowid_alias());
+                    let Some(rowid_alias_col) = rowid_alias_col else {
+                        return false;
+                    };
+                    let matches_target = matches!(
+                        target_col.target,
+                        ColumnTarget::Column(col_no) if col_no == rowid_alias_col
+                    );
+                    if !matches_target {
+                        return false;
+                    }
+                    let correct_order = if *iter_dir == IterationDirection::Forwards {
+                        target_col.order == SortOrder::Asc
+                    } else {
+                        target_col.order == SortOrder::Desc
+                    };
+                    if !correct_order {
+                        return false;
+                    }
+                    1
+                }
+                Some(index) => {
+                    let mut col_idx = 0;
+                    while target_col_idx + col_idx < num_cols_in_order_target
+                        && col_idx < index.columns.len()
+                    {
+                        let target_col = &order_target.0[target_col_idx + col_idx];
+                        if target_col.table_id != table_ref.internal_id {
+                            break;
                         }
-
-                        // Btree table rows are always in ascending order of rowid.
+                        let idx_col = &index.columns[col_idx];
+                        let column_matches = match (&target_col.target, &idx_col.expr) {
+                            (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
+                            (ColumnTarget::Expr(expr), Some(idx_expr)) => {
+                                exprs_are_equivalent(expr, idx_expr)
+                            }
+                            _ => false,
+                        };
+                        if !column_matches {
+                            break;
+                        }
                         let correct_order = if *iter_dir == IterationDirection::Forwards {
-                            target_col.order == SortOrder::Asc
+                            target_col.order == idx_col.order
                         } else {
-                            target_col.order == SortOrder::Desc
+                            target_col.order != idx_col.order
                         };
                         if !correct_order {
-                            return false;
+                            break;
                         }
-                        target_col_idx += 1;
-                        // All order columns matched.
-                        if target_col_idx == num_cols_in_order_target {
-                            return true;
-                        }
+                        col_idx += 1;
                     }
-                    Some(index) => {
-                        // All of the index columns must match the next required columns in the order target.
-                        for index_col in index.columns.iter() {
-                            let target_col = &order_target.0[target_col_idx];
-                            let correct_column = target_col.column_no == index_col.pos_in_table;
-                            if !correct_column {
-                                return false;
-                            }
-                            let correct_order = if *iter_dir == IterationDirection::Forwards {
-                                target_col.order == index_col.order
-                            } else {
-                                target_col.order != index_col.order
-                            };
-                            if !correct_order {
-                                return false;
-                            }
-                            target_col_idx += 1;
-                            // All order columns matched.
-                            if target_col_idx == num_cols_in_order_target {
-                                return true;
-                            }
-                        }
+                    if col_idx == 0 {
+                        return false;
                     }
+                    col_idx
                 }
-            }
-            AccessMethodParams::VirtualTable { .. } => return false,
-            AccessMethodParams::Subquery => return false,
+            },
+            _ => return false,
+        };
+
+        target_col_idx += consumed;
+        if target_col_idx == num_cols_in_order_target {
+            return true;
         }
     }
-    false
+    target_col_idx == num_cols_in_order_target
+}
+
+fn expr_to_column_order(
+    expr: &ast::Expr,
+    order: SortOrder,
+    tables: &TableReferences,
+) -> Option<ColumnOrder> {
+    if let ast::Expr::Column { table, column, .. } = expr {
+        return Some(ColumnOrder {
+            table_id: *table,
+            target: ColumnTarget::Column(*column),
+            order,
+        });
+    }
+    let mask = crate::translate::planner::table_mask_from_expr(expr, tables, &[])
+        .expect("table mask extraction must succeed for order target");
+    if mask.table_count() != 1 {
+        return None;
+    }
+    let table_no = tables
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .find_map(|(i, _)| mask.contains_table(i).then_some(i))
+        .expect("single-table order target expression");
+    let table_id = tables.joined_tables()[table_no].internal_id;
+    Some(ColumnOrder {
+        table_id,
+        target: ColumnTarget::Expr(expr.clone()),
+        order,
+    })
 }

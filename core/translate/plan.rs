@@ -1077,11 +1077,12 @@ impl JoinedTable {
         if index.index_method.is_some() {
             return false;
         }
+        if index.columns.iter().any(|c| c.expr.is_some()) {
+            // expression indexes cannot be covering because they don't map to table columns.
+            return false;
+        }
         let mut index_cols_mask = ColumnUsedMask::default();
         for col in index.columns.iter() {
-            if col.expr.is_some() {
-                continue;
-            }
             index_cols_mask.set(col.pos_in_table);
         }
 

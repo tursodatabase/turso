@@ -580,7 +580,7 @@ fn optimize_table_access(
     }
 
     let access_methods_arena = RefCell::new(Vec::new());
-    let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
+    let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
     let constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -1304,11 +1304,11 @@ fn ephemeral_index_build(
         let a_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == a.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(a.pos_in_table));
         let b_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == b.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(b.pos_in_table));
         match (a_constraint, b_constraint) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,

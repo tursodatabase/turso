@@ -1541,7 +1541,7 @@ mod tests {
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
-        assert!(constraint.table_col_pos == 0); // c1
+        assert!(constraint.table_col_pos == Some(0)); // c1
     }
 
     #[test]
@@ -1676,10 +1676,10 @@ mod tests {
         assert!(constraint_refs.len() == 2);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
-        assert!(constraint.table_col_pos == 0); // c1
+        assert!(constraint.table_col_pos == Some(0)); // c1
         let constraint = &table_constraints[0].constraints[constraint_refs[1].lower_bound.unwrap()];
         assert!(constraint.operator == ast::Operator::Greater);
-        assert!(constraint.table_col_pos == 1); // c2
+        assert!(constraint.table_col_pos == Some(1)); // c2
     }
 
     fn _create_column(c: &TestColumn) -> Column {

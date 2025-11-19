@@ -16,6 +16,7 @@ use crate::{
     vdbe::affinity::Affinity,
     Result,
 };
+use crate::translate::plan::JoinedTable;
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -47,7 +48,10 @@ pub struct Constraint {
     /// The comparison operator (e.g., `=`, `>`, `<`) used in the constraint.
     pub operator: ast::Operator,
     /// The zero-based index of the constrained column within the table's schema.
-    pub table_col_pos: usize,
+    /// None for expression-index constraints.
+    pub table_col_pos: Option<usize>,
+    /// The expression constrained by this constraint, if it is not a simple column reference.
+    pub expr: Option<ast::Expr>,
     /// A bitmask representing the set of tables that appear on the *constraining* side
     /// of the comparison expression. For example, in SELECT * FROM t1,t2,t3 WHERE t1.x = t2.x + t3.x,
     /// the lhs_mask contains t2 and t3. Thus, this constraint can only be used if t2 and t3
@@ -80,7 +84,7 @@ impl Constraint {
             panic!("Expected a valid binary expression");
         };
         let mut affinity = Affinity::Blob;
-        if op.is_comparison() {
+        if op.is_comparison() && self.table_col_pos.is_some() {
             affinity = comparison_affinity(lhs, rhs, referenced_tables);
         }
 
@@ -178,10 +182,10 @@ const SELECTIVITY_OTHER: f64 = 0.9;
 const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
 
 /// Estimate the selectivity of a constraint based on the operator and the column type.
-fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
+fn estimate_selectivity(column: Option<&Column>, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_rowid_alias() || column.primary_key() {
+            if column.is_some_and(|c| c.is_rowid_alias() || c.primary_key()) {
                 SELECTIVITY_UNIQUE_EQUALITY
             } else {
                 SELECTIVITY_EQ
@@ -192,6 +196,22 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
         ast::Operator::Less => SELECTIVITY_RANGE,
         ast::Operator::LessEquals => SELECTIVITY_RANGE,
         _ => SELECTIVITY_OTHER,
+    }
+}
+
+fn expression_matches_table(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> bool {
+    match table_mask_from_expr(expr, table_references, subqueries) {
+        Ok(mask) => table_references
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == table_reference.internal_id)
+            .is_some_and(|idx| mask.contains_table(idx) && mask.table_count() == 1),
+        Err(_) => false,
     }
 }
 
@@ -257,9 +277,10 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            table_col_pos: *column,
+                            table_col_pos: Some(*column),
+                            expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
@@ -274,12 +295,24 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
                             operator,
-                            table_col_pos: rowid_alias_column.unwrap(),
+                            table_col_pos: rowid_alias_column,
+                            expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
+                }
+                _ if expression_matches_table(lhs, table_reference, table_references, subqueries) => {
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Rhs),
+                        operator,
+                        table_col_pos: None,
+                        expr: Some(lhs.clone()),
+                        lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                        selectivity: SELECTIVITY_OTHER,
+                        usable: true,
+                    });
                 }
                 _ => {}
             };
@@ -290,9 +323,10 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
-                            table_col_pos: *column,
+                            table_col_pos: Some(*column),
+                            expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
@@ -304,12 +338,24 @@ pub fn constraints_from_where_clause(
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Lhs),
                             operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column.unwrap(),
+                            table_col_pos: rowid_alias_column,
+                            expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(table_column, operator),
+                            selectivity: estimate_selectivity(Some(table_column), operator),
                             usable: true,
                         });
                     }
+                }
+                _ if expression_matches_table(rhs, table_reference, table_references, subqueries) => {
+                    cs.constraints.push(Constraint {
+                        where_clause_pos: (i, BinaryExprSide::Lhs),
+                        operator: opposite_cmp_op(operator),
+                        table_col_pos: None,
+                        expr: Some(rhs.clone()),
+                        lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                        selectivity: SELECTIVITY_OTHER,
+                        usable: true,
+                    });
                 }
                 _ => {}
             };
@@ -328,19 +374,21 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
-            let constrained_column = &table_reference.table.columns()[constraint.table_col_pos];
-            let column_collation = constrained_column.collation();
+            let constrained_column = constraint
+                .table_col_pos
+                .and_then(|pos| table_reference.table.columns().get(pos));
+            let column_collation = constrained_column.map(|c| c.collation());
             let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
             // Index seek keys must use the same collation as the constrained column.
-            match get_collseq_from_expr(constraining_expr, table_references)? {
-                Some(collation) if collation != column_collation => {
+            match (get_collseq_from_expr(constraining_expr, table_references)?, column_collation) {
+                (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
                 }
                 _ => {}
             }
 
-            if rowid_alias_column == Some(constraint.table_col_pos) {
+            if rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p)) {
                 let rowid_candidate = cs
                     .candidates
                     .iter_mut()
@@ -362,9 +410,13 @@ pub fn constraints_from_where_clause(
                 .get(table_reference.table.get_name())
                 .unwrap_or(&VecDeque::new())
             {
-                if let Some(position_in_index) =
-                    index.column_table_pos_to_index_pos(constraint.table_col_pos)
-                {
+                if let Some(position_in_index) = match constraint.table_col_pos {
+                    Some(pos) => index.column_table_pos_to_index_pos(pos),
+                    None => constraint
+                        .expr
+                        .as_ref()
+                        .and_then(|e| index.expression_to_index_pos(e)),
+                } {
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
                             Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
@@ -415,7 +467,7 @@ pub fn constraints_from_where_clause(
 /// eq, lower_bound and upper_bound holds None or position of the constraint in the [Constraint] array
 pub struct RangeConstraintRef {
     /// position of the column in the table definition
-    pub table_col_pos: usize,
+    pub table_col_pos: Option<usize>,
     /// position of the column in the index definition
     pub index_col_pos: usize,
     /// sort order for the column in the index definition
@@ -621,13 +673,16 @@ pub fn convert_to_vtab_constraint(
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
+            let Some(table_col_pos) = constraint.table_col_pos else {
+                return None;
+            };
             let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
             if other_side_refers_to_self {
                 return None;
             }
             let all_required_tables_are_on_left_side = lhs_mask.contains_all(&constraint.lhs_mask);
             to_ext_constraint_op(&constraint.operator).map(|op| ConstraintInfo {
-                column_index: constraint.table_col_pos as u32,
+                column_index: table_col_pos as u32,
                 op,
                 usable: all_required_tables_are_on_left_side,
                 index: i,

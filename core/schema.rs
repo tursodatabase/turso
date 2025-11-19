@@ -4,6 +4,7 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use parking_lot::RwLock;
 use turso_macros::AtomicEnum;
@@ -125,7 +126,7 @@ use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
-use crate::{util::normalize_ident, Result};
+use crate::Result;
 use core::fmt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2735,6 +2736,13 @@ impl Index {
         self.columns
             .iter()
             .position(|c| c.pos_in_table == table_pos)
+    }
+
+    /// Given an expression, return the position in the index if it matches an expression index column.
+    pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|c| c.expr.as_ref().is_some_and(|e| exprs_are_equivalent(e, expr)))
     }
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
