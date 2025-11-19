@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::ast::{self, Expr, Literal, TriggerEvent, TriggerTime};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -39,6 +39,10 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
+    TriggerContext,
+};
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -481,6 +485,18 @@ fn emit_program_for_delete(
         });
     }
 
+    let join_order = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: false,
+        })
+        .collect::<Vec<_>>();
+
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
@@ -490,38 +506,132 @@ fn emit_program_for_delete(
         None,
         OperationMode::DELETE,
         &plan.where_clause,
-        &[JoinOrderMember::default()],
+        &join_order,
         &mut [],
     )?;
 
-    // Set up main query execution loop
-    open_loop(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &[JoinOrderMember::default()],
-        &plan.where_clause,
-        None,
-        OperationMode::DELETE,
-        &mut [],
-    )?;
+    // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
+    // to delete the rows.
+    if let Some(rowset_plan) = plan.rowset_plan.take() {
+        let rowset_reg = plan
+            .rowset_reg
+            .expect("rowset_reg must be Some if rowset_plan is Some");
 
-    emit_delete_insns(
-        connection,
-        program,
-        &mut t_ctx,
-        &mut plan.table_references,
-        &plan.result_columns,
-    )?;
+        // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
+        program.emit_insn(Insn::Null {
+            dest: rowset_reg,
+            dest_end: None,
+        });
 
-    // Clean up and close the main execution loop
-    close_loop(
-        program,
-        &mut t_ctx,
-        &plan.table_references,
-        &[JoinOrderMember::default()],
-        OperationMode::DELETE,
-    )?;
+        // Execute the rowset SELECT plan to populate the rowset.
+        program.incr_nesting();
+        emit_program_for_select(program, resolver, rowset_plan)?;
+        program.decr_nesting();
+
+        // Close the read cursor(s) opened by the rowset plan before opening for writing
+        let table_ref = plan.table_references.joined_tables().first().unwrap();
+        let table_cursor_id_read =
+            program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
+        program.emit_insn(Insn::Close {
+            cursor_id: table_cursor_id_read,
+        });
+
+        // Open the table cursor for writing
+        let table_cursor_id = table_cursor_id_read;
+
+        if let Some(btree_table) = table_ref.table.btree() {
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: table_cursor_id,
+                root_page: RegisterOrLiteral::Literal(btree_table.root_page),
+                db: table_ref.database_id,
+            });
+
+            // Open all indexes for writing (needed for DELETE)
+            for index in resolver.schema.get_indices(table_ref.table.get_name()) {
+                let index_cursor_id = program.alloc_cursor_index(
+                    Some(CursorKey::index(table_ref.internal_id, index.clone())),
+                    index,
+                )?;
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: index_cursor_id,
+                    root_page: RegisterOrLiteral::Literal(index.root_page),
+                    db: table_ref.database_id,
+                });
+            }
+        }
+
+        // Now iterate over the RowSet and delete each rowid
+        let rowset_loop_start = program.allocate_label();
+        let rowset_loop_end = program.allocate_label();
+        let rowid_reg = program.alloc_register();
+        if table_ref.table.virtual_table().is_some() {
+            // VUpdate requires a NULL second argument ("new rowid") for deletion
+            let new_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: new_rowid_reg,
+                dest_end: None,
+            });
+        }
+
+        program.preassign_label_to_next_insn(rowset_loop_start);
+
+        // Read next rowid from RowSet
+        // Note: rowset_loop_end will be resolved later when we assign it
+        program.emit_insn(Insn::RowSetRead {
+            rowset_reg,
+            pc_if_empty: rowset_loop_end,
+            dest_reg: rowid_reg,
+        });
+
+        emit_delete_insns_when_triggers_present(
+            connection,
+            program,
+            &mut t_ctx,
+            &mut plan.table_references,
+            &plan.result_columns,
+            rowid_reg,
+            table_cursor_id,
+        )?;
+
+        // Continue loop
+        program.emit_insn(Insn::Goto {
+            target_pc: rowset_loop_start,
+        });
+
+        // Assign the end label here, after all loop body code
+        program.preassign_label_to_next_insn(rowset_loop_end);
+    } else {
+        // Normal DELETE path without RowSet
+
+        // Set up main query execution loop
+        open_loop(
+            program,
+            &mut t_ctx,
+            &plan.table_references,
+            &join_order,
+            &plan.where_clause,
+            None,
+            OperationMode::DELETE,
+            &mut [],
+        )?;
+
+        emit_delete_insns(
+            connection,
+            program,
+            &mut t_ctx,
+            &mut plan.table_references,
+            &plan.result_columns,
+        )?;
+
+        // Clean up and close the main execution loop
+        close_loop(
+            program,
+            &mut t_ctx,
+            &plan.table_references,
+            &join_order,
+            OperationMode::DELETE,
+        )?;
+    }
     program.preassign_label_to_next_insn(after_main_loop_label);
     // Finalize program
     program.result_columns = plan.result_columns;
@@ -683,7 +793,6 @@ fn emit_delete_insns<'a>(
     }
     let internal_id = unsafe { (*table_reference).internal_id };
 
-    let table_name = unsafe { &*table_reference }.table.get_name();
     let cursor_id = match unsafe { &(*table_reference).op } {
         Operation::Scan { .. } => program.resolve_cursor_id(&CursorKey::table(internal_id)),
         Operation::Search(search) => match search {
@@ -698,14 +807,111 @@ fn emit_delete_insns<'a>(
             panic!("access through IndexMethod is not supported for delete statements")
         }
     };
+    let btree_table = unsafe { &*table_reference }.btree();
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
+    let has_returning = !result_columns.is_empty();
+    let has_delete_triggers = if let Some(btree_table) = btree_table {
+        has_relevant_triggers_type_only(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
+    } else {
+        false
+    };
+    let cols_len = unsafe { &*table_reference }.columns().len();
+    let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
+        // Get rowid for RETURNING
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: main_table_cursor_id,
+            dest: rowid_reg,
+        });
+        if unsafe { &*table_reference }.virtual_table().is_some() {
+            // VUpdate requires a NULL second argument ("new rowid") for deletion
+            let new_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: new_rowid_reg,
+                dest_end: None,
+            });
+        }
 
-    // Emit the instructions to delete the row
-    let key_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id: main_table_cursor_id,
-        dest: key_reg,
-    });
+        if !has_returning && !has_delete_triggers {
+            (None, rowid_reg)
+        } else {
+            // Allocate registers for column values
+            let columns_start_reg = program.alloc_registers(cols_len);
+
+            // Read all column values from the row to be deleted
+            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+            }
+
+            (Some(columns_start_reg), rowid_reg)
+        }
+    };
+
+    // Get the index that is being used to iterate the deletion loop, if there is one.
+    let iteration_index = unsafe { &*table_reference }.op.index();
+
+    emit_delete_row_common(
+        connection,
+        program,
+        t_ctx,
+        table_references,
+        result_columns,
+        table_reference,
+        rowid_reg,
+        columns_start_reg,
+        main_table_cursor_id,
+        iteration_index,
+        Some(cursor_id), // Use the cursor_id from the operation for virtual tables
+    )?;
+
+    // Delete from the iteration index after deleting from the main table
+    if let Some(index) = iteration_index {
+        let iteration_index_cursor =
+            program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
+        program.emit_insn(Insn::Delete {
+            cursor_id: iteration_index_cursor,
+            table_name: index.name.clone(),
+            is_part_of_update: false,
+        });
+    }
+    if let Some(limit_ctx) = t_ctx.limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: t_ctx.label_main_loop_end.unwrap(),
+        })
+    }
+
+    Ok(())
+}
+
+/// Common deletion logic shared between normal DELETE and RowSet-based DELETE.
+///
+/// Parameters:
+/// - `rowid_reg`: Register containing the rowid of the row to delete
+/// - `columns_start_reg`: Start register containing column values (already read)
+/// - `skip_iteration_index`: If Some(index), skip deleting from this index (used when iterating over an index)
+/// - `virtual_table_cursor_id`: If Some, use this cursor for virtual table deletion
+#[allow(clippy::too_many_arguments)]
+fn emit_delete_row_common(
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &mut TableReferences,
+    result_columns: &[super::plan::ResultSetColumn],
+    table_reference: *const JoinedTable,
+    rowid_reg: usize,
+    columns_start_reg: Option<usize>, // must be provided when there are triggers or RETURNING
+    main_table_cursor_id: usize,
+    skip_iteration_index: Option<&Arc<crate::schema::Index>>,
+    virtual_table_cursor_id: Option<usize>,
+) -> Result<()> {
+    let internal_id = unsafe { (*table_reference).internal_id };
+    let table_name = unsafe { &*table_reference }.table.get_name();
 
     if connection.foreign_keys_enabled() {
         if let Some(table) = unsafe { &*table_reference }.btree() {
@@ -719,7 +925,7 @@ fn emit_delete_insns<'a>(
                     &t_ctx.resolver,
                     table_name,
                     main_table_cursor_id,
-                    key_reg,
+                    rowid_reg,
                 )?;
             }
             if t_ctx.resolver.schema.has_child_fks(table_name) {
@@ -729,7 +935,7 @@ fn emit_delete_insns<'a>(
                     &table,
                     table_name,
                     main_table_cursor_id,
-                    key_reg,
+                    rowid_reg,
                 )?;
             }
         }
@@ -737,31 +943,24 @@ fn emit_delete_insns<'a>(
 
     if unsafe { &*table_reference }.virtual_table().is_some() {
         let conflict_action = 0u16;
-        let start_reg = key_reg;
+        let cursor_id = virtual_table_cursor_id.unwrap_or(main_table_cursor_id);
 
-        let new_rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::Null {
-            dest: new_rowid_reg,
-            dest_end: None,
-        });
         program.emit_insn(Insn::VUpdate {
             cursor_id,
             arg_count: 2,
-            start_reg,
+            start_reg: rowid_reg,
             conflict_action,
         });
     } else {
         // Delete from all indexes before deleting from the main table.
         let indexes = t_ctx.resolver.schema.get_indices(table_name);
 
-        // Get the index that is being used to iterate the deletion loop, if there is one.
-        let iteration_index = unsafe { &*table_reference }.op.index();
-        // Get all indexes that are not the iteration index.
-        let other_indexes = indexes
+        // Get indexes to delete from (skip the iteration index if specified)
+        let indexes_to_delete = indexes
             .filter(|index| {
-                iteration_index
+                skip_iteration_index
                     .as_ref()
-                    .is_none_or(|it_idx| !Arc::ptr_eq(it_idx, index))
+                    .is_none_or(|skip_idx| !Arc::ptr_eq(skip_idx, index))
             })
             .map(|index| {
                 (
@@ -771,7 +970,7 @@ fn emit_delete_insns<'a>(
             })
             .collect::<Vec<_>>();
 
-        for (index, index_cursor_id) in other_indexes {
+        for (index, index_cursor_id) in indexes_to_delete {
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
                     .bind_where_expr(Some(table_references), connection)
@@ -826,11 +1025,6 @@ fn emit_delete_insns<'a>(
 
         // Emit update in the CDC table if necessary (before DELETE updated the table)
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: main_table_cursor_id,
-                dest: rowid_reg,
-            });
             let cdc_has_before = program.capture_data_changes_mode().has_before();
             let before_record_reg = if cdc_has_before {
                 Some(emit_cdc_full_record(
@@ -857,22 +1051,8 @@ fn emit_delete_insns<'a>(
 
         // Emit RETURNING results if specified (must be before DELETE)
         if !result_columns.is_empty() {
-            // Get rowid for RETURNING
-            let rowid_reg = program.alloc_register();
-            program.emit_insn(Insn::RowId {
-                cursor_id: main_table_cursor_id,
-                dest: rowid_reg,
-            });
-            let cols_len = unsafe { &*table_reference }.columns().len();
-
-            // Allocate registers for column values
-            let columns_start_reg = program.alloc_registers(cols_len);
-
-            // Read all column values from the row to be deleted
-            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
-            }
-
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
             // Emit RETURNING results using the values we just read
             emit_returning_results(
                 program,
@@ -889,23 +1069,157 @@ fn emit_delete_insns<'a>(
             table_name: table_name.to_string(),
             is_part_of_update: false,
         });
+    }
 
-        if let Some(index) = iteration_index {
-            let iteration_index_cursor =
-                program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
-            program.emit_insn(Insn::Delete {
-                cursor_id: iteration_index_cursor,
-                table_name: index.name.clone(),
-                is_part_of_update: false,
-            });
+    Ok(())
+}
+
+/// Helper function to delete a row when we've already seeked to it (e.g., from a RowSet).
+/// This is similar to emit_delete_insns but assumes the cursor is already positioned at the row.
+fn emit_delete_insns_when_triggers_present(
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &mut TableReferences,
+    result_columns: &[super::plan::ResultSetColumn],
+    rowid_reg: usize,
+    main_table_cursor_id: usize,
+) -> Result<()> {
+    // Seek to the rowid and delete it
+    let skip_not_found_label = program.allocate_label();
+
+    // Skip if row with rowid pulled from the rowset does not exist in the table.
+    program.emit_insn(Insn::NotExists {
+        cursor: main_table_cursor_id,
+        rowid_reg,
+        target_pc: skip_not_found_label,
+    });
+
+    let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
+    if unsafe { &*table_reference }
+        .virtual_table()
+        .is_some_and(|t| t.readonly())
+    {
+        return Err(crate::LimboError::ReadOnly);
+    }
+    let btree_table = unsafe { &*table_reference }.btree();
+    let has_returning = !result_columns.is_empty();
+    let has_delete_triggers = if let Some(btree_table) = btree_table {
+        has_relevant_triggers_type_only(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            None,
+            &btree_table,
+        )
+    } else {
+        false
+    };
+    let cols_len = unsafe { &*table_reference }.columns().len();
+
+    let columns_start_reg = if !has_returning && !has_delete_triggers {
+        None
+    } else {
+        let columns_start_reg = program.alloc_registers(cols_len);
+        for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+            program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+        }
+        Some(columns_start_reg)
+    };
+
+    let cols_len = unsafe { &*table_reference }.columns().len();
+
+    // Fire BEFORE DELETE triggers
+    if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+        let relevant_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::Before,
+            None,
+            &btree_table,
+        );
+        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+        if has_relevant_triggers {
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let old_registers = (0..cols_len)
+                .map(|i| columns_start_reg + i)
+                .chain(std::iter::once(rowid_reg))
+                .collect::<Vec<_>>();
+            let trigger_ctx = TriggerContext::new(
+                btree_table.clone(),
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
+
+            for trigger in relevant_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                )?;
+            }
         }
     }
-    if let Some(limit_ctx) = t_ctx.limit_ctx {
-        program.emit_insn(Insn::DecrJumpZero {
-            reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
-        })
+
+    // BEFORE DELETE Triggers may have altered the btree so we need to seek again.
+    program.emit_insn(Insn::NotExists {
+        cursor: main_table_cursor_id,
+        rowid_reg,
+        target_pc: skip_not_found_label,
+    });
+
+    emit_delete_row_common(
+        connection,
+        program,
+        t_ctx,
+        table_references,
+        result_columns,
+        table_reference,
+        rowid_reg,
+        columns_start_reg,
+        main_table_cursor_id,
+        None, // Don't skip any indexes when deleting from RowSet
+        None, // Use main_table_cursor_id for virtual tables
+    )?;
+
+    // Fire AFTER DELETE triggers
+    if let Some(btree_table) = unsafe { &*table_reference }.btree() {
+        let relevant_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::After,
+            None,
+            &btree_table,
+        );
+        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+        if has_relevant_triggers {
+            let columns_start_reg = columns_start_reg
+                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let old_registers = (0..cols_len)
+                .map(|i| columns_start_reg + i)
+                .chain(std::iter::once(rowid_reg))
+                .collect::<Vec<_>>();
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table.clone(),
+                None, // No NEW for DELETE
+                Some(old_registers),
+            );
+
+            for trigger in relevant_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx_after,
+                    connection,
+                )?;
+            }
+        }
     }
+
+    program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
 }
@@ -982,6 +1296,18 @@ fn emit_program_for_update(
         UpdateRowSource::Normal
     });
 
+    let join_order = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, t)| JoinOrderMember {
+            table_id: t.internal_id,
+            original_idx: i,
+            is_outer: false,
+        })
+        .collect::<Vec<_>>();
+
     // Initialize the main loop
     init_loop(
         program,
@@ -991,7 +1317,7 @@ fn emit_program_for_update(
         None,
         mode.clone(),
         &plan.where_clause,
-        &[JoinOrderMember::default()],
+        &join_order,
         &mut [],
     )?;
 
@@ -1025,7 +1351,7 @@ fn emit_program_for_update(
         program,
         &mut t_ctx,
         &plan.table_references,
-        &[JoinOrderMember::default()],
+        &join_order,
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
@@ -1063,7 +1389,7 @@ fn emit_program_for_update(
         program,
         &mut t_ctx,
         &plan.table_references,
-        &[JoinOrderMember::default()],
+        &join_order,
         mode.clone(),
     )?;
 
@@ -1072,6 +1398,168 @@ fn emit_program_for_update(
 
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+/// Helper function to evaluate SET expressions and read column values for UPDATE.
+/// This is invoked once for every UPDATE, but will be invoked again if there are
+/// any BEFORE UPDATE triggers that fired, because the triggers may have modified the row,
+/// in which case the previously read values are stale.
+#[allow(clippy::too_many_arguments)]
+fn emit_update_column_values<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    set_clauses: &[(usize, Box<ast::Expr>)],
+    cdc_update_alter_statement: Option<&str>,
+    target_table: &Arc<JoinedTable>,
+    target_table_cursor_id: usize,
+    start: usize,
+    col_len: usize,
+    table_name: &str,
+    has_direct_rowid_update: bool,
+    has_user_provided_rowid: bool,
+    rowid_set_clause_reg: Option<usize>,
+    is_virtual: bool,
+    index: &Option<(Arc<Index>, usize)>,
+    cdc_updates_register: Option<usize>,
+    t_ctx: &mut TranslateCtx<'a>,
+    skip_set_clauses: bool,
+) -> crate::Result<()> {
+    if has_direct_rowid_update {
+        if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
+            if !skip_set_clauses {
+                let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
+                translate_expr(
+                    program,
+                    Some(table_references),
+                    expr,
+                    rowid_set_clause_reg,
+                    &t_ctx.resolver,
+                )?;
+                program.emit_insn(Insn::MustBeInt {
+                    reg: rowid_set_clause_reg,
+                });
+            }
+        }
+    }
+    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
+        let target_reg = start + idx;
+        if let Some((col_idx, expr)) = set_clauses.iter().find(|(i, _)| *i == idx) {
+            if !skip_set_clauses {
+                // Skip if this is the sentinel value
+                if *col_idx == ROWID_SENTINEL {
+                    continue;
+                }
+                if has_user_provided_rowid
+                    && (table_column.primary_key() || table_column.is_rowid_alias())
+                    && !is_virtual
+                {
+                    let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        expr,
+                        rowid_set_clause_reg,
+                        &t_ctx.resolver,
+                    )?;
+
+                    program.emit_insn(Insn::MustBeInt {
+                        reg: rowid_set_clause_reg,
+                    });
+
+                    program.emit_null(target_reg, None);
+                } else {
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        expr,
+                        target_reg,
+                        &t_ctx.resolver,
+                    )?;
+                    if table_column.notnull() {
+                        use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                        program.emit_insn(Insn::HaltIfNull {
+                            target_reg,
+                            err_code: SQLITE_CONSTRAINT_NOTNULL,
+                            description: format!(
+                                "{}.{}",
+                                table_name,
+                                table_column
+                                    .name
+                                    .as_ref()
+                                    .expect("Column name must be present")
+                            ),
+                        });
+                    }
+                }
+
+                if let Some(cdc_updates_register) = cdc_updates_register {
+                    let change_reg = cdc_updates_register + idx;
+                    let value_reg = cdc_updates_register + col_len + idx;
+                    program.emit_bool(true, change_reg);
+                    program.mark_last_insn_constant();
+                    let mut updated = false;
+                    if let Some(ddl_query_for_cdc_update) = cdc_update_alter_statement {
+                        if table_column.name.as_deref() == Some("sql") {
+                            program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
+                            updated = true;
+                        }
+                    }
+                    if !updated {
+                        program.emit_insn(Insn::Copy {
+                            src_reg: target_reg,
+                            dst_reg: value_reg,
+                            extra_amount: 0,
+                        });
+                    }
+                }
+            }
+        } else {
+            // Column is not being updated, read it from the table
+            let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
+                idx.columns
+                    .iter()
+                    .position(|c| Some(&c.name) == table_column.name.as_ref())
+            });
+
+            // don't emit null for pkey of virtual tables. they require first two args
+            // before the 'record' to be explicitly non-null
+            if table_column.is_rowid_alias() && !is_virtual {
+                program.emit_null(target_reg, None);
+            } else if is_virtual {
+                program.emit_insn(Insn::VColumn {
+                    cursor_id: target_table_cursor_id,
+                    column: idx,
+                    dest: target_reg,
+                });
+            } else {
+                let cursor_id = *index
+                    .as_ref()
+                    .and_then(|(_, id)| {
+                        if column_idx_in_index.is_some() {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(&target_table_cursor_id);
+                program.emit_column_or_rowid(
+                    cursor_id,
+                    column_idx_in_index.unwrap_or(idx),
+                    target_reg,
+                );
+            }
+
+            if let Some(cdc_updates_register) = cdc_updates_register {
+                let change_bit_reg = cdc_updates_register + idx;
+                let value_reg = cdc_updates_register + col_len + idx;
+                program.emit_bool(false, change_bit_reg);
+                program.mark_last_insn_constant();
+                program.emit_null(value_reg, None);
+                program.mark_last_insn_constant();
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1219,134 +1707,153 @@ fn emit_update_insns<'a>(
 
     let start = if is_virtual { beg + 2 } else { beg + 1 };
 
-    if has_direct_rowid_update {
-        if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
-            let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
-            translate_expr(
-                program,
-                Some(table_references),
-                expr,
-                rowid_set_clause_reg,
-                &t_ctx.resolver,
-            )?;
-            program.emit_insn(Insn::MustBeInt {
-                reg: rowid_set_clause_reg,
-            });
-        }
-    }
-    for (idx, table_column) in target_table.table.columns().iter().enumerate() {
-        let target_reg = start + idx;
-        if let Some((col_idx, expr)) = set_clauses.iter().find(|(i, _)| *i == idx) {
-            // Skip if this is the sentinel value
-            if *col_idx == ROWID_SENTINEL {
-                continue;
-            }
-            if has_user_provided_rowid
-                && (table_column.primary_key() || table_column.is_rowid_alias())
-                && !is_virtual
-            {
-                let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
-                translate_expr(
-                    program,
-                    Some(table_references),
-                    expr,
-                    rowid_set_clause_reg,
-                    &t_ctx.resolver,
-                )?;
+    let skip_set_clauses = false;
 
-                program.emit_insn(Insn::MustBeInt {
-                    reg: rowid_set_clause_reg,
-                });
+    emit_update_column_values(
+        program,
+        table_references,
+        set_clauses,
+        cdc_update_alter_statement,
+        &target_table,
+        target_table_cursor_id,
+        start,
+        col_len,
+        table_name,
+        has_direct_rowid_update,
+        has_user_provided_rowid,
+        rowid_set_clause_reg,
+        is_virtual,
+        &index,
+        cdc_updates_register,
+        t_ctx,
+        skip_set_clauses,
+    )?;
 
-                program.emit_null(target_reg, None);
+    // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
+    let preserved_old_registers: Option<Vec<usize>> =
+        if let Some(btree_table) = target_table.table.btree() {
+            let updated_column_indices: std::collections::HashSet<usize> =
+                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+            let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
+                t_ctx.resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::Before,
+                Some(updated_column_indices.clone()),
+                &btree_table,
+            );
+            // Read OLD row values for trigger context
+            let old_registers: Vec<usize> = (0..col_len)
+                .map(|i| {
+                    let reg = program.alloc_register();
+                    program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                    reg
+                })
+                .chain(std::iter::once(beg))
+                .collect();
+            let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
+            if !has_relevant_triggers {
+                Some(old_registers)
             } else {
-                translate_expr(
-                    program,
-                    Some(table_references),
-                    expr,
-                    target_reg,
-                    &t_ctx.resolver,
-                )?;
-                if table_column.notnull() {
-                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                    program.emit_insn(Insn::HaltIfNull {
-                        target_reg,
-                        err_code: SQLITE_CONSTRAINT_NOTNULL,
-                        description: format!(
-                            "{}.{}",
-                            table_name,
-                            table_column
-                                .name
-                                .as_ref()
-                                .expect("Column name must be present")
-                        ),
-                    });
-                }
-            }
+                // NEW row values are already in 'start' registers
+                let new_registers = (0..col_len)
+                    .map(|i| start + i)
+                    .chain(std::iter::once(beg))
+                    .collect();
 
-            if let Some(cdc_updates_register) = cdc_updates_register {
-                let change_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + col_len + idx;
-                program.emit_bool(true, change_reg);
-                program.mark_last_insn_constant();
-                let mut updated = false;
-                if let Some(ddl_query_for_cdc_update) = &cdc_update_alter_statement {
-                    if table_column.name.as_deref() == Some("sql") {
-                        program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
-                        updated = true;
-                    }
+                let trigger_ctx = TriggerContext::new(
+                    btree_table.clone(),
+                    Some(new_registers),
+                    Some(old_registers.clone()), // Clone for AFTER trigger
+                );
+
+                for trigger in relevant_before_update_triggers {
+                    fire_trigger(
+                        program,
+                        &mut t_ctx.resolver,
+                        trigger,
+                        &trigger_ctx,
+                        connection,
+                    )?;
                 }
-                if !updated {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: target_reg,
-                        dst_reg: value_reg,
-                        extra_amount: 0,
-                    });
+
+                // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
+                program.emit_insn(Insn::NotExists {
+                cursor: target_table_cursor_id,
+                rowid_reg: beg,
+                target_pc: check_rowid_not_exists_label.expect(
+                    "check_rowid_not_exists_label must be set if there are BEFORE UPDATE triggers",
+                ),
+            });
+
+                let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                    t_ctx.resolver.schema,
+                    TriggerEvent::Update,
+                    TriggerTime::After,
+                    Some(updated_column_indices),
+                    &btree_table,
+                )
+                .clone()
+                .count()
+                    > 0;
+                if has_relevant_after_triggers {
+                    // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
+                    // (since registers might be overwritten during trigger execution)
+                    let preserved: Vec<usize> = old_registers
+                        .iter()
+                        .map(|old_reg| {
+                            let preserved_reg = program.alloc_register();
+                            program.emit_insn(Insn::Copy {
+                                src_reg: *old_reg,
+                                dst_reg: preserved_reg,
+                                extra_amount: 0,
+                            });
+                            preserved_reg
+                        })
+                        .collect();
+                    Some(preserved)
+                } else {
+                    Some(old_registers)
                 }
             }
         } else {
-            let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                idx.columns
-                    .iter()
-                    .position(|c| Some(&c.name) == table_column.name.as_ref())
-            });
+            None
+        };
 
-            // don't emit null for pkey of virtual tables. they require first two args
-            // before the 'record' to be explicitly non-null
-            if table_column.is_rowid_alias() && !is_virtual {
-                program.emit_null(target_reg, None);
-            } else if is_virtual {
-                program.emit_insn(Insn::VColumn {
-                    cursor_id: target_table_cursor_id,
-                    column: idx,
-                    dest: target_reg,
-                });
-            } else {
-                let cursor_id = *index
-                    .as_ref()
-                    .and_then(|(_, id)| {
-                        if column_idx_in_index.is_some() {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(&target_table_cursor_id);
-                program.emit_column_or_rowid(
-                    cursor_id,
-                    column_idx_in_index.unwrap_or(idx),
-                    target_reg,
-                );
-            }
-
-            if let Some(cdc_updates_register) = cdc_updates_register {
-                let change_bit_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + col_len + idx;
-                program.emit_bool(false, change_bit_reg);
-                program.mark_last_insn_constant();
-                program.emit_null(value_reg, None);
-                program.mark_last_insn_constant();
-            }
+    // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
+    // According to the SQLite documentation, the behavior in these cases is undefined:
+    // https://sqlite.org/lang_createtrigger.html
+    // However, based on fuzz testing and observations, the logic seems to be:
+    // The values that are NOT referred to in SET clauses will be evaluated again,
+    // and values in SET clauses are evaluated using the old values.
+    // sqlite> create table t(c0,c1,c2);
+    // sqlite> create trigger tu before update on t begin update t set c1=666, c2=666; end;
+    // sqlite> insert into t values (1,1,1);
+    // sqlite> update t set c0 = c1+1;
+    // sqlite> select * from t;
+    // 2|666|666
+    if target_table.table.btree().is_some() {
+        let before_update_triggers_fired = preserved_old_registers.is_some();
+        let skip_set_clauses = true;
+        if before_update_triggers_fired {
+            emit_update_column_values(
+                program,
+                table_references,
+                set_clauses,
+                cdc_update_alter_statement,
+                &target_table,
+                target_table_cursor_id,
+                start,
+                col_len,
+                table_name,
+                has_direct_rowid_update,
+                has_user_provided_rowid,
+                rowid_set_clause_reg,
+                is_virtual,
+                &index,
+                cdc_updates_register,
+                t_ctx,
+                skip_set_clauses,
+            )?;
         }
     }
 
@@ -1751,6 +2258,46 @@ fn emit_update_insns<'a>(
             },
             table_name: target_table.identifier.clone(),
         });
+
+        // Fire AFTER UPDATE triggers
+        if let Some(btree_table) = target_table.table.btree() {
+            let updated_column_indices: std::collections::HashSet<usize> =
+                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+            let relevant_triggers = get_relevant_triggers_type_and_time(
+                t_ctx.resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            );
+            let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+            if has_relevant_triggers {
+                let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+                let new_registers_after = (0..col_len)
+                    .map(|i| start + i)
+                    .chain(std::iter::once(new_rowid_reg))
+                    .collect();
+
+                // Use preserved OLD registers from BEFORE trigger
+                let old_registers_after = preserved_old_registers;
+
+                let trigger_ctx_after = TriggerContext::new(
+                    btree_table.clone(),
+                    Some(new_registers_after),
+                    old_registers_after, // OLD values preserved from BEFORE trigger
+                );
+
+                for trigger in relevant_triggers {
+                    fire_trigger(
+                        program,
+                        &mut t_ctx.resolver,
+                        trigger,
+                        &trigger_ctx_after,
+                        connection,
+                    )?;
+                }
+            }
+        }
 
         // Emit RETURNING results if specified
         if let Some(returning_columns) = &returning {

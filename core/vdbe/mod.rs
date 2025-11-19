@@ -33,6 +33,7 @@ use crate::{
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
     return_if_io,
+    schema::Trigger,
     state_machine::StateMachine,
     storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
     translate::{collate::CollationSeq, plan::TableReferences},
@@ -41,7 +42,7 @@ use crate::{
         execute::{
             OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
             OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
-            OpRowIdState, OpSeekState, OpTransactionState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
         metrics::StatementMetrics,
     },
@@ -63,6 +64,8 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
+use parking_lot::RwLock;
+use turso_parser::ast::ResolveType;
 
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
@@ -296,6 +299,7 @@ pub struct ProgramState {
     /// Metrics collected during statement execution
     pub metrics: StatementMetrics,
     op_open_ephemeral_state: OpOpenEphemeralState,
+    op_program_state: OpProgramState,
     op_new_rowid_state: OpNewRowidState,
     op_idx_insert_state: OpIdxInsertState,
     op_insert_state: OpInsertState,
@@ -322,6 +326,12 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Program").finish()
+    }
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -360,6 +370,7 @@ impl ProgramState {
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
+            op_program_state: OpProgramState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
             op_idx_insert_state: OpIdxInsertState::MaybeSeek,
             op_insert_state: OpInsertState {
@@ -515,7 +526,12 @@ impl ProgramState {
         match end_statement {
             EndStatement::ReleaseSavepoint => pager.release_savepoint(),
             EndStatement::RollbackSavepoint => {
-                pager.rollback_to_newest_savepoint()?;
+                let stmt_was_rolled_back = pager.rollback_to_newest_savepoint()?;
+                if !stmt_was_rolled_back {
+                    // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                    // caused the error or not. If it didn't, don't reset any FK violation counters.
+                    return Ok(());
+                }
                 // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                 // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
                 connection.fk_deferred_violations.store(
@@ -583,6 +599,17 @@ macro_rules! get_cursor {
     };
 }
 
+/// Tracks the state of explain mode execution, including which subprograms need to be processed.
+#[derive(Default)]
+pub struct ExplainState {
+    /// Program counter positions in the parent program where `Insn::Program` instructions occur.
+    parent_program_pcs: Vec<usize>,
+    /// Index of the subprogram currently being processed, if any.
+    current_subprogram_index: Option<usize>,
+    /// PC value when we started processing the current subprogram, to detect if we need to reset.
+    subprogram_start_pc: Option<usize>,
+}
+
 pub struct Program {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
@@ -605,6 +632,9 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
+    pub trigger: Option<Arc<Trigger>>,
+    pub resolve_type: ResolveType,
+    pub explain_state: RwLock<ExplainState>,
 }
 
 impl Program {
@@ -650,11 +680,106 @@ impl Program {
         // FIXME: do we need this?
         state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
+        let mut explain_state = self.explain_state.write();
+
+        // Check if we're processing a subprogram
+        if let Some(sub_idx) = explain_state.current_subprogram_index {
+            if sub_idx >= explain_state.parent_program_pcs.len() {
+                // All subprograms processed
+                *explain_state = ExplainState::default();
+                return Ok(StepResult::Done);
+            }
+
+            let parent_pc = explain_state.parent_program_pcs[sub_idx];
+            let Insn::Program { program: p, .. } = &self.insns[parent_pc].0 else {
+                panic!("Expected program insn at pc {parent_pc}");
+            };
+            let p = &mut p.write().program;
+
+            let subprogram_insn_count = p.insns.len();
+
+            // Check if the subprogram has already finished (PC is out of bounds)
+            // This can happen if the subprogram finished in a previous call but we're being called again
+            if state.pc as usize >= subprogram_insn_count {
+                // Subprogram is done, move to next one
+                explain_state.subprogram_start_pc = None;
+                if sub_idx + 1 < explain_state.parent_program_pcs.len() {
+                    explain_state.current_subprogram_index = Some(sub_idx + 1);
+                    state.pc = 0;
+                    drop(explain_state);
+                    return self.explain_step(state, _mv_store, pager);
+                } else {
+                    *explain_state = ExplainState::default();
+                    return Ok(StepResult::Done);
+                }
+            }
+
+            // Reset PC to 0 only when starting a new subprogram (when subprogram_start_pc is None)
+            // Once we've started, let the subprogram manage its own PC through its explain_step
+            if explain_state.subprogram_start_pc.is_none() {
+                state.pc = 0;
+                explain_state.subprogram_start_pc = Some(0);
+            }
+
+            // Process the subprogram - it will handle its own explain_step internally
+            // The subprogram's explain_step will process all its instructions (including any nested subprograms)
+            // and return StepResult::Row for each instruction, then StepResult::Done when finished
+            let result = p.step(state, None, pager.clone(), QueryMode::Explain, None)?;
+
+            match result {
+                StepResult::Done => {
+                    // This subprogram is done, move to next one
+                    explain_state.subprogram_start_pc = None; // Clear the start PC marker
+                    if sub_idx + 1 < explain_state.parent_program_pcs.len() {
+                        // Move to next subprogram
+                        explain_state.current_subprogram_index = Some(sub_idx + 1);
+                        // Reset PC to 0 for the next subprogram
+                        state.pc = 0;
+                        // Recursively call to process the next subprogram
+                        drop(explain_state);
+                        return self.explain_step(state, _mv_store, pager);
+                    } else {
+                        // All subprograms done
+                        *explain_state = ExplainState::default();
+                        return Ok(StepResult::Done);
+                    }
+                }
+                StepResult::Row => {
+                    // Output a row from the subprogram
+                    // The subprogram's step already set up the registers with PC starting at 0
+                    // Don't reset subprogram_start_pc - we're still processing this subprogram
+                    drop(explain_state);
+                    return Ok(StepResult::Row);
+                }
+                other => {
+                    drop(explain_state);
+                    return Ok(other);
+                }
+            }
+        }
+
+        // We're processing the parent program
         if state.pc as usize >= self.insns.len() {
-            return Ok(StepResult::Done);
+            // Parent program is done, start processing subprograms
+            if explain_state.parent_program_pcs.is_empty() {
+                // No subprograms to process
+                *explain_state = ExplainState::default();
+                return Ok(StepResult::Done);
+            }
+
+            // Start processing the first subprogram
+            explain_state.current_subprogram_index = Some(0);
+            explain_state.subprogram_start_pc = None; // Will be set when we actually start processing
+            state.pc = 0; // Reset PC to 0 for the first subprogram
+            drop(explain_state);
+            return self.explain_step(state, _mv_store, pager);
         }
 
         let (current_insn, _) = &self.insns[state.pc as usize];
+
+        if matches!(current_insn, Insn::Program { .. }) {
+            explain_state.parent_program_pcs.push(state.pc as usize);
+        }
         let (opcode, p1, p2, p3, p4, p5, comment) = insn_to_row_with_comment(
             self,
             current_insn,
@@ -747,7 +872,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if state.is_interrupted() {
-                self.abort(mv_store, &pager, None, &mut state.auto_txn_cleanup);
+                self.abort(mv_store, &pager, None, state);
                 return Ok(StepResult::Interrupt);
             }
             if let Some(io) = &state.io_completions {
@@ -757,7 +882,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -799,7 +924,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(mv_store, &pager, Some(&err), &mut state.auto_txn_cleanup);
+                    self.abort(mv_store, &pager, Some(&err), state);
                     return Err(err);
                 }
             }
@@ -1059,10 +1184,21 @@ impl Program {
         mv_store: Option<&Arc<MvStore>>,
         pager: &Arc<Pager>,
         err: Option<&LimboError>,
-        cleanup: &mut TxnCleanup,
+        state: &mut ProgramState,
     ) {
+        if self.is_trigger_subprogram() {
+            self.connection.end_trigger_execution();
+        }
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() {
+        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            if err.is_some() {
+                // Any error apart from deferred FK volations causes the statement subtransaction to roll back.
+                let res =
+                    state.end_statement(&self.connection, pager, EndStatement::RollbackSavepoint);
+                if let Err(e) = res {
+                    tracing::error!("Error rolling back statement: {}", e);
+                }
+            }
             match err {
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
@@ -1075,7 +1211,7 @@ impl Program {
                 // and op_halt.
                 Some(LimboError::Constraint(_)) => {}
                 _ => {
-                    if *cleanup != TxnCleanup::None || err.is_some() {
+                    if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = mv_store {
                             if let Some(tx_id) = self.connection.get_mv_tx_id() {
                                 self.connection.auto_commit.store(true, Ordering::SeqCst);
@@ -1090,7 +1226,11 @@ impl Program {
                 }
             }
         }
-        *cleanup = TxnCleanup::None;
+        state.auto_txn_cleanup = TxnCleanup::None;
+    }
+
+    pub fn is_trigger_subprogram(&self) -> bool {
+        self.trigger.is_some()
     }
 }
 

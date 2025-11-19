@@ -23,7 +23,7 @@ use crate::util::{
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::{registers_to_ref_values, EndStatement, TxnCleanup};
+use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
 use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
@@ -39,13 +39,14 @@ use crate::{
     },
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Connection, DatabaseStorage, MvCursor};
+use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
+    num::NonZero,
     sync::{atomic::Ordering, Arc, Mutex},
 };
 use turso_macros::match_ignore_ascii_case;
@@ -75,7 +76,7 @@ use super::{
     CommitState,
 };
 use parking_lot::RwLock;
-use turso_parser::ast::{self, ForeignKeyClause, Name};
+use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::{
@@ -2068,8 +2069,6 @@ pub fn halt(
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     if err_code > 0 {
-        // Any non-FK constraint violation causes the statement subtransaction to roll back.
-        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
         vtab_rollback_all(&program.connection, state)?;
     }
     match err_code {
@@ -2107,10 +2106,13 @@ pub fn halt(
             .load(Ordering::Acquire)
             > 0
     {
-        state.end_statement(&program.connection, pager, EndStatement::RollbackSavepoint)?;
         return Err(LimboError::Constraint(
             "foreign key constraint failed".to_string(),
         ));
+    }
+
+    if program.is_trigger_subprogram() {
+        return Ok(InsnFunctionStepResult::Done);
     }
 
     if auto_commit {
@@ -2256,6 +2258,11 @@ pub fn op_transaction_inner(
         },
         insn
     );
+    if program.is_trigger_subprogram() {
+        crate::bail_parse_error!(
+            "Transaction instruction should not be used in trigger subprograms"
+        );
+    }
     let pager = program.get_pager_from_database_index(db);
     loop {
         match state.op_transaction_state {
@@ -2537,6 +2544,12 @@ pub fn op_auto_commit(
         }
     }
 
+    if program.is_trigger_subprogram() {
+        // Trigger subprograms never commit or rollback.
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     let res = program
         .commit_txn(pager.clone(), state, mv_store, requested_rollback)
         .map(Into::into);
@@ -2641,6 +2654,100 @@ pub fn op_integer(
     state.registers[*dest] = Register::Value(Value::Integer(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub enum OpProgramState {
+    Start,
+    Step,
+}
+
+/// Execute a trigger subprogram (Program opcode).
+pub fn op_program(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Program {
+            params,
+            program: subprogram,
+        },
+        insn
+    );
+    loop {
+        match &mut state.op_program_state {
+            OpProgramState::Start => {
+                let mut statement = subprogram.write();
+                statement.reset();
+                let Some(ref trigger) = statement.get_trigger() else {
+                    crate::bail_parse_error!("trigger subprogram has no trigger");
+                };
+                program.connection.start_trigger_execution(trigger.clone());
+
+                // Extract register values from params (which contain register indices encoded as negative integers)
+                // and bind them to the subprogram's parameters
+                for (param_idx, param_value) in params.iter().enumerate() {
+                    if let Value::Integer(reg_idx) = param_value {
+                        let reg_idx = *reg_idx as usize;
+                        if reg_idx < state.registers.len() {
+                            let value = state.registers[reg_idx].get_value().clone();
+                            let param_index = NonZero::<usize>::new(param_idx + 1).unwrap();
+                            statement.bind_at(param_index, value);
+                        } else {
+                            crate::bail_corrupt_error!(
+                                "Register index {} out of bounds (len={})",
+                                reg_idx,
+                                state.registers.len()
+                            );
+                        }
+                    } else {
+                        crate::bail_parse_error!(
+                            "Trigger parameters should be integers, got {:?}",
+                            param_value
+                        );
+                    }
+                }
+
+                state.op_program_state = OpProgramState::Step;
+            }
+            OpProgramState::Step => {
+                loop {
+                    let mut statement = subprogram.write();
+                    let res = statement.step();
+                    match res {
+                        Ok(step_result) => match step_result {
+                            StepResult::Done => break,
+                            StepResult::IO => {
+                                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                                    Completion::new_yield(),
+                                )));
+                            }
+                            StepResult::Row => continue,
+                            StepResult::Interrupt | StepResult::Busy => {
+                                return Err(LimboError::Busy);
+                            }
+                        },
+                        Err(LimboError::Constraint(constraint_err)) => {
+                            if program.resolve_type != ResolveType::Ignore {
+                                return Err(LimboError::Constraint(constraint_err));
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                program.connection.end_trigger_execution();
+
+                state.op_program_state = OpProgramState::Start;
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 pub fn op_real(
@@ -6570,7 +6677,6 @@ pub fn op_idx_delete(
         insn
     );
 
-    tracing::info!("idx_delete cursor: {:?}", program.cursor_ref[*cursor_id]);
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(cursor.delete(&state.registers[*start_reg..*start_reg + *num_regs]));
         state.pc += 1;
@@ -7596,6 +7702,24 @@ pub fn op_drop_view(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_drop_trigger(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropTrigger { db, trigger_name }, insn);
+
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| {
+        schema.remove_trigger(trigger_name)?;
+        Ok::<(), crate::LimboError>(())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_close(
     program: &Program,
     state: &mut ProgramState,
@@ -7606,6 +7730,9 @@ pub fn op_close(
     load_insn!(Close { cursor_id }, insn);
     let cursors = &mut state.cursors;
     cursors.get_mut(*cursor_id).unwrap().take();
+    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
+        deferred_seek.take();
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

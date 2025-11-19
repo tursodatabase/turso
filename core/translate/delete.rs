@@ -2,13 +2,16 @@ use crate::schema::{Schema, Table};
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{DeletePlan, Operation, Plan};
+use crate::translate::plan::{
+    DeletePlan, JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn, SelectPlan,
+};
 use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use std::sync::Arc;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn};
+use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 
@@ -93,6 +96,8 @@ pub fn prepare_delete_plan(
         );
     }
 
+    let btree_table_for_triggers = table.btree();
+
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table.clone())
     } else if let Some(table) = table.btree() {
@@ -130,18 +135,84 @@ pub fn prepare_delete_plan(
     let (resolved_limit, resolved_offset) =
         limit.map_or(Ok((None, None)), |l| parse_limit(l, connection))?;
 
-    let plan = DeletePlan {
-        table_references,
-        result_columns,
-        where_clause: where_predicates,
-        order_by: vec![],
-        limit: resolved_limit,
-        offset: resolved_offset,
-        contains_constant_false_condition: false,
-        indexes,
-    };
+    // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
+    // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
+    // on the target table -- presumably due to lack of static analysis capabilities to determine whether it's safe
+    // to skip the rowset materialization.
+    let has_delete_triggers = btree_table_for_triggers
+        .as_ref()
+        .map(|bt| has_relevant_triggers_type_only(schema, TriggerEvent::Delete, None, bt))
+        .unwrap_or(false);
 
-    Ok(Plan::Delete(plan))
+    if has_delete_triggers {
+        // Create a SelectPlan that materializes rowids into a RowSet
+        let rowid_internal_id = table_references
+            .joined_tables()
+            .first()
+            .unwrap()
+            .internal_id;
+        let rowset_reg = program.alloc_register();
+
+        let rowset_plan = SelectPlan {
+            table_references: table_references.clone(),
+            result_columns: vec![ResultSetColumn {
+                expr: Expr::RowId {
+                    database: None,
+                    table: rowid_internal_id,
+                },
+                alias: None,
+                contains_aggregates: false,
+            }],
+            where_clause: where_predicates,
+            group_by: None,
+            order_by: vec![],
+            aggregates: vec![],
+            limit: resolved_limit,
+            query_destination: QueryDestination::RowSet { rowset_reg },
+            join_order: table_references
+                .joined_tables()
+                .iter()
+                .enumerate()
+                .map(|(i, t)| JoinOrderMember {
+                    table_id: t.internal_id,
+                    original_idx: i,
+                    is_outer: false,
+                })
+                .collect(),
+            offset: resolved_offset,
+            contains_constant_false_condition: false,
+            distinctness: super::plan::Distinctness::NonDistinct,
+            values: vec![],
+            window: None,
+            non_from_clause_subqueries: vec![],
+        };
+
+        Ok(Plan::Delete(DeletePlan {
+            table_references,
+            result_columns,
+            where_clause: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            contains_constant_false_condition: false,
+            indexes,
+            rowset_plan: Some(rowset_plan),
+            rowset_reg: Some(rowset_reg),
+        }))
+    } else {
+        Ok(Plan::Delete(DeletePlan {
+            table_references,
+            result_columns,
+            where_clause: where_predicates,
+            order_by: vec![],
+            limit: resolved_limit,
+            offset: resolved_offset,
+            contains_constant_false_condition: false,
+            indexes,
+            rowset_plan: None,
+            rowset_reg: None,
+        }))
+    }
 }
 
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {

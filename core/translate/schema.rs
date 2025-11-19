@@ -307,6 +307,7 @@ pub enum SchemaEntryType {
     Table,
     Index,
     View,
+    Trigger,
 }
 
 impl SchemaEntryType {
@@ -315,6 +316,7 @@ impl SchemaEntryType {
             SchemaEntryType::Table => "table",
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
+            SchemaEntryType::Trigger => "trigger",
         }
     }
 }
@@ -677,7 +679,7 @@ pub fn translate_drop_table(
     let table_reg =
         program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()).to_string()); //  r3
     program.mark_last_insn_constant();
-    let table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
+    let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
@@ -692,7 +694,7 @@ pub fn translate_drop_table(
         db: 0,
     });
 
-    //  1. Remove all entries from the schema table related to the table we are dropping, except for triggers
+    //  1. Remove all entries from the schema table related to the table we are dropping (including triggers)
     //  loop to beginning of schema table
     let end_metadata_label = program.allocate_label();
     let metadata_loop = program.allocate_label();
@@ -712,18 +714,6 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::Ne {
         lhs: table_name_and_root_page_register,
         rhs: table_reg,
-        target_pc: next_label,
-        flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
-    });
-    program.emit_column_or_rowid(
-        sqlite_schema_cursor_id_0,
-        0,
-        table_name_and_root_page_register,
-    );
-    program.emit_insn(Insn::Eq {
-        lhs: table_name_and_root_page_register,
-        rhs: table_type,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),

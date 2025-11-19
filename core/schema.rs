@@ -74,6 +74,47 @@ impl Clone for View {
 /// Type alias for regular views collection
 pub type ViewsMap = HashMap<String, Arc<View>>;
 
+/// Trigger structure
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub sql: String,
+    pub table_name: String,
+    pub time: turso_parser::ast::TriggerTime,
+    pub event: turso_parser::ast::TriggerEvent,
+    pub for_each_row: bool,
+    pub when_clause: Option<turso_parser::ast::Expr>,
+    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub temporary: bool,
+}
+
+impl Trigger {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        sql: String,
+        table_name: String,
+        time: Option<turso_parser::ast::TriggerTime>,
+        event: turso_parser::ast::TriggerEvent,
+        for_each_row: bool,
+        when_clause: Option<turso_parser::ast::Expr>,
+        commands: Vec<turso_parser::ast::TriggerCmd>,
+        temporary: bool,
+    ) -> Self {
+        Self {
+            name,
+            sql,
+            table_name,
+            time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
+            event,
+            for_each_row,
+            when_clause,
+            commands,
+            temporary,
+        }
+    }
+}
+
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
@@ -130,6 +171,9 @@ pub struct Schema {
 
     pub views: ViewsMap,
 
+    /// table_name to list of triggers
+    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
+
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
@@ -163,6 +207,7 @@ impl Schema {
         let materialized_view_sql = HashMap::new();
         let incremental_views = HashMap::new();
         let views: ViewsMap = HashMap::new();
+        let triggers = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
         let incompatible_views = HashSet::new();
         Self {
@@ -171,6 +216,7 @@ impl Schema {
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes,
             indexes_enabled,
@@ -308,6 +354,72 @@ impl Schema {
     pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
         let name = normalize_ident(name);
         self.views.get(&name).cloned()
+    }
+
+    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+        self.check_object_name_conflict(&trigger.name)?;
+        let table_name = normalize_ident(table_name);
+
+        // See [Schema::add_index] for why we push to the front of the deque.
+        self.triggers
+            .entry(table_name)
+            .or_default()
+            .push_front(Arc::new(trigger));
+
+        Ok(())
+    }
+
+    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+
+        let mut removed = false;
+        for triggers_list in self.triggers.values_mut() {
+            for i in 0..triggers_list.len() {
+                let trigger = &triggers_list[i];
+                if normalize_ident(&trigger.name) == name {
+                    removed = true;
+                    triggers_list.remove(i);
+                    break;
+                }
+            }
+            if removed {
+                break;
+            }
+        }
+        if !removed {
+            return Err(crate::LimboError::ParseError(format!(
+                "no such trigger: {name}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
+        let table_name = normalize_ident(table_name);
+        let name = normalize_ident(name);
+        self.triggers
+            .get(&table_name)
+            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+    }
+
+    pub fn get_triggers_for_table(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
+        let table_name = normalize_ident(table_name);
+        self.triggers
+            .get(&table_name)
+            .map(|triggers| triggers.iter())
+            .unwrap_or_default()
+    }
+
+    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+        let name = normalize_ident(name);
+        self.triggers
+            .values()
+            .flatten()
+            .find(|t| t.name == name)
+            .cloned()
     }
 
     pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
@@ -856,6 +968,45 @@ impl Schema {
                     }
                 }
             }
+            "trigger" => {
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+
+                let sql = maybe_sql.expect("sql should be present for trigger");
+                let trigger_name = name.to_string();
+
+                let mut parser = Parser::new(sql.as_bytes());
+                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
+                    temporary,
+                    if_not_exists: _,
+                    trigger_name: _,
+                    time,
+                    event,
+                    tbl_name,
+                    for_each_row,
+                    when_clause,
+                    commands,
+                }))) = parser.next_cmd()
+                else {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "invalid trigger sql: {sql}"
+                    )));
+                };
+                self.add_trigger(
+                    Trigger::new(
+                        trigger_name.clone(),
+                        sql.to_string(),
+                        tbl_name.name.to_string(),
+                        time,
+                        event,
+                        for_each_row,
+                        when_clause.map(|e| *e),
+                        commands,
+                        temporary,
+                    ),
+                    tbl_name.name.as_str(),
+                )?;
+            }
             _ => {}
         };
 
@@ -1198,6 +1349,16 @@ impl Clone for Schema {
             .iter()
             .map(|(name, view)| (name.clone(), Arc::new((**view).clone())))
             .collect();
+        let triggers = self
+            .triggers
+            .iter()
+            .map(|(table_name, triggers)| {
+                (
+                    table_name.clone(),
+                    triggers.iter().map(|t| Arc::new((**t).clone())).collect(),
+                )
+            })
+            .collect();
         let incompatible_views = self.incompatible_views.clone();
         Self {
             tables,
@@ -1205,6 +1366,7 @@ impl Clone for Schema {
             materialized_view_sql,
             incremental_views,
             views,
+            triggers,
             indexes,
             has_indexes: self.has_indexes.clone(),
             indexes_enabled: self.indexes_enabled,
