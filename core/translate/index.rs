@@ -7,6 +7,7 @@ use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
@@ -521,43 +522,62 @@ pub fn resolve_sorted_columns(
     let mut resolved = Vec::with_capacity(cols.len());
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
-        match sc.expr.as_ref() {
-            Expr::Id(col_name) | Expr::Name(col_name) => {
-                let ident = col_name.as_str();
-                let Some(col) = table.get_column(ident) else {
-                    crate::bail_parse_error!(
-                        "Error: column '{ident}' does not exist in table '{}'",
-                        table.name
-                    );
-                };
-                resolved.push(IndexColumn {
-                    name: col.1.name.as_ref().unwrap().clone(),
-                    order,
-                    pos_in_table: col.0,
-                    collation: col.1.collation_opt(),
-                    default: col.1.default.clone(),
-                    expr: None,
-                });
-            }
-            _ => {
-                if !validate_index_expression(sc.expr.as_ref(), table) {
-                    crate::bail_parse_error!(
-                        "Error: invalid expression in CREATE INDEX: {}",
-                        sc.expr
-                    );
-                }
-                resolved.push(IndexColumn {
-                    name: sc.expr.to_string(),
-                    order,
-                    pos_in_table: EXPR_INDEX_SENTINEL,
-                    collation: None,
-                    default: None,
-                    expr: Some(sc.expr.clone()),
-                });
-            }
-        };
+        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
+        if let Some((pos, column_name, column)) = resolve_index_column(base_expr, table) {
+            let collation = explicit_collation.or_else(|| column.collation_opt());
+            resolved.push(IndexColumn {
+                name: column_name,
+                order,
+                pos_in_table: pos,
+                collation,
+                default: column.default.clone(),
+                expr: None,
+            });
+            continue;
+        }
+        if !validate_index_expression(sc.expr.as_ref(), table) {
+            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+        }
+        resolved.push(IndexColumn {
+            name: sc.expr.to_string(),
+            order,
+            pos_in_table: EXPR_INDEX_SENTINEL,
+            collation: explicit_collation,
+            default: None,
+            expr: Some(sc.expr.clone()),
+        });
     }
     Ok(resolved)
+}
+
+fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)> {
+    let mut current = expr;
+    let mut coll = None;
+    while let Expr::Collate(inner, seq) = current {
+        coll = Some(CollationSeq::new(seq.as_str())?);
+        current = inner.as_ref();
+    }
+    Ok((coll, current))
+}
+
+fn resolve_index_column<'a>(
+    expr: &'a Expr,
+    table: &'a BTreeTable,
+) -> Option<(usize, String, &'a crate::schema::Column)> {
+    let (pos, column) = match expr {
+        Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
+        Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+            table.get_column(col.as_str())?
+        }
+        Expr::RowId { .. } => table.get_rowid_alias_column()?,
+        _ => return None,
+    };
+    let column_name = column
+        .name
+        .as_ref()
+        .expect("column name must exist for indexed column")
+        .clone();
+    Some((pos, column_name, column))
 }
 
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {

@@ -269,8 +269,7 @@ fn expr_to_column_order(
             order,
         });
     }
-    let mask = table_mask_from_expr(expr, tables, &[])
-        .ok()?;
+    let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
     if mask.table_count() != 1 {
         return None;
     }

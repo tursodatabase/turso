@@ -122,11 +122,11 @@ use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
+use crate::Result;
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
-use crate::Result;
 use core::fmt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2742,9 +2742,11 @@ impl Index {
     /// Expression index matching is textual (after binding), so the caller should normalize the query
     /// expression to resemble the stored index expression (e.g. unqualified column names).
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
-        self.columns
-            .iter()
-            .position(|c| c.expr.as_ref().is_some_and(|e| exprs_are_equivalent(e, expr)))
+        self.columns.iter().position(|c| {
+            c.expr
+                .as_ref()
+                .is_some_and(|e| exprs_are_equivalent(e, expr))
+        })
     }
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
