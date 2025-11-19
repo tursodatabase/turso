@@ -23,12 +23,10 @@ macro_rules! change_state {
     };
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
 #[ignore]
-fn test_simple_overflow_page() -> anyhow::Result<()> {
+fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
 
     let mut huge_text = String::new();
@@ -151,13 +149,12 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_sequential_write() -> anyhow::Result<()> {
+fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -187,12 +184,11 @@ fn test_sequential_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x REAL);")]
 /// There was a regression with inserting multiple rows with a column containing an unary operator :)
 /// https://github.com/tursodatabase/turso/pull/679
-fn test_regression_multi_row_insert() -> anyhow::Result<()> {
+fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL);");
     let conn = tmp_db.connect_limbo();
 
     let insert_query = "INSERT INTO test VALUES (-2), (-3), (-1)";
@@ -222,10 +218,9 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_statement_reset() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "create table test (i integer);")]
+fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into test values (1)")?;
@@ -268,10 +263,9 @@ fn test_statement_reset() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_checkpoint() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_checkpoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
     let iterations = 1001_usize;
     let conn = tmp_db.connect_limbo();
@@ -298,10 +292,9 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_restart() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_restart(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
@@ -343,10 +336,9 @@ fn test_wal_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_after_big_blob() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE temp (t1 BLOB, t2 INTEGER)")]
+fn test_insert_after_big_blob(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE temp (t1 BLOB, t2 INTEGER)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into temp(t1) values (zeroblob (262144))")?;
@@ -355,14 +347,13 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_write_delete_with_index() -> anyhow::Result<()> {
+fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
