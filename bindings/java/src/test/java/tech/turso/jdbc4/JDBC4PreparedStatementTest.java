@@ -867,7 +867,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testBatch_explicit_addBatch() throws Exception {
+  void testBatchInsert() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
     PreparedStatement preparedStatement =
         connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (?, ?)");
@@ -892,7 +892,59 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testBatch_implicit_addBatch() throws Exception {
+  void testBatchUpdate() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (1, 1), (2, 2)").execute();
+
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("UPDATE test SET col2=? WHERE col1=?");
+
+    preparedStatement.setInt(1, 5);
+    preparedStatement.setInt(2, 1);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 6);
+    preparedStatement.setInt(2, 2);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 7);
+    preparedStatement.setInt(2, 3);
+    preparedStatement.addBatch();
+
+    assertArrayEquals(new int[] {1, 1, 0}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(1, rs.getInt(1));
+    assertEquals(5, rs.getInt(2));
+    assertTrue(rs.next());
+    assertEquals(2, rs.getInt(1));
+    assertEquals(6, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatchDelete() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (1, 1), (2, 2)").execute();
+
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("DELETE FROM test WHERE col1=?");
+
+    preparedStatement.setInt(1, 1);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 4);
+    preparedStatement.addBatch();
+
+    assertArrayEquals(new int[] {1, 0}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(2, rs.getInt(1));
+    assertEquals(2, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatch_implicitAddBatch_shouldIgnore() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
     PreparedStatement preparedStatement =
         connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (?, ?)");
@@ -915,7 +967,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testBatch_invalid_command() throws Exception {
+  void testBatch_select_shouldFail() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
     PreparedStatement preparedStatement =
         connection.prepareStatement("SELECT * FROM test WHERE col1=?");
