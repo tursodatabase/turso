@@ -6,3 +6,4 @@ mod test_write_path;
 mod encryption;
 mod test_multi_thread;
 mod test_transactions;
+mod test_expr_index;
