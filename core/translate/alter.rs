@@ -635,45 +635,11 @@ pub fn translate_alter_table(
                                     ))
                                 })?;
 
-                            let mut found_in_when = false;
-                            use crate::translate::expr::walk_expr;
-                            walk_expr(when_expr, &mut |e: &ast::Expr| -> Result<
-                                crate::translate::expr::WalkControl,
-                            > {
-                                match e {
-                                    ast::Expr::Qualified(ns, col)
-                                    | ast::Expr::DoublyQualified(_, ns, col) => {
-                                        let ns_norm = normalize_ident(ns.as_str());
-                                        let col_norm = normalize_ident(col.as_str());
-
-                                        // Check NEW.column or OLD.column
-                                        if (ns_norm.eq_ignore_ascii_case("new")
-                                            || ns_norm.eq_ignore_ascii_case("old"))
-                                            && col_norm == column_name_norm
-                                        {
-                                            found_in_when = true;
-                                            return Ok(
-                                                crate::translate::expr::WalkControl::SkipChildren,
-                                            );
-                                        }
-                                    }
-                                    ast::Expr::Id(col) => {
-                                        // Unqualified column reference - check if it matches
-                                        let col_norm = normalize_ident(col.as_str());
-                                        if col_norm == column_name_norm {
-                                            // Verify this column exists in the trigger's owning table
-                                            if trigger_table.get_column(&col_norm).is_some() {
-                                                found_in_when = true;
-                                                return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                Ok(crate::translate::expr::WalkControl::Continue)
-                            })?;
-
-                            if found_in_when {
+                            if expr_references_trigger_column(
+                                when_expr,
+                                &trigger_table,
+                                &column_name_norm,
+                            )? {
                                 return Err(LimboError::ParseError(format!(
                                     "error in trigger {}: no such column: {}",
                                     trigger.name, from
@@ -962,6 +928,50 @@ fn translate_rename_virtual_table(
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.
 Here are some helpers related to that: */
 
+/// Check if an expression references a specific column from a trigger's owning table.
+/// Checks for NEW.column, OLD.column, and unqualified column references.
+/// Returns true if the column is found, false otherwise.
+fn expr_references_trigger_column(
+    expr: &ast::Expr,
+    table: &crate::schema::BTreeTable,
+    column_name_norm: &str,
+) -> Result<bool> {
+    use crate::translate::expr::walk_expr;
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<
+        crate::translate::expr::WalkControl,
+    > {
+        match e {
+            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
+                let ns_norm = normalize_ident(ns.as_str());
+                let col_norm = normalize_ident(col.as_str());
+
+                // Check NEW.column or OLD.column
+                if (ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old"))
+                    && col_norm == *column_name_norm
+                {
+                    found = true;
+                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::Id(col) => {
+                // Unqualified column reference - check if it matches
+                let col_norm = normalize_ident(col.as_str());
+                if col_norm == *column_name_norm {
+                    // Verify this column exists in the trigger's owning table
+                    if table.get_column(&col_norm).is_some() {
+                        found = true;
+                        return Ok(crate::translate::expr::WalkControl::SkipChildren);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
 /// Check if a trigger references a specific column from its owning table.
 /// Returns true if the column is referenced as old.x, new.x, or unqualified x.
 fn trigger_references_column(
@@ -974,35 +984,7 @@ fn trigger_references_column(
 
     // Check when_clause
     if let Some(ref when_expr) = trigger.when_clause {
-        walk_expr(when_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-            match e {
-                ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                    let ns_norm = normalize_ident(ns.as_str());
-                    let col_norm = normalize_ident(col.as_str());
-
-                    // Check NEW.column or OLD.column
-                    if (ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old"))
-                        && col_norm == column_name_norm
-                    {
-                        found = true;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                }
-                ast::Expr::Id(col) => {
-                    // Unqualified column reference - check if it matches
-                    let col_norm = normalize_ident(col.as_str());
-                    if col_norm == column_name_norm {
-                        // Verify this column exists in the trigger's owning table
-                        if table.get_column(&col_norm).is_some() {
-                            found = true;
-                            return Ok(WalkControl::SkipChildren);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        })?;
+        found = expr_references_trigger_column(when_expr, table, &column_name_norm)?;
     }
 
     if found {
@@ -1064,7 +1046,8 @@ fn trigger_references_column(
     Ok(found)
 }
 
-/// Helper to check if an expression references a column
+/// Helper to check if an expression references a column.
+/// Used as a callback within walk_expr, so it mutates a found flag.
 fn check_column_ref(
     e: &ast::Expr,
     table: &crate::schema::BTreeTable,
@@ -1778,6 +1761,8 @@ fn rewrite_select_for_column_rename(
     let mut select = select;
 
     // Rewrite WITH clause (CTEs)
+    // Note: We clone here because Select doesn't implement Default, so we can't use mem::take.
+    // The clone is necessary to move ownership to rewrite_select_for_column_rename.
     if let Some(ref mut with_clause) = select.with {
         for cte in &mut with_clause.ctes {
             cte.select = rewrite_select_for_column_rename(
@@ -2001,6 +1986,8 @@ fn rewrite_select_table_for_column_rename(
 
     match select_table {
         ast::SelectTable::Select(select, _) => {
+            // Note: We clone here because Select doesn't implement Default, so we can't use mem::take.
+            // The clone is necessary to move ownership to rewrite_select_for_column_rename.
             *select = rewrite_select_for_column_rename(
                 select.clone(),
                 trigger_table,
