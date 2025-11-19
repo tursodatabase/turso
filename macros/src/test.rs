@@ -107,12 +107,12 @@ impl Parse for Args {
 
 struct DatabaseFunction {
     input: ItemFn,
-    tmp_db_fn_arg: Pat,
+    tmp_db_fn_arg: (Pat, syn::Type),
     args: Args,
 }
 
 impl DatabaseFunction {
-    fn new(input: ItemFn, tmp_db_fn_arg: Pat, args: Args) -> Self {
+    fn new(input: ItemFn, tmp_db_fn_arg: (Pat, syn::Type), args: Args) -> Self {
         Self {
             input,
             tmp_db_fn_arg,
@@ -165,20 +165,20 @@ impl DatabaseFunction {
             }
         }
 
-        let arg_name = &self.tmp_db_fn_arg;
+        let (arg_name, arg_ty) = &self.tmp_db_fn_arg;
         let fn_out = &sig.output;
 
         let call_func = if is_result {
-            quote! {(|#arg_name| #fn_out #block)(#arg_name).unwrap();}
+            quote! {(|#arg_name: #arg_ty|#fn_out #block)(#arg_name).unwrap();}
         } else {
-            quote! {(|#arg_name| #block)(#arg_name);}
+            quote! {(|#arg_name: #arg_ty| #block)(#arg_name);}
         };
 
         quote! {
             #[test]
             #(#attrs)*
             #vis fn #fn_name #fn_generics() {
-                let #arg_name = crate::common::TempDatabase::new_with_opts(#db_path, #db_opts);
+                let #arg_name = #arg_ty::new_with_opts(#db_path, #db_opts);
 
                 #call_func
             }
@@ -213,7 +213,7 @@ pub fn test_macro_attribute(args: TokenStream, input: TokenStream) -> TokenStrea
     db_function.to_token_stream().into()
 }
 
-fn check_fn_inputs(input: &ItemFn) -> syn::Result<Pat> {
+fn check_fn_inputs(input: &ItemFn) -> syn::Result<(Pat, syn::Type)> {
     let msg = "Only 1 function argument can be passed and it must be of type `TempDatabase`";
     let args = &input.sig.inputs;
     if args.len() != 1 {
@@ -241,7 +241,7 @@ fn check_fn_inputs(input: &ItemFn) -> syn::Result<Pat> {
                 {
                     return Err(syn::Error::new_spanned(type_path, msg));
                 }
-                Ok(*(pat_type.pat.clone()))
+                Ok((*pat_type.pat.clone(), *pat_type.ty.clone()))
             } else {
                 return Err(syn::Error::new_spanned(pat_type, msg));
             }
