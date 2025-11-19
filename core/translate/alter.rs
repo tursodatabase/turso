@@ -1356,8 +1356,9 @@ fn check_column_ref(
             let ns_norm = normalize_ident(ns.as_str());
             let col_norm = normalize_ident(col.as_str());
 
-            let new_or_old = ns_norm.eq_ignore_ascii_case("new")
-                || ns_norm.eq_ignore_ascii_case("old") && col_norm == *column_name_norm;
+            let new_or_old = (ns_norm.eq_ignore_ascii_case("new")
+                || ns_norm.eq_ignore_ascii_case("old"))
+                && col_norm == *column_name_norm;
             let qualified_ref = ns_norm == trigger_table_name_norm
                 && col_norm == *column_name_norm
                 && table.get_column(&col_norm).is_some();
