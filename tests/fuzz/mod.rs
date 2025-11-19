@@ -2099,6 +2099,7 @@ mod fuzz_tests {
             for i in 0..num_indexes {
                 // Decide if this should be a single-column or multi-column index
                 let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
+                let is_expr = rng.random_bool(0.3);
 
                 if is_multi_column {
                     // Create a multi-column index with 2-3 columns
@@ -2119,7 +2120,14 @@ mod fuzz_tests {
                 } else {
                     // Single-column index
                     let col = rng.random_range(0..num_cols);
-                    indexes.push(format!("CREATE INDEX idx_{i} ON t(c{col})"));
+                    indexes.push(format!(
+                        "CREATE INDEX idx_{i} ON {}",
+                        if is_expr {
+                            format!("t(LOWER(c{col}))")
+                        } else {
+                            format!("t(c{col})")
+                        }
+                    ));
                 }
             }
 
@@ -2504,6 +2512,7 @@ mod fuzz_tests {
             let mut conflict_match_targets = vec!["".to_string(), "(id)".to_string()];
             let mut idx_ddls: Vec<String> = Vec::new();
             for i in 0..num_pidx {
+                let is_expr = rng.random_bool(0.3);
                 // Pick 1 or 2 key columns; always include "k" sometimes to get frequent conflicts.
                 let mut key_cols = Vec::new();
                 if rng.random_bool(0.7) {
@@ -2571,10 +2580,25 @@ mod fuzz_tests {
 
                 let ddl = if rng.random_bool(partial_index_prob) {
                     format!(
-                        "CREATE UNIQUE INDEX idx_p{}_{} ON t({}) WHERE {}",
+                        "CREATE UNIQUE INDEX idx_p{}_{} ON {} WHERE {}",
                         outer,
                         i,
-                        key_cols.join(","),
+                        if is_expr {
+                            format!(
+                                "t({})",
+                                key_cols
+                                    .iter()
+                                    .map(|c| format!(
+                                        "{}( {})",
+                                        functions.choose(&mut rng).unwrap(),
+                                        c
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        } else {
+                            format!("t({})", key_cols.join(","))
+                        },
                         pred
                     )
                 } else {
