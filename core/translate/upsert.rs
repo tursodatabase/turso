@@ -27,9 +27,7 @@ use crate::{
         },
         insert::Insertion,
         plan::ResultSetColumn,
-        trigger_exec::{
-            fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
-        },
+        trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time, TriggerContext},
     },
     util::normalize_ident,
     vdbe::{
@@ -130,24 +128,24 @@ pub fn upsert_matches_rowid_alias(upsert: &Upsert, table: &Table) -> bool {
     if t.targets.len() != 1 {
         return false;
     }
-    
+
     let Some(target_key) = extract_target_key(&t.targets[0].expr) else {
         return false;
     };
-    
+
     // Check if target matches an INTEGER PRIMARY KEY column
     let pk = table.columns().iter().find(|c| c.is_rowid_alias());
     if let Some(pkcol) = pk {
-        if target_key.col_name.eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new())) {
+        if target_key
+            .col_name
+            .eq_ignore_ascii_case(pkcol.name.as_ref().unwrap_or(&String::new()))
+        {
             return true;
         }
     }
-    
+
     if table.btree().is_some_and(|bt| bt.has_rowid) {
-        matches!(
-            target_key.col_name.as_str(),
-            "rowid" | "_rowid_" | "oid"
-        )
+        matches!(target_key.col_name.as_str(), "rowid" | "_rowid_" | "oid")
     } else {
         false
     }
