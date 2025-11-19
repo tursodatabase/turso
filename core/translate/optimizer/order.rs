@@ -40,6 +40,8 @@ pub enum EliminatesSortBy {
 pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSortBy);
 
 impl OrderTarget {
+    /// Build an `OrderTarget` from a list of expressions if they can all be
+    /// satisfied by a single-table ordering (needed for index satisfaction).
     fn maybe_from_iterator<'a>(
         list: impl Iterator<Item = (&'a ast::Expr, SortOrder)> + Clone,
         tables: &crate::translate::plan::TableReferences,

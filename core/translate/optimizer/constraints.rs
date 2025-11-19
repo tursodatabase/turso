@@ -4,19 +4,19 @@ use std::{
     sync::Arc,
 };
 
+use crate::translate::plan::JoinedTable;
 use crate::{
     schema::{Column, Index},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity},
+        expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
         plan::{JoinOrderMember, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{table_mask_from_expr, TableMask},
+        planner::{table_mask_from_expr, TableMask, ROWID_STRS},
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
     Result,
 };
-use crate::translate::plan::JoinedTable;
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
@@ -30,9 +30,9 @@ use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
 /// and to determine the optimal join order. A constraint can only be applied if all tables
 /// referenced in its expression (other than the constrained table itself) are already
 /// available in the current join context, i.e. on the left side in the join order
-/// relative to the table.
+/// relative to the table. Expression indexes are represented by leaving `table_col_pos` empty
+/// and storing the indexed expression in `expr`.
 #[derive(Debug, Clone)]
-///
 pub struct Constraint {
     /// The position of the original `WHERE` clause term this constraint derives from,
     /// and which side of the [ast::Expr::Binary] comparison contains the expression
@@ -215,6 +215,45 @@ fn expression_matches_table(
     }
 }
 
+// Turn bound Column/RowId nodes back into simple identifiers so we can compare
+// the expression textually against the stored expression definition on the index.
+// e.g. this ensures that `a+b` in the query matches `a + b` stored on the index, even
+// though the query expression has already been bound to column positions.
+// TODO: this sucks, we should either lazily bind the constraint or maybe pre-bind and store
+// the index expression and save that for if its translated?
+fn normalize_expr_for_index_matching(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+) -> ast::Expr {
+    let mut expr = expr.clone();
+    let _table_idx = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_reference.internal_id)
+        .expect("table must exist in table_references");
+    let columns = table_reference.table.columns();
+    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Column { column, .. } => {
+                let name = columns[*column]
+                    .name
+                    .as_ref()
+                    .expect("column must have a name")
+                    .clone();
+                *e = ast::Expr::Id(ast::Name::exact(name));
+            }
+            ast::Expr::RowId { .. } => {
+                *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    };
+    let _ = walk_expr_mut(&mut expr, &mut normalize);
+    expr
+}
+
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
 ///
@@ -303,7 +342,13 @@ pub fn constraints_from_where_clause(
                         });
                     }
                 }
-                _ if expression_matches_table(lhs, table_reference, table_references, subqueries) => {
+                _ if expression_matches_table(
+                    lhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
                     cs.constraints.push(Constraint {
                         where_clause_pos: (i, BinaryExprSide::Rhs),
                         operator,
@@ -346,7 +391,13 @@ pub fn constraints_from_where_clause(
                         });
                     }
                 }
-                _ if expression_matches_table(rhs, table_reference, table_references, subqueries) => {
+                _ if expression_matches_table(
+                    rhs,
+                    table_reference,
+                    table_references,
+                    subqueries,
+                ) =>
+                {
                     cs.constraints.push(Constraint {
                         where_clause_pos: (i, BinaryExprSide::Lhs),
                         operator: opposite_cmp_op(operator),
@@ -380,7 +431,10 @@ pub fn constraints_from_where_clause(
             let column_collation = constrained_column.map(|c| c.collation());
             let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
             // Index seek keys must use the same collation as the constrained column.
-            match (get_collseq_from_expr(constraining_expr, table_references)?, column_collation) {
+            match (
+                get_collseq_from_expr(constraining_expr, table_references)?,
+                column_collation,
+            ) {
                 (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
@@ -412,10 +466,11 @@ pub fn constraints_from_where_clause(
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
-                    None => constraint
-                        .expr
-                        .as_ref()
-                        .and_then(|e| index.expression_to_index_pos(e)),
+                    None => constraint.expr.as_ref().and_then(|e| {
+                        let normalized =
+                            normalize_expr_for_index_matching(e, table_reference, table_references);
+                        index.expression_to_index_pos(&normalized)
+                    }),
                 } {
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
@@ -673,9 +728,7 @@ pub fn convert_to_vtab_constraint(
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
-            let Some(table_col_pos) = constraint.table_col_pos else {
-                return None;
-            };
+            let table_col_pos = constraint.table_col_pos?;
             let other_side_refers_to_self = constraint.lhs_mask.contains_table(table_idx);
             if other_side_refers_to_self {
                 return None;

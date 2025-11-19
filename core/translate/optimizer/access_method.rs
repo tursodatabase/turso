@@ -142,15 +142,12 @@ fn find_best_access_method_for_btree(
                 let correct_table = target.table_id == table_no;
                 let correct_column = match (&target.target, &candidate.index) {
                     (ColumnTarget::Column(col_no), Some(index)) => {
-                        index.columns[i].expr.is_none()
-                            && index.columns[i].pos_in_table == *col_no
+                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
                     }
-                    (ColumnTarget::Expr(expr), Some(index)) => {
-                        index.columns[i]
-                            .expr
-                            .as_ref()
-                            .is_some_and(|e| crate::util::exprs_are_equivalent(e, expr))
-                    }
+                    (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
+                        .expr
+                        .as_ref()
+                        .is_some_and(|e| crate::util::exprs_are_equivalent(e, expr)),
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)
                     }

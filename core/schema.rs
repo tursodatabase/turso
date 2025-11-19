@@ -2739,6 +2739,8 @@ impl Index {
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
+    /// Expression index matching is textual (after binding), so the caller should normalize the query
+    /// expression to resemble the stored index expression (e.g. unqualified column names).
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
         self.columns
             .iter()
