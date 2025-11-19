@@ -11,52 +11,97 @@ pub struct TempDatabase {
     pub path: PathBuf,
     pub io: Arc<dyn IO + Send>,
     pub db: Arc<Database>,
+    pub db_opts: turso_core::DatabaseOpts,
+    #[allow(dead_code)]
+    pub db_flags: turso_core::OpenFlags,
 }
 unsafe impl Send for TempDatabase {}
 
-#[allow(clippy::arc_with_non_send_sync)]
-impl TempDatabase {
-    pub fn new_empty() -> Self {
-        Self::new(&format!("test-{}.db", rng().next_u32()))
+#[derive(Debug, Default)]
+pub struct TempDatabaseBuilder {
+    db_name: Option<String>,
+    db_path: Option<PathBuf>,
+    opts: Option<turso_core::DatabaseOpts>,
+    flags: Option<turso_core::OpenFlags>,
+    init_sql: Option<String>,
+}
+
+impl TempDatabaseBuilder {
+    pub const fn new() -> Self {
+        Self {
+            db_name: None,
+            db_path: None,
+            opts: None,
+            flags: None,
+            init_sql: None,
+        }
     }
 
-    pub fn new(db_name: &str) -> Self {
-        let mut path = TempDir::new().unwrap().keep();
-        path.push(db_name);
+    /// Db Name is mutually exclusive with Db Path
+    pub fn with_db_name(mut self, db_name: impl AsRef<str>) -> Self {
+        assert!(
+            self.db_path.is_none(),
+            "DB Name and DB Path are mutually exclusive options"
+        );
 
-        Self::new_with_existent(&path)
+        self.db_name = Some(db_name.as_ref().to_string());
+        self.db_path = None;
+        self
     }
 
-    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
-        let mut path = TempDir::new().unwrap().keep();
-        path.push(db_name);
-        Self::new_with_existent_with_opts(&path, opts)
+    /// Db Path is mutually exclusive with Db Name
+    pub fn with_db_path(mut self, db_path: impl AsRef<Path>) -> Self {
+        assert!(
+            self.db_name.is_none(),
+            "DB Name and DB Path are mutually exclusive options"
+        );
+        self.db_path = Some(db_path.as_ref().to_path_buf());
+        self
     }
 
-    pub fn new_with_existent(db_path: &Path) -> Self {
-        Self::new_with_existent_with_flags(db_path, turso_core::OpenFlags::default())
+    pub fn with_opts(mut self, opts: turso_core::DatabaseOpts) -> Self {
+        self.opts = Some(opts);
+        self
     }
 
-    pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
-        Self::_new(db_path, Some(opts), None)
+    pub fn with_flags(mut self, flags: turso_core::OpenFlags) -> Self {
+        self.flags = Some(flags);
+        self
     }
 
-    pub fn new_with_existent_with_flags(db_path: &Path, flags: turso_core::OpenFlags) -> Self {
-        Self::_new(db_path, None, Some(flags))
+    pub fn with_init_sql(mut self, init_sql: impl AsRef<str>) -> Self {
+        self.init_sql = Some(init_sql.as_ref().to_string());
+        self
     }
 
-    fn _new(
-        db_path: &Path,
-        opts: Option<turso_core::DatabaseOpts>,
-        flags: Option<turso_core::OpenFlags>,
-    ) -> Self {
-        let opts = opts.unwrap_or_else(|| {
+    pub fn build(self) -> TempDatabase {
+        let opts = self.opts.unwrap_or_else(|| {
             turso_core::DatabaseOpts::new()
                 .with_indexes(true)
                 .with_encryption(true)
         });
 
-        let flags = flags.unwrap_or_default();
+        let flags = self.flags.unwrap_or_default();
+
+        let db_path = match self.db_path {
+            Some(db_path) => db_path,
+            None => {
+                let db_name = self
+                    .db_name
+                    .unwrap_or_else(|| format!("test-{}.db", rng().next_u32()));
+                let mut db_path = TempDir::new().unwrap().keep();
+                db_path.push(db_name);
+                db_path
+            }
+        };
+
+        if let Some(init_sql) = self.init_sql {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+            connection.execute(&init_sql, ()).unwrap();
+        }
 
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
@@ -67,25 +112,57 @@ impl TempDatabase {
             None,
         )
         .unwrap();
-        Self {
-            path: db_path.to_path_buf(),
+        TempDatabase {
+            path: db_path,
             io,
             db,
+            db_opts: opts,
+            db_flags: flags,
         }
+    }
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+impl TempDatabase {
+    pub const fn builder() -> TempDatabaseBuilder {
+        TempDatabaseBuilder::new()
+    }
+
+    pub fn new_empty() -> Self {
+        Self::builder().build()
+    }
+
+    pub fn new(db_name: &str) -> Self {
+        Self::builder().with_db_name(db_name).build()
+    }
+
+    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
+        Self::builder()
+            .with_db_name(db_name)
+            .with_opts(opts)
+            .build()
+    }
+
+    pub fn new_with_existent(db_path: &Path) -> Self {
+        Self::builder().with_db_path(db_path).build()
+    }
+
+    pub fn new_with_existent_with_opts(db_path: &Path, opts: turso_core::DatabaseOpts) -> Self {
+        Self::builder()
+            .with_db_path(db_path)
+            .with_opts(opts)
+            .build()
+    }
+
+    pub fn new_with_existent_with_flags(db_path: &Path, flags: turso_core::OpenFlags) -> Self {
+        Self::builder()
+            .with_db_path(db_path)
+            .with_flags(flags)
+            .build()
     }
 
     pub fn new_with_rusqlite(table_sql: &str) -> Self {
-        let mut path = TempDir::new().unwrap().keep();
-        let db_name = "test.db";
-        path.push(db_name);
-        {
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "wal")
-                .unwrap();
-            connection.execute(table_sql, ()).unwrap();
-        }
-        Self::new_with_existent(&path)
+        Self::builder().with_init_sql(table_sql).build()
     }
 
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
