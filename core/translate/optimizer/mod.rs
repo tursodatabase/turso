@@ -735,10 +735,13 @@ fn optimize_table_access(
                             });
                         continue;
                     };
+                    // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
+                    // expression (table_col_pos == None) we cannot derive a seek key that matches
+                    // the row layout, so fall back to a scan in that situation.
                     let usable_constraints = table_constraints
                         .constraints
                         .iter()
-                        .filter(|c| c.usable)
+                        .filter(|c| c.usable && c.table_col_pos.is_some())
                         .cloned()
                         .collect::<Vec<_>>();
                     let mut temp_constraint_refs = (0..usable_constraints.len())
