@@ -8,7 +8,7 @@ use syn::{
     parse_macro_input,
     punctuated::Punctuated,
     spanned::Spanned,
-    ItemFn, Meta, Pat, ReturnType, Token, Type,
+    Ident, ItemFn, Meta, Pat, ReturnType, Token, Type,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +97,6 @@ impl Parse for Args {
                 accum
             });
 
-        dbg!(&errors);
         if let Some(errors) = errors {
             return Err(errors);
         }
@@ -120,10 +119,8 @@ impl DatabaseFunction {
             args,
         }
     }
-}
 
-impl ToTokens for DatabaseFunction {
-    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+    fn tokens_for_db_type(&self, mvcc: bool) -> proc_macro2::TokenStream {
         let ItemFn {
             attrs,
             vis,
@@ -131,7 +128,11 @@ impl ToTokens for DatabaseFunction {
             block,
         } = &self.input;
 
-        let fn_name = &sig.ident;
+        let fn_name = if mvcc {
+            Ident::new(&format!("{}_mvcc", sig.ident), sig.ident.span())
+        } else {
+            sig.ident.clone()
+        };
         let fn_generics = &sig.generics;
 
         // Check the return type
@@ -155,6 +156,7 @@ impl ToTokens for DatabaseFunction {
         if let Some(spanned) = self
             .args
             .mvcc
+            .filter(|_| mvcc)
             .map(|val| val.map(|_| quote! {.with_mvcc(true)}))
         {
             db_opts = quote! {
@@ -166,15 +168,13 @@ impl ToTokens for DatabaseFunction {
         let arg_name = &self.tmp_db_fn_arg;
         let fn_out = &sig.output;
 
-        eprintln!("db_path: {db_path}\ndb_opts: {db_opts}");
-
         let call_func = if is_result {
             quote! {(|#arg_name| #fn_out #block)(#arg_name).unwrap();}
         } else {
             quote! {(|#arg_name| #block)(#arg_name);}
         };
 
-        let out = quote! {
+        quote! {
             #[test]
             #(#attrs)*
             #vis fn #fn_name #fn_generics() {
@@ -182,18 +182,26 @@ impl ToTokens for DatabaseFunction {
 
                 #call_func
             }
-        };
+
+        }
+    }
+}
+
+impl ToTokens for DatabaseFunction {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let out = self.tokens_for_db_type(false);
         out.to_tokens(tokens);
+        if self.args.mvcc.is_some() {
+            let out = self.tokens_for_db_type(true);
+            out.to_tokens(tokens);
+        }
     }
 }
 
 pub fn test_macro_attribute(args: TokenStream, input: TokenStream) -> TokenStream {
-    eprintln!("args: {args} \ninput : {input}");
     let input = parse_macro_input!(input as ItemFn);
 
     let args = parse_macro_input!(args as Args);
-
-    dbg!(&args);
 
     let tmp_db_arg = match check_fn_inputs(&input) {
         Ok(fn_arg) => fn_arg,
