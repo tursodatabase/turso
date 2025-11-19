@@ -651,450 +651,12 @@ pub fn translate_alter_table(
 
                         // Check trigger commands for qualified references to trigger table (e.g., t.x)
                         // SQLite fails RENAME COLUMN if triggers contain qualified references like t.x
-                        // We check all expressions in trigger commands for qualified references
-                        use crate::translate::expr::walk_expr;
-                        let mut found_qualified_ref = false;
-                        for cmd in &trigger.commands {
-                            match cmd {
-                                ast::TriggerCmd::Update {
-                                    sets, where_clause, ..
-                                } => {
-                                    for set in sets {
-                                        walk_expr(
-                                            &set.expr,
-                                            &mut |e: &ast::Expr| -> Result<
-                                                crate::translate::expr::WalkControl,
-                                            > {
-                                                if let ast::Expr::Qualified(ns, col)
-                                                | ast::Expr::DoublyQualified(_, ns, col) = e
-                                                {
-                                                    let ns_norm = normalize_ident(ns.as_str());
-                                                    let col_norm = normalize_ident(col.as_str());
-                                                    // Check if it's a qualified reference to trigger table (not NEW/OLD)
-                                                    if !ns_norm.eq_ignore_ascii_case("new")
-                                                        && !ns_norm.eq_ignore_ascii_case("old")
-                                                        && ns_norm == trigger_table_name_norm
-                                                        && col_norm == column_name_norm
-                                                    {
-                                                        if trigger_table
-                                                            .get_column(&col_norm)
-                                                            .is_some()
-                                                        {
-                                                            found_qualified_ref = true;
-                                                            return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                                                        }
-                                                    }
-                                                }
-                                                Ok(crate::translate::expr::WalkControl::Continue)
-                                            },
-                                        )?;
-                                        if found_qualified_ref {
-                                            break;
-                                        }
-                                    }
-                                    if !found_qualified_ref {
-                                        if let Some(ref where_expr) = where_clause {
-                                            walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<crate::translate::expr::WalkControl> {
-                                                if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
-                                                    let ns_norm = normalize_ident(ns.as_str());
-                                                    let col_norm = normalize_ident(col.as_str());
-                                                    if !ns_norm.eq_ignore_ascii_case("new") 
-                                                        && !ns_norm.eq_ignore_ascii_case("old")
-                                                        && ns_norm == trigger_table_name_norm
-                                                        && col_norm == column_name_norm
-                                                    {
-                                                        if trigger_table.get_column(&col_norm).is_some() {
-                                                            found_qualified_ref = true;
-                                                            return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                                                        }
-                                                    }
-                                                }
-                                                Ok(crate::translate::expr::WalkControl::Continue)
-                                            })?;
-                                        }
-                                    }
-                                }
-                                ast::TriggerCmd::Insert { select, .. }
-                                | ast::TriggerCmd::Select(select) => {
-                                    // Walk through all expressions in SELECT and check ONLY for qualified refs to trigger table
-                                    // We need to check specifically for qualified refs (t.x), not NEW.x, OLD.x, or unqualified x
-                                    // Use walk_select_expressions but check only for qualified refs manually
-                                    use crate::translate::expr::walk_expr;
-                                    // Helper function to check for qualified refs to trigger table
-                                    fn check_qualified_ref_to_trigger_table(
-                                        e: &ast::Expr,
-                                        trigger_table: &crate::schema::BTreeTable,
-                                        trigger_table_name_norm: &str,
-                                        column_name_norm: &str,
-                                        found: &mut bool,
-                                    ) -> Result<crate::translate::expr::WalkControl>
-                                    {
-                                        if let ast::Expr::Qualified(ns, col)
-                                        | ast::Expr::DoublyQualified(_, ns, col) = e
-                                        {
-                                            let ns_norm = normalize_ident(ns.as_str());
-                                            let col_norm = normalize_ident(col.as_str());
-                                            // Only check for qualified refs to trigger table (not NEW/OLD)
-                                            if !ns_norm.eq_ignore_ascii_case("new")
-                                                && !ns_norm.eq_ignore_ascii_case("old")
-                                                && ns_norm == trigger_table_name_norm
-                                                && col_norm == column_name_norm
-                                            {
-                                                if trigger_table.get_column(&col_norm).is_some() {
-                                                    *found = true;
-                                                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                                                }
-                                            }
-                                        }
-                                        Ok(crate::translate::expr::WalkControl::Continue)
-                                    }
-                                    // Check WITH clause
-                                    if let Some(ref with_clause) = select.with {
-                                        for cte in &with_clause.ctes {
-                                            walk_one_select_expressions(
-                                                &cte.select.body.select,
-                                                &trigger_table,
-                                                &trigger_table_name_norm,
-                                                &column_name_norm,
-                                                &mut found_qualified_ref,
-                                            )?;
-                                            if found_qualified_ref {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Check main SELECT body
-                                    if !found_qualified_ref {
-                                        match &select.body.select {
-                                            ast::OneSelect::Select {
-                                                columns,
-                                                from,
-                                                where_clause,
-                                                group_by,
-                                                window_clause,
-                                                ..
-                                            } => {
-                                                // Check columns
-                                                for col in columns {
-                                                    if let ast::ResultColumn::Expr(expr, _) = col {
-                                                        walk_expr(expr, &mut |e| {
-                                                            check_qualified_ref_to_trigger_table(
-                                                                e,
-                                                                &trigger_table,
-                                                                &trigger_table_name_norm,
-                                                                &column_name_norm,
-                                                                &mut found_qualified_ref,
-                                                            )
-                                                        })?;
-                                                        if found_qualified_ref {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                // Check FROM clause - use walk_from_clause_expressions but it uses check_column_ref
-                                                // which checks for all refs. We need to manually check for qualified refs only.
-                                                // Actually, walk_from_clause_expressions will set found_qualified_ref if it finds
-                                                // qualified refs via check_column_ref, so we can use it.
-                                                if !found_qualified_ref {
-                                                    if let Some(ref from_clause) = from {
-                                                        walk_from_clause_expressions(
-                                                            from_clause,
-                                                            &trigger_table,
-                                                            &trigger_table_name_norm,
-                                                            &column_name_norm,
-                                                            &mut found_qualified_ref,
-                                                        )?;
-                                                    }
-                                                }
-                                                // Check WHERE clause
-                                                if !found_qualified_ref {
-                                                    if let Some(ref where_expr) = where_clause {
-                                                        walk_expr(where_expr, &mut |e| {
-                                                            check_qualified_ref_to_trigger_table(
-                                                                e,
-                                                                &trigger_table,
-                                                                &trigger_table_name_norm,
-                                                                &column_name_norm,
-                                                                &mut found_qualified_ref,
-                                                            )
-                                                        })?;
-                                                    }
-                                                }
-                                                // Check GROUP BY
-                                                if !found_qualified_ref {
-                                                    if let Some(ref group_by) = group_by {
-                                                        for expr in &group_by.exprs {
-                                                            walk_expr(expr, &mut |e| {
-                                                                check_qualified_ref_to_trigger_table(
-                                                                    e,
-                                                                    &trigger_table,
-                                                                    &trigger_table_name_norm,
-                                                                    &column_name_norm,
-                                                                    &mut found_qualified_ref,
-                                                                )
-                                                            })?;
-                                                            if found_qualified_ref {
-                                                                break;
-                                                            }
-                                                        }
-                                                        if !found_qualified_ref {
-                                                            if let Some(ref having_expr) =
-                                                                group_by.having
-                                                            {
-                                                                walk_expr(having_expr, &mut |e| {
-                                                                    check_qualified_ref_to_trigger_table(
-                                                                    e, &trigger_table, &trigger_table_name_norm, &column_name_norm, &mut found_qualified_ref
-                                                                )
-                                                                })?;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                // Check WINDOW clause
-                                                if !found_qualified_ref {
-                                                    for window_def in window_clause {
-                                                        walk_window_expressions(
-                                                            &window_def.window,
-                                                            &trigger_table,
-                                                            &trigger_table_name_norm,
-                                                            &column_name_norm,
-                                                            &mut found_qualified_ref,
-                                                        )?;
-                                                        if found_qualified_ref {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            ast::OneSelect::Values(values) => {
-                                                for row in values {
-                                                    for expr in row {
-                                                        walk_expr(expr, &mut |e| {
-                                                            check_qualified_ref_to_trigger_table(
-                                                                e,
-                                                                &trigger_table,
-                                                                &trigger_table_name_norm,
-                                                                &column_name_norm,
-                                                                &mut found_qualified_ref,
-                                                            )
-                                                        })?;
-                                                        if found_qualified_ref {
-                                                            break;
-                                                        }
-                                                    }
-                                                    if found_qualified_ref {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Check compound SELECTs
-                                    if !found_qualified_ref {
-                                        for compound in &select.body.compounds {
-                                            match &compound.select {
-                                                ast::OneSelect::Select {
-                                                    columns,
-                                                    from,
-                                                    where_clause,
-                                                    group_by,
-                                                    window_clause,
-                                                    ..
-                                                } => {
-                                                    for col in columns {
-                                                        if let ast::ResultColumn::Expr(expr, _) =
-                                                            col
-                                                        {
-                                                            walk_expr(expr, &mut |e| {
-                                                                check_qualified_ref_to_trigger_table(
-                                                                    e,
-                                                                    &trigger_table,
-                                                                    &trigger_table_name_norm,
-                                                                    &column_name_norm,
-                                                                    &mut found_qualified_ref,
-                                                                )
-                                                            })?;
-                                                            if found_qualified_ref {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    if !found_qualified_ref {
-                                                        if let Some(ref from_clause) = from {
-                                                            walk_from_clause_expressions(
-                                                                from_clause,
-                                                                &trigger_table,
-                                                                &trigger_table_name_norm,
-                                                                &column_name_norm,
-                                                                &mut found_qualified_ref,
-                                                            )?;
-                                                        }
-                                                    }
-                                                    if !found_qualified_ref {
-                                                        if let Some(ref where_expr) = where_clause {
-                                                            walk_expr(where_expr, &mut |e| {
-                                                                check_qualified_ref_to_trigger_table(
-                                                                    e,
-                                                                    &trigger_table,
-                                                                    &trigger_table_name_norm,
-                                                                    &column_name_norm,
-                                                                    &mut found_qualified_ref,
-                                                                )
-                                                            })?;
-                                                        }
-                                                    }
-                                                    if !found_qualified_ref {
-                                                        if let Some(ref group_by) = group_by {
-                                                            for expr in &group_by.exprs {
-                                                                walk_expr(expr, &mut |e| {
-                                                                    check_qualified_ref_to_trigger_table(
-                                                                    e, &trigger_table, &trigger_table_name_norm, &column_name_norm, &mut found_qualified_ref
-                                                                )
-                                                                })?;
-                                                                if found_qualified_ref {
-                                                                    break;
-                                                                }
-                                                            }
-                                                            if !found_qualified_ref {
-                                                                if let Some(ref having_expr) =
-                                                                    group_by.having
-                                                                {
-                                                                    walk_expr(
-                                                                        having_expr,
-                                                                        &mut |e| {
-                                                                            check_qualified_ref_to_trigger_table(
-                                                                        e, &trigger_table, &trigger_table_name_norm, &column_name_norm, &mut found_qualified_ref
-                                                                    )
-                                                                        },
-                                                                    )?;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if !found_qualified_ref {
-                                                        for window_def in window_clause {
-                                                            walk_window_expressions(
-                                                                &window_def.window,
-                                                                &trigger_table,
-                                                                &trigger_table_name_norm,
-                                                                &column_name_norm,
-                                                                &mut found_qualified_ref,
-                                                            )?;
-                                                            if found_qualified_ref {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                ast::OneSelect::Values(values) => {
-                                                    for row in values {
-                                                        for expr in row {
-                                                            walk_expr(expr, &mut |e| {
-                                                                check_qualified_ref_to_trigger_table(
-                                                                    e,
-                                                                    &trigger_table,
-                                                                    &trigger_table_name_norm,
-                                                                    &column_name_norm,
-                                                                    &mut found_qualified_ref,
-                                                                )
-                                                            })?;
-                                                            if found_qualified_ref {
-                                                                break;
-                                                            }
-                                                        }
-                                                        if found_qualified_ref {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if found_qualified_ref {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Check ORDER BY
-                                    if !found_qualified_ref {
-                                        for sorted_col in &select.order_by {
-                                            walk_expr(&sorted_col.expr, &mut |e| {
-                                                check_qualified_ref_to_trigger_table(
-                                                    e,
-                                                    &trigger_table,
-                                                    &trigger_table_name_norm,
-                                                    &column_name_norm,
-                                                    &mut found_qualified_ref,
-                                                )
-                                            })?;
-                                            if found_qualified_ref {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Check LIMIT
-                                    if !found_qualified_ref {
-                                        if let Some(ref limit) = select.limit {
-                                            walk_expr(&limit.expr, &mut |e| {
-                                                check_qualified_ref_to_trigger_table(
-                                                    e,
-                                                    &trigger_table,
-                                                    &trigger_table_name_norm,
-                                                    &column_name_norm,
-                                                    &mut found_qualified_ref,
-                                                )
-                                            })?;
-                                            if !found_qualified_ref {
-                                                if let Some(ref offset) = limit.offset {
-                                                    walk_expr(offset, &mut |e| {
-                                                        check_qualified_ref_to_trigger_table(
-                                                            e,
-                                                            &trigger_table,
-                                                            &trigger_table_name_norm,
-                                                            &column_name_norm,
-                                                            &mut found_qualified_ref,
-                                                        )
-                                                    })?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ast::TriggerCmd::Delete { where_clause, .. } => {
-                                    if let Some(ref where_expr) = where_clause {
-                                        walk_expr(
-                                            where_expr,
-                                            &mut |e: &ast::Expr| -> Result<
-                                                crate::translate::expr::WalkControl,
-                                            > {
-                                                if let ast::Expr::Qualified(ns, col)
-                                                | ast::Expr::DoublyQualified(_, ns, col) = e
-                                                {
-                                                    let ns_norm = normalize_ident(ns.as_str());
-                                                    let col_norm = normalize_ident(col.as_str());
-                                                    if !ns_norm.eq_ignore_ascii_case("new")
-                                                        && !ns_norm.eq_ignore_ascii_case("old")
-                                                        && ns_norm == trigger_table_name_norm
-                                                        && col_norm == column_name_norm
-                                                    {
-                                                        if trigger_table
-                                                            .get_column(&col_norm)
-                                                            .is_some()
-                                                        {
-                                                            found_qualified_ref = true;
-                                                            return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                                                        }
-                                                    }
-                                                }
-                                                Ok(crate::translate::expr::WalkControl::Continue)
-                                            },
-                                        )?;
-                                    }
-                                }
-                            }
-                            if found_qualified_ref {
-                                break;
-                            }
-                        }
-                        if found_qualified_ref {
+                        if check_trigger_has_qualified_ref_to_column(
+                            trigger,
+                            &trigger_table,
+                            &trigger_table_name_norm,
+                            &column_name_norm,
+                        )? {
                             return Err(LimboError::ParseError(format!(
                                 "error in trigger {}: no such column: {}",
                                 trigger.name, from
@@ -1383,6 +945,243 @@ fn translate_rename_virtual_table(
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.
 Here are some helpers related to that: */
 
+/// Check if a trigger contains qualified references to a specific column in its owning table.
+/// This is used to detect cases like `t.x` in a trigger on table `t`, which SQLite fails on RENAME COLUMN.
+/// Only checks for qualified table references (e.g., t.x), not NEW.x, OLD.x, or unqualified x.
+fn check_trigger_has_qualified_ref_to_column(
+    trigger: &crate::schema::Trigger,
+    trigger_table: &crate::schema::BTreeTable,
+    trigger_table_name_norm: &str,
+    column_name_norm: &str,
+) -> Result<bool> {
+    use crate::translate::expr::walk_expr;
+    use std::cell::Cell;
+
+    let found = Cell::new(false);
+
+    // Helper callback to check for qualified references to trigger table
+    let mut check_qualified_ref = |e: &ast::Expr| -> Result<crate::translate::expr::WalkControl> {
+        if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
+            let ns_norm = normalize_ident(ns.as_str());
+            let col_norm = normalize_ident(col.as_str());
+            // Only check for qualified refs to trigger table (not NEW/OLD)
+            if !ns_norm.eq_ignore_ascii_case("new")
+                && !ns_norm.eq_ignore_ascii_case("old")
+                && ns_norm == trigger_table_name_norm
+                && col_norm == column_name_norm
+                && trigger_table.get_column(&col_norm).is_some()
+            {
+                found.set(true);
+                return Ok(crate::translate::expr::WalkControl::SkipChildren);
+            }
+        }
+        Ok(crate::translate::expr::WalkControl::Continue)
+    };
+
+    for cmd in &trigger.commands {
+        match cmd {
+            ast::TriggerCmd::Update {
+                sets, where_clause, ..
+            } => {
+                for set in sets {
+                    walk_expr(&set.expr, &mut check_qualified_ref)?;
+                    if found.get() {
+                        return Ok(true);
+                    }
+                }
+                if let Some(ref where_expr) = where_clause {
+                    walk_expr(where_expr, &mut check_qualified_ref)?;
+                    if found.get() {
+                        return Ok(true);
+                    }
+                }
+            }
+            ast::TriggerCmd::Insert { select, .. } | ast::TriggerCmd::Select(select) => {
+                // Walk through all expressions in SELECT checking for qualified refs
+                if let Some(ref with_clause) = select.with {
+                    for cte in &with_clause.ctes {
+                        if walk_one_select_expressions_for_qualified_ref(
+                            &cte.select.body.select,
+                            &mut check_qualified_ref,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                if walk_one_select_expressions_for_qualified_ref(
+                    &select.body.select,
+                    &mut check_qualified_ref,
+                )? {
+                    return Ok(true);
+                }
+                for compound in &select.body.compounds {
+                    if walk_one_select_expressions_for_qualified_ref(
+                        &compound.select,
+                        &mut check_qualified_ref,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                for sorted_col in &select.order_by {
+                    walk_expr(&sorted_col.expr, &mut check_qualified_ref)?;
+                    if found.get() {
+                        return Ok(true);
+                    }
+                }
+                if let Some(ref limit) = select.limit {
+                    walk_expr(&limit.expr, &mut check_qualified_ref)?;
+                    if found.get() {
+                        return Ok(true);
+                    }
+                    if let Some(ref offset) = limit.offset {
+                        walk_expr(offset, &mut check_qualified_ref)?;
+                        if found.get() {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            ast::TriggerCmd::Delete { where_clause, .. } => {
+                if let Some(ref where_expr) = where_clause {
+                    walk_expr(where_expr, &mut check_qualified_ref)?;
+                    if found.get() {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Helper to walk OneSelect expressions checking for qualified references
+/// Uses a callback that can mutate the found flag through a closure
+fn walk_one_select_expressions_for_qualified_ref<F>(
+    one_select: &ast::OneSelect,
+    check_fn: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&ast::Expr) -> Result<crate::translate::expr::WalkControl>,
+{
+    use crate::translate::expr::walk_expr;
+
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            for col in columns {
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if matches!(
+                        walk_expr(expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+            }
+            if let Some(ref from_clause) = from {
+                // Walk FROM clause expressions manually using walk_expr
+                match from_clause.select.as_ref() {
+                    ast::SelectTable::Select(select, _) => {
+                        // Recursively check the subquery
+                        if walk_one_select_expressions_for_qualified_ref(
+                            &select.body.select,
+                            check_fn,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    ast::SelectTable::TableCall(_, args, _) => {
+                        for arg in args {
+                            if matches!(
+                                walk_expr(arg, check_fn)?,
+                                crate::translate::expr::WalkControl::SkipChildren
+                            ) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for join in &from_clause.joins {
+                    if let Some(ast::JoinConstraint::On(ref expr)) = join.constraint {
+                        let skip_children = matches!(
+                            walk_expr(expr, check_fn)?,
+                            crate::translate::expr::WalkControl::SkipChildren
+                        );
+                        if skip_children {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            if let Some(ref where_expr) = where_clause {
+                if matches!(
+                    walk_expr(where_expr, check_fn)?,
+                    crate::translate::expr::WalkControl::SkipChildren
+                ) {
+                    return Ok(true);
+                }
+            }
+            if let Some(ref group_by) = group_by {
+                for expr in &group_by.exprs {
+                    if matches!(
+                        walk_expr(expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                if let Some(ref having_expr) = group_by.having {
+                    if matches!(
+                        walk_expr(having_expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+            }
+            for window_def in window_clause {
+                for expr in &window_def.window.partition_by {
+                    if matches!(
+                        walk_expr(expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+                for sorted_col in &window_def.window.order_by {
+                    if matches!(
+                        walk_expr(&sorted_col.expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    if matches!(
+                        walk_expr(expr, check_fn)?,
+                        crate::translate::expr::WalkControl::SkipChildren
+                    ) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Check if an expression references a specific column from a trigger's owning table.
 /// Checks for NEW.column, OLD.column, unqualified column references, and qualified
 /// references to the trigger table (e.g., t.x in a trigger on table t).
@@ -1412,11 +1211,12 @@ fn expr_references_trigger_column(
                     return Ok(crate::translate::expr::WalkControl::SkipChildren);
                 }
                 // Check qualified reference to trigger table (e.g., t.x)
-                if ns_norm == trigger_table_name_norm && col_norm == *column_name_norm {
-                    if table.get_column(&col_norm).is_some() {
-                        found = true;
-                        return Ok(crate::translate::expr::WalkControl::SkipChildren);
-                    }
+                if ns_norm == trigger_table_name_norm
+                    && col_norm == *column_name_norm
+                    && table.get_column(&col_norm).is_some()
+                {
+                    found = true;
+                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
                 }
             }
             ast::Expr::Id(col) => {
@@ -1556,17 +1356,13 @@ fn check_column_ref(
             let ns_norm = normalize_ident(ns.as_str());
             let col_norm = normalize_ident(col.as_str());
 
-            // Check NEW.column or OLD.column
-            if (ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old"))
+            let new_or_old = ns_norm.eq_ignore_ascii_case("new")
+                || ns_norm.eq_ignore_ascii_case("old") && col_norm == *column_name_norm;
+            let qualified_ref = ns_norm == trigger_table_name_norm
                 && col_norm == *column_name_norm
-            {
+                && table.get_column(&col_norm).is_some();
+            if new_or_old || qualified_ref {
                 *found = true;
-            }
-            // Check qualified reference to trigger table (e.g., t.x)
-            else if ns_norm == trigger_table_name_norm && col_norm == *column_name_norm {
-                if table.get_column(&col_norm).is_some() {
-                    *found = true;
-                }
             }
         }
         ast::Expr::Id(col) => {
