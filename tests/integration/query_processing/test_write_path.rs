@@ -85,12 +85,10 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_sequential_overflow_page() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
+fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
     let iterations = 10_usize;
 

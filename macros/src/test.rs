@@ -8,7 +8,7 @@ use syn::{
     parse_macro_input,
     punctuated::Punctuated,
     spanned::Spanned,
-    Ident, ItemFn, Meta, Pat, ReturnType, Token, Type,
+    Expr, Ident, ItemFn, Meta, Pat, ReturnType, Token, Type,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +43,61 @@ impl<T: ToTokens> ToTokens for SpannedType<T> {
 struct Args {
     path: Option<SpannedType<String>>,
     mvcc: Option<SpannedType<()>>,
+    init_sql: Option<Expr>,
+}
+
+impl Args {
+    fn get_tmp_db_builder(
+        &self,
+        fn_name: &Ident,
+        tmp_db_ty: &Type,
+        mvcc: bool,
+    ) -> proc_macro2::TokenStream {
+        let mut builder = quote! {#tmp_db_ty::builder()};
+
+        let db_name = self.path.clone().map_or_else(
+            || {
+                let name = format!("{fn_name}.db");
+                quote! {#name}
+            },
+            |path| path.to_token_stream(),
+        );
+
+        let mut db_opts = quote! {
+            turso_core::DatabaseOpts::new()
+                .with_indexes(true)
+                .with_index_method(true)
+                .with_encryption(true)
+        };
+
+        if let Some(spanned) = self
+            .mvcc
+            .filter(|_| mvcc)
+            .map(|val| val.map(|_| quote! {.with_mvcc(true)}))
+        {
+            db_opts = quote! {
+                #db_opts
+                #spanned
+            }
+        }
+
+        builder = quote! {
+            #builder
+            .with_db_name(#db_name)
+            .with_opts(#db_opts)
+        };
+
+        if let Some(expr) = &self.init_sql {
+            builder = quote! {
+                #builder
+                .with_init_sql(#expr)
+            };
+        }
+
+        quote! {
+            #builder.build()
+        }
+    }
 }
 
 impl Parse for Args {
@@ -52,6 +107,7 @@ impl Parse for Args {
 
         let mut path = None;
         let mut mvcc = None;
+        let mut init_sql = None;
 
         let errors = args
             .into_iter()
@@ -59,19 +115,33 @@ impl Parse for Args {
                 match meta {
                     Meta::NameValue(nv) => {
                         let ident = nv.path.get_ident();
-                        if nv.path.is_ident("path") {
-                            if let syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(lit_str),
-                                ..
-                            }) = &nv.value
-                            {
-                                path = Some(SpannedType(lit_str.value(), nv.value.span()));
-                                seen_args.insert(ident.unwrap().clone());
-                            } else {
-                                return Some(syn::Error::new_spanned(
-                                    nv.value,
-                                    "argument is not a string literal",
-                                ));
+                        if let Some(ident) = ident {
+                            let ident_string = ident.to_string();
+                            match ident_string.as_str() {
+                                "path" => {
+                                    if let syn::Expr::Lit(syn::ExprLit {
+                                        lit: syn::Lit::Str(lit_str),
+                                        ..
+                                    }) = &nv.value
+                                    {
+                                        path = Some(SpannedType(lit_str.value(), nv.value.span()));
+                                        seen_args.insert(ident.clone());
+                                    } else {
+                                        return Some(syn::Error::new_spanned(
+                                            nv.value,
+                                            "argument is not a string literal",
+                                        ));
+                                    }
+                                }
+                                "init_sql" => {
+                                    init_sql = Some(nv.value.clone());
+                                }
+                                _ => {
+                                    return Some(syn::Error::new_spanned(
+                                        nv.path,
+                                        "unexpected argument",
+                                    ))
+                                }
                             }
                         } else {
                             return Some(syn::Error::new_spanned(nv.path, "unexpected argument"));
@@ -101,7 +171,11 @@ impl Parse for Args {
             return Err(errors);
         }
 
-        Ok(Args { path, mvcc })
+        Ok(Args {
+            path,
+            mvcc,
+            init_sql,
+        })
     }
 }
 
@@ -138,33 +212,6 @@ impl DatabaseFunction {
         // Check the return type
         let is_result = is_result(&sig.output);
 
-        let db_path = self.args.path.clone().map_or_else(
-            || {
-                let name = format!("{fn_name}.db");
-                quote! {#name}
-            },
-            |path| path.to_token_stream(),
-        );
-
-        let mut db_opts = quote! {
-            turso_core::DatabaseOpts::new()
-                .with_indexes(true)
-                .with_index_method(true)
-                .with_encryption(true)
-        };
-
-        if let Some(spanned) = self
-            .args
-            .mvcc
-            .filter(|_| mvcc)
-            .map(|val| val.map(|_| quote! {.with_mvcc(true)}))
-        {
-            db_opts = quote! {
-                #db_opts
-                #spanned
-            }
-        }
-
         let (arg_name, arg_ty) = &self.tmp_db_fn_arg;
         let fn_out = &sig.output;
 
@@ -174,11 +221,13 @@ impl DatabaseFunction {
             quote! {(|#arg_name: #arg_ty| #block)(#arg_name);}
         };
 
+        let tmp_db_builder_args = self.args.get_tmp_db_builder(&fn_name, &arg_ty, mvcc);
+
         quote! {
             #[test]
             #(#attrs)*
             #vis fn #fn_name #fn_generics() {
-                let #arg_name = #arg_ty::new_with_opts(#db_path, #db_opts);
+                let #arg_name = #tmp_db_builder_args;
 
                 #call_func
             }
