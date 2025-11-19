@@ -1,21 +1,19 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
-
-use crate::translate::plan::JoinedTable;
 use crate::{
     schema::{Column, Index},
     translate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
-        plan::{JoinOrderMember, NonFromClauseSubquery, TableReferences, WhereTerm},
+        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask, ROWID_STRS},
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
     Result,
+};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};

@@ -46,6 +46,7 @@ use crate::translate::trigger_exec::{
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::{insn::Insn, BranchOffset};
@@ -2056,7 +2057,7 @@ fn emit_update_insns<'a>(
                 .iter()
                 .map(|ic| {
                     if ic.expr.is_some() {
-                        crate::vdbe::affinity::Affinity::Blob.aff_mask()
+                        Affinity::Blob.aff_mask()
                     } else {
                         target_table.table.columns()[ic.pos_in_table]
                             .affinity()

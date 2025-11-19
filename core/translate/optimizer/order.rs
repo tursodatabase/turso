@@ -1,12 +1,13 @@
-use std::cell::RefCell;
-
-use turso_parser::ast::{self, SortOrder, TableInternalId};
-
 use crate::{
-    translate::optimizer::access_method::AccessMethodParams,
-    translate::plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
+    translate::{
+        optimizer::access_method::AccessMethodParams,
+        plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
+        planner::table_mask_from_expr,
+    },
     util::exprs_are_equivalent,
 };
+use std::cell::RefCell;
+use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, join::JoinN};
 
@@ -14,7 +15,9 @@ use super::{access_method::AccessMethod, join::JoinN};
 #[derive(Debug, PartialEq, Clone)]
 pub enum ColumnTarget {
     Column(usize),
-    Expr(ast::Expr),
+    /// We know that the ast lives at least as long as the Statement/Program,
+    /// so we store a raw pointer here to avoid cloning yet another ast::Expr
+    Expr(*const ast::Expr),
 }
 
 /// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
@@ -52,9 +55,7 @@ impl OrderTarget {
         }
         let mut cols = Vec::new();
         for (expr, order) in list {
-            let Some(col) = expr_to_column_order(expr, order, tables) else {
-                return None;
-            };
+            let col = expr_to_column_order(expr, order, tables)?;
             cols.push(col);
         }
         Some(OrderTarget(cols, eliminates_sort))
@@ -222,7 +223,7 @@ pub fn plan_satisfies_order_target(
                         let column_matches = match (&target_col.target, &idx_col.expr) {
                             (ColumnTarget::Column(col_no), None) => idx_col.pos_in_table == *col_no,
                             (ColumnTarget::Expr(expr), Some(idx_expr)) => {
-                                exprs_are_equivalent(expr, idx_expr)
+                                exprs_are_equivalent(unsafe { &**expr }, idx_expr)
                             }
                             _ => false,
                         };
@@ -268,7 +269,7 @@ fn expr_to_column_order(
             order,
         });
     }
-    let mask = crate::translate::planner::table_mask_from_expr(expr, tables, &[])
+    let mask = table_mask_from_expr(expr, tables, &[])
         .expect("table mask extraction must succeed for order target");
     if mask.table_count() != 1 {
         return None;
@@ -282,7 +283,7 @@ fn expr_to_column_order(
     let table_id = tables.joined_tables()[table_no].internal_id;
     Some(ColumnOrder {
         table_id,
-        target: ColumnTarget::Expr(expr.clone()),
+        target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
     })
 }

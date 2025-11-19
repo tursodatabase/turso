@@ -596,6 +596,7 @@ pub fn translate_insert(
             &table,
             &mut result_columns,
             connection,
+            &mut table_references,
         )?;
     }
 
@@ -861,6 +862,7 @@ fn resolve_upserts(
     table: &Table,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
+    table_references: &mut TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);

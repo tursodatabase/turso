@@ -6,6 +6,7 @@ use turso_parser::ast::SortOrder;
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, Constraint, RangeConstraintRef,
 };
+use crate::util::exprs_are_equivalent;
 use crate::{
     schema::{Index, Table},
     translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
@@ -147,7 +148,7 @@ fn find_best_access_method_for_btree(
                     (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
                         .expr
                         .as_ref()
-                        .is_some_and(|e| crate::util::exprs_are_equivalent(e, expr)),
+                        .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)
                     }
