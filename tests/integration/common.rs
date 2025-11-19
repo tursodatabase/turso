@@ -17,7 +17,7 @@ pub struct TempDatabase {
 }
 unsafe impl Send for TempDatabase {}
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TempDatabaseBuilder {
     db_name: Option<String>,
     db_path: Option<PathBuf>,
