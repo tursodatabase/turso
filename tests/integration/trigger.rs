@@ -1917,3 +1917,39 @@ fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table() {
         "INSERT should fail because trigger references dropped column"
     );
 }
+
+#[test]
+fn test_alter_table_rename_column_qualified_reference_to_trigger_table() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+
+    // Create two tables
+    conn.execute("CREATE TABLE t (x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (z INTEGER)").unwrap();
+
+    // Note: SQLite doesn't support qualified references to the trigger's owning table (t.x).
+    // SQLite fails the RENAME COLUMN operation with "error in trigger tu: no such column: t.x".
+    // We match SQLite's behavior - the rename should fail.
+
+    // Create trigger on t that uses qualified reference t.x (invalid in SQLite)
+    conn.execute(
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+         UPDATE u SET z = t.x WHERE z = 1;
+        END",
+    )
+    .unwrap();
+
+    // Rename column x to x_new in table t should fail (SQLite fails with "no such column: t.x")
+    let result = conn.execute("ALTER TABLE t RENAME COLUMN x TO x_new");
+    assert!(
+        result.is_err(),
+        "RENAME COLUMN should fail when trigger uses qualified reference to trigger table"
+    );
+
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("error in trigger") || error_msg.contains("no such column"),
+        "Error should mention trigger or column: {error_msg}",
+    );
+}
