@@ -7,7 +7,7 @@ use turso_parser::ast::{self, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
@@ -570,16 +570,18 @@ pub fn emit_upsert(
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if let Some(expr) = &ic.expr {
                     let mut e = expr.as_ref().clone();
-                    bind_and_rewrite_expr(
+                    rewrite_expr_to_registers(
                         &mut e,
-                        Some(table_references),
+                        table,
+                        before,
+                        ctx.conflict_rowid_reg,
+                        Some(table.get_name()),
                         None,
-                        connection,
-                        BindingBehavior::ResultColumnsNotAllowed,
+                        false,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
-                        Some(table_references),
+                        None,
                         &e,
                         del + i,
                         resolver,
@@ -625,16 +627,18 @@ pub fn emit_upsert(
             for (i, ic) in idx_meta.columns.iter().enumerate() {
                 if let Some(expr) = &ic.expr {
                     let mut e = expr.as_ref().clone();
-                    bind_and_rewrite_expr(
+                    rewrite_expr_to_registers(
                         &mut e,
-                        Some(table_references),
+                        table,
+                        new_start,
+                        new_rowid,
+                        Some(table.get_name()),
                         None,
-                        connection,
-                        BindingBehavior::ResultColumnsNotAllowed,
+                        false,
                     )?;
                     translate_expr_no_constant_opt(
                         program,
-                        Some(table_references),
+                        None,
                         &e,
                         ins + i,
                         resolver,
