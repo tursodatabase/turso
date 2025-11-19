@@ -9,6 +9,7 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -1267,7 +1268,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         start: i64,
         tx_id: TxID,
     ) -> Option<RowID> {
-        let res = self.get_row_id_for_table_in_direction(table_id, start, tx_id, true);
+        let res = self.get_row_id_for_table_in_direction(
+            table_id,
+            start,
+            tx_id,
+            IterationDirection::Forwards,
+        );
         tracing::trace!(
             "get_next_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
             table_id,
@@ -1284,7 +1290,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         start: i64,
         tx_id: TxID,
     ) -> Option<RowID> {
-        let res = self.get_row_id_for_table_in_direction(table_id, start, tx_id, false);
+        let res = self.get_row_id_for_table_in_direction(
+            table_id,
+            start,
+            tx_id,
+            IterationDirection::Backwards,
+        );
         tracing::trace!(
             "get_prev_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
             table_id,
@@ -1300,18 +1311,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_id: MVTableId,
         start: i64,
         tx_id: TxID,
-        forwards: bool,
+        direction: IterationDirection,
     ) -> Option<RowID> {
         tracing::trace!(
-            "getting_row_id_for_table_in_direction(table_id={}, range_start={}, forwards={})",
+            "getting_row_id_for_table_in_direction(table_id={}, range_start={}, direction={:?})",
             table_id,
             start,
-            forwards
+            direction
         );
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        if forwards {
+        if direction == IterationDirection::Forwards {
             let min_bound = RowID {
                 table_id,
                 row_id: start,
@@ -1348,8 +1359,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             // In backward's direction we iterate in reverse order.
             let mut rows = self.rows.range(min_bound..max_bound).rev();
             loop {
-                // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
-                // to loop either until we find a row that is not deleted or until we reach the end of the table.
+                // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
+                // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
                 let next_row = rows.next();
                 let row = next_row?;
 
