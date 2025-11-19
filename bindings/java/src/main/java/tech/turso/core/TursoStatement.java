@@ -20,7 +20,7 @@ public final class TursoStatement {
 
   private final String sql;
   private final long statementPointer;
-  private final TursoResultSet resultSet;
+  private TursoResultSet resultSet;
 
   private boolean closed;
 
@@ -289,6 +289,17 @@ public final class TursoStatement {
   }
 
   private native int parameterCount(long statementPointer) throws SQLException;
+
+  /** Resets this statement so it's ready for re-execution */
+  public void reset() throws SQLException {
+    final int result = reset(statementPointer);
+    if (result == -1) {
+      throw new SQLException("Exception while resetting statement");
+    }
+    this.resultSet = TursoResultSet.of(this);
+  }
+
+  private native int reset(long statementPointer) throws SQLException;
 
   /**
    * Checks if the statement is closed.

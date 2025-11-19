@@ -2888,6 +2888,7 @@ impl Statement {
             &mut self.state.auto_txn_cleanup,
         );
         self.state.reset(max_registers, max_cursors);
+        self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_timeout = None;
     }

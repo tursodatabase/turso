@@ -22,7 +22,7 @@ import tech.turso.core.TursoResultSet;
 public final class JDBC4PreparedStatement extends JDBC4Statement implements PreparedStatement {
 
   private final String sql;
-  private JDBC4ResultSet resultSet;
+  private final JDBC4ResultSet resultSet;
 
   private final int paramCount;
   private Object[] currentBatchParams;
@@ -42,11 +42,6 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
     this.paramCount = statement.parameterCount();
     this.currentBatchParams = new Object[paramCount];
-  }
-
-  private void reprepareStatement() throws SQLException {
-    this.statement = connection.prepare(sql);
-    this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
   }
 
   @Override
@@ -362,8 +357,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     }
     for (int i = 0; i < batchQueryParams.size(); i++) {
       try {
-        // TODO: do this without creating a new statement because this has unnecessary overhead
-        reprepareStatement();
+        statement.reset();
         execute(batchQueryParams.get(i));
         updateCounts[i] = getUpdateCount();
       } catch (SQLException e) {
