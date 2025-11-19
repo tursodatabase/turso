@@ -1,9 +1,8 @@
 use crate::common::{limbo_exec_rows, TempDatabase};
 use turso_core::{LimboError, StepResult, Value};
 
-#[test]
-fn test_statement_reset_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
+#[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
+fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?")?;
@@ -45,9 +44,8 @@ fn test_statement_reset_bind() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_statement_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
+#[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
+fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     let mut stmt = conn.prepare("select ?, ?1, :named, ?3, ?4")?;
@@ -98,8 +96,11 @@ fn test_statement_bind() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_parameter_remap() -> anyhow::Result<()> {
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b integer, c integer, d integer);"
+)]
+fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // ───────────────────────  schema  ──────────────────────────────
     // Table             a     b     c     d
     // INSERT lists:     d ,   c ,   a ,   b
@@ -110,9 +111,6 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
     // We bind ?1 = 111 and ?2 = 222 and expect (7,222,111,22).
     // ───────────────────────────────────────────────────────────────
 
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b integer, c integer, d integer);",
-    );
     let conn = tmp_db.connect_limbo();
 
     // prepare INSERT with re-ordered columns and constants
@@ -161,8 +159,11 @@ fn test_insert_parameter_remap() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b integer, c integer, d integer);"
+)]
+fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // ───────────────────────  schema  ──────────────────────────────
     // Table             a     b     c     d
     // INSERT lists:     d ,   a ,   c ,   b
@@ -174,9 +175,6 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
     // The row should be (111, 444, 333, 999).
     // ───────────────────────────────────────────────────────────────
 
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b integer, c integer, d integer);",
-    );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d, a, c, b) values (?, ?, ?, ?);")?;
 
@@ -229,8 +227,11 @@ fn test_insert_parameter_remap_all_params() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b integer, c integer, d integer);"
+)]
+fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // ───────────────────────  schema  ──────────────────────────────
     // Table             a     b     c     d
     // INSERT lists:     d ,   c ,   b ,   a
@@ -241,9 +242,6 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
     // The row should be (111, 222, 333, 444)
     // ───────────────────────────────────────────────────────────────
 
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b integer, c integer, d integer);",
-    );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (d,c,b,a) values (?, ?, ?, ?);")?;
 
@@ -295,8 +293,12 @@ fn test_insert_parameter_multiple_remap_backwards() -> anyhow::Result<()> {
     assert_eq!(ins.parameters().count(), 4);
     Ok(())
 }
-#[test]
-fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
+
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b integer, c integer, d integer);"
+)]
+fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // ───────────────────────  schema  ──────────────────────────────
     // Table             a     b     c     d
     // INSERT lists:     a ,   b ,   c ,   d
@@ -307,9 +309,6 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
     // The row should be (111, 222, 333, 444)
     // ───────────────────────────────────────────────────────────────
 
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b integer, c integer, d integer);",
-    );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a,b,c,d) values (?, ?, ?, ?);")?;
 
@@ -362,8 +361,11 @@ fn test_insert_parameter_multiple_no_remap() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b integer, c integer, d integer);"
+)]
+fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // ───────────────────────  schema  ──────────────────────────────
     // Table             a     b     c     d
     // INSERT lists:     b ,   a ,   d ,   c
@@ -373,9 +375,6 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
     // The row should be (111, 222, 333, 444), (555, 666, 777, 888)
     // ───────────────────────────────────────────────────────────────
 
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b integer, c integer, d integer);",
-    );
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (b,a,d,c) values (?, ?, ?, ?), (?, ?, ?, ?);")?;
 
@@ -438,9 +437,8 @@ fn test_insert_parameter_multiple_row() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_bind_parameters_update_query() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (a integer, b text);");
+#[turso_macros::test(mvcc, init_sql = "create table test (a integer, b text);")]
+fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b) values (3, 'test1');")?;
     loop {
@@ -480,11 +478,11 @@ fn test_bind_parameters_update_query() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "create table test (a integer, b text, c integer, d integer);",
-    );
+#[turso_macros::test(
+    mvcc,
+    init_sql = "create table test (a integer, b text, c integer, d integer);"
+)]
+fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (a, b, c, d) values (3, 'test1', 4, 5);")?;
     loop {
@@ -527,10 +525,11 @@ fn test_bind_parameters_update_query_multiple_where() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);");
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);"
+)]
+fn test_bind_parameters_update_rowid_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut ins = conn.prepare("insert into test (id, name) values (1, 'test');")?;
     loop {
@@ -584,11 +583,11 @@ fn test_bind_parameters_update_rowid_alias() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
-    );
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);"
+)]
+fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'test', 4);")?;
     conn.execute("insert into test (id, name, age) values (2, 'test', 11);")?;
@@ -651,11 +650,14 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);",
-    );
+// TODO: mvcc fails with `BTree should have returned rowid after next`
+#[turso_macros::test(
+    
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);"
+)]
+fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into test (id, name, age) values (1, 'correct', 4);")?;
     conn.execute("insert into test (id, name, age) values (5, 'test', 11);")?;
@@ -694,10 +696,11 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order() -> anyhow::Result
     Ok(())
 }
 
-#[test]
-fn test_cte_alias() -> anyhow::Result<()> {
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);");
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);"
+)]
+fn test_cte_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("INSERT INTO test (id, name) VALUES (1, 'Limbo');")?;
     conn.execute("INSERT INTO test (id, name) VALUES (2, 'Turso');")?;
@@ -739,9 +742,8 @@ fn test_cte_alias() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_avg_agg() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x, y);");
+#[turso_macros::test(mvcc, init_sql = "create table t (x, y);")]
+fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("insert into t values (1, null), (2, null), (3, null), (null, null), (4, null)")?;
     let mut rows = Vec::new();
@@ -773,9 +775,8 @@ fn test_avg_agg() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_offset_limit_bind() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (i INTEGER);");
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (i INTEGER);")]
+fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO test VALUES (5), (4), (3), (2), (1)")?;
@@ -816,10 +817,11 @@ fn test_offset_limit_bind() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_upsert_parameters_order() -> anyhow::Result<()> {
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);");
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"
+)]
+fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
@@ -863,10 +865,16 @@ fn test_upsert_parameters_order() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_multiple_connections_visibility() -> anyhow::Result<()> {
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);");
+// TODO: mvcc fails with: 
+// tests/integration/query_processing/test_read_path.rs:883:5:
+// assertion `left == right` failed
+//   left: [[Integer(0)]]
+//  right: [[Integer(2)]]
+#[turso_macros::test(
+
+    init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"
+)]
+fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
     conn1.execute("BEGIN")?;
@@ -882,9 +890,8 @@ fn test_multiple_connections_visibility() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_stmt_reset() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x);");
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (x);")]
+fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn1 = tmp_db.connect_limbo();
     let mut stmt1 = conn1.prepare("INSERT INTO test VALUES (?)").unwrap();
     for _ in 0..3 {
@@ -925,10 +932,9 @@ fn test_stmt_reset() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test]
 /// Test that we can only join up to 63 tables, and trying to join more should fail with an error instead of panicing.
-fn test_max_joined_tables_limit() {
-    let tmp_db = TempDatabase::new("test_max_joined_tables_limit");
+fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     // Create 64 tables
@@ -949,9 +955,9 @@ fn test_max_joined_tables_limit() {
     assert!(result.contains("Only up to 63 tables can be joined"));
 }
 
-#[test]
+#[turso_macros::test]
 /// Test that we can create and select from a table with 1000 columns.
-fn test_many_columns() {
+fn test_many_columns(tmp_db: TempDatabase) {
     let mut create_sql = String::from("CREATE TABLE test (");
     for i in 0..1000 {
         if i > 0 {
@@ -961,7 +967,6 @@ fn test_many_columns() {
     }
     create_sql.push(')');
 
-    let tmp_db = TempDatabase::new("test_many_columns");
     let conn = tmp_db.connect_limbo();
     conn.execute(&create_sql).unwrap();
 
@@ -1019,9 +1024,8 @@ fn test_many_columns() {
     );
 }
 
-#[test]
-fn test_eval_param_only_once() {
-    let tmp_db = TempDatabase::new("test_eval_param_only_once");
+#[turso_macros::test]
+fn test_eval_param_only_once(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
