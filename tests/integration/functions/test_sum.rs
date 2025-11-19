@@ -1,11 +1,10 @@
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 use turso_core::LimboError;
 
-#[test]
-fn sum_errors_on_integer_overflow() {
+#[turso_macros::test(mvcc)]
+fn sum_errors_on_integer_overflow(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
 
-    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
