@@ -5,14 +5,14 @@ use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult, Value};
 
 use crate::{
-    generation::{
-        Shadow as _,
-        plan::{
-            ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
-            InteractionType, ResultSet,
+    generation::Shadow as _,
+    model::{
+        Query, ResultSet,
+        interactions::{
+            ConnectionState, Interaction, InteractionBuilder, InteractionPlanIterator,
+            InteractionPlanState, InteractionType,
         },
     },
-    model::Query,
 };
 
 use super::env::{SimConnection, SimulatorEnv};
@@ -199,10 +199,10 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
 
-            let query_interaction = Interaction::new(
-                interaction.connection_index,
-                InteractionType::Query(query.clone()),
-            );
+            let query_interaction = InteractionBuilder::from_interaction(interaction)
+                .interaction(InteractionType::Query(query.clone()))
+                .build()
+                .unwrap();
 
             execute_interaction(env, &query_interaction, stack)?;
         }

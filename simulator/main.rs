@@ -1,11 +1,8 @@
 #![allow(clippy::arc_with_non_send_sync)]
 use anyhow::anyhow;
 use clap::Parser;
-use generation::plan::{InteractionPlan, InteractionPlanState};
-use notify::event::{DataChange, ModifyKind};
-use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
-use runner::bugbase::{Bug, BugBase, LoadedBug};
+use runner::bugbase::BugBase;
 use runner::cli::{SimulatorCLI, SimulatorCommand};
 use runner::differential;
 use runner::env::SimulatorEnv;
@@ -16,13 +13,15 @@ use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::generation::plan::{ConnectionState, InteractionPlanIterator};
+use crate::model::interactions::{
+    ConnectionState, InteractionPlan, InteractionPlanIterator, InteractionPlanState,
+};
 use crate::profiles::Profile;
 use crate::runner::doublecheck;
 use crate::runner::env::{Paths, SimulationPhase, SimulationType};
@@ -42,7 +41,7 @@ fn main() -> anyhow::Result<()> {
     let profile = Profile::parse_from_type(cli_opts.profile.clone())?;
     tracing::debug!(sim_profile = ?profile);
 
-    if let Some(ref command) = cli_opts.subcommand {
+    if let Some(command) = cli_opts.subcommand.take() {
         match command {
             SimulatorCommand::List => {
                 let mut bugbase = BugBase::load()?;
@@ -50,10 +49,10 @@ fn main() -> anyhow::Result<()> {
             }
             SimulatorCommand::Loop { n, short_circuit } => {
                 banner();
-                for i in 0..*n {
+                for i in 0..n {
                     println!("iteration {i}");
-                    let result = testing_main(&cli_opts, &profile);
-                    if result.is_err() && *short_circuit {
+                    let result = testing_main(&mut cli_opts, &profile);
+                    if result.is_err() && short_circuit {
                         println!("short circuiting after {i} iterations");
                         return result;
                     } else if result.is_err() {
@@ -65,7 +64,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             SimulatorCommand::Test { filter } => {
-                let mut bugbase = BugBase::load()?;
+                let bugbase = BugBase::load()?;
                 let bugs = bugbase.load_bugs()?;
                 let mut bugs = bugs
                     .into_iter()
@@ -74,7 +73,7 @@ fn main() -> anyhow::Result<()> {
                             .runs
                             .into_iter()
                             .filter_map(|run| run.error.clone().map(|_| run))
-                            .filter(|run| run.error.as_ref().unwrap().contains(filter))
+                            .filter(|run| run.error.as_ref().unwrap().contains(&filter))
                             .map(|run| run.cli_options)
                             .collect::<Vec<_>>();
 
@@ -99,7 +98,7 @@ fn main() -> anyhow::Result<()> {
 
                 let results = bugs
                     .into_iter()
-                    .map(|cli_opts| testing_main(&cli_opts, &profile))
+                    .map(|mut cli_opts| testing_main(&mut cli_opts, &profile))
                     .collect::<Vec<_>>();
 
                 let (successes, failures): (Vec<_>, Vec<_>) =
@@ -117,11 +116,11 @@ fn main() -> anyhow::Result<()> {
         }
     } else {
         banner();
-        testing_main(&cli_opts, &profile)
+        testing_main(&mut cli_opts, &profile)
     }
 }
 
-fn testing_main(cli_opts: &SimulatorCLI, profile: &Profile) -> anyhow::Result<()> {
+fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Result<()> {
     let mut bugbase = if cli_opts.disable_bugbase {
         None
     } else {
@@ -132,8 +131,7 @@ fn testing_main(cli_opts: &SimulatorCLI, profile: &Profile) -> anyhow::Result<()
     let (seed, mut env, plans) = setup_simulation(bugbase.as_mut(), cli_opts, profile);
 
     if cli_opts.watch {
-        watch_mode(env).unwrap();
-        return Ok(());
+        anyhow::bail!("watch mode is disabled for now");
     }
 
     let paths = env.paths.clone();
@@ -155,58 +153,6 @@ fn testing_main(cli_opts: &SimulatorCLI, profile: &Profile) -> anyhow::Result<()
     }
 
     result
-}
-
-fn watch_mode(env: SimulatorEnv) -> notify::Result<()> {
-    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-    println!("watching {:?}", env.get_plan_path());
-    // Use recommended_watcher() to automatically select the best implementation
-    // for your platform. The `EventHandler` passed to this constructor can be a
-    // closure, a `std::sync::mpsc::Sender`, a `crossbeam_channel::Sender`, or
-    // another type the trait is implemented for.
-    let mut watcher = notify::recommended_watcher(tx)?;
-
-    // Add a path to be watched. All files and directories at that path and
-    // below will be monitored for changes.
-    watcher.watch(&env.get_plan_path(), RecursiveMode::NonRecursive)?;
-    // Block forever, printing out events as they come in
-    let last_execution = Arc::new(Mutex::new(Execution::new(0, 0)));
-    for res in rx {
-        match res {
-            Ok(event) => {
-                if let EventKind::Modify(ModifyKind::Data(DataChange::Content)) = event.kind {
-                    tracing::info!("plan file modified, rerunning simulation");
-                    let env = env.clone_without_connections();
-                    let last_execution_ = last_execution.clone();
-                    let result = SandboxedResult::from(
-                        std::panic::catch_unwind(move || {
-                            let mut env = env;
-                            let plan_path = env.get_plan_path();
-                            let plan = InteractionPlan::compute_via_diff(&plan_path);
-                            env.clear();
-
-                            let env = Arc::new(Mutex::new(env.clone_without_connections()));
-                            run_simulation_default(env, plan, last_execution_.clone())
-                        }),
-                        last_execution.clone(),
-                    );
-                    match result {
-                        SandboxedResult::Correct => {
-                            tracing::info!("simulation succeeded");
-                            println!("simulation succeeded");
-                        }
-                        SandboxedResult::Panicked { error, .. }
-                        | SandboxedResult::FoundBug { error, .. } => {
-                            tracing::error!("simulation failed: '{}'", error);
-                        }
-                    }
-                }
-            }
-            Err(e) => println!("watch error: {e:?}"),
-        }
-    }
-
-    Ok(())
 }
 
 fn run_simulator(
@@ -259,11 +205,6 @@ fn run_simulator(
 
     tracing::info!("{}", plan.stats());
     std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
-    std::fs::write(
-        env.get_plan_path().with_extension("json"),
-        serde_json::to_string_pretty(&*plan).unwrap(),
-    )
-    .unwrap();
 
     // No doublecheck, run shrinking if panicking or found a bug.
     match &result {
@@ -348,7 +289,7 @@ fn run_simulator(
                         tracing::trace!(
                             "adding bug to bugbase, seed: {}, plan: {}, error: {}",
                             env.opts.seed,
-                            plan.len(),
+                            plan.len_properties(),
                             error
                         );
                         bugbase
@@ -384,7 +325,7 @@ fn run_simulator(
                         );
                         // Save the shrunk database
                         if let Some(bugbase) = bugbase.as_deref_mut() {
-                            bugbase.make_shrunk(
+                            bugbase.save_shrunk(
                                 seed,
                                 cli_opts,
                                 final_plan.clone(),
@@ -470,79 +411,57 @@ impl SandboxedResult {
 }
 
 fn setup_simulation(
-    bugbase: Option<&mut BugBase>,
-    cli_opts: &SimulatorCLI,
+    mut bugbase: Option<&mut BugBase>,
+    cli_opts: &mut SimulatorCLI,
     profile: &Profile,
 ) -> (u64, SimulatorEnv, InteractionPlan) {
-    if let Some(seed) = &cli_opts.load {
-        let seed = seed.parse::<u64>().expect("seed should be a number");
-        let bugbase = bugbase.expect("BugBase must be enabled to load a bug");
-        tracing::info!("seed={}", seed);
-        let bug = bugbase
-            .get_bug(seed)
-            .unwrap_or_else(|| panic!("bug '{seed}' not found in bug base"));
-
+    if let Some(seed) = cli_opts.load {
+        let bugbase = bugbase
+            .as_mut()
+            .expect("BugBase must be enabled to load a bug");
         let paths = bugbase.paths(seed);
         if !paths.base.exists() {
             std::fs::create_dir_all(&paths.base).unwrap();
         }
-        let env = SimulatorEnv::new(
-            bug.seed(),
-            cli_opts,
-            paths,
-            SimulationType::Default,
-            profile,
-        );
 
-        let plan = match bug {
-            Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
-            Bug::Unloaded { seed } => {
-                let seed = *seed;
-                bugbase
-                    .load_bug(seed)
-                    .unwrap_or_else(|_| panic!("could not load bug '{seed}' in bug base"))
-                    .plan
-                    .clone()
-            }
-        };
+        let bug = bugbase
+            .get_or_load_bug(seed)
+            .unwrap()
+            .unwrap_or_else(|| panic!("bug '{seed}' not found in bug base"));
 
-        std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
-        std::fs::write(
-            env.get_plan_path().with_extension("json"),
-            serde_json::to_string_pretty(&plan).unwrap(),
-        )
-        .unwrap();
-        (seed, env, plan)
-    } else {
-        let seed = cli_opts.seed.unwrap_or_else(|| {
-            let mut rng = rand::rng();
-            rng.next_u64()
-        });
-        tracing::info!("seed={}", seed);
-
-        let paths = if let Some(bugbase) = bugbase {
-            let paths = bugbase.paths(seed);
-            // Create the output directory if it doesn't exist
-            if !paths.base.exists() {
-                std::fs::create_dir_all(&paths.base)
-                    .map_err(|e| format!("{e:?}"))
-                    .unwrap();
-            }
-            paths
-        } else {
-            let dir = std::env::current_dir().unwrap().join("simulator-output");
-            std::fs::create_dir_all(&dir).unwrap();
-            Paths::new(&dir)
-        };
-
-        let mut env = SimulatorEnv::new(seed, cli_opts, paths, SimulationType::Default, profile);
-
-        tracing::info!("Generating database interaction plan...");
-
-        let plan = InteractionPlan::init_plan(&mut env);
-
-        (seed, env, plan)
+        // run the simulation with the same CLI options as the loaded bug
+        *cli_opts = bug.last_cli_opts();
     }
+    let seed = cli_opts.seed.unwrap_or_else(|| {
+        let mut rng = rand::rng();
+        rng.next_u64()
+    });
+
+    tracing::info!("seed={}", seed);
+    cli_opts.seed = Some(seed);
+
+    let paths = if let Some(bugbase) = bugbase {
+        let paths = bugbase.paths(seed);
+        // Create the output directory if it doesn't exist
+        if !paths.base.exists() {
+            std::fs::create_dir_all(&paths.base)
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+        }
+        paths
+    } else {
+        let dir = std::env::current_dir().unwrap().join("simulator-output");
+        std::fs::create_dir_all(&dir).unwrap();
+        Paths::new(&dir)
+    };
+
+    let env = SimulatorEnv::new(seed, cli_opts, paths, SimulationType::Default, profile);
+
+    tracing::info!("Generating database interaction plan...");
+
+    let plan = InteractionPlan::new(env.profile.experimental_mvcc);
+
+    (seed, env, plan)
 }
 
 fn run_simulation(

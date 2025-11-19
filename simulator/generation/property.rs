@@ -5,8 +5,9 @@
 //! we can generate queries that reference tables that do not exist. This is not a correctness issue, but more of
 //! an optimization issue that is good to point out for the future
 
+use std::num::NonZeroUsize;
+
 use rand::distr::{Distribution, weighted::WeightedIndex};
-use serde::{Deserialize, Serialize};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
@@ -27,253 +28,22 @@ use turso_parser::ast::{self, Distinctness};
 
 use crate::{
     common::print_diff,
-    generation::{
-        Shadow as _, WeightedDistribution, plan::InteractionType, query::QueryDistribution,
+    generation::{Shadow, WeightedDistribution, query::QueryDistribution},
+    model::{
+        Query, QueryCapabilities, QueryDiscriminants, ResultSet,
+        interactions::{
+            Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
+        },
+        metrics::Remaining,
+        property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
-    model::{Query, QueryCapabilities, QueryDiscriminants},
-    profiles::query::QueryProfile,
     runner::env::SimulatorEnv,
 };
-
-use super::plan::{Assertion, Interaction, InteractionStats, ResultSet};
-
-/// Properties are representations of executable specifications
-/// about the database behavior.
-#[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
-#[strum_discriminants(derive(strum::EnumIter))]
-pub enum Property {
-    /// Insert-Select is a property in which the inserted row
-    /// must be in the resulting rows of a select query that has a
-    /// where clause that matches the inserted row.
-    /// The execution of the property is as follows
-    ///     INSERT INTO <t> VALUES (...)
-    ///     I_0
-    ///     I_1
-    ///     ...
-    ///     I_n
-    ///     SELECT * FROM <t> WHERE <predicate>
-    /// The interactions in the middle has the following constraints;
-    /// - There will be no errors in the middle interactions.
-    /// - The inserted row will not be deleted.
-    /// - The inserted row will not be updated.
-    /// - The table `t` will not be renamed, dropped, or altered.
-    InsertValuesSelect {
-        /// The insert query
-        insert: Insert,
-        /// Selected row index
-        row_index: usize,
-        /// Additional interactions in the middle of the property
-        queries: Vec<Query>,
-        /// The select query
-        select: Select,
-        /// Interactive query information if any
-        interactive: Option<InteractiveQueryInfo>,
-    },
-    /// ReadYourUpdatesBack is a property in which the updated rows
-    /// must be in the resulting rows of a select query that has a
-    /// where clause that matches the updated row.
-    /// The execution of the property is as follows
-    ///     UPDATE <t> SET <set_cols=set_vals> WHERE <predicate>
-    ///     SELECT <set_cols> FROM <t> WHERE <predicate>
-    /// These interactions are executed in immediate succession
-    /// just to verify the property that our updates did what they
-    /// were supposed to do.
-    ReadYourUpdatesBack {
-        update: Update,
-        select: Select,
-    },
-    /// TableHasExpectedContent is a property in which the table
-    /// must have the expected content, i.e. all the insertions and
-    /// updates and deletions should have been persisted in the way
-    /// we think they were.
-    /// The execution of the property is as follows
-    ///     SELECT * FROM <t>
-    ///     ASSERT <expected_content>
-    TableHasExpectedContent {
-        table: String,
-    },
-    /// AllTablesHaveExpectedContent is a property in which the table
-    /// must have the expected content, i.e. all the insertions and
-    /// updates and deletions should have been persisted in the way
-    /// we think they were.
-    /// The execution of the property is as follows
-    ///     SELECT * FROM <t>
-    ///     ASSERT <expected_content>
-    /// for each table in the simulator model
-    AllTableHaveExpectedContent {
-        tables: Vec<String>,
-    },
-    /// Double Create Failure is a property in which creating
-    /// the same table twice leads to an error.
-    /// The execution of the property is as follows
-    ///     CREATE TABLE <t> (...)
-    ///     I_0
-    ///     I_1
-    ///     ...
-    ///     I_n
-    ///     CREATE TABLE <t> (...) -> Error
-    /// The interactions in the middle has the following constraints;
-    /// - There will be no errors in the middle interactions.
-    /// - Table `t` will not be renamed or dropped.
-    DoubleCreateFailure {
-        /// The create query
-        create: Create,
-        /// Additional interactions in the middle of the property
-        queries: Vec<Query>,
-    },
-    /// Select Limit is a property in which the select query
-    /// has a limit clause that is respected by the query.
-    /// The execution of the property is as follows
-    ///     SELECT * FROM <t> WHERE <predicate> LIMIT <n>
-    /// This property is a single-interaction property.
-    /// The interaction has the following constraints;
-    /// - The select query will respect the limit clause.
-    SelectLimit {
-        /// The select query
-        select: Select,
-    },
-    /// Delete-Select is a property in which the deleted row
-    /// must not be in the resulting rows of a select query that has a
-    /// where clause that matches the deleted row. In practice, `p1` of
-    /// the delete query will be used as the predicate for the select query,
-    /// hence the select should return NO ROWS.
-    /// The execution of the property is as follows
-    ///     DELETE FROM <t> WHERE <predicate>
-    ///     I_0
-    ///     I_1
-    ///     ...
-    ///     I_n
-    ///     SELECT * FROM <t> WHERE <predicate>
-    /// The interactions in the middle has the following constraints;
-    /// - There will be no errors in the middle interactions.
-    /// - A row that holds for the predicate will not be inserted.
-    /// - The table `t` will not be renamed, dropped, or altered.
-    DeleteSelect {
-        table: String,
-        predicate: Predicate,
-        queries: Vec<Query>,
-    },
-    /// Drop-Select is a property in which selecting from a dropped table
-    /// should result in an error.
-    /// The execution of the property is as follows
-    ///     DROP TABLE <t>
-    ///     I_0
-    ///     I_1
-    ///     ...
-    ///     I_n
-    ///     SELECT * FROM <t> WHERE <predicate> -> Error
-    /// The interactions in the middle has the following constraints;
-    /// - There will be no errors in the middle interactions.
-    /// - The table `t` will not be created, no table will be renamed to `t`.
-    DropSelect {
-        table: String,
-        queries: Vec<Query>,
-        select: Select,
-    },
-    /// Select-Select-Optimizer is a property in which we test the optimizer by
-    /// running two equivalent select queries, one with `SELECT <predicate> from <t>`
-    /// and the other with `SELECT * from <t> WHERE <predicate>`. As highlighted by
-    /// Rigger et al. in Non-Optimizing Reference Engine Construction(NoREC), SQLite
-    /// tends to optimize `where` statements while keeping the result column expressions
-    /// unoptimized. This property is used to test the optimizer. The property is successful
-    /// if the two queries return the same number of rows.
-    SelectSelectOptimizer {
-        table: String,
-        predicate: Predicate,
-    },
-    /// Where-True-False-Null is a property that tests the boolean logic implementation
-    /// in the database. It relies on the fact that `P == true || P == false || P == null` should return true,
-    /// as SQLite uses a ternary logic system. This property is invented in "Finding Bugs in Database Systems via Query Partitioning"
-    /// by Rigger et al. and it is canonically called Ternary Logic Partitioning (TLP).
-    WhereTrueFalseNull {
-        select: Select,
-        predicate: Predicate,
-    },
-    /// UNION-ALL-Preserves-Cardinality is a property that tests the UNION ALL operator
-    /// implementation in the database. It relies on the fact that `SELECT * FROM <t
-    /// > WHERE <predicate> UNION ALL SELECT * FROM <t> WHERE <predicate>`
-    /// should return the same number of rows as `SELECT <predicate> FROM <t> WHERE <predicate>`.
-    /// > The property is succesfull when the UNION ALL of 2 select queries returns the same number of rows
-    /// > as the sum of the two select queries.
-    UNIONAllPreservesCardinality {
-        select: Select,
-        where_clause: Predicate,
-    },
-    /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
-    ///
-    /// # Interactions
-    /// - Executes the `query` without waiting for fsync
-    /// - Drop all connections and Reopen the database
-    /// - Execute the `query` again
-    /// - Query tables to assert that the values were inserted
-    ///
-    FsyncNoWait {
-        query: Query,
-    },
-    FaultyQuery {
-        query: Query,
-    },
-    /// Property used to subsititute a property with its queries only
-    Queries {
-        queries: Vec<Query>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InteractiveQueryInfo {
-    start_with_immediate: bool,
-    end_with_commit: bool,
-}
 
 type PropertyQueryGenFunc<'a, R, G> =
     fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
 
 impl Property {
-    pub(crate) fn name(&self) -> &str {
-        match self {
-            Property::InsertValuesSelect { .. } => "Insert-Values-Select",
-            Property::ReadYourUpdatesBack { .. } => "Read-Your-Updates-Back",
-            Property::TableHasExpectedContent { .. } => "Table-Has-Expected-Content",
-            Property::AllTableHaveExpectedContent { .. } => "All-Tables-Have-Expected-Content",
-            Property::DoubleCreateFailure { .. } => "Double-Create-Failure",
-            Property::SelectLimit { .. } => "Select-Limit",
-            Property::DeleteSelect { .. } => "Delete-Select",
-            Property::DropSelect { .. } => "Drop-Select",
-            Property::SelectSelectOptimizer { .. } => "Select-Select-Optimizer",
-            Property::WhereTrueFalseNull { .. } => "Where-True-False-Null",
-            Property::FsyncNoWait { .. } => "FsyncNoWait",
-            Property::FaultyQuery { .. } => "FaultyQuery",
-            Property::UNIONAllPreservesCardinality { .. } => "UNION-All-Preserves-Cardinality",
-            Property::Queries { .. } => "Queries",
-        }
-    }
-
-    /// Property Does some sort of fault injection
-    pub fn check_tables(&self) -> bool {
-        matches!(
-            self,
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. }
-        )
-    }
-
-    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
-        match self {
-            Property::InsertValuesSelect { queries, .. }
-            | Property::DoubleCreateFailure { queries, .. }
-            | Property::DeleteSelect { queries, .. }
-            | Property::DropSelect { queries, .. }
-            | Property::Queries { queries } => Some(queries),
-            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
-            Property::SelectLimit { .. }
-            | Property::SelectSelectOptimizer { .. }
-            | Property::WhereTrueFalseNull { .. }
-            | Property::UNIONAllPreservesCardinality { .. }
-            | Property::ReadYourUpdatesBack { .. }
-            | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => None,
-        }
-    }
-
     pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
     where
         R: rand::Rng + ?Sized,
@@ -465,7 +235,7 @@ impl Property {
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
-            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
@@ -477,13 +247,18 @@ impl Property {
     /// interactions construct a list of interactions, which is an executable representation of the property.
     /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
-    pub(crate) fn interactions(&self, connection_index: usize) -> Vec<Interaction> {
-        match self {
+    pub(crate) fn interactions(
+        &self,
+        connection_index: usize,
+        id: NonZeroUsize,
+    ) -> Vec<Interaction> {
+        let interactions: Vec<InteractionBuilder> = match self {
             Property::AllTableHaveExpectedContent { tables } => {
                 assert_all_table_values(tables, connection_index).collect()
             }
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
+                let table_dependency = table.clone();
                 let table_name = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
@@ -495,6 +270,7 @@ impl Property {
                             Ok(Err(format!("table {table_name} does not exist")))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let select_interaction = InteractionType::Query(Query::Select(Select::simple(
@@ -535,16 +311,18 @@ impl Property {
                         }
                         Ok(Ok(()))
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select_interaction),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::ReadYourUpdatesBack { update, select } => {
                 let table = update.table().to_string();
+                let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
@@ -555,6 +333,7 @@ impl Property {
                             Ok(Err(format!("table {} does not exist", table.clone())))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
@@ -599,13 +378,14 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![table_dependency],
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, update_interaction),
-                    Interaction::new(connection_index, select_interaction),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(update_interaction),
+                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::InsertValuesSelect {
@@ -645,6 +425,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![insert.table().to_string()],
                 ));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
@@ -679,30 +460,30 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![insert.table().to_string()],
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(
-                    connection_index,
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(
                     InteractionType::Query(Query::Insert(insert.clone())),
                 ));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new(
-                    connection_index,
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push(InteractionBuilder::with_interaction(
                     InteractionType::Query(Query::Select(select.clone())),
                 ));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
             Property::DoubleCreateFailure { create, queries } => {
                 let table_name = create.table.name.clone();
+                let table_dependency = table_name.clone();
 
                 let assumption = InteractionType::Assumption(Assertion::new(
                     "Double-Create-Failure should not be called on an existing table".to_string(),
@@ -714,6 +495,7 @@ impl Property {
                             Ok(Err(format!("table {table_name} already exists")))
                         }
                     },
+                    vec![table_dependency.clone()],
                 ));
 
                 let cq1 = InteractionType::Query(Query::Create(create.clone()));
@@ -736,19 +518,23 @@ impl Property {
                                         }
                                     }
                                 }
-                            }) );
+                            }, vec![table_dependency],) );
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, cq1));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new_ignore_error(connection_index, cq2));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(cq1));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push({
+                    let mut builder = InteractionBuilder::with_interaction(cq2);
+                    builder.ignore_error(true);
+                    builder
+                });
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -780,6 +566,7 @@ impl Property {
                             }
                         }
                     },
+                    select.dependencies().into_iter().collect(),
                 ));
 
                 let limit = select
@@ -805,15 +592,15 @@ impl Property {
                             Err(_) => Ok(Ok(())),
                         }
                     },
+                    select.dependencies().into_iter().collect(),
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(
-                        connection_index,
-                        InteractionType::Query(Query::Select(select.clone())),
-                    ),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Select(
+                        select.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::DeleteSelect {
@@ -840,6 +627,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let delete = InteractionType::Query(Query::Delete(Delete {
@@ -874,19 +662,20 @@ impl Property {
                             Err(err) => Err(LimboError::InternalError(err.to_string())),
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let mut interactions = Vec::new();
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, delete));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new(connection_index, select));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(delete));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push(InteractionBuilder::with_interaction(select));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -914,6 +703,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let table_name = table.clone();
@@ -939,6 +729,7 @@ impl Property {
                             },
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let drop = InteractionType::Query(Query::Drop(Drop {
@@ -949,16 +740,20 @@ impl Property {
 
                 let mut interactions = Vec::new();
 
-                interactions.push(Interaction::new(connection_index, assumption));
-                interactions.push(Interaction::new(connection_index, drop));
-                interactions.extend(
-                    queries
-                        .clone()
-                        .into_iter()
-                        .map(|q| Interaction::new(connection_index, InteractionType::Query(q))),
-                );
-                interactions.push(Interaction::new_ignore_error(connection_index, select));
-                interactions.push(Interaction::new(connection_index, assertion));
+                interactions.push(InteractionBuilder::with_interaction(assumption));
+                interactions.push(InteractionBuilder::with_interaction(drop));
+                interactions.extend(queries.clone().into_iter().map(|q| {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(q));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    builder
+                }));
+                interactions.push({
+                    let mut builder = InteractionBuilder::with_interaction(select);
+                    builder.ignore_error(true);
+                    builder
+                });
+                interactions.push(InteractionBuilder::with_interaction(assertion));
 
                 interactions
             }
@@ -982,6 +777,7 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 let select1 = InteractionType::Query(Query::Select(Select::single(
@@ -1042,18 +838,18 @@ impl Property {
                             }
                         }
                     },
+                    vec![table.clone()],
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select1),
-                    Interaction::new(connection_index, select2),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select1),
+                    InteractionBuilder::with_interaction(select2),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
             Property::FsyncNoWait { query } => {
-                vec![Interaction::new(
-                    connection_index,
+                vec![InteractionBuilder::with_interaction(
                     InteractionType::FsyncQuery(query.clone()),
                 )]
             }
@@ -1083,16 +879,18 @@ impl Property {
                             }
                         }
                     },
+                    query.dependencies().into_iter().collect(),
                 );
                 [
                     InteractionType::FaultyQuery(query.clone()),
                     InteractionType::Assertion(assert),
                 ]
                 .into_iter()
-                .map(|i| Interaction::new(connection_index, i))
+                .map(InteractionBuilder::with_interaction)
                 .collect()
             }
             Property::WhereTrueFalseNull { select, predicate } => {
+                let tables_dependencies = select.dependencies().into_iter().collect::<Vec<_>>();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!(
                         "tables ({}) exists",
@@ -1120,6 +918,7 @@ impl Property {
                             }
                         }
                     },
+                    tables_dependencies.clone(),
                 ));
 
                 let old_predicate = select.body.select.where_clause.clone();
@@ -1241,16 +1040,17 @@ impl Property {
                             }
                         }
                     },
+                    tables_dependencies,
                 ));
 
                 vec![
-                    Interaction::new(connection_index, assumption),
-                    Interaction::new(connection_index, select),
-                    Interaction::new(connection_index, select_tlp),
-                    Interaction::new(connection_index, assertion),
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(select),
+                    InteractionBuilder::with_interaction(select_tlp),
+                    InteractionBuilder::with_interaction(assertion),
                 ]
             }
-            Property::UNIONAllPreservesCardinality {
+            Property::UnionAllPreservesCardinality {
                 select,
                 where_clause,
             } => {
@@ -1295,22 +1095,37 @@ impl Property {
                                 }
                             }
                         },
-                    )),
-                ].into_iter().map(|i| Interaction::new(connection_index, i)).collect()
+                        s3.dependencies().into_iter().collect()
+                    )
+                ),
+                ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
-                .map(|query| Interaction::new(connection_index, InteractionType::Query(query)))
+                .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
-        }
+        };
+
+        assert!(!interactions.is_empty());
+
+        interactions
+            .into_iter()
+            .map(|mut builder| {
+                if !builder.has_property_meta() {
+                    builder.property_meta(PropertyMetadata::new(self, false));
+                }
+                builder.connection_index(connection_index).id(id);
+                builder.build().unwrap()
+            })
+            .collect()
     }
 }
 
 fn assert_all_table_values(
     tables: &[String],
     connection_index: usize,
-) -> impl Iterator<Item = Interaction> + use<'_> {
+) -> impl Iterator<Item = InteractionBuilder> + use<'_> {
     tables.iter().flat_map(move |table| {
         let select = InteractionType::Query(Query::Select(Select::simple(
             table.clone(),
@@ -1364,103 +1179,9 @@ fn assert_all_table_values(
                         Err(err) => Err(LimboError::InternalError(format!("{err}"))),
                     }
                 }
-            }));
-        [select, assertion].into_iter().map(move |i| Interaction::new(connection_index, i))
+            }, vec![table.clone()]));
+        [select, assertion].into_iter().map(InteractionBuilder::with_interaction)
     })
-}
-
-#[derive(Debug)]
-pub(super) struct Remaining {
-    pub select: u32,
-    pub insert: u32,
-    pub create: u32,
-    pub create_index: u32,
-    pub delete: u32,
-    pub update: u32,
-    pub drop: u32,
-    pub alter_table: u32,
-    pub drop_index: u32,
-    pub pragma_count: u32,
-}
-
-pub(super) fn remaining(
-    max_interactions: u32,
-    opts: &QueryProfile,
-    stats: &InteractionStats,
-    mvcc: bool,
-    context: &impl GenerationContext,
-) -> Remaining {
-    let total_weight = opts.total_weight();
-
-    let total_select = (max_interactions * opts.select_weight) / total_weight;
-    let total_insert = (max_interactions * opts.insert_weight) / total_weight;
-    let total_create = (max_interactions * opts.create_table_weight) / total_weight;
-    let total_create_index = (max_interactions * opts.create_index_weight) / total_weight;
-    let total_delete = (max_interactions * opts.delete_weight) / total_weight;
-    let total_update = (max_interactions * opts.update_weight) / total_weight;
-    let total_drop = (max_interactions * opts.drop_table_weight) / total_weight;
-    let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
-    let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
-    let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
-
-    let remaining_select = total_select
-        .checked_sub(stats.select_count)
-        .unwrap_or_default();
-    let remaining_insert = total_insert
-        .checked_sub(stats.insert_count)
-        .unwrap_or_default();
-    let remaining_create = total_create
-        .checked_sub(stats.create_count)
-        .unwrap_or_default();
-    let mut remaining_create_index = total_create_index
-        .checked_sub(stats.create_index_count)
-        .unwrap_or_default();
-    let remaining_delete = total_delete
-        .checked_sub(stats.delete_count)
-        .unwrap_or_default();
-    let remaining_update = total_update
-        .checked_sub(stats.update_count)
-        .unwrap_or_default();
-    let remaining_drop = total_drop.checked_sub(stats.drop_count).unwrap_or_default();
-    let remaining_pragma = total_pragma
-        .checked_sub(stats.pragma_count)
-        .unwrap_or_default();
-
-    let remaining_alter_table = total_alter_table
-        .checked_sub(stats.alter_table_count)
-        .unwrap_or_default();
-
-    let mut remaining_drop_index = total_drop_index
-        .checked_sub(stats.alter_table_count)
-        .unwrap_or_default();
-
-    if mvcc {
-        // TODO: index not supported yet for mvcc
-        remaining_create_index = 0;
-        remaining_drop_index = 0;
-    }
-
-    // if there are no indexes do not allow creation of drop_index
-    if !context
-        .tables()
-        .iter()
-        .any(|table| !table.indexes.is_empty())
-    {
-        remaining_drop_index = 0;
-    }
-
-    Remaining {
-        select: remaining_select,
-        insert: remaining_insert,
-        create: remaining_create,
-        create_index: remaining_create_index,
-        delete: remaining_delete,
-        drop: remaining_drop,
-        update: remaining_update,
-        alter_table: remaining_alter_table,
-        drop_index: remaining_drop_index,
-        pragma_count: remaining_pragma,
-    }
 }
 
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
@@ -1739,7 +1460,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
         Distinctness::All,
     );
 
-    Property::UNIONAllPreservesCardinality {
+    Property::UnionAllPreservesCardinality {
         select,
         where_clause: p2,
     }
@@ -1788,7 +1509,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::DropSelect => property_drop_select,
             PropertyDiscriminants::SelectSelectOptimizer => property_select_select_optimizer,
             PropertyDiscriminants::WhereTrueFalseNull => property_where_true_false_null,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
@@ -1871,7 +1592,7 @@ impl PropertyDiscriminants {
                     0
                 }
             }
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 if opts.indexes
                     && !env.opts.disable_union_all_preserves_cardinality
                     && !ctx.tables().is_empty()
@@ -1935,7 +1656,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
