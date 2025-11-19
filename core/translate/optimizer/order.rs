@@ -270,7 +270,7 @@ fn expr_to_column_order(
         });
     }
     let mask = table_mask_from_expr(expr, tables, &[])
-        .expect("table mask extraction must succeed for order target");
+        .ok()?;
     if mask.table_count() != 1 {
         return None;
     }
@@ -278,8 +278,7 @@ fn expr_to_column_order(
         .joined_tables()
         .iter()
         .enumerate()
-        .find_map(|(i, _)| mask.contains_table(i).then_some(i))
-        .expect("single-table order target expression");
+        .find_map(|(i, _)| mask.contains_table(i).then_some(i))?;
     let table_id = tables.joined_tables()[table_no].internal_id;
     Some(ColumnOrder {
         table_id,
