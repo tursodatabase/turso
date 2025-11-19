@@ -1,8 +1,12 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use parking_lot::RwLock;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -1688,4 +1692,151 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     assert_eq!(rows[1], vec![Value::Integer(4)]);
     assert_eq!(rows[2], vec![Value::Integer(3)]);
     assert_eq!(rows[3], vec![Value::Integer(1)]);
+}
+
+#[test]
+#[ignore = "we need to implement seek with btree cursor"]
+fn test_cursor_with_btree_and_mvcc_fuzz() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut rows_in_db = sorted_vec::SortedVec::new();
+    let mut seen = HashSet::new();
+    let (mut rng, _seed) = rng_from_time_or_env();
+
+    let mut maybe_conn = Some(db.connect());
+    {
+        maybe_conn
+            .as_mut()
+            .unwrap()
+            .execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+    }
+
+    #[repr(u8)]
+    #[derive(Debug)]
+    enum Op {
+        Insert = 0,
+        Delete = 1,
+        SelectForward = 2,
+        SelectBackward = 3,
+        SeekForward = 4,
+        SeekBackward = 5,
+        Checkpoint = 6,
+    }
+
+    impl From<u8> for Op {
+        fn from(value: u8) -> Self {
+            match value {
+                0 => Op::Insert,
+                1 => Op::Delete,
+                2 => Op::SelectForward,
+                3 => Op::SelectBackward,
+                4 => Op::SeekForward,
+                5 => Op::SeekBackward,
+                6 => Op::Checkpoint,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    for i in 0..10000 {
+        let conn = maybe_conn.as_mut().unwrap();
+        let op = rng.random_range(0..=Op::Checkpoint as usize);
+        let op = Op::from(op as u8);
+        println!("tick: {i} op: {op:?} ");
+        match op {
+            Op::Insert => {
+                let value = loop {
+                    let value = rng.random_range(0..10000);
+                    if !seen.contains(&value) {
+                        seen.insert(value);
+                        break value;
+                    }
+                };
+                conn.execute(format!("INSERT INTO t VALUES ({value})").as_str())
+                    .unwrap();
+                rows_in_db.push(value);
+            }
+            Op::Delete => {
+                if rows_in_db.is_empty() {
+                    continue;
+                }
+                let index = rng.random_range(0..rows_in_db.len());
+                let value = rows_in_db[index];
+                conn.execute(format!("DELETE FROM t WHERE x = {value}").as_str())
+                    .unwrap();
+                rows_in_db.remove_index(index);
+                seen.remove(&value);
+            }
+            Op::SelectForward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x asc");
+                assert_eq!(rows.len(), rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SelectBackward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x desc");
+                assert_eq!(rows.len(), rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter().rev()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SeekForward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x asc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SeekBackward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x desc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter().rev()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::Checkpoint => {
+                // This forces things to move to the BTree file (.db)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                // This forces MVCC to be cleared
+                db.restart();
+                maybe_conn = Some(db.connect());
+            }
+        }
+    }
+}
+
+pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
+    let seed = std::env::var("SEED").map_or(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        |v| {
+            v.parse()
+                .expect("Failed to parse SEED environment variable as u64")
+        },
+    );
+    let rng = ChaCha8Rng::seed_from_u64(seed as u64);
+    (rng, seed as u64)
 }
