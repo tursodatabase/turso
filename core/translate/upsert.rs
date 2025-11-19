@@ -27,6 +27,9 @@ use crate::{
         },
         insert::Insertion,
         plan::ResultSetColumn,
+        trigger_exec::{
+            fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
+        },
     },
     util::normalize_ident,
     vdbe::{
@@ -368,8 +371,33 @@ pub fn emit_upsert(
         }
     }
 
-    // BEFORE for index maintenance / CDC
-    let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
+    let modified_cols: HashSet<usize> = set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+
+    let btree_table = table.btree().unwrap();
+    let relevant_before_triggers = get_relevant_triggers_type_and_time(
+        resolver.schema,
+        ast::TriggerEvent::Update,
+        ast::TriggerTime::Before,
+        Some(modified_cols.clone()),
+        &btree_table,
+    );
+    let has_relevant_before_triggers = relevant_before_triggers.clone().count() > 0;
+
+    let relevant_after_triggers = get_relevant_triggers_type_and_time(
+        resolver.schema,
+        ast::TriggerEvent::Update,
+        ast::TriggerTime::After,
+        Some(modified_cols.clone()),
+        &btree_table,
+    );
+    let has_relevant_after_triggers = relevant_after_triggers.clone().count() > 0;
+
+    // BEFORE for index maintenance / CDC / triggers
+    let before_start = if has_relevant_before_triggers
+        || has_relevant_after_triggers
+        || ctx.cdc_table.is_some()
+        || !ctx.idx_cursors.is_empty()
+    {
         let s = program.alloc_registers(num_cols);
         program.emit_insn(Insn::Copy {
             src_reg: current_start,
@@ -429,15 +457,7 @@ pub fn emit_upsert(
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        let col = &table.columns()[*col_idx];
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg: new_start + *col_idx,
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + col.name.as_ref().unwrap(),
-            });
-        }
-        if col.is_rowid_alias() {
+        if table.columns()[*col_idx].is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
             let r = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -447,17 +467,6 @@ pub fn emit_upsert(
             });
             program.emit_insn(Insn::MustBeInt { reg: r });
             new_rowid_reg = Some(r);
-        }
-    }
-
-    if let Some(bt) = table.btree() {
-        if bt.is_strict {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: num_cols,
-                check_generated: true,
-                table_reference: Arc::clone(&bt),
-            });
         }
     }
 
@@ -508,6 +517,90 @@ pub fn emit_upsert(
                 rowid_set_clause_reg,
                 set_pairs,
             )?;
+        }
+    }
+
+    let trigger_ctx = if has_relevant_before_triggers || has_relevant_after_triggers {
+        let n_cols = table.columns().len();
+        let mut old_regs = Vec::with_capacity(n_cols + 1);
+        if let Some(start) = before_start {
+            for i in 0..n_cols {
+                old_regs.push(start + i);
+            }
+        }
+        old_regs.push(ctx.conflict_rowid_reg);
+
+        let mut new_regs = Vec::with_capacity(n_cols + 1);
+        for i in 0..n_cols {
+            new_regs.push(new_start + i);
+        }
+        new_regs.push(new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg));
+
+        Some(TriggerContext::new(
+            btree_table.clone(),
+            Some(new_regs),
+            Some(old_regs),
+        ))
+    } else {
+        None
+    };
+
+    if has_relevant_before_triggers {
+        if let Some(ctx) = &trigger_ctx {
+            for trigger in relevant_before_triggers {
+                fire_trigger(program, resolver, trigger, ctx, connection)?;
+            }
+        }
+    }
+
+    if has_relevant_before_triggers {
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: ctx.row_done_label,
+        });
+    }
+
+    if has_relevant_before_triggers {
+        for i in 0..num_cols {
+            if !modified_cols.contains(&i) {
+                let col = &table.columns()[i];
+                if col.is_rowid_alias() {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: ctx.cursor_id,
+                        dest: new_start + i,
+                    });
+                } else {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: ctx.cursor_id,
+                        column: i,
+                        dest: new_start + i,
+                        default: None,
+                    });
+                }
+            }
+        }
+    }
+
+    for (col_idx, _) in set_pairs.iter() {
+        let col = &table.columns()[*col_idx];
+        if col.notnull() && !col.is_rowid_alias() {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: new_start + *col_idx,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: String::from(table.get_name()) + col.name.as_ref().unwrap(),
+            });
+        }
+    }
+
+    if let Some(bt) = table.btree() {
+        if bt.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: new_start,
+                count: num_cols,
+                check_generated: true,
+                table_reference: Arc::clone(&bt),
+            });
         }
     }
 
@@ -738,6 +831,13 @@ pub fn emit_upsert(
             flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
         });
+    }
+    if has_relevant_after_triggers {
+        if let Some(ctx) = &trigger_ctx {
+            for trigger in relevant_after_triggers {
+                fire_trigger(program, resolver, trigger, ctx, connection)?;
+            }
+        }
     }
 
     // emit CDC instructions
