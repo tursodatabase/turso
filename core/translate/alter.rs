@@ -166,7 +166,11 @@ pub fn translate_alter_table(
                     );
                     let where_copy = index
                         .bind_where_expr(Some(&mut table_references), connection)
-                        .expect("where clause to exist");
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "index where clause unexpectedly missing".to_string(),
+                            )
+                        })?;
                     let mut column_referenced = false;
                     walk_expr(
                         &where_copy,
@@ -224,8 +228,13 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
-                unreachable!();
+            let cmd = parser.next_cmd().map_err(|e| {
+                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+            })?;
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+                return Err(LimboError::ParseError(
+                    "generated UPDATE statement did not parse as expected".to_string(),
+                ));
             };
 
             translate_update_for_schema_change(
@@ -332,7 +341,11 @@ pub fn translate_alter_table(
                 }
             }
 
-            let new_column_name = column.name.as_ref().unwrap();
+            let new_column_name = column.name.as_ref().ok_or_else(|| {
+                LimboError::ParseError(
+                    "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
+                )
+            })?;
             if btree.get_column(new_column_name).is_some() {
                 return Err(LimboError::ParseError(
                     "duplicate column name: ".to_string() + new_column_name,
@@ -413,8 +426,13 @@ pub fn translate_alter_table(
             );
 
             let mut parser = Parser::new(stmt.as_bytes());
-            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap() else {
-                unreachable!();
+            let cmd = parser.next_cmd().map_err(|e| {
+                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+            })?;
+            let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+                return Err(LimboError::ParseError(
+                    "generated UPDATE statement did not parse as expected".to_string(),
+                ));
             };
 
             translate_update_for_schema_change(
@@ -453,10 +471,15 @@ pub fn translate_alter_table(
                 )));
             };
 
-            let sqlite_schema = resolver
-                .schema
-                .get_btree_table(SQLITE_TABLEID)
-                .expect("sqlite_schema should be on schema");
+            let sqlite_schema =
+                resolver
+                    .schema
+                    .get_btree_table(SQLITE_TABLEID)
+                    .ok_or_else(|| {
+                        LimboError::ParseError(
+                            "sqlite_schema table not found in schema".to_string(),
+                        )
+                    })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
@@ -624,7 +647,6 @@ pub fn translate_alter_table(
                             trigger,
                             &target_table_name_norm,
                             from,
-                            resolver,
                         )?;
                     }
 
@@ -651,10 +673,15 @@ pub fn translate_alter_table(
                 }
             }
 
-            let sqlite_schema = resolver
-                .schema
-                .get_btree_table(SQLITE_TABLEID)
-                .expect("sqlite_schema should be on schema");
+            let sqlite_schema =
+                resolver
+                    .schema
+                    .get_btree_table(SQLITE_TABLEID)
+                    .ok_or_else(|| {
+                        LimboError::ParseError(
+                            "sqlite_schema table not found in schema".to_string(),
+                        )
+                    })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
 
@@ -730,8 +757,12 @@ pub fn translate_alter_table(
                 );
 
                 let mut parser = Parser::new(update_stmt.as_bytes());
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = parser.next_cmd().unwrap()
-                else {
+                let cmd = parser.next_cmd().map_err(|e| {
+                    LimboError::ParseError(format!(
+                        "failed to parse trigger update SQL for {trigger_name}: {e}"
+                    ))
+                })?;
+                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                     return Err(LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}",
                     )));
@@ -787,7 +818,9 @@ fn translate_rename_virtual_table(
     let sqlite_schema = resolver
         .schema
         .get_btree_table(SQLITE_TABLEID)
-        .expect("sqlite_schema should be on schema");
+        .ok_or_else(|| {
+            LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+        })?;
 
     let schema_cur = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -1009,7 +1042,6 @@ fn trigger_references_column_in_other_tables(
     trigger: &crate::schema::Trigger,
     target_table_name: &str,
     column_name: &str,
-    _resolver: &Resolver,
 ) -> Result<bool> {
     let column_name_norm = normalize_ident(column_name);
     let target_table_name_norm = normalize_ident(target_table_name);
@@ -1340,6 +1372,9 @@ fn rewrite_trigger_sql_for_column_rename(
 
     // Parse the trigger SQL
     let mut parser = Parser::new(trigger_sql.as_bytes());
+    let cmd = parser
+        .next_cmd()
+        .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
         if_not_exists,
@@ -1350,7 +1385,7 @@ fn rewrite_trigger_sql_for_column_rename(
         for_each_row,
         when_clause,
         commands,
-    })) = parser.next_cmd().unwrap()
+    })) = cmd
     else {
         return Err(LimboError::ParseError(format!(
             "failed to parse trigger SQL: {trigger_sql}"
@@ -1400,19 +1435,21 @@ fn rewrite_trigger_sql_for_column_rename(
     };
 
     // Clone and rewrite expressions
-    let new_when_clause = when_clause.as_ref().map(|e| {
-        rewrite_expr_for_column_rename(
-            e,
-            &trigger_table,
-            &trigger_table_name,
-            &target_table_name,
-            &old_col_norm,
-            &new_col_norm,
-            None, // WHEN clause: unqualified refs refer to trigger's owning table
-            resolver,
-        )
-        .unwrap()
-    });
+    let new_when_clause = when_clause
+        .as_ref()
+        .map(|e| {
+            rewrite_expr_for_column_rename(
+                e,
+                &trigger_table,
+                &trigger_table_name,
+                &target_table_name,
+                &old_col_norm,
+                &new_col_norm,
+                None, // WHEN clause: unqualified refs refer to trigger's owning table
+                resolver,
+            )
+        })
+        .transpose()?;
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -1559,8 +1596,8 @@ fn rewrite_trigger_cmd_for_column_rename(
             }
 
             // Rewrite WHERE clause - unqualified column references refer to UPDATE target table
-            let new_where = where_clause.map(|e| {
-                Box::new(
+            let new_where = where_clause
+                .map(|e| {
                     rewrite_expr_for_column_rename(
                         &e,
                         trigger_table,
@@ -1571,9 +1608,9 @@ fn rewrite_trigger_cmd_for_column_rename(
                         Some(&update_table_name_norm), // UPDATE WHERE: unqualified refs refer to UPDATE target
                         resolver,
                     )
-                    .unwrap(),
-                )
-            });
+                    .map(Box::new)
+                })
+                .transpose()?;
             Ok(ast::TriggerCmd::Update {
                 or_conflict,
                 tbl_name,
@@ -1629,8 +1666,8 @@ fn rewrite_trigger_cmd_for_column_rename(
             let delete_table_name_norm = normalize_ident(tbl_name.as_str());
 
             // Rewrite WHERE clause - unqualified column references refer to DELETE target table
-            let new_where = where_clause.map(|e| {
-                Box::new(
+            let new_where = where_clause
+                .map(|e| {
                     rewrite_expr_for_column_rename(
                         &e,
                         trigger_table,
@@ -1641,9 +1678,9 @@ fn rewrite_trigger_cmd_for_column_rename(
                         Some(&delete_table_name_norm), // DELETE WHERE: unqualified refs refer to DELETE target
                         resolver,
                     )
-                    .unwrap(),
-                )
-            });
+                    .map(Box::new)
+                })
+                .transpose()?;
             Ok(ast::TriggerCmd::Delete {
                 tbl_name,
                 where_clause: new_where,
