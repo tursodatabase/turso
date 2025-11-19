@@ -652,7 +652,6 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
 
 // TODO: mvcc fails with `BTree should have returned rowid after next`
 #[turso_macros::test(
-    
     init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, age integer);"
 )]
 fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
@@ -865,15 +864,12 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-// TODO: mvcc fails with: 
+// TODO: mvcc fails with:
 // tests/integration/query_processing/test_read_path.rs:883:5:
 // assertion `left == right` failed
 //   left: [[Integer(0)]]
 //  right: [[Integer(2)]]
-#[turso_macros::test(
-
-    init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);"
-)]
+#[turso_macros::test(init_sql = "CREATE TABLE test (k INTEGER PRIMARY KEY, v INTEGER);")]
 fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
