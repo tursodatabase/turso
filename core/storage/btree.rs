@@ -723,12 +723,9 @@ impl BTreeCursor {
         }
         let mut record_cursor_ref = self.record_cursor.borrow_mut();
         let record_cursor = record_cursor_ref.deref_mut();
-        let rowid = match self
-            .get_immutable_record()
-            .as_ref()
-            .unwrap()
-            .last_value(record_cursor)
-        {
+        let immutable_record_opt = self.get_immutable_record();
+        let immutable_record = immutable_record_opt.as_ref()?;
+        let rowid = match immutable_record.last_value(record_cursor) {
             Some(Ok(ValueRef::Integer(rowid))) => rowid,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
@@ -844,7 +841,7 @@ impl BTreeCursor {
             let left_child_page = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
-                .unwrap()
+                .ok_or_else(|| LimboError::Corrupt("Page not found at level in stack".to_string()))?
                 .cell_interior_read_left_child_page(cell_idx);
 
             if page_type == PageType::IndexInterior {
@@ -895,7 +892,9 @@ impl BTreeCursor {
                 next_page,
                 remaining_to_read,
                 page,
-            } = read_overflow_state.as_mut().unwrap();
+            } = read_overflow_state.as_mut().ok_or_else(|| {
+                LimboError::Corrupt("overflow read state unexpectedly None".into())
+            })?;
 
             turso_assert!(page.is_loaded(), "page should be loaded");
             tracing::debug!(next_page, remaining_to_read, "reading overflow page");
@@ -925,12 +924,11 @@ impl BTreeCursor {
             std::mem::swap(payload, &mut payload_swap);
 
             let mut reuse_immutable = self.get_immutable_record_or_create();
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            reuse_immutable
-                .as_mut()
-                .unwrap()
-                .start_serialization(&payload_swap);
+            let reuse_immutable_ref = reuse_immutable.as_mut().ok_or_else(|| {
+                LimboError::Corrupt("immutable record unexpectedly None after create".into())
+            })?;
+            reuse_immutable_ref.invalidate();
+            reuse_immutable_ref.start_serialization(&payload_swap);
             self.record_cursor.borrow_mut().invalidate();
 
             let _ = read_overflow_state.take();
@@ -1018,7 +1016,7 @@ impl BTreeCursor {
             }
 
             let usable_size = self.usable_space();
-            let cell = contents.cell_get(cell_idx, usable_size).unwrap();
+            let cell = contents.cell_get(cell_idx, usable_size)?;
 
             let (payload, payload_size, first_overflow_page) = match cell {
                 BTreeCell::TableLeafCell(cell) => {
@@ -1068,17 +1066,15 @@ impl BTreeCursor {
             }
 
             if amount > 0 {
-                if first_overflow_page.is_none() {
-                    return Err(LimboError::Corrupt(
-                        "Expected overflow page but none found".into(),
-                    ));
-                }
+                let first_overflow_page = first_overflow_page.ok_or_else(|| {
+                    LimboError::Corrupt("Expected overflow page but none found".into())
+                })?;
 
                 let overflow_size = usable_size - 4;
                 let pages_to_skip = offset / overflow_size as u32;
                 let page_offset = offset % overflow_size as u32;
                 // Read page
-                let (page, c) = self.read_page(first_overflow_page.unwrap() as i64)?;
+                let (page, c) = self.read_page(first_overflow_page as i64)?;
 
                 self.state =
                     CursorState::ReadWritePayload(PayloadOverflowWithOffset::SkipOverflowPages {
@@ -1523,7 +1519,9 @@ impl BTreeCursor {
                     let left_child_page = self
                         .stack
                         .get_page_contents_at_level(old_top_idx)
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found at level in stack".to_string())
+                        })?
                         .cell_interior_read_left_child_page(nearest_matching_cell);
                     self.stack.set_cell_index(nearest_matching_cell as i32);
                     let (mem_page, c) = self.read_page(left_child_page as i64)?;
@@ -1540,7 +1538,9 @@ impl BTreeCursor {
                 match self
                     .stack
                     .get_page_contents_at_level(old_top_idx)
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Page not found at level in stack".to_string())
+                    })?
                     .rightmost_pointer()
                 {
                     Some(right_most_pointer) => {
@@ -1563,7 +1563,7 @@ impl BTreeCursor {
             let cell_rowid = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
-                .unwrap()
+                .ok_or_else(|| LimboError::Corrupt("Page not found at level in stack".to_string()))?
                 .cell_table_interior_read_rowid(cur_cell_idx as usize)?;
             // in sqlite btrees left child pages have <= keys.
             // table btrees can have a duplicate rowid in the interior cell, so for example if we are looking for rowid=10,
@@ -1686,7 +1686,9 @@ impl BTreeCursor {
                     match self
                         .stack
                         .get_page_contents_at_level(old_top_idx)
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found at level in stack".to_string())
+                        })?
                         .rightmost_pointer()
                     {
                         Some(right_most_pointer) => {
@@ -1708,7 +1710,9 @@ impl BTreeCursor {
                 let matching_cell = self
                     .stack
                     .get_page_contents_at_level(old_top_idx)
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Page not found at level in stack".to_string())
+                    })?
                     .cell_get(leftmost_matching_cell, self.usable_space())?;
                 self.stack.set_cell_index(leftmost_matching_cell as i32);
                 // we don't advance in case of forward iteration and index tree internal nodes because we will visit this node going up.
@@ -1728,7 +1732,9 @@ impl BTreeCursor {
                 };
 
                 {
-                    let page = self.stack.get_page_at_level(old_top_idx).unwrap();
+                    let page = self.stack.get_page_at_level(old_top_idx).ok_or_else(|| {
+                        LimboError::Corrupt("Page not found at level in stack".to_string())
+                    })?;
                     turso_assert!(
                         page.get().id != *left_child_page as usize,
                         "corrupt: current page and left child page of cell {} are both {}",
@@ -1753,7 +1759,7 @@ impl BTreeCursor {
             let cell = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
-                .unwrap()
+                .ok_or_else(|| LimboError::Corrupt("Page not found at level in stack".to_string()))?
                 .cell_get(cur_cell_idx as usize, self.usable_space())?;
             let BTreeCell::IndexInteriorCell(IndexInteriorCell {
                 payload,
@@ -1770,29 +1776,33 @@ impl BTreeCursor {
             } else {
                 self.get_immutable_record_or_create()
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Failed to get or create immutable record".to_string())
+                    })?
                     .invalidate();
                 self.get_immutable_record_or_create()
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Failed to get or create immutable record".to_string())
+                    })?
                     .start_serialization(payload);
                 self.record_cursor.borrow_mut().invalidate();
             };
             let (target_leaf_page_is_in_left_subtree, is_eq) = {
                 let record = self.get_immutable_record();
-                let record = record.as_ref().unwrap();
+                let record = record.as_ref().ok_or_else(|| {
+                    LimboError::Corrupt("Immutable record not available".to_string())
+                })?;
 
-                let interior_cell_vs_index_key = record_comparer
-                    .compare(
-                        record,
-                        &key_values,
-                        self.index_info
-                            .as_ref()
-                            .expect("indexbtree_move_to without index_info"),
-                        0,
-                        tie_breaker,
-                    )
-                    .unwrap();
+                let interior_cell_vs_index_key = record_comparer.compare(
+                    record,
+                    &key_values,
+                    self.index_info
+                        .as_ref()
+                        .expect("indexbtree_move_to without index_info"),
+                    0,
+                    tie_breaker,
+                )?;
 
                 // in sqlite btrees left child pages have <= keys.
                 // in general, in forwards iteration we want to find the first key that matches the seek condition.
@@ -2087,7 +2097,11 @@ impl BTreeCursor {
                             < self
                                 .stack
                                 .get_page_contents_at_level(old_top_idx)
-                                .unwrap()
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Page not found at level in stack".to_string(),
+                                    )
+                                })?
                                 .cell_count() as i32;
                     self.has_record.set(has_record);
 
@@ -2107,7 +2121,7 @@ impl BTreeCursor {
             let cell = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
-                .unwrap()
+                .ok_or_else(|| LimboError::Corrupt("Page not found at level in stack".to_string()))?
                 .cell_get(cur_cell_idx as usize, self.usable_space())?;
             let BTreeCell::IndexLeafCell(IndexLeafCell {
                 payload,
@@ -2123,11 +2137,15 @@ impl BTreeCursor {
             } else {
                 self.get_immutable_record_or_create()
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Failed to get or create immutable record".to_string())
+                    })?
                     .invalidate();
                 self.get_immutable_record_or_create()
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        LimboError::Corrupt("Failed to get or create immutable record".to_string())
+                    })?
                     .start_serialization(payload);
 
                 self.record_cursor.borrow_mut().invalidate();
@@ -2139,7 +2157,7 @@ impl BTreeCursor {
                 self.index_info
                     .as_ref()
                     .expect("indexbtree_seek without index_info"),
-            );
+            )?;
             if found {
                 nearest_matching_cell.set(Some(cur_cell_idx as usize));
                 match iter_dir {
@@ -2181,14 +2199,14 @@ impl BTreeCursor {
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
-    ) -> (Ordering, bool) {
+    ) -> Result<(Ordering, bool)> {
         let record = self.get_immutable_record();
-        let record = record.as_ref().unwrap();
+        let record = record
+            .as_ref()
+            .ok_or_else(|| LimboError::Corrupt("Immutable record not available".to_string()))?;
 
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer
-            .compare(record, key_values, index_info, 0, tie_breaker)
-            .unwrap();
+        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
@@ -2198,7 +2216,7 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-        (cmp, found)
+        Ok((cmp, found))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2315,15 +2333,15 @@ impl BTreeCursor {
                                     record_values.as_slice(),
                                     self.get_immutable_record()
                                         .as_ref()
-                                        .unwrap()
+                                        .ok_or_else(|| LimboError::Corrupt("Immutable record not available".to_string()))?
                                         .get_values().as_slice(),
-                                        &self.index_info.as_ref().unwrap().key_info,
+                                        &self.index_info.as_ref().ok_or_else(|| LimboError::Corrupt("Index info not available".to_string()))?.key_info,
                                 );
                                 if cmp == Ordering::Equal {
                                     tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.has_record.set(true);
                                     let CursorState::Write(write_state) = &mut self.state else {
-                                        panic!("expected write state");
+                                        return Err(LimboError::Corrupt("Expected write state".to_string()));
                                     };
                                     *write_state = WriteState::Overwrite {
                                         page,
@@ -2534,18 +2552,28 @@ impl BTreeCursor {
                     if cur_page_contents.page_type() == PageType::TableLeaf
                         && cur_page_contents.overflow_cells.len() == 1
                     {
-                        let overflow_cell_is_last =
-                            cur_page_contents.overflow_cells.first().unwrap().index
-                                == cur_page_contents.cell_count();
+                        let overflow_cell_is_last = cur_page_contents
+                            .overflow_cells
+                            .first()
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Overflow cells list is empty".to_string())
+                            })?
+                            .index
+                            == cur_page_contents.cell_count();
                         if overflow_cell_is_last {
                             let parent = self
                                 .stack
                                 .get_page_at_level(self.stack.current() - 1)
-                                .expect("parent page should be on the stack");
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Parent page not found on stack".to_string(),
+                                    )
+                                })?;
                             let parent_contents = parent.get_contents();
                             if parent.get().id != 1
-                                && parent_contents.rightmost_pointer().unwrap()
-                                    == cur_page.get().id as u32
+                                && parent_contents.rightmost_pointer().ok_or_else(|| {
+                                    LimboError::Corrupt("Rightmost pointer not found".to_string())
+                                })? == cur_page.get().id as u32
                             {
                                 // If all of the following are true, we can use the balance_quick() fast path:
                                 // - The page is a table leaf page
@@ -2711,7 +2739,12 @@ impl BTreeCursor {
                         self.stack.retreat();
                     }
 
-                    let parent_page = self.stack.get_page_at_level(parent_page_idx).unwrap();
+                    let parent_page =
+                        self.stack
+                            .get_page_at_level(parent_page_idx)
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Parent page not found on stack".to_string())
+                            })?;
                     let parent_contents = parent_page.get_contents();
                     if !past_rightmost_pointer && over_cell_count > 0 {
                         // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
@@ -2721,7 +2754,10 @@ impl BTreeCursor {
                         } else {
                             turso_assert!(false, "{page_type:?} must have no overflow cells");
                         }
-                        let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                        let overflow_cell =
+                            parent_contents.overflow_cells.first().ok_or_else(|| {
+                                LimboError::Corrupt("Overflow cell not found in parent".to_string())
+                            })?;
                         let parent_page_cell_idx = self.stack.current_cell_index() as usize;
                         // Parent page must be positioned at the divider cell that overflowed due to the replacement.
                         turso_assert!(
@@ -2777,7 +2813,9 @@ impl BTreeCursor {
                         == parent_contents.cell_count();
                     // Get the right page pointer that we will need to update later
                     let right_pointer = if last_sibling_is_right_pointer {
-                        parent_contents.rightmost_pointer_raw().unwrap()
+                        parent_contents.rightmost_pointer_raw().ok_or_else(|| {
+                            LimboError::Corrupt("Rightmost pointer not found".to_string())
+                        })?
                     } else {
                         let max_overflow_cells = if matches!(page_type, PageType::IndexInterior) {
                             1
@@ -2857,9 +2895,19 @@ impl BTreeCursor {
                                 parent_contents.overflow_cells.len() == 1,
                                 "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
                             );
-                            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
-                            pgno =
-                                u32::from_be_bytes(overflow_cell.payload[0..4].try_into().unwrap());
+                            let overflow_cell =
+                                parent_contents.overflow_cells.first().ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Overflow cell not found in parent".to_string(),
+                                    )
+                                })?;
+                            pgno = u32::from_be_bytes(
+                                overflow_cell.payload[0..4].try_into().map_err(|_| {
+                                    LimboError::Corrupt(
+                                        "Invalid page number in overflow cell".to_string(),
+                                    )
+                                })?,
+                            );
                         } else {
                             // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
                             // here we only subtract 1 if the divider cell has been shifted left, i.e. the overflow cell was placed to the left
@@ -2910,19 +2958,25 @@ impl BTreeCursor {
                 BalanceSubState::NonRootDoBalancing => {
                     // Ensure all involved pages are in memory.
                     let mut balance_info = balance_info.borrow_mut();
-                    let balance_info = balance_info.as_mut().unwrap();
+                    let balance_info = balance_info.as_mut().ok_or_else(|| {
+                        LimboError::Corrupt("Balance info not available".to_string())
+                    })?;
                     for page in balance_info
                         .pages_to_balance
                         .iter()
                         .take(balance_info.sibling_count)
                     {
-                        let page = page.as_ref().unwrap();
+                        let page = page
+                            .as_ref()
+                            .expect("Page should exist in balance info during validation");
                         self.pager.add_dirty(page)?;
 
                         #[cfg(debug_assertions)]
                         let page_type_of_siblings = balance_info.pages_to_balance[0]
                             .as_ref()
-                            .unwrap()
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Page not found in balance info".to_string())
+                            })?
                             .get_contents()
                             .page_type();
 
@@ -2945,7 +2999,10 @@ impl BTreeCursor {
                         MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [const { None }; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     for i in (0..balance_info.sibling_count).rev() {
-                        let sibling_page = balance_info.pages_to_balance[i].as_ref().unwrap();
+                        let sibling_page =
+                            balance_info.pages_to_balance[i].as_ref().ok_or_else(|| {
+                                LimboError::Corrupt("Page not found in balance info".to_string())
+                            })?;
                         turso_assert!(sibling_page.is_loaded(), "sibling page is not loaded");
                         let sibling_contents = sibling_page.get_contents();
                         total_cells_to_redistribute += sibling_contents.cell_count();
@@ -2973,7 +3030,12 @@ impl BTreeCursor {
                                 parent_contents.overflow_cells.len() == 1,
                                 "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
                             );
-                            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                            let overflow_cell =
+                                parent_contents.overflow_cells.first().ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Overflow cell not found in parent".to_string(),
+                                    )
+                                })?;
                             &overflow_cell.payload
                         } else {
                             // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
@@ -3034,7 +3096,9 @@ impl BTreeCursor {
 
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?
                         .get_contents()
                         .page_type();
                     tracing::debug!("balance_non_root(page_type={:?})", page_type);
@@ -3046,7 +3110,9 @@ impl BTreeCursor {
                         .take(balance_info.sibling_count)
                         .enumerate()
                     {
-                        let old_page = old_page.as_ref().unwrap();
+                        let old_page = old_page.as_ref().ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?;
                         let old_page_contents = old_page.get_contents();
                         let page_type = old_page_contents.page_type();
                         let max_local = payload_overflow_threshold_max(page_type, usable_space);
@@ -3089,14 +3155,23 @@ impl BTreeCursor {
                             // But we don't need the last divider as it will remain the same.
                             let mut divider_cell = balance_info.divider_cell_payloads[i]
                                 .as_mut()
-                                .unwrap()
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Divider cell payload not available".to_string(),
+                                    )
+                                })?
                                 .as_mut_slice();
                             // TODO(pere): in case of old pages are leaf pages, so index leaf page, we need to strip page pointers
                             // from divider cells in index interior pages (parent) because those should not be included.
                             cells_inserted += 1;
                             if !is_leaf {
                                 // This divider cell needs to be updated with new left pointer,
-                                let right_pointer = old_page_contents.rightmost_pointer().unwrap();
+                                let right_pointer =
+                                    old_page_contents.rightmost_pointer().ok_or_else(|| {
+                                        LimboError::Corrupt(
+                                            "Rightmost pointer not found".to_string(),
+                                        )
+                                    })?;
                                 divider_cell[..LEFT_CHILD_PTR_SIZE_BYTES]
                                     .copy_from_slice(&right_pointer.to_be_bytes());
                             } else {
@@ -3148,7 +3223,9 @@ impl BTreeCursor {
                     for i in 0..balance_info.sibling_count {
                         cell_array.cell_count_per_page_cumulative[i] =
                             old_cell_count_per_page_cumulative[i];
-                        let page = &balance_info.pages_to_balance[i].as_ref().unwrap();
+                        let page = &balance_info.pages_to_balance[i].as_ref().ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?;
                         let page_contents = page.get_contents();
                         let free_space = compute_free_space(page_contents, usable_space);
 
@@ -3409,18 +3486,26 @@ impl BTreeCursor {
                         cell_array,
                         sibling_count_new,
                         ..
-                    } = context.as_mut().unwrap();
+                    } = context.as_mut().ok_or_else(|| {
+                        LimboError::Corrupt("Balance context not available".to_string())
+                    })?;
                     let pager = self.pager.clone();
                     let mut balance_info = balance_info.borrow_mut();
-                    let balance_info = balance_info.as_mut().unwrap();
+                    let balance_info = balance_info.as_mut().ok_or_else(|| {
+                        LimboError::Corrupt("Balance info not available".to_string())
+                    })?;
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?
                         .get_contents()
                         .page_type();
                     // Allocate pages or set dirty if not needed
                     if *i < balance_info.sibling_count {
-                        let page = balance_info.pages_to_balance[*i].as_ref().unwrap();
+                        let page = balance_info.pages_to_balance[*i].as_ref().ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?;
                         turso_assert!(page.is_dirty(), "sibling page must be already marked dirty");
                         pages_to_balance_new[*i].replace(page.clone());
                     } else {
@@ -3441,7 +3526,9 @@ impl BTreeCursor {
                         continue;
                     } else {
                         *sub_state = BalanceSubState::NonRootDoBalancingFinish {
-                            context: context.take().unwrap(),
+                            context: context.take().ok_or_else(|| {
+                                LimboError::Corrupt("Balance context not available".to_string())
+                            })?,
                         };
                     }
                 }
@@ -3457,10 +3544,14 @@ impl BTreeCursor {
                         },
                 } => {
                     let mut balance_info = balance_info.borrow_mut();
-                    let balance_info = balance_info.as_mut().unwrap();
+                    let balance_info = balance_info.as_mut().ok_or_else(|| {
+                        LimboError::Corrupt("Balance info not available".to_string())
+                    })?;
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?
                         .get_contents()
                         .page_type();
                     let parent_is_root = !self.stack.has_parent();
@@ -3477,7 +3568,15 @@ impl BTreeCursor {
                             .take(sibling_count_new)
                             .enumerate()
                         {
-                            page_numbers[i] = page.as_ref().unwrap().get().id;
+                            page_numbers[i] = page
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Page not found in balance info".to_string(),
+                                    )
+                                })?
+                                .get()
+                                .id;
                         }
                         page_numbers.sort();
                         for (page, new_id) in pages_to_balance_new
@@ -3486,7 +3585,9 @@ impl BTreeCursor {
                             .rev()
                             .zip(page_numbers.iter().rev().take(sibling_count_new))
                         {
-                            let page = page.as_ref().unwrap();
+                            let page = page
+                                .as_ref()
+                                .expect("Page should exist in balance info during validation");
                             if *new_id != page.get().id {
                                 page.get().id = *new_id;
                                 self.pager
@@ -3503,7 +3604,12 @@ impl BTreeCursor {
                             for page in pages_to_balance_new.iter().take(sibling_count_new) {
                                 tracing::debug!(
                                     "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().id
+                                    page.as_ref()
+                                        .ok_or_else(|| LimboError::Corrupt(
+                                            "Page not found in balance info".to_string()
+                                        ))?
+                                        .get()
+                                        .id
                                 );
                             }
                         }
@@ -3519,7 +3625,9 @@ impl BTreeCursor {
                     // therfore invalidating the pointer.
                     let right_page_id = pages_to_balance_new[sibling_count_new - 1]
                         .as_ref()
-                        .unwrap()
+                        .ok_or_else(|| {
+                            LimboError::Corrupt("Page not found in balance info".to_string())
+                        })?
                         .get()
                         .id as u32;
                     let rightmost_pointer = balance_info.rightmost_pointer;
@@ -3543,11 +3651,20 @@ impl BTreeCursor {
                         let last_sibling_idx = balance_info.sibling_count - 1;
                         let last_page = balance_info.pages_to_balance[last_sibling_idx]
                             .as_ref()
-                            .unwrap();
-                        let right_pointer = last_page.get_contents().rightmost_pointer().unwrap();
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Page not found in balance info".to_string())
+                            })?;
+                        let right_pointer = last_page
+                            .get_contents()
+                            .rightmost_pointer()
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Rightmost pointer not found".to_string())
+                            })?;
                         let new_last_page = pages_to_balance_new[sibling_count_new - 1]
                             .as_ref()
-                            .unwrap();
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Page not found in balance info".to_string())
+                            })?;
                         new_last_page
                             .get_contents()
                             .write_rightmost_ptr(right_pointer);
@@ -3564,7 +3681,9 @@ impl BTreeCursor {
                         .take(sibling_count_new - 1)
                     /* do not take last page */
                     {
-                        let page = page.as_ref().unwrap();
+                        let page = page
+                            .as_ref()
+                            .expect("Page should exist in balance info during validation");
                         // e.g. if we have 3 pages and the leftmost child page has 3 cells,
                         // then the divider cell idx is 3 in the flat cell array.
                         let divider_cell_idx = cell_array.cell_count_up_to_page(sibling_page_idx);
@@ -3675,7 +3794,9 @@ impl BTreeCursor {
                     {
                         // Let's ensure every page is pointed to by the divider cell or the rightmost pointer.
                         for page in pages_to_balance_new.iter().take(sibling_count_new) {
-                            let page = page.as_ref().unwrap();
+                            let page = page
+                                .as_ref()
+                                .expect("Page should exist in balance info during validation");
                             assert!(
                                 pages_pointed_to.contains(&(page.get().id as u32)),
                                 "page {} not pointed to by divider cell or rightmost pointer",
@@ -3753,7 +3874,12 @@ impl BTreeCursor {
                                     cell_array.cell_count_up_to_page(page_idx) - start_new_cells,
                                 )
                             };
-                            let page = pages_to_balance_new[page_idx].as_ref().unwrap();
+                            let page =
+                                pages_to_balance_new[page_idx].as_ref().ok_or_else(|| {
+                                    LimboError::Corrupt(
+                                        "Page not found in balance info".to_string(),
+                                    )
+                                })?;
                             tracing::debug!("pre_edit_page(page={})", page.get().id);
                             let page_contents = page.get_contents();
                             edit_page(
@@ -3777,7 +3903,9 @@ impl BTreeCursor {
                     }
 
                     // TODO: vacuum support
-                    let first_child_page = pages_to_balance_new[0].as_ref().unwrap();
+                    let first_child_page = pages_to_balance_new[0].as_ref().ok_or_else(|| {
+                        LimboError::Corrupt("Page not found in balance info".to_string())
+                    })?;
                     let first_child_contents = first_child_page.get_contents();
                     if parent_is_root
                         && parent_contents.cell_count() == 0
@@ -3841,7 +3969,7 @@ impl BTreeCursor {
                         sibling_count_new,
                         right_page_id,
                         usable_space,
-                    );
+                    )?;
 
                     // Balance-shallower case
                     if sibling_count_new == 0 {
@@ -3872,7 +4000,11 @@ impl BTreeCursor {
                     } else {
                         let balance_info = balance_info.borrow();
                         let balance_info = balance_info.as_ref().expect("must be balancing");
-                        let page = balance_info.pages_to_balance[*curr_page].as_ref().unwrap();
+                        let page = balance_info.pages_to_balance[*curr_page]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                LimboError::Corrupt("Page not found in balance info".to_string())
+                            })?;
                         return_if_io!(self.pager.free_page(Some(page.clone()), page.get().id));
                         *sub_state = BalanceSubState::FreePages {
                             curr_page: *curr_page + 1,
@@ -3947,11 +4079,11 @@ impl BTreeCursor {
         sibling_count_new: usize,
         right_page_id: u32,
         usable_space: usize,
-    ) {
+    ) -> Result<()> {
         let mut valid = true;
         let mut current_index_cell = 0;
         for cell_idx in 0..parent_contents.cell_count() {
-            let cell = parent_contents.cell_get(cell_idx, usable_space).unwrap();
+            let cell = parent_contents.cell_get(cell_idx, usable_space)?;
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
                     let left_child_page = table_interior_cell.left_child_page;
@@ -3982,7 +4114,11 @@ impl BTreeCursor {
             .take(sibling_count_new)
             .enumerate()
         {
-            let page = page.as_ref().unwrap();
+            let page = page.as_ref().ok_or_else(|| {
+                LimboError::Corrupt(
+                    "Page should exist in balance info during validation".to_string(),
+                )
+            })?;
             let contents = page.get_contents();
             debug_validate_cells!(contents, usable_space);
             // Cells are distributed in order
@@ -4004,8 +4140,7 @@ impl BTreeCursor {
                     contents,
                     0,
                     usable_space,
-                )
-                .unwrap();
+                )?;
                 match &cell {
                     BTreeCell::TableInteriorCell(table_interior_cell) => {
                         let left_child_page = table_interior_cell.left_child_page;
@@ -4223,11 +4358,8 @@ impl BTreeCursor {
                         contents,
                         0,
                         usable_space,
-                    )
-                    .unwrap();
-                    let parent_cell = parent_contents
-                        .cell_get(cell_divider_idx, usable_space)
-                        .unwrap();
+                    )?;
+                    let parent_cell = parent_contents.cell_get(cell_divider_idx, usable_space)?;
                     let rowid = match cell {
                         BTreeCell::TableLeafCell(table_leaf_cell) => table_leaf_cell.rowid,
                         _ => unreachable!(),
@@ -4324,6 +4456,7 @@ impl BTreeCursor {
             valid,
             "corrupted database, cells were not balanced properly"
         );
+        Ok(())
     }
 
     /// Balance the root page.
@@ -4703,7 +4836,10 @@ impl BTreeCursor {
 
     fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
         let page_ref = root_page.get();
-        let contents = page_ref.contents.as_ref().unwrap();
+        let contents = page_ref
+            .contents
+            .as_ref()
+            .ok_or_else(|| LimboError::Corrupt("Page contents not loaded".to_string()))?;
 
         let page_type = match contents.page_type() {
             PageType::TableLeaf | PageType::TableInterior => PageType::TableLeaf,
@@ -4844,7 +4980,10 @@ impl BTreeCursor {
             self.valid_state = CursorValidState::Valid;
             return Ok(IOResult::Done(()));
         }
-        let ctx = self.context.take().unwrap();
+        let ctx = self
+            .context
+            .take()
+            .ok_or_else(|| LimboError::Corrupt("Cursor context not available".to_string()))?;
         let seek_key = match ctx.key {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
             CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record),
@@ -4995,7 +5134,7 @@ impl CursorTrait for BTreeCursor {
         if !invalidated {
             let record_ref =
                 Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
-                    .unwrap();
+                    .expect("Record should be valid after checking invalidated flag");
             return Ok(IOResult::Done(Some(record_ref)));
         }
 
@@ -5028,17 +5167,26 @@ impl CursorTrait for BTreeCursor {
         } else {
             self.get_immutable_record_or_create()
                 .as_mut()
-                .unwrap()
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "Failed to get mutable reference to immutable record".to_string(),
+                    )
+                })?
                 .invalidate();
             self.get_immutable_record_or_create()
                 .as_mut()
-                .unwrap()
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "Failed to get mutable reference to immutable record".to_string(),
+                    )
+                })?
                 .start_serialization(payload);
             self.record_cursor.borrow_mut().invalidate();
         };
 
         let record_ref =
-            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref()).unwrap();
+            Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| opt.as_ref())
+                .expect("Record should be valid after get_immutable_record_or_create");
         Ok(IOResult::Done(Some(record_ref)))
     }
 
@@ -5538,8 +5686,9 @@ impl CursorTrait for BTreeCursor {
 
                     if cell_idx == contents.cell_count() {
                         // Move to right child
-                        // should be safe as contents is not a leaf page
-                        let right_most_pointer = contents.rightmost_pointer().unwrap();
+                        let right_most_pointer = contents.rightmost_pointer().ok_or_else(|| {
+                            LimboError::Corrupt("Interior page missing rightmost pointer".into())
+                        })?;
                         self.stack.advance();
                         let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
                         self.stack.push(mem_page);
@@ -5620,7 +5769,7 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_record(&mut self) {
         self.get_immutable_record_or_create()
             .as_mut()
-            .unwrap()
+            .expect("Failed to get mutable reference to immutable record after creation")
             .invalidate();
         self.record_cursor.borrow_mut().invalidate();
     }
@@ -5645,7 +5794,9 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn get_index_info(&self) -> &IndexInfo {
-        self.index_info.as_ref().unwrap()
+        self.index_info
+            .as_ref()
+            .expect("Index info should be set for index cursors")
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
@@ -6346,7 +6497,9 @@ impl PageStack {
             return;
         }
         let current = self.current();
-        let page = self.stack[current].as_ref().unwrap();
+        let page = self.stack[current]
+            .as_ref()
+            .expect("Page should exist in stack at current position");
         turso_assert!(
             page.is_pinned(),
             "parent page {} is not pinned",
@@ -6394,14 +6547,18 @@ impl PageStack {
     /// This is the page that is currently being traversed.
     fn top(&self) -> Arc<Page> {
         let current = self.current();
-        let page = self.stack[current].clone().unwrap();
+        let page = self.stack[current]
+            .clone()
+            .expect("Page should exist in stack at current position");
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
 
     fn top_ref(&self) -> &Arc<Page> {
         let current = self.current();
-        let page = self.stack[current].as_ref().unwrap();
+        let page = self.stack[current]
+            .as_ref()
+            .expect("Page should exist in stack at current position");
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
@@ -7584,7 +7741,9 @@ fn fill_cell_payload(
                     cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
                 }
                 if matches!(page_type, PageType::TableLeaf) {
-                    let int_key = int_key.unwrap();
+                    let int_key = int_key.ok_or_else(|| {
+                        LimboError::Corrupt("int_key must be provided for TableLeaf pages".into())
+                    })?;
                     write_varint_to_vec(record_buf.len() as u64, cell_payload);
                     write_varint_to_vec(int_key as u64, cell_payload);
                 } else {
