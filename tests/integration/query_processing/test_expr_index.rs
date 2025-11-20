@@ -74,3 +74,28 @@ fn expression_index_used_for_order_by() -> anyhow::Result<()> {
     assert_eq!(rows, vec![vec![0.into(), 5.into()]]);
     Ok(())
 }
+
+#[test]
+fn expression_index_covering_scan() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (a INT, b INT);");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO t VALUES (1, 2)")?;
+    conn.execute("INSERT INTO t VALUES (3, 4)")?;
+    conn.execute("INSERT INTO t VALUES (5, 6)")?;
+
+    conn.execute("CREATE INDEX idx_expr_proj ON t(a + b)")?;
+
+    let plans = explain_plans(&conn, "SELECT a + b FROM t")?;
+    assert!(
+        plans
+            .iter()
+            .any(|p| p.contains("USING COVERING INDEX idx_expr_proj")),
+        "expected covering index usage, got {plans:?}"
+    );
+
+    let rows = limbo_exec_rows(&tmp_db, &conn, "SELECT a + b FROM t ORDER BY a + b");
+    assert_eq!(rows, vec![vec![3.into()], vec![7.into()], vec![11.into()]]);
+    Ok(())
+}
