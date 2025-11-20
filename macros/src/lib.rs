@@ -132,7 +132,7 @@ fn generate_get_description(
     }
 
     let enum_impl = format!(
-        "impl {enum_name}  {{ 
+        "impl {enum_name}  {{
      pub fn get_description(&self) -> Option<&str> {{
      match self {{
      {all_enum_arms}
@@ -140,7 +140,9 @@ fn generate_get_description(
      }}
      }}"
     );
-    enum_impl.parse().unwrap()
+    enum_impl
+        .parse()
+        .expect("generated code should be valid Rust")
 }
 
 /// Register your extension with 'core' by providing the relevant functions
