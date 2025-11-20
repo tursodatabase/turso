@@ -184,6 +184,7 @@ impl TempDatabase {
         .unwrap()
     }
 
+    #[allow(dead_code)]
     #[cfg(feature = "test_helper")]
     pub fn get_pending_byte() -> u32 {
         let pending_byte_sqlite = unsafe {
@@ -194,6 +195,7 @@ impl TempDatabase {
         pending_byte_turso
     }
 
+    #[allow(dead_code)]
     #[cfg(feature = "test_helper")]
     pub fn set_pending_byte(offset: u32) {
         unsafe {
@@ -202,6 +204,7 @@ impl TempDatabase {
         Database::set_pending_byte(offset);
     }
 
+    #[allow(dead_code)]
     #[cfg(feature = "test_helper")]
     pub fn reset_pending_byte() {
         // 1 Gib

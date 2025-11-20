@@ -221,7 +221,7 @@ impl DatabaseFunction {
             quote! {(|#arg_name: #arg_ty| #block)(#arg_name);}
         };
 
-        let tmp_db_builder_args = self.args.get_tmp_db_builder(&fn_name, &arg_ty, mvcc);
+        let tmp_db_builder_args = self.args.get_tmp_db_builder(&fn_name, arg_ty, mvcc);
 
         quote! {
             #[test]
@@ -270,7 +270,7 @@ fn check_fn_inputs(input: &ItemFn) -> syn::Result<(Pat, syn::Type)> {
     }
     let first = args.first().unwrap();
     match first {
-        syn::FnArg::Receiver(receiver) => return Err(syn::Error::new_spanned(receiver, msg)),
+        syn::FnArg::Receiver(receiver) => Err(syn::Error::new_spanned(receiver, msg)),
         syn::FnArg::Typed(pat_type) => {
             if let Type::Path(type_path) = pat_type.ty.as_ref() {
                 // Check if qself is None (not a qualified path like <T as Trait>::Type)
@@ -282,17 +282,17 @@ fn check_fn_inputs(input: &ItemFn) -> syn::Result<(Pat, syn::Type)> {
                 // This works for both:
                 // - Simple: TempDatabase
                 // - Qualified: crate::TempDatabase, my_module::TempDatabase
-                if !type_path
+                if type_path
                     .path
                     .segments
                     .last()
-                    .is_some_and(|segment| segment.ident == "TempDatabase")
+                    .is_none_or(|segment| segment.ident != "TempDatabase")
                 {
                     return Err(syn::Error::new_spanned(type_path, msg));
                 }
                 Ok((*pat_type.pat.clone(), *pat_type.ty.clone()))
             } else {
-                return Err(syn::Error::new_spanned(pat_type, msg));
+                Err(syn::Error::new_spanned(pat_type, msg))
             }
         }
     }
