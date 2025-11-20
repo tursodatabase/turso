@@ -590,16 +590,14 @@ impl Database {
                 AutoVacuumMode::None
             };
 
-            // Force autovacuum to None if the experimental flag is not enabled
-            let final_mode = if !self.opts.enable_autovacuum {
-                if mode != AutoVacuumMode::None {
-                    tracing::warn!(
-                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
-                    );
-                }
-                AutoVacuumMode::None
-            } else {
+            // TODO: remove behind experimental toggle once feature is fully supported.
+            // Do not disable autovacuum if the database header already has it enabled; otherwise we would
+            // corrupt pointer-map expectations for existing databases. The flag only controls enabling it
+            // when creating/rewriting databases, not honoring an already-enabled file.
+            let final_mode = if mode != AutoVacuumMode::None || self.opts.enable_autovacuum {
                 mode
+            } else {
+                AutoVacuumMode::None
             };
 
             pager.set_auto_vacuum_mode(final_mode);
