@@ -11,6 +11,9 @@ use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{Table, Type};
+use crate::translate::expression_index::{
+    normalize_expr_for_index_matching, single_table_column_usage,
+};
 use crate::translate::optimizer::TakeOwnership;
 use crate::translate::plan::{Operation, ResultSetColumn};
 use crate::translate::planner::parse_row_id;
@@ -97,6 +100,50 @@ macro_rules! expect_arguments_max {
 
         args
     }};
+}
+
+#[inline]
+/// For expression indexes, try to emit code that directly reads the value from the index
+/// under the following conditions:
+/// - The expression only references columns from a single table
+/// - The referenced table has an index whose expression matches the given expression
+///
+/// If an expression index exactly matches the requested expression, we can
+/// fetch the precomputed value from the index key instead of re-evaluating
+/// the expression. That matters for:
+/// - SELECT a/b FROM t with INDEX ON t(a/b) (avoid computing a/b for every row)
+/// - ORDER BY a+b when the index already stores a+b (preserves ordering)
+/// We mut do this check early in translate_expr so downstream translation does
+/// not build redundant bytecode.
+fn try_emit_expression_index_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+) -> Result<bool> {
+    let Some(referenced_tables) = referenced_tables else {
+        return Ok(false);
+    };
+    let Some((table_id, _)) = single_table_column_usage(expr) else {
+        return Ok(false);
+    };
+    let Some(table_reference) = referenced_tables.find_joined_table_by_internal_id(table_id) else {
+        return Ok(false);
+    };
+    let Some(index) = table_reference.op.index() else {
+        return Ok(false);
+    };
+    let normalized = normalize_expr_for_index_matching(expr, table_reference, referenced_tables);
+    let Some(expr_pos) = index.expression_to_index_pos(&normalized) else {
+        return Ok(false);
+    };
+    let Some(cursor_id) =
+        program.resolve_cursor_id_safe(&CursorKey::index(table_id, index.clone()))
+    else {
+        return Ok(false);
+    };
+    program.emit_column_or_rowid(cursor_id, expr_pos, target_register);
+    Ok(true)
 }
 
 macro_rules! expect_arguments_min {
@@ -596,6 +643,14 @@ pub fn translate_expr(
             dst_reg: target_register,
             extra_amount: 0,
         });
+        if let Some(span) = constant_span {
+            program.constant_span_end(span);
+        }
+        return Ok(target_register);
+    }
+
+    // At the very start we try to satisfy the expression from an expression index
+    if try_emit_expression_index_value(program, referenced_tables, expr, target_register)? {
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }

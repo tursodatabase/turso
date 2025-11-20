@@ -26,7 +26,7 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Search, SelectPlan, TableReferences},
+    plan::{Operation, QueryDestination, Scan, Search, SelectPlan, TableReferences},
 };
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
@@ -486,15 +486,33 @@ pub fn emit_from_clause_subqueries(
             program,
             true,
             match &table_reference.op {
-                Operation::Scan { .. } => {
-                    if table_reference.table.get_name() == table_reference.identifier {
-                        format!("SCAN {}", table_reference.identifier)
-                    } else {
-                        format!(
-                            "SCAN {} AS {}",
-                            table_reference.table.get_name(),
-                            table_reference.identifier
-                        )
+                Operation::Scan(scan) => {
+                    let table_name =
+                        if table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.clone()
+                        } else {
+                            format!(
+                                "{} AS {}",
+                                table_reference.table.get_name(),
+                                table_reference.identifier
+                            )
+                        };
+
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            if let Some(index) = index {
+                                if table_reference.utilizes_covering_index() {
+                                    format!("SCAN {table_name} USING COVERING INDEX {}", index.name)
+                                } else {
+                                    format!("SCAN {table_name} USING INDEX {}", index.name)
+                                }
+                            } else {
+                                format!("SCAN {table_name}")
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            format!("SCAN {table_name}")
+                        }
                     }
                 }
                 Operation::Search(search) => match search {

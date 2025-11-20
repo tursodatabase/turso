@@ -2,9 +2,10 @@ use crate::{
     schema::{Column, Index},
     translate::{
         collate::get_collseq_from_expr,
-        expr::{as_binary_components, comparison_affinity, walk_expr_mut, WalkControl},
+        expr::{as_binary_components, comparison_affinity},
+        expression_index::normalize_expr_for_index_matching,
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
-        planner::{table_mask_from_expr, TableMask, ROWID_STRS},
+        planner::{table_mask_from_expr, TableMask},
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -211,45 +212,6 @@ fn expression_matches_table(
             .is_some_and(|idx| mask.contains_table(idx) && mask.table_count() == 1),
         Err(_) => false,
     }
-}
-
-// Turn bound Column/RowId nodes back into simple identifiers so we can compare
-// the expression textually against the stored expression definition on the index.
-// e.g. this ensures that `a+b` in the query matches `a + b` stored on the index, even
-// though the query expression has already been bound to column positions.
-// TODO: this sucks, we should either lazily bind the constraint or maybe pre-bind and store
-// the index expression and save that for if its translated?
-fn normalize_expr_for_index_matching(
-    expr: &ast::Expr,
-    table_reference: &JoinedTable,
-    table_references: &TableReferences,
-) -> ast::Expr {
-    let mut expr = expr.clone();
-    let _table_idx = table_references
-        .joined_tables()
-        .iter()
-        .position(|t| t.internal_id == table_reference.internal_id)
-        .expect("table must exist in table_references");
-    let columns = table_reference.table.columns();
-    let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Column { column, .. } => {
-                let name = columns[*column]
-                    .name
-                    .as_ref()
-                    .expect("column must have a name")
-                    .clone();
-                *e = ast::Expr::Id(ast::Name::exact(name));
-            }
-            ast::Expr::RowId { .. } => {
-                *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    };
-    let _ = walk_expr_mut(&mut expr, &mut normalize);
-    expr
 }
 
 /// Precompute all potentially usable [Constraints] from a WHERE clause.

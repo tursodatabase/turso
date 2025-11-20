@@ -30,12 +30,9 @@ pub fn normalize_expr_for_index_matching(
     let mut normalize = |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Column { column, .. } => {
-                let name = columns[*column]
-                    .name
-                    .as_ref()
-                    .expect("column must have a name")
-                    .clone();
-                *e = ast::Expr::Id(ast::Name::exact(name));
+                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_ref()) {
+                    *e = ast::Expr::Id(ast::Name::exact(name.clone()));
+                }
             }
             ast::Expr::RowId { .. } => {
                 *e = ast::Expr::Id(ast::Name::exact(ROWID_STRS[0].to_string()));

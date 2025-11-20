@@ -192,6 +192,8 @@ pub fn translate_create_index(
             internal_id: table_ref,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }],
         vec![],

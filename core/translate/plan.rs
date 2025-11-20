@@ -7,7 +7,9 @@ use crate::{
     function::AggFunc,
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
-        collate::get_collseq_from_expr, emitter::UpdateRowSource,
+        collate::get_collseq_from_expr,
+        emitter::UpdateRowSource,
+        expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::SeekRangeConstraint,
     },
     vdbe::{
@@ -586,6 +588,20 @@ pub struct JoinedTable {
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
+    /// Count of how many times each column is referenced.
+    ///
+    /// Expression indexes can satisfy a column requirement if the column is
+    /// only used to build the expression itself. Tracking counts lets us
+    /// subtract a column from the covering set only when every usage is
+    /// accounted for by an expression index.
+    pub column_use_counts: Vec<usize>,
+    /// Expressions referencing this table that may be satisfied by an expression index.
+    ///
+    /// Each entry stores the normalized expression text and the columns it
+    /// needs. During covering checks we ask: does an index contain this
+    /// expression? If yes, all columns that *only* feed this expression can be
+    /// removed from the required-column set.
+    pub expression_index_usages: Vec<ExpressionIndexUsage>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
 }
@@ -690,6 +706,39 @@ impl TableReferences {
     /// Returns a mutable reference to the [JoinedTable]s in the query plan.
     pub fn joined_tables_mut(&mut self) -> &mut Vec<JoinedTable> {
         &mut self.joined_tables
+    }
+
+    /// Resets the expression index usages for all joined tables.
+    pub fn reset_expression_index_usages(&mut self) {
+        for table in self.joined_tables.iter_mut() {
+            table.clear_expression_index_usages();
+        }
+    }
+
+    /// Called before optimization so we can reuse the same registration
+    /// for result columns, ORDER BY, and GROUP BY expressions. If a
+    /// SELECT lists `LOWER(name)` and an index exists on `LOWER(name)`, we
+    /// can plan a covering scan because the expression value lives inside
+    /// the index key.
+    pub fn register_expression_index_usage(&mut self, expr: &ast::Expr) {
+        let Some((table_id, columns_mask)) = single_table_column_usage(expr) else {
+            return;
+        };
+        let Some(table_ref) = self
+            .joined_tables()
+            .iter()
+            .find(|t| t.internal_id == table_id)
+        else {
+            return;
+        };
+        let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        if let Some(table_ref_mut) = self
+            .joined_tables_mut()
+            .iter_mut()
+            .find(|t| t.internal_id == table_id)
+        {
+            table_ref_mut.register_expression_index_usage(normalized, columns_mask);
+        }
     }
 
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
@@ -844,6 +893,10 @@ impl ColumnUsedMask {
         self.0.contains(index as u32)
     }
 
+    pub fn clear(&mut self, index: usize) {
+        self.0.remove(index as u32);
+    }
+
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
         other.0.is_subset(&self.0)
     }
@@ -851,12 +904,32 @@ impl ColumnUsedMask {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn subtract(&mut self, other: &Self) {
+        for idx in other.0.iter() {
+            self.0.remove(idx);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().map(|idx| idx as usize)
+    }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
     fn bitor_assign(&mut self, rhs: &Self) {
         self.0 |= &rhs.0;
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExpressionIndexUsage {
+    /// Normalized (non-bound) ast of the expression as stored on an index column.
+    /// Example: `lower(name)` for INDEX ON t(lower(name)).
+    pub normalized_expr: Box<ast::Expr>,
+    /// Columns required to compute the expression. Helps decide whether using
+    /// the expression value from the index fully covers those column reads.
+    pub columns_mask: ColumnUsedMask,
 }
 
 #[derive(Clone, Debug)]
@@ -957,6 +1030,8 @@ impl JoinedTable {
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         })
     }
@@ -968,7 +1043,91 @@ impl JoinedTable {
     /// Mark a column as used in the query.
     /// This is used to determine whether a covering index can be used.
     pub fn mark_column_used(&mut self, index: usize) {
+        if index >= self.column_use_counts.len() {
+            self.column_use_counts.resize(index + 1, 0);
+        }
+        self.column_use_counts[index] += 1;
         self.col_used_mask.set(index);
+    }
+
+    /// Clear any previously registered expression index usages.
+    pub fn clear_expression_index_usages(&mut self) {
+        self.expression_index_usages.clear();
+    }
+
+    /// Example: SELECT a+b FROM t WHERE a+b=5 with INDEX ON t(a+b)
+    /// We want to remember that (a+b) is available on an index key and that
+    /// columns a and b are only needed to produce that expression. Later we
+    /// can avoid opening the table cursor if all column references are
+    /// covered by expression keys.
+    pub fn register_expression_index_usage(
+        &mut self,
+        normalized_expr: ast::Expr,
+        columns_mask: ColumnUsedMask,
+    ) {
+        if columns_mask.is_empty() {
+            return;
+        }
+        if self
+            .expression_index_usages
+            .iter()
+            .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized_expr))
+        {
+            return;
+        }
+        self.expression_index_usages.push(ExpressionIndexUsage {
+            normalized_expr: Box::new(normalized_expr),
+            columns_mask,
+        });
+    }
+
+    /// Provided an index that may contain expression keys, remove any
+    /// columns from `required_columns` that are fully covered by expression index values.
+    fn apply_expression_index_coverage(
+        &self,
+        index: &Index,
+        required_columns: &mut ColumnUsedMask,
+    ) {
+        if self.expression_index_usages.is_empty() {
+            return;
+        }
+        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
+        let mut any_covered = false;
+        for usage in &self.expression_index_usages {
+            // If the index stores the expression (e.g. idx on lower(name)), all
+            // columns needed *solely* for that expression can be treated as
+            // covered by the index key. Example:
+            //   CREATE INDEX idx ON t(lower(name));
+            //   SELECT lower(name) FROM t;
+            // Column `name` is not otherwise needed, so we can rely on the
+            // expression value from the index and drop the table cursor.
+            if index
+                .expression_to_index_pos(&usage.normalized_expr)
+                .is_some()
+            {
+                any_covered = true;
+                for col_idx in usage.columns_mask.iter() {
+                    if col_idx >= coverage_counts.len() {
+                        coverage_counts.resize(col_idx + 1, 0);
+                    }
+                    coverage_counts[col_idx] += 1;
+                }
+            }
+        }
+        if !any_covered {
+            return;
+        }
+        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
+            if covered == 0 {
+                continue;
+            }
+            // Only drop the requirement if *all* references to this column are
+            // satisfied by expression-index values. If the column is also
+            // selected or filtered directly, the table data is still needed.
+            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
+                required_columns.clear(col_idx);
+            }
+        }
     }
 
     /// Open the necessary cursors for this table reference.
@@ -1077,12 +1236,13 @@ impl JoinedTable {
         if index.index_method.is_some() {
             return false;
         }
-        if index.columns.iter().any(|c| c.expr.is_some()) {
-            // expression indexes cannot be covering because they don't map to table columns.
-            return false;
+        let mut required_columns = self.col_used_mask.clone();
+        self.apply_expression_index_coverage(index, &mut required_columns);
+        if required_columns.is_empty() {
+            return true;
         }
         let mut index_cols_mask = ColumnUsedMask::default();
-        for col in index.columns.iter() {
+        for col in index.columns.iter().filter(|c| c.expr.is_none()) {
             index_cols_mask.set(col.pos_in_table);
         }
 
@@ -1090,9 +1250,9 @@ impl JoinedTable {
         if btree.has_rowid {
             if let Some(pos_of_rowid_alias_col) = btree.get_rowid_alias_column().map(|(pos, _)| pos)
             {
-                let mut empty_mask = ColumnUsedMask::default();
-                empty_mask.set(pos_of_rowid_alias_col);
-                if self.col_used_mask == empty_mask {
+                let mut rowid_only = ColumnUsedMask::default();
+                rowid_only.set(pos_of_rowid_alias_col);
+                if required_columns == rowid_only {
                     // However if the index would be ONLY used for the rowid, then let's not bother using it to cover the query.
                     // Example: if the query is SELECT id FROM t, and id is a rowid alias, then let's rather just scan the table
                     // instead of an index.
@@ -1102,7 +1262,7 @@ impl JoinedTable {
             }
         }
 
-        index_cols_mask.contains_all_set_bits_of(&self.col_used_mask)
+        index_cols_mask.contains_all_set_bits_of(&required_columns)
     }
 
     /// Returns true if the index selected for use with this [TableReference] is a covering index,

@@ -267,6 +267,8 @@ fn add_ephemeral_table_to_update_plan(
             }),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }],
         vec![],
@@ -531,6 +533,39 @@ fn optimize_table_access_with_custom_modules(
     Ok(false)
 }
 
+/// We do a single pass over projected, grouping, and ordering expressions to
+/// capture every expression that could be served directly from an expression index.
+/// Example:
+///   CREATE INDEX idx ON t(lower(a));
+///   SELECT lower(a) FROM t ORDER BY lower(a);
+/// Both the SELECT list and ORDER BY can be covered by idx, avoiding a
+/// table cursor entirely. Recording them upfront lets both the cost model
+/// and covering checks reuse the same facts.
+fn register_expression_index_usages_for_plan(
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    group_by: Option<&GroupBy>,
+) {
+    table_references.reset_expression_index_usages();
+    for rc in result_columns {
+        table_references.register_expression_index_usage(&rc.expr);
+    }
+    for (expr, _) in order_by {
+        table_references.register_expression_index_usage(expr);
+    }
+    if let Some(group_by) = group_by {
+        for expr in &group_by.exprs {
+            table_references.register_expression_index_usage(expr);
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                table_references.register_expression_index_usage(expr);
+            }
+        }
+    }
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -561,6 +596,13 @@ fn optimize_table_access(
             TableReferences::MAX_JOINED_TABLES
         );
     }
+
+    register_expression_index_usages_for_plan(
+        table_references,
+        result_columns,
+        order_by.as_slice(),
+        group_by.as_ref(),
+    );
 
     if table_references.joined_tables().len() == 1 {
         let optimized = optimize_table_access_with_custom_modules(

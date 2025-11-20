@@ -189,6 +189,8 @@ pub fn prepare_update_plan(
         op: build_scan_op(&table, iter_dir),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);

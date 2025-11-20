@@ -351,34 +351,37 @@ mod tests {
         collation: Option<CollationSeq>,
     ) -> TableReferences {
         let mut table_references = TableReferences::new_empty();
+        let table = Table::BTree(Arc::new(BTreeTable {
+            root_page: 0,
+            has_autoincrement: false,
+            has_rowid: false,
+            is_strict: false,
+            name: "foo".to_string(),
+            primary_key_columns: vec![],
+            columns: vec![Column::new(
+                Some("foo".to_string()),
+                "text".to_string(),
+                None,
+                Type::Text,
+                collation,
+                ColDef::default(),
+            )],
+            unique_sets: vec![],
+            foreign_keys: vec![],
+        }));
         table_references.add_joined_table(JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "foo".to_string(),
             internal_id: TableInternalId::from(1),
             join_info: None,
-            table: Table::BTree(Arc::new(BTreeTable {
-                root_page: 0,
-                has_autoincrement: false,
-                has_rowid: false,
-                is_strict: false,
-                name: "foo".to_string(),
-                primary_key_columns: vec![],
-                columns: vec![Column::new(
-                    Some("foo".to_string()),
-                    "text".to_string(),
-                    None,
-                    Type::Text,
-                    collation,
-                    ColDef::default(),
-                )],
-                unique_sets: vec![],
-                foreign_keys: vec![],
-            })),
+            table,
         });
 
         table_references
@@ -396,6 +399,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "t1".to_string(),
             internal_id: TableInternalId::from(1),
@@ -426,6 +431,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "t2".to_string(),
             internal_id: TableInternalId::from(2),
@@ -463,6 +470,8 @@ mod tests {
                 index: None,
             }),
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
             identifier: "bar".to_string(),
             internal_id: TableInternalId::from(1),

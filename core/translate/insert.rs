@@ -258,6 +258,8 @@ pub fn translate_insert(
             op: Operation::default_scan_for(&table),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }],
         vec![],

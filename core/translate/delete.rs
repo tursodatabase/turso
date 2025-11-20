@@ -138,6 +138,8 @@ pub fn prepare_delete_plan(
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
