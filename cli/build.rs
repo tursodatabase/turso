@@ -13,9 +13,9 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=manuals");
 
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    let syntax =
-        SyntaxDefinition::load_from_str(include_str!("./SQL.sublime-syntax"), false, None).unwrap();
+    let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR not set by cargo");
+    let syntax = SyntaxDefinition::load_from_str(include_str!("./SQL.sublime-syntax"), false, None)
+        .expect("failed to load SQL syntax definition");
     let mut ps = SyntaxSet::new().into_builder();
     ps.add(syntax);
     let ps = ps.build();
@@ -23,5 +23,5 @@ fn main() {
         &ps,
         Path::new(&out_dir).join("SQL_syntax_set_dump.packdump"),
     )
-    .unwrap();
+    .expect("failed to dump syntax set");
 }
