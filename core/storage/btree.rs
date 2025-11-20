@@ -1,6 +1,8 @@
 use rustc_hash::FxHashMap;
 use tracing::{instrument, Level};
 
+#[cfg(not(feature = "omit_autovacuum"))]
+use crate::storage::pager::{ptrmap, ptrmap::PtrmapType, AutoVacuumMode};
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -374,6 +376,9 @@ struct BalanceInfo {
     sibling_count: usize,
     /// First divider cell to remove that marks the first sibling
     first_divider_cell: usize,
+    /// Parent page id of the balanced siblings (used for ptrmap updates)
+    #[cfg(not(feature = "omit_autovacuum"))]
+    parent_page_id: u32,
 }
 
 /// Holds the state machine for the operation that was in flight when the cursor
@@ -2613,6 +2618,12 @@ impl BTreeCursor {
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
         let parent_contents = parent.get_contents();
+        #[cfg(not(feature = "omit_autovacuum"))]
+        return_if_io!(self.update_ptrmap(
+            new_rightmost_leaf.get().id as u32,
+            PtrmapType::BTreeNode,
+            parent.get().id as u32
+        ));
         let rightmost_pointer = parent_contents
             .rightmost_pointer()
             .expect("parent should have a rightmost pointer");
@@ -2656,6 +2667,27 @@ impl BTreeCursor {
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
         self.pager.add_dirty(parent)?;
         self.pager.add_dirty(&new_rightmost_leaf)?;
+        #[cfg(not(feature = "omit_autovacuum"))]
+        {
+            return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                &self.pager,
+                parent,
+                parent_contents,
+                usable_space
+            ));
+            return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                &self.pager,
+                old_rightmost_leaf,
+                old_rightmost_leaf_contents,
+                usable_space
+            ));
+            return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                &self.pager,
+                &new_rightmost_leaf,
+                new_rightmost_leaf_contents,
+                usable_space
+            ));
+        }
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -2901,6 +2933,8 @@ impl BTreeCursor {
                         divider_cell_payloads: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
                         sibling_count,
                         first_divider_cell: first_cell_divider,
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        parent_page_id: parent_page.get().id as u32,
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
                     let completion = group.build();
@@ -3431,6 +3465,14 @@ impl BTreeCursor {
                             0,
                             BtreePageAllocMode::Any
                         ));
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if !matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                            return_if_io!(pager.ptrmap_put(
+                                page.get().id as u32,
+                                PtrmapType::BTreeNode,
+                                balance_info.parent_page_id
+                            ));
+                        }
                         pages_to_balance_new[*i].replace(page);
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
@@ -3469,43 +3511,17 @@ impl BTreeCursor {
                     let parent_contents = parent_page.get_contents();
                     let mut sibling_count_new = *sibling_count_new;
                     let is_table_leaf = matches!(page_type, PageType::TableLeaf);
-                    // Reassign page numbers in increasing order
+                    #[cfg(not(feature = "omit_autovacuum"))]
                     {
-                        let mut page_numbers: [usize; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
-                            [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
-                        for (i, page) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .enumerate()
-                        {
-                            page_numbers[i] = page.as_ref().unwrap().get().id;
-                        }
-                        page_numbers.sort();
-                        for (page, new_id) in pages_to_balance_new
-                            .iter()
-                            .take(sibling_count_new)
-                            .rev()
-                            .zip(page_numbers.iter().rev().take(sibling_count_new))
-                        {
-                            let page = page.as_ref().unwrap();
-                            if *new_id != page.get().id {
-                                page.get().id = *new_id;
-                                self.pager
-                                    .upsert_page_in_cache(*new_id, page.clone(), true)?;
-                            }
-                        }
-
-                        #[cfg(debug_assertions)]
-                        {
-                            tracing::debug!(
-                                "balance_non_root(parent page_id={})",
-                                parent_page.get().id
-                            );
+                        let parent_id = parent_page.get().id as u32;
+                        if !matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
                             for page in pages_to_balance_new.iter().take(sibling_count_new) {
-                                tracing::debug!(
-                                    "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().id
-                                );
+                                let page = page.as_ref().unwrap();
+                                return_if_io!(self.pager.ptrmap_put(
+                                    page.get().id as u32,
+                                    PtrmapType::BTreeNode,
+                                    parent_id
+                                ));
                             }
                         }
                     }
@@ -3684,6 +3700,13 @@ impl BTreeCursor {
                             );
                         }
                     }
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                        &self.pager,
+                        parent_page,
+                        parent_contents,
+                        usable_space,
+                    ));
                     /* 7. Start real movement of cells. Next comment is borrowed from SQLite: */
                     /* Now update the actual sibling pages. The order in which they are updated
                      ** is important, as this code needs to avoid disrupting any page from which
@@ -3772,8 +3795,31 @@ impl BTreeCursor {
                                 page_contents.cell_count()
                             );
                             page_contents.overflow_cells.clear();
+                            #[cfg(not(feature = "omit_autovacuum"))]
+                            return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                                &self.pager,
+                                page,
+                                page_contents,
+                                usable_space
+                            ));
 
                             done[page_idx] = true;
+                        }
+                    }
+
+                    // Ensure ptrmaps for all balanced pages reflect their final contents,
+                    // including any overflow chains that may have moved between pages.
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if !matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                        for page in pages_to_balance_new.iter().take(sibling_count_new) {
+                            let page = page.as_ref().unwrap();
+                            let contents = page.get_contents();
+                            return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                                &self.pager,
+                                page,
+                                contents,
+                                usable_space,
+                            ));
                         }
                     }
 
@@ -3825,6 +3871,14 @@ impl BTreeCursor {
                                 &child_buf[first_child_contents.offset
                                     ..first_child_contents.offset + header_and_pointer_size],
                             );
+
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+                            &self.pager,
+                            parent_page,
+                            parent_contents,
+                            usable_space
+                        ));
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
                         assert!(sibling_count_new < balance_info.sibling_count);
@@ -4348,6 +4402,12 @@ impl BTreeCursor {
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
+        #[cfg(not(feature = "omit_autovacuum"))]
+        return_if_io!(self.update_ptrmap(
+            child.get().id as u32,
+            PtrmapType::BTreeNode,
+            root.get().id as u32
+        ));
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -4386,6 +4446,13 @@ impl BTreeCursor {
             &mut root_contents.overflow_cells,
         );
         root_contents.overflow_cells.clear();
+        #[cfg(not(feature = "omit_autovacuum"))]
+        return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+            &self.pager,
+            &child,
+            child_contents,
+            self.usable_space()
+        ));
 
         // 2. Modify root
         let new_root_page_type = match root_contents.page_type() {
@@ -4402,6 +4469,13 @@ impl BTreeCursor {
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
+        #[cfg(not(feature = "omit_autovacuum"))]
+        return_if_io!(BTreeCursor::update_child_ptrmaps_for_page(
+            &self.pager,
+            &root,
+            root_contents,
+            self.usable_space()
+        ));
         self.root_page = root.get().id as i64;
         self.stack.clear();
         self.stack.push(root);
@@ -4876,6 +4950,89 @@ impl BTreeCursor {
     pub fn allocate_page(&self, page_type: PageType, offset: usize) -> Result<IOResult<PageRef>> {
         self.pager
             .do_allocate_page(page_type, offset, BtreePageAllocMode::Any)
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn update_ptrmap(
+        &self,
+        page_no: u32,
+        entry_type: PtrmapType,
+        parent_page_no: u32,
+    ) -> Result<IOResult<()>> {
+        if matches!(self.pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return Ok(IOResult::Done(()));
+        }
+        self.pager.ptrmap_put(page_no, entry_type, parent_page_no)
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn update_child_ptrmaps_for_page(
+        pager: &Arc<Pager>,
+        parent_page: &PageRef,
+        contents: &PageContent,
+        usable_space: usize,
+    ) -> Result<IOResult<()>> {
+        if matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return Ok(IOResult::Done(()));
+        }
+        let parent_id = parent_page.get().id as u32;
+
+        let update_overflow_chain = |first: Option<u32>, owner: u32| -> Result<IOResult<()>> {
+            if let Some(mut page_no) = first {
+                return_if_io!(pager.ptrmap_put(page_no, PtrmapType::Overflow1, owner));
+                loop {
+                    let (overflow_page, c) = pager.read_page(page_no as i64)?;
+                    let next = overflow_page.get_contents().read_u32_no_offset(0);
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    return_if_io!(pager.ptrmap_put(next, PtrmapType::Overflow2, page_no));
+                    page_no = next;
+                }
+            }
+            Ok(IOResult::Done(()))
+        };
+
+        for cell_idx in 0..contents.cell_count() {
+            let cell = contents.cell_get(cell_idx, usable_space)?;
+            match cell {
+                BTreeCell::TableInteriorCell(cell) => {
+                    return_if_io!(pager.ptrmap_put(
+                        cell.left_child_page,
+                        PtrmapType::BTreeNode,
+                        parent_id
+                    ));
+                }
+                BTreeCell::IndexInteriorCell(cell) => {
+                    return_if_io!(pager.ptrmap_put(
+                        cell.left_child_page,
+                        PtrmapType::BTreeNode,
+                        parent_id
+                    ));
+                    return_if_io!(update_overflow_chain(cell.first_overflow_page, parent_id));
+                }
+                BTreeCell::TableLeafCell(cell) => {
+                    return_if_io!(update_overflow_chain(cell.first_overflow_page, parent_id));
+                }
+                BTreeCell::IndexLeafCell(cell) => {
+                    return_if_io!(update_overflow_chain(cell.first_overflow_page, parent_id));
+                }
+            }
+        }
+
+        if matches!(
+            contents.page_type(),
+            PageType::TableInterior | PageType::IndexInterior
+        ) {
+            if let Some(rightmost_child) = contents.rightmost_pointer() {
+                return_if_io!(pager.ptrmap_put(rightmost_child, PtrmapType::BTreeNode, parent_id));
+            }
+        }
+
+        Ok(IOResult::Done(()))
     }
 }
 
@@ -5780,6 +5937,20 @@ pub enum IntegrityCheckError {
     },
     #[error("Page {page_id}: never used")]
     PageNeverUsed { page_id: i64 },
+    #[cfg(not(feature = "omit_autovacuum"))]
+    #[error("Ptrmap entry missing for page {page_id}")]
+    PtrMapMissing { page_id: i64 },
+    #[cfg(not(feature = "omit_autovacuum"))]
+    #[error(
+        "Ptrmap entry for page {page_id} mismatch: expected=({expected:?}, parent={expected_parent}), got=({actual:?}, parent={actual_parent})"
+    )]
+    PtrMapMismatch {
+        page_id: i64,
+        expected: PtrmapType,
+        expected_parent: u32,
+        actual: PtrmapType,
+        actual_parent: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5810,6 +5981,7 @@ pub struct IntegrityCheckState {
     pub db_size: usize,
     first_leaf_level: Option<usize>,
     pub page_reference: FxHashMap<i64, i64>,
+    pub page_categories: FxHashMap<i64, PageCategory>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -5820,6 +5992,7 @@ impl IntegrityCheckState {
             page_stack: Vec::new(),
             db_size,
             page_reference: FxHashMap::default(),
+            page_categories: FxHashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {
@@ -5865,6 +6038,7 @@ impl IntegrityCheckState {
         errors: &mut Vec<IntegrityCheckError>,
     ) {
         let page_id = entry.page_idx;
+        self.page_categories.insert(page_id, entry.page_category);
         let Some(previous) = self.page_reference.insert(page_id, referenced_by) else {
             self.page_stack.push(entry);
             return;
@@ -5874,6 +6048,17 @@ impl IntegrityCheckState {
             page_category: entry.page_category,
             references: vec![previous, referenced_by],
         });
+    }
+
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn parent_category(&self, page_id: i64) -> Option<PageCategory> {
+        let Some(parent_id) = self.page_reference.get(&page_id) else {
+            return None;
+        };
+        if *parent_id == 0 {
+            return None;
+        }
+        self.page_categories.get(parent_id).copied()
     }
 }
 impl std::fmt::Debug for IntegrityCheckState {
@@ -5921,9 +6106,76 @@ pub fn integrity_check(
             }
         };
         turso_assert!(page.is_loaded(), "page should be loaded");
+
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if !matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            state.page = Some(page.clone());
+            let page_id = page.get().id as u32;
+            let page_size = pager.get_page_size_unchecked().get() as usize;
+            if page_id > 1 && !ptrmap::is_ptrmap_page(page_id, page_size) {
+                let expected = match page_category {
+                    PageCategory::PointerMap => None,
+                    PageCategory::Normal => {
+                        let referenced_by = *state.page_reference.get(&page_idx).unwrap_or(&0);
+                        // Page 1/root has referenced_by == 0
+                        let entry_type = if referenced_by == 0 {
+                            PtrmapType::RootPage
+                        } else {
+                            PtrmapType::BTreeNode
+                        };
+                        Some((entry_type, referenced_by as u32))
+                    }
+                    PageCategory::Overflow => {
+                        let referenced_by = *state.page_reference.get(&page_idx).unwrap_or(&0);
+                        // Determine if parent was another overflow page to pick the right ptrmap type.
+                        let parent_is_overflow = matches!(
+                            state.parent_category(page_idx),
+                            Some(PageCategory::Overflow)
+                        );
+                        // If we don't know the parent, fall back to Overflow1.
+                        let entry_type = if parent_is_overflow {
+                            PtrmapType::Overflow2
+                        } else {
+                            PtrmapType::Overflow1
+                        };
+                        Some((entry_type, referenced_by as u32))
+                    }
+                    PageCategory::FreeListTrunk | PageCategory::FreePage => {
+                        Some((PtrmapType::FreePage, 0))
+                    }
+                };
+
+                if let Some((expected_type, expected_parent)) = expected {
+                    match return_if_io!(pager.ptrmap_get(page_id)) {
+                        Some(entry) => {
+                            if entry.entry_type != expected_type
+                                || entry.parent_page_no != expected_parent
+                            {
+                                errors.push(IntegrityCheckError::PtrMapMismatch {
+                                    page_id: page_idx,
+                                    expected: expected_type,
+                                    expected_parent,
+                                    actual: entry.entry_type,
+                                    actual_parent: entry.parent_page_no,
+                                });
+                            }
+                        }
+                        None => {
+                            errors.push(IntegrityCheckError::PtrMapMissing { page_id: page_idx })
+                        }
+                    }
+                }
+            }
+            state.page = None;
+        }
+
         state.page_stack.pop();
 
         let contents = page.get_contents();
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if matches!(page_category, PageCategory::PointerMap) {
+            continue;
+        }
         if page_category == PageCategory::FreeListTrunk {
             state.freelist_count.actual_count += 1;
             let next_freelist_trunk_page = contents.read_u32_no_offset(0);
@@ -7679,6 +7931,20 @@ fn fill_cell_payload(
                             "new overflow page is not loaded"
                         );
                         let new_overflow_page_id = new_overflow_page.get().id as u32;
+                        #[cfg(not(feature = "omit_autovacuum"))]
+                        if !matches!(pager.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                            let (entry_type, parent_page_no) =
+                                if let Some(prev_page) = current_overflow_page.as_ref() {
+                                    (PtrmapType::Overflow2, prev_page.get().id as u32)
+                                } else {
+                                    (PtrmapType::Overflow1, page.get().id as u32)
+                                };
+                            return_if_io!(pager.ptrmap_put(
+                                new_overflow_page_id,
+                                entry_type,
+                                parent_page_no
+                            ));
+                        }
 
                         if let Some(prev_page) = current_overflow_page {
                             // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.

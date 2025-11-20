@@ -29,6 +29,8 @@ use tracing::{instrument, trace, Level};
 use turso_macros::AtomicEnum;
 
 use super::btree::btree_init_page;
+#[cfg(not(feature = "omit_autovacuum"))]
+use super::btree::{integrity_check, IntegrityCheckState, PageCategory};
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
 use super::sqlite3_ondisk::begin_write_btree_page;
 use super::wal::CheckpointMode;
@@ -436,6 +438,7 @@ impl DbState {
 enum PtrMapGetState {
     Start,
     Deserialize {
+        target_page_num: u32,
         ptrmap_page: PageRef,
         offset_in_ptrmap_page: usize,
     },
@@ -446,6 +449,7 @@ enum PtrMapGetState {
 enum PtrMapPutState {
     Start,
     Deserialize {
+        target_page_num: u32,
         ptrmap_page: PageRef,
         offset_in_ptrmap_page: usize,
     },
@@ -998,6 +1002,7 @@ impl Pager {
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
+                        target_page_num,
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     };
@@ -1006,9 +1011,14 @@ impl Pager {
                     }
                 }
                 PtrMapGetState::Deserialize {
+                    target_page_num: state_target_page,
                     ptrmap_page,
                     offset_in_ptrmap_page,
                 } => {
+                    if state_target_page != target_page_num {
+                        self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Start;
+                        continue;
+                    }
                     turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
                     let ptrmap_page_inner = ptrmap_page.get();
                     let ptrmap_pg_no = ptrmap_page_inner.id;
@@ -1105,6 +1115,7 @@ impl Pager {
 
                     let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
+                        target_page_num: db_page_no_to_update,
                         ptrmap_page,
                         offset_in_ptrmap_page,
                     };
@@ -1113,9 +1124,14 @@ impl Pager {
                     }
                 }
                 PtrMapPutState::Deserialize {
+                    target_page_num: state_target_page,
                     ptrmap_page,
                     offset_in_ptrmap_page,
                 } => {
+                    if state_target_page != db_page_no_to_update {
+                        self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
+                        continue;
+                    }
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
                     let ptrmap_page_inner = ptrmap_page.get();
                     let ptrmap_pg_no = ptrmap_page_inner.id;
@@ -1457,6 +1473,87 @@ impl Pager {
         Ok(IOResult::Done(wal.borrow_mut().begin_write_tx()?))
     }
 
+    #[cfg(not(feature = "omit_autovacuum"))]
+    fn reclaim_orphan_pages(&self, connection: &Connection) -> Result<IOResult<()>> {
+        if matches!(self.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+            return Ok(IOResult::Done(()));
+        }
+
+        let pager_arc = connection.pager.load();
+
+        let db_size = return_if_io!(self.with_header(|header| header.database_size)).get();
+        if db_size <= 1 {
+            return Ok(IOResult::Done(()));
+        }
+
+        let roots = {
+            let schema = connection.schema.read();
+            let mut root_pages = Vec::new();
+            for table in schema.tables.values() {
+                if let crate::schema::Table::BTree(table) = table.as_ref() {
+                    root_pages.push(table.root_page as i64);
+                    if let Some(indexes) = schema.indexes.get(table.name.as_str()) {
+                        for index in indexes.iter() {
+                            if index.root_page > 0 {
+                                root_pages.push(index.root_page as i64);
+                            }
+                        }
+                    }
+                }
+            }
+            root_pages
+        };
+
+        let mut errors = Vec::new();
+        let mut state = IntegrityCheckState::new(db_size as usize);
+        let freelist_trunk =
+            return_if_io!(self.with_header(|header| header.freelist_trunk_page)).get();
+        if freelist_trunk > 0 {
+            let expected_count =
+                return_if_io!(self.with_header(|header| header.freelist_pages)).get();
+            state.set_expected_freelist_count(expected_count as usize);
+            state.start(
+                freelist_trunk as i64,
+                PageCategory::FreeListTrunk,
+                &mut errors,
+            );
+        } else if let Some(first_root) = roots.first() {
+            state.start(*first_root, PageCategory::Normal, &mut errors);
+        } else {
+            return Ok(IOResult::Done(()));
+        }
+
+        let mut current_root_idx = if freelist_trunk > 0 { 0 } else { 1 };
+        loop {
+            match integrity_check(&mut state, &mut errors, &pager_arc) {
+                Ok(IOResult::Done(())) => {
+                    if current_root_idx < roots.len() {
+                        state.start(roots[current_root_idx], PageCategory::Normal, &mut errors);
+                        current_root_idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                Ok(IOResult::IO(c)) => return Ok(IOResult::IO(c)),
+                Err(e) => return Err(e),
+            }
+        }
+
+        let page_size = self.get_page_size_unchecked().get() as usize;
+        for page_no in 2..=db_size {
+            let page_no_u32 = page_no as u32;
+            if ptrmap::is_ptrmap_page(page_no_u32, page_size) {
+                continue;
+            }
+            if state.page_reference.contains_key(&(page_no as i64)) {
+                continue;
+            }
+            return_if_io!(self.free_page(None, page_no as usize));
+        }
+
+        Ok(IOResult::Done(()))
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
         if connection.is_nested_stmt() {
@@ -1472,6 +1569,13 @@ impl Pager {
             _ => (false, false),
         };
         tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
+        #[cfg(not(feature = "omit_autovacuum"))]
+        if matches!(
+            self.get_auto_vacuum_mode(),
+            AutoVacuumMode::Full | AutoVacuumMode::Incremental
+        ) {
+            return_if_io!(self.reclaim_orphan_pages(connection));
+        }
         let commit_status = return_if_io!(self.commit_dirty_pages(
             connection.is_wal_auto_checkpoint_disabled(),
             connection.get_sync_mode(),
@@ -2277,6 +2381,16 @@ impl Pager {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid page number {page_id} for free operation"
                         )));
+                    }
+
+                    #[cfg(not(feature = "omit_autovacuum"))]
+                    if !matches!(self.get_auto_vacuum_mode(), AutoVacuumMode::None) {
+                        let page_size = self.get_page_size_unchecked().get() as usize;
+                        if page_id as u32 >= ptrmap::FIRST_PTRMAP_PAGE_NO
+                            && !ptrmap::is_ptrmap_page(page_id as u32, page_size)
+                        {
+                            return_if_io!(self.ptrmap_put(page_id as u32, PtrmapType::FreePage, 0));
+                        }
                     }
 
                     let (page, _c) = match page.take() {
