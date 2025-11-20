@@ -495,6 +495,30 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
     atomic_enum::derive_atomic_enum_inner(input)
 }
 
+/// Test macro for `core_tester` crate
+///
+/// Generates a runnable Rust test from the following function signature
+///
+/// ```no_run
+/// fn test_x(db: TempDatabase) -> Result<()> {}
+/// // Or
+/// fn test_y(db: TempDatabase) {}
+/// ```
+///
+/// Macro accepts the following arguments
+///
+/// - `mvcc` flag: creates an additional test that will run the same code with MVCC enabled
+/// - `path` arg: specifies the name of the database to be created
+/// - `init_sql` arg: specifies the SQL query that will be run by `rusqlite` before initializing the Turso database
+///
+/// Example:
+/// ```no_run,rust
+/// #[turso_macros::test(mvcc, path = "test.db", init_sql = "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);")]
+/// fn test_integer_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
+///     // Code goes here to test
+///     Ok(())
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
