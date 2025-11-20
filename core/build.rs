@@ -8,7 +8,7 @@ fn main() {
         println!("cargo::rerun-if-changed=build.rs");
     }
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set by cargo"));
     let built_file = out_dir.join("built.rs");
 
     built::write_built_file().expect("Failed to acquire build-time information");
@@ -19,7 +19,8 @@ fn main() {
         &built_file,
         format!(
             "{}\npub const BUILT_TIME_SQLITE: &str = \"{}\";\n",
-            fs::read_to_string(&built_file).unwrap(),
+            fs::read_to_string(&built_file)
+                .expect("built.rs should exist after built::write_built_file()"),
             sqlite_date
         ),
     )
