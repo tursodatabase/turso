@@ -143,13 +143,14 @@ impl Display for SelectPlan {
                     }
                 },
                 Operation::IndexMethodQuery(query) => {
-                    let index_method = query.index.index_method.as_ref().unwrap();
-                    writeln!(
-                        f,
-                        "{}QUERY INDEX METHOD {}",
-                        indent,
-                        index_method.definition().method_name
-                    )?;
+                    if let Some(index_method) = query.index.index_method.as_ref() {
+                        writeln!(
+                            f,
+                            "{}QUERY INDEX METHOD {}",
+                            indent,
+                            index_method.definition().method_name
+                        )?;
+                    }
                 }
             }
         }
@@ -217,13 +218,14 @@ impl Display for DeletePlan {
                     }
                 },
                 Operation::IndexMethodQuery(query) => {
-                    let module = query.index.index_method.as_ref().unwrap();
-                    writeln!(
-                        f,
-                        "{}QUERY MODULE {}",
-                        indent,
-                        module.definition().method_name
-                    )?;
+                    if let Some(module) = query.index.index_method.as_ref() {
+                        writeln!(
+                            f,
+                            "{}QUERY MODULE {}",
+                            indent,
+                            module.definition().method_name
+                        )?;
+                    }
                 }
             }
         }
@@ -304,13 +306,14 @@ impl fmt::Display for UpdatePlan {
                     }
                 },
                 Operation::IndexMethodQuery(query) => {
-                    let module = query.index.index_method.as_ref().unwrap();
-                    writeln!(
-                        f,
-                        "{}QUERY MODULE {}",
-                        indent,
-                        module.definition().method_name
-                    )?;
+                    if let Some(module) = query.index.index_method.as_ref() {
+                        writeln!(
+                            f,
+                            "{}QUERY MODULE {}",
+                            indent,
+                            module.definition().method_name
+                        )?;
+                    }
                 }
             }
         }
@@ -517,7 +520,10 @@ impl ToTokens for SelectPlan {
                     s.append(TokenType::TK_JOIN, None)?;
                 }
 
-                let table_ref = self.joined_tables().get(order.original_idx).unwrap();
+                let table_ref = self
+                    .joined_tables()
+                    .get(order.original_idx)
+                    .expect("table reference not found for join order");
                 table_ref.to_tokens(s, context)?;
             }
 
@@ -701,14 +707,11 @@ impl ToTokens for UpdatePlan {
 
         s.comma(
             self.set_clauses.iter().map(|(col_idx, set_expr)| {
-                let col_name = table
+                let col = table
                     .table
                     .get_column_at(*col_idx)
-                    .as_ref()
-                    .unwrap()
-                    .name
-                    .as_ref()
-                    .unwrap();
+                    .unwrap_or_else(|| panic!("column at index {} not found", col_idx));
+                let col_name = col.name.as_ref().expect("column must have a name");
 
                 ast::Set {
                     col_names: vec![ast::Name::exact(col_name.clone())],
