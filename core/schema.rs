@@ -632,7 +632,12 @@ impl Schema {
             } else {
                 let table = self
                     .get_btree_table(&unparsed_sql_from_index.table_name)
-                    .unwrap();
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "table {} not found",
+                            unparsed_sql_from_index.table_name
+                        ))
+                    })?;
                 let index = Index::from_sql(
                     syms,
                     &unparsed_sql_from_index.sql,
@@ -652,12 +657,20 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).unwrap();
+            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+                LimboError::InternalError(format!("table {} not found", automatic_index.0))
+            })?;
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
             let mut pk_index_added = false;
             for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-                let col_name = &unique_set.columns.first().unwrap().0;
+                let col_name = &unique_set
+                    .columns
+                    .first()
+                    .ok_or_else(|| {
+                        LimboError::InternalError("unique set has no columns".to_string())
+                    })?
+                    .0;
                 let Some((pos_in_table, column)) = table.get_column(col_name) else {
                     return Err(LimboError::ParseError(format!(
                         "Column {col_name} not found in table {}",
@@ -669,7 +682,10 @@ impl Schema {
                         // rowid alias, no index needed
                         continue;
                     }
-                    assert!(table.primary_key_columns.first().unwrap().0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", table.primary_key_columns.first().unwrap().0, col_name);
+                    let first_pk_col = table.primary_key_columns.first().ok_or_else(|| {
+                        LimboError::InternalError("table has no primary key columns".to_string())
+                    })?;
+                    assert!(first_pk_col.0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", first_pk_col.0, col_name);
                     // Add single column primary key index
                     assert!(
                         !pk_index_added,
@@ -677,18 +693,24 @@ impl Schema {
                         table.name
                     );
                     pk_index_added = true;
+                    let root_page = automatic_indexes.pop().ok_or_else(|| {
+                        LimboError::InternalError("not enough automatic indexes".to_string())
+                    })?;
                     self.add_index(Arc::new(Index::automatic_from_primary_key(
                         table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
+                        root_page,
                         1,
                     )?))?;
                 } else {
                     // Add single column unique index
                     if let Some(autoidx) = automatic_indexes.pop() {
+                        let first_col = unique_set.columns.first().ok_or_else(|| {
+                            LimboError::InternalError("unique set has no columns".to_string())
+                        })?;
                         self.add_index(Arc::new(Index::automatic_from_unique(
                             table.as_ref(),
                             autoidx,
-                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
+                            vec![(pos_in_table, first_col.1)],
                         )?))?;
                     }
                 }
@@ -703,9 +725,12 @@ impl Schema {
                         table.name
                     );
                     pk_index_added = true;
+                    let root_page = automatic_indexes.pop().ok_or_else(|| {
+                        LimboError::InternalError("not enough automatic indexes".to_string())
+                    })?;
                     self.add_index(Arc::new(Index::automatic_from_primary_key(
                         table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
+                        root_page,
                         unique_set.columns.len(),
                     )?))?;
                 } else {
@@ -721,9 +746,12 @@ impl Schema {
                         };
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
+                    let root_page = automatic_indexes.pop().ok_or_else(|| {
+                        LimboError::InternalError("not enough automatic indexes".to_string())
+                    })?;
                     self.add_index(Arc::new(Index::automatic_from_unique(
                         table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
+                        root_page,
                         column_indices_and_sort_orders,
                     )?))?;
                 }
@@ -840,7 +868,10 @@ impl Schema {
                     // Check if this is a DBSP state table
                     if table.name.starts_with(DBSP_TABLE_PREFIX) {
                         // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
-                        let suffix = table.name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+                        let suffix = table
+                            .name
+                            .strip_prefix(DBSP_TABLE_PREFIX)
+                            .expect("checked starts_with above");
 
                         // Parse version and view name (format: "<version>_<viewname>")
                         if let Some(underscore_pos) = suffix.find('_') {
@@ -890,7 +921,9 @@ impl Schema {
                         // Check if this is an index for a DBSP state table
                         if table_name.starts_with(DBSP_TABLE_PREFIX) {
                             // Extract version and view name from __turso_internal_dbsp_state_v<version>_<viewname>
-                            let suffix = table_name.strip_prefix(DBSP_TABLE_PREFIX).unwrap();
+                            let suffix = table_name
+                                .strip_prefix(DBSP_TABLE_PREFIX)
+                                .expect("checked starts_with above");
 
                             // Parse version and view name (format: "<version>_<viewname>")
                             if let Some(underscore_pos) = suffix.find('_') {
@@ -2049,7 +2082,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             let unique_set_w_only_rowid_alias = unique_sets.iter().position(|us| {
                 us.is_primary_key
                     && us.columns.len() == 1
-                    && &us.columns.first().unwrap().0 == col.name.as_ref().unwrap()
+                    && us.columns.first().map(|c| &c.0) == col.name.as_ref()
             });
             if let Some(u) = unique_set_w_only_rowid_alias {
                 unique_sets.remove(u);
@@ -2221,7 +2254,9 @@ impl ResolvedFkRef {
         }
         // special case: if FK uses a rowid alias on child, and rowid changed
         if self.child_cols.len() == 1 {
-            let (i, col) = child_tbl.get_column(&self.child_cols[0]).unwrap();
+            let (i, col) = child_tbl
+                .get_column(&self.child_cols[0])
+                .expect("child_cols[0] exists in child table");
             if col.is_rowid_alias() && updated_child_positions.contains(&i) {
                 return true;
             }
@@ -2662,7 +2697,9 @@ impl Index {
                     col_name, table.name
                 )));
             };
-            let (_, column) = table.get_column(col_name).unwrap();
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("checked column exists above");
             primary_keys.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
@@ -2704,7 +2741,7 @@ impl Index {
                     .iter()
                     .find(|(pos, _)| *pos == pos_in_table)?;
                 Some(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
+                    name: normalize_ident(col.name.as_ref().expect("column has a name")),
                     order: *sort_order,
                     pos_in_table: *pos_in_table,
                     collation: col.collation_opt(),
