@@ -167,7 +167,9 @@ pub fn translate_create_index(
     // 3. table_cursor_id         - table we are creating the index on
     // 4. sorter_cursor_id        - sorter
     // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(sqlite_table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
     let table_ref = program.table_reference_counter.next();
@@ -715,12 +717,16 @@ pub fn resolve_index_method_parameters(
                     b.as_bytes()
                         .chunks_exact(2)
                         .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
+                            let hex_byte = std::str::from_utf8(pair).map_err(|_| {
+                                crate::LimboError::ParseError(
+                                    "invalid UTF-8 in hex string".to_string(),
+                                )
+                            })?;
+                            u8::from_str_radix(hex_byte, 16).map_err(|_| {
+                                crate::LimboError::ParseError("invalid hex digit".to_string())
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<u8>, _>>()?,
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
@@ -802,7 +808,9 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(sqlite_table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -904,7 +912,9 @@ pub fn translate_drop_index(
         p5: 0,
     });
 
-    let index = maybe_index.unwrap();
+    let Some(index) = maybe_index else {
+        crate::bail_parse_error!("index not found");
+    };
     if index.index_method.is_some() && !index.is_backing_btree_index() {
         let cursor_id = program.alloc_cursor_index(None, index)?;
         program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
