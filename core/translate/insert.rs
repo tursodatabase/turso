@@ -1835,6 +1835,7 @@ fn translate_column(
 // DO UPDATE (matching target) -> fetch conflicting rowid and jump to `upsert_entry`.
 //
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
+#[allow(clippy::too_many_arguments)]
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
