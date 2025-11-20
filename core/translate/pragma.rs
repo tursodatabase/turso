@@ -782,11 +782,15 @@ fn emit_columns_for_table_info(
 ) {
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
-    // Therefore, we enumerate only after filtering out hidden columns.
-    for (i, column) in columns.iter().enumerate() {
-        // The output has the same columns as for PRAGMA table_info plus a column, "hidden",
-        // whose value signifies a normal column (0), a dynamic or stored generated column (2 or 3),
-        // or a hidden column in a virtual table (1). The rows for which this field is non-zero are those omitted for PRAGMA table_info.
+    // Therefore, we enumerate only after filtering out hidden columns (if extended set to false).
+    let mut cid = 0;
+    for column in columns.iter() {
+        // Determine column type which will be used for filtering in table_info pragma or as "hidden" column for table_xinfo pragma.
+        //
+        // SQLite docs about table_xinfo:
+        // > The output has the same columns as for PRAGMA table_info plus a column, "hidden",
+        // > whose value signifies a normal column (0), a dynamic or stored generated column (2 or 3),
+        // > or a hidden column in a virtual table (1). The rows for which this field is non-zero are those omitted for PRAGMA table_info.
         //
         // (see https://sqlite.org/pragma.html#pragma_table_xinfo)
         let column_type = if column.hidden() {
@@ -796,12 +800,16 @@ fn emit_columns_for_table_info(
             // normal column
             0
         };
+
         if !extended && column_type != 0 {
+            // This pragma (table_info) does not show information about generated columns or hidden columns.
             continue;
         }
 
         // cid
-        program.emit_int(i as i64, base_reg);
+        program.emit_int(cid as i64, base_reg);
+        cid += 1;
+
         // name
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
