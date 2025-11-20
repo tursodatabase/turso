@@ -399,7 +399,9 @@ pub fn emit_query<'a>(
 
     if plan.is_simple_count() {
         emit_simple_count(program, t_ctx, plan)?;
-        return Ok(t_ctx.reg_result_cols_start.unwrap());
+        return t_ctx.reg_result_cols_start.ok_or_else(|| {
+            crate::LimboError::InternalError("reg_result_cols_start was not set".to_string())
+        });
     }
 
     // Set up main query execution loop
@@ -437,7 +439,9 @@ pub fn emit_query<'a>(
         let row_source = &t_ctx
             .meta_group_by
             .as_ref()
-            .expect("group by metadata not found")
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("group by metadata not found".to_string())
+            })?
             .row_source;
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
@@ -457,7 +461,9 @@ pub fn emit_query<'a>(
         emit_order_by(program, t_ctx, plan)?;
     }
 
-    Ok(t_ctx.reg_result_cols_start.unwrap())
+    t_ctx.reg_result_cols_start.ok_or_else(|| {
+        crate::LimboError::InternalError("reg_result_cols_start was not set".to_string())
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -514,9 +520,11 @@ fn emit_program_for_delete(
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
     // to delete the rows.
     if let Some(rowset_plan) = plan.rowset_plan.take() {
-        let rowset_reg = plan
-            .rowset_reg
-            .expect("rowset_reg must be Some if rowset_plan is Some");
+        let rowset_reg = plan.rowset_reg.ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "rowset_reg must be Some if rowset_plan is Some".to_string(),
+            )
+        })?;
 
         // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
         program.emit_insn(Insn::Null {
@@ -530,7 +538,13 @@ fn emit_program_for_delete(
         program.decr_nesting();
 
         // Close the read cursor(s) opened by the rowset plan before opening for writing
-        let table_ref = plan.table_references.joined_tables().first().unwrap();
+        let table_ref = plan
+            .table_references
+            .joined_tables()
+            .first()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("plan has at least one table".to_string())
+            })?;
         let table_cursor_id_read =
             program.resolve_cursor_id(&CursorKey::table(table_ref.internal_id));
         program.emit_insn(Insn::Close {
@@ -655,7 +669,9 @@ pub fn emit_fk_child_decrement_on_delete(
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         for cname in &fk_ref.child_cols {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
+            let (pos, col) = child_tbl.get_column(cname).ok_or_else(|| {
+                crate::LimboError::InternalError(format!("foreign key column {} not found", cname))
+            })?;
             let src = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -679,10 +695,20 @@ pub fn emit_fk_child_decrement_on_delete(
             let parent_tbl = resolver
                 .schema
                 .get_btree_table(&fk_ref.fk.parent_table)
-                .expect("parent btree");
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "parent btree table {} not found",
+                        fk_ref.fk.parent_table
+                    ))
+                })?;
             let pcur = open_read_table(program, &parent_tbl);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (pos, col) = child_tbl.get_column(&fk_ref.child_cols[0]).ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "foreign key column {} not found",
+                    &fk_ref.child_cols[0]
+                ))
+            })?;
             let val = if col.is_rowid_alias() {
                 child_rowid_reg
             } else {
@@ -727,15 +753,29 @@ pub fn emit_fk_child_decrement_on_delete(
             let parent_tbl = resolver
                 .schema
                 .get_btree_table(&fk_ref.fk.parent_table)
-                .expect("parent btree");
-            let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "parent btree table {} not found",
+                        fk_ref.fk.parent_table
+                    ))
+                })?;
+            let idx = fk_ref.parent_unique_index.as_ref().ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "unique index not found for foreign key".to_string(),
+                )
+            })?;
             let icur = open_read_index(program, idx);
 
             // Build probe from current child row
             let n = fk_ref.child_cols.len();
             let probe = program.alloc_registers(n);
             for (i, cname) in fk_ref.child_cols.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
+                let (pos, col) = child_tbl.get_column(cname).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!(
+                        "foreign key column {} not found",
+                        cname
+                    ))
+                })?;
                 let src = if col.is_rowid_alias() {
                     child_rowid_reg
                 } else {
@@ -756,7 +796,9 @@ pub fn emit_fk_child_decrement_on_delete(
             }
             program.emit_insn(Insn::Affinity {
                 start_reg: probe,
-                count: std::num::NonZeroUsize::new(n).unwrap(),
+                count: std::num::NonZeroUsize::new(n).ok_or_else(|| {
+                    crate::LimboError::InternalError("foreign key column count is zero".to_string())
+                })?,
                 affinities: build_index_affinity_string(idx, &parent_tbl),
             });
 
@@ -785,7 +827,10 @@ fn emit_delete_insns<'a>(
     result_columns: &'a [super::plan::ResultSetColumn],
 ) -> Result<()> {
     // we can either use this obviously safe raw pointer or we can clone it
-    let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
+    let table_reference: *const JoinedTable =
+        table_references.joined_tables().first().ok_or_else(|| {
+            crate::LimboError::InternalError("plan has at least one table".to_string())
+        })?;
     if unsafe { &*table_reference }
         .virtual_table()
         .is_some_and(|t| t.readonly())
@@ -883,7 +928,9 @@ fn emit_delete_insns<'a>(
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                crate::LimboError::InternalError("label_main_loop_end was not set".to_string())
+            })?,
         })
     }
 
@@ -975,7 +1022,11 @@ fn emit_delete_row_common(
             let skip_delete_label = if index.where_clause.is_some() {
                 let where_copy = index
                     .bind_where_expr(Some(table_references), connection)
-                    .expect("where clause to exist");
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "where clause not found for partial index".to_string(),
+                        )
+                    })?;
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
                 translate_expr_no_constant_opt(
@@ -1051,8 +1102,12 @@ fn emit_delete_row_common(
 
         // Emit RETURNING results if specified (must be before DELETE)
         if !result_columns.is_empty() {
-            let columns_start_reg = columns_start_reg
-                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let columns_start_reg = columns_start_reg.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "columns_start_reg must be provided when there are triggers or RETURNING"
+                        .to_string(),
+                )
+            })?;
             // Emit RETURNING results using the values we just read
             emit_returning_results(
                 program,
@@ -1095,7 +1150,10 @@ fn emit_delete_insns_when_triggers_present(
         target_pc: skip_not_found_label,
     });
 
-    let table_reference: *const JoinedTable = table_references.joined_tables().first().unwrap();
+    let table_reference: *const JoinedTable =
+        table_references.joined_tables().first().ok_or_else(|| {
+            crate::LimboError::InternalError("plan has at least one table".to_string())
+        })?;
     if unsafe { &*table_reference }
         .virtual_table()
         .is_some_and(|t| t.readonly())
@@ -1139,8 +1197,12 @@ fn emit_delete_insns_when_triggers_present(
         );
         let has_relevant_triggers = relevant_triggers.clone().count() > 0;
         if has_relevant_triggers {
-            let columns_start_reg = columns_start_reg
-                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let columns_start_reg = columns_start_reg.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "columns_start_reg must be provided when there are triggers or RETURNING"
+                        .to_string(),
+                )
+            })?;
             let old_registers = (0..cols_len)
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
@@ -1195,8 +1257,12 @@ fn emit_delete_insns_when_triggers_present(
         );
         let has_relevant_triggers = relevant_triggers.clone().count() > 0;
         if has_relevant_triggers {
-            let columns_start_reg = columns_start_reg
-                .expect("columns_start_reg must be provided when there are triggers or RETURNING");
+            let columns_start_reg = columns_start_reg.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "columns_start_reg must be provided when there are triggers or RETURNING"
+                        .to_string(),
+                )
+            })?;
             let old_registers = (0..cols_len)
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
@@ -1265,10 +1331,14 @@ fn emit_program_for_update(
             .table_references
             .joined_tables()
             .first()
-            .unwrap()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("no joined tables in ephemeral plan".to_string())
+            })?
             .clone();
         program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: temp_cursor_id.unwrap(),
+            cursor_id: temp_cursor_id.ok_or_else(|| {
+                crate::LimboError::InternalError("temp_cursor_id was not set".to_string())
+            })?,
             is_table: true,
         });
         program.incr_nesting();
@@ -1280,16 +1350,21 @@ fn emit_program_for_update(
             plan.table_references
                 .joined_tables()
                 .first()
-                .unwrap()
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError("no joined tables in plan".to_string())
+                })?
                 .clone(),
         )
     };
 
     let mode = OperationMode::UPDATE(if has_ephemeral_table {
         UpdateRowSource::PrebuiltEphemeralTable {
-            ephemeral_table_cursor_id: temp_cursor_id.expect(
-                "ephemeral table cursor id is always allocated if has_ephemeral_table is true",
-            ),
+            ephemeral_table_cursor_id: temp_cursor_id.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "ephemeral table cursor id must be allocated when has_ephemeral_table is true"
+                        .to_string(),
+                )
+            })?,
             target_table: target_table.clone(),
         }
     } else {
@@ -1324,14 +1399,16 @@ fn emit_program_for_update(
     // Prepare index cursors
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
-        let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
-            plan.table_references
-                .joined_tables()
-                .first()
-                .unwrap()
-                .internal_id,
-            index.clone(),
-        )) {
+        let first_table = plan
+            .table_references
+            .joined_tables()
+            .first()
+            .ok_or_else(|| {
+                crate::LimboError::InternalError("no joined tables in plan".to_string())
+            })?;
+        let index_cursor = if let Some(cursor) = program
+            .resolve_cursor_id_safe(&CursorKey::index(first_table.internal_id, index.clone()))
+        {
             cursor
         } else {
             let cursor = program.alloc_cursor_index(None, index)?;
@@ -1362,7 +1439,9 @@ fn emit_program_for_update(
         program.resolve_cursor_id(&CursorKey::table(target_table.internal_id));
 
     let iteration_cursor_id = if has_ephemeral_table {
-        temp_cursor_id.unwrap()
+        temp_cursor_id.ok_or_else(|| {
+            crate::LimboError::InternalError("temp_cursor_id was not set".to_string())
+        })?
     } else {
         target_table_cursor_id
     };
@@ -1428,7 +1507,9 @@ fn emit_update_column_values<'a>(
     if has_direct_rowid_update {
         if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
             if !skip_set_clauses {
-                let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
+                let rowid_set_clause_reg = rowid_set_clause_reg.ok_or_else(|| {
+                    crate::LimboError::InternalError("rowid_set_clause_reg was not set".to_string())
+                })?;
                 translate_expr(
                     program,
                     Some(table_references),
@@ -1454,7 +1535,11 @@ fn emit_update_column_values<'a>(
                     && (table_column.primary_key() || table_column.is_rowid_alias())
                     && !is_virtual
                 {
-                    let rowid_set_clause_reg = rowid_set_clause_reg.unwrap();
+                    let rowid_set_clause_reg = rowid_set_clause_reg.ok_or_else(|| {
+                        crate::LimboError::InternalError(
+                            "rowid_set_clause_reg was not set".to_string(),
+                        )
+                    })?;
                     translate_expr(
                         program,
                         Some(table_references),
@@ -1484,10 +1569,11 @@ fn emit_update_column_values<'a>(
                             description: format!(
                                 "{}.{}",
                                 table_name,
-                                table_column
-                                    .name
-                                    .as_ref()
-                                    .expect("Column name must be present")
+                                table_column.name.as_ref().ok_or_else(|| {
+                                    crate::LimboError::InternalError(
+                                        "Column name must be present".to_string(),
+                                    )
+                                })?
                             ),
                         });
                     }
@@ -1589,8 +1675,13 @@ fn emit_update_insns<'a>(
     target_table: Arc<JoinedTable>,
 ) -> crate::Result<()> {
     let internal_id = target_table.internal_id;
-    let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let source_table = table_references.joined_tables().first().unwrap();
+    let loop_labels = t_ctx.labels_main_loop.first().ok_or_else(|| {
+        crate::LimboError::InternalError("main loop labels were not set".to_string())
+    })?;
+    let source_table = table_references
+        .joined_tables()
+        .first()
+        .ok_or_else(|| crate::LimboError::InternalError("no joined tables in plan".to_string()))?;
     let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
@@ -1666,13 +1757,19 @@ fn emit_update_insns<'a>(
         program.emit_insn(Insn::NotExists {
             cursor: target_table_cursor_id,
             rowid_reg: beg,
-            target_pc: check_rowid_not_exists_label.unwrap(),
+            target_pc: check_rowid_not_exists_label.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "check_rowid_not_exists_label was not set".to_string(),
+                )
+            })?,
         });
     } else {
         // if no rowid, we're done
         program.emit_insn(Insn::IsNull {
             reg: beg,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                crate::LimboError::InternalError("label_main_loop_end was not set".to_string())
+            })?,
         });
     }
 
@@ -1730,94 +1827,96 @@ fn emit_update_insns<'a>(
     )?;
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let preserved_old_registers: Option<Vec<usize>> =
-        if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
-                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
-                t_ctx.resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
-            // Read OLD row values for trigger context
-            let old_registers: Vec<usize> = (0..col_len)
-                .map(|i| {
-                    let reg = program.alloc_register();
-                    program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                    reg
-                })
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
+        target_table.table.btree()
+    {
+        let updated_column_indices: std::collections::HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        // Read OLD row values for trigger context
+        let old_registers: Vec<usize> = (0..col_len)
+            .map(|i| {
+                let reg = program.alloc_register();
+                program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                reg
+            })
+            .chain(std::iter::once(beg))
+            .collect();
+        let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
+        if !has_relevant_triggers {
+            Some(old_registers)
+        } else {
+            // NEW row values are already in 'start' registers
+            let new_registers = (0..col_len)
+                .map(|i| start + i)
                 .chain(std::iter::once(beg))
                 .collect();
-            let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
-            if !has_relevant_triggers {
-                Some(old_registers)
-            } else {
-                // NEW row values are already in 'start' registers
-                let new_registers = (0..col_len)
-                    .map(|i| start + i)
-                    .chain(std::iter::once(beg))
-                    .collect();
 
-                let trigger_ctx = TriggerContext::new(
-                    btree_table.clone(),
-                    Some(new_registers),
-                    Some(old_registers.clone()), // Clone for AFTER trigger
-                );
+            let trigger_ctx = TriggerContext::new(
+                btree_table.clone(),
+                Some(new_registers),
+                Some(old_registers.clone()), // Clone for AFTER trigger
+            );
 
-                for trigger in relevant_before_update_triggers {
-                    fire_trigger(
-                        program,
-                        &mut t_ctx.resolver,
-                        trigger,
-                        &trigger_ctx,
-                        connection,
-                    )?;
-                }
+            for trigger in relevant_before_update_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                )?;
+            }
 
-                // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
-                program.emit_insn(Insn::NotExists {
+            // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
+            program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
                 rowid_reg: beg,
-                target_pc: check_rowid_not_exists_label.expect(
-                    "check_rowid_not_exists_label must be set if there are BEFORE UPDATE triggers",
-                ),
+                target_pc: check_rowid_not_exists_label
+                    .ok_or_else(|| crate::LimboError::InternalError(
+                        "check_rowid_not_exists_label must be set if there are BEFORE UPDATE triggers".to_string(),
+                    ))?,
             });
 
-                let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                    t_ctx.resolver.schema,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .clone()
-                .count()
-                    > 0;
-                if has_relevant_after_triggers {
-                    // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
-                    // (since registers might be overwritten during trigger execution)
-                    let preserved: Vec<usize> = old_registers
-                        .iter()
-                        .map(|old_reg| {
-                            let preserved_reg = program.alloc_register();
-                            program.emit_insn(Insn::Copy {
-                                src_reg: *old_reg,
-                                dst_reg: preserved_reg,
-                                extra_amount: 0,
-                            });
-                            preserved_reg
-                        })
-                        .collect();
-                    Some(preserved)
-                } else {
-                    Some(old_registers)
-                }
+            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                t_ctx.resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .clone()
+            .count()
+                > 0;
+            if has_relevant_after_triggers {
+                // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
+                // (since registers might be overwritten during trigger execution)
+                let preserved: Vec<usize> = old_registers
+                    .iter()
+                    .map(|old_reg| {
+                        let preserved_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: *old_reg,
+                            dst_reg: preserved_reg,
+                            extra_amount: 0,
+                        });
+                        preserved_reg
+                    })
+                    .collect();
+                Some(preserved)
+            } else {
+                Some(old_registers)
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
     // According to the SQLite documentation, the behavior in these cases is undefined:
@@ -1920,7 +2019,11 @@ fn emit_update_insns<'a>(
             // so we can emit Insn::Column instructions and refer to the old values.
             let where_clause = index
                 .bind_where_expr(Some(table_references), connection)
-                .expect("where clause to exist");
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "where clause not found for partial index".to_string(),
+                    )
+                })?;
             let old_satisfied_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
@@ -1935,7 +2038,11 @@ fn emit_update_insns<'a>(
             let mut new_where = index
                 .where_clause
                 .as_ref()
-                .expect("checked where clause to exist")
+                .ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "where clause not found for partial index".to_string(),
+                    )
+                })?
                 .clone();
             // Now we need to rewrite the Expr::Id and Expr::Qualified/Expr::RowID (from a copy of the original, un-bound `where` expr),
             // to refer to the new values, which are already loaded into registers starting at `start`.
@@ -1973,7 +2080,9 @@ fn emit_update_insns<'a>(
             // If the old values don't satisfy the WHERE clause, skip the delete
             program.emit_insn(Insn::IfNot {
                 reg: old_satisfied,
-                target_pc: skip_delete_label.unwrap(),
+                target_pc: skip_delete_label.ok_or_else(|| {
+                    crate::LimboError::InternalError("skip_delete_label was not set".to_string())
+                })?,
                 jump_if_null: true,
             });
         }
@@ -2014,7 +2123,9 @@ fn emit_update_insns<'a>(
             // If the new values don't satisfy the WHERE clause, skip the idx insert
             program.emit_insn(Insn::IfNot {
                 reg: new_satisfied,
-                target_pc: skip_insert_label.unwrap(),
+                target_pc: skip_insert_label.ok_or_else(|| {
+                    crate::LimboError::InternalError("skip_insert_label was not set".to_string())
+                })?,
                 jump_if_null: true,
             });
         }
@@ -2067,7 +2178,9 @@ fn emit_update_insns<'a>(
                 .collect::<String>();
             program.emit_insn(Insn::Affinity {
                 start_reg: idx_start_reg,
-                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+                count: NonZeroUsize::new(num_cols).ok_or_else(|| {
+                    crate::LimboError::InternalError("index column count is zero".to_string())
+                })?,
                 affinities: aff,
             });
             let constraint_check = program.allocate_label();
@@ -2142,7 +2255,9 @@ fn emit_update_insns<'a>(
 
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
-            let target_reg = rowid_set_clause_reg.unwrap();
+            let target_reg = rowid_set_clause_reg.ok_or_else(|| {
+                crate::LimboError::InternalError("rowid_set_clause_reg was not set".to_string())
+            })?;
 
             program.emit_insn(Insn::Eq {
                 lhs: target_reg,
@@ -2165,7 +2280,12 @@ fn emit_update_insns<'a>(
                         .table
                         .columns()
                         .get(idx)
-                        .unwrap()
+                        .ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "column index {} out of bounds",
+                                idx
+                            ))
+                        })?
                         .name
                         .as_ref()
                         .map_or("", |v| v)
@@ -2202,7 +2322,11 @@ fn emit_update_insns<'a>(
             program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
                 rowid_reg: beg,
-                target_pc: check_rowid_not_exists_label.unwrap(),
+                target_pc: check_rowid_not_exists_label.ok_or_else(|| {
+                    crate::LimboError::InternalError(
+                        "check_rowid_not_exists_label was not set".to_string(),
+                    )
+                })?,
             });
         }
 
@@ -2231,7 +2355,9 @@ fn emit_update_insns<'a>(
                 program,
                 target_table.table.columns(),
                 target_table_cursor_id,
-                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
+                cdc_rowid_before_reg.ok_or_else(|| {
+                    crate::LimboError::InternalError("cdc_rowid_before_reg must be set".to_string())
+                })?,
             ))
         } else {
             None
@@ -2345,8 +2471,9 @@ fn emit_update_insns<'a>(
 
         // emit actual CDC instructions for write to the CDC table
         if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-            let cdc_rowid_before_reg =
-                cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set");
+            let cdc_rowid_before_reg = cdc_rowid_before_reg.ok_or_else(|| {
+                crate::LimboError::InternalError("cdc_rowid_before_reg must be set".to_string())
+            })?;
             if has_user_provided_rowid {
                 emit_cdc_insns(
                     program,
@@ -2404,7 +2531,9 @@ fn emit_update_insns<'a>(
     if let Some(limit_ctx) = t_ctx.limit_ctx {
         program.emit_insn(Insn::DecrJumpZero {
             reg: limit_ctx.reg_limit,
-            target_pc: t_ctx.label_main_loop_end.unwrap(),
+            target_pc: t_ctx.label_main_loop_end.ok_or_else(|| {
+                crate::LimboError::InternalError("label_main_loop_end was not set".to_string())
+            })?,
         })
     }
     // TODO(pthorpe): handle RETURNING clause
@@ -2650,7 +2779,12 @@ fn init_limit(
                         });
                     } else {
                         program.emit_insn(Insn::Real {
-                            value: n.parse::<f64>().unwrap(),
+                            value: n.parse::<f64>().map_err(|_| {
+                                crate::LimboError::InternalError(format!(
+                                    "invalid float literal: {}",
+                                    n
+                                ))
+                            })?,
                             dest: limit_ctx.reg_limit,
                         });
                         program.add_comment(program.offset(), "LIMIT counter");
@@ -2710,9 +2844,11 @@ fn init_limit(
     }
 
     // exit early if LIMIT 0
-    let main_loop_end = t_ctx
-        .label_main_loop_end
-        .expect("label_main_loop_end must be set before init_limit");
+    let main_loop_end = t_ctx.label_main_loop_end.ok_or_else(|| {
+        crate::LimboError::InternalError(
+            "label_main_loop_end must be set before init_limit".to_string(),
+        )
+    })?;
     program.emit_insn(Insn::IfNot {
         reg: limit_ctx.reg_limit,
         target_pc: main_loop_end,
@@ -2833,9 +2969,12 @@ fn emit_index_column_value_new_image(
             NoConstantOptReason::RegisterReuse,
         )?;
     } else {
-        let col_in_table = columns
-            .get(idx_col.pos_in_table)
-            .expect("column index out of bounds");
+        let col_in_table = columns.get(idx_col.pos_in_table).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "column index {} out of bounds",
+                idx_col.pos_in_table
+            ))
+        })?;
         let src_reg = if col_in_table.is_rowid_alias() {
             rowid_reg
         } else {
