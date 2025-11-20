@@ -365,9 +365,10 @@ impl ProgramBuilder {
     ) -> crate::Result<usize> {
         tracing::debug!("alloc cursor: {:?} {:?}", key, index.index_method.is_some());
         let module = index.index_method.as_ref();
-        if module.is_some_and(|m| !m.definition().backing_btree) {
-            let module = module.unwrap().clone();
-            return Ok(self._alloc_cursor_id(key, CursorType::IndexMethod(module)));
+        if let Some(m) = module {
+            if !m.definition().backing_btree {
+                return Ok(self._alloc_cursor_id(key, CursorType::IndexMethod(m.clone())));
+            }
         }
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
     }
