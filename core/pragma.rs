@@ -93,6 +93,18 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["cid", "name", "type", "notnull", "dflt_value", "pk"],
         ),
+        TableXinfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &[
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ],
+        ),
         UserVersion => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["user_version"],

@@ -60,7 +60,7 @@ pub fn translate_pragma(
     let (mut program, mode) = match body {
         None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo => query_pragma(
+            PragmaName::TableInfo | PragmaName::TableXinfo => query_pragma(
                 pragma,
                 resolver.schema,
                 Some(*value),
@@ -226,6 +226,12 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::TableInfo => {
+            // because we need control over the write parameter for the transaction,
+            // this should be unreachable. We have to force-call query_pragma before
+            // getting here
+            unreachable!();
+        }
+        PragmaName::TableXinfo => {
             // because we need control over the write parameter for the transaction,
             // this should be unreachable. We have to force-call query_pragma before
             // getting here
@@ -548,19 +554,52 @@ fn query_pragma(
             };
 
             let base_reg = register;
-            program.alloc_registers(5);
+            program.alloc_registers(6);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
-                    emit_columns_for_table_info(&mut program, table.columns(), base_reg);
+                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, false);
                 } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
                     let view = view_mutex.lock();
                     let flat_columns = view.column_schema.flat_columns();
-                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg);
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, false);
                 } else if let Some(view) = schema.get_view(&name) {
-                    emit_columns_for_table_info(&mut program, &view.columns, base_reg);
+                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, false);
                 }
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+            for name in col_names {
+                program.add_pragma_result_column(name.into());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TableXinfo => {
+            let name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            program.alloc_registers(7);
+            if let Some(name) = name {
+                if let Some(table) = schema.get_table(&name) {
+                    emit_columns_for_table_info(&mut program, table.columns(), base_reg, true);
+                } else if let Some(view_mutex) = schema.get_materialized_view(&name) {
+                    let view = view_mutex.lock().unwrap();
+                    let flat_columns = view.column_schema.flat_columns();
+                    emit_columns_for_table_info(&mut program, &flat_columns, base_reg, true);
+                } else if let Some(view) = schema.get_view(&name) {
+                    emit_columns_for_table_info(&mut program, &view.columns, base_reg, true);
+                }
+            }
+            let col_names = [
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ];
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
@@ -739,11 +778,28 @@ fn emit_columns_for_table_info(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
     base_reg: usize,
+    extended: bool,
 ) {
     // According to the SQLite documentation: "The 'cid' column should not be taken to
     // mean more than 'rank within the current result set'."
     // Therefore, we enumerate only after filtering out hidden columns.
-    for (i, column) in columns.iter().filter(|col| !col.hidden()).enumerate() {
+    for (i, column) in columns.iter().enumerate() {
+        // The output has the same columns as for PRAGMA table_info plus a column, "hidden",
+        // whose value signifies a normal column (0), a dynamic or stored generated column (2 or 3),
+        // or a hidden column in a virtual table (1). The rows for which this field is non-zero are those omitted for PRAGMA table_info.
+        //
+        // (see https://sqlite.org/pragma.html#pragma_table_xinfo)
+        let column_type = if column.hidden() {
+            // hidden column
+            1
+        } else {
+            // normal column
+            0
+        };
+        if !extended && column_type != 0 {
+            continue;
+        }
+
         // cid
         program.emit_int(i as i64, base_reg);
         // name
@@ -768,7 +824,11 @@ fn emit_columns_for_table_info(
         // pk
         program.emit_bool(column.primary_key(), base_reg + 5);
 
-        program.emit_result_row(base_reg, 6);
+        if extended {
+            program.emit_int(column_type, base_reg + 6);
+        }
+
+        program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
 }
 

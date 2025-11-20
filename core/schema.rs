@@ -1864,6 +1864,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             crate::bail_parse_error!("CHECK constraints are not yet supported");
                         }
                         ast::ColumnConstraint::Generated { .. } => {
+                            // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
                             crate::bail_parse_error!("GENERATED columns are not yet supported");
                         }
                         ast::ColumnConstraint::PrimaryKey {
