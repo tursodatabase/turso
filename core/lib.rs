@@ -67,7 +67,7 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
 use std::collections::HashSet;
@@ -82,7 +82,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex, Weak,
+        Arc, LazyLock, Weak,
     },
     time::Duration,
 };
@@ -276,7 +276,7 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("mv_store", &mv_store_status);
 
-        let init_lock_status = if self.init_lock.try_lock().is_ok() {
+        let init_lock_status = if self.init_lock.try_lock().is_some() {
             "unlocked"
         } else {
             "locked"
@@ -380,7 +380,7 @@ impl Database {
             );
         }
 
-        let mut registry = DATABASE_MANAGER.lock().unwrap();
+        let mut registry = DATABASE_MANAGER.lock();
 
         let canonical_path = std::fs::canonicalize(path)
             .ok()
@@ -623,7 +623,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(self.schema.lock().unwrap().clone()),
+            schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(FxHashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
@@ -900,17 +900,17 @@ impl Database {
 
     #[inline]
     pub(crate) fn with_schema_mut<T>(&self, f: impl FnOnce(&mut Schema) -> Result<T>) -> Result<T> {
-        let mut schema_ref = self.schema.lock().unwrap();
+        let mut schema_ref = self.schema.lock();
         let schema = Arc::make_mut(&mut *schema_ref);
         f(schema)
     }
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {
-        let schema = self.schema.lock().unwrap();
+        let schema = self.schema.lock();
         schema.clone()
     }
 
     pub(crate) fn update_schema_if_newer(&self, another: Arc<Schema>) {
-        let mut schema = self.schema.lock().unwrap();
+        let mut schema = self.schema.lock();
         if schema.schema_version < another.schema_version {
             tracing::debug!(
                 "DB schema is outdated: {} < {}",
@@ -1352,7 +1352,7 @@ impl Connection {
         };
         pager.end_read_tx();
 
-        let db_schema_version = self.db.schema.lock().unwrap().schema_version;
+        let db_schema_version = self.db.schema.lock().schema_version;
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
             self.db.path,
@@ -1676,7 +1676,7 @@ impl Connection {
 
     pub fn maybe_update_schema(&self) {
         let current_schema_version = self.schema.read().schema_version;
-        let schema = self.db.schema.lock().unwrap();
+        let schema = self.db.schema.lock();
         if matches!(self.get_tx_state(), TransactionState::None)
             && current_schema_version != schema.schema_version
         {
@@ -2199,7 +2199,7 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self.db.schema.lock().unwrap().indexes_enabled();
+        let use_indexes = self.db.schema.lock().indexes_enabled();
         let use_mvcc = self.db.mv_store.is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
@@ -2316,11 +2316,7 @@ impl Connection {
                 .get(&database_id)
                 .expect("Database ID should be valid after resolve_database_id");
 
-            let schema = db
-                .schema
-                .lock()
-                .expect("Schema lock should not fail")
-                .clone();
+            let schema = db.schema.lock().clone();
 
             // Cache the schema for future use
             schemas.insert(database_id, schema.clone());

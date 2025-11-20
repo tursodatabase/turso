@@ -9,7 +9,8 @@ use crate::incremental::persistence::WriteRow;
 use crate::storage::btree::CursorTrait;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinType {
@@ -499,7 +500,7 @@ impl JoinOperator {
 
                             if Self::sql_keys_equal(&left_key, &right_key) {
                                 if let Some(tracker) = &self.tracker {
-                                    tracker.lock().unwrap().record_join_lookup();
+                                    tracker.lock().record_join_lookup();
                                 }
 
                                 // Combine the rows

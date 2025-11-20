@@ -1,10 +1,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -1254,7 +1254,7 @@ impl Wal for WalFile {
                     );
                     let page = unsafe { std::slice::from_raw_parts(page_ptr as *mut u8, page_len) };
                     if buf.as_slice() != page {
-                        *conflict.lock().unwrap() = true;
+                        *conflict.lock() = true;
                     }
                 }
             });
@@ -1271,7 +1271,7 @@ impl Wal for WalFile {
                 &self.io_ctx.read(),
             )?;
             self.io.wait_for_completion(c)?;
-            return if *conflict.lock().unwrap() {
+            return if *conflict.lock() {
                 Err(LimboError::Conflict(format!(
                     "frame content differs from the WAL: frame_id={frame_id}"
                 )))
@@ -2516,10 +2516,10 @@ pub mod test {
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
         StepResult, Wal, WalFile, WalFileShared, IO,
     };
-    use parking_lot::RwLock;
+    use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    use std::sync::{atomic::Ordering, Arc, Mutex};
+    use std::sync::{atomic::Ordering, Arc};
     #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();
@@ -2550,11 +2550,11 @@ pub mod test {
         let _ = wal_file.truncate(
             WAL_HEADER_SIZE as u64,
             Completion::new_trunc(move |_| {
-                *_done.lock().unwrap() = true;
+                *_done.lock() = true;
             }),
         );
         assert!(wal_file.size().unwrap() == WAL_HEADER_SIZE as u64);
-        assert!(*done.lock().unwrap());
+        assert!(*done.lock());
     }
 
     #[test]

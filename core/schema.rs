@@ -127,10 +127,10 @@ use crate::{
 };
 use crate::{util::normalize_ident, Result};
 use core::fmt;
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,

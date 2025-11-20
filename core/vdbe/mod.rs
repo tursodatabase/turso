@@ -960,7 +960,7 @@ impl Program {
                     let mut views = Vec::new();
                     for view_name in self.connection.view_transaction_states.get_view_names() {
                         if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
-                            let view = view_mutex.lock().unwrap();
+                            let view = view_mutex.lock();
                             let root_page = view.get_root_page();
 
                             // Materialized views should always have storage (root_page != 0)
@@ -1002,7 +1002,7 @@ impl Program {
 
                     let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock().unwrap();
+                        let mut view = view_mutex.lock();
 
                         // Create a DeltaSet from the per-table deltas
                         let mut delta_set = crate::incremental::compiler::DeltaSet::new();

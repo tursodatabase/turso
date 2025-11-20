@@ -9,7 +9,8 @@ use crate::{
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// State machine for seek operations
 #[derive(Debug)]
@@ -89,7 +90,7 @@ impl MaterializedViewCursor {
         }
 
         // Get the view and the current transaction state
-        let mut view_guard = self.view.lock().unwrap();
+        let mut view_guard = self.view.lock();
         let table_deltas = self.tx_state.get_table_deltas();
 
         // Process the deltas through the circuit to get materialized changes
@@ -350,7 +351,7 @@ mod tests {
             ))?;
 
         // Get the view's root page
-        let view = view_mutex.lock().unwrap();
+        let view = view_mutex.lock();
         let root_page = view.get_root_page();
         if root_page == 0 {
             return Err(crate::LimboError::InternalError(

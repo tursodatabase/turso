@@ -47,7 +47,7 @@ use std::ops::DerefMut;
 use std::{
     borrow::BorrowMut,
     num::NonZero,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{atomic::Ordering, Arc},
 };
 use turso_macros::match_ignore_ascii_case;
 
@@ -75,7 +75,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -966,7 +966,7 @@ pub fn op_open_read(
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
 
             // Get the view name and look up or create its transaction state
-            let view_name = view_mutex.lock().unwrap().name().to_string();
+            let view_name = view_mutex.lock().name().to_string();
             let tx_state = program
                 .connection
                 .view_transaction_states
@@ -7902,7 +7902,7 @@ pub fn op_populate_materialized_views(
     for (view_name, _root_page, cursor_id) in view_info {
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
-            let mut view = view.lock().unwrap();
+            let mut view = view.lock();
             // Drop the schema borrow before calling populate_from_table
             drop(schema);
 

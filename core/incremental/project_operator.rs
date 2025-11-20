@@ -8,7 +8,8 @@ use crate::incremental::operator::{
 };
 use crate::types::IOResult;
 use crate::{Connection, Database, Result, Value};
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::{atomic::Ordering, Arc};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {
@@ -124,7 +125,7 @@ impl IncrementalOperator for ProjectOperator {
 
         for (row, weight) in delta.changes {
             if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_project();
+                tracker.lock().record_project();
             }
 
             let projected = self.project_values(&row.values);
@@ -152,7 +153,7 @@ impl IncrementalOperator for ProjectOperator {
         // Commit the delta to our internal state and build output
         for (row, weight) in &deltas.left.changes {
             if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_project();
+                tracker.lock().record_project();
             }
             let projected = self.project_values(&row.values);
             let projected_row = HashableRow::new(row.rowid, projected);

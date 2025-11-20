@@ -143,7 +143,7 @@ pub enum CursorType {
     VirtualTable(Arc<VirtualTable>),
     MaterializedView(
         Arc<BTreeTable>,
-        Arc<std::sync::Mutex<crate::incremental::view::IncrementalView>>,
+        Arc<parking_lot::Mutex<crate::incremental::view::IncrementalView>>,
     ),
 }
 

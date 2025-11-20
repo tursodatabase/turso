@@ -74,7 +74,7 @@ impl MvccTestDbNoConn {
         // First let's clear any entries in database manager in order to force restart.
         // If not, we will load the same database instance again.
         {
-            let mut manager = DATABASE_MANAGER.lock().unwrap();
+            let mut manager = DATABASE_MANAGER.lock();
             manager.clear();
         }
 

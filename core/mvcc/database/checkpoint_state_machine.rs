@@ -541,14 +541,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .io
                             .block(|| {
                                 self.pager.with_header_mut(|header| {
-                                    header.schema_cookie = self
-                                        .connection
-                                        .db
-                                        .schema
-                                        .lock()
-                                        .unwrap()
-                                        .schema_version
-                                        .into();
+                                    header.schema_cookie =
+                                        self.connection.db.schema.lock().schema_version.into();
                                     *header
                                 })
                             })

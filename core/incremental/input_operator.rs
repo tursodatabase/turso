@@ -7,7 +7,8 @@ use crate::incremental::operator::{
 };
 use crate::types::IOResult;
 use crate::Result;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Input operator - source of data for the circuit
 /// Represents base relations/tables that receive external updates

@@ -15,7 +15,7 @@ use crate::{
     IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::BTreeSet;
@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 use turso_macros::AtomicEnum;
 
@@ -1423,7 +1423,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if !self.db_state.get().is_initialized() {
-            if let Ok(_lock) = self.init_lock.try_lock() {
+            if let Some(_lock) = self.init_lock.try_lock() {
                 match (self.db_state.get(), self.allocating_page1()) {
                     // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
                     (DbState::Uninitialized, false) | (DbState::Initializing, true) => {

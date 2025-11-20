@@ -1057,7 +1057,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // Make sure we capture all the schema changes that were deserialized from the logical log.
         bootstrap_conn.promote_to_regular_connection();
         bootstrap_conn.reparse_schema()?;
-        *bootstrap_conn.db.schema.lock().unwrap() = bootstrap_conn.schema.read().clone();
+        *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
 
         Ok(())
     }
@@ -1644,9 +1644,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
 
-        if connection.schema.read().schema_version
-            > connection.db.schema.lock().unwrap().schema_version
-        {
+        if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
             // Connection made schema changes during tx and rolled back -> revert connection-local schema.
             *connection.schema.write() = connection.db.clone_schema();
         }

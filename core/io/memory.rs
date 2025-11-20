@@ -3,10 +3,11 @@ use crate::turso_assert;
 use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
+use parking_lot::Mutex;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use tracing::debug;
 
@@ -42,7 +43,7 @@ impl Clock for MemoryIO {
 
 impl IO for MemoryIO {
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         if !files.contains_key(path) && !flags.contains(OpenFlags::Create) {
             return Err(
                 crate::error::CompletionError::IOError(std::io::ErrorKind::NotFound).into(),
@@ -61,7 +62,7 @@ impl IO for MemoryIO {
         Ok(files.get(path).unwrap().clone())
     }
     fn remove_file(&self, path: &str) -> Result<()> {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files.lock();
         files.remove(path);
         Ok(())
     }
