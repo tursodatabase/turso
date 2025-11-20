@@ -42,7 +42,7 @@ pub unsafe extern "C" fn execute(
                     let args_slice = &mut std::slice::from_raw_parts_mut(args, arg_count as usize);
                     for (i, val) in args_slice.iter_mut().enumerate() {
                         stmt.bind_at(
-                            NonZeroUsize::new(i + 1).unwrap(),
+                            NonZeroUsize::new(i + 1).expect("i cannot be negative"),
                             Value::from_ffi(std::mem::take(val)).unwrap_or(Value::Null),
                         );
                     }
