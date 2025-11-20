@@ -14,12 +14,9 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use parking_lot::Mutex;
 use std::sync::atomic::AtomicU8;
-use std::{
-    collections::HashMap,
-    rc::Rc,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{

@@ -491,7 +491,7 @@ fn parse_table(
         }
 
         // Check if this materialized view has persistent storage
-        let view_guard = view.lock().unwrap();
+        let view_guard = view.lock();
         let root_page = view_guard.get_root_page();
 
         if root_page == 0 {

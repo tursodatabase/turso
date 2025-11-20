@@ -7799,14 +7799,7 @@ mod tests {
         vdbe::Register,
         BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
     };
-    use std::{
-        cell::RefCell,
-        collections::HashSet,
-        mem::transmute,
-        ops::Deref,
-        rc::Rc,
-        sync::{Arc, Mutex},
-    };
+    use std::{cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, rc::Rc, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -9082,7 +9075,7 @@ mod tests {
                 Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
-                Arc::new(Mutex::new(())),
+                Arc::new(parking_lot::Mutex::new(())),
             )
             .unwrap(),
         );

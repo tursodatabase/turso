@@ -8,7 +8,8 @@ use crate::incremental::operator::{
 };
 use crate::types::IOResult;
 use crate::{Result, Value};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Filter predicate for filtering rows
 #[derive(Debug, Clone)]
@@ -260,7 +261,7 @@ impl IncrementalOperator for FilterOperator {
         // Process the delta through the filter
         for (row, weight) in delta.changes {
             if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_filter();
+                tracker.lock().record_filter();
             }
 
             // Only pass through rows that satisfy the filter predicate
@@ -292,7 +293,7 @@ impl IncrementalOperator for FilterOperator {
         // Only pass through and track rows that satisfy the filter predicate
         for (row, weight) in deltas.left.changes {
             if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_filter();
+                tracker.lock().record_filter();
             }
 
             // Only track and output rows that pass the filter

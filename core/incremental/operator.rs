@@ -15,8 +15,9 @@ use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
 use crate::types::IOResult;
 use crate::Result;
+use parking_lot::Mutex;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -263,7 +264,8 @@ mod tests {
     use crate::util::IOExt;
     use crate::Value;
     use crate::{Database, MemoryIO, IO};
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     /// Create a test pager for operator tests with both table and index
     fn create_test_pager() -> (std::sync::Arc<crate::Pager>, i64, i64) {
@@ -702,7 +704,7 @@ mod tests {
             .unwrap();
 
         // Reset tracker for delta processing
-        tracker.lock().unwrap().aggregation_updates = 0;
+        tracker.lock().aggregation_updates = 0;
 
         // Add one item to category 'cat_0'
         let mut delta = Delta::new();
@@ -720,7 +722,7 @@ mod tests {
             .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
+        assert_eq!(tracker.lock().aggregation_updates, 1);
 
         // Check the final state - cat_0 should now have count 11
         let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);
@@ -732,7 +734,7 @@ mod tests {
         assert_eq!(cat_0.0.values[1], Value::Integer(11));
 
         // Verify incremental behavior - we process the delta twice (eval + commit)
-        let t = tracker.lock().unwrap();
+        let t = tracker.lock();
         assert_incremental(&t, 2, 101);
     }
 
@@ -804,7 +806,7 @@ mod tests {
         assert_eq!(widget_sum.values[1], Value::Integer(250));
 
         // Reset tracker
-        tracker.lock().unwrap().aggregation_updates = 0;
+        tracker.lock().aggregation_updates = 0;
 
         // Add sale of 50 for Widget
         let mut delta = Delta::new();
@@ -822,7 +824,7 @@ mod tests {
             .block(|| agg.commit((&delta).into(), &mut cursors))
             .unwrap();
 
-        assert_eq!(tracker.lock().unwrap().aggregation_updates, 1);
+        assert_eq!(tracker.lock().aggregation_updates, 1);
 
         // Check final state - Widget should now be 300 (250 + 50)
         let final_state = get_current_state_from_btree(&agg, &pager, &mut cursors);

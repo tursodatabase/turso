@@ -7,10 +7,11 @@ use crate::incremental::operator::{
 };
 use crate::types::IOResult;
 use crate::Result;
+use parking_lot::Mutex;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// How the merge operator should handle rowids when combining deltas
 #[derive(Debug, Clone)]

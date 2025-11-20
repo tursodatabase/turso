@@ -10,9 +10,10 @@ use crate::incremental::persistence::{ReadRecord, WriteRow};
 use crate::storage::btree::CursorTrait;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Display};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // Architecture of the Aggregate Operator
 // ========================================
@@ -1492,7 +1493,7 @@ impl AggregateOperator {
         // Process each change in the delta
         for (row, weight) in delta.changes.iter() {
             if let Some(tracker) = &self.tracker {
-                tracker.lock().unwrap().record_aggregation();
+                tracker.lock().record_aggregation();
             }
 
             // Extract group key

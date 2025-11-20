@@ -15,9 +15,10 @@ use crate::{vtab::VirtualTable, SymbolTable};
 use crate::{LimboError, IO};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
+use parking_lot::Mutex;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use turso_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
@@ -65,9 +66,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
                 // Use the schema handler to insert the table
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
-                let Ok(guard) = mutex.lock() else {
-                    return ResultCode::Error;
-                };
+                let guard = mutex.lock();
                 let schema_ptr = Arc::as_ptr(&*guard) as *mut Schema;
                 (*schema_ptr).tables.insert(name_str, table);
             } else {
