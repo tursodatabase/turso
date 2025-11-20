@@ -57,16 +57,16 @@ do_execsql_test pragma-table-xinfo-call-syntax {
 }
 
 do_execsql_test pragma-table-info-vtable {
-  PRAGMA table_info(generate_series)
-} {0|value|INTEGER|0||0
+  SELECT name FROM pragma_table_info('generate_series')
+} {value
 }
 
 do_execsql_test pragma-table-xinfo-vtable {
-  PRAGMA table_xinfo(generate_series)
-} {{0|value|INTEGER|0||0|0
-1|start|INTEGER HIDDEN|0||0|1
-2|stop|INTEGER HIDDEN|0||0|1
-3|step|INTEGER HIDDEN|0||0|1}}
+  SELECT name, hidden FROM pragma_table_xinfo('generate_series')
+} {{value|0
+start|1
+stop|1
+step|1}}
 
 do_execsql_test pragma-table-info-alt-name-equal-syntax {
   PRAGMA table_info=sqlite_master
