@@ -303,11 +303,10 @@ fn add_ephemeral_table_to_update_plan(
                 .is_some_and(|join_info| join_info.outer),
         })
         .collect();
-    let rowid_internal_id = table_references_ephemeral_select
-        .joined_tables()
-        .first()
-        .unwrap()
-        .internal_id;
+    let Some(first_table) = table_references_ephemeral_select.joined_tables().first() else {
+        crate::bail_parse_error!("ephemeral select must have at least one joined table");
+    };
+    let rowid_internal_id = first_table.internal_id;
 
     let ephemeral_plan = SelectPlan {
         table_references: table_references_ephemeral_select,
@@ -652,7 +651,10 @@ fn optimize_table_access(
             .iter()
             .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
         {
-            t.join_info.as_mut().unwrap().outer = false;
+            let Some(join_info) = t.join_info.as_mut() else {
+                crate::bail_parse_error!("join_info must exist for table with outer join");
+            };
+            join_info.outer = false;
             for term in where_clause.iter_mut() {
                 if let Some(from_outer_join) = term.from_outer_join {
                     if from_outer_join == t.internal_id {
@@ -811,7 +813,7 @@ fn optimize_table_access(
                     let ephemeral_index = ephemeral_index_build(
                         &table_references.joined_tables_mut()[table_idx],
                         &usable_constraint_refs,
-                    );
+                    )?;
                     let ephemeral_index = Arc::new(ephemeral_index);
                     table_references.joined_tables_mut()[table_idx].op =
                         Operation::Search(Search::Seek {
@@ -1328,19 +1330,28 @@ impl Optimizable for ast::Expr {
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
     constraint_refs: &[RangeConstraintRef],
-) -> Index {
+) -> Result<Index> {
     let mut ephemeral_columns: Vec<IndexColumn> = table_reference
         .columns()
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: c.collation_opt(),
-            default: c.default.clone(),
-            expr: None,
+        .map(|(i, c)| {
+            let Some(name) = c.name.clone() else {
+                return Err(crate::LimboError::ParseError(
+                    "column must have a name".to_string(),
+                ));
+            };
+            Ok(IndexColumn {
+                name,
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: c.collation_opt(),
+                default: c.default.clone(),
+                expr: None,
+            })
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
         .collect();
@@ -1380,7 +1391,7 @@ fn ephemeral_index_build(
         index_method: None,
     };
 
-    ephemeral_index
+    Ok(ephemeral_index)
 }
 
 /// Build a [SeekDef] for a given list of [Constraint]s
@@ -1435,7 +1446,9 @@ fn build_seek_def(
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
     assert!(!key.is_empty());
-    let last = key.last().unwrap();
+    let Some(last) = key.last() else {
+        crate::bail_parse_error!("key must not be empty");
+    };
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
     if last.eq.is_some() {
@@ -1461,7 +1474,9 @@ fn build_seek_def(
     assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
 
     // pop last key as we will do some form of range search
-    let last = key.pop().unwrap();
+    let Some(last) = key.pop() else {
+        crate::bail_parse_error!("key must not be empty for pop");
+    };
 
     // after that all key components must be equality constraints
     debug_assert!(key.iter().all(|k| k.eq.is_some()));
