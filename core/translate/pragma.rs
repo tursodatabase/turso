@@ -554,7 +554,8 @@ fn query_pragma(
             };
 
             let base_reg = register;
-            program.alloc_registers(6);
+            // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
+            program.alloc_registers(5);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
                     emit_columns_for_table_info(&mut program, table.columns(), base_reg, false);
@@ -579,7 +580,8 @@ fn query_pragma(
             };
 
             let base_reg = register;
-            program.alloc_registers(7);
+            // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
+            program.alloc_registers(6);
             if let Some(name) = name {
                 if let Some(table) = schema.get_table(&name) {
                     emit_columns_for_table_info(&mut program, table.columns(), base_reg, true);
