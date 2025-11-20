@@ -49,7 +49,9 @@ where
         return Value::Null;
     }
 
-    let value = values.next().unwrap();
+    let Some(value) = values.next() else {
+        return Value::Null;
+    };
     let value = value.as_value_ref();
     let format_str = if matches!(
         value,
@@ -80,11 +82,15 @@ where
 {
     let values = values.into_iter();
     if values.len() == 0 {
-        let now = parse_naive_date_time(Value::build_text("now")).unwrap();
+        let Some(now) = parse_naive_date_time(Value::build_text("now")) else {
+            return Value::Null;
+        };
         return format_dt(now, output_type, false);
     }
     let mut values = values.peekable();
-    let first = values.peek().unwrap();
+    let Some(first) = values.peek() else {
+        return Value::Null;
+    };
     if let Some(mut dt) = parse_naive_date_time(first) {
         // if successful, treat subsequent entries as modifiers
         modify_dt(&mut dt, values.skip(1), output_type)
@@ -231,18 +237,19 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> 
         }
         Modifier::StartOfMonth => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap();
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .ok_or_else(|| InvalidModifier("failed to construct start of month".to_string()))?;
         }
         Modifier::StartOfYear => {
             *dt = NaiveDate::from_ymd_opt(dt.year(), 1, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap();
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .ok_or_else(|| InvalidModifier("failed to construct start of year".to_string()))?;
         }
         Modifier::StartOfDay => {
-            *dt = dt.date().and_hms_opt(0, 0, 0).unwrap();
+            *dt = dt
+                .date()
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| InvalidModifier("failed to construct start of day".to_string()))?;
         }
         Modifier::Weekday(day) => {
             let current_day = dt.weekday().num_days_from_sunday();
@@ -259,11 +266,18 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> 
         }
         Modifier::Utc => {
             // TODO: handle datetime('now', 'utc') no-op
-            let local_dt = chrono::Local.from_local_datetime(dt).unwrap();
+            let local_dt = chrono::Local
+                .from_local_datetime(dt)
+                .single()
+                .ok_or_else(|| {
+                    InvalidModifier("ambiguous local datetime during DST transition".to_string())
+                })?;
             *dt = local_dt.with_timezone(&Utc).naive_utc();
         }
         Modifier::Subsec => {
-            *dt = dt.with_nanosecond(dt.nanosecond()).unwrap();
+            *dt = dt
+                .with_nanosecond(dt.nanosecond())
+                .ok_or_else(|| InvalidModifier("failed to set nanoseconds".to_string()))?;
             return Ok(true);
         }
     }
@@ -482,7 +496,7 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
 
     // First, try to parse as date-only format
     if let Ok(date) = NaiveDate::parse_from_str(value, date_only_format) {
-        return Some(date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap()));
+        return NaiveTime::from_hms_opt(0, 0, 0).map(|time| date.and_time(time));
     }
 
     for format in &datetime_formats {
@@ -598,10 +612,9 @@ fn is_leap_second(dt: &NaiveDateTime) -> bool {
 
 fn get_max_datetime_exclusive() -> NaiveDateTime {
     // The maximum date in SQLite is 9999-12-31
-    NaiveDateTime::new(
-        NaiveDate::from_ymd_opt(10000, 1, 1).unwrap(),
-        NaiveTime::from_hms_milli_opt(00, 00, 00, 000).unwrap(),
-    )
+    let date = NaiveDate::from_ymd_opt(10000, 1, 1).expect("10000-01-01 is valid");
+    let time = NaiveTime::from_hms_milli_opt(00, 00, 00, 000).expect("00:00:00.000 is valid");
+    NaiveDateTime::new(date, time)
 }
 
 /// Modifier doc https://www.sqlite.org/lang_datefunc.html#modifiers
@@ -824,8 +837,15 @@ where
         return Value::Null;
     }
 
-    let start = parse_naive_date_time(values.next().unwrap());
-    let end = parse_naive_date_time(values.next().unwrap());
+    let Some(start_val) = values.next() else {
+        return Value::Null;
+    };
+    let Some(end_val) = values.next() else {
+        return Value::Null;
+    };
+
+    let start = parse_naive_date_time(start_val);
+    let end = parse_naive_date_time(end_val);
 
     match (start, end) {
         (Some(start), Some(end)) => {
