@@ -4,9 +4,10 @@ use crate::{
 };
 #[cfg(not(target_family = "wasm"))]
 use libloading::{Library, Symbol};
+use parking_lot::Mutex;
 use std::{
     ffi::{c_char, CString},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 use turso_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl};
 
@@ -52,12 +53,7 @@ impl Connection {
         let result_code = unsafe { entry(api_ptr) };
         if result_code.is_ok() {
             let extensions = get_extension_libraries();
-            extensions
-                .lock()
-                .map_err(|_| {
-                    LimboError::ExtensionError("Error locking extension libraries".to_string())
-                })?
-                .push((Arc::new(lib), api_ref));
+            extensions.lock().push((Arc::new(lib), api_ref));
             if self.is_db_initialized() {
                 self.parse_schema_rows()?;
             }
@@ -156,10 +152,7 @@ fn register_static_vfs_modules(_api: &mut ExtensionApi) {
 }
 
 pub fn add_vfs_module(name: String, vfs: Arc<VfsMod>) {
-    let mut modules = VFS_MODULES
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap();
+    let mut modules = VFS_MODULES.get_or_init(|| Mutex::new(Vec::new())).lock();
     if !modules.iter().any(|v| v.0 == name) {
         modules.push((name, vfs));
     }
@@ -169,7 +162,6 @@ pub fn list_vfs_modules() -> Vec<String> {
     VFS_MODULES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap()
         .iter()
         .map(|v| v.0.clone())
         .collect()
@@ -179,6 +171,5 @@ pub fn get_vfs_modules() -> Vec<Vfs> {
     VFS_MODULES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
-        .unwrap()
         .clone()
 }
