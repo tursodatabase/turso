@@ -299,7 +299,8 @@ impl IndexInfo {
         let idx_str_len = self.idx_str.as_ref().map(|s| s.len()).unwrap_or(0);
         let c_idx_str = self
             .idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap().into_raw())
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut());
         ExtIndexInfo {
             code: ResultCode::OK,
