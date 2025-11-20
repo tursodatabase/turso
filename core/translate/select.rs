@@ -337,10 +337,10 @@ fn prepare_one_select_plan(
                             .iter_mut()
                             .find(|t| t.identifier == name_normalized);
 
-                        if referenced_table.is_none() {
-                            crate::bail_parse_error!("no such table: {}", name.as_str());
-                        }
-                        let table = referenced_table.unwrap();
+                        let table = match referenced_table {
+                            Some(t) => t,
+                            None => crate::bail_parse_error!("no such table: {}", name.as_str()),
+                        };
                         let num_columns = table.columns().len();
                         for idx in 0..num_columns {
                             let column = &table.columns()[idx];
@@ -768,11 +768,11 @@ pub fn emit_simple_count(
     _t_ctx: &mut TranslateCtx,
     plan: &SelectPlan,
 ) -> Result<()> {
-    let cursors = plan
-        .joined_tables()
-        .first()
-        .unwrap()
-        .resolve_cursors(program, OperationMode::SELECT)?;
+    let first_table = match plan.joined_tables().first() {
+        Some(t) => t,
+        None => crate::bail_parse_error!("no joined tables in plan"),
+    };
+    let cursors = first_table.resolve_cursors(program, OperationMode::SELECT)?;
 
     let cursor_id = {
         match cursors {
