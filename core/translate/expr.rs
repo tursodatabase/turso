@@ -498,13 +498,19 @@ pub fn translate_condition_expr(
 
             if *not {
                 // When IN is TRUE (match found), NOT IN should be FALSE
-                program.resolve_label(not_true_label.unwrap(), program.offset());
+                let label = not_true_label.ok_or_else(|| {
+                    crate::LimboError::InternalError("not_true_label not set".to_string())
+                })?;
+                program.resolve_label(label, program.offset());
                 program.emit_insn(Insn::Goto {
                     target_pc: jump_target_when_false,
                 });
 
                 // When IN is FALSE (no match), NOT IN should be TRUE
-                program.resolve_label(not_false_label.unwrap(), program.offset());
+                let label = not_false_label.ok_or_else(|| {
+                    crate::LimboError::InternalError("not_false_label not set".to_string())
+                })?;
+                program.resolve_label(label, program.offset());
                 program.emit_insn(Insn::Goto {
                     target_pc: jump_target_when_true,
                 });
@@ -687,7 +693,10 @@ pub fn translate_expr(
                         value: 0,
                         dest: target_register,
                     });
-                    let lhs_columns = match unwrap_parens(lhs.as_ref().unwrap())? {
+                    let lhs = lhs.as_ref().ok_or_else(|| {
+                        crate::LimboError::InternalError("lhs is None".to_string())
+                    })?;
+                    let lhs_columns = match unwrap_parens(lhs)? {
                         ast::Expr::Parenthesized(exprs) => {
                             exprs.iter().map(|e| e.as_ref()).collect()
                         }
@@ -703,7 +712,12 @@ pub fn translate_expr(
                             lhs_column_regs_start + i,
                             resolver,
                         )?;
-                        if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                        let ref_tables = referenced_tables.as_ref().ok_or_else(|| {
+                            crate::LimboError::InternalError(
+                                "referenced_tables is None".to_string(),
+                            )
+                        })?;
+                        if !lhs_column.is_nonnull(ref_tables) {
                             program.emit_insn(Insn::IsNull {
                                 reg: lhs_column_regs_start + i,
                                 target_pc: if *not_in {
@@ -839,13 +853,10 @@ pub fn translate_expr(
             let base_reg = base.as_ref().map(|_| program.alloc_register());
             let expr_reg = program.alloc_register();
             if let Some(base_expr) = base {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    base_expr,
-                    base_reg.unwrap(),
-                    resolver,
-                )?;
+                let reg = base_reg.ok_or_else(|| {
+                    crate::LimboError::InternalError("base_reg is None".to_string())
+                })?;
+                translate_expr(program, referenced_tables, base_expr, reg, resolver)?;
             };
             for (when_expr, then_expr) in when_then_pairs {
                 translate_expr_no_constant_opt(
@@ -913,7 +924,9 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Cast { expr, type_name } => {
-            let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
+            let type_name = type_name.as_ref().ok_or_else(|| {
+                crate::LimboError::ParseError("CAST requires a type name".to_string())
+            })?;
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
             let type_affinity = Affinity::affinity(&type_name.name);
             program.emit_insn(Insn::Cast {
@@ -950,8 +963,11 @@ pub fn translate_expr(
                 crate::bail_parse_error!("unknown function {}", name.as_str());
             }
 
+            let func = func_type.ok_or_else(|| {
+                crate::LimboError::ParseError(format!("unknown function {}", name.as_str()))
+            })?;
             let func_ctx = FuncCtx {
-                func: func_type.unwrap(),
+                func,
                 arg_count: args_count,
             };
 
@@ -1278,9 +1294,12 @@ pub fn translate_expr(
                                 start_reg = Some(start_reg.unwrap_or(reg));
                                 translate_expr(program, referenced_tables, arg, reg, resolver)?;
                             }
+                            let reg = start_reg.ok_or_else(|| {
+                                crate::LimboError::InternalError("start_reg not set".to_string())
+                            })?;
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
-                                start_reg: start_reg.unwrap(),
+                                start_reg: reg,
                                 dest: target_register,
                                 func: func_ctx,
                             });
@@ -1395,10 +1414,12 @@ pub fn translate_expr(
                             }
 
                             if args.len() % 2 != 0 {
+                                let last_arg =
+                                    args.last().expect("args.len() % 2 != 0 implies non-empty");
                                 translate_expr_no_constant_opt(
                                     program,
                                     referenced_tables,
-                                    args.last().unwrap(),
+                                    last_arg,
                                     target_register,
                                     resolver,
                                     NoConstantOptReason::RegisterReuse,
@@ -2091,8 +2112,11 @@ pub fn translate_expr(
                 crate::bail_parse_error!("unknown function {}", name.as_str());
             }
 
+            let func = func_type.ok_or_else(|| {
+                crate::LimboError::ParseError(format!("unknown function {}", name.as_str()))
+            })?;
             let func_ctx = FuncCtx {
-                func: func_type.unwrap(),
+                func,
                 arg_count: args_count,
             };
 
@@ -2146,9 +2170,11 @@ pub fn translate_expr(
             is_rowid_alias,
         } => {
             let (index, index_method, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
-                    .find_joined_table_by_internal_id(*table_ref_id)
+                let ref_tables = referenced_tables.ok_or_else(|| {
+                    crate::LimboError::InternalError("referenced_tables is None".to_string())
+                })?;
+                if let Some(table_reference) =
+                    ref_tables.find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
@@ -2165,8 +2191,10 @@ pub fn translate_expr(
             };
             let use_index_method = index_method.and_then(|m| m.covered_columns.get(column));
 
-            let (is_from_outer_query_scope, table) = referenced_tables
-                .unwrap()
+            let ref_tables = referenced_tables.ok_or_else(|| {
+                crate::LimboError::InternalError("referenced_tables is None".to_string())
+            })?;
+            let (is_from_outer_query_scope, table) = ref_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .unwrap_or_else(|| {
                     unreachable!(
@@ -2217,8 +2245,13 @@ pub fn translate_expr(
                     };
 
                     if let Some(custom_module_column) = use_index_method {
+                        let cursor_id = index_cursor_id.ok_or_else(|| {
+                            crate::LimboError::InternalError(
+                                "index_cursor_id not set for index method".to_string(),
+                            )
+                        })?;
                         program.emit_column_or_rowid(
-                            index_cursor_id.unwrap(),
+                            cursor_id,
                             *custom_module_column,
                             target_register,
                         );
@@ -2302,9 +2335,11 @@ pub fn translate_expr(
             table: table_ref_id,
         } => {
             let (index, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
-                    .find_joined_table_by_internal_id(*table_ref_id)
+                let ref_tables = referenced_tables.ok_or_else(|| {
+                    crate::LimboError::InternalError("referenced_tables is None".to_string())
+                })?;
+                if let Some(table_reference) =
+                    ref_tables.find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (
                         table_reference.op.index(),
@@ -3397,7 +3432,10 @@ pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
     match expr {
         ast::Expr::Column { .. } => Ok(expr),
         ast::Expr::Parenthesized(exprs) => match exprs.len() {
-            1 => unwrap_parens(exprs.first().unwrap()),
+            1 => {
+                let first = exprs.first().expect("checked length == 1");
+                unwrap_parens(first)
+            }
             _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.
         },
         _ => Ok(expr),
@@ -3412,7 +3450,8 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let last = exprs.pop().expect("checked length == 1");
+                let (expr, count) = unwrap_parens_owned(*last.clone())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }
@@ -3712,11 +3751,20 @@ pub fn bind_and_rewrite_expr<'a>(
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
                             } else {
+                                let col_idx_val = col_idx
+                                    .expect("col_idx must be Some when match_result is None");
                                 let col =
-                                    joined_table.table.columns().get(col_idx.unwrap()).unwrap();
+                                    joined_table.table.columns().get(col_idx_val).ok_or_else(
+                                        || {
+                                            crate::LimboError::InternalError(format!(
+                                                "column index {} out of bounds",
+                                                col_idx_val
+                                            ))
+                                        },
+                                    )?;
                                 match_result = Some((
                                     joined_table.internal_id,
-                                    col_idx.unwrap(),
+                                    col_idx_val,
                                     col.is_rowid_alias(),
                                 ));
                             }
@@ -3755,10 +3803,19 @@ pub fn bind_and_rewrite_expr<'a>(
                                 if match_result.is_some() {
                                     crate::bail_parse_error!("Column {} is ambiguous", id.as_str());
                                 }
-                                let col = outer_ref.table.columns().get(col_idx.unwrap()).unwrap();
+                                let col_idx_val =
+                                    col_idx.expect("col_idx must be Some when is_some() is true");
+                                let col = outer_ref.table.columns().get(col_idx_val).ok_or_else(
+                                    || {
+                                        crate::LimboError::InternalError(format!(
+                                            "column index {} out of bounds",
+                                            col_idx_val
+                                        ))
+                                    },
+                                )?;
                                 match_result = Some((
                                     outer_ref.internal_id,
-                                    col_idx.unwrap(),
+                                    col_idx_val,
                                     col.is_rowid_alias(),
                                 ));
                             }
@@ -3818,7 +3875,8 @@ pub fn bind_and_rewrite_expr<'a>(
                     if matching_tbl.is_none() {
                         crate::bail_parse_error!("no such table: {}", normalized_table_name);
                     }
-                    let (tbl_id, tbl) = matching_tbl.unwrap();
+                    let (tbl_id, tbl) =
+                        matching_tbl.expect("matching_tbl must be Some when is_none() is false");
                     let normalized_id = normalize_ident(id.as_str());
                     let col_idx = tbl.columns().iter().position(|c| {
                         c.name
@@ -3833,7 +3891,12 @@ pub fn bind_and_rewrite_expr<'a>(
                     let Some(col_idx) = col_idx else {
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
-                    let col = tbl.columns().get(col_idx).unwrap();
+                    let col = tbl.columns().get(col_idx).ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "column index {} out of bounds",
+                            col_idx
+                        ))
+                    })?;
                     *expr = Expr::Column {
                         database: None, // TODO: support different databases
                         table: tbl_id,
@@ -3895,7 +3958,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             ))
                         })?;
 
-                    let col = table.columns().get(col_idx).unwrap();
+                    let col = table.columns().get(col_idx).ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "column index {} out of bounds",
+                            col_idx
+                        ))
+                    })?;
 
                     // Check if this is a rowid alias
                     let is_rowid_alias = col.is_rowid_alias();
@@ -4136,9 +4204,12 @@ pub fn get_expr_affinity(
                 Affinity::Blob
             }
         }
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            get_expr_affinity(exprs.first().unwrap(), referenced_tables)
-        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => get_expr_affinity(
+            exprs
+                .first()
+                .expect("exprs.len() == 1 guarantees first() returns Some"),
+            referenced_tables,
+        ),
         ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
         // Literals have NO affinity in SQLite!
         ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
@@ -4227,9 +4298,9 @@ pub fn emit_literal(
                 .chunks_exact(2)
                 .map(|pair| {
                     // We assume that sqlite3-parser has already validated that
-                    // the input is valid hex string, thus unwrap is safe.
-                    let hex_byte = std::str::from_utf8(pair).unwrap();
-                    u8::from_str_radix(hex_byte, 16).unwrap()
+                    // the input is valid hex string, thus expect is safe.
+                    let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
+                    u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
                 .collect();
             program.emit_insn(Insn::Blob {
@@ -4386,7 +4457,10 @@ pub(crate) fn emit_returning_results<'a>(
     }
 
     turso_assert!(table_references.joined_tables().len() == 1, "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table");
-    let table = table_references.joined_tables().first().unwrap();
+    let table = table_references
+        .joined_tables()
+        .first()
+        .ok_or_else(|| crate::LimboError::InternalError("no joined tables".to_string()))?;
 
     resolver.enable_expr_to_reg_cache();
     let expr = Expr::RowId {
