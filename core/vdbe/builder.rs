@@ -545,11 +545,11 @@ impl ProgramBuilder {
         });
         for resolved_offset in self.label_to_resolved_offset.iter_mut() {
             if let Some((old_offset, target)) = resolved_offset {
-                let new_offset = self
-                    .insns
-                    .iter()
-                    .position(|(_, index)| *old_offset == *index as u32)
-                    .unwrap() as u32;
+                let new_offset =
+                    self.insns
+                        .iter()
+                        .position(|(_, index)| *old_offset == *index as u32)
+                        .expect("instruction offset must exist") as u32;
                 *resolved_offset = Some((new_offset, *target));
             }
         }
@@ -1065,7 +1065,7 @@ impl ProgramBuilder {
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
-        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
         if let CursorType::BTreeTable(btree) = cursor_type {
             let column_def = btree
                 .columns
@@ -1085,7 +1085,7 @@ impl ProgramBuilder {
     }
 
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {
-        let (_, cursor_type) = self.cursor_ref.get(cursor_id).unwrap();
+        let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
         use crate::translate::expr::sanitize_string;
 
@@ -1115,9 +1115,10 @@ impl ProgramBuilder {
                         .chunks_exact(2)
                         .map(|pair| {
                             // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
+                            // the input is valid hex string, thus expect is safe.
+                            let hex_byte =
+                                std::str::from_utf8(pair).expect("parser validated hex string");
+                            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                         })
                         .collect(),
                 ),
