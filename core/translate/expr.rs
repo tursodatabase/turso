@@ -113,6 +113,7 @@ macro_rules! expect_arguments_max {
 /// the expression. That matters for:
 /// - SELECT a/b FROM t with INDEX ON t(a/b) (avoid computing a/b for every row)
 /// - ORDER BY a+b when the index already stores a+b (preserves ordering)
+///
 /// We mut do this check early in translate_expr so downstream translation does
 /// not build redundant bytecode.
 fn try_emit_expression_index_value(
