@@ -712,7 +712,11 @@ impl Stmt {
         let slice = unsafe { std::slice::from_raw_parts(col_names, count_value as usize) };
         for x in slice {
             let name = unsafe { CStr::from_ptr(*x) };
-            names.push(name.to_str().unwrap().to_string());
+            names.push(
+                name.to_str()
+                    .expect("column name should be valid UTF-8")
+                    .to_string(),
+            );
         }
         unsafe { free_column_names(col_names, count_value) };
         names
