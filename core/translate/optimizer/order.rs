@@ -193,11 +193,10 @@ pub fn plan_satisfies_order_target(
                     let Some(rowid_alias_col) = rowid_alias_col else {
                         return false;
                     };
-                    let matches_target = matches!(
+                    if !matches!(
                         target_col.target,
                         ColumnTarget::Column(col_no) if col_no == rowid_alias_col
-                    );
-                    if !matches_target {
+                    ) {
                         return false;
                     }
                     let correct_order = if *iter_dir == IterationDirection::Forwards {

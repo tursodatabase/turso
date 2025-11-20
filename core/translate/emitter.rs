@@ -2776,6 +2776,8 @@ fn rewrite_where_for_update_registers(
     })
 }
 
+/// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
+/// Handling expression indexes and regular columns
 fn emit_index_column_value_old_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2808,6 +2810,8 @@ fn emit_index_column_value_old_image(
     Ok(())
 }
 
+/// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
+/// Handling expression indexes and regular columns
 fn emit_index_column_value_new_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

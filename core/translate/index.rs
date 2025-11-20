@@ -6,7 +6,7 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
@@ -550,6 +550,9 @@ pub fn resolve_sorted_columns(
     Ok(resolved)
 }
 
+/// Extracts collation sequence from an expression if it is a Collate expression.
+/// Given the example: `col1 COLLATE NOCASE` / Expr::Collation(Expr::Id(col1), CollationSeq)
+/// returns (Some(CollationSeq), Expr::Id(col1))
 fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)> {
     let mut current = expr;
     let mut coll = None;
@@ -560,10 +563,14 @@ fn extract_collation(expr: &Expr) -> crate::Result<(Option<CollationSeq>, &Expr)
     Ok((coll, current))
 }
 
+/// For a given Index Expression, attempts to resolve it to a column position in the table.
+/// Returning (position_in_table, column_name, column_reference).
+/// This is needed to support Collated indexes, where the ast node is not simply the column name,
+/// but isn't treated like an arbitrary expression either.
 fn resolve_index_column<'a>(
     expr: &'a Expr,
     table: &'a BTreeTable,
-) -> Option<(usize, String, &'a crate::schema::Column)> {
+) -> Option<(usize, String, &'a Column)> {
     let (pos, column) = match expr {
         Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
         Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
@@ -580,6 +587,15 @@ fn resolve_index_column<'a>(
     Some((pos, column_name, column))
 }
 
+/// Validates that an index expression only contains allowed constructs.
+///
+/// https://sqlite.org/expridx.html
+/// There are certain reasonable restrictions on expressions that appear in CREATE INDEX statements:
+/// Expressions in CREATE INDEX statements may only refer to columns of the table being indexed, not to columns in other tables.
+/// Expressions in CREATE INDEX statements may contain function calls, but only to functions whose output is always determined completely by its input parameters
+/// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
+/// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
+/// Expressions in CREATE INDEX statements may not use subqueries.
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {

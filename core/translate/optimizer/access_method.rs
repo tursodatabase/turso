@@ -142,13 +142,17 @@ fn find_best_access_method_for_btree(
                 let target = &order_target.0[i];
                 let correct_table = target.table_id == table_no;
                 let correct_column = match (&target.target, &candidate.index) {
+                    // Regular column target on normal index, simply check column number
+                    // against index column's pos_in_table
                     (ColumnTarget::Column(col_no), Some(index)) => {
                         index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
                     }
+                    // Expression column target on expression index, check expr equivalence
                     (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
                         .expr
                         .as_ref()
                         .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
+                    // Normal column target on rowid index, check if column is rowid
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)
                     }

@@ -182,7 +182,8 @@ fn upsert_index_is_affected(
     false
 }
 
-/// Columns referenced by the partial WHERE (empty if none).
+/// Collect HashSet of columns referenced by the partial WHERE (empty if none), or
+/// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
     let mut out = HashSet::new();
     if let Some(expr) = &idx.where_clause {
