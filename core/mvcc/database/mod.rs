@@ -9,6 +9,7 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -1267,35 +1268,108 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         start: i64,
         tx_id: TxID,
     ) -> Option<RowID> {
-        tracing::trace!(
-            "getting_next_id_for_table(table_id={}, range_start={})",
+        let res = self.get_row_id_for_table_in_direction(
             table_id,
             start,
+            tx_id,
+            IterationDirection::Forwards,
         );
-        let min_bound = RowID {
+        tracing::trace!(
+            "get_next_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
             table_id,
-            row_id: start,
-        };
+            start,
+            tx_id,
+            res
+        );
+        res
+    }
 
-        let max_bound = RowID {
+    pub fn get_prev_row_id_for_table(
+        &self,
+        table_id: MVTableId,
+        start: i64,
+        tx_id: TxID,
+    ) -> Option<RowID> {
+        let res = self.get_row_id_for_table_in_direction(
             table_id,
-            row_id: i64::MAX,
-        };
+            start,
+            tx_id,
+            IterationDirection::Backwards,
+        );
+        tracing::trace!(
+            "get_prev_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
+            table_id,
+            start,
+            tx_id,
+            res
+        );
+        res
+    }
+
+    pub fn get_row_id_for_table_in_direction(
+        &self,
+        table_id: MVTableId,
+        start: i64,
+        tx_id: TxID,
+        direction: IterationDirection,
+    ) -> Option<RowID> {
+        tracing::trace!(
+            "getting_row_id_for_table_in_direction(table_id={}, range_start={}, direction={:?})",
+            table_id,
+            start,
+            direction
+        );
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        let mut rows = self.rows.range(min_bound..max_bound);
-        loop {
-            // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
-            // to loop either until we find a row that is not deleted or until we reach the end of the table.
-            let next_row = rows.next();
-            let row = next_row?;
+        if direction == IterationDirection::Forwards {
+            let min_bound = RowID {
+                table_id,
+                row_id: start,
+            };
 
-            // We found a row, let's check if it's visible to the transaction.
-            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
-                return Some(visible_row);
+            let max_bound = RowID {
+                table_id,
+                row_id: i64::MAX,
+            };
+            let mut rows = self.rows.range(min_bound..max_bound);
+            loop {
+                // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
+                // to loop either until we find a row that is not deleted or until we reach the end of the table.
+                let next_row = rows.next();
+                tracing::trace!("next_row: {:?}", next_row);
+                let row = next_row?;
+
+                // We found a row, let's check if it's visible to the transaction.
+                if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                    return Some(visible_row);
+                }
+                // If this row is not visible, continue to the next row
             }
-            // If this row is not visible, continue to the next row
+        } else {
+            let min_bound = RowID {
+                table_id,
+                row_id: i64::MIN,
+            };
+
+            let max_bound = RowID {
+                table_id,
+                row_id: start,
+            };
+            // In backward's direction we iterate in reverse order.
+            let mut rows = self.rows.range(min_bound..max_bound).rev();
+            loop {
+                // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
+                // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
+                let next_row = rows.next();
+                let row = next_row?;
+
+                // We found a row, let's check if it's visible to the transaction.
+                if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                    return Some(visible_row);
+                }
+                // If this row is not visible, continue to the next row
+            }
         }
     }
 
