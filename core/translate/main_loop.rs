@@ -234,7 +234,10 @@ pub fn init_loop(
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenRead {
                             cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page,
+                            root_page: index
+                                .as_ref()
+                                .expect("index must exist when index_cursor_id is Some")
+                                .root_page,
                             db: table.database_id,
                         });
                     }
@@ -250,7 +253,11 @@ pub fn init_loop(
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page.into(),
+                            root_page: index
+                                .as_ref()
+                                .expect("index must exist when index_cursor_id is Some")
+                                .root_page
+                                .into(),
                             db: table.database_id,
                         });
                     }
@@ -291,7 +298,11 @@ pub fn init_loop(
                                 .resolve_cursor_id(&CursorKey::table(target_table.internal_id));
                             program.emit_insn(Insn::OpenWrite {
                                 cursor_id: target_table_cursor_id,
-                                root_page: target_table.btree().unwrap().root_page.into(),
+                                root_page: target_table
+                                    .btree()
+                                    .expect("target table must be a BTree table")
+                                    .root_page
+                                    .into(),
                                 db: table.database_id,
                             });
                         }
@@ -299,7 +310,11 @@ pub fn init_loop(
                     if let Some(index_cursor_id) = index_cursor_id {
                         program.emit_insn(Insn::OpenWrite {
                             cursor_id: index_cursor_id,
-                            root_page: index.as_ref().unwrap().root_page.into(),
+                            root_page: index
+                                .as_ref()
+                                .expect("index must exist when index_cursor_id is Some")
+                                .root_page
+                                .into(),
                             db: table.database_id,
                         });
                     }
@@ -415,10 +430,15 @@ pub fn init_loop(
                             db: table.database_id,
                         });
                     }
-                    let index_cursor_id = index_cursor_id.unwrap();
+                    let index_cursor_id = index_cursor_id
+                        .expect("index_cursor_id must be Some for index method query");
                     program.emit_insn(Insn::OpenRead {
                         cursor_id: index_cursor_id,
-                        root_page: table.op.index().unwrap().root_page,
+                        root_page: table
+                            .op
+                            .index()
+                            .expect("operation must be index method query")
+                            .root_page,
                         db: table.database_id,
                     });
                 }
@@ -435,8 +455,12 @@ pub fn init_loop(
         let meta = ConditionMetadata {
             jump_if_condition_is_true: false,
             jump_target_when_true: jump_target,
-            jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
-            jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
+            jump_target_when_false: t_ctx
+                .label_main_loop_end
+                .expect("label_main_loop_end must be set"),
+            jump_target_when_null: t_ctx
+                .label_main_loop_end
+                .expect("label_main_loop_end must be set"),
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -476,7 +500,9 @@ pub fn open_loop(
         // This is used to determine whether to emit actual columns or NULLs for the columns of the right table.
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
-                let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
+                let lj_meta = t_ctx.meta_left_joins[joined_table_index]
+                    .as_ref()
+                    .expect("left join metadata must exist for outer join");
                 program.emit_insn(Insn::Integer {
                     value: 0,
                     dest: lj_meta.reg_match_flag,
@@ -746,7 +772,9 @@ pub fn open_loop(
         // for the right table's cursor.
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
-                let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
+                let lj_meta = t_ctx.meta_left_joins[joined_table_index]
+                    .as_ref()
+                    .expect("left join metadata must exist for outer join");
                 program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
                 program.emit_insn(Insn::Integer {
                     value: 1,
@@ -914,7 +942,10 @@ fn emit_loop_source(
                 row_source,
                 registers,
                 ..
-            } = t_ctx.meta_group_by.as_ref().unwrap();
+            } = t_ctx
+                .meta_group_by
+                .as_ref()
+                .expect("meta_group_by must be set when emitting to group by");
 
             let start_reg = registers.reg_group_by_source_cols_start;
             let mut cur_reg = start_reg;
@@ -1026,7 +1057,9 @@ fn emit_loop_source(
                 None
             };
 
-            let col_start = t_ctx.reg_result_cols_start.unwrap();
+            let col_start = t_ctx
+                .reg_result_cols_start
+                .expect("reg_result_cols_start must be set");
 
             // Process only non-aggregate columns
             let non_agg_columns = plan
@@ -1048,7 +1081,9 @@ fn emit_loop_source(
             }
             if let Some(label) = label_emit_nonagg_only_once {
                 program.resolve_label(label, program.offset());
-                let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
+                let flag = t_ctx
+                    .reg_nonagg_emit_once_flag
+                    .expect("reg_nonagg_emit_once_flag must be set");
                 program.emit_int(1, flag);
             }
 
@@ -1072,7 +1107,9 @@ fn emit_loop_source(
                 offset_jump_to,
                 t_ctx.reg_nonagg_emit_once_flag,
                 t_ctx.reg_offset,
-                t_ctx.reg_result_cols_start.unwrap(),
+                t_ctx
+                    .reg_result_cols_start
+                    .expect("reg_result_cols_start must be set"),
                 t_ctx.limit_ctx,
             )?;
 
@@ -1212,7 +1249,8 @@ pub fn close_loop(
             Operation::IndexMethodQuery(_) => {
                 program.resolve_label(loop_labels.next, program.offset());
                 program.emit_insn(Insn::Next {
-                    cursor_id: index_cursor_id.unwrap(),
+                    cursor_id: index_cursor_id
+                        .expect("index_cursor_id must be Some for index method query"),
                     pc_if_next: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
@@ -1223,7 +1261,9 @@ pub fn close_loop(
         // and emit a row with NULLs for the right table, and then jump back to the next row of the left table.
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
-                let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
+                let lj_meta = t_ctx.meta_left_joins[table_index]
+                    .as_ref()
+                    .expect("left join metadata must exist for outer join");
                 // The left join match flag is set to 1 when there is any match on the right table
                 // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
                 // If the left join match flag has been set to 1, we jump to the next row on the outer table,
@@ -1387,7 +1427,7 @@ fn emit_seek(
         if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
             program.emit_insn(Insn::Affinity {
                 start_reg,
-                count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                count: std::num::NonZeroUsize::new(num_regs).expect("num_regs must be non-zero"),
                 affinities: seek_def
                     .iter_affinity(&seek_def.start)
                     .map(|affinity| affinity.aff_mask())
@@ -1509,7 +1549,7 @@ fn emit_seek_termination(
         rowid_reg = Some(program.alloc_register());
         program.emit_insn(Insn::RowId {
             cursor_id: seek_cursor_id,
-            dest: rowid_reg.unwrap(),
+            dest: rowid_reg.expect("rowid_reg was just set to Some"),
         });
 
         affinity = if let Some(table_ref) = tables
@@ -1553,39 +1593,39 @@ fn emit_seek_termination(
             target_pc: loop_end,
         }),
         (false, SeekOp::GE { .. }) => program.emit_insn(Insn::Ge {
-            lhs: rowid_reg.unwrap(),
+            lhs: rowid_reg.expect("rowid_reg must be Some when is_index is false"),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default()
                 .jump_if_null()
-                .with_affinity(affinity.unwrap()),
+                .with_affinity(affinity.expect("affinity must be Some when is_index is false")),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::GT) => program.emit_insn(Insn::Gt {
-            lhs: rowid_reg.unwrap(),
+            lhs: rowid_reg.expect("rowid_reg must be Some when is_index is false"),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default()
                 .jump_if_null()
-                .with_affinity(affinity.unwrap()),
+                .with_affinity(affinity.expect("affinity must be Some when is_index is false")),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::LE { .. }) => program.emit_insn(Insn::Le {
-            lhs: rowid_reg.unwrap(),
+            lhs: rowid_reg.expect("rowid_reg must be Some when is_index is false"),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default()
                 .jump_if_null()
-                .with_affinity(affinity.unwrap()),
+                .with_affinity(affinity.expect("affinity must be Some when is_index is false")),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::LT) => program.emit_insn(Insn::Lt {
-            lhs: rowid_reg.unwrap(),
+            lhs: rowid_reg.expect("rowid_reg must be Some when is_index is false"),
             rhs: start_reg,
             target_pc: loop_end,
             flags: CmpInsFlags::default()
                 .jump_if_null()
-                .with_affinity(affinity.unwrap()),
+                .with_affinity(affinity.expect("affinity must be Some when is_index is false")),
             collation: program.curr_collation(),
         }),
     };
