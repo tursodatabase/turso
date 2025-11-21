@@ -311,9 +311,10 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     };
     let stmt = match db.conn.prepare(sql) {
         Ok(stmt) => stmt,
-        Err(_) => {
-            db.err_code = SQLITE_ERROR;
-            return SQLITE_ERROR;
+        Err(err) => {
+            let code = handle_limbo_err(err, std::ptr::null_mut());
+            db.err_code = code;
+            return code;
         }
     };
     let new_stmt = Box::leak(Box::new(sqlite3_stmt::new(raw_db, stmt)));
@@ -367,8 +368,8 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let db = &mut *stmt.db;
     loop {
         let _db = db.inner.lock().unwrap();
-        if let Ok(result) = stmt.stmt.step() {
-            match result {
+        match stmt.stmt.step() {
+            Ok(result) => match result {
                 turso_core::StepResult::IO => {
                     stmt.stmt.run_once().unwrap();
                     continue;
@@ -383,9 +384,8 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
                     return SQLITE_ROW;
                 }
                 turso_core::StepResult::Busy => return SQLITE_BUSY,
-            }
-        } else {
-            return SQLITE_ERROR;
+            },
+            Err(err) => return handle_limbo_err(err, std::ptr::null_mut()),
         }
     }
 }
@@ -435,11 +435,7 @@ pub unsafe extern "C" fn sqlite3_exec(
             match db_inner.conn.execute(trimmed) {
                 Ok(_) => continue,
                 Err(e) => {
-                    if !err.is_null() {
-                        let err_msg = format!("SQL error: {e:?}");
-                        *err = CString::new(err_msg).unwrap().into_raw();
-                    }
-                    return SQLITE_ERROR;
+                    return handle_limbo_err(e, err);
                 }
             }
         } else if callback.is_none() {
@@ -2118,4 +2114,21 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
     }
 
     rc
+}
+
+fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
+    if !container.is_null() {
+        let err_msg = format!("{}", err);
+        unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
+    }
+    match err {
+        LimboError::Corrupt(..) => SQLITE_CORRUPT,
+        LimboError::NotADB => SQLITE_NOTADB,
+        LimboError::Constraint(_) => SQLITE_CONSTRAINT,
+        LimboError::DatabaseFull(_) => SQLITE_FULL,
+        LimboError::TableLocked => SQLITE_LOCKED,
+        LimboError::ReadOnly => SQLITE_READONLY,
+        LimboError::Busy => SQLITE_BUSY,
+        _ => SQLITE_ERROR,
+    }
 }
