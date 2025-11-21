@@ -62,7 +62,6 @@ pub const SQLITE_CHECKPOINT_TRUNCATE: ffi::c_int = 3;
 pub const SQLITE_INTEGER: ffi::c_int = 1;
 pub const SQLITE_FLOAT: ffi::c_int = 2;
 pub const SQLITE_TEXT: ffi::c_int = 3;
-pub const SQLITE3_TEXT: ffi::c_int = 3;
 pub const SQLITE_BLOB: ffi::c_int = 4;
 pub const SQLITE_NULL: ffi::c_int = 5;
 
