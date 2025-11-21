@@ -1499,6 +1499,13 @@ pub enum PragmaName {
     Synchronous,
     /// returns information about the columns of a table
     TableInfo,
+    /// returns extended information about the columns of a table
+    ///
+    /// The only differece from TableInfo is additional "hidden" column whose value signifies
+    /// - a normal column (0)
+    /// - a dynamic or stored generated column (2 or 3)
+    /// - or a hidden column in a virtual table (1)
+    TableXinfo,
     /// enable capture-changes logic for the connection
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
