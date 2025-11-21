@@ -7,13 +7,17 @@
 //!
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
-use crate::function::AggFunc;
-use crate::schema::{Schema, Type};
-use crate::types::Value;
-use crate::{LimboError, Result};
-use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
+use crate::{
+    function::AggFunc,
+    schema::{Schema, Type},
+    types::Value,
+    LimboError, Result,
+};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Formatter},
+    sync::Arc,
+};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 

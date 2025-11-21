@@ -46,16 +46,18 @@ use transaction::TransactionBehavior;
 use turso_core::types::WalFrameInfo;
 pub use value::Value;
 
-pub use params::params_from_iter;
-pub use params::IntoParams;
+pub use params::{params_from_iter, IntoParams};
 
-use std::fmt::Debug;
-use std::future::Future;
-use std::num::NonZero;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::{
+    fmt::Debug,
+    future::Future,
+    num::NonZero,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, Mutex,
+    },
+    task::Poll,
+};
 pub use turso_core::EncryptionOpts;
 use turso_core::OpenFlags;
 

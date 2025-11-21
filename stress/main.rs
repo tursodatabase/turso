@@ -1,20 +1,22 @@
 mod opts;
 
 use anarchist_readable_name_generator_lib::readable_name_custom;
-use antithesis_sdk::random::{get_random, AntithesisRng};
-use antithesis_sdk::*;
+use antithesis_sdk::{
+    random::{get_random, AntithesisRng},
+    *,
+};
 use clap::Parser;
 use core::panic;
 use opts::Opts;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{Read, Write},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso::Builder;
 
 pub struct Plan {

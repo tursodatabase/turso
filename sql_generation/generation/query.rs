@@ -1,22 +1,27 @@
-use crate::generation::{
-    gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
-    ArbitrarySized, GenerationContext,
-};
-use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
-use crate::model::query::predicate::Predicate;
-use crate::model::query::select::{
-    CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
-    SelectInner, SelectTable,
-};
-use crate::model::query::update::Update;
-use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
-use crate::model::table::{
-    Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+use crate::{
+    generation::{
+        gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
+        ArbitrarySized, GenerationContext,
+    },
+    model::{
+        query::{
+            alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants},
+            predicate::Predicate,
+            select::{
+                CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn,
+                SelectBody, SelectInner, SelectTable,
+            },
+            update::Update,
+            Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
+        },
+        table::{
+            Column, Index, JoinTable, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
+        },
+    },
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
-use rand::seq::IndexedRandom;
-use rand::Rng;
+use rand::{seq::IndexedRandom, Rng};
 use turso_parser::ast::{Expr, SortOrder};
 
 use super::{backtrack, pick};

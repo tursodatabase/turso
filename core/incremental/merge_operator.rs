@@ -1,17 +1,21 @@
 // Merge operator for DBSP - combines two delta streams
 // Used in recursive CTEs and UNION operations
 
-use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
-use crate::incremental::operator::{
-    ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+use crate::{
+    incremental::{
+        dbsp::{Delta, DeltaPair, HashableRow},
+        operator::{ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator},
+    },
+    types::IOResult,
+    Result,
 };
-use crate::types::IOResult;
-use crate::Result;
 use parking_lot::Mutex;
-use std::collections::{hash_map::DefaultHasher, HashMap};
-use std::fmt::{self, Display};
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    fmt::{self, Display},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// How the merge operator should handle rowids when combining deltas
 #[derive(Debug, Clone)]

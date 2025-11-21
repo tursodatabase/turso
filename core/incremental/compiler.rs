@@ -5,26 +5,34 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
-use crate::incremental::aggregate_operator::AggregateOperator;
-use crate::incremental::dbsp::{Delta, DeltaPair};
-use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::operator::{
-    create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+use crate::{
+    incremental::{
+        aggregate_operator::AggregateOperator,
+        dbsp::{Delta, DeltaPair},
+        expr_compiler::CompiledExpression,
+        operator::{
+            create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
+            IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+        },
+    },
+    schema::Type,
+    storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
 };
-use crate::schema::Type;
-use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
-use crate::translate::logical::{
-    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
+use crate::{
+    return_and_restore_if_io, return_if_io,
+    translate::logical::{
+        BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
+        LogicalSchema, SchemaRef,
+    },
+    types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value},
+    LimboError, Pager, Result,
 };
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
-use crate::Pager;
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
-use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Formatter},
+    sync::{atomic::Ordering, Arc},
+};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
@@ -2252,16 +2260,19 @@ impl DbspCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incremental::dbsp::Delta;
-    use crate::incremental::operator::{FilterOperator, FilterPredicate};
-    use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
-    use crate::storage::pager::CreateBTreeFlags;
-    use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
-    use crate::util::IOExt;
-    use crate::{Database, MemoryIO, Pager, IO};
+    use crate::{
+        incremental::{
+            dbsp::Delta,
+            operator::{FilterOperator, FilterPredicate},
+        },
+        schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type},
+        storage::pager::CreateBTreeFlags,
+        translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema},
+        util::IOExt,
+        Database, MemoryIO, Pager, IO,
+    };
     use std::sync::Arc;
-    use turso_parser::ast;
-    use turso_parser::parser::Parser;
+    use turso_parser::{ast, parser::Parser};
 
     // Macro to create a test schema with a users table
     macro_rules! test_schema {

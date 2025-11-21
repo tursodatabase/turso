@@ -547,9 +547,11 @@ impl Default for PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::page_cache::CacheError;
-    use crate::storage::pager::{Page, PageRef};
-    use crate::storage::sqlite3_ondisk::PageContent;
+    use crate::storage::{
+        page_cache::CacheError,
+        pager::{Page, PageRef},
+        sqlite3_ondisk::PageContent,
+    };
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,

@@ -266,8 +266,10 @@ pub enum Value {
 }
 
 pub mod option_u64_as_str {
-    use serde::de::Error;
-    use serde::{de::Visitor, ser, Deserializer, Serialize as _};
+    use serde::{
+        de::{Error, Visitor},
+        ser, Deserializer, Serialize as _,
+    };
 
     pub fn serialize<S: ser::Serializer>(value: &Option<u64>, ser: S) -> Result<S::Ok, S::Error> {
         value.map(|v| v.to_string()).serialize(ser)
@@ -350,8 +352,7 @@ pub mod option_u64_as_str {
 }
 
 mod i64_as_str {
-    use serde::{de, ser};
-    use serde::{de::Error as _, Serialize as _};
+    use serde::{de, de::Error as _, ser, Serialize as _};
 
     pub fn serialize<S: ser::Serializer>(value: &i64, ser: S) -> Result<S::Ok, S::Error> {
         value.to_string().serialize(ser)
@@ -371,8 +372,7 @@ mod i64_as_str {
 pub(crate) mod bytes_as_base64 {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use bytes::Bytes;
-    use serde::{de, ser};
-    use serde::{de::Error as _, Serialize as _};
+    use serde::{de, de::Error as _, ser, Serialize as _};
 
     pub fn serialize<S: ser::Serializer>(value: &Bytes, ser: S) -> Result<S::Ok, S::Error> {
         STANDARD_NO_PAD.encode(value).serialize(ser)
@@ -389,8 +389,10 @@ pub(crate) mod bytes_as_base64 {
 }
 
 mod option_i64_as_str {
-    use serde::de::{Error, Visitor};
-    use serde::{ser, Deserializer, Serialize as _};
+    use serde::{
+        de::{Error, Visitor},
+        ser, Deserializer, Serialize as _,
+    };
 
     pub fn serialize<S: ser::Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
         value.map(|v| v.to_string()).serialize(ser)
@@ -449,8 +451,7 @@ mod option_i64_as_str {
 pub(crate) mod bytes_as_base64_pad {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use bytes::Bytes;
-    use serde::{de, ser};
-    use serde::{de::Error as _, Serialize as _};
+    use serde::{de, de::Error as _, ser, Serialize as _};
 
     pub fn serialize<S: ser::Serializer>(value: &Bytes, ser: S) -> Result<S::Ok, S::Error> {
         STANDARD.encode(value).serialize(ser)

@@ -1,21 +1,26 @@
-use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, RowVersion, TxTimestampOrID, WriteRowStateMachine,
-    SQLITE_SCHEMA_MVCC_TABLE_ID,
-};
-use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
-use crate::storage::btree::{BTreeCursor, CursorTrait};
-use crate::storage::pager::CreateBTreeFlags;
-use crate::storage::wal::{CheckpointMode, TursoRwLock};
-use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
 use crate::{
+    mvcc::{
+        clock::LogicalClock,
+        database::{
+            DeleteRowStateMachine, MVTableId, MvStore, RowVersion, TxTimestampOrID,
+            WriteRowStateMachine, SQLITE_SCHEMA_MVCC_TABLE_ID,
+        },
+    },
+    state_machine::{StateMachine, StateTransition, TransitionResult},
+    storage::{
+        btree::{BTreeCursor, CursorTrait},
+        pager::CreateBTreeFlags,
+        wal::{CheckpointMode, TursoRwLock},
+    },
+    types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor},
     CheckpointResult, Completion, Connection, IOExt, Pager, Result, TransactionState, Value,
     ValueRef,
 };
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{atomic::Ordering, Arc},
+};
 
 #[derive(Debug)]
 pub enum CheckpointState {

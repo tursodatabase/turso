@@ -3,8 +3,10 @@ use std::cell::RefCell;
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::{
-    translate::optimizer::access_method::AccessMethodParams,
-    translate::plan::{GroupBy, IterationDirection, JoinedTable},
+    translate::{
+        optimizer::access_method::AccessMethodParams,
+        plan::{GroupBy, IterationDirection, JoinedTable},
+    },
     util::exprs_are_equivalent,
 };
 

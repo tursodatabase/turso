@@ -40,42 +40,47 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
-use crate::index_method::IndexMethod;
-use crate::schema::Trigger;
-use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::AtomicCipherMode;
-use crate::storage::pager::{AutoVacuumMode, HeaderRef};
-use crate::translate::display::PlanContext;
-use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
-use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE};
-use crate::vdbe::metrics::ConnectionMetrics;
-use crate::vtab::VirtualTable;
-use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
+use crate::{
+    incremental::view::AllViewsTxState,
+    index_method::IndexMethod,
+    schema::Trigger,
+    storage::{
+        checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
+        encryption::AtomicCipherMode,
+        pager::{AutoVacuumMode, HeaderRef},
+    },
+    translate::{
+        display::PlanContext, emitter::TransactionMode, pragma::TURSO_CDC_DEFAULT_TABLE_NAME,
+    },
+    vdbe::{
+        explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
+        metrics::ConnectionMetrics,
+    },
+    vtab::VirtualTable,
+};
 use arc_swap::ArcSwap;
 use core::str;
 pub use error::{CompletionError, LimboError};
-pub use io::clock::{Clock, Instant};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
+    clock::{Clock, Instant},
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
-use std::collections::HashSet;
-use std::task::Waker;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
@@ -84,33 +89,38 @@ use std::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Weak,
     },
+    task::Waker,
     time::Duration,
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
-pub use storage::database::IOContext;
-pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
-use storage::page_cache::PageCache;
-use storage::pager::{AtomicDbState, DbState};
-use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
-    database::DatabaseStorage,
-    pager::PageRef,
-    pager::{Page, Pager},
+    database::{DatabaseStorage, IOContext},
+    encryption::{CipherMode, EncryptionContext, EncryptionKey},
+    pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
+};
+use storage::{
+    page_cache::PageCache,
+    pager::{AtomicDbState, DbState},
+    sqlite3_ondisk::PageSize,
 };
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
-use turso_parser::ast::fmt::ToTokens;
-use turso_parser::{ast, ast::Cmd, parser::Parser};
+use turso_parser::{
+    ast,
+    ast::{fmt::ToTokens, Cmd},
+    parser::Parser,
+};
 use types::IOResult;
-pub use types::Value;
-pub use types::ValueRef;
+pub use types::{Value, ValueRef};
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
-    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, Register,
+    builder::QueryMode,
+    explain::{EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS},
+    Register,
 };
 
 /// Configuration for database features

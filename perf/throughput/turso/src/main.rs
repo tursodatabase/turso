@@ -1,10 +1,12 @@
 use clap::{Parser, ValueEnum};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Barrier,
+    },
+    time::{Duration, Instant},
+};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use turso::{Builder, Database, Result};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

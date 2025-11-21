@@ -4,25 +4,29 @@ use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
 
-use crate::error::LimboError;
-use crate::ext::{ExtValue, ExtValueType};
-use crate::index_method::IndexMethodCursor;
-use crate::numeric::format_float;
-use crate::pseudo::PseudoCursor;
-use crate::schema::Index;
-use crate::storage::btree::CursorTrait;
-use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
-use crate::translate::collate::CollationSeq;
-use crate::translate::plan::IterationDirection;
-use crate::vdbe::sorter::Sorter;
-use crate::vdbe::Register;
-use crate::vtab::VirtualTableCursor;
-use crate::{Completion, CompletionError, Result, IO};
-use std::borrow::{Borrow, Cow};
-use std::fmt::{Debug, Display};
-use std::iter::Peekable;
-use std::ops::Deref;
-use std::task::Waker;
+use crate::{
+    error::LimboError,
+    ext::{ExtValue, ExtValueType},
+    index_method::IndexMethodCursor,
+    numeric::format_float,
+    pseudo::PseudoCursor,
+    schema::Index,
+    storage::{
+        btree::CursorTrait,
+        sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint},
+    },
+    translate::{collate::CollationSeq, plan::IterationDirection},
+    vdbe::{sorter::Sorter, Register},
+    vtab::VirtualTableCursor,
+    Completion, CompletionError, Result, IO,
+};
+use std::{
+    borrow::{Borrow, Cow},
+    fmt::{Debug, Display},
+    iter::Peekable,
+    ops::Deref,
+    task::Waker,
+};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN

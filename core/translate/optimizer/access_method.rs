@@ -3,12 +3,12 @@ use std::sync::Arc;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::SortOrder;
 
-use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, Constraint, RangeConstraintRef,
-};
 use crate::{
     schema::{Index, Table},
-    translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
+    translate::{
+        optimizer::constraints::{convert_to_vtab_constraint, Constraint, RangeConstraintRef},
+        plan::{IterationDirection, JoinOrderMember, JoinedTable},
+    },
     vtab::VirtualTable,
     LimboError, Result,
 };

@@ -1,38 +1,35 @@
-use std::collections::HashSet;
-use std::num::NonZeroUsize;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 use turso_parser::ast::{self, Upsert};
 
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{IndexColumn, ROWID_SENTINEL};
-use crate::translate::emitter::UpdateRowSource;
-use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
-use crate::translate::planner::ROWID_STRS;
-use crate::vdbe::insn::CmpInsFlags;
-use crate::Connection;
 use crate::{
     bail_parse_error,
-    error::SQLITE_CONSTRAINT_NOTNULL,
-    schema::{Index, Schema, Table},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
+    schema::{Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
+            UpdateRowSource,
         },
         expr::{
-            emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            NoConstantOptReason,
+            emit_returning_results, translate_expr, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
         },
-        insert::Insertion,
+        fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks},
+        insert::{format_unique_violation_desc, InsertEmitCtx, Insertion},
         plan::ResultSetColumn,
+        planner::ROWID_STRS,
     },
     util::normalize_ident,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{IdxInsertFlags, InsertFlags, Insn},
+        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
     },
+    Connection,
 };
 
 // The following comment is copied directly from SQLite source and should be used as a guiding light

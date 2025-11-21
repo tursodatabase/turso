@@ -2,22 +2,23 @@
 // Operator DAG for DBSP-style incremental computation
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
-pub use crate::incremental::aggregate_operator::{
-    AggregateEvalState, AggregateFunction, AggregateState,
+pub use crate::incremental::{
+    aggregate_operator::{AggregateEvalState, AggregateFunction, AggregateState},
+    filter_operator::{FilterOperator, FilterPredicate},
+    input_operator::InputOperator,
+    join_operator::{JoinEvalState, JoinOperator, JoinType},
+    project_operator::{ProjectColumn, ProjectOperator},
 };
-pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
-pub use crate::incremental::input_operator::InputOperator;
-pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinType};
-pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 
-use crate::incremental::dbsp::{Delta, DeltaPair};
-use crate::schema::{Index, IndexColumn};
-use crate::storage::btree::BTreeCursor;
-use crate::types::IOResult;
-use crate::Result;
+use crate::{
+    incremental::dbsp::{Delta, DeltaPair},
+    schema::{Index, IndexColumn},
+    storage::btree::BTreeCursor,
+    types::IOResult,
+    Result,
+};
 use parking_lot::Mutex;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -256,14 +257,16 @@ pub trait IncrementalOperator: Debug + Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
-    use crate::incremental::dbsp::HashableRow;
-    use crate::storage::btree::CursorTrait;
-    use crate::storage::pager::CreateBTreeFlags;
-    use crate::types::Text;
-    use crate::util::IOExt;
-    use crate::Value;
-    use crate::{Database, MemoryIO, IO};
+    use crate::{
+        incremental::{
+            aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR},
+            dbsp::HashableRow,
+        },
+        storage::{btree::CursorTrait, pager::CreateBTreeFlags},
+        types::Text,
+        util::IOExt,
+        Database, MemoryIO, Value, IO,
+    };
     use parking_lot::Mutex;
     use std::sync::Arc;
 

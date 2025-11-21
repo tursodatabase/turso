@@ -5,18 +5,22 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
-use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
     jsonb_replace,
 };
-use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
-use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
+use crate::{
+    bail_constraint_error, bail_parse_error,
+    json::{
+        error::Error as JsonError,
+        path::{json_path, JsonPath, PathElement},
+    },
+    types::{AsValueRef, Text, TextSubtype, Value, ValueType},
+    LimboError, ValueRef,
+};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
-use std::borrow::Cow;
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {

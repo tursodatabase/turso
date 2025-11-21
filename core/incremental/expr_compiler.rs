@@ -2,16 +2,18 @@
 // This module provides utilities to compile SQL expressions into VDBE subprograms
 // that can be executed efficiently in the incremental computation context.
 
-use crate::schema::Schema;
-use crate::storage::pager::Pager;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::translate_expr;
-use crate::types::Text;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::Insn;
-use crate::vdbe::{Program, ProgramState, Register};
-use crate::SymbolTable;
-use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
+use crate::{
+    schema::Schema,
+    storage::pager::Pager,
+    translate::{emitter::Resolver, expr::translate_expr},
+    types::Text,
+    vdbe::{
+        builder::{ProgramBuilder, ProgramBuilderOpts},
+        insn::Insn,
+        Program, ProgramState, Register,
+    },
+    CaptureDataChangesMode, Connection, QueryMode, Result, SymbolTable, Value,
+};
 use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal, Operator};
 

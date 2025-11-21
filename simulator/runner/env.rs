@@ -1,26 +1,29 @@
-use std::fmt::Display;
-use std::mem;
-use std::ops::{Deref, DerefMut};
-use std::panic::UnwindSafe;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    fmt::Display,
+    mem,
+    ops::{Deref, DerefMut},
+    panic::UnwindSafe,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bitmaps::Bitmap;
 use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sql_generation::generation::GenerationContext;
-use sql_generation::model::query::transaction::Rollback;
-use sql_generation::model::table::Table;
+use sql_generation::{
+    generation::GenerationContext,
+    model::{query::transaction::Rollback, table::Table},
+};
 use tracing::trace;
 use turso_core::Database;
 
-use crate::generation::Shadow;
-use crate::model::Query;
-use crate::profiles::Profile;
-use crate::runner::SimIO;
-use crate::runner::io::SimulatorIO;
-use crate::runner::memory::io::MemorySimIO;
+use crate::{
+    generation::Shadow,
+    model::Query,
+    profiles::Profile,
+    runner::{SimIO, io::SimulatorIO, memory::io::MemorySimIO},
+};
 
 use super::cli::SimulatorCLI;
 

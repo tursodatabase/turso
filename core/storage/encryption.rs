@@ -1,11 +1,9 @@
 #![allow(unused_variables, dead_code)]
 use crate::{LimboError, Result};
-use aegis::aegis128l::Aegis128L;
-use aegis::aegis128x2::Aegis128X2;
-use aegis::aegis128x4::Aegis128X4;
-use aegis::aegis256::Aegis256;
-use aegis::aegis256x2::Aegis256X2;
-use aegis::aegis256x4::Aegis256X4;
+use aegis::{
+    aegis128l::Aegis128L, aegis128x2::Aegis128X2, aegis128x4::Aegis128X4, aegis256::Aegis256,
+    aegis256x2::Aegis256X2, aegis256x4::Aegis256X4,
+};
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes128Gcm, Aes256Gcm, Key, Nonce,

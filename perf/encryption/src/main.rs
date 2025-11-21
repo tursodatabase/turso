@@ -1,9 +1,12 @@
 use clap::Parser;
-use rand::rngs::SmallRng;
-use rand::{Rng, RngCore, SeedableRng};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use rand::{rngs::SmallRng, Rng, RngCore, SeedableRng};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Barrier,
+    },
+    time::{Duration, Instant},
+};
 use turso::{Builder, Database, EncryptionOpts, Result};
 
 #[derive(Parser)]

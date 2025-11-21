@@ -2,12 +2,14 @@
 // Filter operator for DBSP-style incremental computation
 // This operator filters rows based on predicates
 
-use crate::incremental::dbsp::{Delta, DeltaPair};
-use crate::incremental::operator::{
-    ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+use crate::{
+    incremental::{
+        dbsp::{Delta, DeltaPair},
+        operator::{ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator},
+    },
+    types::IOResult,
+    Result, Value,
 };
-use crate::types::IOResult;
-use crate::{Result, Value};
 use parking_lot::Mutex;
 use std::sync::Arc;
 

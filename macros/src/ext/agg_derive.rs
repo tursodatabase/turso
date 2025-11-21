@@ -1,7 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse_macro_input;
-use syn::DeriveInput;
+use syn::{parse_macro_input, DeriveInput};
 
 pub fn derive_agg_func(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);

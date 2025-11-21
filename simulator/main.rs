@@ -2,29 +2,36 @@
 use anyhow::anyhow;
 use clap::Parser;
 use rand::prelude::*;
-use runner::bugbase::BugBase;
-use runner::cli::{SimulatorCLI, SimulatorCommand};
-use runner::differential;
-use runner::env::SimulatorEnv;
-use runner::execution::{Execution, ExecutionHistory, ExecutionResult, execute_interactions};
-use std::any::Any;
-use std::backtrace::Backtrace;
-use std::fs::OpenOptions;
-use std::io::{IsTerminal, Write};
-use std::path::Path;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::field::MakeExt;
-use tracing_subscriber::fmt::format;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-use crate::model::interactions::{
-    ConnectionState, InteractionPlan, InteractionPlanIterator, InteractionPlanState,
+use runner::{
+    bugbase::BugBase,
+    cli::{SimulatorCLI, SimulatorCommand},
+    differential,
+    env::SimulatorEnv,
+    execution::{Execution, ExecutionHistory, ExecutionResult, execute_interactions},
 };
-use crate::profiles::Profile;
-use crate::runner::doublecheck;
-use crate::runner::env::{Paths, SimulationPhase, SimulationType};
+use std::{
+    any::Any,
+    backtrace::Backtrace,
+    fs::OpenOptions,
+    io::{IsTerminal, Write},
+    path::Path,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
+use tracing_subscriber::{
+    EnvFilter, field::MakeExt, fmt::format, layer::SubscriberExt, util::SubscriberInitExt,
+};
+
+use crate::{
+    model::interactions::{
+        ConnectionState, InteractionPlan, InteractionPlanIterator, InteractionPlanState,
+    },
+    profiles::Profile,
+    runner::{
+        doublecheck,
+        env::{Paths, SimulationPhase, SimulationType},
+    },
+};
 
 mod common;
 mod generation;

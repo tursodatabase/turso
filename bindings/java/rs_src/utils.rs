@@ -1,6 +1,8 @@
 use crate::errors::TursoError;
-use jni::objects::{JByteArray, JObject};
-use jni::JNIEnv;
+use jni::{
+    objects::{JByteArray, JObject},
+    JNIEnv,
+};
 
 pub(crate) fn utf8_byte_arr_to_str(
     env: &JNIEnv,

@@ -2,8 +2,10 @@
 // For now, we'll use a basic approach and can expand to full DBSP later
 
 use crate::Value;
-use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
+};
 
 /// A 128-bit hash value implemented as a UUID
 /// We use UUID because it's a standard 128-bit type we already depend on

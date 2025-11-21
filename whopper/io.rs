@@ -1,9 +1,11 @@
 use memmap2::{MmapMut, MmapOptions};
 use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File as StdFile, OpenOptions};
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{File as StdFile, OpenOptions},
+    sync::{Arc, Mutex, Weak},
+};
 use tracing::debug;
 use turso_core::{Clock, Completion, File, IO, Instant, OpenFlags, Result};
 

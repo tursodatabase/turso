@@ -1,13 +1,15 @@
 // Project operator for DBSP-style incremental computation
 // This operator projects/transforms columns in a relational stream
 
-use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
-use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::operator::{
-    ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+use crate::{
+    incremental::{
+        dbsp::{Delta, DeltaPair, HashableRow},
+        expr_compiler::CompiledExpression,
+        operator::{ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator},
+    },
+    types::IOResult,
+    Connection, Database, Result, Value,
 };
-use crate::types::IOResult;
-use crate::{Connection, Database, Result, Value};
 use parking_lot::Mutex;
 use std::sync::{atomic::Ordering, Arc};
 

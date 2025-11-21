@@ -1,10 +1,12 @@
 use turso_core::types::FromValue;
 
 use crate::{Error, Result, Value};
-use std::fmt::Debug;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::{
+    fmt::Debug,
+    future::Future,
+    sync::{Arc, Mutex},
+    task::Poll,
+};
 
 /// Results of a prepared statement query.
 pub struct Rows {

@@ -1,56 +1,63 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, Literal, TriggerEvent, TriggerTime};
 
-use super::aggregation::emit_ungrouped_aggregation;
-use super::expr::translate_expr;
-use super::group_by::{
-    group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
+use super::{
+    aggregation::emit_ungrouped_aggregation,
+    expr::translate_expr,
+    group_by::{
+        group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata,
+        GroupByRowSource,
+    },
+    main_loop::{
+        close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+    },
+    order_by::{emit_order_by, init_order_by, SortMetadata},
+    plan::{
+        Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
+    },
+    select::emit_simple_count,
+    subquery::emit_from_clause_subqueries,
 };
-use super::main_loop::{
-    close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+use crate::{
+    bail_parse_error,
+    error::SQLITE_CONSTRAINT_PRIMARYKEY,
+    function::Func,
+    schema::{BTreeTable, Column, Index, Schema, Table, ROWID_SENTINEL},
+    translate::{
+        compound_select::emit_program_for_compound_select,
+        expr::{
+            emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
+            NoConstantOptReason, WalkControl,
+        },
+        fkeys::{
+            build_index_affinity_string, emit_fk_child_update_counters,
+            emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
+            emit_parent_key_change_checks, open_read_index, open_read_table,
+            stabilize_new_row_for_fk,
+        },
+        plan::{DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search},
+        planner::ROWID_STRS,
+        subquery::emit_non_from_clause_subquery,
+        trigger_exec::{
+            fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
+            TriggerContext,
+        },
+        values::emit_values,
+        window::{emit_window_results, init_window, WindowMetadata},
+    },
+    util::{exprs_are_equivalent, normalize_ident},
+    vdbe::{
+        builder::{CursorKey, CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        BranchOffset,
+    },
+    Connection, Result, SymbolTable,
 };
-use super::order_by::{emit_order_by, init_order_by, SortMetadata};
-use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
-};
-use super::select::emit_simple_count;
-use super::subquery::emit_from_clause_subqueries;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Index, Schema, Table, ROWID_SENTINEL};
-use crate::translate::compound_select::emit_program_for_compound_select;
-use crate::translate::expr::{
-    emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
-    WalkControl,
-};
-use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_child_update_counters,
-    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
-    emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
-};
-use crate::translate::plan::{
-    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
-};
-use crate::translate::planner::ROWID_STRS;
-use crate::translate::subquery::emit_non_from_clause_subquery;
-use crate::translate::trigger_exec::{
-    fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
-    TriggerContext,
-};
-use crate::translate::values::emit_values;
-use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident};
-use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::{insn::Insn, BranchOffset};
-use crate::Connection;
-use crate::{bail_parse_error, Result, SymbolTable};
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,

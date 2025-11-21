@@ -1,53 +1,50 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo,
 };
 
-use crate::error::{
-    SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
-};
-use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
-use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
-    OperationMode,
-};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    BindingBehavior, WalkControl,
-};
-use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_delete_parent_existence_checks, emit_fk_violation,
-    emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
-};
-use crate::translate::plan::{
-    ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences,
-};
-use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time};
-use crate::translate::upsert::{
-    collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
-};
-use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{Column, Schema},
-    vdbe::{
-        builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    schema::{self, BTreeTable, ColDef, Column, Index, ResolvedFkRef, Schema, Table},
+    translate::{
+        emitter::{
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
+            OperationMode,
+        },
+        expr::{
+            bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
+            BindingBehavior, WalkControl,
+        },
+        fkeys::{
+            build_index_affinity_string, emit_fk_delete_parent_existence_checks, emit_fk_violation,
+            emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
+        },
+        plan::{ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences},
+        planner::ROWID_STRS,
+        trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time},
+        upsert::{
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            ResolvedUpsertTarget,
+        },
     },
+    util::normalize_ident,
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, CursorType, ProgramBuilder, ProgramBuilderOpts},
+        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        BranchOffset,
+    },
+    Connection, Result, VirtualTable,
 };
-use crate::{Connection, Result, VirtualTable};
 
-use super::emitter::Resolver;
-use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
-use super::plan::QueryDestination;
-use super::select::translate_select;
-use super::trigger_exec::{has_relevant_triggers_type_only, TriggerContext};
+use super::{
+    emitter::Resolver,
+    expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason},
+    plan::QueryDestination,
+    select::translate_select,
+    trigger_exec::{has_relevant_triggers_type_only, TriggerContext},
+};
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {

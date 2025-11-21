@@ -1,29 +1,25 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use crate::bail_parse_error;
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::index_method::IndexMethodConfiguration;
-use crate::numeric::Numeric;
-use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
-use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
-};
-use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
-use crate::translate::insert::format_unique_violation_desc;
-use crate::translate::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
-};
-use crate::vdbe::builder::CursorKey;
-use crate::vdbe::insn::{CmpInsFlags, Cookie};
-use crate::vdbe::BranchOffset;
 use crate::{
-    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
+    bail_parse_error,
+    error::SQLITE_CONSTRAINT_UNIQUE,
+    index_method::IndexMethodConfiguration,
+    numeric::Numeric,
+    schema::{BTreeTable, Index, IndexColumn, PseudoCursorType, Table, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
+    translate::{
+        emitter::{
+            emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+        },
+        expr::{translate_condition_expr, ConditionMetadata},
+        insert::format_unique_violation_desc,
+        plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    },
     util::normalize_ident,
     vdbe::{
-        builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
+        builder::{CursorKey, CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, Cookie, IdxInsertFlags, Insn, RegisterOrLiteral},
+        BranchOffset,
     },
 };
 use turso_parser::ast::{self, Expr, SortOrder, SortedColumn};

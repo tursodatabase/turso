@@ -1,11 +1,17 @@
-use crate::translate::emitter::TranslateCtx;
-use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
-use crate::translate::plan::{QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_offset;
-use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{IdxInsertFlags, Insn};
-use crate::vdbe::BranchOffset;
-use crate::Result;
+use crate::{
+    translate::{
+        emitter::TranslateCtx,
+        expr::{translate_expr_no_constant_opt, NoConstantOptReason},
+        plan::{QueryDestination, SelectPlan},
+        result_row::emit_offset,
+    },
+    vdbe::{
+        builder::ProgramBuilder,
+        insn::{IdxInsertFlags, Insn},
+        BranchOffset,
+    },
+    Result,
+};
 
 pub fn emit_values(
     program: &mut ProgramBuilder,

@@ -1,7 +1,5 @@
 use super::*;
-use crate::io::PlatformIO;
-use crate::mvcc::clock::LocalClock;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::{io::PlatformIO, mvcc::clock::LocalClock, storage::sqlite3_ondisk::DatabaseHeader};
 use parking_lot::RwLock;
 
 pub(crate) struct MvccTestDbNoConn {
@@ -712,13 +710,14 @@ fn test_future_row() {
     assert_eq!(row, None);
 }
 
-use crate::mvcc::cursor::MvccLazyCursor;
-use crate::mvcc::database::{MvStore, Row, RowID};
-use crate::types::Text;
-use crate::Value;
-use crate::{Database, StepResult};
-use crate::{MemoryIO, Statement};
-use crate::{ValueRef, DATABASE_MANAGER};
+use crate::{
+    mvcc::{
+        cursor::MvccLazyCursor,
+        database::{MvStore, Row, RowID},
+    },
+    types::Text,
+    Database, MemoryIO, Statement, StepResult, Value, ValueRef, DATABASE_MANAGER,
+};
 
 // Simple atomic clock implementation for testing
 

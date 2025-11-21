@@ -1,12 +1,16 @@
-use crate::errors::{
-    Result, TursoError, TURSO_ETC, TURSO_FAILED_TO_PARSE_BYTE_ARRAY,
-    TURSO_FAILED_TO_PREPARE_STATEMENT,
+use crate::{
+    errors::{
+        Result, TursoError, TURSO_ETC, TURSO_FAILED_TO_PARSE_BYTE_ARRAY,
+        TURSO_FAILED_TO_PREPARE_STATEMENT,
+    },
+    turso_statement::TursoStatement,
+    utils::{set_err_msg_and_throw_exception, utf8_byte_arr_to_str},
 };
-use crate::turso_statement::TursoStatement;
-use crate::utils::{set_err_msg_and_throw_exception, utf8_byte_arr_to_str};
-use jni::objects::{JByteArray, JObject};
-use jni::sys::jlong;
-use jni::JNIEnv;
+use jni::{
+    objects::{JByteArray, JObject},
+    sys::jlong,
+    JNIEnv,
+};
 use std::sync::Arc;
 use turso_core::Connection;
 

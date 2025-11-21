@@ -1,9 +1,8 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::parse::ParseStream;
-use syn::punctuated::Punctuated;
-use syn::token::Eq;
-use syn::{parse_macro_input, Ident, LitStr, Token};
+use syn::{
+    parse::ParseStream, parse_macro_input, punctuated::Punctuated, token::Eq, Ident, LitStr, Token,
+};
 mod agg_derive;
 mod match_ignore_ascii_case;
 mod scalars;

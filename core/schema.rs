@@ -1,10 +1,14 @@
-use crate::function::Func;
-use crate::incremental::view::IncrementalView;
-use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
-use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
-use crate::translate::planner::ROWID_STRS;
-use crate::vdbe::affinity::Affinity;
+use crate::{
+    function::Func,
+    incremental::view::IncrementalView,
+    index_method::{IndexMethodAttachment, IndexMethodConfiguration},
+    translate::{
+        expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl},
+        index::{resolve_index_method_parameters, resolve_sorted_columns},
+        planner::ROWID_STRS,
+    },
+    vdbe::affinity::Affinity,
+};
 use parking_lot::RwLock;
 use turso_macros::AtomicEnum;
 
@@ -115,28 +119,32 @@ impl Trigger {
     }
 }
 
-use crate::storage::btree::{BTreeCursor, CursorTrait};
-use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{SelectPlan, TableReferences};
-use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
-};
 use crate::{
     bail_parse_error, contains_ignore_ascii_case, eq_ignore_ascii_case, match_ignore_ascii_case,
-    Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
+    storage::btree::{BTreeCursor, CursorTrait},
+    translate::{
+        collate::CollationSeq,
+        plan::{SelectPlan, TableReferences},
+    },
+    util::{
+        module_args_from_sql, module_name_from_sql, normalize_ident, type_from_name, IOExt,
+        UnparsedFromSqlIndex,
+    },
+    Connection, LimboError, MvCursor, MvStore, Pager, Result, SymbolTable, ValueRef, VirtualTable,
 };
-use crate::{util::normalize_ident, Result};
 use core::fmt;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::Deref;
-use std::sync::Arc;
-use tracing::trace;
-use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    ops::Deref,
+    sync::Arc,
 };
+use tracing::trace;
 use turso_parser::{
-    ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
+    ast::{
+        self, Cmd, ColumnDefinition, CreateTableBody, Expr, InitDeferredPred, Literal, RefAct,
+        ResultColumn, SortOrder, Stmt, TableOptions,
+    },
     parser::Parser,
 };
 
@@ -917,8 +925,10 @@ impl Schema {
             }
             "view" => {
                 use crate::schema::View;
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
+                use turso_parser::{
+                    ast::{Cmd, Stmt},
+                    parser::Parser,
+                };
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
@@ -969,8 +979,10 @@ impl Schema {
                 }
             }
             "trigger" => {
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
+                use turso_parser::{
+                    ast::{Cmd, Stmt},
+                    parser::Parser,
+                };
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let trigger_name = name.to_string();

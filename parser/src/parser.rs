@@ -1,19 +1,22 @@
-use crate::ast::{
-    check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateVirtualTable,
-    DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound, FrameClause, FrameExclude,
-    FrameMode, FromClause, FunctionTail, GroupBy, Indexed, IndexedColumn, InitDeferredPred,
-    InsertBody, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit,
-    Literal, Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder,
-    OneSelect, Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Window, WindowDef, With,
+use crate::{
+    ast::{
+        check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint,
+        ColumnDefinition, CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody,
+        CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
+        FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GroupBy, Indexed,
+        IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
+        JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
+        NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
+        QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable,
+        Set, SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType,
+        TriggerCmd, TriggerEvent, TriggerTime, Type, TypeSize, UnaryOperator, Update, Upsert,
+        UpsertDo, UpsertIndex, Window, WindowDef, With,
+    },
+    error::Error,
+    lexer::{Lexer, Token},
+    token::TokenType::{self, *},
+    Result,
 };
-use crate::error::Error;
-use crate::lexer::{Lexer, Token};
-use crate::token::TokenType::{self, *};
-use crate::Result;
 use turso_macros::match_ignore_ascii_case;
 
 macro_rules! peek_expect {

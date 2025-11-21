@@ -20,9 +20,11 @@
 //!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`
 //! - `columns` — number of columns
 //! - `schema` — optional custom SQL `CREATE TABLE` schema
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    sync::Arc,
+};
 use turso_ext::{
     register_extension, Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive,
     VTable, Value,

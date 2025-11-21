@@ -1,16 +1,12 @@
 mod palette;
 mod terminal;
 
-use crate::input::OutputMode;
-use crate::HOME_DIR;
+use crate::{input::OutputMode, HOME_DIR};
 use nu_ansi_term::Color;
 use palette::LimboColor;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer};
-use std::fmt::Debug;
-use std::fs::read_to_string;
-use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::{fmt::Debug, fs::read_to_string, path::PathBuf, sync::LazyLock};
 use terminal::{TerminalDetector, TerminalTheme};
 use validator::Validate;
 

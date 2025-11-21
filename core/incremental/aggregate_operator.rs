@@ -1,19 +1,26 @@
 // Aggregate operator for DBSP-style incremental computation
 
-use crate::function::{AggFunc, Func};
-use crate::incremental::dbsp::Hash128;
-use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
-use crate::incremental::operator::{
-    generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+use crate::{
+    function::{AggFunc, Func},
+    incremental::{
+        dbsp::{Delta, DeltaPair, Hash128, HashableRow},
+        operator::{
+            generate_storage_id, ComputationTracker, DbspStateCursors, EvalState,
+            IncrementalOperator,
+        },
+        persistence::{ReadRecord, WriteRow},
+    },
+    return_and_restore_if_io, return_if_io,
+    storage::btree::CursorTrait,
+    types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef},
+    LimboError, Result, Value,
 };
-use crate::incremental::persistence::{ReadRecord, WriteRow};
-use crate::storage::btree::CursorTrait;
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::{self, Display};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::{self, Display},
+    sync::Arc,
+};
 
 // Architecture of the Aggregate Operator
 // ========================================

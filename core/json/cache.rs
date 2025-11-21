@@ -1,7 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 
-use crate::types::AsValueRef;
-use crate::{Value, ValueRef};
+use crate::{types::AsValueRef, Value, ValueRef};
 
 use super::jsonb::Jsonb;
 

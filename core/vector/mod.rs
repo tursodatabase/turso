@@ -1,9 +1,7 @@
-use crate::types::AsValueRef;
-use crate::types::Value;
-use crate::types::ValueType;
-use crate::LimboError;
-use crate::Result;
-use crate::ValueRef;
+use crate::{
+    types::{AsValueRef, Value, ValueType},
+    LimboError, Result, ValueRef,
+};
 
 pub mod operations;
 pub mod vector_types;

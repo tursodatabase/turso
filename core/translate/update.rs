@@ -1,26 +1,29 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use crate::schema::ROWID_SENTINEL;
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
-use crate::translate::plan::{Operation, Scan};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
     bail_parse_error,
-    schema::{Schema, Table},
+    schema::{Schema, Table, ROWID_SENTINEL},
+    translate::{
+        emitter::Resolver,
+        expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl},
+        plan::{Operation, Scan},
+        planner::{parse_limit, ROWID_STRS},
+    },
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
-use super::emitter::emit_program;
-use super::expr::process_returning_clause;
-use super::optimizer::optimize_plan;
-use super::plan::{
-    ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
+use super::{
+    emitter::emit_program,
+    expr::process_returning_clause,
+    optimizer::optimize_plan,
+    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan},
+    planner::parse_where,
 };
-use super::planner::parse_where;
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.

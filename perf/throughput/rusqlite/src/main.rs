@@ -1,8 +1,10 @@
 use clap::Parser;
 use rusqlite::{Connection, Result};
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::Instant;
+use std::{
+    sync::{Arc, Barrier},
+    thread,
+    time::Instant,
+};
 
 #[derive(Parser)]
 #[command(name = "write-throughput")]

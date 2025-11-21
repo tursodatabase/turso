@@ -1,12 +1,12 @@
 //! Build.rs script to generate a binary syntax set for syntect
 //! based on the SQL.sublime-syntax file.
 
-use std::env;
-use std::path::Path;
+use std::{env, path::Path};
 
-use syntect::dumps::dump_to_uncompressed_file;
-use syntect::parsing::SyntaxDefinition;
-use syntect::parsing::SyntaxSet;
+use syntect::{
+    dumps::dump_to_uncompressed_file,
+    parsing::{SyntaxDefinition, SyntaxSet},
+};
 
 fn main() {
     println!("cargo::rerun-if-changed=SQL.sublime-syntax");

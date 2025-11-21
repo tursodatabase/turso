@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use indexmap::IndexSet;
 use rand::Rng;
 
-use crate::generation::{pick, readable_name_custom, Arbitrary, GenerationContext};
-use crate::model::table::{Column, ColumnType, Name, Table};
+use crate::{
+    generation::{pick, readable_name_custom, Arbitrary, GenerationContext},
+    model::table::{Column, ColumnType, Name, Table},
+};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 

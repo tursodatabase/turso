@@ -21,28 +21,22 @@ use super::{
 use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
-        emitter::prepare_cdc_if_necessary,
-        plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
+        collate::get_collseq_from_expr,
+        emitter::{prepare_cdc_if_necessary, UpdateRowSource},
+        plan::{DistinctCtx, Distinctness, EvalAt, NonFromClauseSubquery, Scan, SeekKeyComponent},
         result_row::emit_select_result,
+        subquery::emit_non_from_clause_subquery,
+        window::emit_window_loop_source,
     },
     types::SeekOp,
     vdbe::{
         affinity,
+        affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
-};
-use crate::{
-    translate::{
-        collate::get_collseq_from_expr,
-        emitter::UpdateRowSource,
-        plan::{EvalAt, NonFromClauseSubquery},
-        subquery::emit_non_from_clause_subquery,
-        window::emit_window_loop_source,
-    },
-    vdbe::affinity::Affinity,
 };
 
 // Metadata for handling LEFT JOIN operations

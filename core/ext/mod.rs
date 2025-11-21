@@ -1,16 +1,19 @@
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
-use crate::index_method::backing_btree::BackingBtreeIndexMethod;
-use crate::index_method::toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod;
-use crate::index_method::{
-    BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
-};
-use crate::schema::{Schema, Table};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
-use crate::{function::ExternalFunc, Connection, Database};
-use crate::{vtab::VirtualTable, SymbolTable};
+use crate::{
+    function::ExternalFunc,
+    index_method::{
+        backing_btree::BackingBtreeIndexMethod,
+        toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod, BACKING_BTREE_INDEX_METHOD_NAME,
+        TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
+    },
+    schema::{Schema, Table},
+    vtab::VirtualTable,
+    Connection, Database, SymbolTable,
+};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
 #[cfg(feature = "fs")]

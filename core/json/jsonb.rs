@@ -1,6 +1,11 @@
-use crate::json::error::{Error as PError, Result as PResult};
-use crate::json::Conv;
-use crate::{bail_parse_error, LimboError, Result};
+use crate::{
+    bail_parse_error,
+    json::{
+        error::{Error as PError, Result as PResult},
+        Conv,
+    },
+    LimboError, Result,
+};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},

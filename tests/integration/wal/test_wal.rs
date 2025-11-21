@@ -1,8 +1,10 @@
 use crate::common::{do_flush, maybe_setup_tracing, TempDatabase};
-use std::cell::RefCell;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    ops::Deref,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 use turso_core::{Connection, LimboError, Result, StepResult};
 
 #[allow(clippy::arc_with_non_send_sync)]

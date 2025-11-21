@@ -1,12 +1,14 @@
 // Input operator for DBSP-style incremental computation
 // This operator serves as the entry point for data into the incremental computation pipeline
 
-use crate::incremental::dbsp::{Delta, DeltaPair};
-use crate::incremental::operator::{
-    ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+use crate::{
+    incremental::{
+        dbsp::{Delta, DeltaPair},
+        operator::{ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator},
+    },
+    types::IOResult,
+    Result,
 };
-use crate::types::IOResult;
-use crate::Result;
 use parking_lot::Mutex;
 use std::sync::Arc;
 

@@ -41,13 +41,14 @@ pub use database::MvStore;
 
 #[cfg(test)]
 mod tests {
-    use crate::mvcc::database::tests::{
-        commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
+    use crate::mvcc::database::{
+        tests::{commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn},
+        RowID,
     };
-    use crate::mvcc::database::RowID;
-    use std::sync::atomic::AtomicI64;
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    };
 
     static IDS: AtomicI64 = AtomicI64::new(1);
 

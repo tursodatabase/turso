@@ -1,17 +1,23 @@
 use parking_lot::RwLock;
 
-use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::database::{MVTableId, MvStore, Row, RowID, RowVersionState};
-use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
-use crate::translate::plan::IterationDirection;
-use crate::types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult};
-use crate::{return_if_io, Result};
-use crate::{Pager, Value};
-use std::any::Any;
-use std::cell::{Ref, RefCell};
-use std::fmt::Debug;
-use std::ops::Bound;
-use std::sync::Arc;
+use crate::{
+    mvcc::{
+        clock::LogicalClock,
+        database::{MVTableId, MvStore, Row, RowID, RowVersionState},
+    },
+    return_if_io,
+    storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
+    translate::plan::IterationDirection,
+    types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult},
+    Pager, Result, Value,
+};
+use std::{
+    any::Any,
+    cell::{Ref, RefCell},
+    fmt::Debug,
+    ops::Bound,
+    sync::Arc,
+};
 
 #[derive(Debug, Copy, Clone)]
 enum CursorPosition {

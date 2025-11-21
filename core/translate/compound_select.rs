@@ -1,12 +1,19 @@
-use crate::schema::{Index, IndexColumn, Schema};
-use crate::translate::collate::get_collseq_from_expr;
-use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
-use crate::translate::expr::translate_expr;
-use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
-use crate::vdbe::BranchOffset;
-use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
+use crate::{
+    emit_explain,
+    schema::{Index, IndexColumn, Schema},
+    translate::{
+        collate::get_collseq_from_expr,
+        emitter::{emit_query, LimitCtx, Resolver, TranslateCtx},
+        expr::translate_expr,
+        plan::{Plan, QueryDestination, SelectPlan},
+    },
+    vdbe::{
+        builder::{CursorType, ProgramBuilder},
+        insn::Insn,
+        BranchOffset,
+    },
+    LimboError, QueryMode, SymbolTable,
+};
 use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
