@@ -59,9 +59,15 @@ impl InteractionPlan {
         }
 
         let num_interactions = env.opts.max_interactions as usize;
-        // If last interaction needs to check all db tables, generate the Property to do so
+        // If last interaction needs to check all db tables, generate the Property to do so.
+        // But only generate the interaction if we actually have any tables to check
+        // This can happen if we created a table, and then deleted the table, and there are no more tables to check
         if let Some(i) = self.last_interactions()
             && i.check_tables()
+            && !env
+                .connection_context(i.connection_index)
+                .tables()
+                .is_empty()
         {
             let check_all_tables = Interactions::new(
                 i.connection_index,
