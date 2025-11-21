@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 use crate::{
     io::ReadComplete,
-    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowVersion},
+    mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
     turso_assert,
     types::ImmutableRecord,
@@ -119,12 +119,15 @@ impl LogRecordType {
         buffer.extend_from_slice(&table_id_i64.to_be_bytes());
         buffer.extend_from_slice(&self.as_u8().to_be_bytes());
         let size_before_payload = buffer.len();
+        let RowKey::Int(rowid) = row_version.row.id.row_id else {
+            panic!("Index rows should not be written to logical log");
+        };
         match self {
             LogRecordType::DeleteRow => {
-                write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
+                write_varint_to_vec(rowid as u64, buffer);
             }
             LogRecordType::InsertRow => {
-                write_varint_to_vec(row_version.row.id.row_id as u64, buffer);
+                write_varint_to_vec(rowid as u64, buffer);
 
                 let data = &row_version.row.data;
                 // Maybe this isn't needed? We already might infer data size with payload size
@@ -359,7 +362,7 @@ impl StreamingLogicalLogReader {
                                 transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
                             };
                             return Ok(StreamingResult::DeleteRow {
-                                rowid: RowID::new(table_id, rowid as i64),
+                                rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
                             });
                         }
                         LogRecordType::InsertRow => {
@@ -374,10 +377,13 @@ impl StreamingLogicalLogReader {
                                 transaction_size,
                                 transaction_read_bytes: transaction_read_bytes + bytes_read_on_row,
                             };
-                            let row =
-                                Row::new(RowID::new(table_id, rowid as i64), buffer, column_count);
+                            let row = Row::new(
+                                RowID::new(table_id, RowKey::Int(rowid as i64)),
+                                buffer,
+                                column_count,
+                            );
                             return Ok(StreamingResult::InsertRow {
-                                rowid: RowID::new(table_id, rowid as i64),
+                                rowid: RowID::new(table_id, RowKey::Int(rowid as i64)),
                                 row,
                             });
                         }
@@ -483,7 +489,7 @@ impl StreamingLogicalLogReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::BTreeSet, sync::Arc};
 
     use rand::{rng, Rng};
     use rand_chacha::{
@@ -495,7 +501,7 @@ mod tests {
         mvcc::{
             database::{
                 tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
-                Row, RowID,
+                Row, RowID, RowKey,
             },
             persistent_storage::Storage,
             LocalClock, MvStore,
@@ -535,7 +541,7 @@ mod tests {
                     Row {
                         id: RowID {
                             table_id: (-1).into(),
-                            row_id: 1,
+                            row_id: RowKey::Int(1),
                         },
                         data: data.as_blob().to_vec(),
                         column_count: 5,
@@ -559,7 +565,7 @@ mod tests {
         mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         let row = mvcc_store
-            .read(tx, RowID::new((-2).into(), 1))
+            .read(tx, RowID::new((-2).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
         let record = ImmutableRecord::from_bin_record(row.data.clone());
@@ -574,7 +580,12 @@ mod tests {
     #[test]
     fn test_logical_log_read_multiple_transactions() {
         let values = (0..100)
-            .map(|i| (RowID::new((-2).into(), i), format!("foo_{i}")))
+            .map(|i| {
+                (
+                    RowID::new((-2).into(), RowKey::Int(i as i64)),
+                    format!("foo_{i}"),
+                )
+            })
             .collect::<Vec<(RowID, String)>>();
         // let's not drop db as we don't want files to be removed
         let db = MvccTestDbNoConn::new_with_random_db();
@@ -603,7 +614,7 @@ mod tests {
                     Row {
                         id: RowID {
                             table_id: (-1).into(),
-                            row_id: 1,
+                            row_id: RowKey::Int(1),
                         },
                         data: data.as_blob().to_vec(),
                         column_count: 5,
@@ -615,7 +626,11 @@ mod tests {
             // generate insert per transaction
             for (rowid, value) in &values {
                 let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
-                let row = generate_simple_string_row(rowid.table_id, rowid.row_id, value);
+                let row = generate_simple_string_row(
+                    rowid.table_id,
+                    rowid.row_id.to_int_or_panic(),
+                    value,
+                );
                 mvcc_store.insert(tx_id, row).unwrap();
                 commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
             }
@@ -633,7 +648,7 @@ mod tests {
         mvcc_store.maybe_recover_logical_log(pager.clone()).unwrap();
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
-            let row = mvcc_store.read(tx, *rowid).unwrap().unwrap();
+            let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
@@ -650,8 +665,8 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
-        let mut present_rowids = HashSet::new();
-        let mut non_present_rowids = HashSet::new();
+        let mut present_rowids = BTreeSet::new();
+        let mut non_present_rowids = BTreeSet::new();
         for _ in 0..num_transactions {
             let num_operations = rng.next_u64() % 8;
             let mut ops = vec![];
@@ -660,14 +675,14 @@ mod tests {
                 match op_type {
                     0 => {
                         let row_id = rng.next_u64();
-                        let rowid = RowID::new((-2).into(), row_id as i64);
+                        let rowid = RowID::new((-2).into(), RowKey::Int(row_id as i64));
                         let row = generate_simple_string_row(
                             rowid.table_id,
-                            rowid.row_id,
+                            rowid.row_id.to_int_or_panic(),
                             &format!("row_{row_id}"),
                         );
-                        ops.push((LogRecordType::InsertRow, Some(row), rowid));
-                        present_rowids.insert(rowid);
+                        ops.push((LogRecordType::InsertRow, Some(row), rowid.clone()));
+                        present_rowids.insert(rowid.clone());
                         non_present_rowids.remove(&rowid);
                         tracing::debug!("insert {rowid:?}");
                     }
@@ -676,10 +691,10 @@ mod tests {
                             continue;
                         }
                         let row_id_pos = rng.next_u64() as usize % present_rowids.len();
-                        let row_id = *present_rowids.iter().nth(row_id_pos).unwrap();
-                        ops.push((LogRecordType::DeleteRow, None, row_id));
+                        let row_id = present_rowids.iter().nth(row_id_pos).unwrap().clone();
+                        ops.push((LogRecordType::DeleteRow, None, row_id.clone()));
                         present_rowids.remove(&row_id);
-                        non_present_rowids.insert(row_id);
+                        non_present_rowids.insert(row_id.clone());
                         tracing::debug!("removed {row_id:?}");
                     }
                     _ => unreachable!(),
@@ -714,7 +729,7 @@ mod tests {
                     Row {
                         id: RowID {
                             table_id: (-1).into(),
-                            row_id: 1,
+                            row_id: RowKey::Int(1),
                         },
                         data: data.as_blob().to_vec(),
                         column_count: 5,
@@ -729,7 +744,7 @@ mod tests {
                 for (op_type, maybe_row, rowid) in ops {
                     match op_type {
                         LogRecordType::DeleteRow => {
-                            mvcc_store.delete(tx_id, *rowid).unwrap();
+                            mvcc_store.delete(tx_id, rowid.clone()).unwrap();
                         }
                         LogRecordType::InsertRow => {
                             mvcc_store
@@ -754,7 +769,7 @@ mod tests {
         // Check rowids that weren't deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
-            let row = mvcc_store.read(tx, present_rowid).unwrap().unwrap();
+            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.data.clone());
             let values = record.get_values();
             let foo = values.first().unwrap();
@@ -762,13 +777,16 @@ mod tests {
                 unreachable!()
             };
 
-            assert_eq!(foo.as_str(), format!("row_{}", present_rowid.row_id as u64));
+            assert_eq!(
+                foo.as_str(),
+                format!("row_{}", present_rowid.row_id.to_int_or_panic())
+            );
         }
 
         // Check rowids that were deleted
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in non_present_rowids {
-            let row = mvcc_store.read(tx, present_rowid).unwrap();
+            let row = mvcc_store.read(tx, present_rowid.clone()).unwrap();
             assert!(
                 row.is_none(),
                 "row {present_rowid:?} should have been removed"

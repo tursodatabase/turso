@@ -234,7 +234,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Sort by table_id descending (schema changes first)
                 std::cmp::Reverse(version.0.row.id.table_id),
                 // Then by row_id ascending
-                version.0.row.id.row_id,
+                version.0.row.id.row_id.clone(),
             )
         });
         self.checkpointed_txid_max_new = max_timestamp;
@@ -478,7 +478,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     // This is a delete operation
                     let state_machine = self
                         .mvstore
-                        .delete_row_from_pager(row_version.row.id, cursor)?;
+                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
                 } else {

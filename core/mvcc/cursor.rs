@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::database::{MVTableId, MvStore, Row, RowID, RowVersionState};
+use crate::mvcc::database::{MVTableId, MvStore, Row, RowID, RowKey, RowVersionState};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
 use crate::types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult};
@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::ops::Bound;
 use std::sync::Arc;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 enum CursorPosition {
     /// We haven't loaded any row yet.
     BeforeFirst,
@@ -30,20 +30,20 @@ enum CursorPosition {
     End,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum NextState {
     NextBtree {
         new_position_in_mvcc: CursorPosition,
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum PrevState {
     PrevBtree {
         new_position_in_mvcc: CursorPosition,
     },
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Next(NextState),
     Prev(PrevState),
@@ -132,7 +132,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
-        let row_id = match *self.current_pos.borrow() {
+        let row_id = match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
                 in_btree,
@@ -152,12 +152,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
         let _ = self.last();
-        match *self.current_pos.borrow() {
+        match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
                 btree_consumed: _,
-            } => row_id.row_id + 1,
+            } => row_id.row_id.to_int_or_panic() + 1,
             CursorPosition::BeforeFirst => 1,
             CursorPosition::End => 1,
         }
@@ -173,7 +173,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn get_current_pos(&self) -> CursorPosition {
-        *self.current_pos.borrow()
+        self.current_pos.borrow().clone()
     }
 
     /// Returns the new position of the cursor based on the new position in MVCC and the current rowid in BTree.
@@ -205,7 +205,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
-                        row_id,
+                        row_id: RowKey::Int(row_id),
                     },
                     in_btree,
                     btree_consumed,
@@ -214,7 +214,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             (None, Some(btree_rowid)) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id: self.table_id,
-                    row_id: *btree_rowid,
+                    row_id: RowKey::Int(*btree_rowid),
                 },
                 in_btree: true,
                 btree_consumed: true,
@@ -222,7 +222,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             (Some(mvcc_rowid), None) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id: self.table_id,
-                    row_id: *mvcc_rowid,
+                    row_id: RowKey::Int(*mvcc_rowid),
                 },
                 in_btree: false,
                 btree_consumed: true,
@@ -240,7 +240,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         // If the row is not found in MVCC index, this means row_id is valid in btree
         matches!(
             self.db
-                .find_row_last_version_state(self.table_id, row_id, self.tx_id),
+                .find_row_last_version_state(self.table_id, RowKey::Int(row_id), self.tx_id),
             RowVersionState::NotFound
         )
     }
@@ -276,15 +276,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
     fn next(&mut self) -> Result<IOResult<bool>> {
-        let current_state = *self.state.borrow();
+        let current_state = self.state.borrow().clone();
         if current_state.is_none() {
             let before_first = matches!(self.get_current_pos(), CursorPosition::BeforeFirst);
-            let min_id = match *self.current_pos.borrow() {
+            let min_id = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => row_id.row_id + 1,
+                } => row_id.row_id.to_int_or_panic() + 1,
                 // TODO: do we need to forward twice?
                 CursorPosition::BeforeFirst => i64::MIN, // we need to find first row, so we look from the first id,
                 CursorPosition::End => {
@@ -321,7 +321,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // Now we need to loop for next rowid in btree that is valid.
         // FIXME: this is quite unperformant, we should find a better way to do this.
         loop {
-            let current_state = *self.state.borrow();
+            let current_state = self.state.borrow().clone();
             let Some(MvccLazyCursorState::Next(NextState::NextBtree {
                 new_position_in_mvcc,
             })) = current_state
@@ -359,7 +359,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id),
+                } => Some(row_id.row_id.to_int_or_panic()),
                 CursorPosition::BeforeFirst => None,
                 CursorPosition::End => None,
             };
@@ -399,14 +399,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn prev(&mut self) -> Result<IOResult<bool>> {
-        let current_state = *self.state.borrow();
+        let current_state = self.state.borrow().clone();
         if current_state.is_none() {
-            let max_id = match *self.current_pos.borrow() {
+            let max_id = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => row_id.row_id,
+                } => row_id.row_id.to_int_or_panic(),
                 CursorPosition::BeforeFirst => {
                     return Ok(IOResult::Done(false));
                 }
@@ -435,7 +435,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // Now we need to loop for prev rowid in btree that is valid.
         // FIXME: this is quite unperformant, we should find a better way to do this.
         loop {
-            let current_state = *self.state.borrow();
+            let current_state = self.state.borrow().clone();
             let Some(MvccLazyCursorState::Prev(PrevState::PrevBtree {
                 new_position_in_mvcc,
             })) = current_state
@@ -472,7 +472,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id),
+                } => Some(row_id.row_id.to_int_or_panic()),
                 CursorPosition::BeforeFirst => None,
                 CursorPosition::End => None,
             };
@@ -518,7 +518,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 row_id,
                 in_btree: _,
                 btree_consumed: _,
-            } => Some(row_id.row_id),
+            } => Some(row_id.row_id.to_int_or_panic()),
             CursorPosition::BeforeFirst => None,
             CursorPosition::End => None,
         };
@@ -535,7 +535,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let row_id = match seek_key {
             SeekKey::TableRowId(row_id) => row_id,
             SeekKey::IndexKey(_) => {
-                todo!();
+                panic!("SeekKey::IndexKey is not supported for mvcc table cursor");
             }
         };
         // gt -> lower_bound bound excluded, we want first row after row_id
@@ -544,7 +544,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
         let rowid = RowID {
             table_id: self.table_id,
-            row_id,
+            row_id: RowKey::Int(row_id),
         };
         let (bound, lower_bound) = match op {
             SeekOp::GT => (Bound::Excluded(&rowid), true),
@@ -556,12 +556,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
         if let Some(rowid) = rowid {
             self.current_pos.replace(CursorPosition::Loaded {
-                row_id: rowid,
+                row_id: rowid.clone(),
                 in_btree: false,
                 btree_consumed: false,
             });
             if op.eq_only() {
-                if rowid.row_id == row_id {
+                if rowid.row_id.to_int_or_panic() == row_id {
                     Ok(IOResult::Done(SeekResult::Found))
                 } else {
                     Ok(IOResult::Done(SeekResult::NotFound))
@@ -584,9 +584,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         let Some(rowid) = key.maybe_rowid() else {
-            todo!()
+            panic!("BTreeKey::maybe_rowid() should return Some(rowid) for table rowid keys");
         };
-        let row_id = RowID::new(self.table_id, rowid);
+        let row_id = RowID::new(self.table_id, RowKey::Int(rowid));
         let record_buf = key.get_record().unwrap().get_payload().to_vec();
         let num_columns = match key {
             BTreeKey::IndexKey(record) => record.column_count(),
@@ -595,12 +595,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
 
         self.current_pos.replace(CursorPosition::Loaded {
-            row_id: row.id,
+            row_id: row.id.clone(),
             in_btree: false,
             btree_consumed: true,
         });
         // FIXME: set btree to somewhere close to this rowid?
-        if self.db.read(self.tx_id, row.id)?.is_some() {
+        if self.db.read(self.tx_id, row.id.clone())?.is_some() {
             self.db.update(self.tx_id, row).inspect_err(|_| {
                 self.current_pos.replace(CursorPosition::BeforeFirst);
             })?;
@@ -615,9 +615,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn delete(&mut self) -> Result<IOResult<()>> {
         let IOResult::Done(Some(rowid)) = self.rowid()? else {
-            todo!();
+            panic!("Rowid should be Some(rowid) for mvcc table cursor");
         };
-        let rowid = RowID::new(self.table_id, rowid);
+        let rowid = RowID::new(self.table_id, RowKey::Int(rowid));
         self.db.delete(self.tx_id, rowid)?;
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -640,14 +640,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let rowid = self.db.seek_rowid(
             Bound::Included(&RowID {
                 table_id: self.table_id,
-                row_id: *int_key,
+                row_id: RowKey::Int(*int_key),
             }),
             true,
             self.tx_id,
         );
         tracing::trace!("found {rowid:?}");
         let exists = if let Some(rowid) = rowid {
-            rowid.row_id == *int_key
+            let RowKey::Int(rowid) = rowid.row_id else {
+                panic!("Rowid is not an integer in mvcc table cursor");
+            };
+            rowid == *int_key
         } else {
             false
         };
@@ -655,7 +658,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.current_pos.replace(CursorPosition::Loaded {
                 row_id: RowID {
                     table_id: self.table_id,
-                    row_id: *int_key,
+                    row_id: RowKey::Int(*int_key),
                 },
                 in_btree: false,
                 btree_consumed: false,
@@ -705,7 +708,12 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let new_position_in_mvcc = self
             .db
             .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id)
-            .map(|id| id.row_id);
+            .map(|id| {
+                let RowKey::Int(rowid) = id.row_id else {
+                    panic!("Rowid is not an integer in mvcc table cursor");
+                };
+                rowid
+            });
 
         let IOResult::Done(maybe_rowid_in_btree) = self.btree_cursor.rowid()? else {
             panic!("BTree should have returned rowid after rewind because we called btree_cursor.rewind()");
@@ -741,7 +749,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         let max_rowid = RowID {
             table_id: self.table_id,
-            row_id: i64::MAX,
+            row_id: RowKey::Int(i64::MAX),
         };
         let bound = Bound::Included(&max_rowid);
         let lower_bound = false;
