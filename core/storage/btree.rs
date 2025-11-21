@@ -3128,7 +3128,7 @@ impl BTreeCursor {
                                     max_local,
                                     min_local,
                                     page_type,
-                                );
+                                )?;
                             let buf = old_page_contents.as_ptr();
                             let cell_buf = &mut buf[cell_start..cell_start + cell_len];
                             // TODO(pere): make this reference and not copy
