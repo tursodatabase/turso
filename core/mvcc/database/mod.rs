@@ -11,9 +11,11 @@ use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
+use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
+use crate::types::IndexInfo;
 use crate::types::RecordCursor;
 use crate::types::SeekResult;
 use crate::Completion;
@@ -84,15 +86,125 @@ impl std::fmt::Display for MVTableId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Wrapper for index keys that implements collation-aware, ASC/DESC-aware ordering.
+#[derive(Debug, Clone)]
+pub struct SortableIndexKey {
+    /// The key as bytes.
+    pub key: ImmutableRecord,
+    /// Index metadata containing sort orders and collations
+    pub metadata: Arc<IndexInfo>,
+}
+
+impl SortableIndexKey {
+    pub fn new_from_bytes(key_bytes: Vec<u8>, metadata: Arc<IndexInfo>) -> Self {
+        Self {
+            key: ImmutableRecord::from_bin_record(key_bytes),
+            metadata,
+        }
+    }
+
+    pub fn new_from_record(key: ImmutableRecord, metadata: Arc<IndexInfo>) -> Self {
+        Self { key, metadata }
+    }
+
+    pub fn new_from_values(values: Vec<ValueRef>, metadata: Arc<IndexInfo>) -> Self {
+        let len = values.len();
+        Self {
+            key: ImmutableRecord::from_values(values, len),
+            metadata,
+        }
+    }
+
+    fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
+        debug_assert!(
+            Arc::ptr_eq(&self.metadata, &other.metadata),
+            "IndexInfo pointers must be the same"
+        );
+
+        let mut lhs_cursor = RecordCursor::new();
+        let mut rhs_cursor = RecordCursor::new();
+
+        lhs_cursor.ensure_parsed_upto(&self.key, self.metadata.num_cols - 1)?;
+        rhs_cursor.ensure_parsed_upto(&other.key, self.metadata.num_cols - 1)?;
+
+        for i in 0..self.metadata.num_cols {
+            let lhs_value = lhs_cursor.deserialize_column(&self.key, i)?;
+            let rhs_value = rhs_cursor.deserialize_column(&other.key, i)?;
+
+            let cmp = compare_immutable(
+                std::iter::once(&lhs_value),
+                std::iter::once(&rhs_value),
+                &self.metadata.key_info[i..i + 1],
+            );
+
+            if cmp != std::cmp::Ordering::Equal {
+                return Ok(cmp);
+            }
+        }
+
+        Ok(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialEq for SortableIndexKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.key == other.key {
+            return true;
+        }
+
+        self.compare(other)
+            .map(|ord| ord == std::cmp::Ordering::Equal)
+            .unwrap_or(false)
+    }
+}
+
+impl Eq for SortableIndexKey {}
+
+impl PartialOrd for SortableIndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SortableIndexKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.compare(other).expect("Failed to compare IndexKeys")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowKey {
+    Int(i64),
+    Record(SortableIndexKey),
+}
+
+impl RowKey {
+    pub fn to_int_or_panic(&self) -> i64 {
+        match self {
+            RowKey::Int(row_id) => *row_id,
+            _ => panic!("RowKey is not an integer"),
+        }
+    }
+}
+
+impl std::fmt::Display for RowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RowKey::Int(row_id) => write!(f, "{row_id}"),
+            RowKey::Record(record) => write!(f, "{record:?}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
     pub table_id: MVTableId,
-    pub row_id: i64,
+    pub row_id: RowKey,
 }
 
 impl RowID {
-    pub fn new(table_id: MVTableId, row_id: i64) -> Self {
+    pub fn new(table_id: MVTableId, row_id: RowKey) -> Self {
         Self { table_id, row_id }
     }
 }
@@ -551,7 +663,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
-                    .extend(tx.write_set.iter().map(|v| *v.value()));
+                    .extend(tx.write_set.iter().map(|v| v.value().clone()));
                 self.write_set.sort_by(|a, b| {
                     // table ids are negative, and sqlite_schema has id -1 so we want to sort in descending order of table id
                     b.table_id.cmp(&a.table_id).then(a.row_id.cmp(&b.row_id))
@@ -766,7 +878,10 @@ impl StateTransition for WriteRowStateMachine {
             }
             WriteRowState::Seek => {
                 // Position the cursor by seeking to the row position
-                let seek_key = SeekKey::TableRowId(self.row.id.row_id);
+                let seek_key = match &self.row.id.row_id {
+                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                };
 
                 match self
                     .cursor
@@ -784,7 +899,10 @@ impl StateTransition for WriteRowStateMachine {
             }
             WriteRowState::Insert => {
                 // Insert the record into the B-tree
-                let key = BTreeKey::new_table_rowid(self.row.id.row_id, self.record.as_ref());
+                let key = match &self.row.id.row_id {
+                    RowKey::Int(row_id) => BTreeKey::new_table_rowid(*row_id, self.record.as_ref()),
+                    RowKey::Record(record) => BTreeKey::new_index_key(&record.key),
+                };
 
                 match self
                     .cursor
@@ -842,7 +960,10 @@ impl StateTransition for DeleteRowStateMachine {
                 Ok(TransitionResult::Continue)
             }
             DeleteRowState::Seek => {
-                let seek_key = SeekKey::TableRowId(self.rowid.row_id);
+                let seek_key = match &self.rowid.row_id {
+                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                };
 
                 match self
                     .cursor
@@ -1094,13 +1215,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
-        let id = row.id;
+        let id = row.id.clone();
         let row_version = RowVersion {
             begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
             end: None,
             row,
         };
-        tx.insert_to_write_set(id);
+        tx.insert_to_write_set(id.clone());
         self.insert_version(id, row_version);
         Ok(())
     }
@@ -1125,7 +1246,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Returns `true` if the row was successfully updated, and `false` otherwise.
     pub fn update(&self, tx_id: TxID, row: Row) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
-        if !self.delete(tx_id, row.id)? {
+        if !self.delete(tx_id, row.id.clone())? {
             return Ok(false);
         }
         self.insert(tx_id, row)?;
@@ -1136,7 +1257,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// any old data if it existed. Bails on a delete error, e.g. write-write conflict.
     pub fn upsert(&self, tx_id: TxID, row: Row) -> Result<()> {
         tracing::trace!("upsert(tx_id={}, row.id={:?})", tx_id, row.id);
-        self.delete(tx_id, row.id)?;
+        self.delete(tx_id, row.id.clone())?;
         self.insert(tx_id, row)
     }
 
@@ -1228,7 +1349,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Gets all row ids in the database.
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");
-        let keys = self.rows.iter().map(|entry| *entry.key());
+        let keys = self.rows.iter().map(|entry| entry.key().clone());
         Ok(keys.collect())
     }
 
@@ -1246,18 +1367,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         );
         let start_id = RowID {
             table_id,
-            row_id: start,
+            row_id: RowKey::Int(start),
         };
 
         let end_id = RowID {
             table_id,
-            row_id: i64::MAX,
+            row_id: RowKey::Int(i64::MAX),
         };
 
         self.rows
             .range(start_id..end_id)
             .take(max_items as usize)
-            .for_each(|entry| bucket.push(*entry.key()));
+            .for_each(|entry| bucket.push(entry.key().clone()));
 
         Ok(())
     }
@@ -1325,12 +1446,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if direction == IterationDirection::Forwards {
             let min_bound = RowID {
                 table_id,
-                row_id: start,
+                row_id: RowKey::Int(start),
             };
 
             let max_bound = RowID {
                 table_id,
-                row_id: i64::MAX,
+                row_id: RowKey::Int(i64::MAX),
             };
             let mut rows = self.rows.range(min_bound..max_bound);
             loop {
@@ -1349,12 +1470,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let min_bound = RowID {
                 table_id,
-                row_id: i64::MIN,
+                row_id: RowKey::Int(i64::MIN),
             };
 
             let max_bound = RowID {
                 table_id,
-                row_id: start,
+                row_id: RowKey::Int(start),
             };
             // In backward's direction we iterate in reverse order.
             let mut rows = self.rows.range(min_bound..max_bound).rev();
@@ -1376,7 +1497,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn find_row_last_version_state(
         &self,
         table_id: MVTableId,
-        row_id: i64,
+        row_id: RowKey,
         tx_id: TxID,
     ) -> RowVersionState {
         tracing::trace!(
@@ -1387,7 +1508,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let tx = self.txs.get(&tx_id).unwrap();
         let tx = tx.value();
-        let versions = self.rows.get(&RowID { table_id, row_id });
+        let versions = self.rows.get(&RowID {
+            table_id,
+            row_id: row_id.clone(),
+        });
         if versions.is_none() {
             return RowVersionState::NotFound;
         }
@@ -1415,7 +1539,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .iter()
             .rev()
             .find(|version| version.is_visible_to(tx, &self.txs))
-            .map(|_| *row.key())
+            .map(|_| row.key().clone())
     }
 
     pub fn seek_rowid(
@@ -1448,7 +1572,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Bound::Excluded(rowid) => rowid.table_id,
             Bound::Unbounded => unreachable!(),
         };
-        res.filter(|&rowid| rowid.table_id == table_id_expect)
+        res.filter(|rowid| rowid.table_id == table_id_expect)
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -1836,7 +1960,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 should_stay
             });
             if row_versions.is_empty() {
-                to_remove.push(*entry.key());
+                to_remove.push(entry.key().clone());
             }
         }
         for id in to_remove {
@@ -1850,7 +1974,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         for record in tx_log {
             tracing::debug!("recover() -> tx_timestamp={}", record.tx_timestamp);
             for version in record.row_versions {
-                self.insert_version(version.row.id, version);
+                self.insert_version(version.row.id.clone(), version);
             }
             self.clock.reset(record.tx_timestamp);
         }
@@ -1941,9 +2065,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .rows
             .upper_bound(Bound::Included(&RowID {
                 table_id,
-                row_id: i64::MAX,
+                row_id: RowKey::Int(i64::MAX),
             }))
-            .map(|entry| Some(entry.key().row_id))
+            .map(|entry| Some(entry.key().row_id.to_int_or_panic()))
             .unwrap_or(None);
         last_rowid
     }
