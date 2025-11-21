@@ -548,7 +548,11 @@ impl IncrementalView {
                 );
                 // Only add if there's actually a condition for this table
                 if let Some(condition) = table_specific_condition {
-                    let conditions = table_conditions.get_mut(table_name).unwrap();
+                    let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "table_conditions should have entry for table_name".to_string(),
+                        )
+                    })?;
                     conditions.push(Some(condition));
                 }
             }
@@ -558,7 +562,11 @@ impl IncrementalView {
             // explicitly, because the same table may appear in many conditions - some of which
             // have filters that would otherwise be applied.
             for table_name in table_map.keys() {
-                let conditions = table_conditions.get_mut(table_name).unwrap();
+                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "table_conditions should have entry for table_name".to_string(),
+                    )
+                })?;
                 conditions.push(None);
             }
         }
@@ -1222,7 +1230,11 @@ impl IncrementalView {
                         match stmt.step()? {
                             crate::vdbe::StepResult::Row => {
                                 // Get the row
-                                let row = stmt.row().unwrap();
+                                let row = stmt.row().ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "row should exist after StepResult::Row".to_string(),
+                                    )
+                                })?;
 
                                 // Extract values from the row
                                 let all_values: Vec<crate::types::Value> =
