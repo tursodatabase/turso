@@ -1963,10 +1963,10 @@ pub unsafe extern "C" fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> ffi:
 }
 
 fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
-    match db.e_open_state {
-        SQLITE_STATE_SICK | SQLITE_STATE_OPEN | SQLITE_STATE_BUSY => true,
-        _ => false,
-    }
+    matches!(
+        db.e_open_state,
+        SQLITE_STATE_SICK | SQLITE_STATE_OPEN | SQLITE_STATE_BUSY
+    )
 }
 
 // https://sqlite.org/c3ref/table_column_metadata.html
@@ -2113,7 +2113,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 
 fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     if !container.is_null() {
-        let err_msg = format!("{}", err);
+        let err_msg = format!("{err}");
         unsafe { *container = CString::new(err_msg).unwrap().into_raw() };
     }
     match err {
