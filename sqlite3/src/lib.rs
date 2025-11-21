@@ -14,19 +14,42 @@ macro_rules! stub {
     };
 }
 
-pub const SQLITE_OK: ffi::c_int = 0;
-pub const SQLITE_ERROR: ffi::c_int = 1;
-pub const SQLITE_ABORT: ffi::c_int = 4;
-pub const SQLITE_BUSY: ffi::c_int = 5;
-pub const SQLITE_NOMEM: ffi::c_int = 7;
-pub const SQLITE_INTERRUPT: ffi::c_int = 9;
-pub const SQLITE_NOTFOUND: ffi::c_int = 12;
-pub const SQLITE_CANTOPEN: ffi::c_int = 14;
-pub const SQLITE_MISUSE: ffi::c_int = 21;
-pub const SQLITE_RANGE: ffi::c_int = 25;
-pub const SQLITE_ROW: ffi::c_int = 100;
-pub const SQLITE_DONE: ffi::c_int = 101;
+/* generic error-codes */
+pub const SQLITE_OK: ffi::c_int = 0; /* Successful result */
+pub const SQLITE_ERROR: ffi::c_int = 1; /* Generic error */
+pub const SQLITE_INTERNAL: ffi::c_int = 2; /* Internal logic error in SQLite */
+pub const SQLITE_PERM: ffi::c_int = 3; /* Access permission denied */
+pub const SQLITE_ABORT: ffi::c_int = 4; /* Callback routine requested an abort */
+pub const SQLITE_BUSY: ffi::c_int = 5; /* The database file is locked */
+pub const SQLITE_LOCKED: ffi::c_int = 6; /* A table in the database is locked */
+pub const SQLITE_NOMEM: ffi::c_int = 7; /* A malloc() failed */
+pub const SQLITE_READONLY: ffi::c_int = 8; /* Attempt to write a readonly database */
+pub const SQLITE_INTERRUPT: ffi::c_int = 9; /* Operation terminated by sqlite3_interrupt()*/
+pub const SQLITE_IOERR: ffi::c_int = 10; /* Some kind of disk I/O error occurred */
+pub const SQLITE_CORRUPT: ffi::c_int = 11; /* The database disk image is malformed */
+pub const SQLITE_NOTFOUND: ffi::c_int = 12; /* Unknown opcode in sqlite3_file_control() */
+pub const SQLITE_FULL: ffi::c_int = 13; /* Insertion failed because database is full */
+pub const SQLITE_CANTOPEN: ffi::c_int = 14; /* Unable to open the database file */
+pub const SQLITE_PROTOCOL: ffi::c_int = 15; /* Database lock protocol error */
+pub const SQLITE_EMPTY: ffi::c_int = 16; /* Internal use only */
+pub const SQLITE_SCHEMA: ffi::c_int = 17; /* The database schema changed */
+pub const SQLITE_TOOBIG: ffi::c_int = 18; /* String or BLOB exceeds size limit */
+pub const SQLITE_CONSTRAINT: ffi::c_int = 19; /* Abort due to constraint violation */
+pub const SQLITE_MISMATCH: ffi::c_int = 20; /* Data type mismatch */
+pub const SQLITE_MISUSE: ffi::c_int = 21; /* Library used incorrectly */
+pub const SQLITE_NOLFS: ffi::c_int = 22; /* Uses OS features not supported on host */
+pub const SQLITE_AUTH: ffi::c_int = 23; /* Authorization denied */
+pub const SQLITE_FORMAT: ffi::c_int = 24; /* Not used */
+pub const SQLITE_RANGE: ffi::c_int = 25; /* 2nd parameter to sqlite3_bind out of range */
+pub const SQLITE_NOTADB: ffi::c_int = 26; /* File opened that is not a database file */
+pub const SQLITE_NOTICE: ffi::c_int = 27; /* Notifications from sqlite3_log() */
+pub const SQLITE_WARNING: ffi::c_int = 28; /* Warnings from sqlite3_log() */
+pub const SQLITE_ROW: ffi::c_int = 100; /* sqlite3_step() has another row ready */
+pub const SQLITE_DONE: ffi::c_int = 101; /* sqlite3_step() has finished executing */
+
+/* extended error-codes */
 pub const SQLITE_ABORT_ROLLBACK: ffi::c_int = SQLITE_ABORT | (2 << 8);
+
 pub const SQLITE_STATE_OPEN: u8 = 0x76;
 pub const SQLITE_STATE_SICK: u8 = 0xba;
 pub const SQLITE_STATE_BUSY: u8 = 0x6d;
