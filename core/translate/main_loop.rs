@@ -7,7 +7,7 @@ use super::{
     display::PlanContext,
     emitter::{OperationMode, TranslateCtx},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt, ConditionContext,
         ConditionMetadata, NoConstantOptReason,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
@@ -435,6 +435,7 @@ pub fn init_loop(
             jump_target_when_true: jump_target,
             jump_target_when_false: t_ctx.label_main_loop_end.unwrap(),
             jump_target_when_null: t_ctx.label_main_loop_end.unwrap(),
+            context: ConditionContext::WhereClause,
         };
         translate_condition_expr(program, tables, &cond.expr, meta, &t_ctx.resolver)?;
         program.preassign_label_to_next_insn(jump_target);
@@ -825,6 +826,7 @@ fn emit_conditions(
             jump_target_when_true,
             jump_target_when_false: next,
             jump_target_when_null: next,
+            context: ConditionContext::WhereClause,
         };
         translate_condition_expr(
             program,

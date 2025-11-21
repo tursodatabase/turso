@@ -16,7 +16,8 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-    translate_condition_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
+    translate_condition_expr, walk_expr_mut, BindingBehavior, ConditionContext, ConditionMetadata,
+    WalkControl,
 };
 
 use crate::translate::fkeys::{
@@ -401,7 +402,8 @@ pub fn translate_insert(
         has_user_provided_rowid,
     );
 
-    let notnull_resume_label: Option<BranchOffset> = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
+    let notnull_resume_label: Option<BranchOffset> =
+        emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     emit_check_constraints(&mut program, &ctx, &insertion, resolver, connection)?;
 
@@ -2949,11 +2951,13 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     Ok(())
 }
 
-/// Rewrites a CHECK constraint's AST
+/// Rewrites a CHECK constraint's AST in-place
 ///
-/// the function replaces each column name reference with a direct reference
+/// **IMPORTANT**: This function mutates the input expression directly.
+///
+/// The function replaces each column name reference with a direct reference
 /// to the register (`Expr::Register`) that holds the new row's value for that column.
-pub fn rewrite_check_expr(
+pub fn rewrite_check_expr_in_place(
     expr: &mut ast::Expr,
     insertion: &Insertion,
 ) -> crate::Result<WalkControl> {
@@ -2993,12 +2997,36 @@ pub fn rewrite_check_expr(
     )
 }
 
-// this is needed for insert or ignore.
+/// Determines how to handle CHECK constraint failures.
+///
+/// This enum distinguishes between standard INSERT behavior (which should halt with an error)
+/// and INSERT OR IGNORE behavior (which should jump to a label to skip the row).
 pub enum CheckFailureMode {
+    /// Standard behavior: Halt execution with a constraint violation error.
     Halt,
+    /// INSERT OR IGNORE behavior: Jump to the specified label (usually the end of the row processing loop)
+    /// effectively ignoring the failure and moving to the next row.
     Jump(BranchOffset),
 }
 
+/// Emits bytecode to validate CHECK constraints for an insertion or update operation.
+///
+/// This function is called "generic" because it can be used in multiple contexts:
+/// - INSERT operations (via `emit_check_constraints`)
+/// - UPDATE operations (via `emit_update_insns` in emitter.rs)
+/// - Both INSERT OR IGNORE and regular INSERT (controlled by `failure_mode`)
+///
+/// The function handles CHECK constraint validation by:
+/// 1. Applying column affinities to ensure proper type comparisons
+/// 2. Rewriting CHECK expressions to reference the appropriate registers
+/// 3. Translating each CHECK constraint into conditional jump logic
+/// 4. Either halting with an error or jumping to a recovery label on failure
+///
+/// # NULL Handling
+/// CHECK constraints follow SQL standard semantics where NULL is treated as TRUE.
+/// This means if a CHECK expression evaluates to NULL, the constraint passes.
+/// This is implemented via `ConditionMetadata` with `jump_target_when_null` set
+/// to the same target as `jump_target_when_true`.
 pub fn emit_generic_check_constraints(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -3034,7 +3062,7 @@ pub fn emit_generic_check_constraints(
 
         let mut check_expr = expr.clone();
 
-        rewrite_check_expr(&mut check_expr, insertion)?;
+        rewrite_check_expr_in_place(&mut check_expr, insertion)?;
 
         let constraint_name_str = constraint
             .name
@@ -3070,6 +3098,7 @@ pub fn emit_generic_check_constraints(
             jump_target_when_true: continue_label,
             jump_target_when_false: fail_label,
             jump_target_when_null: continue_label,
+            context: ConditionContext::CheckConstraint,
         };
 
         tracing::debug!(
@@ -3108,7 +3137,6 @@ pub fn emit_generic_check_constraints(
         program.preassign_label_to_next_insn(continue_label);
     }
 
-    tracing::debug!("done wirh check contsraint logic");
     Ok(())
 }
 

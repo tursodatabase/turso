@@ -208,6 +208,8 @@ do_execsql_test_on_specific_db {:memory:} check-insert-or-ignore-ok {
 } {4|11.0}
 
 # todo integrity_check
+# sqlite's integrity_check verifies check constraints too (unless PRAGMA ignore_check_constraints is ON).
+# made a separate issue tracking: #3866
 # do_execsql_test_in_memory_any_error check-pragma-ignore-check-constraints-off {
 #    CREATE TABLE t4(x, y, CHECK (x+y==11));
 #    PRAGMA ignore_check_constraints=ON;

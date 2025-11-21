@@ -26,14 +26,108 @@ use crate::{turso_assert, Result, Value};
 
 use super::collate::CollationSeq;
 
+/// Context for conditional expressions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionContext {
+    /// Condition from WHERE clause (NULL = FALSE for filtering)
+    WhereClause,
+    /// Condition from CHECK constraint (NULL = TRUE, constraint passes)
+    CheckConstraint,
+}
+
+/// Metadata for conditional expressions, tracking jump targets and context.
+///
+/// # NULL Handling: WHERE vs CHECK Constraints
+///
+/// This struct tracks the origin of conditional expressions because NULL values are
+/// handled fundamentally differently in WHERE clauses versus CHECK constraints:
+///
+/// ## WHERE Clause Semantics (Two-Valued Logic)
+///
+/// In WHERE clauses (and like HAVING, ON, WHEN), SQLite
+/// treats NULL as FALSE:
+///
+/// ## CHECK Constraint Semantics (Three-Valued Logic)
+///
+/// CHECK constraints follow SQL standard three-valued logic where NULL means "unknown"
+/// and is treated as passing the constraint:
+///
+/// - **NULL = PASS**: If a CHECK expression evaluates to NULL, the constraint passes
+/// - **FALSE = FAIL**: Only an explicit FALSE value violates the constraint
+/// - **TRUE = PASS**: TRUE values pass the constraint obviously...
+///
+/// From SQLite docs:
+/// "If the result is zero (integer value 0 or real value 0.0), then a constraint
+/// violation has occurred. If the CHECK expression evaluates to NULL, or any other
+/// non-zero value, it is not a constraint violation."
+///
+/// Example: `CHECK (x > 5)` with x=NULL -> NULL -> constraint passes
+///
+/// This difference affects how we generate bytecode for expressions like OR:
+///
+/// ### WHERE clause: `WHERE a OR b`
+/// - NULL OR FALSE = NULL → treated as FALSE → row excluded
+/// - NULL OR TRUE = TRUE → row included
+/// - Can use simplified two-way logic (NULL and FALSE both jump to "exclude")
+///
+/// ### CHECK constraint: `CHECK (a OR b)`
+/// - NULL OR FALSE = NULL (constraint passes since NULL ≠ 0)
+/// - NULL OR TRUE = TRUE (passes)
+/// - FALSE OR FALSE = FALSE (fails, it's zero)
+/// - Needs proper three-way logic because NULL shall not be treated as FALSE
+///
+/// The `context` field tracks whether we're in a WHERE-like or CHECK-like
+/// context so we can generate the appropriate bytecode for NULL handling.
 #[derive(Debug, Clone, Copy)]
 pub struct ConditionMetadata {
     pub jump_if_condition_is_true: bool,
     pub jump_target_when_true: BranchOffset,
     pub jump_target_when_false: BranchOffset,
     pub jump_target_when_null: BranchOffset,
+    pub context: ConditionContext,
 }
 
+impl ConditionMetadata {
+    /// Determines whether a comparison should jump on NULL based on the jump direction.
+    ///
+    /// The behavior depends on whether we're jumping when the
+    /// condition is true or false:
+    /// - When jumping on true: jump on NULL if NULL target == TRUE target
+    /// - When jumping on false: jump on NULL if NULL target == FALSE target
+    ///
+    /// This is used to set the `jump_if_null` flag on comparison instructions.
+    pub fn should_jump_on_null(self) -> bool {
+        if self.jump_if_condition_is_true {
+            self.jump_target_when_true == self.jump_target_when_null
+        } else {
+            self.jump_target_when_false == self.jump_target_when_null
+        }
+    }
+
+    /// Returns true if this condition is from a WHERE clause.
+    #[inline]
+    pub fn is_from_where_clause(self) -> bool {
+        self.context == ConditionContext::WhereClause
+    }
+}
+
+/// Emits conditional jump instructions based on the condition metadata.
+///
+/// This function handles the different cases of conditional jumps depending on where
+/// NULL, TRUE, and FALSE values should jump to. The logic differs between WHERE clauses
+/// and CHECK constraints:
+///
+/// **WHERE clause semantics**: NULL is treated as FALSE
+///   - `jump_target_when_null` == `jump_target_when_false`
+///   - Example: `WHERE x > 5` - if x is NULL, don't include the row (same as FALSE)
+///
+/// **CHECK constraint semantics**: NULL is treated as TRUE (constraint passes)
+///   - `jump_target_when_null` == `jump_target_when_true`
+///   - Example: `CHECK (x > 5)` - if x is NULL, the constraint passes (same as TRUE)
+///
+/// **Three-way NULL handling**: All three targets are different
+///   - Requires explicit NULL checks before the comparison
+///   - Used in complex expressions like OR with CHECK constraints
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, reg: usize) {
     let jmp_true = cond_meta.jump_target_when_true;
@@ -45,7 +139,7 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             target_pc: jmp_true,
         });
     } else if jmp_null == jmp_true {
-        // Treat Null as True - check constraints
+        // Treat NULL as TRUE (CHECK constraint semantics)
         program.emit_insn(Insn::If {
             reg,
             target_pc: jmp_true,
@@ -55,7 +149,7 @@ fn emit_cond_jump(program: &mut ProgramBuilder, cond_meta: ConditionMetadata, re
             target_pc: jmp_false,
         });
     } else if jmp_null == jmp_false {
-        // Treat NULL as false  where clause.
+        // Treat NULL as FALSE (WHERE clause semantics)
         program.emit_insn(Insn::IfNot {
             reg,
             target_pc: jmp_false,
@@ -393,16 +487,27 @@ pub fn translate_condition_expr(
             )?;
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            let where_clause_cntxt = condition_metadata.jump_target_when_false
-                == condition_metadata.jump_target_when_null;
+            // Binary OR handling differs significantly between WHERE clauses and CHECK constraints
+            // due to fundamentally different NULL semantics:
 
-            if where_clause_cntxt {
-                tracing::trace!(
-                    context = "WHERE-like",
-                    ?condition_metadata,
-                    "Translating OR with unified NULL/FALSE logic"
-                );
+            //   The OR operator's truth table with NULL requires special handling:
+            //   - If LHS is TRUE -> result is TRUE (short-circuit, don't evaluate RHS)
+            //   - If LHS is FALSE -> result depends on RHS (must evaluate RHS)
+            //   - If LHS is NULL -> result depends on RHS, but if RHS is also NULL/FALSE, result is NULL (not FALSE!)
+            //
+            //   For CHECK constraints, we need to distinguish NULL from FALSE in the LHS,
+            //   because "NULL OR FALSE" = NULL (passes), but "FALSE OR FALSE" = FALSE (fails).
+            //   This requires separate code paths for when LHS is NULL vs when LHS is FALSE.
+            //
+            let cond_is_from_where_clause = condition_metadata.is_from_where_clause();
 
+            tracing::trace!(
+                ?condition_metadata,
+                is_where_clause = cond_is_from_where_clause,
+                "Translating OR expression"
+            );
+
+            if cond_is_from_where_clause {
                 let fallthrough_label = program.allocate_label();
                 translate_condition_expr(
                     program,
@@ -413,6 +518,7 @@ pub fn translate_condition_expr(
                         jump_target_when_true: condition_metadata.jump_target_when_true,
                         jump_target_when_false: fallthrough_label,
                         jump_target_when_null: fallthrough_label,
+                        context: condition_metadata.context,
                     },
                     resolver,
                 )?;
@@ -434,23 +540,13 @@ pub fn translate_condition_expr(
                     jump_target_when_true: condition_metadata.jump_target_when_true,
                     jump_target_when_false: lhs_is_false_label,
                     jump_target_when_null: lhs_is_null_label,
+                    context: condition_metadata.context,
                 };
-
-                tracing::trace!(
-                    context = "CHECK-like",
-                    ?condition_metadata,
-                    ?lhs_metadata,
-                    "Translating OR LHS"
-                );
 
                 translate_condition_expr(program, referenced_tables, lhs, lhs_metadata, resolver)?;
 
                 program.preassign_label_to_next_insn(lhs_is_false_label);
-                tracing::trace!(
-                    context = "CHECK-like",
-                    ?condition_metadata,
-                    "Translating OR RHS (after LHS was FALSE)"
-                );
+
                 translate_condition_expr(
                     program,
                     referenced_tables,
@@ -469,14 +565,8 @@ pub fn translate_condition_expr(
                     jump_target_when_true: condition_metadata.jump_target_when_true,
                     jump_target_when_false: condition_metadata.jump_target_when_null,
                     jump_target_when_null: condition_metadata.jump_target_when_null,
+                    context: condition_metadata.context,
                 };
-
-                tracing::trace!(
-                    context = "CHECK-like",
-                    original_metadata = ?condition_metadata,
-                    modified_metadata = ?rhs_metadata_for_null_lhs,
-                    "Translating OR RHS (after LHS was NULL)"
-                );
 
                 translate_condition_expr(
                     program,
@@ -521,6 +611,7 @@ pub fn translate_condition_expr(
                 jump_target_when_true,
                 jump_target_when_false,
                 jump_target_when_null,
+                context: _,
             } = condition_metadata;
 
             // Adjust targets if `NOT IN`
@@ -533,6 +624,7 @@ pub fn translate_condition_expr(
                         jump_target_when_true: not_true_label,
                         jump_target_when_false: not_false_label,
                         jump_target_when_null,
+                        context: condition_metadata.context,
                     },
                     Some(not_true_label),
                     Some(not_false_label),
@@ -2401,6 +2493,7 @@ pub fn translate_expr(
                     jump_target_when_true: dest_if_true,
                     jump_target_when_false: dest_if_false,
                     jump_target_when_null: dest_if_null,
+                    context: ConditionContext::WhereClause,
                 },
                 resolver,
             )?;
@@ -3047,11 +3140,7 @@ fn emit_binary_condition_insn(
         condition_metadata.jump_target_when_false
     };
 
-    let should_jump_on_null = if condition_metadata.jump_if_condition_is_true {
-        condition_metadata.jump_target_when_true == condition_metadata.jump_target_when_null
-    } else {
-        condition_metadata.jump_target_when_false == condition_metadata.jump_target_when_null
-    };
+    let should_jump_on_null = condition_metadata.should_jump_on_null();
 
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
     if should_jump_on_null {
@@ -3061,7 +3150,7 @@ fn emit_binary_condition_insn(
     let eval_result = |program: &mut ProgramBuilder, result_reg: usize| {
         emit_cond_jump(program, condition_metadata, result_reg);
     };
-    if matches!(
+    let is_standard_comparison = matches!(
         op,
         ast::Operator::Equals
             | ast::Operator::NotEquals
@@ -3069,9 +3158,15 @@ fn emit_binary_condition_insn(
             | ast::Operator::LessEquals
             | ast::Operator::Greater
             | ast::Operator::GreaterEquals
-    ) && condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_false
-        && condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_true
-    {
+    );
+    let null_target_differs_from_true =
+        condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_true;
+    let null_target_differs_from_false =
+        condition_metadata.jump_target_when_null != condition_metadata.jump_target_when_false;
+    let needs_explicit_null_checks =
+        null_target_differs_from_true && null_target_differs_from_false;
+
+    if is_standard_comparison && needs_explicit_null_checks {
         tracing::trace!(
             context = "Binary comparison NULL check",
             ?op,

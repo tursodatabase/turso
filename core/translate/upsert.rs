@@ -9,7 +9,9 @@ use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
-use crate::translate::insert::{InsertEmitCtx, emit_generic_check_constraints, format_unique_violation_desc,CheckFailureMode};
+use crate::translate::insert::{
+    emit_generic_check_constraints, format_unique_violation_desc, CheckFailureMode, InsertEmitCtx,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::insn::CmpInsFlags;
 use crate::Connection;
