@@ -94,11 +94,15 @@ impl EncryptionKey {
 
         match bytes.len() {
             16 => {
-                let key: [u8; 16] = bytes.try_into().unwrap();
+                let key: [u8; 16] = bytes.try_into().map_err(|_| {
+                    LimboError::Corrupt("Failed to convert bytes to 16-byte key".into())
+                })?;
                 Ok(Self::Key128(key))
             }
             32 => {
-                let key: [u8; 32] = bytes.try_into().unwrap();
+                let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                    LimboError::Corrupt("Failed to convert bytes to 32-byte key".into())
+                })?;
                 Ok(Self::Key256(key))
             }
             _ => Err(LimboError::InvalidArgument(format!(
