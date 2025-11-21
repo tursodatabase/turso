@@ -204,8 +204,8 @@ impl DatabaseStorage for DatabaseFile {
             return Err(LimboError::IntegerOverflow);
         };
         let buffer = match &io_ctx.encryption_or_checksum {
-            EncryptionOrChecksum::Encryption(ctx) => encrypt_buffer(page_idx, buffer, ctx),
-            EncryptionOrChecksum::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
+            EncryptionOrChecksum::Encryption(ctx) => encrypt_buffer(page_idx, buffer, ctx)?,
+            EncryptionOrChecksum::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx)?,
             EncryptionOrChecksum::None => buffer,
         };
         self.file.pwrite(pos, buffer, c)
@@ -232,12 +232,12 @@ impl DatabaseStorage for DatabaseFile {
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| encrypt_buffer(first_page_idx + i, buffer, ctx))
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
             EncryptionOrChecksum::Checksum(ctx) => buffers
                 .into_iter()
                 .enumerate()
                 .map(|(i, buffer)| checksum_buffer(first_page_idx + i, buffer, ctx))
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>>>()?,
             EncryptionOrChecksum::None => buffers,
         };
         let c = self.file.pwritev(pos, buffers, c)?;
@@ -268,13 +268,20 @@ impl DatabaseFile {
     }
 }
 
-fn encrypt_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &EncryptionContext) -> Arc<Buffer> {
-    let encrypted_data = ctx.encrypt_page(buffer.as_slice(), page_idx).unwrap();
-    Arc::new(Buffer::new(encrypted_data.to_vec()))
+fn encrypt_buffer(
+    page_idx: usize,
+    buffer: Arc<Buffer>,
+    ctx: &EncryptionContext,
+) -> Result<Arc<Buffer>> {
+    let encrypted_data = ctx.encrypt_page(buffer.as_slice(), page_idx)?;
+    Ok(Arc::new(Buffer::new(encrypted_data.to_vec())))
 }
 
-fn checksum_buffer(page_idx: usize, buffer: Arc<Buffer>, ctx: &ChecksumContext) -> Arc<Buffer> {
-    ctx.add_checksum_to_page(buffer.as_mut_slice(), page_idx)
-        .unwrap();
-    buffer
+fn checksum_buffer(
+    page_idx: usize,
+    buffer: Arc<Buffer>,
+    ctx: &ChecksumContext,
+) -> Result<Arc<Buffer>> {
+    ctx.add_checksum_to_page(buffer.as_mut_slice(), page_idx)?;
+    Ok(buffer)
 }
