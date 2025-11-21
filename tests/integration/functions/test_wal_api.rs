@@ -11,9 +11,9 @@ use turso_core::{
 
 use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
 
-#[test]
-fn test_wal_frame_count() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_count(db: TempDatabase) {
     let conn = db.connect_limbo();
     assert_eq!(conn.wal_state().unwrap().max_frame, 0);
     conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -27,11 +27,15 @@ fn test_wal_frame_count() {
     assert_eq!(conn.wal_state().unwrap().max_frame, 15);
 }
 
-#[test]
-fn test_wal_frame_transfer_no_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -66,11 +70,16 @@ fn test_wal_frame_transfer_no_schema_changes() {
     );
 }
 
-#[test]
-fn test_wal_frame_transfer_various_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     let conn3 = db2.connect_limbo();
     conn1
@@ -125,11 +134,16 @@ fn test_wal_frame_transfer_various_schema_changes() {
     );
 }
 
-#[test]
-fn test_wal_frame_transfer_schema_changes() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -164,11 +178,16 @@ fn test_wal_frame_transfer_schema_changes() {
     );
 }
 
-#[test]
-fn test_wal_frame_transfer_no_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -203,11 +222,16 @@ fn test_wal_frame_transfer_no_schema_changes_rollback() {
     );
 }
 
-#[test]
-fn test_wal_frame_transfer_schema_changes_rollback() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -238,11 +262,16 @@ fn test_wal_frame_transfer_schema_changes_rollback() {
     );
 }
 
-#[test]
-fn test_wal_frame_conflict() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_conflict(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -257,11 +286,16 @@ fn test_wal_frame_conflict() {
     assert!(conn2.wal_insert_frame(1, &frame).is_err());
 }
 
-#[test]
-fn test_wal_frame_far_away_write() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_far_away_write(db: TempDatabase) {
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.clone().build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -283,13 +317,19 @@ fn test_wal_frame_far_away_write() {
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
-#[test]
-fn test_wal_frame_api_no_schema_changes_fuzz() {
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
+
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
     for _ in 0..4 {
-        let db1 = TempDatabase::new_empty();
+        let db1 = builder.clone().build();
         let conn1 = db1.connect_limbo();
-        let db2 = TempDatabase::new_empty();
+        let db2 = builder.clone().build();
         let conn2 = db2.connect_limbo();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -340,9 +380,9 @@ fn test_wal_frame_api_no_schema_changes_fuzz() {
     }
 }
 
-#[test]
-fn test_wal_api_changed_pages() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_changed_pages(db1: TempDatabase) {
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -419,9 +459,9 @@ fn revert_to(conn: &Arc<turso_core::Connection>, frame_watermark: u64) -> turso_
     Ok(())
 }
 
-#[test]
-fn test_wal_api_revert_pages() {
-    let db1 = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_revert_pages(db1: TempDatabase) {
     let conn1 = db1.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
@@ -463,9 +503,9 @@ fn test_wal_api_revert_pages() {
     );
 }
 
-#[test]
-fn test_wal_upper_bound_passive() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_upper_bound_passive(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -518,9 +558,9 @@ fn test_wal_upper_bound_passive() {
     }
 }
 
-#[test]
-fn test_wal_upper_bound_truncate() {
-    let db = TempDatabase::new_empty();
+// TODO: enable MVCC
+#[turso_macros::test()]
+fn test_wal_upper_bound_truncate(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -546,9 +586,9 @@ fn test_wal_upper_bound_truncate() {
         .unwrap();
 }
 
-#[test]
-fn test_wal_state_checkpoint_seq() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_state_checkpoint_seq(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -584,9 +624,9 @@ fn test_wal_state_checkpoint_seq() {
     );
 }
 
-#[test]
-fn test_wal_checkpoint_no_work() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_checkpoint_no_work(db: TempDatabase) {
     let writer = db.connect_limbo();
     let reader = db.connect_limbo();
 
@@ -629,9 +669,9 @@ fn test_wal_checkpoint_no_work() {
     reader.execute("SELECT * FROM test").unwrap();
 }
 
-#[test]
-fn test_wal_revert_change_db_size() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_revert_change_db_size(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer.execute("create table t(x, y)").unwrap();
@@ -676,9 +716,9 @@ fn test_wal_revert_change_db_size() {
     );
 }
 
-#[test]
-fn test_wal_api_exec_commit() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_exec_commit(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -723,9 +763,8 @@ fn test_wal_api_exec_commit() {
     );
 }
 
-#[test]
-fn test_wal_api_exec_rollback() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_wal_api_exec_rollback(db: TempDatabase) {
     let writer = db.connect_limbo();
 
     writer
@@ -758,9 +797,9 @@ fn test_wal_api_exec_rollback() {
     assert_eq!(rows, vec![] as Vec<Vec<turso_core::types::Value>>);
 }
 
-#[test]
-fn test_wal_api_insert_exec_mix() {
-    let db = TempDatabase::new_empty();
+// TODO: mvcc
+#[turso_macros::test()]
+fn test_wal_api_insert_exec_mix(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("create table a(x, y)").unwrap();
@@ -854,6 +893,7 @@ fn test_wal_api_insert_exec_mix() {
     );
 }
 
+// TODO: see later how this test should work with mvcc
 #[test]
 fn test_db_share_same_file() {
     let mut path = TempDir::new().unwrap().keep();
@@ -925,12 +965,16 @@ fn test_db_share_same_file() {
     );
 }
 
-#[test]
-fn test_wal_api_simulate_spilled_frames() {
+#[turso_macros::test(mvcc)]
+fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
     let (mut rng, _) = rng_from_time();
-    let db1 = TempDatabase::new_empty();
+    let opts = db.db_opts;
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+    let db1 = builder.clone().build();
     let conn1 = db1.connect_limbo();
-    let db2 = TempDatabase::new_empty();
+    let db2 = builder.build();
     let conn2 = db2.connect_limbo();
     conn1
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")

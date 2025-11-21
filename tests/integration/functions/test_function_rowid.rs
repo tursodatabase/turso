@@ -1,12 +1,12 @@
 use crate::common::{do_flush, TempDatabase};
 use turso_core::StepResult;
 
-#[test]
-fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY, val TEXT);"
+)]
+fn test_last_insert_rowid_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite(
-        "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY, val TEXT);",
-    );
     let conn = tmp_db.connect_limbo();
 
     // Simple insert
@@ -86,11 +86,9 @@ fn test_last_insert_rowid_basic() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_integer_primary_key() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);")]
+fn test_integer_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     for query in &[

@@ -4,9 +4,8 @@ use turso_core::{Statement, StepResult};
 
 use crate::common::{maybe_setup_tracing, TempDatabase};
 
-#[test]
-fn test_schema_reprepare() {
-    let tmp_db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_schema_reprepare(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     conn1
@@ -49,13 +48,20 @@ fn test_schema_reprepare() {
     assert_eq!(row, (20, 30));
 }
 
-#[test]
+#[turso_macros::test(mvcc)]
 #[ignore]
-fn test_create_multiple_connections() -> anyhow::Result<()> {
+fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let tries = 1;
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty());
+        let tmp_db = Arc::new(
+            TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build(),
+        );
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -129,12 +135,19 @@ fn test_create_multiple_connections() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(mvcc)]
 #[ignore]
-fn test_reader_writer() -> anyhow::Result<()> {
+fn test_reader_writer(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let tries = 10;
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
     for _ in 0..tries {
-        let tmp_db = Arc::new(TempDatabase::new_empty());
+        let tmp_db = Arc::new(
+            TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build(),
+        );
         {
             let conn = tmp_db.connect_limbo();
             conn.execute("CREATE TABLE t (x)").unwrap();
@@ -203,10 +216,9 @@ fn test_reader_writer() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_schema_reprepare_write() {
+#[turso_macros::test(mvcc)]
+fn test_schema_reprepare_write(tmp_db: TempDatabase) {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty();
     let conn1 = tmp_db.connect_limbo();
     conn1.execute("CREATE TABLE t(x, y, z)").unwrap();
     let conn2 = tmp_db.connect_limbo();
@@ -250,10 +262,10 @@ fn advance(stmt: &mut Statement) -> anyhow::Result<()> {
 }
 
 /// Regression test detected by whopper
-#[test]
-fn test_interleaved_transactions() -> anyhow::Result<()> {
+// TODO: cannot run with mvcc as we don't support indexes
+#[turso_macros::test]
+fn test_interleaved_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
-    let tmp_db = TempDatabase::new_empty();
     {
         let bootstrap_conn = tmp_db.connect_limbo();
         bootstrap_conn.execute("CREATE TABLE table_0 (id INTEGER,col_1 REAL,col_2 INTEGER,col_3 REAL,col_4 TEXT,col_5 REAL,col_6 TEXT)")?;
