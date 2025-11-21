@@ -47,7 +47,10 @@ fn replace(src: &str, old: &str, new: &str) -> String {
             result.push_str(new);
             idx += old.len();
         } else {
-            let ch = src[idx..].chars().next().unwrap();
+            let ch = src[idx..]
+                .chars()
+                .next()
+                .expect("string slice should have at least one character");
             result.push(ch);
             idx += ch.len_utf8();
         }
