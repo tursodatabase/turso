@@ -1,5 +1,4 @@
-use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::{create_exception, exceptions::PyException};
 
 create_exception!(
     limbo,

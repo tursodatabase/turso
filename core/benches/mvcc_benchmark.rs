@@ -1,12 +1,17 @@
 use std::sync::Arc;
 
-use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{
+    async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
+};
 use pprof::criterion::{Output, PProfProfiler};
-use turso_core::mvcc::clock::LocalClock;
-use turso_core::mvcc::database::{MvStore, Row, RowID};
-use turso_core::types::{IOResult, ImmutableRecord, Text};
-use turso_core::{Connection, Database, MemoryIO, Value};
+use turso_core::{
+    mvcc::{
+        clock::LocalClock,
+        database::{MvStore, Row, RowID},
+    },
+    types::{IOResult, ImmutableRecord, Text},
+    Connection, Database, MemoryIO, Value,
+};
 
 struct BenchDb {
     _db: Arc<Database>,

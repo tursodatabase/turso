@@ -1,25 +1,29 @@
-use crate::schema::{BTreeTable, Table};
-use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
-use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::order_by::order_by_sorter_insert;
-use crate::translate::plan::{
-    Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
-    SelectPlan, TableReferences, Window,
+use crate::{
+    schema::{BTreeTable, Table},
+    translate::{
+        aggregation::{translate_aggregation_step, AggArgumentSource},
+        collate::{get_collseq_from_expr, CollationSeq},
+        emitter::{Resolver, TranslateCtx},
+        expr::{walk_expr, walk_expr_mut, WalkControl},
+        order_by::order_by_sorter_insert,
+        plan::{
+            Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination,
+            ResultSetColumn, SelectPlan, TableReferences, Window,
+        },
+        planner::resolve_window_and_aggregate_functions,
+        result_row::emit_select_result,
+    },
+    types::KeyInfo,
+    util::exprs_are_equivalent,
+    vdbe::{
+        builder::{CursorType, ProgramBuilder, TableRefIdCounter},
+        insn::{InsertFlags, Insn},
+        BranchOffset, CursorID,
+    },
+    Result,
 };
-use crate::translate::planner::resolve_window_and_aggregate_functions;
-use crate::translate::result_row::emit_select_result;
-use crate::types::KeyInfo;
-use crate::util::exprs_are_equivalent;
-use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
-use crate::vdbe::insn::{InsertFlags, Insn};
-use crate::vdbe::{BranchOffset, CursorID};
-use crate::Result;
-use std::mem;
-use std::sync::Arc;
-use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
+use std::{mem, sync::Arc};
+use turso_parser::ast::{Expr, FunctionTail, Literal, Name, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 

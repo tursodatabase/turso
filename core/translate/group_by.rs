@@ -7,18 +7,17 @@ use super::{
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
 };
-use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
-    plan::Aggregate,
-};
-use crate::translate::{
-    emitter::Resolver,
-    expr::{walk_expr, WalkControl},
-    optimizer::Optimizable,
-};
 use crate::{
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr, CollationSeq},
+    translate::{
+        aggregation::{translate_aggregation_step, AggArgumentSource},
+        collate::{get_collseq_from_expr, CollationSeq},
+        emitter::Resolver,
+        expr::{walk_expr, WalkControl},
+        optimizer::Optimizable,
+        plan::{Aggregate, ResultSetColumn},
+    },
+    types::KeyInfo,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -27,7 +26,6 @@ use crate::{
     },
     Result,
 };
-use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
 
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]

@@ -297,9 +297,7 @@ impl MaterializedViewCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::btree::BTreeCursor;
-    use crate::util::IOExt;
-    use crate::{Connection, Database, OpenFlags};
+    use crate::{storage::btree::BTreeCursor, util::IOExt, Connection, Database, OpenFlags};
     use std::sync::Arc;
 
     /// Helper to create a test connection with a table and materialized view

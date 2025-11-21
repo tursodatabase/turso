@@ -1,10 +1,12 @@
-use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::num::NonZeroUsize;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    num::NonZeroUsize,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 use turso_ext::{
     register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
     ExtResult, IndexInfo, OrderByInfo, ResultCode, StepResult, VTabCursor, VTabKind, VTabModule,

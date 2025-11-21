@@ -1,6 +1,5 @@
 use parking_lot::RwLock;
-use std::iter::successors;
-use std::{result::Result, sync::Arc};
+use std::{iter::successors, result::Result, sync::Arc};
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 

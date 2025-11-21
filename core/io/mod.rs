@@ -1,14 +1,11 @@
-use crate::storage::buffer_pool::ArenaBuffer;
-use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
-use crate::{BufferPool, Result};
+use crate::{
+    storage::{buffer_pool::ArenaBuffer, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE},
+    BufferPool, Result,
+};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use rand::{Rng, RngCore};
-use std::cell::RefCell;
-use std::fmt;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::{fmt::Debug, pin::Pin};
+use std::{cell::RefCell, fmt, fmt::Debug, pin::Pin, ptr::NonNull, sync::Arc};
 
 cfg_block! {
     #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {

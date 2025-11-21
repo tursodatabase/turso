@@ -1,8 +1,6 @@
 use core::f64;
 
-use crate::types::Value;
-use crate::vdbe::Register;
-use crate::LimboError;
+use crate::{types::Value, vdbe::Register, LimboError};
 
 fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result<String> {
     let pre_formatted = format!("{number:.6e}");

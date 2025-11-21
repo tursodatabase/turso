@@ -3,8 +3,10 @@ pub mod rowid_alias;
 
 #[cfg(test)]
 mod fuzz_tests {
-    use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
-    use rand::Rng;
+    use rand::{
+        seq::{IndexedRandom, IteratorRandom, SliceRandom},
+        Rng,
+    };
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};

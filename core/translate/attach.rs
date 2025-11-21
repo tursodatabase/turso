@@ -1,10 +1,14 @@
-use crate::function::{Func, ScalarFunc};
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::{sanitize_string, translate_expr};
-use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
-use crate::util::normalize_ident;
-use crate::vdbe::insn::Insn;
-use crate::Result;
+use crate::{
+    function::{Func, ScalarFunc},
+    translate::{
+        emitter::Resolver,
+        expr::{sanitize_string, translate_expr},
+        ProgramBuilder, ProgramBuilderOpts,
+    },
+    util::normalize_ident,
+    vdbe::insn::Insn,
+    Result,
+};
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement

@@ -4,23 +4,30 @@
 use chrono::Datelike;
 use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
-use turso_parser::ast::{PragmaName, QualifiedName};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
-use crate::pragma::pragma_for;
-use crate::schema::Schema;
-use crate::storage::encryption::{CipherMode, EncryptionKey};
-use crate::storage::pager::AutoVacuumMode;
-use crate::storage::pager::Pager;
-use crate::storage::sqlite3_ondisk::CacheSize;
-use crate::storage::wal::CheckpointMode;
-use crate::translate::emitter::{Resolver, TransactionMode};
-use crate::translate::schema::translate_create_table;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{
+    bail_parse_error,
+    pragma::pragma_for,
+    schema::Schema,
+    storage::{
+        encryption::{CipherMode, EncryptionKey},
+        pager::{AutoVacuumMode, Pager},
+        sqlite3_ondisk::CacheSize,
+        wal::CheckpointMode,
+    },
+    translate::{
+        emitter::{Resolver, TransactionMode},
+        schema::translate_create_table,
+    },
+    util::{normalize_ident, parse_signed_number, parse_string, IOExt as _},
+    vdbe::{
+        builder::{ProgramBuilder, ProgramBuilderOpts},
+        insn::{Cookie, Insn},
+    },
+    CaptureDataChangesMode, LimboError, Value,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 

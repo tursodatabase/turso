@@ -2,32 +2,40 @@
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::array;
-use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::{array, borrow::Cow, collections::BTreeMap};
 use strum::EnumString;
 use tracing::{instrument, Level};
 
 use parking_lot::RwLock;
-use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::{fmt, sync::Arc};
-
-use super::buffer_pool::BufferPool;
-use super::pager::{PageRef, Pager};
-use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
-use crate::fast_lock::SpinLock;
-use crate::io::CompletionGroup;
-use crate::io::{clock, File, IO};
-use crate::storage::database::EncryptionOrChecksum;
-use crate::storage::sqlite3_ondisk::{
-    begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
-    write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+use std::{
+    fmt,
+    fmt::{Debug, Formatter},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
 };
-use crate::types::{IOCompletions, IOResult};
+
+use super::{
+    buffer_pool::BufferPool,
+    pager::{PageRef, Pager},
+    sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE},
+};
 use crate::{
-    bail_corrupt_error, io_yield_one, return_if_io, turso_assert, Buffer, Completion,
-    CompletionError, IOContext, LimboError, Result,
+    bail_corrupt_error,
+    fast_lock::SpinLock,
+    io::{clock, CompletionGroup, File, IO},
+    io_yield_one, return_if_io,
+    storage::{
+        database::EncryptionOrChecksum,
+        sqlite3_ondisk::{
+            begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
+            write_pages_vectored, PageSize, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
+        },
+    },
+    turso_assert,
+    types::{IOCompletions, IOResult},
+    Buffer, Completion, CompletionError, IOContext, LimboError, Result,
 };
 
 #[derive(Debug, Clone, Default)]

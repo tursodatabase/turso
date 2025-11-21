@@ -1,9 +1,13 @@
-use crate::errors::{Result, TursoError, TURSO_ETC};
-use crate::turso_connection::TursoConnection;
-use crate::utils::set_err_msg_and_throw_exception;
-use jni::objects::{JByteArray, JObject};
-use jni::sys::{jint, jlong};
-use jni::JNIEnv;
+use crate::{
+    errors::{Result, TursoError, TURSO_ETC},
+    turso_connection::TursoConnection,
+    utils::set_err_msg_and_throw_exception,
+};
+use jni::{
+    objects::{JByteArray, JObject},
+    sys::{jint, jlong},
+    JNIEnv,
+};
 use std::sync::Arc;
 use turso_core::Database;
 

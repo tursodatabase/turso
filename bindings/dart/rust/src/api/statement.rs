@@ -1,16 +1,15 @@
-use std::collections::HashMap;
-use std::num::NonZero;
-use std::sync::Arc;
+use std::{collections::HashMap, num::NonZero, sync::Arc};
 
 use flutter_rust_bridge::frb;
-pub use turso_core::Connection;
-pub use turso_core::Statement;
 use turso_core::Value;
+pub use turso_core::{Connection, Statement};
 
-use crate::helpers::result::ExecuteResult;
-use crate::helpers::return_value::ReturnValue;
-use crate::helpers::wrapper::Wrapper;
-use crate::helpers::{params::Params, result::QueryResult};
+use crate::helpers::{
+    params::Params,
+    result::{ExecuteResult, QueryResult},
+    return_value::ReturnValue,
+    wrapper::Wrapper,
+};
 
 #[frb(opaque)]
 pub struct RustStatement {

@@ -1,13 +1,16 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::{
+    io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, StepResult, Value as DbValue};
 
 #[derive(Debug, Serialize, Deserialize)]

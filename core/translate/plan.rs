@@ -5,11 +5,12 @@ use turso_parser::ast::{
 
 use crate::{
     function::AggFunc,
-    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
+    schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table, Type},
     translate::{
         collate::get_collseq_from_expr, emitter::UpdateRowSource,
         optimizer::constraints::SeekRangeConstraint,
     },
+    types::SeekOp,
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
@@ -18,7 +19,6 @@ use crate::{
     },
     Result, VirtualTable,
 };
-use crate::{schema::Type, types::SeekOp};
 
 use turso_parser::ast::TableInternalId;
 
@@ -163,8 +163,7 @@ impl From<Expr> for WhereTerm {
     }
 }
 
-use crate::ast::Expr;
-use crate::util::exprs_are_equivalent;
+use crate::{ast::Expr, util::exprs_are_equivalent};
 
 /// The loop index where to evaluate the condition.
 /// For example, in `SELECT * FROM u JOIN p WHERE u.id = 5`, the condition can already be evaluated at the first loop (idx 0),

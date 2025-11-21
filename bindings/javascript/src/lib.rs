@@ -13,17 +13,14 @@
 #[cfg(feature = "browser")]
 pub mod browser;
 
-use napi::bindgen_prelude::*;
-use napi::{Env, Task};
+use napi::{bindgen_prelude::*, Env, Task};
 use napi_derive::napi;
-use std::sync::{Mutex, OnceLock};
 use std::{
     cell::{Cell, RefCell},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::{filter::LevelFilter, fmt::format::FmtSpan};
 
 /// Step result constants
 const STEP_ROW: u32 = 1;

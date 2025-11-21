@@ -1,52 +1,56 @@
 #![allow(unused_variables)]
-use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::AlterTableFunc;
-use crate::mvcc::database::CheckpointStateMachine;
-use crate::schema::Table;
-use crate::state_machine::StateMachine;
-use crate::storage::btree::{
-    integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
-};
-use crate::storage::database::DatabaseFile;
-use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
-use crate::translate::collate::CollationSeq;
-use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
-};
-use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-};
-use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
-use crate::vdbe::insn::InsertFlags;
-use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
-use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        SQLITE_CONSTRAINT_UNIQUE,
     },
     ext::ExtValue,
-    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, AlterTableFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
-    translate::emitter::TransactionMode,
+    get_cursor,
+    mvcc::database::CheckpointStateMachine,
+    schema::Table,
+    state_machine::StateMachine,
+    storage::{
+        btree::{
+            integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
+        },
+        database::DatabaseFile,
+        page_cache::PageCache,
+        pager::{AtomicDbState, CreateBTreeFlags, DbState},
+        sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize},
+    },
+    translate::{collate::CollationSeq, emitter::TransactionMode},
+    types::{
+        compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
+        ImmutableRecord, SeekResult, Text,
+    },
+    util::{
+        normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+        rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    },
+    vdbe::{
+        affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber},
+        insn::InsertFlags,
+        registers_to_ref_values,
+        value::ComparisonOp,
+        EndStatement, StepResult, TxnCleanup,
+    },
+    vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice},
+    CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor,
 };
-use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
 use either::Either;
-use std::any::Any;
-use std::env::temp_dir;
-use std::ops::DerefMut;
 use std::{
+    any::Any,
     borrow::BorrowMut,
+    env::temp_dir,
     num::NonZero,
+    ops::DerefMut,
     sync::{atomic::Ordering, Arc},
 };
 use turso_macros::match_ignore_ascii_case;
@@ -76,8 +80,10 @@ use super::{
     CommitState,
 };
 use parking_lot::{Mutex, RwLock};
-use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
-use turso_parser::parser::Parser;
+use turso_parser::{
+    ast::{self, ForeignKeyClause, Name, ResolveType},
+    parser::Parser,
+};
 
 use super::{
     likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape},

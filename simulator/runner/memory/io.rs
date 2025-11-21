@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -7,9 +6,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
 
-use crate::runner::SimIO;
-use crate::runner::clock::SimulatorClock;
-use crate::runner::memory::file::MemorySimFile;
+use crate::runner::{SimIO, clock::SimulatorClock, memory::file::MemorySimFile};
 
 /// File descriptor
 pub type Fd = String;

@@ -1,20 +1,27 @@
-use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
-use super::dbsp::Delta;
-use super::operator::ComputationTracker;
-use crate::schema::{BTreeTable, Schema};
-use crate::storage::btree::CursorTrait;
-use crate::translate::logical::LogicalPlanBuilder;
-use crate::types::{IOResult, Value};
-use crate::util::{extract_view_columns, ViewColumnSchema};
-use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use super::{
+    compiler::{DbspCircuit, DbspCompiler, DeltaSet},
+    dbsp::Delta,
+    operator::ComputationTracker,
+};
+use crate::{
+    return_if_io,
+    schema::{BTreeTable, Schema},
+    storage::btree::CursorTrait,
+    translate::logical::LogicalPlanBuilder,
+    types::{IOResult, Value},
+    util::{extract_view_columns, ViewColumnSchema},
+    LimboError, Pager, Result, Statement,
+};
 use parking_lot::Mutex;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::rc::Rc;
-use std::sync::Arc;
-use turso_parser::ast;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt,
+    rc::Rc,
+    sync::Arc,
+};
 use turso_parser::{
+    ast,
     ast::{Cmd, Stmt},
     parser::Parser,
 };
@@ -1386,8 +1393,7 @@ mod tests {
     use super::*;
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use std::sync::Arc;
-    use turso_parser::ast;
-    use turso_parser::parser::Parser;
+    use turso_parser::{ast, parser::Parser};
 
     // Helper function to create a test schema with multiple tables
     fn create_test_schema() -> Schema {

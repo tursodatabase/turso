@@ -1,11 +1,17 @@
-use crate::schema::{Schema, DBSP_TABLE_PREFIX};
-use crate::storage::pager::CreateBTreeFlags;
-use crate::translate::emitter::Resolver;
-use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{Connection, Result};
+use crate::{
+    schema::{Schema, DBSP_TABLE_PREFIX},
+    storage::pager::CreateBTreeFlags,
+    translate::{
+        emitter::Resolver,
+        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    },
+    util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
+    vdbe::{
+        builder::{CursorType, ProgramBuilder},
+        insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+    },
+    Connection, Result,
+};
 use std::sync::Arc;
 use turso_parser::ast;
 
@@ -40,8 +46,7 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    use crate::incremental::view::IncrementalView;
-    use crate::schema::BTreeTable;
+    use crate::{incremental::view::IncrementalView, schema::BTreeTable};
     let view_column_schema =
         IncrementalView::validate_and_extract_columns(select_stmt, resolver.schema)?;
     let view_columns = view_column_schema.flat_columns();

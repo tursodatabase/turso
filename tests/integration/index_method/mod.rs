@@ -10,7 +10,10 @@ use turso_core::{
     },
     schema::IndexColumn,
     types::IOResult,
-    vector::{self, vector_types::VectorType},
+    vector::{
+        vector_types::VectorType,
+        {self},
+    },
     Register, Result, Value,
 };
 use turso_parser::ast::SortOrder;

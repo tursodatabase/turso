@@ -43,13 +43,17 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::schema::Schema;
-use crate::storage::pager::Pager;
-use crate::translate::delete::translate_delete;
-use crate::translate::emitter::Resolver;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
-use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use crate::{
+    bail_parse_error,
+    schema::Schema,
+    storage::pager::Pager,
+    translate::{delete::translate_delete, emitter::Resolver},
+    vdbe::{
+        builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode},
+        Program,
+    },
+    Connection, Result, SymbolTable,
+};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index};

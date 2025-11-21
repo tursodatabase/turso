@@ -1,15 +1,20 @@
-use crate::schema::{Schema, Table};
-use crate::translate::emitter::{emit_program, Resolver};
-use crate::translate::expr::process_returning_clause;
-use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{
-    DeletePlan, JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn, SelectPlan,
+use crate::{
+    schema::{Schema, Table},
+    translate::{
+        emitter::{emit_program, Resolver},
+        expr::process_returning_clause,
+        optimizer::optimize_plan,
+        plan::{
+            DeletePlan, JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn,
+            SelectPlan,
+        },
+        planner::{parse_limit, parse_where},
+        trigger_exec::has_relevant_triggers_type_only,
+    },
+    util::normalize_ident,
+    vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
+    Result,
 };
-use crate::translate::planner::{parse_limit, parse_where};
-use crate::translate::trigger_exec::has_relevant_triggers_type_only;
-use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::Result;
 use std::sync::Arc;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
 

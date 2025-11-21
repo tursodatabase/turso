@@ -1,5 +1,4 @@
-use std::cmp::PartialEq;
-use std::sync::Arc;
+use std::{cmp::PartialEq, sync::Arc};
 
 use super::{
     expr::walk_expr,
@@ -10,29 +9,22 @@ use super::{
     },
     select::prepare_select_plan,
 };
-use crate::translate::{
-    emitter::Resolver,
-    expr::{BindingBehavior, WalkControl},
-    plan::{NonFromClauseSubquery, SubqueryState},
-};
 use crate::{
     ast::Limit,
-    function::Func,
+    function::{AggFunc, ExtFunc, Func},
     schema::Table,
+    translate::{
+        emitter::Resolver,
+        expr::{bind_and_rewrite_expr, BindingBehavior, WalkControl},
+        plan::{NonFromClauseSubquery, SubqueryState, Window, WindowFunction},
+    },
     util::{exprs_are_equivalent, normalize_ident},
+    vdbe::builder::ProgramBuilder,
     Result,
 };
-use crate::{
-    function::{AggFunc, ExtFunc},
-    translate::expr::bind_and_rewrite_expr,
-};
-use crate::{
-    translate::plan::{Window, WindowFunction},
-    vdbe::builder::ProgramBuilder,
-};
-use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, TableInternalId, With,
+    self, As, Expr, FromClause, JoinType, Literal::Null, Materialized, Over, QualifiedName,
+    TableInternalId, With,
 };
 
 /// Valid ways to refer to the rowid of a btree table.

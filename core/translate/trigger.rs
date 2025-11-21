@@ -1,11 +1,17 @@
-use crate::translate::emitter::Resolver;
-use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
-use crate::translate::ProgramBuilder;
-use crate::translate::ProgramBuilderOpts;
-use crate::util::normalize_ident;
-use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Result};
+use crate::{
+    bail_parse_error,
+    translate::{
+        emitter::Resolver,
+        schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+        ProgramBuilder, ProgramBuilderOpts,
+    },
+    util::normalize_ident,
+    vdbe::{
+        builder::CursorType,
+        insn::{Cookie, Insn},
+    },
+    Result,
+};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST

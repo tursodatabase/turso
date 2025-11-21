@@ -3,26 +3,28 @@ use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 
-use super::emitter::Resolver;
-use super::optimizer::Optimizable;
-use super::plan::TableReferences;
+use super::{emitter::Resolver, optimizer::Optimizable, plan::TableReferences};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::functions::datetime;
-use crate::schema::{Table, Type};
-use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::{Operation, ResultSetColumn};
-use crate::translate::planner::parse_row_id;
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::CursorKey;
-use crate::vdbe::{
-    builder::ProgramBuilder,
-    insn::{CmpInsFlags, Insn},
-    BranchOffset,
+use crate::{
+    function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc},
+    functions::datetime,
+    schema::{Table, Type},
+    translate::{
+        optimizer::TakeOwnership,
+        plan::{Operation, ResultSetColumn},
+        planner::parse_row_id,
+    },
+    turso_assert,
+    util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal},
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, ProgramBuilder},
+        insn::{CmpInsFlags, Insn},
+        BranchOffset,
+    },
+    Result, Value,
 };
-use crate::{turso_assert, Result, Value};
 
 use super::collate::CollationSeq;
 

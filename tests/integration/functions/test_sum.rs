@@ -26,9 +26,7 @@ fn sum_errors_on_integer_overflow() {
         .expect_err("SUM should report integer overflow");
     assert!(matches!(err, LimboError::IntegerOverflow));
 
-    use rusqlite::ffi::Error as FfiError;
-    use rusqlite::Error::SqliteFailure;
-    use rusqlite::ErrorCode;
+    use rusqlite::{ffi::Error as FfiError, Error::SqliteFailure, ErrorCode};
 
     let mut stmt = sqlite_conn
         .prepare("SELECT sum(a) FROM t")

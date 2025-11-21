@@ -1,11 +1,11 @@
 use parking_lot::RwLock;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 pub mod logical_log;
-use crate::mvcc::database::LogRecord;
-use crate::mvcc::persistent_storage::logical_log::LogicalLog;
-use crate::{Completion, File, Result};
+use crate::{
+    mvcc::{database::LogRecord, persistent_storage::logical_log::LogicalLog},
+    Completion, File, Result,
+};
 
 pub struct Storage {
     pub logical_log: RwLock<LogicalLog>,

@@ -1,7 +1,9 @@
-use crate::schema::Schema;
-use crate::translate::{emitter::TransactionMode, ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::Insn;
-use crate::Result;
+use crate::{
+    schema::Schema,
+    translate::{emitter::TransactionMode, ProgramBuilder, ProgramBuilderOpts},
+    vdbe::insn::Insn,
+    Result,
+};
 use turso_parser::ast::{Name, TransactionType};
 
 pub fn translate_tx_begin(

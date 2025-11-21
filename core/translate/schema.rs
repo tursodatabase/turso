@@ -1,21 +1,23 @@
 use std::sync::Arc;
 
-use crate::ast;
-use crate::ext::VTabImpl;
-use crate::schema::{
-    create_table, BTreeTable, ColDef, Column, Table, Type, RESERVED_TABLE_PREFIXES,
+use crate::{
+    ast, bail_constraint_error, bail_parse_error,
+    ext::VTabImpl,
+    schema::{create_table, BTreeTable, ColDef, Column, Table, Type, RESERVED_TABLE_PREFIXES},
+    storage::pager::CreateBTreeFlags,
+    translate::{
+        emitter::{
+            emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
+        },
+        ProgramBuilder, ProgramBuilderOpts,
+    },
+    util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
+    vdbe::{
+        builder::CursorType,
+        insn::{CmpInsFlags, Cookie, InsertFlags, Insn},
+    },
+    Connection, Result,
 };
-use crate::storage::pager::CreateBTreeFlags;
-use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
-};
-use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
-use crate::util::normalize_ident;
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
-use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{CmpInsFlags, Cookie, InsertFlags, Insn};
-use crate::Connection;
-use crate::{bail_constraint_error, bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 

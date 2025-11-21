@@ -1045,8 +1045,10 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::Value;
-    use crate::vdbe::{Bitfield, Register};
+    use crate::{
+        types::Value,
+        vdbe::{Bitfield, Register},
+    };
 
     use rand::{Rng, RngCore};
     use std::collections::HashMap;

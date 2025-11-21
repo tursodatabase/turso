@@ -1,12 +1,18 @@
-use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
-use crate::schema::Column;
-use crate::util::columns_from_create_table_body;
-use crate::{Connection, LimboError, SymbolTable, Value};
+use crate::{
+    pragma::{PragmaVirtualTable, PragmaVirtualTableCursor},
+    schema::Column,
+    util::columns_from_create_table_body,
+    Connection, LimboError, SymbolTable, Value,
+};
 use parking_lot::RwLock;
-use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
+use std::{
+    ffi::c_void,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Arc,
+    },
+};
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 

@@ -25,12 +25,17 @@
 
 // Section: imports
 
-use crate::api::connection::*;
-use crate::api::statement::*;
-use crate::helpers::wrapper::*;
-use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
-use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
-use flutter_rust_bridge::{Handler, IntoIntoDart};
+use crate::{
+    api::{connection::*, statement::*},
+    helpers::wrapper::*,
+};
+use flutter_rust_bridge::{
+    for_generated::{
+        byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt},
+        transform_result_dco, Lifetimeable, Lockable,
+    },
+    Handler, IntoIntoDart,
+};
 
 // Section: boilerplate
 
@@ -1749,14 +1754,17 @@ mod io {
     // Section: imports
 
     use super::*;
-    use crate::api::connection::*;
-    use crate::api::statement::*;
-    use crate::helpers::wrapper::*;
-    use flutter_rust_bridge::for_generated::byteorder::{
-        NativeEndian, ReadBytesExt, WriteBytesExt,
+    use crate::{
+        api::{connection::*, statement::*},
+        helpers::wrapper::*,
     };
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
-    use flutter_rust_bridge::{Handler, IntoIntoDart};
+    use flutter_rust_bridge::{
+        for_generated::{
+            byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt},
+            transform_result_dco, Lifetimeable, Lockable,
+        },
+        Handler, IntoIntoDart,
+    };
 
     // Section: boilerplate
 
@@ -1830,16 +1838,19 @@ mod web {
     // Section: imports
 
     use super::*;
-    use crate::api::connection::*;
-    use crate::api::statement::*;
-    use crate::helpers::wrapper::*;
-    use flutter_rust_bridge::for_generated::byteorder::{
-        NativeEndian, ReadBytesExt, WriteBytesExt,
+    use crate::{
+        api::{connection::*, statement::*},
+        helpers::wrapper::*,
     };
-    use flutter_rust_bridge::for_generated::wasm_bindgen;
-    use flutter_rust_bridge::for_generated::wasm_bindgen::prelude::*;
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
-    use flutter_rust_bridge::{Handler, IntoIntoDart};
+    use flutter_rust_bridge::{
+        for_generated::{
+            byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt},
+            transform_result_dco, wasm_bindgen,
+            wasm_bindgen::prelude::*,
+            Lifetimeable, Lockable,
+        },
+        Handler, IntoIntoDart,
+    };
 
     // Section: boilerplate
 

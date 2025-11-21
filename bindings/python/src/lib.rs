@@ -1,11 +1,10 @@
 use anyhow::Result;
 use errors::*;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::rc::Rc;
-use std::sync::Arc;
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyList, PyTuple},
+};
+use std::{cell::RefCell, num::NonZeroUsize, rc::Rc, sync::Arc};
 use turso_core::{DatabaseOpts, Value};
 
 mod errors;

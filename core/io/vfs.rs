@@ -1,11 +1,17 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
-use crate::ext::VfsMod;
-use crate::io::clock::{Clock, DefaultClock, Instant};
-use crate::io::CompletionInner;
-use crate::{LimboError, Result};
-use std::ffi::{c_void, CString};
-use std::ptr::NonNull;
-use std::sync::Arc;
+use crate::{
+    ext::VfsMod,
+    io::{
+        clock::{Clock, DefaultClock, Instant},
+        CompletionInner,
+    },
+    LimboError, Result,
+};
+use std::{
+    ffi::{c_void, CString},
+    ptr::NonNull,
+    sync::Arc,
+};
 use turso_ext::{BufferRef, IOCallback, SendPtr, VfsFileImpl, VfsImpl};
 
 impl Clock for VfsMod {

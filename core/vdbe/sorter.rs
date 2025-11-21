@@ -1,22 +1,23 @@
 use turso_parser::ast::SortOrder;
 
-use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
-use std::collections::BinaryHeap;
-use std::rc::Rc;
-use std::sync::{atomic, Arc, RwLock};
+use std::{
+    cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse},
+    collections::BinaryHeap,
+    rc::Rc,
+    sync::{atomic, Arc, RwLock},
+};
 use tempfile;
 
-use crate::types::IOCompletions;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, OpenFlags, IO},
+    io_yield_one, return_if_io,
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
-    Result,
+    types::{IOCompletions, IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
+    CompletionError, Result,
 };
-use crate::{io_yield_one, return_if_io, CompletionError};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {
@@ -724,10 +725,12 @@ enum SortedChunkIOState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::collate::CollationSeq;
-    use crate::types::{ImmutableRecord, Value, ValueRef, ValueType};
-    use crate::util::IOExt;
-    use crate::PlatformIO;
+    use crate::{
+        translate::collate::CollationSeq,
+        types::{ImmutableRecord, Value, ValueRef, ValueType},
+        util::IOExt,
+        PlatformIO,
+    };
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,

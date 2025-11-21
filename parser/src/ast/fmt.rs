@@ -1,10 +1,11 @@
 //! AST node format
 use std::fmt::{self, Display, Formatter, Write};
 
-use crate::ast::*;
-use crate::token::TokenType;
-use crate::token::TokenType::*;
-use crate::Result;
+use crate::{
+    ast::*,
+    token::{TokenType, TokenType::*},
+    Result,
+};
 
 use crate::ast::TableInternalId;
 

@@ -1,48 +1,35 @@
-use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::persistent_storage::Storage;
-use crate::state_machine::StateMachine;
-use crate::state_machine::StateTransition;
-use crate::state_machine::TransitionResult;
-use crate::storage::btree::BTreeCursor;
-use crate::storage::btree::BTreeKey;
-use crate::storage::btree::CursorTrait;
-use crate::storage::btree::CursorValidState;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use crate::storage::wal::TursoRwLock;
-use crate::translate::plan::IterationDirection;
-use crate::turso_assert;
-use crate::types::IOCompletions;
-use crate::types::IOResult;
-use crate::types::ImmutableRecord;
-use crate::types::RecordCursor;
-use crate::types::SeekResult;
-use crate::Completion;
-use crate::File;
-use crate::IOExt;
-use crate::LimboError;
-use crate::Result;
-use crate::Statement;
-use crate::StepResult;
-use crate::Value;
-use crate::ValueRef;
-use crate::{Connection, Pager};
+use crate::{
+    mvcc::{clock::LogicalClock, persistent_storage::Storage},
+    state_machine::{StateMachine, StateTransition, TransitionResult},
+    storage::{
+        btree::{BTreeCursor, BTreeKey, CursorTrait, CursorValidState},
+        sqlite3_ondisk::DatabaseHeader,
+        wal::TursoRwLock,
+    },
+    translate::plan::IterationDirection,
+    turso_assert,
+    types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor, SeekResult},
+    Completion, Connection, File, IOExt, LimboError, Pager, Result, Statement, StepResult, Value,
+    ValueRef,
+};
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
-use std::cell::RefCell;
-use std::fmt::Debug;
-use std::marker::PhantomData;
-use std::ops::Bound;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tracing::instrument;
-use tracing::Level;
+use std::{
+    cell::RefCell,
+    fmt::Debug,
+    marker::PhantomData,
+    ops::Bound,
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc,
+    },
+};
+use tracing::{instrument, Level};
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};
 
-use super::persistent_storage::logical_log::StreamingLogicalLogReader;
-use super::persistent_storage::logical_log::StreamingResult;
+use super::persistent_storage::logical_log::{StreamingLogicalLogReader, StreamingResult};
 
 #[cfg(test)]
 pub mod tests;

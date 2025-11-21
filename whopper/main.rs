@@ -12,9 +12,7 @@ use sql_generation::{
         table::{Column, ColumnType, Index, Table},
     },
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{cell::RefCell, collections::HashMap, sync::Arc};
 use tracing::trace;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use turso_core::{

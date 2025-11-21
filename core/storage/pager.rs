@@ -1,36 +1,41 @@
-use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::IOV_MAX;
-use crate::storage::{
-    buffer_pool::BufferPool,
-    database::DatabaseStorage,
-    sqlite3_ondisk::{
-        self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
-    },
-    wal::{CheckpointResult, Wal},
-};
-use crate::types::{IOCompletions, WalState};
-use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
-    IOResult, LimboError, Result, TransactionState,
+    io::CompletionGroup,
+    io_yield_one, return_if_io,
+    storage::{
+        buffer_pool::BufferPool,
+        database::DatabaseStorage,
+        sqlite3_ondisk::{
+            self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
+        },
+        subjournal::Subjournal,
+        wal::{CheckpointResult, Wal, IOV_MAX},
+    },
+    turso_assert,
+    types::{IOCompletions, WalFrameInfo, WalState},
+    util::IOExt as _,
+    Completion, CompletionError, Connection, IOContext, IOResult, LimboError, OpenFlags, Result,
+    TransactionState, IO,
 };
-use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
-use std::cell::{RefCell, UnsafeCell};
-use std::collections::BTreeSet;
-use std::rc::Rc;
-use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+use std::{
+    cell::{RefCell, UnsafeCell},
+    collections::BTreeSet,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        Arc,
+    },
 };
-use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 use turso_macros::AtomicEnum;
 
-use super::btree::btree_init_page;
-use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
-use super::sqlite3_ondisk::begin_write_btree_page;
-use super::wal::CheckpointMode;
+use super::{
+    btree::btree_init_page,
+    page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey},
+    sqlite3_ondisk::begin_write_btree_page,
+    wal::CheckpointMode,
+};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
@@ -3080,19 +3085,20 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::Arc;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-    use super::ptrmap::*;
-    use super::*;
-    use crate::io::{MemoryIO, OpenFlags, IO};
-    use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::database::DatabaseFile;
-    use crate::storage::page_cache::PageCache;
-    use crate::storage::pager::Pager;
-    use crate::storage::sqlite3_ondisk::PageSize;
-    use crate::storage::wal::{WalFile, WalFileShared};
+    use super::{ptrmap::*, *};
+    use crate::{
+        io::{MemoryIO, OpenFlags, IO},
+        storage::{
+            buffer_pool::BufferPool,
+            database::DatabaseFile,
+            page_cache::PageCache,
+            pager::Pager,
+            sqlite3_ondisk::PageSize,
+            wal::{WalFile, WalFileShared},
+        },
+    };
 
     pub fn run_until_done<T>(
         mut action: impl FnMut() -> Result<IOResult<T>>,

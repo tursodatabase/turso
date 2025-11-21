@@ -253,8 +253,10 @@ fn test_corruption_turso_magic_bytes() -> anyhow::Result<()> {
 
     // corrupt the Turso magic bytes by changing "Turso" to "Vurso" (the db name as it was intended)
     {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
+        use std::{
+            fs::OpenOptions,
+            io::{Seek, SeekFrom, Write},
+        };
 
         let mut file = OpenOptions::new().write(true).open(&db_path)?;
 
@@ -331,8 +333,10 @@ fn test_corruption_associated_data_bytes() -> anyhow::Result<()> {
 
         // corrupt one byte
         {
-            use std::fs::OpenOptions;
-            use std::io::{Read, Seek, SeekFrom, Write};
+            use std::{
+                fs::OpenOptions,
+                io::{Read, Seek, SeekFrom, Write},
+            };
 
             let mut file = OpenOptions::new()
                 .read(true)
@@ -383,8 +387,10 @@ fn test_turso_header_structure() -> anyhow::Result<()> {
 
     let verify_header =
         |db_path: &str, expected_cipher_id: u8, description: &str| -> anyhow::Result<()> {
-            use std::fs::File;
-            use std::io::{Read, Seek, SeekFrom};
+            use std::{
+                fs::File,
+                io::{Read, Seek, SeekFrom},
+            };
 
             let mut file = File::open(db_path)?;
             let mut header = [0u8; 16];

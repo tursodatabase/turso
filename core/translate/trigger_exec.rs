@@ -1,14 +1,16 @@
-use crate::schema::{BTreeTable, Trigger};
-use crate::translate::emitter::Resolver;
-use crate::translate::expr::translate_expr;
-use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
-use crate::util::normalize_ident;
-use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, QueryMode, Result, Statement};
+use crate::{
+    bail_parse_error,
+    schema::{BTreeTable, Trigger},
+    translate::{
+        emitter::Resolver, expr::translate_expr, translate_inner, ProgramBuilder,
+        ProgramBuilderOpts,
+    },
+    util::normalize_ident,
+    vdbe::insn::Insn,
+    QueryMode, Result, Statement,
+};
 use parking_lot::RwLock;
-use std::collections::HashSet;
-use std::num::NonZero;
-use std::sync::Arc;
+use std::{collections::HashSet, num::NonZero, sync::Arc};
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -87,8 +89,7 @@ fn rewrite_trigger_expr_for_subprogram(
     table: &BTreeTable,
     ctx: &TriggerSubprogramContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-    use crate::translate::expr::WalkControl;
+    use crate::translate::expr::{walk_expr_mut, WalkControl};
 
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {
@@ -732,8 +733,7 @@ fn rewrite_trigger_expr_for_when_clause(
     table: &BTreeTable,
     ctx: &TriggerContext,
 ) -> Result<()> {
-    use crate::translate::expr::walk_expr_mut;
-    use crate::translate::expr::WalkControl;
+    use crate::translate::expr::{walk_expr_mut, WalkControl};
 
     walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
         match e {

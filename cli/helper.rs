@@ -1,23 +1,28 @@
 use clap::Parser;
 use nu_ansi_term::{Color, Style};
-use rustyline::completion::{extract_word, Completer, Pair};
-use rustyline::highlight::Highlighter;
-use rustyline::hint::HistoryHinter;
-use rustyline::{Completer, Helper, Hinter, Validator};
+use rustyline::{
+    completion::{extract_word, Completer, Pair},
+    highlight::Highlighter,
+    hint::HistoryHinter,
+    Completer, Helper, Hinter, Validator,
+};
 use shlex::Shlex;
-use std::cell::RefCell;
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::{ffi::OsString, path::PathBuf, str::FromStr as _};
-use syntect::dumps::from_uncompressed_data;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::{Scope, SyntaxSet};
-use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use std::{
+    cell::RefCell, ffi::OsString, marker::PhantomData, path::PathBuf, str::FromStr as _, sync::Arc,
+};
+use syntect::{
+    dumps::from_uncompressed_data,
+    easy::HighlightLines,
+    highlighting::ThemeSet,
+    parsing::{Scope, SyntaxSet},
+    util::{as_24_bit_terminal_escaped, LinesWithEndings},
+};
 use turso_core::{Connection, StepResult};
 
-use crate::commands::CommandParser;
-use crate::config::{HighlightConfig, CONFIG_DIR};
+use crate::{
+    commands::CommandParser,
+    config::{HighlightConfig, CONFIG_DIR},
+};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {

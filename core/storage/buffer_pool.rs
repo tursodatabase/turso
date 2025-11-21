@@ -1,12 +1,14 @@
 use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
-use crate::fast_lock::SpinLock;
-use crate::io::TEMP_BUFFER_CACHE;
-use crate::{turso_assert, Buffer, LimboError, IO};
+use crate::{fast_lock::SpinLock, io::TEMP_BUFFER_CACHE, turso_assert, Buffer, LimboError, IO};
 use parking_lot::Mutex;
-use std::cell::UnsafeCell;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::{
+    cell::UnsafeCell,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Weak,
+    },
+};
 
 #[derive(Debug)]
 /// A buffer allocated from an arena from `[BufferPool]`
@@ -433,8 +435,7 @@ impl Arena {
 
 #[cfg(all(unix, not(miri)))]
 mod arena {
-    use libc::MAP_ANONYMOUS;
-    use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+    use libc::{mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
     use std::ffi::c_void;
 
     pub unsafe fn alloc(len: usize) -> *mut u8 {

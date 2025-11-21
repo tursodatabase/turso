@@ -1,8 +1,12 @@
-use crate::common::{self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check};
-use crate::common::{compare_string, do_flush, TempDatabase};
+use crate::common::{
+    self, compare_string, do_flush, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check,
+    TempDatabase,
+};
 use log::debug;
-use std::io::{Read, Seek, Write};
-use std::sync::Arc;
+use std::{
+    io::{Read, Seek, Write},
+    sync::Arc,
+};
 use turso_core::{
     CheckpointMode, Connection, Database, DatabaseOpts, LimboError, Row, Statement, StepResult,
     Value,

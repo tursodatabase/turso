@@ -1,8 +1,10 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
-use std::ffi::{self, CStr, CString};
-use std::num::{NonZero, NonZeroUsize};
+use std::{
+    ffi::{self, CStr, CString},
+    num::{NonZero, NonZeroUsize},
+};
 use tracing::trace;
 use turso_core::{CheckpointMode, LimboError, Value};
 

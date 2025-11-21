@@ -4,13 +4,12 @@ use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
-use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
         Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
         pragma::Pragma,
-        select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
+        select::{CompoundOperator, FromClause, ResultColumn, SelectInner, SelectTable},
         transaction::{Begin, Commit, Rollback},
         update::Update,
     },

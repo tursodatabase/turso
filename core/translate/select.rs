@@ -1,28 +1,34 @@
-use super::emitter::{emit_program, TranslateCtx};
-use super::plan::{
-    select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
-    Search, TableReferences, WhereTerm, Window,
+use super::{
+    emitter::{emit_program, TranslateCtx},
+    plan::{
+        select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference,
+        QueryDestination, Search, TableReferences, WhereTerm, Window,
+    },
 };
-use crate::schema::Table;
-use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
-use crate::translate::group_by::compute_group_by_sort_order;
-use crate::translate::optimizer::optimize_plan;
-use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
-use crate::translate::planner::{
-    break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    resolve_window_and_aggregate_functions,
+use crate::{
+    schema::Table,
+    translate::{
+        emitter::{OperationMode, Resolver},
+        expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior},
+        group_by::compute_group_by_sort_order,
+        optimizer::optimize_plan,
+        plan::{GroupBy, Plan, ResultSetColumn, SelectPlan},
+        planner::{
+            break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
+            resolve_window_and_aggregate_functions,
+        },
+        subquery::plan_subqueries_from_select_plan,
+        window::plan_windows,
+    },
+    util::normalize_ident,
+    vdbe::{
+        builder::{ProgramBuilder, ProgramBuilderOpts},
+        insn::Insn,
+    },
+    Connection, Result,
 };
-use crate::translate::subquery::plan_subqueries_from_select_plan;
-use crate::translate::window::plan_windows;
-use crate::util::normalize_ident;
-use crate::vdbe::builder::ProgramBuilderOpts;
-use crate::vdbe::insn::Insn;
-use crate::Connection;
-use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::sync::Arc;
-use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundSelect, Expr, ResultColumn};
 
 pub struct TranslateSelectResult {
     pub program: ProgramBuilder,

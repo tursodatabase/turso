@@ -2,8 +2,8 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 use turso_parser::ast::{
-    self,
     fmt::{BlankContext, ToTokens},
+    {self},
 };
 
 use crate::model::table::{SimValue, Table, TableContext};
