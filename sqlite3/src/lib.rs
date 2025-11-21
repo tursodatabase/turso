@@ -983,7 +983,6 @@ pub unsafe extern "C" fn sqlite3_bind_double(
     idx: ffi::c_int,
     val: f64,
 ) -> ffi::c_int {
-    println!("Bind Double Rust");
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
@@ -1820,7 +1819,6 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
             SQLITE_OK
         }
         Err(e) => {
-            println!("Checkpoint error: {e}");
             if matches!(e, turso_core::LimboError::Busy) {
                 SQLITE_BUSY
             } else {
@@ -1967,10 +1965,7 @@ pub unsafe extern "C" fn libsql_wal_disable_checkpoint(db: *mut sqlite3) -> ffi:
 fn sqlite3_safety_check_sick_or_ok(db: &sqlite3Inner) -> bool {
     match db.e_open_state {
         SQLITE_STATE_SICK | SQLITE_STATE_OPEN | SQLITE_STATE_BUSY => true,
-        _ => {
-            eprintln!("Invalid database state: {}", db.e_open_state);
-            false
-        }
+        _ => false,
     }
 }
 
