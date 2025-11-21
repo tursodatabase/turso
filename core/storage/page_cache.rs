@@ -135,15 +135,13 @@ impl PageCache {
             let mut cursor = self.queue.cursor_mut_from_ptr(self.clock_hand);
             cursor.move_next();
 
-            if cursor.get().is_some() {
-                self.clock_hand =
-                    cursor.as_cursor().get().unwrap() as *const _ as *mut PageCacheEntry;
+            if let Some(entry) = cursor.get() {
+                self.clock_hand = entry as *const _ as *mut PageCacheEntry;
             } else {
                 // Reached end, wrap to front
                 let front_cursor = self.queue.front_mut();
-                if front_cursor.get().is_some() {
-                    self.clock_hand =
-                        front_cursor.as_cursor().get().unwrap() as *const _ as *mut PageCacheEntry;
+                if let Some(entry) = front_cursor.get() {
+                    self.clock_hand = entry as *const _ as *mut PageCacheEntry;
                 } else {
                     self.clock_hand = std::ptr::null_mut();
                 }
@@ -204,7 +202,12 @@ impl PageCache {
         if self.clock_hand.is_null() {
             // First entry - just push it
             self.queue.push_back(entry);
-            let entry_ptr = self.queue.back().get().unwrap() as *const _ as *mut PageCacheEntry;
+            let entry_ptr = self
+                .queue
+                .back()
+                .get()
+                .expect("queue should have entry after push_back")
+                as *const _ as *mut PageCacheEntry;
             self.map.insert(key, entry_ptr);
             self.clock_hand = entry_ptr;
         } else {
