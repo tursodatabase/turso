@@ -18,7 +18,9 @@ pub struct PageCacheKey(usize);
 
 const CLEAR: u8 = 0;
 const REF_MAX: u8 = 3;
-const HOT_PAGE_THRESHOLD: u64 = 5;
+
+/// semi-arbitrary heuristic to determine pages which are frequently touched.
+const HOT_PAGE_THRESHOLD: u64 = 6;
 
 /// An entry in the page cache.
 ///
@@ -186,6 +188,9 @@ impl PageCache {
     }
 
     #[inline]
+    /// Returns true if the page qualifies to be spilled to disk.
+    ///
+    /// Does not enforce any hot-page policy; callers can layer that separately.
     fn can_spill_page(p: &PageRef) -> bool {
         p.is_dirty()
             && !p.is_pinned()
@@ -198,30 +203,51 @@ impl PageCache {
                 .as_ref()
                 .is_some_and(|c| c.overflow_cells.is_empty())
             && p.get().id.ne(&DatabaseHeader::PAGE_ID) // never spill page 1
-            // dirty_gen is increased every time `mark_dirty` is called on a PageRef, dont spill hot pages
-            && p.dirty_gen() <= HOT_PAGE_THRESHOLD
     }
 
-    /// Collect candidates for spilling to disk when cache under pressure
+    /// Collect candidates for spilling to disk when cache under pressure.
     pub fn compute_spill_candidates(&mut self) -> Vec<PinGuard> {
         const SPILL_BATCH: usize = 128;
         if self.len() == 0 || self.clock_hand.is_null() {
             return Vec::new();
         }
-        let mut out = Vec::with_capacity(SPILL_BATCH);
+        // Collect all spillable pages and sort by a composite key:
+        //  cold first (dirty_gen <= HOT_PAGE_THRESHOLD), then lower ref_bit,
+        //  then lower dirty_gen, then lower page id. This keeps the coldest,
+        //  safest pages at the front while still allowing hot pages to be chosen
+        //  when we are fully saturated.
+        let mut candidates: Vec<(bool, u8, u64, usize, PinGuard)> = Vec::new();
         let start = self.clock_hand;
         let mut ptr = start;
         loop {
             let entry = unsafe { &mut *ptr };
             let page = &entry.page;
-            // On the first  pass, only spill if ref_bit is CLEAR, we that we can ensure spilling the coldest pages.
-            // For the second pass, we can be more lenient and accept pages with ref_bit < REF_MAX.
-            if Self::can_spill_page(page) {
-                out.push(PinGuard::new(page.clone()));
-                if out.len() >= SPILL_BATCH {
+            if !Self::can_spill_page(page) {
+                let mut cur = unsafe { self.queue.cursor_mut_from_ptr(ptr) };
+                cur.move_next();
+                if let Some(next) = cur.get() {
+                    ptr = next as *const _ as *mut PageCacheEntry;
+                } else if let Some(front) = self.queue.front_mut().get() {
+                    ptr = front as *const _ as *mut PageCacheEntry;
+                } else {
                     break;
                 }
+                if ptr == start {
+                    break;
+                }
+                continue;
             }
+
+            let gen = page.dirty_gen();
+            let is_hot = gen > HOT_PAGE_THRESHOLD;
+            let meta = (
+                is_hot,
+                entry.ref_bit,
+                gen,
+                page.get().id,
+                PinGuard::new(page.clone()),
+            );
+            candidates.push(meta);
             let mut cur = unsafe { self.queue.cursor_mut_from_ptr(ptr) };
             cur.move_next();
             if let Some(next) = cur.get() {
@@ -235,7 +261,15 @@ impl PageCache {
                 break;
             }
         }
-        out
+        candidates.sort_by_key(|(is_hot, ref_bit, dirty_gen, id, _)| {
+            (*is_hot, *ref_bit, *dirty_gen, *id)
+        });
+
+        candidates
+            .into_iter()
+            .take(SPILL_BATCH)
+            .map(|(_, _, _, _, pg)| pg)
+            .collect()
     }
 
     #[inline]
@@ -796,7 +830,7 @@ mod tests {
 
         // Inserting same page instance should return KeyExists error
         let result = cache.insert(key1, page1_v2.clone());
-        assert_eq!(result, Err(CacheError::KeyExists));
+        assert!(matches!(result, Err(CacheError::KeyExists)));
         assert_eq!(cache.len(), 1);
 
         // Verify the page is still accessible
@@ -957,7 +991,7 @@ mod tests {
         let page3 = page_with_content(3);
         let result = cache.insert(key3, page3);
 
-        assert_eq!(result, Err(CacheError::Full));
+        assert!(matches!(result, Err(CacheError::Full)));
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
     }

@@ -8006,8 +8006,7 @@ mod tests {
         let cursor = BTreeCursor::new_table(pager.clone(), page_idx, num_columns);
         let page = match cursor.read_page(page_idx).unwrap() {
             IOResult::IO(IOCompletions::Single(c)) => {
-                pager.io.wait_for_completion(c);
-                // TODO
+                pager.io.wait_for_completion(c).unwrap();
                 return validate_btree(pager.clone(), page_idx);
             }
             IOResult::Done((page, _c)) => {
@@ -8034,14 +8033,14 @@ mod tests {
                     left_child_page, ..
                 }) => {
                     match cursor.read_page(left_child_page as i64).unwrap() {
-                        IOResult::Done((child_page, c)) => {
+                        IOResult::Done((child_page, _c)) => {
                             while child_page.is_locked() {
                                 pager.io.step().unwrap();
                             }
                             child_pages.push(child_page);
                         }
                         IOResult::IO(IOCompletions::Single(c)) => {
-                            pager.io.wait_for_completion(c);
+                            pager.io.wait_for_completion(c).unwrap();
                         }
                     }
                     if left_child_page == page.get().id as u32 {
@@ -9692,7 +9691,7 @@ mod tests {
                     run_until_done(
                         || {
                             fill_cell_payload(
-                                &PinGuard::new(page),
+                                &PinGuard::new(page.clone()),
                                 Some(i as i64),
                                 &mut payload,
                                 cell_idx,
@@ -9774,7 +9773,7 @@ mod tests {
                         run_until_done(
                             || {
                                 fill_cell_payload(
-                                    &PinGuard::new(page),
+                                    &PinGuard::new(page.clone()),
                                     Some(i),
                                     &mut payload,
                                     cell_idx,
@@ -10147,7 +10146,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &PinGuard::new(page),
+                    &PinGuard::new(page.clone()),
                     Some(0),
                     &mut payload,
                     0,
@@ -10233,7 +10232,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &PinGuard::new(page),
+                    &PinGuard::new(page.clone()),
                     Some(0),
                     &mut payload,
                     0,
@@ -10639,7 +10638,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &PinGuard::new(page),
+                    &PinGuard::new(page.clone()),
                     Some(cell_idx as i64),
                     &mut payload,
                     cell_idx as usize,
