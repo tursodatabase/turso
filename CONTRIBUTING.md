@@ -128,6 +128,14 @@ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 cargo bench --bench benchmark -- --profile-time=5
 ```
 
+## Coding Style
+
+### Error handling
+
+* Turso is a library, which means we prefer error handling over crashing.
+* However, we care about correctness more than crashing, which means we use assertions liberally.
+* We don't use `unwrap()` in Turso code, except for tests. Instead, we implement error handling or -- when not possible -- use expect() to clearly communicate that this is an invariant (assertion).
+
 ## Debugging bugs
 
 ### Query execution debugging
