@@ -1315,6 +1315,7 @@ fn ephemeral_index_build(
             (None, None) => Ordering::Equal,
         }
     });
+    let n_key_col = ephemeral_columns.len();
     let ephemeral_index = Index {
         name: format!(
             "ephemeral_{}_{}",
@@ -1332,6 +1333,8 @@ fn ephemeral_index_build(
             .btree()
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
+        is_primary_key: false,
+        n_key_col,
     };
 
     ephemeral_index
