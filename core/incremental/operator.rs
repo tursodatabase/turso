@@ -409,7 +409,8 @@ mod tests {
             vec![],                          // No GROUP BY
             vec![AggregateFunction::Sum(2)], // age is at index 2
             vec!["id".to_string(), "name".to_string(), "age".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data: 3 users
         let mut initial_delta = Delta::new();
@@ -532,7 +533,8 @@ mod tests {
                 "player".to_string(),
                 "score".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initial data: players on different teams
         let mut initial_delta = Delta::new();
@@ -682,7 +684,8 @@ mod tests {
                 "category".to_string(),
                 "price".to_string(),
             ],
-        );
+        )
+        .unwrap();
         agg.set_tracker(tracker.clone());
 
         // Initial: 100 items in 10 categories (10 items each)
@@ -761,7 +764,8 @@ mod tests {
                 "product".to_string(),
                 "amount".to_string(),
             ],
-        );
+        )
+        .unwrap();
         agg.set_tracker(tracker.clone());
 
         // Initial sales
@@ -860,7 +864,8 @@ mod tests {
                 "user_id".to_string(),
                 "amount".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initial orders
         let mut initial = Delta::new();
@@ -948,7 +953,8 @@ mod tests {
                 "category".to_string(),
                 "value".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial = Delta::new();
@@ -1050,7 +1056,8 @@ mod tests {
                 "category".to_string(),
                 "value".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial = Delta::new();
@@ -1129,7 +1136,8 @@ mod tests {
             group_by,
             aggregates.clone(),
             input_columns,
-        );
+        )
+        .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -1218,7 +1226,8 @@ mod tests {
             group_by,
             aggregates.clone(),
             input_columns,
-        );
+        )
+        .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -1301,7 +1310,8 @@ mod tests {
             group_by,
             aggregates.clone(),
             input_columns,
-        );
+        )
+        .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -1369,7 +1379,8 @@ mod tests {
             group_by,
             aggregates.clone(),
             input_columns,
-        );
+        )
+        .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -1609,7 +1620,8 @@ mod tests {
                 "category".to_string(),
                 "amount".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initialize with data
         let mut init_data = Delta::new();
@@ -1774,7 +1786,8 @@ mod tests {
                 AggregateFunction::Sum(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initialize
         let mut init_data = Delta::new();
@@ -1852,7 +1865,8 @@ mod tests {
             vec![1], // type is at index 1
             vec![AggregateFunction::Count],
             vec!["id".to_string(), "type".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initialize
         let mut init_data = Delta::new();
@@ -1968,7 +1982,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2035,7 +2050,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2124,7 +2140,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2213,7 +2230,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2294,7 +2312,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2375,7 +2394,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut initial_delta = Delta::new();
@@ -2469,7 +2489,8 @@ mod tests {
                 "name".to_string(),
                 "price".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Initial data with two categories
         let mut initial_delta = Delta::new();
@@ -2565,7 +2586,8 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data with NULL values
         let mut initial_delta = Delta::new();
@@ -2640,7 +2662,8 @@ mod tests {
                 AggregateFunction::Max(2), // score is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "score".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data with integer scores
         let mut initial_delta = Delta::new();
@@ -2707,7 +2730,8 @@ mod tests {
                 AggregateFunction::Max(1), // name is at index 1
             ],
             vec!["id".to_string(), "name".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data with text values
         let mut initial_delta = Delta::new();
@@ -2748,7 +2772,8 @@ mod tests {
                 AggregateFunction::Avg(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut delta = Delta::new();
@@ -2837,7 +2862,8 @@ mod tests {
                 AggregateFunction::Min(2), // col3 is at index 2
             ],
             vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
-        );
+        )
+        .unwrap();
 
         // Initial data
         let mut delta = Delta::new();
@@ -4007,7 +4033,8 @@ mod tests {
                 "val2".to_string(),
                 "val3".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Add initial data
         let mut delta = Delta::new();
@@ -4052,7 +4079,8 @@ mod tests {
                 "val2".to_string(),
                 "val3".to_string(),
             ],
-        );
+        )
+        .unwrap();
 
         // Process new data
         let mut delta2 = Delta::new();
@@ -4110,7 +4138,8 @@ mod tests {
             vec![0], // group by column 0 (value)
             vec![],  // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Create input with duplicates
         let mut input = Delta::new();
@@ -4165,7 +4194,8 @@ mod tests {
             vec![0, 1], // group by both columns
             vec![],     // Empty aggregates for plain DISTINCT
             vec!["category".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // First batch: insert some values
         let mut delta1 = Delta::new();
@@ -4250,7 +4280,8 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Insert value with weight 3
         let mut delta1 = Delta::new();
@@ -4318,7 +4349,8 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Insert some values
         let mut delta1 = Delta::new();
@@ -4346,7 +4378,8 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Add new value and delete existing (100 has weight 2, so it stays)
         let mut delta2 = Delta::new();
@@ -4392,7 +4425,8 @@ mod tests {
             vec![0, 1], // group by category and value
             vec![],     // Empty aggregates for plain DISTINCT
             vec!["category".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Create a complex batch with multiple groups and duplicates within each group
         let mut delta = Delta::new();
@@ -4484,7 +4518,8 @@ mod tests {
                 AggregateFunction::AvgDistinct(0),   // AVG(DISTINCT value)
             ],
             vec!["value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Insert distinct values: 10, 20, 30 (each appearing multiple times)
         let mut input = Delta::new();
@@ -4533,7 +4568,8 @@ mod tests {
             vec![], // No GROUP BY
             vec![AggregateFunction::CountDistinct(1)],
             vec!["id".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Insert 3 distinct values
         let mut delta1 = Delta::new();
@@ -4578,7 +4614,8 @@ mod tests {
             vec![],
             vec![AggregateFunction::SumDistinct(1)],
             vec!["id".to_string(), "value".to_string()],
-        );
+        )
+        .unwrap();
 
         // Insert values including a duplicate
         let mut delta1 = Delta::new();
