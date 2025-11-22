@@ -4,7 +4,7 @@ This document describes the compatibility of Turso with SQLite.
 
 ## Table of contents
 
-- [Turso compatibility with SQLite](#limbo-compatibility-with-sqlite)
+- [Turso compatibility with SQLite](#turso-compatibility-with-sqlite)
   - [Table of contents](#table-of-contents)
   - [Overview](#overview)
     - [Features](#features)
@@ -389,7 +389,7 @@ Modifiers:
 | json_type(json)                    | Yes     |                                                                                                                                              |
 | json_type(json,path)               | Yes     |                                                                                                                                              |
 | json_valid(json)                   | Yes     |                                                                                                                                              |
-| json_valid(json,flags)             |         |                                                                                                                                              |
+| json_valid(json,flags)             | Yes     |                                                                                                                                              |
 | json_quote(value)                  | Yes     |                                                                                                                                              |
 | json_group_array(value)            | Yes     |                                                                                                                                              |
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |
