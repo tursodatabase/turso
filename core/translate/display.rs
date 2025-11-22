@@ -12,7 +12,7 @@ use turso_parser::{
 use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
-    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Search, SelectPlan,
+    Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SelectPlan,
     UpdatePlan,
 };
 
@@ -92,14 +92,37 @@ impl Display for SelectPlan {
             };
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{indent}SCAN {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}SCAN {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}SCAN {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}SCAN {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            writeln!(f, "{indent}SCAN {table_name}")?;
+                        }
+                    }
                 }
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
@@ -143,14 +166,37 @@ impl Display for DeletePlan {
             let indent = "`--";
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}DELETE FROM {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}DELETE FROM {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            writeln!(f, "{indent}DELETE FROM {table_name}")?;
+                        }
+                    }
                 }
                 Operation::Search(search) => match search {
                     Search::RowidEq { .. } | Search::Seek { index: None, .. } => {
@@ -202,17 +248,41 @@ impl fmt::Display for UpdatePlan {
             };
 
             match &reference.op {
-                Operation::Scan { .. } => {
+                Operation::Scan(scan) => {
                     let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
                     };
 
-                    if i == 0 {
-                        writeln!(f, "{indent}UPDATE {table_name}")?;
-                    } else {
-                        writeln!(f, "{indent}SCAN {table_name}")?;
+                    match scan {
+                        Scan::BTreeTable { index, .. } => {
+                            let action = if i == 0 { "UPDATE" } else { "SCAN" };
+                            if let Some(index) = index {
+                                if reference.utilizes_covering_index() {
+                                    writeln!(
+                                        f,
+                                        "{indent}{action} {table_name} USING COVERING INDEX {}",
+                                        index.name
+                                    )?;
+                                } else {
+                                    writeln!(
+                                        f,
+                                        "{indent}{action} {table_name} USING INDEX {}",
+                                        index.name
+                                    )?;
+                                }
+                            } else {
+                                writeln!(f, "{indent}{action} {table_name}")?;
+                            }
+                        }
+                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                            if i == 0 {
+                                writeln!(f, "{indent}UPDATE {table_name}")?;
+                            } else {
+                                writeln!(f, "{indent}SCAN {table_name}")?;
+                            }
+                        }
                     }
                 }
                 Operation::Search(search) => match search {

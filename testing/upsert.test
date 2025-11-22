@@ -385,30 +385,30 @@ do_execsql_test_on_specific_db {:memory:} upsert-non-rowid-pk-target {
 # (right now it errors on Parse Error: cannot use expressions in CREATE INDEX)
 #
 # Target specifies BINARY but the unique index is NOCASE: target should NOT match, so expect error
-# do_execsql_test_in_memory_any_error upsert-collate-target-mismatch {
-#     CREATE TABLE cm (name TEXT, v);
-#     CREATE UNIQUE INDEX cm_name_nocase ON cm(name COLLATE NOCASE);
-#     INSERT INTO cm VALUES ('Alice', 1);
-#     INSERT INTO cm VALUES ('aLiCe', 2)
-#       ON CONFLICT(name COLLATE BINARY) DO UPDATE SET v = excluded.v;
-# }
-#
-# do_execsql_test_on_specific_db {:memory:} upsert-collate-omitted-target-matches {
-#     CREATE TABLE co (name TEXT, v);
-#     CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
-#     INSERT INTO co VALUES ('Alice', 1);
-#     INSERT INTO co VALUES ('aLiCe', 9)
-#       ON CONFLICT DO UPDATE SET v = excluded.v;
-#     SELECT * FROM co;
-# } {Alice|9}
-#
-#
-# do_execsql_test_on_specific_db {:memory:} upsert-composite-collate-orderless {
-#     CREATE TABLE cc (name TEXT, city TEXT, val);
-#     CREATE UNIQUE INDEX cc_nc ON cc(name COLLATE NOCASE, city);
-#     INSERT INTO cc VALUES ('Alice','SF','old');
-#     INSERT INTO cc VALUES ('aLiCe','SF','new')
-#       ON CONFLICT(city, name COLLATE NOCASE) DO UPDATE SET val = excluded.val;
-#     SELECT * FROM cc;
-# } {Alice|SF|new}
+do_execsql_test_in_memory_any_error upsert-collate-target-mismatch {
+    CREATE TABLE cm (name TEXT, v);
+    CREATE UNIQUE INDEX cm_name_nocase ON cm(name COLLATE NOCASE);
+    INSERT INTO cm VALUES ('Alice', 1);
+    INSERT INTO cm VALUES ('aLiCe', 2)
+      ON CONFLICT(name COLLATE BINARY) DO UPDATE SET v = excluded.v;
+}
+
+do_execsql_test_on_specific_db {:memory:} upsert-collate-omitted-target-matches {
+    CREATE TABLE co (name TEXT, v);
+    CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
+    INSERT INTO co VALUES ('Alice', 1);
+    INSERT INTO co VALUES ('aLiCe', 9)
+      ON CONFLICT DO UPDATE SET v = excluded.v;
+    SELECT * FROM co;
+} {Alice|9}
+
+
+do_execsql_test_on_specific_db {:memory:} upsert-composite-collate-orderless {
+    CREATE TABLE cc (name TEXT, city TEXT, val);
+    CREATE UNIQUE INDEX cc_nc ON cc(name COLLATE NOCASE, city);
+    INSERT INTO cc VALUES ('Alice','SF','old');
+    INSERT INTO cc VALUES ('aLiCe','SF','new')
+      ON CONFLICT(city, name COLLATE NOCASE) DO UPDATE SET val = excluded.val;
+    SELECT * FROM cc;
+} {Alice|SF|new}
 

@@ -64,6 +64,7 @@ fn test_vector_sparse_ivf_create_destroy() {
                 pos_in_table: 1,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             parameters: HashMap::new(),
         })
@@ -106,6 +107,7 @@ fn test_vector_sparse_ivf_insert_query() {
                 pos_in_table: 1,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             parameters: HashMap::new(),
         })
@@ -196,6 +198,7 @@ fn test_vector_sparse_ivf_update() {
                 pos_in_table: 1,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             parameters: HashMap::new(),
         })

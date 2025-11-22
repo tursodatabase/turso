@@ -409,15 +409,17 @@ fn create_dedupe_index(
     let mut dedupe_columns = right_select
         .result_columns
         .iter()
-        .map(|c| IndexColumn {
+        .enumerate()
+        .map(|(i, c)| IndexColumn {
             name: c
                 .name(&right_select.table_references)
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
             order: SortOrder::Asc,
-            pos_in_table: 0,
+            pos_in_table: i,
             default: None,
             collation: None,
+            expr: None,
         })
         .collect::<Vec<_>>();
     for (i, column) in dedupe_columns.iter_mut().enumerate() {

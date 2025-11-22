@@ -51,6 +51,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
                 collation: None,
                 pos_in_table: 0,
                 default: None,
+                expr: None,
             },
             IndexColumn {
                 name: "zset_id".to_string(),
@@ -58,6 +59,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
                 collation: None,
                 pos_in_table: 1,
                 default: None,
+                expr: None,
             },
             IndexColumn {
                 name: "element_id".to_string(),
@@ -65,6 +67,7 @@ pub fn create_dbsp_state_index(root_page: i64) -> Index {
                 collation: None,
                 pos_in_table: 2,
                 default: None,
+                expr: None,
             },
         ],
         unique: true,

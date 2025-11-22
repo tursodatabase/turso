@@ -267,6 +267,8 @@ fn add_ephemeral_table_to_update_plan(
             }),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }],
         vec![],
@@ -531,6 +533,39 @@ fn optimize_table_access_with_custom_modules(
     Ok(false)
 }
 
+/// We do a single pass over projected, grouping, and ordering expressions to
+/// capture every expression that could be served directly from an expression index.
+/// Example:
+///   CREATE INDEX idx ON t(lower(a));
+///   SELECT lower(a) FROM t ORDER BY lower(a);
+/// Both the SELECT list and ORDER BY can be covered by idx, avoiding a
+/// table cursor entirely. Recording them upfront lets both the cost model
+/// and covering checks reuse the same facts.
+fn register_expression_index_usages_for_plan(
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    order_by: &[(Box<ast::Expr>, SortOrder)],
+    group_by: Option<&GroupBy>,
+) {
+    table_references.reset_expression_index_usages();
+    for rc in result_columns {
+        table_references.register_expression_index_usage(&rc.expr);
+    }
+    for (expr, _) in order_by {
+        table_references.register_expression_index_usage(expr);
+    }
+    if let Some(group_by) = group_by {
+        for expr in &group_by.exprs {
+            table_references.register_expression_index_usage(expr);
+        }
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                table_references.register_expression_index_usage(expr);
+            }
+        }
+    }
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -562,6 +597,13 @@ fn optimize_table_access(
         );
     }
 
+    register_expression_index_usages_for_plan(
+        table_references,
+        result_columns,
+        order_by.as_slice(),
+        group_by.as_ref(),
+    );
+
     if table_references.joined_tables().len() == 1 {
         let optimized = optimize_table_access_with_custom_modules(
             schema,
@@ -580,7 +622,7 @@ fn optimize_table_access(
     }
 
     let access_methods_arena = RefCell::new(Vec::new());
-    let maybe_order_target = compute_order_target(order_by, group_by.as_mut());
+    let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
     let constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
@@ -735,10 +777,13 @@ fn optimize_table_access(
                             });
                         continue;
                     };
+                    // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
+                    // expression (table_col_pos == None) we cannot derive a seek key that matches
+                    // the row layout, so fall back to a scan in that situation.
                     let usable_constraints = table_constraints
                         .constraints
                         .iter()
-                        .filter(|c| c.usable)
+                        .filter(|c| c.usable && c.table_col_pos.is_some())
                         .cloned()
                         .collect::<Vec<_>>();
                     let mut temp_constraint_refs = (0..usable_constraints.len())
@@ -1294,6 +1339,7 @@ fn ephemeral_index_build(
             pos_in_table: i,
             collation: c.collation_opt(),
             default: c.default.clone(),
+            expr: None,
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))
@@ -1303,11 +1349,11 @@ fn ephemeral_index_build(
         let a_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == a.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(a.pos_in_table));
         let b_constraint = constraint_refs
             .iter()
             .enumerate()
-            .find(|(_, c)| c.table_col_pos == b.pos_in_table);
+            .find(|(_, c)| c.table_col_pos == Some(b.pos_in_table));
         match (a_constraint, b_constraint) {
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
