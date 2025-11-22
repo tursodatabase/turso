@@ -9,7 +9,7 @@ use crate::schema::{Table, RESERVED_TABLE_PREFIXES};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
-use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
+use crate::translate::expr::{translate_condition_expr, ConditionContext, ConditionMetadata};
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
@@ -279,6 +279,7 @@ pub fn translate_create_index(
                     jump_target_when_false: label,
                     jump_target_when_true: BranchOffset::Placeholder,
                     jump_target_when_null: label,
+                    context: ConditionContext::WhereClause,
                 },
                 resolver,
             )?;
@@ -369,6 +370,7 @@ pub fn translate_create_index(
                     jump_target_when_false: label,
                     jump_target_when_true: BranchOffset::Placeholder,
                     jump_target_when_null: label,
+                    context: ConditionContext::WhereClause,
                 },
                 resolver,
             )?;

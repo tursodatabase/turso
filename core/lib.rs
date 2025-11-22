@@ -652,6 +652,7 @@ impl Database {
             busy_timeout: RwLock::new(Duration::new(0, 0)),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
+            ignore_check_constraints: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             vtab_txn_states: RwLock::new(HashSet::new()),
         });
@@ -1189,6 +1190,7 @@ pub struct Connection {
     fk_deferred_violations: AtomicIsize,
     /// Track when each virtual table instance is currently in transaction.
     vtab_txn_states: RwLock<HashSet<u64>>,
+    ignore_check_constraints: AtomicBool,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -2500,6 +2502,15 @@ impl Connection {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
+    }
+
+    pub fn set_ignore_check_constraints(&self, enable: bool) {
+        self.ignore_check_constraints
+            .store(enable, Ordering::Release);
+    }
+
+    pub fn ignore_check_constraints_enabled(&self) -> bool {
+        self.ignore_check_constraints.load(Ordering::Acquire)
     }
 }
 

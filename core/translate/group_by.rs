@@ -2,7 +2,7 @@ use turso_parser::ast::{self, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{translate_condition_expr, translate_expr, ConditionContext, ConditionMetadata},
     order_by::order_by_sorter_insert,
     plan::{Distinctness, GroupBy, SelectPlan},
     result_row::emit_select_result,
@@ -819,6 +819,7 @@ pub fn group_by_emit_row_phase<'a>(
                     jump_target_when_true: if_true_target,
                     // treat null result has false for now
                     jump_target_when_null: labels.label_group_by_end_without_emitting_row,
+                    context: ConditionContext::WhereClause,
                 },
                 &t_ctx.resolver,
             )?;
