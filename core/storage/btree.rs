@@ -506,6 +506,14 @@ pub enum CursorValidState {
     RequireAdvance(IterationDirection),
 }
 
+#[derive(Debug, Clone)]
+struct PendingChild {
+    page_id: i64,
+    push_backwards: bool,
+    set_cell_index: Option<i32>,
+    retreat_parent: bool,
+}
+
 #[derive(Debug)]
 /// State used for seeking
 pub enum CursorSeekState {
@@ -674,6 +682,8 @@ pub struct BTreeCursor {
     /// Advancing is only skipped if the cursor is currently pointing to a valid record
     /// when next() is called.
     pub skip_advance: Cell<bool>,
+    /// Pending child page read that must complete before mutating the stack (keeps loops re-entrant on IO).
+    pending_child: RefCell<Option<PendingChild>>,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -699,6 +709,40 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
+    /// Load a pending child page if present, applying deferred stack mutations only after the read completes.
+    fn load_pending_child(&mut self) -> Result<IOResult<()>> {
+        let Some(pending) = self.pending_child.borrow_mut().take() else {
+            return Ok(IOResult::Done(()));
+        };
+
+        match self.read_page(pending.page_id)? {
+            IOResult::Done((page, c)) => {
+                if let Some(c) = c {
+                    if !c.succeeded() {
+                        *self.pending_child.borrow_mut() = Some(pending);
+                        return Ok(IOResult::IO(IOCompletions::Single(c)));
+                    }
+                }
+                if pending.retreat_parent {
+                    self.stack.retreat();
+                }
+                if let Some(idx) = pending.set_cell_index {
+                    self.stack.set_cell_index(idx);
+                }
+                if pending.push_backwards {
+                    self.stack.push_backwards(page);
+                } else {
+                    self.stack.push(page);
+                }
+                Ok(IOResult::Done(()))
+            }
+            IOResult::IO(c) => {
+                *self.pending_child.borrow_mut() = Some(pending);
+                Ok(IOResult::IO(c))
+            }
+        }
+    }
+
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         let valid_state = if root_page == 1 && !pager.db_state.get().is_initialized() {
             CursorValidState::Invalid
@@ -741,6 +785,7 @@ impl BTreeCursor {
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
             skip_advance: Cell::new(false),
+            pending_child: RefCell::new(None),
         }
     }
 
@@ -802,6 +847,9 @@ impl BTreeCursor {
     #[instrument(skip(self), level = Level::DEBUG, name = "prev")]
     pub fn get_prev_record(&mut self) -> Result<IOResult<bool>> {
         loop {
+            if let IOResult::IO(c) = self.load_pending_child()? {
+                return Ok(IOResult::IO(c));
+            }
             let (old_top_idx, page_type, is_index, is_leaf, cell_count) = {
                 let page = self.stack.top_ref();
                 let contents = page.get_contents();
@@ -822,12 +870,12 @@ impl BTreeCursor {
                 let rightmost_pointer = self.stack.top_ref().get_contents().rightmost_pointer();
                 if let Some(rightmost_pointer) = rightmost_pointer {
                     let past_rightmost_pointer = cell_count as i32 + 1;
-                    self.stack.set_cell_index(past_rightmost_pointer);
-                    let (page, c) = return_if_io!(self.read_page(rightmost_pointer as i64));
-                    self.stack.push_backwards(page);
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
+                    *self.pending_child.borrow_mut() = Some(PendingChild {
+                        page_id: rightmost_pointer as i64,
+                        push_backwards: true,
+                        set_cell_index: Some(past_rightmost_pointer),
+                        retreat_parent: false,
+                    });
                     continue;
                 }
             }
@@ -892,7 +940,14 @@ impl BTreeCursor {
                 // this parent: key 666
                 // left child has: key 663, key 664, key 665
                 // we need to move to the previous parent (with e.g. key 662) when iterating backwards.
-                self.stack.retreat();
+                // Defer retreat until after the child page load completes to keep this re-entrant.
+                self.pending_child.borrow_mut().replace(PendingChild {
+                    page_id: left_child_page as i64,
+                    push_backwards: true,
+                    set_cell_index: None,
+                    retreat_parent: true,
+                });
+                continue;
             }
 
             let (mem_page, c) = return_if_io!(self.read_page(left_child_page as i64));
@@ -914,17 +969,23 @@ impl BTreeCursor {
     ) -> Result<IOResult<()>> {
         loop {
             if self.read_overflow_state.borrow().is_none() {
-                let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
-                    payload: payload.to_vec(),
-                    next_page: start_next_page,
-                    remaining_to_read: payload_size as usize - payload.len(),
-                    page,
-                });
-                if let Some(c) = c {
-                    io_yield_one!(c);
+                match self.read_page(start_next_page as i64)? {
+                    IOResult::Done((page, c)) => {
+                        if let Some(c) = c {
+                            if !c.succeeded() {
+                                return Ok(IOResult::IO(IOCompletions::Single(c)));
+                            }
+                        }
+                        *self.read_overflow_state.borrow_mut() = Some(ReadPayloadOverflow {
+                            payload: payload.to_vec(),
+                            next_page: start_next_page,
+                            remaining_to_read: payload_size as usize - payload.len(),
+                            page,
+                        });
+                        continue;
+                    }
+                    IOResult::IO(c) => return Ok(IOResult::IO(c)),
                 }
-                continue;
             }
             let mut read_overflow_state = self.read_overflow_state.borrow_mut();
             let ReadPayloadOverflow {
@@ -946,13 +1007,21 @@ impl BTreeCursor {
             *remaining_to_read -= to_read;
 
             if *remaining_to_read != 0 && next != 0 {
-                let (new_page, c) = return_if_io!(self.pager.read_page(next as i64));
-                *page = new_page;
-                *next_page = next;
-                if let Some(c) = c {
-                    io_yield_one!(c);
+                match self.pager.read_page(next as i64)? {
+                    IOResult::Done((new_page, c)) => {
+                        *page = new_page;
+                        *next_page = next;
+                        if let Some(c) = c {
+                            io_yield_one!(c);
+                        }
+                        continue;
+                    }
+                    IOResult::IO(c) => {
+                        // Preserve progress and retry after IO completes.
+                        *next_page = next;
+                        return Ok(IOResult::IO(c));
+                    }
                 }
-                continue;
             }
             turso_assert!(
                 *remaining_to_read == 0 && next == 0,
