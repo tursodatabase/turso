@@ -7675,6 +7675,7 @@ pub fn op_drop_table(
     {
         conn.with_schema_mut(|schema| {
             schema.remove_indices_for_table(table_name);
+            schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
         });
     }
