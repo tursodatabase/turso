@@ -775,7 +775,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     let schema = connection.schema.read().clone();
                     connection.db.update_schema_if_newer(schema);
                 }
-                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or(LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
                 self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
@@ -784,7 +787,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                let tx = mvcc_store.txs.get(&self.tx_id).unwrap();
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or(LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
                 tx_unlocked
                     .state
@@ -1329,7 +1335,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// and `None` otherwise.
     pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         if let Some(row_versions) = self.rows.get(&id) {
@@ -1441,7 +1450,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             direction
         );
 
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
         let tx = tx.value();
         if direction == IterationDirection::Forwards {
             let min_bound = RowID {
@@ -1506,18 +1518,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             row_id,
         );
 
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
         let tx = tx.value();
-        let versions = self.rows.get(&RowID {
+        let Some(versions) = self.rows.get(&RowID {
             table_id,
             row_id: row_id.clone(),
-        });
-        if versions.is_none() {
+        }) else {
             return RowVersionState::NotFound;
-        }
-        let versions = versions.unwrap();
+        };
         let versions = versions.value().read();
-        let last_version = versions.last().unwrap();
+        let last_version = versions.last().expect("versions should not be empty");
         if last_version.is_visible_to(tx, &self.txs) {
             RowVersionState::LiveVersion
         } else {
@@ -1550,7 +1563,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Option<RowID> {
         tracing::trace!("seek_rowid(bound={:?}, lower_bound={})", bound, lower_bound,);
 
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
         let tx = tx.value();
         let res = if lower_bound {
             self.rows
@@ -1592,7 +1608,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let unlock = || self.blocking_checkpoint_lock.unlock();
         let tx_id = maybe_existing_tx_id.unwrap_or_else(|| self.get_tx_id());
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
-            self.txs.get(&tx_id).unwrap().value().begin_ts
+            self.txs
+                .get(&tx_id)
+                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?
+                .value()
+                .begin_ts
         } else {
             self.get_timestamp()
         };
@@ -1672,11 +1692,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
         if self.global_header.read().is_none() {
-            pager.io.block(|| pager.maybe_allocate_page1()).unwrap();
+            pager
+                .io
+                .block(|| pager.maybe_allocate_page1())
+                .expect("failed to allocate page1");
             let header = pager
                 .io
                 .block(|| pager.with_header(|header| *header))
-                .unwrap();
+                .expect("failed to read database header");
             // TODO: We initialize header here, maybe this needs more careful handling
             self.global_header.write().replace(header);
             tracing::debug!(
@@ -1685,7 +1708,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             );
             header
         } else {
-            let header = self.global_header.read().unwrap();
+            let header = self
+                .global_header
+                .read()
+                .expect("global_header should be initialized");
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
             header
         }
@@ -1707,7 +1733,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         F: Fn(&DatabaseHeader) -> T,
     {
         if let Some(tx_id) = tx_id {
-            let tx = self.txs.get(tx_id).unwrap();
+            let tx = self
+                .txs
+                .get(tx_id)
+                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
             let header = tx.value();
             let header = header.header.read();
             tracing::debug!("with_header read: header={:?}", header);
@@ -1715,7 +1744,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let header = self.global_header.read();
             tracing::debug!("with_header read: header={:?}", header);
-            Ok(f(header.as_ref().unwrap()))
+            Ok(f(header.as_ref().ok_or(LimboError::InternalError(
+                "global_header not initialized".to_string(),
+            ))?))
         }
     }
 
@@ -1724,14 +1755,19 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         F: Fn(&mut DatabaseHeader) -> T,
     {
         if let Some(tx_id) = tx_id {
-            let tx = self.txs.get(tx_id).unwrap();
+            let tx = self
+                .txs
+                .get(tx_id)
+                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
             let header = tx.value();
             let mut header = header.header.write();
             tracing::debug!("with_header_mut read: header={:?}", header);
             Ok(f(&mut header))
         } else {
             let mut header = self.global_header.write();
-            let header = header.as_mut().unwrap();
+            let header = header.as_mut().ok_or(LimboError::InternalError(
+                "global_header not initialized".to_string(),
+            ))?;
             tracing::debug!("with_header_mut write: header={:?}", header);
             Ok(f(header))
         }
@@ -1767,7 +1803,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// transactions.
     pub fn commit_load_tx(&self, tx_id: TxID) {
         let end_ts = self.get_timestamp();
-        let tx = self.txs.get(&tx_id).unwrap();
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
         let tx = tx.value();
         for rowid in &tx.write_set {
             let rowid = rowid.value();
@@ -1809,7 +1848,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// * `tx_id` - The ID of the transaction to abort.
     pub fn rollback_tx(&self, tx_id: TxID, _pager: Arc<Pager>, connection: &Connection) {
-        let tx_unlocked = self.txs.get(&tx_id).unwrap();
+        let tx_unlocked = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
         *connection.mv_tx.write() = None;
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
@@ -1986,7 +2028,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
-            Some(TxTimestampOrID::TxID(tx_id)) => self.txs.get(tx_id).unwrap().value().begin_ts,
+            Some(TxTimestampOrID::TxID(tx_id)) => {
+                self.txs
+                    .get(tx_id)
+                    .expect("transaction should exist in txs map")
+                    .value()
+                    .begin_ts
+            }
             // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
             //
             // The row version chain should be append-only (aside from garbage collection),
@@ -2091,7 +2139,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx_id = 0;
         self.begin_load_tx(pager.clone())?;
         loop {
-            match reader.next_record(&pager.io).unwrap() {
+            match reader.next_record(&pager.io)? {
                 StreamingResult::InsertRow { row, rowid } => {
                     if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         // Sqlite schema row version inserts
@@ -2099,7 +2147,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let mut record_values = record_cursor.get_values(&record);
-                        let val = record_values.nth(3).unwrap()?;
+                        let val = record_values.nth(3).ok_or(LimboError::InternalError(
+                            "Expected at least 4 columns in sqlite_schema".to_string(),
+                        ))??;
                         let ValueRef::Integer(root_page) = val else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
@@ -2181,7 +2231,9 @@ pub(crate) fn is_write_write_conflict(
 ) -> bool {
     match rv.end {
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let te = txs.get(&rv_end).unwrap();
+            let te = txs
+                .get(&rv_end)
+                .expect("transaction should exist in txs map");
             let te = te.value();
             if te.tx_id == tx.tx_id {
                 return false;
@@ -2207,7 +2259,9 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
     match rv.begin {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
         Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs.get(&rv_begin).unwrap();
+            let tb = txs
+                .get(&rv_begin)
+                .expect("transaction should exist in txs map");
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
@@ -2272,7 +2326,13 @@ fn stmt_get_all_rows(stmt: &mut Statement) -> Result<Vec<Vec<Value>>> {
         let step = stmt.step()?;
         match step {
             StepResult::Row => {
-                rows.push(stmt.row().unwrap().get_values().cloned().collect());
+                rows.push(
+                    stmt.row()
+                        .ok_or(LimboError::InternalError("No row available".to_string()))?
+                        .get_values()
+                        .cloned()
+                        .collect(),
+                );
             }
             StepResult::Done => {
                 break;
