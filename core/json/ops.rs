@@ -75,7 +75,10 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
@@ -100,7 +103,10 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     for arg in args {
         if let Some(path) = json_path_from_db_value(&arg, true)? {
             let mut op = DeleteOperation::new();
@@ -123,13 +129,22 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
@@ -155,13 +170,22 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
@@ -187,14 +211,23 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
@@ -220,14 +253,23 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);

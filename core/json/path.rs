@@ -244,7 +244,9 @@ fn handle_array_index(
             *index_state = ArrayIndexState::AfterHash;
         }
         (ArrayIndexState::Start, '0'..='9') => {
-            *index_buffer = ch.1.to_digit(10).unwrap() as i128;
+            *index_buffer = ch.1.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+            })? as i128;
             *index_state = ArrayIndexState::CollectingNumbers;
         }
         (ArrayIndexState::AfterHash, '-') => {
@@ -257,7 +259,9 @@ fn handle_array_index(
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
             let (new_num, is_max) = collect_num(
                 *index_buffer,
-                ch.1.to_digit(10).unwrap() as i128,
+                ch.1.to_digit(10).ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                })? as i128,
                 *index_buffer < 0,
             );
             if is_max {
@@ -283,7 +287,9 @@ fn handle_negative_index(
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).unwrap() as i128);
+            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+                crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
+            })? as i128);
             *index_state = ArrayIndexState::CollectingNumbers;
             Ok(())
         } else {
