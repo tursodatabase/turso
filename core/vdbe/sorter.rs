@@ -1,9 +1,10 @@
 use turso_parser::ast::SortOrder;
 
+use parking_lot::RwLock;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
-use std::sync::{atomic, Arc, RwLock};
+use std::sync::{atomic, Arc};
 use tempfile;
 
 use crate::types::IOCompletions;
@@ -158,10 +159,7 @@ impl Sorter {
                 SortState::InitHeap => {
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
-                            matches!(
-                                *chunk.io_state.read().unwrap(),
-                                SortedChunkIOState::WaitingForWrite
-                            )
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
                         }),
                         "chunks should been written"
                     );
@@ -255,7 +253,7 @@ impl Sorter {
                 // Make sure all chunks read at least one record into their buffer.
                 turso_assert!(
                     !self.chunks.iter().any(|chunk| matches!(
-                        *chunk.io_state.read().unwrap(),
+                        *chunk.io_state.read(),
                         SortedChunkIOState::WaitingForRead
                     )),
                     "chunks should have been read"
@@ -438,7 +436,7 @@ impl SortedChunk {
                     }
 
                     if self.records.is_empty() {
-                        let mut buffer_ref = self.buffer.write().unwrap();
+                        let mut buffer_ref = self.buffer.write();
                         let buffer = buffer_ref.as_mut_slice();
                         let mut buffer_offset = 0;
                         while buffer_offset < buffer_len {
@@ -449,8 +447,7 @@ impl SortedChunk {
                                         (record_size as usize, bytes_read)
                                     }
                                     Err(LimboError::Corrupt(_))
-                                        if *self.io_state.read().unwrap()
-                                            != SortedChunkIOState::ReadEOF =>
+                                        if *self.io_state.read() != SortedChunkIOState::ReadEOF =>
                                     {
                                         // Failed to decode a partial varint.
                                         break;
@@ -460,7 +457,7 @@ impl SortedChunk {
                                     }
                                 };
                             if record_size > buffer_len - (buffer_offset + bytes_read) {
-                                if *self.io_state.read().unwrap() == SortedChunkIOState::ReadEOF {
+                                if *self.io_state.read() == SortedChunkIOState::ReadEOF {
                                     crate::bail_corrupt_error!("Incomplete record");
                                 }
                                 break;
@@ -489,13 +486,13 @@ impl SortedChunk {
                     self.next_state = NextState::Finish;
                     // This check is done to see if we need to read more from the chunk before popping the record
                     if self.records.len() == 1
-                        && *self.io_state.read().unwrap() != SortedChunkIOState::ReadEOF
+                        && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
                         // We've consumed the last record. Read more payload into the buffer.
                         if self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst)
                             == 0
                         {
-                            *self.io_state.write().unwrap() = SortedChunkIOState::ReadEOF;
+                            *self.io_state.write() = SortedChunkIOState::ReadEOF;
                         } else {
                             let c = self.read()?;
                             if !c.succeeded() {
@@ -513,9 +510,9 @@ impl SortedChunk {
     }
 
     fn read(&mut self) -> Result<Completion> {
-        *self.io_state.write().unwrap() = SortedChunkIOState::WaitingForRead;
+        *self.io_state.write() = SortedChunkIOState::WaitingForRead;
 
-        let read_buffer_size = self.buffer.read().unwrap().len() - self.buffer_len();
+        let read_buffer_size = self.buffer.read().len() - self.buffer_len();
         let read_buffer_size = read_buffer_size
             .min(self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst));
 
@@ -535,12 +532,12 @@ impl SortedChunk {
 
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
-                *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::ReadEOF;
+                *chunk_io_state_copy.write() = SortedChunkIOState::ReadEOF;
                 return;
             }
-            *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::ReadComplete;
+            *chunk_io_state_copy.write() = SortedChunkIOState::ReadComplete;
 
-            let mut stored_buf_ref = stored_buffer_copy.write().unwrap();
+            let mut stored_buf_ref = stored_buffer_copy.write();
             let stored_buf = stored_buf_ref.as_mut_slice();
             let mut stored_buf_len = stored_buffer_len_copy.load(atomic::Ordering::SeqCst);
 
@@ -566,8 +563,8 @@ impl SortedChunk {
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
-        assert!(*self.io_state.read().unwrap() == SortedChunkIOState::None);
-        *self.io_state.write().unwrap() = SortedChunkIOState::WaitingForWrite;
+        assert!(*self.io_state.read() == SortedChunkIOState::None);
+        *self.io_state.write() = SortedChunkIOState::WaitingForWrite;
         self.chunk_size = chunk_size;
 
         let buffer = Buffer::new_temporary(self.chunk_size);
@@ -592,7 +589,7 @@ impl SortedChunk {
             let Ok(bytes_written) = res else {
                 return;
             };
-            *chunk_io_state_copy.write().unwrap() = SortedChunkIOState::WriteComplete;
+            *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
