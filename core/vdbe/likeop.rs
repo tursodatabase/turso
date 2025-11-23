@@ -60,7 +60,7 @@ fn construct_like_regex_with_escape(pattern: &str, escape: char) -> Regex {
         .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
-        .unwrap()
+        .expect("constructed LIKE regex pattern should be valid")
 }
 
 // Implements GLOB pattern matching. Caches the constructed regex if a cache is provided
@@ -173,7 +173,8 @@ fn construct_glob_regex(pattern: &str) -> Result<Regex, LimboError> {
     regex_pattern.push('$');
 
     if bracket_closed {
-        Ok(Regex::new(&regex_pattern).unwrap())
+        Regex::new(&regex_pattern)
+            .map_err(|e| LimboError::InternalError(format!("invalid GLOB regex pattern: {e}")))
     } else {
         Err(LimboError::Constraint(
             "blob pattern is not closed".to_string(),
