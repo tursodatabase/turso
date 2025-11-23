@@ -1,12 +1,6 @@
 package tech.turso.jdbc4;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -870,5 +864,115 @@ class JDBC4PreparedStatementTest {
         connection.prepareStatement("DELETE  FROM test   where col = ? ");
     preparedStatement.setInt(1, 1);
     assertEquals(preparedStatement.executeUpdate(), 1);
+  }
+
+  @Test
+  void testBatchInsert() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (?, ?)");
+
+    preparedStatement.setInt(1, 1);
+    preparedStatement.setInt(2, 2);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 3);
+    preparedStatement.setInt(2, 4);
+    preparedStatement.addBatch();
+
+    assertArrayEquals(new int[] {1, 1}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(1, rs.getInt(1));
+    assertEquals(2, rs.getInt(2));
+    assertTrue(rs.next());
+    assertEquals(3, rs.getInt(1));
+    assertEquals(4, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatchUpdate() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (1, 1), (2, 2)").execute();
+
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("UPDATE test SET col2=? WHERE col1=?");
+
+    preparedStatement.setInt(1, 5);
+    preparedStatement.setInt(2, 1);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 6);
+    preparedStatement.setInt(2, 2);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 7);
+    preparedStatement.setInt(2, 3);
+    preparedStatement.addBatch();
+
+    assertArrayEquals(new int[] {1, 1, 0}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(1, rs.getInt(1));
+    assertEquals(5, rs.getInt(2));
+    assertTrue(rs.next());
+    assertEquals(2, rs.getInt(1));
+    assertEquals(6, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatchDelete() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (1, 1), (2, 2)").execute();
+
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("DELETE FROM test WHERE col1=?");
+
+    preparedStatement.setInt(1, 1);
+    preparedStatement.addBatch();
+    preparedStatement.setInt(1, 4);
+    preparedStatement.addBatch();
+
+    assertArrayEquals(new int[] {1, 0}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(2, rs.getInt(1));
+    assertEquals(2, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatch_implicitAddBatch_shouldIgnore() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("INSERT INTO test (col1, col2) VALUES (?, ?)");
+
+    preparedStatement.setInt(1, 1);
+    preparedStatement.setInt(2, 2);
+    preparedStatement.addBatch();
+    // we set parameters but don't call addBatch afterward
+    // we should only get a result for the first insert statement to match sqlite-jdbc behavior
+    preparedStatement.setInt(1, 3);
+    preparedStatement.setInt(2, 4);
+
+    assertArrayEquals(new int[] {1}, preparedStatement.executeBatch());
+
+    ResultSet rs = connection.prepareStatement("SELECT * FROM test").executeQuery();
+    assertTrue(rs.next());
+    assertEquals(1, rs.getInt(1));
+    assertEquals(2, rs.getInt(2));
+    assertFalse(rs.next());
+  }
+
+  @Test
+  void testBatch_select_shouldFail() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col1 INTEGER, col2 INTEGER)").execute();
+    PreparedStatement preparedStatement =
+        connection.prepareStatement("SELECT * FROM test WHERE col1=?");
+    preparedStatement.setInt(1, 1);
+    preparedStatement.addBatch();
+    assertThrows(BatchUpdateException.class, preparedStatement::executeBatch);
   }
 }

@@ -10,23 +10,11 @@ import java.math.BigDecimal;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.sql.Array;
-import java.sql.Blob;
-import java.sql.Clob;
-import java.sql.Date;
-import java.sql.NClob;
-import java.sql.ParameterMetaData;
-import java.sql.PreparedStatement;
-import java.sql.Ref;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.RowId;
-import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
-import java.sql.SQLXML;
-import java.sql.Time;
-import java.sql.Timestamp;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
+import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoResultSet;
 
@@ -35,6 +23,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   private final String sql;
   private final JDBC4ResultSet resultSet;
+
+  private final int paramCount;
+  private Object[] currentBatchParams;
+  private final ArrayList<Object[]> batchQueryParams = new ArrayList<>();
 
   /**
    * Creates a new JDBC4PreparedStatement.
@@ -48,97 +40,110 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     this.sql = sql;
     this.statement = connection.prepare(sql);
     this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
+    this.paramCount = statement.parameterCount();
+    this.currentBatchParams = new Object[paramCount];
   }
 
   @Override
   public ResultSet executeQuery() throws SQLException {
     // TODO: check bindings etc
+    bindParams(currentBatchParams);
     return this.resultSet;
   }
 
   @Override
   public int executeUpdate() throws SQLException {
     requireNonNull(this.statement);
+    bindParams(currentBatchParams);
     final TursoResultSet resultSet = statement.getResultSet();
     resultSet.consumeAll();
     return Math.toIntExact(statement.changes());
   }
 
+  /**
+   * This helper method saves a parameter locally without binding it to the underlying native
+   * statement. We have to do this so we are able to switch between different sets of parameters
+   * when batching queries.
+   */
+  private void setParam(int parameterIndex, @Nullable Object object) {
+    requireNonNull(this.statement);
+    currentBatchParams[parameterIndex - 1] = object;
+  }
+
   @Override
   public void setNull(int parameterIndex, int sqlType) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindNull(parameterIndex);
+    setParam(parameterIndex, null);
   }
 
   @Override
   public void setBoolean(int parameterIndex, boolean x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindInt(parameterIndex, x ? 1 : 0);
+    setParam(parameterIndex, x ? 1 : 0);
   }
 
   @Override
   public void setByte(int parameterIndex, byte x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindInt(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setShort(int parameterIndex, short x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindInt(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setInt(int parameterIndex, int x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindInt(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setLong(int parameterIndex, long x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindLong(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setFloat(int parameterIndex, float x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindDouble(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setDouble(int parameterIndex, double x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindDouble(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setBigDecimal(int parameterIndex, BigDecimal x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindText(parameterIndex, x.toString());
+    setParam(parameterIndex, x.toString());
   }
 
   @Override
   public void setString(int parameterIndex, String x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindText(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setBytes(int parameterIndex, byte[] x) throws SQLException {
     requireNonNull(this.statement);
-    this.statement.bindBlob(parameterIndex, x);
+    setParam(parameterIndex, x);
   }
 
   @Override
   public void setDate(int parameterIndex, Date x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
     } else {
       long time = x.getTime();
-      this.statement.bindBlob(
-          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+      setParam(parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
     }
   }
 
@@ -146,11 +151,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setTime(int parameterIndex, Time x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
     } else {
       long time = x.getTime();
-      this.statement.bindBlob(
-          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+      setParam(parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
     }
   }
 
@@ -158,11 +162,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setTimestamp(int parameterIndex, Timestamp x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
     } else {
       long time = x.getTime();
-      this.statement.bindBlob(
-          parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
+      setParam(parameterIndex, ByteBuffer.allocate(Long.BYTES).putLong(time).array());
     }
   }
 
@@ -170,14 +173,14 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setAsciiStream(int parameterIndex, InputStream x, int length) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     if (length < 0) {
       throw new SQLException("setAsciiStream length must be non-negative");
     }
     if (length == 0) {
-      this.statement.bindText(parameterIndex, "");
+      setParam(parameterIndex, "");
       return;
     }
     try {
@@ -188,7 +191,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         offset += read;
       }
       String ascii = new String(buffer, 0, offset, StandardCharsets.US_ASCII);
-      this.statement.bindText(parameterIndex, ascii);
+      setParam(parameterIndex, ascii);
     } catch (IOException e) {
       throw new SQLException("Error reading ASCII stream", e);
     }
@@ -198,14 +201,14 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setUnicodeStream(int parameterIndex, InputStream x, int length) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     if (length < 0) {
       throw new SQLException("setUnicodeStream length must be non-negative");
     }
     if (length == 0) {
-      this.statement.bindText(parameterIndex, "");
+      setParam(parameterIndex, "");
       return;
     }
     try {
@@ -216,7 +219,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         offset += read;
       }
       String text = new String(buffer, 0, offset, StandardCharsets.UTF_8);
-      this.statement.bindText(parameterIndex, text);
+      setParam(parameterIndex, text);
     } catch (IOException e) {
       throw new SQLException("Error reading Unicode stream", e);
     }
@@ -226,14 +229,14 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setBinaryStream(int parameterIndex, InputStream x, int length) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     if (length < 0) {
       throw new SQLException("setBinaryStream length must be non-negative");
     }
     if (length == 0) {
-      this.statement.bindBlob(parameterIndex, new byte[0]);
+      setParam(parameterIndex, new byte[0]);
       return;
     }
     try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
@@ -246,15 +249,21 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
         totalRead += bytesRead;
       }
       byte[] data = baos.toByteArray();
-      this.statement.bindBlob(parameterIndex, data);
+      setParam(parameterIndex, data);
     } catch (IOException e) {
       throw new SQLException("Error reading binary stream", e);
     }
   }
 
   @Override
-  public void clearParameters() throws SQLException {
-    // TODO
+  public void clearParameters() {
+    this.currentBatchParams = new Object[paramCount];
+  }
+
+  @Override
+  public void clearBatch() throws SQLException {
+    this.batchQueryParams.clear();
+    this.currentBatchParams = new Object[paramCount];
   }
 
   @Override
@@ -266,7 +275,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setObject(int parameterIndex, Object x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     if (x instanceof String) {
@@ -309,14 +318,77 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public boolean execute() throws SQLException {
+    return execute(currentBatchParams);
+  }
+
+  /** This helper method runs the statement using the provided parameter values. */
+  private boolean execute(Object[] params) throws SQLException {
     // TODO: check whether this is sufficient
-    requireNonNull(this.statement);
-    return statement.execute();
+    requireNonNull(statement);
+    bindParams(params);
+    boolean result = statement.execute();
+    updateCount = statement.changes();
+    return result;
   }
 
   @Override
-  public void addBatch() throws SQLException {
-    // TODO
+  public int[] executeBatch() throws SQLException {
+    return Arrays.stream(executeLargeBatch()).mapToInt(l -> (int) l).toArray();
+  }
+
+  @Override
+  public long[] executeLargeBatch() throws SQLException {
+    requireNonNull(this.statement);
+    if (batchQueryParams.isEmpty()) {
+      return new long[0];
+    }
+    long[] updateCounts = new long[batchQueryParams.size()];
+    if (!isBatchCompatibleStatement(sql)) {
+      updateCounts[0] = EXECUTE_FAILED;
+      BatchUpdateException bue =
+          new BatchUpdateException(
+              "Batch commands cannot return result sets.",
+              "HY000", // General error SQL state
+              0,
+              Arrays.stream(updateCounts).mapToInt(l -> (int) l).toArray());
+      // Clear the batch after failure
+      clearBatch();
+      throw bue;
+    }
+    for (int i = 0; i < batchQueryParams.size(); i++) {
+      try {
+        statement.reset();
+        execute(batchQueryParams.get(i));
+        updateCounts[i] = getUpdateCount();
+      } catch (SQLException e) {
+        BatchUpdateException bue =
+            new BatchUpdateException(
+                "Batch entry " + i + " (" + sql + ") failed: " + e.getMessage(),
+                e.getSQLState(),
+                e.getErrorCode(),
+                updateCounts,
+                e.getCause());
+        // Clear the batch after failure
+        clearBatch();
+        throw bue;
+      }
+    }
+    clearBatch();
+    return updateCounts;
+  }
+
+  /** Takes the given set of parameters and binds it to the underlying statement. */
+  private void bindParams(Object[] params) throws SQLException {
+    requireNonNull(statement);
+    for (int paramIndex = 1; paramIndex <= params.length; paramIndex++) {
+      statement.bindObject(paramIndex, params[paramIndex - 1]);
+    }
+  }
+
+  @Override
+  public void addBatch() {
+    batchQueryParams.add(currentBatchParams);
+    currentBatchParams = new Object[paramCount];
   }
 
   @Override
@@ -463,23 +535,23 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   public void setAsciiStream(int parameterIndex, InputStream x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     byte[] data = readBytes(x);
     String ascii = new String(data, StandardCharsets.US_ASCII);
-    this.statement.bindText(parameterIndex, ascii);
+    setParam(parameterIndex, ascii);
   }
 
   @Override
   public void setBinaryStream(int parameterIndex, InputStream x) throws SQLException {
     requireNonNull(this.statement);
     if (x == null) {
-      this.statement.bindNull(parameterIndex);
+      setParam(parameterIndex, null);
       return;
     }
     byte[] data = readBytes(x);
-    this.statement.bindBlob(parameterIndex, data);
+    setParam(parameterIndex, data);
   }
 
   /**
