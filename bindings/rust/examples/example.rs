@@ -1,40 +1,50 @@
 use turso::Builder;
+use turso::Error;
 
 #[tokio::main]
-async fn main() {
-    let db = Builder::new_local(":memory:").build().await.unwrap();
-
-    let conn = db.connect().unwrap();
-
-    conn.query("select 1; select 1;", ()).await.unwrap();
-
-    conn.execute("CREATE TABLE IF NOT EXISTS users (email TEXT)", ())
+async fn main() -> Result<(), Error> {
+    let db = Builder::new_local(":memory:")
+        .build()
         .await
-        .unwrap();
+        .expect("Turso Failed to Build memory db");
+
+    let conn = db.connect()?;
+
+    conn.query("select 1; select 1;", ()).await?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (email TEXT, age INTEGER)",
+        (),
+    )
+    .await?;
 
     conn.pragma_query("journal_mode", |row| {
         println!("{:?}", row.get_value(0));
         Ok(())
-    })
-    .unwrap();
+    })?;
 
     let mut stmt = conn
-        .prepare("INSERT INTO users (email) VALUES (?1)")
-        .await
-        .unwrap();
+        .prepare("INSERT INTO users (email, age) VALUES (?1, ?2)")
+        .await?;
 
-    stmt.execute(["foo@example.com"]).await.unwrap();
+    stmt.execute(["foo@example.com", &21.to_string()]).await?;
 
-    let mut stmt = conn
-        .prepare("SELECT * FROM users WHERE email = ?1")
-        .await
-        .unwrap();
+    let mut stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").await?;
 
-    let mut rows = stmt.query(["foo@example.com"]).await.unwrap();
+    let mut rows = stmt.query(["foo@example.com"]).await?;
 
-    let row = rows.next().await.unwrap().unwrap();
+    let row = rows.next().await?;
 
-    let value = row.get_value(0).unwrap();
+    assert!(
+        row.is_some(),
+        "The row that was just inserted hasn't been found"
+    );
 
-    println!("Row: {value:?}");
+    if let Some(row_values) = row {
+        let email = row_values.get_value(0)?;
+        let age = row_values.get_value(1)?;
+        println!("Row: {email:?} {age:?}");
+    }
+
+    Ok(())
 }
