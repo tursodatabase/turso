@@ -332,11 +332,15 @@ impl PathOperation for SetOperation {
             bail_parse_error!("Nothing to operate on!")
         }
         let value = &self.value.data;
-        let target = stack.pop().unwrap();
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("stack should not be empty after check".to_string())
+        })?;
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let array_value_idx = target.get_array_index().ok_or_else(|| {
+                LimboError::InternalError("target should have array index".to_string())
+            })?;
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
                 json.read_header(obj_value_idx)?;
@@ -407,11 +411,15 @@ impl PathOperation for DeleteOperation {
             bail_parse_error!("Nothing to operate on!")
         }
 
-        let target = stack.pop().unwrap();
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("stack should not be empty after check".to_string())
+        })?;
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let array_value_idx = target.get_array_index().ok_or_else(|| {
+                LimboError::InternalError("target should have array index".to_string())
+            })?;
 
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
@@ -483,11 +491,15 @@ impl PathOperation for ReplaceOperation {
             bail_parse_error!("Nothing to operate on!")
         }
         let value = &self.value.data;
-        let target = stack.pop().unwrap();
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("stack should not be empty after check".to_string())
+        })?;
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let array_value_idx = target.get_array_index().ok_or_else(|| {
+                LimboError::InternalError("target should have array index".to_string())
+            })?;
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
                 json.read_header(obj_value_idx)?;
@@ -560,11 +572,15 @@ impl PathOperation for InsertOperation {
             bail_parse_error!("Nothing to operate on!")
         }
         let value = &self.value.data;
-        let target = stack.pop().unwrap();
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("stack should not be empty after check".to_string())
+        })?;
 
         // handle array
         if target.has_specific_index() {
-            let array_value_idx = target.get_array_index().unwrap();
+            let array_value_idx = target.get_array_index().ok_or_else(|| {
+                LimboError::InternalError("target should have array index".to_string())
+            })?;
             let obj_value_idx = target.field_value_index;
             let (JsonbHeader(_, obj_value_size), obj_value_header_size) =
                 json.read_header(obj_value_idx)?;
@@ -637,7 +653,9 @@ impl PathOperation for SearchOperation {
     }
 
     fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
-        let target = stack.pop().unwrap();
+        let target = stack.pop().ok_or_else(|| {
+            LimboError::InternalError("stack should not be empty after check".to_string())
+        })?;
         let idx = if let Some(idx) = target.get_array_index() {
             idx
         } else {
@@ -890,7 +908,7 @@ impl Jsonb {
         };
         jsonb
             .write_element_header(0, ElementType::ARRAY, 0, false)
-            .unwrap();
+            .expect("writing header to new vector should not fail");
         jsonb
     }
 
@@ -900,7 +918,7 @@ impl Jsonb {
         };
         jsonb
             .write_element_header(0, ElementType::OBJECT, 0, false)
-            .unwrap();
+            .expect("writing header to new vector should not fail");
         jsonb
     }
 
@@ -2330,7 +2348,11 @@ impl Jsonb {
                 && !matches!(current, PathElement::ArrayLocator(_));
 
             let result = if next_is_array {
-                let array_locator = path_iter.next().unwrap();
+                let array_locator = path_iter.next().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "array locator should exist after peek check".to_string(),
+                    )
+                })?;
 
                 self.navigate_to_segment(
                     SegmentVariant::KeyWithArrayIndex(current, array_locator),
@@ -2378,7 +2400,9 @@ impl Jsonb {
 
             if el_type == ElementType::ARRAY && !is_prev_arr {
                 is_prev_arr = true;
-                let arr_element_idx = parent.get_array_index().unwrap();
+                let arr_element_idx = parent.get_array_index().ok_or_else(|| {
+                    LimboError::InternalError("array element should have index".to_string())
+                })?;
                 let (JsonbHeader(arr_el_type, arr_el_size), arr_el_header_len) =
                     self.read_header(arr_element_idx)?;
 
@@ -2715,8 +2739,10 @@ impl Jsonb {
                 }
 
                 if current_pos == end_pos && mode.allows_insert() {
-                    if idx.is_some() && idx.unwrap() != 0 {
-                        bail_parse_error!("cant create new arr with idx");
+                    if let Some(idx_val) = idx {
+                        if *idx_val != 0 {
+                            bail_parse_error!("cant create new arr with idx");
+                        }
                     }
 
                     let key_header_type = if *is_raw {
@@ -2960,9 +2986,15 @@ impl Jsonb {
                         let target_path_result =
                             result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
 
-                        if target_path_result.is_ok() {
-                            let target_stack = target_path_result.unwrap();
-                            let target_value_idx = target_stack.last().unwrap().field_value_index;
+                        if let Ok(target_stack) = target_path_result {
+                            let target_value_idx = target_stack
+                                .last()
+                                .ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "target stack should not be empty".to_string(),
+                                    )
+                                })?
+                                .field_value_index;
                             let (target_header, _) = result.read_header(target_value_idx)?;
 
                             if target_header.0 == ElementType::OBJECT {

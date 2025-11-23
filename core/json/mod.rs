@@ -264,15 +264,24 @@ where
         return Ok(Value::Null);
     }
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
 
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
@@ -297,14 +306,23 @@ where
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(args.next().unwrap(), make_jsonb_fn)?;
+    let first_arg = args.next().ok_or_else(|| {
+        crate::LimboError::InternalError("args should not be empty after length check".to_string())
+    })?;
+    let mut json = json_cache.get_or_insert_with(first_arg, make_jsonb_fn)?;
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while args.len() > 1 {
-        let first = args.next().unwrap();
+        let first = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "args should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let path = json_path_from_db_value(&first, true)?;
 
-        let second = args.next().unwrap();
+        let second = args.next().ok_or_else(|| {
+            crate::LimboError::InternalError("args should have second element in loop".to_string())
+        })?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
@@ -446,7 +464,10 @@ where
 {
     let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
     if paths.len() == 1 {
-        if let Some(path) = json_path_from_db_value(&paths.next().unwrap(), true)? {
+        let first_path = paths.next().ok_or_else(|| {
+            crate::LimboError::InternalError("paths should have one element".to_string())
+        })?;
+        if let Some(path) = json_path_from_db_value(&first_path, true)? {
             let mut json = value;
 
             let mut op = SearchOperation::new(json.len());
@@ -553,7 +574,10 @@ pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate
 
         return Ok(Value::Text(Text::json(element_type.into())));
     }
-    if let Some(path) = json_path_from_db_value(&path.unwrap(), true)? {
+    let path_value = path.ok_or_else(|| {
+        crate::LimboError::InternalError("path should be Some after is_none check".to_string())
+    })?;
+    if let Some(path) = json_path_from_db_value(&path_value, true)? {
         let mut json = convert_dbtype_to_jsonb(value, Conv::Strict)?;
 
         if let Ok(mut path) = json.navigate_path(&path, PathOperationMode::ReplaceExisting) {
@@ -657,7 +681,11 @@ where
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while values.len() > 1 {
-        let first = values.next().unwrap();
+        let first = values.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "values should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
@@ -665,7 +693,11 @@ where
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
 
-        let second = values.next().unwrap();
+        let second = values.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "values should have second element in loop".to_string(),
+            )
+        })?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -689,7 +721,11 @@ where
 
     // TODO: when `array_chunks` is stabilized we can chunk by 2 here
     while values.len() > 1 {
-        let first = values.next().unwrap();
+        let first = values.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "values should have at least 2 elements in loop".to_string(),
+            )
+        })?;
         let first = first.as_value_ref();
         if first.value_type() != ValueType::Text {
             bail_constraint_error!("json_object() labels must be TEXT")
@@ -697,7 +733,11 @@ where
         let key = convert_dbtype_to_jsonb(first, Conv::ToString)?;
         json.append_jsonb_to_end(key.data());
 
-        let second = values.next().unwrap();
+        let second = values.next().ok_or_else(|| {
+            crate::LimboError::InternalError(
+                "values should have second element in loop".to_string(),
+            )
+        })?;
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
