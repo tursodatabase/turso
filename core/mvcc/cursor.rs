@@ -5,7 +5,7 @@ use crate::mvcc::database::{MVTableId, MvStore, Row, RowID, RowKey, RowVersionSt
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
 use crate::types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult};
-use crate::{return_if_io, Result};
+use crate::{return_if_io, LimboError, Result};
 use crate::{Pager, Value};
 use std::any::Any;
 use std::cell::{Ref, RefCell};
@@ -110,7 +110,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     };
                     {
                         let mut record = self.get_immutable_record_or_create();
-                        let record = record.as_mut().unwrap();
+                        let record = record.as_mut().ok_or(LimboError::InternalError(
+                            "immutable record not initialized".to_string(),
+                        ))?;
                         record.invalidate();
                         record.start_serialization(&row.data);
                     }
@@ -119,7 +121,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         Ref::filter_map(self.reusable_immutable_record.borrow(), |opt| {
                             opt.as_ref()
                         })
-                        .unwrap();
+                        .ok()
+                        .ok_or(LimboError::InternalError(
+                            "immutable record not initialized".to_string(),
+                        ))?;
                     Ok(IOResult::Done(Some(record_ref)))
                 }
             }
@@ -587,10 +592,21 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             panic!("BTreeKey::maybe_rowid() should return Some(rowid) for table rowid keys");
         };
         let row_id = RowID::new(self.table_id, RowKey::Int(rowid));
-        let record_buf = key.get_record().unwrap().get_payload().to_vec();
+        let record_buf = key
+            .get_record()
+            .ok_or(LimboError::InternalError(
+                "BTreeKey should have a record".to_string(),
+            ))?
+            .get_payload()
+            .to_vec();
         let num_columns = match key {
             BTreeKey::IndexKey(record) => record.column_count(),
-            BTreeKey::TableRowId((_, record)) => record.as_ref().unwrap().column_count(),
+            BTreeKey::TableRowId((_, record)) => record
+                .as_ref()
+                .ok_or(LimboError::InternalError(
+                    "TableRowId should have a record".to_string(),
+                ))?
+                .column_count(),
         };
         let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
 
@@ -770,7 +786,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn invalidate_record(&mut self) {
         self.get_immutable_record_or_create()
             .as_mut()
-            .unwrap()
+            .expect("immutable record should be initialized")
             .invalidate();
         self.record_cursor.borrow_mut().invalidate();
     }
