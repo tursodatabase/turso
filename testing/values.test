@@ -63,11 +63,11 @@ do_execsql_test_in_memory_any_error values-illegal-column-ref {
 }
 
 # Unquoted identifiers in VALUES should produce a parse error
-do_execsql_test_in_memory_error_content values-unquoted-identifier-single {
+do_execsql_test_in_memory_any_error values-unquoted-identifier-single {
   values(asdf);
 }
 
-do_execsql_test_in_memory_error_content values-unquoted-identifier-mixed {
+do_execsql_test_in_memory_any_error values-unquoted-identifier-mixed {
   values(1, asdf);
 }
 
