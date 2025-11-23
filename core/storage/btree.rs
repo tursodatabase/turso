@@ -3233,7 +3233,7 @@ impl BTreeCursor {
                                 .len()
                                 as i64;
                             new_page_sizes[i] -= size_of_cell_to_remove_from_left;
-                            let size_of_cell_to_move_right = if !is_table_leaf {
+                            let size_of_cell_to_move_right = if !is_leaf {
                                 if cell_array.cell_count_per_page_cumulative[i]
                                     < cell_array.cell_payloads.len() as u16
                                 {
@@ -3268,7 +3268,7 @@ impl BTreeCursor {
                             new_page_sizes[i] += size_of_cell_to_remove_from_right;
                             cell_array.cell_count_per_page_cumulative[i] += 1;
 
-                            let size_of_cell_to_remove_from_right = if !is_table_leaf {
+                            let size_of_cell_to_remove_from_right = if !is_leaf {
                                 if cell_array.cell_count_per_page_cumulative[i]
                                     < cell_array.cell_payloads.len() as u16
                                 {
