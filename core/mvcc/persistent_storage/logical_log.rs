@@ -8,7 +8,8 @@ use crate::{
     types::ImmutableRecord,
     Buffer, Completion, CompletionError, LimboError, Result,
 };
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::File;
 
@@ -275,7 +276,7 @@ pub struct StreamingLogicalLogReader {
 
 impl StreamingLogicalLogReader {
     pub fn new(file: Arc<dyn File>) -> Self {
-        let file_size = file.size().unwrap() as usize;
+        let file_size = file.size().expect("failed to get file size") as usize;
         Self {
             file,
             offset: 0,
@@ -292,7 +293,7 @@ impl StreamingLogicalLogReader {
         let header = Arc::new(RwLock::new(LogHeader::default()));
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let header = header.clone();
-            let mut header = header.write().unwrap();
+            let mut header = header.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
                 return;
@@ -307,7 +308,9 @@ impl StreamingLogicalLogReader {
             }
             let buf = buf.as_slice();
             header.version = buf[0];
-            header.salt = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+            header.salt = u64::from_be_bytes([
+                buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+            ]);
             header.encrypted = buf[10];
             tracing::trace!("LogicalLog header={:?}", header);
         });
@@ -400,36 +403,50 @@ impl StreamingLogicalLogReader {
 
     fn consume_u8(&mut self, io: &Arc<dyn crate::IO>) -> Result<u8> {
         self.read_more_data(io, 1)?;
-        let r = self.buffer.read().unwrap()[self.buffer_offset];
+        let r = self.buffer.read()[self.buffer_offset];
         self.buffer_offset += 1;
         Ok(r)
     }
 
     fn consume_i64(&mut self, io: &Arc<dyn crate::IO>) -> Result<i64> {
         self.read_more_data(io, 8)?;
-        let r = i64::from_be_bytes(
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let buf = self.buffer.read();
+        let offset = self.buffer_offset;
+        let r = i64::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
         self.buffer_offset += 8;
         Ok(r)
     }
 
     fn consume_u64(&mut self, io: &Arc<dyn crate::IO>) -> Result<u64> {
         self.read_more_data(io, 8)?;
-        let r = u64::from_be_bytes(
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let buf = self.buffer.read();
+        let offset = self.buffer_offset;
+        let r = u64::from_be_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
         self.buffer_offset += 8;
         Ok(r)
     }
 
     fn consume_varint(&mut self, io: &Arc<dyn crate::IO>) -> Result<(u64, usize)> {
         self.read_more_data(io, 9)?;
-        let buffer_guard = self.buffer.read().unwrap();
+        let buffer_guard = self.buffer.read();
         let buffer = &buffer_guard[self.buffer_offset..];
         let (v, n) = read_varint(buffer)?;
         self.buffer_offset += n;
@@ -438,14 +455,13 @@ impl StreamingLogicalLogReader {
 
     fn consume_buffer(&mut self, io: &Arc<dyn crate::IO>, amount: usize) -> Result<Vec<u8>> {
         self.read_more_data(io, amount)?;
-        let buffer =
-            self.buffer.read().unwrap()[self.buffer_offset..self.buffer_offset + amount].to_vec();
+        let buffer = self.buffer.read()[self.buffer_offset..self.buffer_offset + amount].to_vec();
         self.buffer_offset += amount;
         Ok(buffer)
     }
 
-    fn get_buffer(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
-        self.buffer.read().unwrap()
+    fn get_buffer(&self) -> parking_lot::RwLockReadGuard<'_, Vec<u8>> {
+        self.buffer.read()
     }
 
     pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
@@ -459,7 +475,7 @@ impl StreamingLogicalLogReader {
         let buffer = self.buffer.clone();
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let buffer = buffer.clone();
-            let mut buffer = buffer.write().unwrap();
+            let mut buffer = buffer.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::trace!("couldn't ready log err={:?}", res,);
                 return;
@@ -477,13 +493,13 @@ impl StreamingLogicalLogReader {
         self.offset += to_read;
         // cleanup consumed bytes
         // this could be better for sure
-        let _ = self.buffer.write().unwrap().drain(0..self.buffer_offset);
+        let _ = self.buffer.write().drain(0..self.buffer_offset);
         self.buffer_offset = 0;
         Ok(())
     }
 
     fn bytes_can_read(&self) -> usize {
-        self.buffer.read().unwrap().len() - self.buffer_offset
+        self.buffer.read().len() - self.buffer_offset
     }
 }
 
