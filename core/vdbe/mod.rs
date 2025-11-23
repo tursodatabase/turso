@@ -792,11 +792,11 @@ impl Program {
 
         state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
         state.registers[1] = Register::Value(Value::from_text(opcode));
-        state.registers[2] = Register::Value(Value::Integer(p1 as i64));
-        state.registers[3] = Register::Value(Value::Integer(p2 as i64));
-        state.registers[4] = Register::Value(Value::Integer(p3 as i64));
+        state.registers[2] = Register::Value(Value::Integer(p1));
+        state.registers[3] = Register::Value(Value::Integer(p2));
+        state.registers[4] = Register::Value(Value::Integer(p3));
         state.registers[5] = Register::Value(p4);
-        state.registers[6] = Register::Value(Value::Integer(p5 as i64));
+        state.registers[6] = Register::Value(Value::Integer(p5));
         state.registers[7] = Register::Value(Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
