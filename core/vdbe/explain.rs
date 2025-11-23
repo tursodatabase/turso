@@ -561,7 +561,7 @@ pub fn insn_to_row(
                         name
                     }
                     CursorType::BTreeIndex(index) => {
-                        let name = &index.columns.get(*column).unwrap().name;
+                        let name = &index.columns.get(*column).expect("column index out of bounds").name;
                         Some(name)
                     }
                     CursorType::MaterializedView(table, _) => {
@@ -571,7 +571,7 @@ pub fn insn_to_row(
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
-                    CursorType::VirtualTable(v) => v.columns.get(*column).unwrap().name.as_ref(),
+                    CursorType::VirtualTable(v) => v.columns.get(*column).expect("column index out of bounds").name.as_ref(),
                 };
                 (
                     "Column",
@@ -1017,8 +1017,8 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        if collation.is_some() {
-                            format!("{sign}{}", collation.unwrap())
+                        if let Some(coll) = collation {
+                            format!("{sign}{coll}")
                         } else {
                             format!("{sign}B")
                         }
