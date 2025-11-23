@@ -997,7 +997,7 @@ impl Program {
                         .connection
                         .view_transaction_states
                         .get(view_name)
-                        .unwrap()
+                        .expect("view should have transaction state")
                         .get_table_deltas();
 
                     let schema = self.connection.schema.read();
@@ -1067,7 +1067,7 @@ impl Program {
                     let Some(tx_id) = conn.get_mv_tx_id() else {
                         return Ok(IOResult::Done(()));
                     };
-                    let state_machine = mv_store.commit_tx(tx_id, &conn).unwrap();
+                    let state_machine = mv_store.commit_tx(tx_id, &conn)?;
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
                 let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
@@ -1314,7 +1314,12 @@ impl<'a> FromValueRow<'a> for &'a Value {
 
 impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-        let value = unsafe { self.values.add(idx).as_ref().unwrap() };
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
+        };
         let value = match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -1323,7 +1328,12 @@ impl Row {
     }
 
     pub fn get_value(&self, idx: usize) -> &Value {
-        let value = unsafe { self.values.add(idx).as_ref().unwrap() };
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
+        };
         match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),

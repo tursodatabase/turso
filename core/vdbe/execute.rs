@@ -425,15 +425,17 @@ pub fn op_checkpoint_inner(
                 }
             }
             OpCheckpointState::FinishCheckpoint { result } => {
-                let step_result = program
-                    .connection
-                    .pager
-                    .load()
-                    .wal_checkpoint_finish(result.as_mut().unwrap());
+                let step_result = program.connection.pager.load().wal_checkpoint_finish(
+                    result
+                        .as_mut()
+                        .expect("checkpoint result should be Some in FinishCheckpoint state"),
+                );
                 match step_result {
                     Ok(IOResult::Done(())) => {
                         state.op_checkpoint_state = OpCheckpointState::CompleteResult {
-                            result: Ok(result.take().unwrap()),
+                            result: Ok(result.take().expect(
+                                "checkpoint result should be Some in FinishCheckpoint state",
+                            )),
                         };
                         continue;
                     }
@@ -575,7 +577,7 @@ pub fn op_jump(
             "Jump without compare".to_string(),
         ));
     }
-    let target_pc = match cmp.unwrap() {
+    let target_pc = match cmp.expect("comparison should succeed for valid operands") {
         std::cmp::Ordering::Less => *target_pc_lt,
         std::cmp::Ordering::Equal => *target_pc_eq,
         std::cmp::Ordering::Greater => *target_pc_gt,
@@ -919,14 +921,19 @@ pub fn op_open_read(
             *cursor_ref = Some(Cursor::IndexMethod(cursor));
         }
 
-        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = state.cursors[*cursor_id]
+            .as_mut()
+            .expect("cursor should exist after initialization");
         let cursor = cursor.as_index_method_mut();
         return_if_io!(cursor.open_read(&program.connection));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     if program.connection.get_mv_tx_id().is_none() {
         assert!(*root_page >= 0, "");
     }
@@ -941,7 +948,9 @@ pub fn op_open_read(
     let maybe_promote_to_mvcc_cursor =
         |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
             if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store.unwrap().clone();
+                let mv_store = mv_store
+                    .expect("mv_store should be Some when MVCC transaction is active")
+                    .clone();
                 Ok(Box::new(MvCursor::new(
                     mv_store,
                     tx_id,
@@ -982,7 +991,7 @@ pub fn op_open_read(
 
             cursors
                 .get_mut(*cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_materialized_view(mv_cursor));
         }
         CursorType::BTreeTable(_) => {
@@ -995,7 +1004,7 @@ pub fn op_open_read(
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
@@ -1008,7 +1017,7 @@ pub fn op_open_read(
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::Pseudo(_) => {
@@ -1036,7 +1045,10 @@ pub fn op_vopen(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VOpen { cursor_id }, insn);
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VOpen on non-virtual table cursor");
     };
@@ -1174,7 +1186,10 @@ pub fn op_vupdate(
         },
         insn
     );
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VUpdate on non-virtual table cursor");
     };
@@ -1351,7 +1366,7 @@ pub fn op_open_pseudo(
         let cursor = PseudoCursor::default();
         cursors
             .get_mut(*cursor_id)
-            .unwrap()
+            .expect("cursor_id should be valid")
             .replace(Cursor::new_pseudo(cursor));
     }
     state.pc += 1;
@@ -1529,7 +1544,10 @@ pub fn op_column(
                     // Fall back to normal handling
                 }
 
-                let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+                let (_, cursor_type) = program
+                    .cursor_ref
+                    .get(*cursor_id)
+                    .expect("cursor_id should exist in cursor_ref");
                 match cursor_type {
                     CursorType::BTreeTable(_)
                     | CursorType::BTreeIndex(_)
@@ -1698,14 +1716,18 @@ pub fn op_column(
                                 // I64
                                 6 => {
                                     let value = Value::Integer(i64::from_be_bytes(
-                                        buf[..8].try_into().unwrap(),
+                                        buf[..8]
+                                            .try_into()
+                                            .expect("slice should be exactly 8 bytes"),
                                     ));
                                     state.registers[*dest] = Register::Value(value);
                                 }
                                 // F64
                                 7 => {
                                     let value = Value::Float(f64::from_be_bytes(
-                                        buf[..8].try_into().unwrap(),
+                                        buf[..8]
+                                            .try_into()
+                                            .expect("slice should be exactly 8 bytes"),
                                     ));
                                     state.registers[*dest] = Register::Value(value);
                                 }
@@ -1805,7 +1827,9 @@ pub fn op_column(
                         state.registers[*dest] = Register::Value(value);
                     }
                     CursorType::IndexMethod(..) => {
-                        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+                        let cursor = state.cursors[*cursor_id]
+                            .as_mut()
+                            .expect("cursor should exist");
                         let cursor = cursor.as_index_method_mut();
                         let value = return_if_io!(cursor.query_column(*column));
                         state.registers[*dest] = Register::Value(value);
@@ -2344,7 +2368,8 @@ pub fn op_transaction_inner(
                         *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
-                        let (tx_id, mv_tx_mode) = current_mv_tx.unwrap();
+                        let (tx_id, mv_tx_mode) = current_mv_tx
+                            .expect("current_mv_tx should be Some when updated is true");
                         let actual_tx_mode = if mv_tx_mode == TransactionMode::Concurrent {
                             TransactionMode::Concurrent
                         } else {
@@ -2693,7 +2718,8 @@ pub fn op_program(
                         let reg_idx = *reg_idx as usize;
                         if reg_idx < state.registers.len() {
                             let value = state.registers[reg_idx].get_value().clone();
-                            let param_index = NonZero::<usize>::new(param_idx + 1).unwrap();
+                            let param_index = NonZero::<usize>::new(param_idx + 1)
+                                .expect("param_idx + 1 should be non-zero");
                             statement.bind_at(param_index, value);
                         } else {
                             crate::bail_corrupt_error!(
@@ -2877,17 +2903,21 @@ pub fn op_row_id(
                     match index_cursor {
                         Cursor::BTree(index_cursor) => {
                             let record = return_if_io!(index_cursor.record());
-                            let record = record.as_ref().unwrap();
+                            let record =
+                                record.as_ref().expect("index cursor should have a record");
                             let mut record_cursor_ref = index_cursor.record_cursor_mut();
                             let record_cursor = record_cursor_ref.deref_mut();
-                            let rowid = record.last_value(record_cursor).unwrap();
+                            let rowid = record
+                                .last_value(record_cursor)
+                                .expect("record should have a last value");
                             match rowid {
                                 Ok(ValueRef::Integer(rowid)) => rowid,
                                 _ => unreachable!(),
                             }
                         }
                         Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(index_cursor.query_rowid()).unwrap()
+                            return_if_io!(index_cursor.query_rowid())
+                                .expect("index cursor should have a rowid")
                         }
                         _ => panic!("unexpected cursor type"),
                     }
@@ -2912,14 +2942,18 @@ pub fn op_row_id(
             }
             OpRowIdState::GetRowid => {
                 let cursors = &mut state.cursors;
-                if let Some(Cursor::BTree(btree_cursor)) = cursors.get_mut(*cursor_id).unwrap() {
+                if let Some(Cursor::BTree(btree_cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
+                {
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
                         state.registers[*dest] = Register::Value(Value::Integer(*rowid));
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
-                } else if let Some(Cursor::Virtual(virtual_cursor)) =
-                    cursors.get_mut(*cursor_id).unwrap()
+                } else if let Some(Cursor::Virtual(virtual_cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
                 {
                     let rowid = virtual_cursor.rowid();
                     if rowid != 0 {
@@ -2927,16 +2961,18 @@ pub fn op_row_id(
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
-                } else if let Some(Cursor::MaterializedView(mv_cursor)) =
-                    cursors.get_mut(*cursor_id).unwrap()
+                } else if let Some(Cursor::MaterializedView(mv_cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
                         state.registers[*dest] = Register::Value(Value::Integer(rowid));
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
-                } else if let Some(Cursor::IndexMethod(cursor)) =
-                    cursors.get_mut(*cursor_id).unwrap()
+                } else if let Some(Cursor::IndexMethod(cursor)) = cursors
+                    .get_mut(*cursor_id)
+                    .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest] = Register::Value(Value::Integer(rowid));
@@ -2968,7 +3004,11 @@ pub fn op_idx_row_id(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
-    let cursor = cursors.get_mut(*cursor_id).unwrap().as_mut().unwrap();
+    let cursor = cursors
+        .get_mut(*cursor_id)
+        .expect("cursor_id should be valid")
+        .as_mut()
+        .expect("cursor should exist");
 
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
@@ -4313,7 +4353,7 @@ pub fn op_sorter_open(
     let cursors = &mut state.cursors;
     cursors
         .get_mut(*cursor_id)
-        .unwrap()
+        .expect("cursor_id should be valid")
         .replace(Cursor::new_sorter(cursor));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5351,7 +5391,7 @@ pub fn op_function(
                     for column in table.columns() {
                         use crate::types::TextRef;
 
-                        let name = column.name.as_ref().unwrap();
+                        let name = column.name.as_ref().expect("column should have a name");
                         let name_json = json::convert_ref_dbtype_to_jsonb(
                             ValueRef::Text(TextRef::new(name, TextSubtype::Text)),
                             json::Conv::ToString,
@@ -5671,7 +5711,9 @@ pub fn op_function(
                         };
 
                         let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
+                        let ast::Cmd::Stmt(stmt) =
+                            parser.next().expect("parser should have next item")?
+                        else {
                             todo!()
                         };
 
@@ -5837,9 +5879,8 @@ pub fn op_function(
                         }
                     };
 
-                    let column_def = Parser::new(column_def.as_bytes())
-                        .parse_column_definition(true)
-                        .unwrap();
+                    let column_def =
+                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
 
                     let rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -5849,7 +5890,9 @@ pub fn op_function(
                         };
 
                         let mut parser = Parser::new(sql.as_str().as_bytes());
-                        let ast::Cmd::Stmt(stmt) = parser.next().unwrap().unwrap() else {
+                        let ast::Cmd::Stmt(stmt) =
+                            parser.next().expect("parser should have next item")?
+                        else {
                             todo!()
                         };
 
@@ -6110,7 +6153,10 @@ pub fn op_sequence(
         },
         insn
     );
-    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let cursor_seq = state
+        .cursor_seqs
+        .get_mut(*cursor_id)
+        .expect("cursor_id should be valid");
     let seq_num = *cursor_seq;
     *cursor_seq += 1;
     state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
@@ -6133,7 +6179,10 @@ pub fn op_sequence_test(
         },
         insn
     );
-    let cursor_seq = state.cursor_seqs.get_mut(*cursor_id).unwrap();
+    let cursor_seq = state
+        .cursor_seqs
+        .get_mut(*cursor_id)
+        .expect("cursor_id should be valid");
     let was_zero = *cursor_seq == 0;
     *cursor_seq += 1;
     state.pc = if was_zero {
@@ -6823,7 +6872,10 @@ pub fn op_idx_insert(
 
     match state.op_idx_insert_state {
         OpIdxInsertState::MaybeSeek => {
-            let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+            let (_, cursor_type) = program
+                .cursor_ref
+                .get(cursor_id)
+                .expect("cursor_id should exist in cursor_ref");
             let CursorType::BTreeIndex(index_meta) = cursor_type else {
                 panic!("IdxInsert: not a BTreeIndex cursor");
             };
@@ -6962,7 +7014,9 @@ pub fn op_new_rowid(
         let rowid = {
             let cursor = state.get_cursor(*cursor);
             let cursor = cursor.as_btree_mut() as &mut dyn Any;
-            let mvcc_cursor = cursor.downcast_mut::<MvCursor>().unwrap();
+            let mvcc_cursor = cursor
+                .downcast_mut::<MvCursor>()
+                .expect("cursor should be MvCursor in MVCC mode");
             mvcc_cursor.get_next_rowid()
         };
         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
@@ -7323,7 +7377,9 @@ pub fn op_open_write(
             *cursor_ref = Some(Cursor::IndexMethod(cursor));
         }
 
-        let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+        let cursor = state.cursors[*cursor_id]
+            .as_mut()
+            .expect("cursor should exist");
         let cursor = cursor.as_index_method_mut();
         return_if_io!(cursor.open_write(&program.connection));
         state.pc += 1;
@@ -7358,7 +7414,10 @@ pub fn op_open_write(
         }
     }
 
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
         CursorType::BTreeIndex(index) => Some(index),
@@ -7378,7 +7437,9 @@ pub fn op_open_write(
         let maybe_promote_to_mvcc_cursor =
             |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                    let mv_store = mv_store.unwrap().clone();
+                    let mv_store = mv_store
+                        .expect("mv_store should be Some when MVCC transaction is active")
+                        .clone();
                     Ok(Box::new(MvCursor::new(
                         mv_store,
                         tx_id,
@@ -7406,7 +7467,7 @@ pub fn op_open_write(
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         } else {
             let num_columns = match cursor_type {
@@ -7425,7 +7486,7 @@ pub fn op_open_write(
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
             cursors
                 .get_mut(*cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
     }
@@ -7509,7 +7570,9 @@ pub fn op_index_method_create(
             *cursor_ref = Some(Cursor::IndexMethod(cursor));
         }
     }
-    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
     return_if_io!(cursor.create(&program.connection));
 
@@ -7539,7 +7602,9 @@ pub fn op_index_method_destroy(
             *cursor_ref = Some(Cursor::IndexMethod(cursor));
         }
     }
-    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
     return_if_io!(cursor.destroy(&program.connection));
 
@@ -7571,7 +7636,9 @@ pub fn op_index_method_query(
     if let Some(mv_store) = mv_store {
         todo!("MVCC is not supported yet");
     }
-    let cursor = state.cursors[*cursor_id].as_mut().unwrap();
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
     let has_rows =
         return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
@@ -7642,7 +7709,10 @@ pub fn op_reset_sorter(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ResetSorter { cursor_id }, insn);
 
-    let (_, cursor_type) = program.cursor_ref.get(*cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     let cursor = state.get_cursor(*cursor_id);
 
     match cursor_type {
@@ -7729,7 +7799,10 @@ pub fn op_close(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
     let cursors = &mut state.cursors;
-    cursors.get_mut(*cursor_id).unwrap().take();
+    cursors
+        .get_mut(*cursor_id)
+        .expect("cursor_id should be valid")
+        .take();
     if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
         deferred_seek.take();
     }
@@ -8294,7 +8367,10 @@ pub fn op_open_ephemeral(
             };
             let root_page = return_if_io!(pager.btree_create(flag)) as i64;
 
-            let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+            let (_, cursor_type) = program
+                .cursor_ref
+                .get(cursor_id)
+                .expect("cursor_id should exist in cursor_ref");
 
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
@@ -8316,7 +8392,10 @@ pub fn op_open_ephemeral(
 
             let cursors = &mut state.cursors;
 
-            let (_, cursor_type) = program.cursor_ref.get(cursor_id).unwrap();
+            let (_, cursor_type) = program
+                .cursor_ref
+                .get(cursor_id)
+                .expect("cursor_id should exist in cursor_ref");
 
             let OpOpenEphemeralState::Rewind { cursor } =
                 std::mem::take(&mut state.op_open_ephemeral_state)
@@ -8329,13 +8408,13 @@ pub fn op_open_ephemeral(
                 CursorType::BTreeTable(_) => {
                     cursors
                         .get_mut(cursor_id)
-                        .unwrap()
+                        .expect("cursor_id should be valid")
                         .replace(Cursor::new_btree(cursor));
                 }
                 CursorType::BTreeIndex(_) => {
                     cursors
                         .get_mut(cursor_id)
-                        .unwrap()
+                        .expect("cursor_id should be valid")
                         .replace(Cursor::new_btree(cursor));
                 }
                 CursorType::Pseudo(_) => {
@@ -8387,7 +8466,10 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = original_cursor.get_pager();
 
-    let (_, cursor_type) = program.cursor_ref.get(*original_cursor_id).unwrap();
+    let (_, cursor_type) = program
+        .cursor_ref
+        .get(*original_cursor_id)
+        .expect("cursor_id should exist in cursor_ref");
     match cursor_type {
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
@@ -8397,7 +8479,9 @@ pub fn op_open_dup(
             ));
             let cursor: Box<dyn CursorTrait> =
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                    let mv_store = mv_store.unwrap().clone();
+                    let mv_store = mv_store
+                        .expect("mv_store should be Some when MVCC transaction is active")
+                        .clone();
                     Box::new(MvCursor::new(mv_store, tx_id, root_page, cursor)?)
                 } else {
                     cursor
@@ -8405,7 +8489,7 @@ pub fn op_open_dup(
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
-                .unwrap()
+                .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(table) => {
