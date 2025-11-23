@@ -1,5 +1,4 @@
-use turso::Builder;
-use turso::Error;
+use turso::{Builder, Error};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
