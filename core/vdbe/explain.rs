@@ -734,7 +734,7 @@ pub fn insn_to_row(
                 "Program",
                 // First register that contains a param
                 params.first().map(|v| match v {
-                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1) as i64,
+                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1),
                     _ => 0,
                 }).unwrap_or(0),
                 // Number of registers that contain params
