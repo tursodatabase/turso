@@ -526,7 +526,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in Prepare state".to_string(),
+                        ));
+                    };
                     if *idx == v.as_f32_sparse().idx.len() {
                         self.insert_state = VectorSparseInvertedIndexInsertState::Init;
                         return Ok(IOResult::Done(()));
@@ -542,7 +546,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     );
                     tracing::debug!(
                         "insert_state: seek: component={}, sum={}, rowid={}",
-                        vector.as_ref().unwrap().as_f32_sparse().idx[*idx],
+                        position,
                         *sum,
                         *rowid,
                     );
@@ -561,7 +565,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                     key,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in SeekInverted state".to_string(),
+                        ));
+                    };
                     let result =
                         return_if_io!(inverted_cursor
                             .seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true }));
@@ -581,10 +589,18 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                     key,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in InsertInverted state".to_string(),
+                        ));
+                    };
                     return_if_io!(inverted_cursor.insert(&BTreeKey::IndexKey(k)));
 
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in InsertInverted state".to_string(),
+                        ));
+                    };
                     let position = v.as_f32_sparse().idx[*idx];
                     let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
                     self.insert_state = VectorSparseInvertedIndexInsertState::SeekStats {
@@ -602,7 +618,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in SeekStats state".to_string(),
+                        ));
+                    };
                     let result = return_if_io!(
                         stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
@@ -616,7 +636,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             };
                         }
                         SeekResult::NotFound | SeekResult::TryAdvance => {
-                            let v = vector.as_ref().unwrap();
+                            let Some(v) = vector.as_ref() else {
+                                return Err(LimboError::InternalError(
+                                    "vector must be present in SeekStats state".to_string(),
+                                ));
+                            };
                             let position = v.as_f32_sparse().idx[*idx];
                             let value = v.as_f32_sparse().values[*idx] as f64;
                             tracing::debug!(
@@ -653,7 +677,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 } => {
                     let record = return_if_io!(stats_cursor.record());
                     let component = parse_stat_row(record.as_deref())?;
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in ReadStats state".to_string(),
+                        ));
+                    };
                     let position = v.as_f32_sparse().idx[*idx];
                     let value = v.as_f32_sparse().values[*idx] as f64;
                     tracing::debug!(
@@ -687,7 +715,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in UpdateStats state".to_string(),
+                        ));
+                    };
                     return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
 
                     self.insert_state = VectorSparseInvertedIndexInsertState::Prepare {
@@ -746,7 +778,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in Prepare state".to_string(),
+                        ));
+                    };
                     if *idx == v.as_f32_sparse().idx.len() {
                         self.delete_state = VectorSparseInvertedIndexDeleteState::Init;
                         return Ok(IOResult::Done(()));
@@ -775,13 +811,25 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                     key,
                 } => {
+                    let component_idx = vector
+                        .as_ref()
+                        .and_then(|v| v.as_f32_sparse().idx.get(*idx).copied())
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "vector must be present in SeekInverted state".to_string(),
+                            )
+                        })?;
                     tracing::debug!(
                         "delete_state: seek: component={}, sum={}, rowid={}",
-                        vector.as_ref().unwrap().as_f32_sparse().idx[*idx],
+                        component_idx,
                         *sum,
                         *rowid,
                     );
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in SeekInverted state".to_string(),
+                        ));
+                    };
                     let result = return_if_io!(
                         cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
@@ -832,7 +880,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                 } => {
                     return_if_io!(cursor.delete());
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in DeleteInverted state".to_string(),
+                        ));
+                    };
                     let position = v.as_f32_sparse().idx[*idx];
                     let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
                     self.delete_state = VectorSparseInvertedIndexDeleteState::SeekStats {
@@ -850,7 +902,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in SeekStats state".to_string(),
+                        ));
+                    };
                     let result = return_if_io!(
                         stats_cursor.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
@@ -878,7 +934,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 } => {
                     let record = return_if_io!(stats_cursor.record());
                     let component = parse_stat_row(record.as_deref())?;
-                    let v = vector.as_ref().unwrap();
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in ReadStats state".to_string(),
+                        ));
+                    };
                     let position = v.as_f32_sparse().idx[*idx];
                     tracing::debug!(
                         "update stats(delete): {} (cnt={}, min={}, max={})",
@@ -911,7 +971,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in UpdateStats state".to_string(),
+                        ));
+                    };
                     return_if_io!(stats_cursor.insert(&BTreeKey::IndexKey(k)));
 
                     self.delete_state = VectorSparseInvertedIndexDeleteState::Prepare {
@@ -981,9 +1045,19 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     limit,
                     key,
                 } => {
-                    let p = &vector.as_ref().unwrap().as_f32_sparse().idx[*idx..];
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in CollectComponentsSeek state".to_string(),
+                        ));
+                    };
+                    let p = &v.as_f32_sparse().idx[*idx..];
                     if p.is_empty() && key.is_none() {
-                        let mut components = components.take().unwrap();
+                        let Some(mut components) = components.take() else {
+                            return Err(LimboError::InternalError(
+                                "components must be present in CollectComponentsSeek state"
+                                    .to_string(),
+                            ));
+                        };
                         match self.scan_order {
                             ScanOrder::DatasetFrequencyAsc => {
                                 // order by cnt ASC in order to check low-cardinality components first
@@ -1022,13 +1096,22 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         continue;
                     }
                     if key.is_none() {
-                        let position = vector.as_ref().unwrap().as_f32_sparse().idx[*idx];
+                        let Some(v) = vector.as_ref() else {
+                            return Err(LimboError::InternalError(
+                                "vector must be present in CollectComponentsSeek state".to_string(),
+                            ));
+                        };
+                        let position = v.as_f32_sparse().idx[*idx];
                         *key = Some(ImmutableRecord::from_values(
                             &[Value::Integer(position as i64)],
                             1,
                         ));
                     }
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in CollectComponentsSeek state".to_string(),
+                        ));
+                    };
                     let result = return_if_io!(
                         stats.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: true })
                     );
@@ -1064,9 +1147,19 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     limit,
                 } => {
                     let record = return_if_io!(stats.record());
-                    let v = vector.as_ref().unwrap().as_f32_sparse().values[*idx];
+                    let Some(v) = vector.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "vector must be present in CollectComponentsRead state".to_string(),
+                        ));
+                    };
+                    let value = v.as_f32_sparse().values[*idx];
                     let component = parse_stat_row(record.as_deref())?;
-                    components.as_mut().unwrap().push((component, v));
+                    let Some(comps) = components.as_mut() else {
+                        return Err(LimboError::InternalError(
+                            "components must be present in CollectComponentsRead state".to_string(),
+                        ));
+                    };
+                    comps.push((component, value));
                     self.search_state =
                         VectorSparseInvertedIndexSearchState::CollectComponentsSeek {
                             sum: *sum,
@@ -1087,9 +1180,17 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     component,
                     sum_threshold,
                 } => {
-                    let c = components.as_ref().unwrap();
+                    let Some(c) = components.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "components must be present in Seek state".to_string(),
+                        ));
+                    };
                     if c.is_empty() && key.is_none() {
-                        let distances = distances.take().unwrap();
+                        let Some(distances) = distances.take() else {
+                            return Err(LimboError::InternalError(
+                                "distances must be present in Seek state".to_string(),
+                            ));
+                        };
                         self.search_result = distances.iter().map(|(d, i)| (*i, d.0)).collect();
                         return Ok(IOResult::Done(!self.search_result.is_empty()));
                     }
@@ -1104,8 +1205,13 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         // so we have two intervals: [(best + delta) * Q .. M] and [M .. M / (best + delta) - (Q - M)]
                         // to simplify code for now we will pick upper bound from second range if it is not degenerate, otherwise check first range
                         let m = c.iter().map(|c| c.max).sum::<f64>().min(*sum);
-                        if distances.as_ref().unwrap().len() >= *limit as usize {
-                            if let Some((max_threshold, _)) = distances.as_ref().unwrap().last() {
+                        let Some(dists) = distances.as_ref() else {
+                            return Err(LimboError::InternalError(
+                                "distances must be present in Seek state".to_string(),
+                            ));
+                        };
+                        if dists.len() >= *limit as usize {
+                            if let Some((max_threshold, _)) = dists.last() {
                                 let best = 1.0 - max_threshold.0;
                                 let delta = self.delta;
                                 let q = *sum;
@@ -1131,19 +1237,37 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 }
                             }
                         }
-                        let c = components.as_mut().unwrap().pop_front().unwrap();
+                        let Some(comps) = components.as_mut() else {
+                            return Err(LimboError::InternalError(
+                                "components must be present in Seek state".to_string(),
+                            ));
+                        };
+                        let Some(c) = comps.pop_front() else {
+                            return Err(LimboError::InternalError(
+                                "components queue must not be empty in Seek state".to_string(),
+                            ));
+                        };
                         *key = Some(ImmutableRecord::from_values(
                             &[Value::Integer(c.position as i64)],
                             1,
                         ));
                         *component = Some(c.position);
                     }
-                    let k = key.as_ref().unwrap();
+                    let Some(k) = key.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "key must be present in Seek state".to_string(),
+                        ));
+                    };
                     let result = return_if_io!(
                         inverted.seek(SeekKey::IndexKey(k), SeekOp::GE { eq_only: false })
                     );
                     match result {
                         SeekResult::Found => {
+                            let Some(comp) = component.take() else {
+                                return Err(LimboError::InternalError(
+                                    "component must be present in Seek state".to_string(),
+                                ));
+                            };
                             self.search_state = VectorSparseInvertedIndexSearchState::Read {
                                 sum: *sum,
                                 components: components.take(),
@@ -1152,10 +1276,15 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 current: Some(Vec::new()),
                                 limit: *limit,
                                 sum_threshold: sum_threshold.take(),
-                                component: component.unwrap(),
+                                component: comp,
                             };
                         }
                         SeekResult::TryAdvance | SeekResult::NotFound => {
+                            let Some(comp) = component.take() else {
+                                return Err(LimboError::InternalError(
+                                    "component must be present in Seek state".to_string(),
+                                ));
+                            };
                             self.search_state = VectorSparseInvertedIndexSearchState::Next {
                                 sum: *sum,
                                 components: components.take(),
@@ -1164,7 +1293,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 current: Some(Vec::new()),
                                 limit: *limit,
                                 sum_threshold: sum_threshold.take(),
-                                component: component.unwrap(),
+                                component: comp,
                             };
                         }
                     }
@@ -1182,9 +1311,19 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let record = return_if_io!(inverted.record());
                     let row = parse_inverted_index_row(record.as_deref())?;
                     if row.position != *component
-                        || (sum_threshold.is_some() && row.sum > sum_threshold.unwrap())
+                        || (sum_threshold.is_some()
+                            && row.sum
+                                > sum_threshold.ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "sum_threshold must be present when checked".to_string(),
+                                    )
+                                })?)
                     {
-                        let mut current = current.take().unwrap();
+                        let Some(mut current) = current.take() else {
+                            return Err(LimboError::InternalError(
+                                "current must be present in Read state".to_string(),
+                            ));
+                        };
                         current.sort();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
@@ -1198,8 +1337,18 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         };
                         continue;
                     }
-                    if collected.as_mut().unwrap().insert(row.rowid) {
-                        current.as_mut().unwrap().push(row.rowid);
+                    let Some(coll) = collected.as_mut() else {
+                        return Err(LimboError::InternalError(
+                            "collected must be present in Read state".to_string(),
+                        ));
+                    };
+                    if coll.insert(row.rowid) {
+                        let Some(curr) = current.as_mut() else {
+                            return Err(LimboError::InternalError(
+                                "current must be present in Read state".to_string(),
+                            ));
+                        };
+                        curr.push(row.rowid);
                     }
 
                     self.search_state = VectorSparseInvertedIndexSearchState::Next {
@@ -1225,7 +1374,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 } => {
                     let result = return_if_io!(inverted.next());
                     if !result {
-                        let mut current = current.take().unwrap();
+                        let Some(mut current) = current.take() else {
+                            return Err(LimboError::InternalError(
+                                "current must be present in Next state".to_string(),
+                            ));
+                        };
                         current.sort();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
@@ -1259,7 +1412,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     current,
                     rowid,
                 } => {
-                    let c = current.as_ref().unwrap();
+                    let Some(c) = current.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "current must be present in EvaluateSeek state".to_string(),
+                        ));
+                    };
                     if c.is_empty() && rowid.is_none() {
                         self.search_state = VectorSparseInvertedIndexSearchState::Seek {
                             sum: *sum,
@@ -1274,10 +1431,24 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         continue;
                     }
                     if rowid.is_none() {
-                        *rowid = Some(current.as_mut().unwrap().pop_front().unwrap());
+                        let Some(curr) = current.as_mut() else {
+                            return Err(LimboError::InternalError(
+                                "current must be present in EvaluateSeek state".to_string(),
+                            ));
+                        };
+                        *rowid = Some(curr.pop_front().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "current queue must not be empty in EvaluateSeek state".to_string(),
+                            )
+                        })?);
                     }
 
-                    let rowid = *rowid.as_ref().unwrap();
+                    let Some(rid) = rowid.as_ref() else {
+                        return Err(LimboError::InternalError(
+                            "rowid must be present in EvaluateSeek state".to_string(),
+                        ));
+                    };
+                    let rowid = *rid;
                     let k = SeekKey::TableRowId(rowid);
                     let result = return_if_io!(main.seek(k, SeekOp::GE { eq_only: true }));
                     if !matches!(result, SeekResult::Found) {
@@ -1336,10 +1507,14 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             arg.as_f32_sparse()
                         );
                         let distance = operations::jaccard::vector_distance_jaccard(&data, &arg)?;
-                        let distances = distances.as_mut().unwrap();
-                        distances.insert((FloatOrd(distance), *rowid));
-                        if distances.len() > *limit as usize {
-                            let _ = distances.pop_last();
+                        let Some(dists) = distances.as_mut() else {
+                            return Err(LimboError::InternalError(
+                                "distances must be present in EvaluateRead state".to_string(),
+                            ));
+                        };
+                        dists.insert((FloatOrd(distance), *rowid));
+                        if dists.len() > *limit as usize {
+                            let _ = dists.pop_last();
                         }
                     }
 
@@ -1358,12 +1533,20 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
     }
 
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
-        let result = self.search_result.front().unwrap();
+        let Some(result) = self.search_result.front() else {
+            return Err(LimboError::InternalError(
+                "search_result must not be empty when query_rowid is called".to_string(),
+            ));
+        };
         Ok(IOResult::Done(Some(result.0)))
     }
 
     fn query_column(&mut self, _: usize) -> Result<IOResult<Value>> {
-        let result = self.search_result.front().unwrap();
+        let Some(result) = self.search_result.front() else {
+            return Err(LimboError::InternalError(
+                "search_result must not be empty when query_column is called".to_string(),
+            ));
+        };
         Ok(IOResult::Done(Value::Float(result.1)))
     }
 
