@@ -741,9 +741,11 @@ fn translate_rows_and_open_tables(
     inserting_multiple_rows: bool,
 ) -> Result<()> {
     if inserting_multiple_rows {
-        let select_result_start_reg = program
-            .reg_result_cols_start
-            .unwrap_or(ctx.yield_reg_opt.unwrap() + 1);
+        let select_result_start_reg = program.reg_result_cols_start.unwrap_or(
+            ctx.yield_reg_opt
+                .expect("yield_reg_opt must be set when inserting multiple rows")
+                + 1,
+        );
         translate_rows_multiple(
             program,
             insertion,
@@ -1347,7 +1349,7 @@ fn init_source_emission<'a>(
                                 }
                                 table
                                     .get_column_by_name(&column_name)
-                                    .unwrap()
+                                    .expect("column must exist in table")
                                     .1
                                     .affinity()
                                     .aff_mask()
@@ -2117,7 +2119,10 @@ fn translate_virtual_table_insert(
     }
     let (num_values, value) = match &mut body {
         InsertBody::Select(select, None) => match &mut select.body.select {
-            OneSelect::Values(values) => (values[0].len(), values.pop().unwrap()),
+            OneSelect::Values(values) => (
+                values[0].len(),
+                values.pop().expect("values must not be empty for INSERT"),
+            ),
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
         InsertBody::DefaultValues => (0, vec![]),
@@ -2490,7 +2495,9 @@ fn emit_update_sqlite_sequence(
         extra_amount: 0,
     });
 
-    let seq_table = schema.get_btree_table("sqlite_sequence").unwrap();
+    let seq_table = schema
+        .get_btree_table("sqlite_sequence")
+        .expect("sqlite_sequence table must exist");
     let affinity_str = seq_table
         .columns
         .iter()
@@ -2695,7 +2702,9 @@ pub fn emit_fk_child_insert_checks(
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
         for cname in &fk_ref.child_cols {
-            let (i, col) = child_tbl.get_column(cname).unwrap();
+            let (i, col) = child_tbl
+                .get_column(cname)
+                .expect("child column must exist");
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -2714,7 +2723,9 @@ pub fn emit_fk_child_insert_checks(
             let pcur = open_read_table(program, &parent_tbl);
 
             // first child col carries rowid
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_cols[0]).unwrap();
+            let (i_child, col_child) = child_tbl
+                .get_column(&fk_ref.child_cols[0])
+                .expect("first child column must exist");
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -2768,7 +2779,9 @@ pub fn emit_fk_child_insert_checks(
             let probe = {
                 let start = program.alloc_registers(ncols);
                 for (k, cname) in fk_ref.child_cols.iter().enumerate() {
-                    let (i, col) = child_tbl.get_column(cname).unwrap();
+                    let (i, col) = child_tbl
+                        .get_column(cname)
+                        .expect("child column must exist");
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg
@@ -2793,10 +2806,12 @@ pub fn emit_fk_child_insert_checks(
                 let parent_cols: Vec<&str> =
                     idx.columns.iter().map(|ic| ic.name.as_str()).collect();
 
-                // Build new parent-key image from this same row’s new values, in the index order.
+                // Build new parent-key image from this same row's new values, in the index order.
                 let parent_new = program.alloc_registers(ncols);
                 for (i, pname) in parent_cols.iter().enumerate() {
-                    let (pos, col) = child_tbl.get_column(pname).unwrap();
+                    let (pos, col) = child_tbl
+                        .get_column(pname)
+                        .expect("parent column must exist in child table");
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
                             new_rowid_reg

@@ -214,7 +214,10 @@ impl Page {
     }
 
     pub fn get_contents(&self) -> &mut PageContent {
-        self.get().contents.as_mut().unwrap()
+        self.get()
+            .contents
+            .as_mut()
+            .expect("page contents should be initialized")
     }
 
     pub fn is_locked(&self) -> bool {
@@ -750,7 +753,9 @@ impl Pager {
                 );
 
                 let savepoints = savepoints.read();
-                let cur_savepoint = savepoints.last().unwrap();
+                let cur_savepoint = savepoints
+                    .last()
+                    .expect("savepoint must exist when writing to subjournal");
                 cur_savepoint.add_dirty_page(page_id as u32);
                 cur_savepoint
                     .write_offset
@@ -760,7 +765,9 @@ impl Pager {
         let c = Completion::new_write(write_complete);
 
         let subjournal = self.subjournal.read();
-        let subjournal = subjournal.as_ref().unwrap();
+        let subjournal = subjournal
+            .as_ref()
+            .expect("subjournal must be open when writing page");
 
         let c = subjournal.write_page(write_offset, page_size, buffer.clone(), c)?;
         assert!(c.succeeded(), "memory IO should complete immediately");
@@ -769,7 +776,12 @@ impl Pager {
 
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
         self.open_subjournal()?;
-        let subjournal_offset = self.subjournal.read().as_ref().unwrap().size()?;
+        let subjournal_offset = self
+            .subjournal
+            .read()
+            .as_ref()
+            .expect("subjournal should be open after open_subjournal")
+            .size()?;
         // Currently as we only have anonymous savepoints opened at the start of a statement,
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
@@ -844,7 +856,13 @@ impl Pager {
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
             assert!(c.succeeded(), "memory IO should complete immediately");
-            let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
+            let page_id_slice = page_id_buffer.as_slice();
+            let page_id = u32::from_be_bytes([
+                page_id_slice[0],
+                page_id_slice[1],
+                page_id_slice[2],
+                page_id_slice[3],
+            ]);
             current_offset += 4;
 
             // Check if we've already rolled back this page or if the page is beyond the database size at the start of the savepoint
@@ -892,7 +910,7 @@ impl Pager {
             .subjournal
             .read()
             .as_ref()
-            .unwrap()
+            .expect("subjournal must be open during rollback")
             .truncate(journal_start_offset)?;
         assert!(
             truncate_completion.succeeded(),
@@ -1274,7 +1292,11 @@ impl Pager {
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
-        let contents = page.get().contents.as_mut().unwrap();
+        let contents = page
+            .get()
+            .contents
+            .as_mut()
+            .expect("page contents should be initialized");
         let buf = contents.as_ptr();
         buf.fill(0);
 
@@ -1982,7 +2004,7 @@ impl Pager {
                             .now()
                             .to_system_time()
                             .duration_since(self.commit_info.read().time.to_system_time())
-                            .unwrap()
+                            .expect("commit time should be in the past")
                             .as_millis()
                     );
                     let (should_finish, result, completion) = {
@@ -2011,7 +2033,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let wal = self.wal.as_ref().unwrap().borrow();
+        let wal = self.wal.as_ref().expect("WAL should be enabled").borrow();
         wal.changed_pages_after(frame_watermark)
     }
 
@@ -2356,7 +2378,11 @@ impl Pager {
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
-                    let contents = page.get().contents.as_mut().unwrap();
+                    let contents = page
+                        .get()
+                        .contents
+                        .as_mut()
+                        .expect("page contents should be initialized");
                     // Point to previous trunk
                     contents.write_u32_no_offset(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
                     // Zero leaf count
@@ -2658,7 +2684,7 @@ impl Pager {
                             let mut cache = self.page_cache.write();
                             cache
                                 .insert(page_key, richard_hipp_special_page.clone())
-                                .unwrap();
+                                .expect("cache insertion should succeed");
                         }
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;

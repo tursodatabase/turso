@@ -144,7 +144,9 @@ pub fn translate_create_table(
         }
     }
 
-    let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(schema_master_table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -233,7 +235,9 @@ pub fn translate_create_table(
         }
     }
 
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -424,7 +428,9 @@ fn collect_autoindexes(
 
     // include UNIQUE singles, include PK single only if not rowid alias
     for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-        let (col_name, _sort) = us.columns.first().unwrap();
+        let Some((col_name, _sort)) = us.columns.first() else {
+            crate::bail_parse_error!("unique set must have at least one column");
+        };
         let Some((_pos, col)) = table.get_column(col_name) else {
             bail_parse_error!("Column {col_name} not found in table {}", table.name);
         };
@@ -570,7 +576,9 @@ pub fn translate_create_virtual_table(
         table_name: table_name_reg,
         args_reg,
     });
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -653,7 +661,9 @@ pub fn translate_drop_table(
         bail_parse_error!("table {} may not be dropped", tbl_name.name.as_str());
     }
 
-    let table = table.unwrap(); // safe since we just checked for None
+    let Some(table) = table else {
+        crate::bail_parse_error!("table not found");
+    };
 
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
     if resolver.schema.is_materialized_view(tbl_name.name.as_str()) {
@@ -683,7 +693,9 @@ pub fn translate_drop_table(
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
 
-    let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let Some(schema_table) = resolver.schema.get_btree_table(SQLITE_TABLEID) else {
+        crate::bail_parse_error!("sqlite_schema table not found");
+    };
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
         //  cursor 0
         CursorType::BTreeTable(schema_table.clone()),

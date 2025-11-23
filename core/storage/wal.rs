@@ -1031,7 +1031,7 @@ impl Wal for WalFile {
         self.with_shared(|shared| {
             let nbackfills = shared.nbackfills.load(Ordering::Acquire);
             turso_assert!(
-                frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
+                frame_watermark.map_or(true, |fw| fw >= nbackfills),
                 "frame_watermark must be >= than current WAL backfill amount: frame_watermark={:?}, nBackfill={}", frame_watermark, nbackfills
             );
         });
@@ -1126,7 +1126,11 @@ impl Wal for WalFile {
             // This means that readers trying to acquire the lock will block even if the lock is unlocked
             // when there are writers waiting to acquire the lock.
             // Because of this, attempts to recursively acquire a read lock within a single thread may result in a deadlock."
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         begin_read_wal_frame(
             file.as_ref(),
@@ -1194,7 +1198,11 @@ impl Wal for WalFile {
         });
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
         Ok(c)
@@ -1260,7 +1268,11 @@ impl Wal for WalFile {
             });
             let file = self.with_shared(|shared| {
                 assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-                shared.file.as_ref().unwrap().clone()
+                shared
+                    .file
+                    .as_ref()
+                    .expect("WAL file must be initialized")
+                    .clone()
             });
             let c = begin_read_wal_frame(
                 file.as_ref(),
@@ -1285,7 +1297,11 @@ impl Wal for WalFile {
         let (header, file) = self.with_shared(|shared| {
             let header = shared.wal_header.clone();
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            let file = shared.file.as_ref().unwrap().clone();
+            let file = shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone();
             (header, file)
         });
         let header = header.lock();
@@ -1340,7 +1356,11 @@ impl Wal for WalFile {
         });
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         self.syncing.store(true, Ordering::SeqCst);
         let c = file.sync(completion)?;
@@ -1465,7 +1485,11 @@ impl Wal for WalFile {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             (
                 *shared.wal_header.lock(),
-                shared.file.as_ref().unwrap().clone(),
+                shared
+                    .file
+                    .as_ref()
+                    .expect("WAL file must be initialized")
+                    .clone(),
             )
         });
         let c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
@@ -1475,7 +1499,11 @@ impl Wal for WalFile {
     fn prepare_wal_finish(&mut self) -> Result<Completion> {
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         let shared = self.shared.clone();
         let c = file.sync(Completion::new_sync(move |_| {
@@ -1598,7 +1626,11 @@ impl Wal for WalFile {
 
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         let c = file.pwritev(start_off, iovecs, c)?;
         Ok(c)
@@ -2035,7 +2067,9 @@ impl WalFile {
                         else {
                             panic!("unxpected state");
                         };
-                        checkpoint_result.take().unwrap()
+                        checkpoint_result
+                            .take()
+                            .expect("checkpoint result must be present in Truncate state")
                     };
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.with_shared(|shared| shared.epoch.fetch_add(1, Ordering::Release));
@@ -2178,7 +2212,11 @@ impl WalFile {
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
             shared.initialized.store(false, Ordering::Release);
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
 
         let CheckpointState::Truncate {
@@ -2288,7 +2326,11 @@ impl WalFile {
         // schedule read of the page payload
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
-            shared.file.as_ref().unwrap().clone()
+            shared
+                .file
+                .as_ref()
+                .expect("WAL file must be initialized")
+                .clone()
         });
         let c = begin_read_wal_frame(
             file.as_ref(),
