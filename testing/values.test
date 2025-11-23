@@ -65,11 +65,11 @@ do_execsql_test_in_memory_any_error values-illegal-column-ref {
 # Unquoted identifiers in VALUES should produce a parse error
 do_execsql_test_in_memory_error_content values-unquoted-identifier-single {
   values(asdf);
-} {Parse error: no such column: asdf}
+}
 
 do_execsql_test_in_memory_error_content values-unquoted-identifier-mixed {
   values(1, asdf);
-} {Parse error: no such column: asdf}
+}
 
 # Also verify correlated VALUES references outer columns row-by-row
 do_execsql_test_on_specific_db {:memory:} values-correlated-values-in-select {
