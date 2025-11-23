@@ -59,7 +59,12 @@ impl IO for MemoryIO {
                 }),
             );
         }
-        Ok(files.get(path).unwrap().clone())
+        Ok(files
+            .get(path)
+            .ok_or(crate::LimboError::InternalError(
+                "file should exist after insert".to_string(),
+            ))?
+            .clone())
     }
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock();
