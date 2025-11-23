@@ -330,11 +330,12 @@ impl Sorter {
             None => {
                 let temp_dir = tempfile::tempdir()?;
                 let chunk_file_path = temp_dir.as_ref().join("chunk_file");
-                let chunk_file = self.io.open_file(
-                    chunk_file_path.to_str().unwrap(),
-                    OpenFlags::Create,
-                    false,
-                )?;
+                let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
+                    LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+                })?;
+                let chunk_file =
+                    self.io
+                        .open_file(chunk_file_path_str, OpenFlags::Create, false)?;
                 self.temp_file = Some(TempFile {
                     _temp_dir: temp_dir,
                     file: chunk_file.clone(),
@@ -681,7 +682,9 @@ impl Ord for SortableImmutableRecord {
                     // SAFETY: these were checked to be valid UTF-8 on construction.
                     &left, &right,
                 ),
-                _ => this_key_value.partial_cmp(&other_key_value).unwrap(),
+                _ => this_key_value
+                    .partial_cmp(&other_key_value)
+                    .expect("sorter values of the same column should be comparable"),
             };
             if !cmp.is_eq() {
                 return match column_order {
