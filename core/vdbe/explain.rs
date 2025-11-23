@@ -734,11 +734,11 @@ pub fn insn_to_row(
                 "Program",
                 // First register that contains a param
                 params.first().map(|v| match v {
-                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1) as i32,
+                    crate::types::Value::Integer(i) if *i < 0 => (-i - 1) as i64,
                     _ => 0,
                 }).unwrap_or(0),
                 // Number of registers that contain params
-                params.len() as i32,
+                params.len() as i64,
                 0,
                 Value::build_text(program.sql.clone()),
                 0,
@@ -1426,7 +1426,7 @@ pub fn insn_to_row(
             ),
             Insn::DropTrigger { db, trigger_name } => (
                 "DropTrigger",
-                *db as i32,
+                *db as i64,
                 0,
                 0,
                 Value::build_text(trigger_name.clone()),
