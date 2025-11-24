@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::mvcc::cursor::MvccCursorType;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::schema::Table;
 use crate::state_machine::StateMachine;
@@ -14,7 +15,7 @@ use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize}
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
+    ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
@@ -947,22 +948,24 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor =
-        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    tx_id,
-                    *root_page,
-                    btree_cursor,
-                )?))
-            } else {
-                Ok(btree_cursor)
-            }
-        };
+    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+                                        mv_cursor_type: MvccCursorType|
+     -> Result<Box<dyn CursorTrait>> {
+        if let Some(tx_id) = program.connection.get_mv_tx_id() {
+            let mv_store = mv_store
+                .expect("mv_store should be Some when MVCC transaction is active")
+                .clone();
+            Ok(Box::new(MvCursor::new(
+                mv_store,
+                tx_id,
+                *root_page,
+                mv_cursor_type,
+                btree_cursor,
+            )?))
+        } else {
+            Ok(btree_cursor)
+        }
+    };
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
@@ -974,7 +977,7 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().name().to_string();
@@ -1003,7 +1006,7 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -1016,7 +1019,9 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            let cursor =
+                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -7435,22 +7440,24 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor =
-            |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-                if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                    let mv_store = mv_store
-                        .expect("mv_store should be Some when MVCC transaction is active")
-                        .clone();
-                    Ok(Box::new(MvCursor::new(
-                        mv_store,
-                        tx_id,
-                        root_page,
-                        btree_cursor,
-                    )?))
-                } else {
-                    Ok(btree_cursor)
-                }
-            };
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+                                            mv_cursor_type: MvccCursorType|
+         -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store
+                    .expect("mv_store should be Some when MVCC transaction is active")
+                    .clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
         if let Some(index) = maybe_index {
             let conn = program.connection.clone();
             let schema = conn.schema.read();
@@ -7465,7 +7472,9 @@ pub fn op_open_write(
                 index.as_ref(),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            let cursor =
+                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -7484,7 +7493,7 @@ pub fn op_open_write(
                 maybe_transform_root_page_to_positive(mv_store, root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -8484,7 +8493,13 @@ pub fn op_open_dup(
                     let mv_store = mv_store
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    Box::new(MvCursor::new(mv_store, tx_id, root_page, cursor)?)
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        MvccCursorType::Table,
+                        cursor,
+                    )?)
                 } else {
                     cursor
                 };

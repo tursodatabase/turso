@@ -1,10 +1,14 @@
 use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::database::{MVTableId, MvStore, Row, RowID, RowKey, RowVersionState};
+use crate::mvcc::database::{
+    MVTableId, MvStore, Row, RowID, RowKey, RowVersionState, SortableIndexKey,
+};
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
-use crate::types::{IOResult, ImmutableRecord, RecordCursor, SeekKey, SeekOp, SeekResult};
+use crate::types::{
+    IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey, SeekOp, SeekResult,
+};
 use crate::{return_if_io, LimboError, Result};
 use crate::{Pager, Value};
 use std::any::Any;
@@ -56,10 +60,17 @@ enum MvccLazyCursorState {
     Exists(ExistsState),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MvccCursorType {
+    Table,
+    Index(Arc<IndexInfo>),
+}
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
-    pub table_id: MVTableId,
+    mv_cursor_type: MvccCursorType,
+    table_id: MVTableId,
     tx_id: u64,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
@@ -75,6 +86,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         db: Arc<MvStore<Clock>>,
         tx_id: u64,
         root_page_or_table_id: i64,
+        mv_cursor_type: MvccCursorType,
         btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
         assert!(
@@ -85,6 +97,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(Self {
             db,
             tx_id,
+            mv_cursor_type,
             current_pos: RefCell::new(CursorPosition::BeforeFirst),
             table_id,
             reusable_immutable_record: RefCell::new(None),

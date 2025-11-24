@@ -833,6 +833,7 @@ fn test_lazy_scan_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
+        MvccCursorType::Table,
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -875,6 +876,7 @@ fn test_lazy_scan_cursor_with_gaps() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
+        MvccCursorType::Table,
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -926,6 +928,7 @@ fn test_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
+        MvccCursorType::Table,
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -980,6 +983,7 @@ fn test_cursor_with_empty_table() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
+        MvccCursorType::Table,
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
@@ -997,6 +1001,7 @@ fn test_cursor_modification_during_scan() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
+        MvccCursorType::Table,
         Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
     )
     .unwrap();
