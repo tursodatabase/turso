@@ -3,8 +3,10 @@ package tech.turso.jdbc4;
 import java.sql.*;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 import tech.turso.annotations.SkipNullableCheck;
 import tech.turso.core.TursoConnection;
 import tech.turso.core.TursoStatement;
@@ -13,6 +15,7 @@ import tech.turso.core.TursoStatement;
 public final class JDBC4Connection implements Connection {
 
   private final TursoConnection connection;
+  private final AtomicInteger savepointCounter = new AtomicInteger();
 
   private Map<String, Class<?>> typeMap = new HashMap<>();
 
@@ -186,8 +189,24 @@ public final class JDBC4Connection implements Connection {
   @Override
   @SkipNullableCheck
   public Savepoint setSavepoint() throws SQLException {
-    // TODO
-    return null;
+    checkOpen();
+    if (getAutoCommit()) {
+      throw new SQLException("Cannot create savepoint in auto-commit mode");
+    }
+    int id = savepointCounter.incrementAndGet();
+    String name = "SP" + id;
+    Savepoint sp = new JDBC4Savepoint(id, name);
+    try {
+      exec("SAVEPOINT " + name);
+    } catch (SQLException e) {
+      // libSQL does not support SAVEPOINT yet.
+      String msg = Objects.toString(e.getMessage(), "");
+      if (msg.contains("not supported")) {
+        throw new SQLFeatureNotSupportedException("SAVEPOINT not supported by libSQL", e);
+      }
+      throw e;
+    }
+    return sp;
   }
 
   @Override
@@ -195,6 +214,12 @@ public final class JDBC4Connection implements Connection {
   public Savepoint setSavepoint(String name) throws SQLException {
     // TODO
     return null;
+  }
+
+  private void exec(String sql) throws SQLException {
+    try (Statement st = createStatement()) {
+      st.execute(sql);
+    }
   }
 
   @Override
