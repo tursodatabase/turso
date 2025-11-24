@@ -191,6 +191,8 @@ fn time_date_internal(args: &[Value]) -> Value {
         seconds -= offset_sec as i64;
     }
 
+    let offset = ok_tri!(FixedOffset::east_opt(0), "failed to create UTC offset");
+
     let t = Time::time_date(
         year as i32,
         month as i32,
@@ -199,7 +201,7 @@ fn time_date_internal(args: &[Value]) -> Value {
         minutes,
         seconds,
         nano_secs,
-        FixedOffset::east_opt(0).unwrap(),
+        offset,
     );
 
     let t = tri!(t);
@@ -632,7 +634,10 @@ fn dur_ns(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::nanoseconds(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::nanoseconds(1).num_nanoseconds(),
+        "failed to convert nanoseconds duration"
+    ))
 }
 
 /// 1 microsecond
@@ -642,7 +647,10 @@ fn dur_us(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::microseconds(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::microseconds(1).num_nanoseconds(),
+        "failed to convert microseconds duration"
+    ))
 }
 
 /// 1 millisecond
@@ -652,7 +660,10 @@ fn dur_ms(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::milliseconds(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::milliseconds(1).num_nanoseconds(),
+        "failed to convert milliseconds duration"
+    ))
 }
 
 /// 1 second
@@ -662,7 +673,10 @@ fn dur_s(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::seconds(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::seconds(1).num_nanoseconds(),
+        "failed to convert seconds duration"
+    ))
 }
 
 /// 1 minute
@@ -672,7 +686,10 @@ fn dur_m(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::minutes(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::minutes(1).num_nanoseconds(),
+        "failed to convert minutes duration"
+    ))
 }
 
 /// 1 hour
@@ -682,7 +699,10 @@ fn dur_h(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    Value::from_integer(chrono::Duration::hours(1).num_nanoseconds().unwrap())
+    Value::from_integer(ok_tri!(
+        chrono::Duration::hours(1).num_nanoseconds(),
+        "failed to convert hours duration"
+    ))
 }
 
 // Time Arithmetic
@@ -992,19 +1012,13 @@ fn time_parse(args: &[Value]) -> Value {
     }
 
     if let Ok(mut dt) = chrono::NaiveDateTime::parse_from_str(dt_str, "%Y-%m-%d %H:%M:%S") {
-        // Unwrap is safe here
-        dt = dt.with_nanosecond(0).unwrap();
+        dt = ok_tri!(dt.with_nanosecond(0), "failed to set nanosecond to 0");
         return Time::from_datetime(dt.and_utc()).into_blob();
     }
 
     if let Ok(date) = chrono::NaiveDate::parse_from_str(dt_str, "%Y-%m-%d") {
-        // Unwrap is safe here
-
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .with_nanosecond(0)
-            .unwrap();
+        let dt = ok_tri!(date.and_hms_opt(0, 0, 0), "failed to create time 00:00:00");
+        let dt = ok_tri!(dt.with_nanosecond(0), "failed to set nanosecond to 0");
         return Time::from_datetime(dt.and_utc()).into_blob();
     }
 
@@ -1012,9 +1026,12 @@ fn time_parse(args: &[Value]) -> Value {
         chrono::NaiveTime::parse_from_str(dt_str, "%H:%M:%S"),
         "error parsing datetime string"
     );
-    let dt = NaiveDateTime::new(NaiveDate::from_ymd_opt(1, 1, 1).unwrap(), time)
-        .with_nanosecond(0)
-        .unwrap();
+    let date = ok_tri!(
+        NaiveDate::from_ymd_opt(1, 1, 1),
+        "failed to create baseline date"
+    );
+    let dt = NaiveDateTime::new(date, time);
+    let dt = ok_tri!(dt.with_nanosecond(0), "failed to set nanosecond to 0");
 
     Time::from_datetime(dt.and_utc()).into_blob()
 }

@@ -59,7 +59,16 @@ impl ChecksumContext {
 
         let actual_page = &page[..CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE];
         let stored_checksum_bytes = &page[CHECKSUM_PAGE_SIZE - CHECKSUM_SIZE..];
-        let stored_checksum = u64::from_le_bytes(stored_checksum_bytes.try_into().unwrap());
+        let stored_checksum = u64::from_le_bytes([
+            stored_checksum_bytes[0],
+            stored_checksum_bytes[1],
+            stored_checksum_bytes[2],
+            stored_checksum_bytes[3],
+            stored_checksum_bytes[4],
+            stored_checksum_bytes[5],
+            stored_checksum_bytes[6],
+            stored_checksum_bytes[7],
+        ]);
 
         let computed_checksum = self.compute_checksum(actual_page);
         if stored_checksum != computed_checksum {

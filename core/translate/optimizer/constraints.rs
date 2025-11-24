@@ -288,18 +288,19 @@ pub fn constraints_from_where_clause(
                     // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
                     // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
                     // we check it here.
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator,
-                            table_col_pos: rowid_alias_column,
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
-                            usable: true,
-                        });
+                    if *table == table_reference.internal_id {
+                        if let Some(rowid_col_pos) = rowid_alias_column {
+                            let table_column = &table_reference.table.columns()[rowid_col_pos];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
+                                operator,
+                                table_col_pos: Some(rowid_col_pos),
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                                selectivity: estimate_selectivity(Some(table_column), operator),
+                                usable: true,
+                            });
+                        }
                     }
                 }
                 _ if expression_matches_table(
@@ -337,18 +338,19 @@ pub fn constraints_from_where_clause(
                     }
                 }
                 ast::Expr::RowId { table, .. } => {
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Lhs),
-                            operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column,
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
-                            usable: true,
-                        });
+                    if *table == table_reference.internal_id {
+                        if let Some(rowid_col_pos) = rowid_alias_column {
+                            let table_column = &table_reference.table.columns()[rowid_col_pos];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Lhs),
+                                operator: opposite_cmp_op(operator),
+                                table_col_pos: Some(rowid_col_pos),
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                                selectivity: estimate_selectivity(Some(table_column), operator),
+                                usable: true,
+                            });
+                        }
                     }
                 }
                 _ if expression_matches_table(
@@ -413,7 +415,7 @@ pub fn constraints_from_where_clause(
                             None
                         }
                     })
-                    .unwrap();
+                    .expect("rowid candidate must exist in candidates list");
                 rowid_candidate.refs.push(ConstraintRef {
                     constraint_vec_pos: i,
                     index_col_pos: 0,
@@ -563,7 +565,10 @@ pub fn usable_constraints_for_join_order<'a>(
 ) -> Vec<RangeConstraintRef> {
     debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let table_idx = join_order.last().unwrap().original_idx;
+    let table_idx = join_order
+        .last()
+        .expect("join_order must not be empty")
+        .original_idx;
     let lhs_mask = TableMask::from_table_number_iter(
         join_order
             .iter()
@@ -584,23 +589,32 @@ pub fn usable_constraints_for_join_order<'a>(
         }
         if Some(cref.index_col_pos) == usable.last().map(|x| x.index_col_pos) {
             // Two constraints on the same index column can be combined into a single range constraint.
-            assert_eq!(cref.sort_order, usable.last().unwrap().sort_order);
-            assert_eq!(cref.index_col_pos, usable.last().unwrap().index_col_pos);
+            let last_usable = usable
+                .last()
+                .expect("usable must not be empty when matching last index_col_pos");
+            assert_eq!(cref.sort_order, last_usable.sort_order);
+            assert_eq!(cref.index_col_pos, last_usable.index_col_pos);
             assert_eq!(
                 constraints[cref.constraint_vec_pos].table_col_pos,
-                usable.last().unwrap().table_col_pos
+                last_usable.table_col_pos
             );
             // if we already have eq constraint - we must not add anything to it
             // otherwise, we can incorrectly consume filters which will not be used in the access path
-            if usable.last().unwrap().eq.is_some() {
+            if last_usable.eq.is_some() {
                 continue;
             }
             match constraints[cref.constraint_vec_pos].operator {
                 ast::Operator::Greater | ast::Operator::GreaterEquals => {
-                    usable.last_mut().unwrap().lower_bound = Some(cref.constraint_vec_pos);
+                    usable
+                        .last_mut()
+                        .expect("usable must not be empty")
+                        .lower_bound = Some(cref.constraint_vec_pos);
                 }
                 ast::Operator::Less | ast::Operator::LessEquals => {
-                    usable.last_mut().unwrap().upper_bound = Some(cref.constraint_vec_pos);
+                    usable
+                        .last_mut()
+                        .expect("usable must not be empty")
+                        .upper_bound = Some(cref.constraint_vec_pos);
                 }
                 _ => {}
             }
@@ -677,7 +691,10 @@ pub fn convert_to_vtab_constraint(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
 ) -> Vec<ConstraintInfo> {
-    let table_idx = join_order.last().unwrap().original_idx;
+    let table_idx = join_order
+        .last()
+        .expect("join_order must not be empty")
+        .original_idx;
     let lhs_mask = TableMask::from_table_number_iter(
         join_order
             .iter()

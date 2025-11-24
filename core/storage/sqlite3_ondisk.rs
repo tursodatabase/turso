@@ -468,7 +468,9 @@ impl PageContent {
     }
 
     pub fn page_type(&self) -> PageType {
-        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
+        self.read_u8(BTREE_PAGE_TYPE)
+            .try_into()
+            .expect("Invalid page type")
     }
 
     pub fn maybe_page_type(&self) -> Option<PageType> {
@@ -804,6 +806,7 @@ impl PageContent {
             min_local,
             page_type,
         )
+        .expect("Failed to get cell raw region")
     }
 
     /// Get region(start end length) of a cell's payload
@@ -815,13 +818,13 @@ impl PageContent {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> (usize, usize) {
+    ) -> Result<(usize, usize)> {
         let buf = self.as_ptr();
         assert!(idx < cell_count, "cell_get: idx out of bounds");
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
-                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let (len_payload, n_payload) = read_varint(&buf[start + 4..])?;
                 let (overflows, to_read) =
                     payload_overflows(len_payload as usize, max_local, min_local, usable_size);
                 if overflows {
@@ -831,11 +834,11 @@ impl PageContent {
                 }
             }
             PageType::TableInterior => {
-                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                let (_, n_rowid) = read_varint(&buf[start + 4..])?;
                 4 + n_rowid
             }
             PageType::IndexLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (len_payload, n_payload) = read_varint(&buf[start..])?;
                 let (overflows, to_read) =
                     payload_overflows(len_payload as usize, max_local, min_local, usable_size);
                 if overflows {
@@ -849,8 +852,8 @@ impl PageContent {
                 }
             }
             PageType::TableLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
-                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let (len_payload, n_payload) = read_varint(&buf[start..])?;
+                let (_, n_rowid) = read_varint(&buf[start + n_payload..])?;
                 let (overflows, to_read) =
                     payload_overflows(len_payload as usize, max_local, min_local, usable_size);
                 if overflows {
@@ -864,7 +867,7 @@ impl PageContent {
                 }
             }
         };
-        (start, len)
+        Ok((start, len))
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -1269,7 +1272,10 @@ impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
             if self.extra_data.is_none() {
                 self.extra_data = Some(Vec::new());
             }
-            self.extra_data.as_mut().unwrap().push(value);
+            self.extra_data
+                .as_mut()
+                .expect("extra_data was just initialized")
+                .push(value);
             self.len += 1;
         }
     }
@@ -1278,7 +1284,10 @@ impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
         assert!(self.extra_data.is_some());
         assert!(index >= self.data.len());
         let extra_data_index = index - self.data.len();
-        let extra_data = self.extra_data.as_ref().unwrap();
+        let extra_data = self
+            .extra_data
+            .as_ref()
+            .expect("extra_data existence was just asserted");
         assert!(extra_data_index < extra_data.len());
         extra_data[extra_data_index]
     }
@@ -1806,14 +1815,14 @@ impl StreamingWalReader {
         let (page_sz, c1, c2, use_native, ok) = {
             let mut h = self.header.lock();
             let s = buf.as_slice();
-            h.magic = u32::from_be_bytes(s[0..4].try_into().unwrap());
-            h.file_format = u32::from_be_bytes(s[4..8].try_into().unwrap());
-            h.page_size = u32::from_be_bytes(s[8..12].try_into().unwrap());
-            h.checkpoint_seq = u32::from_be_bytes(s[12..16].try_into().unwrap());
-            h.salt_1 = u32::from_be_bytes(s[16..20].try_into().unwrap());
-            h.salt_2 = u32::from_be_bytes(s[20..24].try_into().unwrap());
-            h.checksum_1 = u32::from_be_bytes(s[24..28].try_into().unwrap());
-            h.checksum_2 = u32::from_be_bytes(s[28..32].try_into().unwrap());
+            h.magic = u32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+            h.file_format = u32::from_be_bytes([s[4], s[5], s[6], s[7]]);
+            h.page_size = u32::from_be_bytes([s[8], s[9], s[10], s[11]]);
+            h.checkpoint_seq = u32::from_be_bytes([s[12], s[13], s[14], s[15]]);
+            h.salt_1 = u32::from_be_bytes([s[16], s[17], s[18], s[19]]);
+            h.salt_2 = u32::from_be_bytes([s[20], s[21], s[22], s[23]]);
+            h.checksum_1 = u32::from_be_bytes([s[24], s[25], s[26], s[27]]);
+            h.checksum_2 = u32::from_be_bytes([s[28], s[29], s[30], s[31]]);
             tracing::debug!("WAL header: {:?}", *h);
 
             let use_native = cfg!(target_endian = "big") == ((h.magic & 1) != 0);
@@ -1874,12 +1883,12 @@ impl StreamingWalReader {
             let fh = &buf[pos..pos + WAL_FRAME_HEADER_SIZE];
             let page = &buf[pos + WAL_FRAME_HEADER_SIZE..pos + frame_size];
 
-            let page_number = u32::from_be_bytes(fh[0..4].try_into().unwrap());
-            let db_size = u32::from_be_bytes(fh[4..8].try_into().unwrap());
-            let s1 = u32::from_be_bytes(fh[8..12].try_into().unwrap());
-            let s2 = u32::from_be_bytes(fh[12..16].try_into().unwrap());
-            let c1 = u32::from_be_bytes(fh[16..20].try_into().unwrap());
-            let c2 = u32::from_be_bytes(fh[20..24].try_into().unwrap());
+            let page_number = u32::from_be_bytes([fh[0], fh[1], fh[2], fh[3]]);
+            let db_size = u32::from_be_bytes([fh[4], fh[5], fh[6], fh[7]]);
+            let s1 = u32::from_be_bytes([fh[8], fh[9], fh[10], fh[11]]);
+            let s2 = u32::from_be_bytes([fh[12], fh[13], fh[14], fh[15]]);
+            let c1 = u32::from_be_bytes([fh[16], fh[17], fh[18], fh[19]]);
+            let c2 = u32::from_be_bytes([fh[20], fh[21], fh[22], fh[23]]);
 
             if page_number == 0 {
                 break;
@@ -2062,12 +2071,12 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
-    let page_number = u32::from_be_bytes(frame[0..4].try_into().unwrap());
-    let db_size = u32::from_be_bytes(frame[4..8].try_into().unwrap());
-    let salt_1 = u32::from_be_bytes(frame[8..12].try_into().unwrap());
-    let salt_2 = u32::from_be_bytes(frame[12..16].try_into().unwrap());
-    let checksum_1 = u32::from_be_bytes(frame[16..20].try_into().unwrap());
-    let checksum_2 = u32::from_be_bytes(frame[20..24].try_into().unwrap());
+    let page_number = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    let db_size = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+    let salt_1 = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
+    let salt_2 = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
+    let checksum_1 = u32::from_be_bytes([frame[16], frame[17], frame[18], frame[19]]);
+    let checksum_2 = u32::from_be_bytes([frame[20], frame[21], frame[22], frame[23]]);
     let header = WalFrameHeader {
         page_number,
         db_size,
@@ -2204,16 +2213,17 @@ pub fn checksum_wal(
     let mut i = 0;
     if native_endian {
         while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap());
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap());
+            let v0 = u32::from_ne_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            let v1 = u32::from_ne_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
             i += 8;
         }
     } else {
         while i < buf.len() {
-            let v0 = u32::from_ne_bytes(buf[i..i + 4].try_into().unwrap()).swap_bytes();
-            let v1 = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap()).swap_bytes();
+            let v0 = u32::from_ne_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]).swap_bytes();
+            let v1 =
+                u32::from_ne_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]).swap_bytes();
             s0 = s0.wrapping_add(v0.wrapping_add(s1));
             s1 = s1.wrapping_add(v1.wrapping_add(s0));
             i += 8;

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 pub mod ast;
 pub mod error;
 pub mod lexer;

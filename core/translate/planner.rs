@@ -726,7 +726,8 @@ pub fn parse_from(
         }
     }
 
-    let from_owned = std::mem::take(&mut from).unwrap();
+    let from_owned =
+        std::mem::take(&mut from).expect("from clause must be Some for SELECT with FROM");
     let select_owned = from_owned.select;
     let joins_owned = from_owned.joins;
     parse_from_clause_table(
@@ -939,7 +940,7 @@ pub fn table_mask_from_expr(
                 };
                 let used_outer_query_refs = plan
                     .as_ref()
-                    .unwrap()
+                    .expect("unevaluated subquery must have a plan")
                     .table_references
                     .outer_query_refs()
                     .iter()
@@ -992,7 +993,7 @@ pub fn determine_where_to_eval_expr(
                     SubqueryState::Unevaluated { plan } => {
                         let used_outer_refs = plan
                             .as_ref()
-                            .unwrap()
+                            .expect("unevaluated subquery must have a plan")
                             .table_references
                             .outer_query_refs()
                             .iter()
@@ -1066,7 +1067,10 @@ fn parse_join(
 
     // this is called once for each join, so we only need to check the rightmost table
     // against all previous tables for duplicates
-    let rightmost_table = table_references.joined_tables().last().unwrap();
+    let rightmost_table = table_references
+        .joined_tables()
+        .last()
+        .expect("joined_tables must not be empty when checking for duplicates");
     let has_duplicate = table_references
         .joined_tables()
         .iter()
@@ -1185,8 +1189,10 @@ fn parse_join(
                             distinct_name.as_str()
                         );
                     }
-                    let (left_table_idx, left_table_id, left_col_idx, left_col) = left_col.unwrap();
-                    let (right_col_idx, right_col) = right_col.unwrap();
+                    let (left_table_idx, left_table_id, left_col_idx, left_col) =
+                        left_col.expect("left_col must be Some when not bailing");
+                    let (right_col_idx, right_col) =
+                        right_col.expect("right_col must be Some when not bailing");
                     let expr = Expr::Binary(
                         Box::new(Expr::Column {
                             database: None,
@@ -1206,12 +1212,12 @@ fn parse_join(
                     let left_table: &mut JoinedTable = table_references
                         .joined_tables_mut()
                         .get_mut(left_table_idx)
-                        .unwrap();
+                        .expect("left_table_idx must be valid");
                     left_table.mark_column_used(left_col_idx);
                     let right_table: &mut JoinedTable = table_references
                         .joined_tables_mut()
                         .get_mut(cur_table_idx)
-                        .unwrap();
+                        .expect("cur_table_idx must be valid");
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
@@ -1233,7 +1239,7 @@ fn parse_join(
     let rightmost_table = table_references
         .joined_tables_mut()
         .get_mut(last_idx)
-        .unwrap();
+        .expect("last_idx must be valid since joined_tables().len() >= 2");
     rightmost_table.join_info = Some(JoinInfo { outer, using });
 
     Ok(())

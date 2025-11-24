@@ -200,9 +200,9 @@ impl Time {
         offset: FixedOffset,
     ) -> Result<Self> {
         let mut dt: NaiveDateTime = NaiveDate::from_ymd_opt(1, 1, 1)
-            .unwrap()
+            .ok_or(TimeError::CreationError)?
             .and_hms_opt(0, 0, 0)
-            .unwrap();
+            .ok_or(TimeError::CreationError)?;
 
         match year.cmp(&0) {
             std::cmp::Ordering::Greater => {
@@ -338,7 +338,7 @@ impl Time {
         let mut minutes: i64 = 0;
         let mut seconds: i64 = 0;
         let mut nano_secs: i64 = 0;
-        let offset = FixedOffset::east_opt(0).unwrap(); // UTC
+        let offset = FixedOffset::east_opt(0).ok_or(TimeError::InvalidOffset)?; // UTC
 
         match field {
             Millennium => {
