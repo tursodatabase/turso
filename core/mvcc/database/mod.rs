@@ -2061,6 +2061,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.insert_version_raw(&mut versions, row_version)
     }
 
+    #[allow(dead_code)]
+    fn insert_index_version(
+        &self,
+        index_id: MVTableId,
+        key: SortableIndexKey,
+        row_version: RowVersion,
+    ) {
+        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index = index.value();
+        let versions = index.get_or_insert_with(key, || RwLock::new(Vec::new()));
+        let mut versions = versions.value().write();
+        self.insert_version_raw(&mut versions, row_version);
+    }
+
     /// Inserts a new row version into the internal data structure for versions,
     /// while making sure that the row version is inserted in the correct order.
     pub fn insert_version_raw(&self, versions: &mut Vec<RowVersion>, row_version: RowVersion) {
