@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
@@ -94,5 +95,20 @@ class JDBC4ConnectionTest {
   void isValid_should_return_false_on_closed_connection() throws SQLException {
     connection.close();
     assertFalse(connection.isValid(10));
+  }
+
+  @Test
+  void setSavepoint_should_throw_exception_in_auto_commit_mode() throws Exception {
+    assertThrows(SQLException.class, () -> connection.setSavepoint());
+  }
+
+  @Test
+  void setSavepoint_should_throw_not_supported() throws Exception {
+    connection.setAutoCommit(false);
+    assertThrows(
+        SQLFeatureNotSupportedException.class,
+        () -> {
+          connection.setSavepoint();
+        });
   }
 }
