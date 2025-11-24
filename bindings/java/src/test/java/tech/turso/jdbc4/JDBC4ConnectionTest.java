@@ -111,4 +111,30 @@ class JDBC4ConnectionTest {
           connection.setSavepoint();
         });
   }
+
+  @Test
+  void setSavepoint_with_name_should_throw_exception_in_auto_commit_mode() throws Exception {
+    assertThrows(SQLException.class, () -> connection.setSavepoint("POINT_A"));
+  }
+
+  @Test
+  void setSavepoint_with_empty_name_should_throw_exception() throws Exception {
+    connection.setAutoCommit(false);
+
+    assertThrows(
+        SQLException.class,
+        () -> {
+          connection.setSavepoint("");
+        });
+  }
+
+  @Test
+  void setSavepoint_with_name_should_throw_not_supported() throws Exception {
+    connection.setAutoCommit(false);
+    assertThrows(
+        SQLFeatureNotSupportedException.class,
+        () -> {
+          connection.setSavepoint("POINT_A");
+        });
+  }
 }
