@@ -1,6 +1,7 @@
 use crate::types::AsValueRef;
 use crate::types::Value;
 use crate::types::ValueType;
+use crate::vdbe::Register;
 use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
@@ -33,75 +34,50 @@ pub fn parse_vector<'a>(
     }
 }
 
-pub fn vector32<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector32(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
         return Err(LimboError::ConversionError(
             "vector32 requires exactly one argument".to_string(),
         ));
     }
-    let value = args.next().unwrap();
-    let vector = parse_vector(&value, Some(VectorType::Float32Dense))?;
+    let value = args[0].get_value();
+    let vector = parse_vector(value, Some(VectorType::Float32Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
-pub fn vector32_sparse<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector32_sparse(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
         return Err(LimboError::ConversionError(
             "vector32_sparse requires exactly one argument".to_string(),
         ));
     }
-    let value = args.next().unwrap();
-    let vector = parse_vector(&value, Some(VectorType::Float32Sparse))?;
+    let value = args[0].get_value();
+    let vector = parse_vector(value, Some(VectorType::Float32Sparse))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Sparse)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
-pub fn vector64<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector64(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
         return Err(LimboError::ConversionError(
             "vector64 requires exactly one argument".to_string(),
         ));
     }
-    let value = args.next().unwrap();
-    let vector = parse_vector(&value, Some(VectorType::Float64Dense))?;
+    let value = args[0].get_value();
+    let vector = parse_vector(value, Some(VectorType::Float64Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float64Dense)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
-pub fn vector_extract<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_extract(args: &[Register]) -> Result<Value> {
     if args.len() != 1 {
         return Err(LimboError::ConversionError(
             "vector_extract requires exactly one argument".to_string(),
         ));
     }
 
-    let value = args.next().unwrap();
-    let value = value.as_value_ref();
+    let value = args[0].get_value().as_value_ref();
     let blob = match value {
         ValueRef::Blob(b) => b,
         _ => {
@@ -119,110 +95,77 @@ where
     Ok(Value::build_text(operations::text::vector_to_text(&vector)))
 }
 
-pub fn vector_distance_cos<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::ConversionError(
             "vector_distance_cos requires exactly two arguments".to_string(),
         ));
     }
 
-    let value_0 = args.next().unwrap();
-    let value_1 = args.next().unwrap();
-    let x = parse_vector(&value_0, None)?;
-    let y = parse_vector(&value_1, None)?;
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value();
+    let x = parse_vector(value_0, None)?;
+    let y = parse_vector(value_1, None)?;
     let dist = operations::distance_cos::vector_distance_cos(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
-pub fn vector_distance_l2<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::ConversionError(
             "distance_l2 requires exactly two arguments".to_string(),
         ));
     }
 
-    let value_0 = args.next().unwrap();
-    let value_1 = args.next().unwrap();
-    let x = parse_vector(&value_0, None)?;
-    let y = parse_vector(&value_1, None)?;
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value();
+    let x = parse_vector(value_0, None)?;
+    let y = parse_vector(value_1, None)?;
     let dist = operations::distance_l2::vector_distance_l2(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
-pub fn vector_distance_jaccard<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::ConversionError(
             "distance_jaccard requires exactly two arguments".to_string(),
         ));
     }
 
-    let value_0 = args.next().unwrap();
-    let value_1 = args.next().unwrap();
-    let x = parse_vector(&value_0, None)?;
-    let y = parse_vector(&value_1, None)?;
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value();
+    let x = parse_vector(value_0, None)?;
+    let y = parse_vector(value_1, None)?;
     let dist = operations::jaccard::vector_distance_jaccard(&x, &y)?;
     Ok(Value::Float(dist))
 }
 
-pub fn vector_concat<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_concat(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::InvalidArgument(
             "concat requires exactly two arguments".into(),
         ));
     }
 
-    let value_0 = args.next().unwrap();
-    let value_1 = args.next().unwrap();
-    let x = parse_vector(&value_0, None)?;
-    let y = parse_vector(&value_1, None)?;
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value();
+    let x = parse_vector(value_0, None)?;
+    let y = parse_vector(value_1, None)?;
     let vector = operations::concat::vector_concat(&x, &y)?;
     Ok(operations::serialize::vector_serialize(vector))
 }
 
-pub fn vector_slice<I, E, V>(args: I) -> Result<Value>
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    let mut args = args.into_iter();
+pub fn vector_slice(args: &[Register]) -> Result<Value> {
     if args.len() != 3 {
         return Err(LimboError::InvalidArgument(
             "vector_slice requires exactly three arguments".into(),
         ));
     }
-    let value_0 = args.next().unwrap();
-    let value_1 = args.next().unwrap();
-    let value_1 = value_1.as_value_ref();
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value().as_value_ref();
+    let value_2 = args[2].get_value().as_value_ref();
 
-    let value_2 = args.next().unwrap();
-    let value_2 = value_2.as_value_ref();
-
-    let vector = parse_vector(&value_0, None)?;
+    let vector = parse_vector(value_0, None)?;
 
     let start_index = value_1
         .as_int()
