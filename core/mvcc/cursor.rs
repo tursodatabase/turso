@@ -43,10 +43,17 @@ enum PrevState {
         new_position_in_mvcc: CursorPosition,
     },
 }
+
+#[derive(Debug, Clone)]
+enum ExistsState {
+    ExistsBtree,
+}
+
 #[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Next(NextState),
     Prev(PrevState),
+    Exists(ExistsState),
 }
 
 pub struct MvccLazyCursor<Clock: LogicalClock> {
@@ -632,39 +639,59 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
-        self.invalidate_record();
-        let int_key = match key {
-            Value::Integer(i) => i,
-            _ => unreachable!("btree tables are indexed by integers!"),
-        };
-        let rowid = self.db.seek_rowid(
-            Bound::Included(&RowID {
-                table_id: self.table_id,
-                row_id: RowKey::Int(*int_key),
-            }),
-            true,
-            self.tx_id,
-        );
-        tracing::trace!("found {rowid:?}");
-        let exists = if let Some(rowid) = rowid {
-            let RowKey::Int(rowid) = rowid.row_id else {
-                panic!("Rowid is not an integer in mvcc table cursor");
+        if self.state.borrow().is_none() {
+            self.invalidate_record();
+            let int_key = match key {
+                Value::Integer(i) => i,
+                _ => unreachable!("btree tables are indexed by integers!"),
             };
-            rowid == *int_key
-        } else {
-            false
-        };
-        if exists {
-            self.current_pos.replace(CursorPosition::Loaded {
-                row_id: RowID {
+            let rowid = self.db.seek_rowid(
+                Bound::Included(&RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(*int_key),
-                },
-                in_btree: false,
-                btree_consumed: false,
-            });
+                }),
+                true,
+                self.tx_id,
+            );
+            tracing::trace!("found {rowid:?}");
+            let exists = if let Some(rowid) = rowid {
+                let RowKey::Int(rowid) = rowid.row_id else {
+                    panic!("Rowid is not an integer in mvcc table cursor");
+                };
+                rowid == *int_key
+            } else {
+                false
+            };
+            if exists {
+                self.current_pos.replace(CursorPosition::Loaded {
+                    row_id: RowID {
+                        table_id: self.table_id,
+                        row_id: RowKey::Int(*int_key),
+                    },
+                    in_btree: false,
+                    btree_consumed: false,
+                });
+                return Ok(IOResult::Done(exists));
+            } else if self.is_btree_allocated() {
+                self.state
+                    .replace(Some(MvccLazyCursorState::Exists(ExistsState::ExistsBtree)));
+            } else {
+                return Ok(IOResult::Done(false));
+            }
         }
-        Ok(IOResult::Done(exists))
+
+        let Some(MvccLazyCursorState::Exists(ExistsState::ExistsBtree)) =
+            self.state.borrow().clone()
+        else {
+            panic!("Invalid state {:?}", self.state.borrow());
+        };
+        assert!(
+            self.is_btree_allocated(),
+            "BTree should be allocated when we are in ExistsBtree state"
+        );
+        self.state.replace(None);
+        let found = return_if_io!(self.btree_cursor.exists(key));
+        Ok(IOResult::Done(found))
     }
 
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
