@@ -212,8 +212,26 @@ public final class JDBC4Connection implements Connection {
   @Override
   @SkipNullableCheck
   public Savepoint setSavepoint(String name) throws SQLException {
-    // TODO
-    return null;
+    checkOpen();
+    if (getAutoCommit()) {
+      throw new SQLException("Cannot create savepoint in auto-commit mode");
+    }
+    if (name == null || name.isEmpty()) {
+      throw new SQLException("Savepoint name cannot be null or empty");
+    }
+    int id = savepointCounter.incrementAndGet();
+    Savepoint sp = new JDBC4Savepoint(id, name);
+    try {
+      exec("SAVEPOINT " + name);
+    } catch (SQLException e) {
+      // libSQL does not support SAVEPOINT yet.
+      String msg = Objects.toString(e.getMessage(), "");
+      if (msg.contains("not supported")) {
+        throw new SQLFeatureNotSupportedException("SAVEPOINT not supported by libSQL", e);
+      }
+      throw e;
+    }
+    return sp;
   }
 
   private void exec(String sql) throws SQLException {
