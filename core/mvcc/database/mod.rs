@@ -1055,6 +1055,10 @@ pub struct MvStore<Clock: LogicalClock> {
     /// The value is Option because tables created in an MVCC commit that have not
     /// been checkpointed yet have no real root page assigned yet.
     pub table_id_to_rootpage: SkipMap<MVTableId, Option<u64>>,
+    /// Unlike table rows which are stored in a single map, we have a separate map for every index
+    /// because operations like last() on an index are much easier when we don't have to take the
+    /// table identifier into account.
+    pub index_rows: SkipMap<MVTableId, SkipMap<SortableIndexKey, RwLock<Vec<RowVersion>>>>,
     txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
     next_rowid: AtomicU64,
@@ -1098,6 +1102,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Self {
             rows: SkipMap::new(),
             table_id_to_rootpage: SkipMap::from_iter(vec![(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1))]), // table id 1 / root page 1 is always sqlite_schema.
+            index_rows: SkipMap::new(),
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
