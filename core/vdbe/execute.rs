@@ -24,7 +24,10 @@ use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, Par
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
-use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
+use crate::vector::{
+    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos,
+    vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
+};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -66,7 +69,6 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn},
     },
-    vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
 use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
@@ -5526,47 +5528,46 @@ pub fn op_function(
             }
         },
         crate::function::Func::Vector(vector_func) => {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+            let args = &state.registers[*start_reg..*start_reg + arg_count];
             match vector_func {
                 VectorFunc::Vector => {
-                    let result = vector32(values)?;
+                    let result = vector32(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector32 => {
-                    let result = vector32(values)?;
+                    let result = vector32(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector32Sparse => {
-                    let result = vector32_sparse(values)?;
+                    let result = vector32_sparse(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector64 => {
-                    let result = vector64(values)?;
+                    let result = vector64(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorExtract => {
-                    let result = vector_extract(values)?;
+                    let result = vector_extract(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceCos => {
-                    let result = vector_distance_cos(values)?;
+                    let result = vector_distance_cos(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceL2 => {
-                    let result = vector_distance_l2(values)?;
+                    let result = vector_distance_l2(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceJaccard => {
-                    let result = vector_distance_jaccard(values)?;
+                    let result = vector_distance_jaccard(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorConcat => {
-                    let result = vector_concat(values)?;
+                    let result = vector_concat(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorSlice => {
-                    let result = vector_slice(values)?;
+                    let result = vector_slice(args)?;
                     state.registers[*dest] = Register::Value(result)
                 }
             }
