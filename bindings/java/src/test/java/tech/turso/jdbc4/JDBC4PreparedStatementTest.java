@@ -909,6 +909,53 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
+  void testSetCharacterStream_noLength_insert_and_select() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "test";
+    Reader reader = new StringReader(text);
+
+    stmt.setCharacterStream(1, reader);
+    stmt.execute();
+
+    PreparedStatement stmt2 = connection.prepareStatement("SELECT col FROM test");
+    ResultSet rs = stmt2.executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals(text, rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_noLength_nullReader() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setCharacterStream(1, null);
+    stmt.execute();
+
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_noLength_emptyReader() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    Reader empty = new StringReader("");
+    stmt.setCharacterStream(1, empty);
+    stmt.execute();
+
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals("", rs.getString(1));
+  }
+
+  @Test
   void execute_insert_should_return_number_of_inserted_elements() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col INTEGER)").execute();
     PreparedStatement prepareStatement =
