@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.io.Reader;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
@@ -833,6 +835,77 @@ class JDBC4PreparedStatementTest {
     byte[] result = rs.getBytes(1);
     assertNotNull(result);
     assertEquals(0, result.length);
+  }
+
+  @Test
+  void testSetCharacterStream_withLength_insert_and_select() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    String text = "test";
+    Reader reader = new StringReader(text);
+
+    stmt.setCharacterStream(1, reader, 4);
+    stmt.execute();
+
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals("test", rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_withLength_shorterThanLength() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    Reader reader = new StringReader("test");
+    stmt.setCharacterStream(1, reader, 5);
+
+    stmt.execute();
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals("test", rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_withLength_zero() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    Reader reader = new StringReader("test");
+    stmt.setCharacterStream(1, reader, 0);
+
+    stmt.execute();
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertEquals("", rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_withLength_nullReader() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    stmt.setCharacterStream(1, null, 10);
+
+    stmt.execute();
+    ResultSet rs = connection.prepareStatement("SELECT col FROM test").executeQuery();
+
+    assertTrue(rs.next());
+    assertNull(rs.getString(1));
+  }
+
+  @Test
+  void testSetCharacterStream_withLength_negativeLength() throws Exception {
+    connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
+    PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
+
+    Reader reader = new StringReader("text");
+
+    assertThrows(SQLException.class, () -> stmt.setCharacterStream(1, reader, -1));
   }
 
   @Test
