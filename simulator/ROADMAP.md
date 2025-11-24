@@ -49,6 +49,9 @@ preliminary discussions on this, but a well-planned proposal will be necessary f
 enough for constructing interesting DQLs and instead starts to generate DMLs. We can use a similar approach.
 - [ ] Coverage-guided generation: Coverage guidance has been a striking force in the last decade of random testing. Any
 proposal on advancing the simulator in this area will be welcomed.
+- [ ] Continuation Simulations: Simulations that load an existing DB file and start testing on top of that.
+- [ ] Long-term simulations: Most of our simulations are bounded by minutes, why shouldn't we run OSS-Fuzz style continuous campaigns?
+This requires implementing continuation simulations so we can preserve progress over time if the underlying machine fails.
 
 ## Correctness
 
@@ -61,6 +64,11 @@ include/exclude certain properties, change them in small ways based on the requi
 - [ ] SQL with Contracts (SQL-C): There's a work-in-progress pull request ([https://github.com/tursodatabase/turso/pull/3715](https://github.com/tursodatabase/turso/pull/3715))
 for a SQL extension that includes inline bindings and assertions reasoning about dataframes. As this is done, the simulator will
 output SQL-C files, which can be consumed by any SQL-C executor, decoupling the generation/execution in the simulator.
+- [ ] Shadow State Abstraction: We currently maintain a shadow Turso, a simple in-memory key-value store that mimics the semantics
+of the SQL statements. We use this shadow state for both random input generation as well as correctness checking in some of the
+properties. However, maintaining a shadow state for all of SQL is virtually impossible, hence we would like to have alternative
+solutions that make it easier to extend our reach, because a shadow implementation of any feature is required in order to use the simulator.
+In this direction, we shall abstract away the shadow state, allowing multiple implementation of shadowing, and the ability to switch between them.
 - [ ] SQLite as shadow state: Currently, we have a custom shadow state implementation that mimics Turso's behavior.
 Another approach would be to use SQLite as the shadow state, using SQLite to be the source of truth for the contents
 of the database. We can generally rely on this fact because Turso binary format is compatible with SQLite, but
@@ -78,19 +86,24 @@ SQLancer has a number of properties implemented for testing various database sys
 We have ported some of them to the simulator, and we plan to port more in the future. The current list of
 ported properties is as follows:
 
-- [ ] InsertSelect: This property is a variation of the Pivoted Query Synthesis paper, where we first
-insert some values into the database, and try to read them back by crafting a SELECT query that should return
-the values.
-  - [x] `INSERT VALUES ...; SELECT ...:`: We can currently test inserting some literal values and reading them back.
-  - [ ] `INSERT SELECT ...; SELECT ...;`: We cannot test using the result of another SELECT for picking the inserted values.
-  - [ ] TODO: (there are other variants we currently do not support)
-- [x] SelectSelectOptimizer: This is another SQLancer-inspired property, where we check that `SELECT * from t WHERE p` is equivalent to
-`SELECT p from t` by asserting that the number of returned rows in the first one is equal to the number of `TRUE` values in the second one.
-The SQLancer version of this property is presented in [CERT: Finding Performance Issues in Database Systems Through
-the Lens of Cardinality Estimation](https://arxiv.org/pdf/2306.00355).
-- [x] WhereTrueFalseNull: This property relies on the three-valued logic of SQL, where `p OR (NOT P) OR (p IS NULL)` should always be `TRUE`.
-The SQLancer version of this property is presented in [Automatic Testing of Database Management Systems](https://arxiv.org/pdf/1801.10275).
-- [x] UNIONAllPreservesCardinality: TODO
+- [ ] [Pivoted Query Synthesis (PQS)](https://www.usenix.org/system/files/osdi20-rigger.pdf)
+  - [ ] InsertSelect: This property is a variation of the Pivoted Query Synthesis paper, where we first
+  insert some values into the database, and try to read them back by crafting a SELECT query that should return
+  the values.
+    - [x] `INSERT VALUES ...; SELECT ...:`: We can currently test inserting some literal values and reading them back.
+    - [ ] `INSERT SELECT ...; SELECT ...;`: We cannot test using the result of another SELECT for picking the inserted values.
+    - [ ] TODO: (there are other variants we currently do not support)
+- [ ] [Non-optimizing Reference Engine Construction (NoREC)](https://arxiv.org/abs/2007.08292)
+  - [x] SelectSelectOptimizer: This is another SQLancer-inspired property, where we check that `SELECT * from t WHERE p` is equivalent to
+  `SELECT p from t` by asserting that the number of returned rows in the first one is equal to the number of `TRUE` values in the second one.
+- [ ] [Ternary Logic Partitioning (TLP)](https://dl.acm.org/doi/pdf/10.1145/3428279)
+  - [x] WhereTrueFalseNull: This property relies on the three-valued logic of SQL, where `p OR (NOT P) OR (p IS NULL)` should always be `TRUE`.
+  - [x] UNIONAllPreservesCardinality: This property asserts that merging the results of multiple queries via `UNION ALL` is equivalent to
+- [ ] [Differential Query Execution (DQE)](https://ieeexplore.ieee.org/document/10172736)
+  - [ ] TODO: This paper is not open access, if anyone has access, please update this.
+- [ ] [Cardinality Estimation Restriction Testing (CERT)](https://arxiv.org/pdf/2306.00355)
+- [ ] [Differential Query Plans (DQP)](https://dl.acm.org/doi/pdf/10.1145/3654991)
+- [ ] [Constant Optimization Driven Database System Testing (CODDTest)](https://arxiv.org/abs/2501.11252)
 
 #### Bespoke Properties
 
@@ -116,9 +129,11 @@ These properties are invariants that check the consistency between Turso and the
 
 ### Oracles
 
-- [ ] Property: TODO
-- [ ] Differential: TODO
-- [ ] Doublecheck: TODO
+- [x] Property: The `property` oracle tests the properties presented above by generating random SQL statements and assertions that follow them.
+- [x] Differential: The `differential` oracle tests Turso against SQLite.
+- [x] Doublecheck: The `doublecheck` oracle tests Turso against itself for checking determinism across runs.
+- [ ] Oracle-based Generation: Currently, we generate regardless the oracle, but `property` oracle actually poses limitations compared to `differential`
+and `doublecheck` oracles, in those oracles we have much more freedom to generate random inputs. We must leverage this freedom.
 
 ## Debugging
 
@@ -139,3 +154,11 @@ These properties are invariants that check the consistency between Turso and the
 ## Fault Injection
 
 - [ ] TODO
+
+## Data Collection
+
+At the moment, we collect no data from the simulator, which makes it hard to make future decisions. Some examples are:
+
+- Which properties are the most useful for finding bugs?
+- What are the bottlenecks of the simulator speed, how can we optimize them?
+- Which features/profiles are used, which are not, so we can focus on simplification by removing unused features or understanding why they aren't used.
