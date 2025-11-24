@@ -206,8 +206,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     /// If we are moving backwards -> choose larger rowid (mvcc if mvcc > btree, else btree)
     fn get_new_position_from_mvcc_and_btree(
         &mut self,
-        new_position_in_mvcc: &Option<i64>,
-        current_rowid_in_btree: &Option<i64>,
+        new_position_in_mvcc: &Option<RowKey>,
+        current_rowid_in_btree: &Option<RowKey>,
         direction: IterationDirection,
     ) -> CursorPosition {
         tracing::trace!("get_new_position_from_mvcc_and_btree(new_position_in_mvcc={:?}, current_rowid_in_btree={:?}, direction={:?})", new_position_in_mvcc, current_rowid_in_btree, direction);
@@ -222,15 +222,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 };
 
                 let (row_id, in_btree, btree_consumed) = if use_mvcc {
-                    (*mvcc_rowid, false, false)
+                    (mvcc_rowid.clone(), false, false)
                 } else {
-                    (*btree_rowid, true, true)
+                    (btree_rowid.clone(), true, true)
                 };
 
                 CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
-                        row_id: RowKey::Int(row_id),
+                        row_id,
                     },
                     in_btree,
                     btree_consumed,
@@ -239,7 +239,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             (None, Some(btree_rowid)) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id: self.table_id,
-                    row_id: RowKey::Int(*btree_rowid),
+                    row_id: btree_rowid.clone(),
                 },
                 in_btree: true,
                 btree_consumed: true,
@@ -247,7 +247,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             (Some(mvcc_rowid), None) => CursorPosition::Loaded {
                 row_id: RowID {
                     table_id: self.table_id,
-                    row_id: RowKey::Int(*mvcc_rowid),
+                    row_id: mvcc_rowid.clone(),
                 },
                 in_btree: false,
                 btree_consumed: true,
@@ -261,11 +261,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
     }
 
-    fn query_btree_version_is_valid(&self, row_id: i64) -> bool {
+    fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
         // If the row is not found in MVCC index, this means row_id is valid in btree
         matches!(
             self.db
-                .find_row_last_version_state(self.table_id, RowKey::Int(row_id), self.tx_id),
+                .find_row_last_version_state(self.table_id, key, self.tx_id),
             RowVersionState::NotFound
         )
     }
@@ -280,12 +280,27 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.current_pos.replace(CursorPosition::End);
 
-        let position_in_mvcc = self.db.get_last_rowid(self.table_id);
+        let position_in_mvcc = self.db.get_last_rowid(self.table_id, &self.mv_cursor_type);
         let position_in_btree = if self.is_btree_allocated() {
-            let IOResult::Done(maybe_rowid) = self.btree_cursor.rowid()? else {
-                panic!("BTree should have returned rowid after last");
-            };
-            maybe_rowid
+            match &self.mv_cursor_type {
+                MvccCursorType::Table => {
+                    let IOResult::Done(maybe_rowid) = self.btree_cursor.rowid()? else {
+                        panic!("BTree should have returned rowid after last");
+                    };
+                    maybe_rowid.map(RowKey::Int)
+                }
+                MvccCursorType::Index(index_info) => {
+                    let IOResult::Done(maybe_rowid) = self.btree_cursor.record()? else {
+                        panic!("BTree should have returned rowid after last");
+                    };
+                    maybe_rowid.map(|record| {
+                        RowKey::Record(SortableIndexKey {
+                            key: record.clone(),
+                            metadata: index_info.clone(),
+                        })
+                    })
+                }
+            }
         } else {
             None
         };
@@ -304,40 +319,40 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let current_state = self.state.borrow().clone();
         if current_state.is_none() {
             let before_first = matches!(self.get_current_pos(), CursorPosition::BeforeFirst);
-            let min_id = match self.current_pos.borrow().clone() {
+            let min_key_exclusive = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => row_id.row_id.to_int_or_panic() + 1,
+                } => Some(row_id.row_id),
                 // TODO: do we need to forward twice?
-                CursorPosition::BeforeFirst => i64::MIN, // we need to find first row, so we look from the first id,
+                CursorPosition::BeforeFirst => None,
                 CursorPosition::End => {
                     // let's keep same state, we reached the end so no point in moving forward.
                     return Ok(IOResult::Done(false));
                 }
             };
 
-            let new_position_in_mvcc =
-                match self
-                    .db
-                    .get_next_row_id_for_table(self.table_id, min_id, self.tx_id)
-                {
-                    Some(id) => CursorPosition::Loaded {
-                        row_id: id,
-                        in_btree: false,
-                        btree_consumed: false,
-                    },
-                    None => {
-                        if before_first {
-                            // if it wasn't loaded and we didn't find anything, it means the table is empty.
-                            CursorPosition::BeforeFirst
-                        } else {
-                            // if we had something loaded, and we didn't find next key then it means we are at the end.
-                            CursorPosition::End
-                        }
+            let new_position_in_mvcc = match self.db.get_next_row_id_for_table(
+                self.table_id,
+                min_key_exclusive.as_ref(),
+                self.tx_id,
+            ) {
+                Some(id) => CursorPosition::Loaded {
+                    row_id: id,
+                    in_btree: false,
+                    btree_consumed: false,
+                },
+                None => {
+                    if before_first {
+                        // if it wasn't loaded and we didn't find anything, it means the table is empty.
+                        CursorPosition::BeforeFirst
+                    } else {
+                        // if we had something loaded, and we didn't find next key then it means we are at the end.
+                        CursorPosition::End
                     }
-                };
+                }
+            };
             self.state
                 .replace(Some(MvccLazyCursorState::Next(NextState::NextBtree {
                     new_position_in_mvcc,
@@ -384,16 +399,30 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id.to_int_or_panic()),
+                } => Some(row_id.row_id),
                 CursorPosition::BeforeFirst => None,
                 CursorPosition::End => None,
             };
             let current_rowid_in_btree = if found {
-                let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
-                    panic!("BTree should have returned rowid after next");
+                let key = match &self.mv_cursor_type {
+                    MvccCursorType::Table => {
+                        let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
+                            panic!("BTree should have returned rowid after next");
+                        };
+                        RowKey::Int(rowid)
+                    }
+                    MvccCursorType::Index(index_info) => {
+                        let IOResult::Done(Some(record)) = self.btree_cursor.record()? else {
+                            panic!("BTree should have returned record after next");
+                        };
+                        RowKey::Record(SortableIndexKey {
+                            key: record.clone(),
+                            metadata: index_info.clone(),
+                        })
+                    }
                 };
-                if self.query_btree_version_is_valid(rowid) {
-                    Some(rowid)
+                if self.query_btree_version_is_valid(&key) {
+                    Some(key)
                 } else {
                     // if the row is not valid, we need to continue to the next rowid in btree.
                     //  We first set consumed to true so that next time we call next, we don't use the same rowid.
@@ -426,32 +455,30 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn prev(&mut self) -> Result<IOResult<bool>> {
         let current_state = self.state.borrow().clone();
         if current_state.is_none() {
-            let max_id = match self.current_pos.borrow().clone() {
+            let max_id_exclusive = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => row_id.row_id.to_int_or_panic(),
+                } => Some(row_id.row_id.clone()),
                 CursorPosition::BeforeFirst => {
                     return Ok(IOResult::Done(false));
                 }
-                CursorPosition::End => {
-                    i64::MAX // we need to find last row, so we look from the last id,
-                }
+                CursorPosition::End => None,
             };
 
-            let new_position_in_mvcc =
-                match self
-                    .db
-                    .get_prev_row_id_for_table(self.table_id, max_id, self.tx_id)
-                {
-                    Some(id) => CursorPosition::Loaded {
-                        row_id: id,
-                        in_btree: false,
-                        btree_consumed: false,
-                    },
-                    None => CursorPosition::BeforeFirst,
-                };
+            let new_position_in_mvcc = match self.db.get_prev_row_id_for_table(
+                self.table_id,
+                max_id_exclusive.as_ref(),
+                self.tx_id,
+            ) {
+                Some(id) => CursorPosition::Loaded {
+                    row_id: id,
+                    in_btree: false,
+                    btree_consumed: false,
+                },
+                None => CursorPosition::BeforeFirst,
+            };
             self.state
                 .replace(Some(MvccLazyCursorState::Prev(PrevState::PrevBtree {
                     new_position_in_mvcc,
@@ -497,16 +524,30 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id.to_int_or_panic()),
+                } => Some(row_id.row_id),
                 CursorPosition::BeforeFirst => None,
                 CursorPosition::End => None,
             };
             let maybe_rowid_in_btree = if found {
-                let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
-                    panic!("BTree should have returned rowid after prev because we found a valid rowid after calling btree_cursor.prev()");
+                let key = match &self.mv_cursor_type {
+                    MvccCursorType::Table => {
+                        let IOResult::Done(Some(rowid)) = self.btree_cursor.rowid()? else {
+                            panic!("BTree should have returned rowid after prev");
+                        };
+                        RowKey::Int(rowid)
+                    }
+                    MvccCursorType::Index(index_info) => {
+                        let IOResult::Done(Some(record)) = self.btree_cursor.record()? else {
+                            panic!("BTree should have returned record after prev");
+                        };
+                        RowKey::Record(SortableIndexKey {
+                            key: record.clone(),
+                            metadata: index_info.clone(),
+                        })
+                    }
                 };
-                if self.query_btree_version_is_valid(rowid) {
-                    Some(rowid)
+                if self.query_btree_version_is_valid(&key) {
+                    Some(key)
                 } else {
                     // if the row is not valid, we need to continue to the next rowid in btree.
                     //  We first set consumed to true so that next time we call next, we don't use the same rowid.
@@ -761,23 +802,33 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.current_pos.replace(CursorPosition::BeforeFirst);
         }
 
-        let new_position_in_mvcc = self
-            .db
-            .get_next_row_id_for_table(self.table_id, i64::MIN, self.tx_id)
-            .map(|id| {
-                let RowKey::Int(rowid) = id.row_id else {
-                    panic!("Rowid is not an integer in mvcc table cursor");
-                };
-                rowid
-            });
+        let new_position_in_mvcc =
+            self.db
+                .get_next_row_id_for_table(self.table_id, None, self.tx_id);
 
-        let IOResult::Done(maybe_rowid_in_btree) = self.btree_cursor.rowid()? else {
-            panic!("BTree should have returned rowid after rewind because we called btree_cursor.rewind()");
+        let maybe_rowid_in_btree = match &self.mv_cursor_type {
+            MvccCursorType::Table => {
+                let IOResult::Done(maybe_rowid_in_btree) = self.btree_cursor.rowid()? else {
+                    panic!("BTree should have returned rowid after rewind because we called btree_cursor.rewind()");
+                };
+                let key = maybe_rowid_in_btree.map(RowKey::Int);
+                key.filter(|key| self.query_btree_version_is_valid(key))
+            }
+            MvccCursorType::Index(index_info) => {
+                let IOResult::Done(maybe_record_in_btree) = self.btree_cursor.record()? else {
+                    panic!("BTree should have returned record after rewind because we called btree_cursor.rewind()");
+                };
+                let key = maybe_record_in_btree.map(|record| {
+                    RowKey::Record(SortableIndexKey {
+                        key: record.clone(),
+                        metadata: index_info.clone(),
+                    })
+                });
+                key.filter(|key| self.query_btree_version_is_valid(key))
+            }
         };
-        let maybe_rowid_in_btree =
-            maybe_rowid_in_btree.filter(|rowid| self.query_btree_version_is_valid(*rowid));
         let new_position = self.get_new_position_from_mvcc_and_btree(
-            &new_position_in_mvcc,
+            &new_position_in_mvcc.map(|r| r.row_id),
             &maybe_rowid_in_btree,
             IterationDirection::Forwards,
         );

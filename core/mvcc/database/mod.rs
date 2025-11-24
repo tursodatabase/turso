@@ -1,4 +1,5 @@
 use crate::mvcc::clock::LogicalClock;
+use crate::mvcc::cursor::MvccCursorType;
 use crate::mvcc::persistent_storage::Storage;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -1400,7 +1401,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_next_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: i64,
+        start: Option<&RowKey>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1410,7 +1411,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             IterationDirection::Forwards,
         );
         tracing::trace!(
-            "get_next_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
+            "get_next_row_id_for_table(table_id={}, start={:?}, tx_id={}, res={:?})",
             table_id,
             start,
             tx_id,
@@ -1422,7 +1423,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_prev_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: i64,
+        start: Option<&RowKey>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1432,7 +1433,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             IterationDirection::Backwards,
         );
         tracing::trace!(
-            "get_prev_row_id_for_table(table_id={}, start={}, tx_id={}, res={:?})",
+            "get_prev_row_id_for_table(table_id={}, start={:?}, tx_id={}, res={:?})",
             table_id,
             start,
             tx_id,
@@ -1444,12 +1445,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_row_id_for_table_in_direction(
         &self,
         table_id: MVTableId,
-        start: i64,
+        start: Option<&RowKey>,
         tx_id: TxID,
         direction: IterationDirection,
     ) -> Option<RowID> {
         tracing::trace!(
-            "getting_row_id_for_table_in_direction(table_id={}, range_start={}, direction={:?})",
+            "getting_row_id_for_table_in_direction(table_id={}, range_start={:?}, direction={:?})",
             table_id,
             start,
             direction
@@ -1461,52 +1462,112 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx.value();
         if direction == IterationDirection::Forwards {
-            let min_bound = RowID {
+            let min_bound = start.map(|start| RowID {
                 table_id,
-                row_id: RowKey::Int(start),
-            };
+                row_id: start.clone(),
+            });
 
-            let max_bound = RowID {
-                table_id,
-                row_id: RowKey::Int(i64::MAX),
-            };
-            let mut rows = self.rows.range(min_bound..max_bound);
-            loop {
-                // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
-                // to loop either until we find a row that is not deleted or until we reach the end of the table.
-                let next_row = rows.next();
-                tracing::trace!("next_row: {:?}", next_row);
-                let row = next_row?;
+            match min_bound {
+                Some(min_bound) => {
+                    let mut rows = self.rows.range(min_bound..);
+                    rows.next(); // exclusive wrt. min bound
+                    loop {
+                        // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
+                        // to loop either until we find a row that is not deleted or until we reach the end of the table.
+                        let next_row = rows.next();
+                        tracing::trace!("next_row: {:?}", next_row);
+                        let row = next_row?;
+                        if row.key().table_id != table_id {
+                            // In case of table rows, we store the rows of all tables in a single map,
+                            // so we must stop iteration if we reach a row that is on a different table.
+                            // In the case of indexes we have a separate map per table so this is not
+                            // relevant.
+                            return None;
+                        }
 
-                // We found a row, let's check if it's visible to the transaction.
-                if let Some(visible_row) = self.find_last_visible_version(tx, row) {
-                    return Some(visible_row);
+                        // We found a row, let's check if it's visible to the transaction.
+                        if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                            return Some(visible_row);
+                        }
+                        // If this row is not visible, continue to the next row
+                    }
                 }
-                // If this row is not visible, continue to the next row
+                None => {
+                    let mut rows = self.rows.range(..);
+                    loop {
+                        // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
+                        // to loop either until we find a row that is not deleted or until we reach the end of the table.
+                        let next_row = rows.next();
+                        tracing::trace!("next_row: {:?}", next_row);
+                        let row = next_row?;
+                        if row.key().table_id != table_id {
+                            // In case of table rows, we store the rows of all tables in a single map,
+                            // so we must stop iteration if we reach a row that is on a different table.
+                            // In the case of indexes we have a separate map per table so this is not
+                            // relevant.
+                            return None;
+                        }
+
+                        // We found a row, let's check if it's visible to the transaction.
+                        if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                            return Some(visible_row);
+                        }
+                        // If this row is not visible, continue to the next row
+                    }
+                }
             }
         } else {
-            let min_bound = RowID {
+            let max_bound = start.map(|start| RowID {
                 table_id,
-                row_id: RowKey::Int(i64::MIN),
-            };
+                row_id: start.clone(),
+            });
 
-            let max_bound = RowID {
-                table_id,
-                row_id: RowKey::Int(start),
-            };
-            // In backward's direction we iterate in reverse order.
-            let mut rows = self.rows.range(min_bound..max_bound).rev();
-            loop {
-                // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
-                // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
-                let next_row = rows.next();
-                let row = next_row?;
+            match max_bound {
+                Some(max_bound) => {
+                    let mut rows = self.rows.range(max_bound..).rev();
+                    rows.next(); // exclusive wrt. max bound
+                    loop {
+                        // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
+                        // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
+                        let next_row = rows.next();
+                        let row = next_row?;
+                        if row.key().table_id != table_id {
+                            // In case of table rows, we store the rows of all tables in a single map,
+                            // so we must stop iteration if we reach a row that is on a different table.
+                            // In the case of indexes we have a separate map per table so this is not
+                            // relevant.
+                            return None;
+                        }
 
-                // We found a row, let's check if it's visible to the transaction.
-                if let Some(visible_row) = self.find_last_visible_version(tx, row) {
-                    return Some(visible_row);
+                        // We found a row, let's check if it's visible to the transaction.
+                        if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                            return Some(visible_row);
+                        }
+                        // If this row is not visible, continue to the next row
+                    }
                 }
-                // If this row is not visible, continue to the next row
+                None => {
+                    let mut rows = self.rows.range(..).rev();
+                    loop {
+                        // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
+                        // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
+                        let next_row = rows.next();
+                        let row = next_row?;
+                        if row.key().table_id != table_id {
+                            // In case of table rows, we store the rows of all tables in a single map,
+                            // so we must stop iteration if we reach a row that is on a different table.
+                            // In the case of indexes we have a separate map per table so this is not
+                            // relevant.
+                            return None;
+                        }
+
+                        // We found a row, let's check if it's visible to the transaction.
+                        if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                            return Some(visible_row);
+                        }
+                        // If this row is not visible, continue to the next row
+                    }
+                }
             }
         }
     }
@@ -1514,7 +1575,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn find_row_last_version_state(
         &self,
         table_id: MVTableId,
-        row_id: RowKey,
+        row_id: &RowKey,
         tx_id: TxID,
     ) -> RowVersionState {
         tracing::trace!(
@@ -2127,16 +2188,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(state_machine)
     }
 
-    pub fn get_last_rowid(&self, table_id: MVTableId) -> Option<i64> {
-        let last_rowid = self
-            .rows
-            .upper_bound(Bound::Included(&RowID {
-                table_id,
-                row_id: RowKey::Int(i64::MAX),
-            }))
-            .map(|entry| Some(entry.key().row_id.to_int_or_panic()))
-            .unwrap_or(None);
-        last_rowid
+    pub fn get_last_rowid(
+        &self,
+        table_id: MVTableId,
+        mv_cursor_type: &MvccCursorType,
+    ) -> Option<RowKey> {
+        match mv_cursor_type {
+            MvccCursorType::Table => {
+                let last_rowid = self
+                    .rows
+                    .upper_bound(Bound::Included(&RowID {
+                        table_id,
+                        row_id: RowKey::Int(i64::MAX),
+                    }))
+                    .map(|entry| Some(RowKey::Int(entry.key().row_id.to_int_or_panic())))
+                    .unwrap_or(None);
+                last_rowid
+            }
+            MvccCursorType::Index(_) => {
+                let index = self.index_rows.get(&table_id).unwrap();
+                let index = index.value();
+                index
+                    .iter()
+                    .last()
+                    .map(|entry| RowKey::Record(entry.key().clone()))
+            }
+        }
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
