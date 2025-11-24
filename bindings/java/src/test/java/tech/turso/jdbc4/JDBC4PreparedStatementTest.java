@@ -838,7 +838,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testSetCharacterStream_withLength_insert_and_select() throws Exception {
+  void testSetCharacterStream_intLength_insert_and_select() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
 
@@ -855,7 +855,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testSetCharacterStream_withLength_shorterThanLength() throws Exception {
+  void testSetCharacterStream_intLength_shorterThanLength() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
 
@@ -870,7 +870,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testSetCharacterStream_withLength_zero() throws Exception {
+  void testSetCharacterStream_intLength_zero() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
 
@@ -885,7 +885,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testSetCharacterStream_withLength_nullReader() throws Exception {
+  void testSetCharacterStream_intLength_nullReader() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
 
@@ -899,7 +899,7 @@ class JDBC4PreparedStatementTest {
   }
 
   @Test
-  void testSetCharacterStream_withLength_negativeLength() throws Exception {
+  void testSetCharacterStream_intLength_negativeLength() throws Exception {
     connection.prepareStatement("CREATE TABLE test (col TEXT)").execute();
     PreparedStatement stmt = connection.prepareStatement("INSERT INTO test (col) VALUES (?)");
 

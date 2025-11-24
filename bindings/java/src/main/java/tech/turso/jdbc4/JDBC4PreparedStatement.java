@@ -607,7 +607,22 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
 
   @Override
   public void setCharacterStream(int parameterIndex, Reader reader) throws SQLException {
-    // TODO
+    requireNonNull(this.statement);
+    if (reader == null) {
+      setParam(parameterIndex, null);
+      return;
+    }
+    try {
+      StringBuilder sb = new StringBuilder();
+      char[] buffer = new char[8192];
+      int read;
+      while ((read = reader.read(buffer)) != -1) {
+        sb.append(buffer, 0, read);
+      }
+      setParam(parameterIndex, sb.toString());
+    } catch (IOException e) {
+      throw new SQLException("Error reading character stream", e);
+    }
   }
 
   @Override
