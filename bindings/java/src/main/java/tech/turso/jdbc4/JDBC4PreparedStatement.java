@@ -546,7 +546,8 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   @Override
   public void setCharacterStream(int parameterIndex, Reader reader, long length)
       throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setCharacterStream(parameterIndex, reader, (int) length);
   }
 
   private void requireLengthIsPositiveInt(long length) throws SQLFeatureNotSupportedException {
