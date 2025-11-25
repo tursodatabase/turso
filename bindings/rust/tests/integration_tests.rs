@@ -191,7 +191,7 @@ async fn test_rows_returned() {
        SELECT b.id, a.name
        FROM   books b
        JOIN   authors a ON a.id = b.author_id
-       WHERE  a.id = 1;       -- Alice’s five books
+       WHERE  a.id = 1;       -- Alice's five books
        ",
             (),
         )
@@ -636,4 +636,114 @@ async fn test_connection_clone() {
 
     let id: i64 = row.get(0).unwrap();
     assert_eq!(id, 1);
+}
+
+#[tokio::test]
+async fn test_insert_returning_partial_consume() {
+    // Regression test for: INSERT...RETURNING should insert all rows even if
+    // only some RETURNING values are consumed before the statement is dropped/reset.
+    // This matches the sqlite3 bindings fix in commit e39e60ef1.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // Use query() to get RETURNING values, but only consume first row
+    let mut stmt = conn
+        .prepare("INSERT INTO t (x) VALUES (1), (2), (3) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+
+    // Only consume first row
+    let first_row = rows.next().await.unwrap().unwrap();
+    assert_eq!(first_row.get::<i64>(0).unwrap(), 1);
+
+    // Drop the rows iterator without consuming remaining rows
+    drop(rows);
+    drop(stmt);
+
+    // All 3 rows should have been inserted despite only consuming 1 RETURNING value
+    let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        count, 3,
+        "All 3 rows should be inserted even if RETURNING was partially consumed"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_commit_without_mvcc() {
+    // Regression test: COMMIT should work for non-MVCC transactions.
+    // The op_auto_commit function must check TransactionState, not just MVCC tx.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    // Begin explicit transaction
+    conn.execute("BEGIN IMMEDIATE TRANSACTION", ())
+        .await
+        .unwrap();
+
+    // Insert data within transaction
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello')", ())
+        .await
+        .unwrap();
+
+    // Commit should succeed
+    conn.execute("COMMIT", ())
+        .await
+        .expect("COMMIT should succeed for non-MVCC transactions");
+
+    // Verify data was committed
+    let mut rows = conn
+        .query("SELECT value FROM test WHERE id = 1", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let value: String = row.get(0).unwrap();
+    assert_eq!(value, "hello", "Data should be committed");
+}
+
+#[tokio::test]
+async fn test_transaction_with_insert_returning_then_commit() {
+    // Regression test: Combining INSERT...RETURNING (partial consume) with explicit transaction.
+    // This tests the interaction between the reset-to-completion fix and transaction commit.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // Begin transaction
+    conn.execute("BEGIN IMMEDIATE TRANSACTION", ())
+        .await
+        .unwrap();
+
+    // INSERT...RETURNING, only consume first row
+    let mut stmt = conn
+        .prepare("INSERT INTO t (x) VALUES (1), (2), (3) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let first = rows.next().await.unwrap().unwrap();
+    assert_eq!(first.get::<i64>(0).unwrap(), 1);
+    drop(rows);
+    drop(stmt);
+
+    // Commit should succeed even after partial RETURNING consumption
+    conn.execute("COMMIT", ())
+        .await
+        .expect("COMMIT should succeed after INSERT...RETURNING");
+
+    // Verify all 3 rows were inserted
+    let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 3, "All rows should be committed");
 }
