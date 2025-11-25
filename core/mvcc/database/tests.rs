@@ -1551,7 +1551,7 @@ fn transaction_display() {
         header: RwLock::new(DatabaseHeader::default()),
     };
 
-    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: RowKey::Int(1)1 }, RowID { table_id: MVTableId(-2), row_id: RowKey::Int(1)3 }], read_set: [RowID { table_id: MVTableId(-2), row_id: RowKey::Int(1)7 }, RowID { table_id: MVTableId(-2), row_id: RowKey::Int(1)9 }] }";
+    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }

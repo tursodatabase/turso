@@ -165,7 +165,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             } if !in_btree => row_id,
             _ => panic!("invalid position to read current mvcc row"),
         };
-        self.db.read(self.tx_id, row_id)
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
+        self.db
+            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -253,8 +258,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 btree_consumed: true,
             },
             (None, None) => match direction {
-                IterationDirection::Forwards => CursorPosition::BeforeFirst,
-                IterationDirection::Backwards => CursorPosition::End,
+                IterationDirection::Forwards => CursorPosition::End,
+                IterationDirection::Backwards => CursorPosition::BeforeFirst,
             },
         }
     }
@@ -335,7 +340,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }),
                 // TODO: do we need to forward twice?
                 CursorPosition::BeforeFirst => match &self.mv_cursor_type {
-                    MvccCursorType::Table => Some((false, RowKey::Int(i64::MIN))),
+                    MvccCursorType::Table => Some((true, RowKey::Int(i64::MIN))),
                     MvccCursorType::Index(_) => None,
                 },
                 CursorPosition::End => {
@@ -603,7 +608,26 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 row_id,
                 in_btree: _,
                 btree_consumed: _,
-            } => Some(row_id.row_id.to_int_or_panic()),
+            } => match &row_id.row_id {
+                RowKey::Int(id) => Some(*id),
+                RowKey::Record(sortable_key) => {
+                    // For index cursors, the rowid is stored in the last column of the index record
+                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                        panic!("RowKey::Record requires Index cursor type");
+                    };
+                    if index_info.has_rowid {
+                        let mut record_cursor = RecordCursor::new();
+                        match sortable_key.key.last_value(&mut record_cursor) {
+                            Some(Ok(crate::types::ValueRef::Integer(rowid))) => Some(rowid),
+                            _ => {
+                                crate::bail_parse_error!("Failed to parse rowid from index record")
+                            }
+                        }
+                    } else {
+                        crate::bail_parse_error!("Indexes without rowid are not supported in MVCC");
+                    }
+                }
+            },
             CursorPosition::BeforeFirst => None,
             CursorPosition::End => None,
         };
@@ -617,19 +641,26 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
-        let row_id = match seek_key {
-            SeekKey::TableRowId(row_id) => row_id,
-            SeekKey::IndexKey(_) => {
-                panic!("SeekKey::IndexKey is not supported for mvcc table cursor");
-            }
-        };
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
-        let rowid = RowID {
-            table_id: self.table_id,
-            row_id: RowKey::Int(row_id),
+        let rowid = match seek_key {
+            SeekKey::TableRowId(row_id) => RowID {
+                table_id: self.table_id,
+                row_id: RowKey::Int(row_id),
+            },
+            SeekKey::IndexKey(index_key) => {
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("SeekKey::IndexKey requires Index cursor type");
+                };
+                let sortable_key =
+                    SortableIndexKey::new_from_record(index_key.clone(), index_info.clone());
+                RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Record(sortable_key),
+                }
+            }
         };
         let (bound, lower_bound) = match op {
             SeekOp::GT => (Bound::Excluded(&rowid), true),
@@ -638,15 +669,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             SeekOp::LE { eq_only: _ } => (Bound::Included(&rowid), false),
         };
         self.invalidate_record();
-        let rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
-        if let Some(rowid) = rowid {
+        let found_rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
+        if let Some(found_rowid) = found_rowid {
             self.current_pos.replace(CursorPosition::Loaded {
-                row_id: rowid.clone(),
+                row_id: found_rowid.clone(),
                 in_btree: false,
                 btree_consumed: false,
             });
             if op.eq_only() {
-                if rowid.row_id.to_int_or_panic() == row_id {
+                if found_rowid.row_id == rowid.row_id {
                     Ok(IOResult::Done(SeekResult::Found))
                 } else {
                     Ok(IOResult::Done(SeekResult::NotFound))
@@ -665,13 +696,20 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         }
     }
 
-    /// Insert a row into the table.
+    /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
-        let Some(rowid) = key.maybe_rowid() else {
-            panic!("BTreeKey::maybe_rowid() should return Some(rowid) for table rowid keys");
+        let row_id = match key {
+            BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
+            BTreeKey::IndexKey(record) => {
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("BTreeKey::IndexKey requires Index cursor type");
+                };
+                let sortable_key =
+                    SortableIndexKey::new_from_record((*record).clone(), index_info.clone());
+                RowID::new(self.table_id, RowKey::Record(sortable_key))
+            }
         };
-        let row_id = RowID::new(self.table_id, RowKey::Int(rowid));
         let record_buf = key
             .get_record()
             .ok_or(LimboError::InternalError(
@@ -695,26 +733,43 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             in_btree: false,
             btree_consumed: true,
         });
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
         // FIXME: set btree to somewhere close to this rowid?
-        if self.db.read(self.tx_id, row.id.clone())?.is_some() {
-            self.db.update(self.tx_id, row).inspect_err(|_| {
-                self.current_pos.replace(CursorPosition::BeforeFirst);
-            })?;
+        if self
+            .db
+            .read_from_table_or_index(self.tx_id, row.id.clone(), maybe_index_id)?
+            .is_some()
+        {
+            self.db
+                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos.replace(CursorPosition::BeforeFirst);
+                })?;
         } else {
-            self.db.insert(self.tx_id, row).inspect_err(|_| {
-                self.current_pos.replace(CursorPosition::BeforeFirst);
-            })?;
+            self.db
+                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos.replace(CursorPosition::BeforeFirst);
+                })?;
         }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
 
     fn delete(&mut self) -> Result<IOResult<()>> {
-        let IOResult::Done(Some(rowid)) = self.rowid()? else {
-            panic!("Rowid should be Some(rowid) for mvcc table cursor");
+        let rowid = match self.get_current_pos() {
+            CursorPosition::Loaded { row_id, .. } => row_id,
+            _ => panic!("Cannot delete: no current row"),
         };
-        let rowid = RowID::new(self.table_id, RowKey::Int(rowid));
-        self.db.delete(self.tx_id, rowid)?;
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
+        self.db
+            .delete_from_table_or_index(self.tx_id, rowid, maybe_index_id)?;
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -873,7 +928,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn get_index_info(&self) -> &crate::types::IndexInfo {
-        todo!()
+        match &self.mv_cursor_type {
+            MvccCursorType::Index(index_info) => index_info,
+            MvccCursorType::Table => panic!("get_index_info called on table cursor"),
+        }
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
@@ -911,7 +969,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn has_rowid(&self) -> bool {
-        todo!()
+        match &self.mv_cursor_type {
+            MvccCursorType::Index(index_info) => index_info.has_rowid,
+            MvccCursorType::Table => true, // currently we don't support WITHOUT ROWID tables
+        }
     }
 
     fn record_cursor_mut(&self) -> std::cell::RefMut<'_, crate::types::RecordCursor> {
