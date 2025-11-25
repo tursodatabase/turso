@@ -1,7 +1,21 @@
-use std::{fmt::Display, mem::ManuallyDrop, sync::Arc};
+use std::{
+    fmt::Display,
+    mem::ManuallyDrop,
+    sync::{Arc, Once, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use tracing::{level_filters::LevelFilter, Event, Level, Subscriber};
+use tracing_subscriber::{
+    fmt::{self, format::Writer},
+    layer::{Context, SubscriberExt},
+    util::SubscriberInitExt,
+    EnvFilter, Layer,
+};
 use turso_capi_macros::signature;
-use turso_core::{types::Text, Connection, Database, LimboError, Statement, StepResult};
+use turso_core::{
+    types::Text, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Statement, StepResult,
+};
 
 use crate::c::{turso_slice_ref_t, turso_status_t, turso_value_t, turso_value_union_t};
 
@@ -16,6 +30,10 @@ mod c {
 
 fn err_to_c_string<E: Display>(err: &E) -> *const std::ffi::c_char {
     let message = format!("{err}");
+    str_to_c_string(&message)
+}
+
+fn str_to_c_string(message: &str) -> *const std::ffi::c_char {
     let message = std::ffi::CString::new(message).expect("string must be zero terminated");
     message.into_raw()
 }
@@ -56,6 +74,13 @@ fn turso_status(code: c::turso_status_code_t) -> turso_status_t {
     }
 }
 
+fn turso_status_message(code: c::turso_status_code_t, message: &str) -> turso_status_t {
+    c::turso_status_t {
+        error: str_to_c_string(message),
+        code,
+    }
+}
+
 fn turso_slice_from_bytes(bytes: &[u8]) -> turso_slice_ref_t {
     turso_slice_ref_t {
         ptr: bytes.as_ptr() as *const std::ffi::c_void,
@@ -67,10 +92,112 @@ fn bytes_from_turso_slice(slice: turso_slice_ref_t) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) }
 }
 
+static LOGGER: RwLock<Option<unsafe extern "C" fn(c::turso_log_t)>> = RwLock::new(None);
+static SETUP: Once = Once::new();
+
+struct CallbackLayer<F>
+where
+    F: Fn(c::turso_log_t) + Send + Sync + 'static,
+{
+    callback: F,
+}
+
+impl<S, F> Layer<S> for CallbackLayer<F>
+where
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    F: Fn(c::turso_log_t) + Send + Sync + 'static,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut buffer = String::new();
+        let mut visitor = fmt::format::DefaultVisitor::new(Writer::new(&mut buffer), true);
+
+        let level = match *event.metadata().level() {
+            Level::ERROR => c::turso_tracing_level_t::TURSO_TRACING_LEVEL_ERROR,
+            Level::WARN => c::turso_tracing_level_t::TURSO_TRACING_LEVEL_WARN,
+            Level::INFO => c::turso_tracing_level_t::TURSO_TRACING_LEVEL_INFO,
+            Level::DEBUG => c::turso_tracing_level_t::TURSO_TRACING_LEVEL_DEBUG,
+            Level::TRACE => c::turso_tracing_level_t::TURSO_TRACING_LEVEL_TRACE,
+        };
+
+        event.record(&mut visitor);
+
+        // TODO: handle this unwrap gracefully
+        let file = std::ffi::CString::new(event.metadata().file().unwrap_or("")).unwrap();
+        // TODO: handle this unwrap gracefully
+        let message = std::ffi::CString::new(buffer).unwrap();
+        // TODO: handle this unwrap gracefully
+        let target = std::ffi::CString::new(event.metadata().target()).unwrap();
+
+        let log = c::turso_log_t {
+            level,
+            target: target.as_ptr(),
+            message: message.as_ptr(), // SAFETY: `message` outlives `callback`
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|t| t.as_secs())
+                .unwrap_or(0),
+            file: file.as_ptr(), // SAFETY: `message` outlives `callback`
+            line: event.metadata().line().unwrap_or(0) as usize,
+            ..Default::default()
+        };
+
+        (self.callback)(log);
+    }
+}
+
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_setup(config: c::turso_config_t) -> c::turso_status_t {
-    todo!()
+    fn callback(log: c::turso_log_t) {
+        let Ok(logger) = LOGGER.try_read() else {
+            return;
+        };
+
+        if let Some(logger) = *logger {
+            unsafe { logger(log) }
+        }
+    }
+
+    if let Some(logger) = config.logger.as_ref() {
+        let mut guard = LOGGER.write().unwrap();
+        *guard = Some(*logger);
+    }
+
+    let level_filter = if !config.log_level.is_null() {
+        let log_level_cstr = unsafe { std::ffi::CStr::from_ptr(config.log_level) };
+        match log_level_cstr.to_str() {
+            Ok("error") => Some(LevelFilter::ERROR),
+            Ok("warn") => Some(LevelFilter::WARN),
+            Ok("info") => Some(LevelFilter::INFO),
+            Ok("debug") => Some(LevelFilter::DEBUG),
+            Ok("trace") => Some(LevelFilter::TRACE),
+            Ok(_) => {
+                return turso_status_message(
+                    c::turso_status_code_t::TURSO_ERROR,
+                    "unknown log level",
+                )
+            }
+            Err(err) => {
+                return turso_status_err(&err, c::turso_status_code_t::TURSO_ERROR);
+            }
+        }
+    } else {
+        None
+    };
+
+    SETUP.call_once(|| {
+        if let Some(level_filter) = level_filter {
+            tracing_subscriber::registry()
+                .with(CallbackLayer { callback }.with_filter(level_filter))
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(CallbackLayer { callback }.with_filter(EnvFilter::from_default_env()))
+                .init();
+        }
+    });
+
+    turso_status_ok()
 }
 
 #[no_mangle]
@@ -98,7 +225,36 @@ pub extern "C" fn turso_database_init(config: c::turso_database_config_t) -> c::
             }
         },
     };
-    match turso_core::Database::open_file(io.clone(), filename_str, false, true) {
+    let mut opts = DatabaseOpts::new();
+    if !config.experimental_features.is_null() {
+        let experimental_cstr = unsafe { std::ffi::CStr::from_ptr(config.experimental_features) };
+        let experimental_str = match experimental_cstr.to_str() {
+            Ok(s) => s,
+            Err(err) => {
+                return c::turso_database_t {
+                    status: turso_status_err(&err, c::turso_status_code_t::TURSO_ERROR),
+                    inner: std::ptr::null_mut(),
+                }
+            }
+        };
+        for features in experimental_str.split(",").map(|s| s.trim()) {
+            opts = match features {
+                "views" => opts.with_views(true),
+                "mvcc" => opts.with_mvcc(true),
+                "index_method" => opts.with_index_method(true),
+                "strict" => opts.with_strict(true),
+                "autovacuum" => opts.with_autovacuum(true),
+                _ => opts,
+            };
+        }
+    }
+    match turso_core::Database::open_file_with_flags(
+        io.clone(),
+        filename_str,
+        OpenFlags::default(),
+        opts,
+        None,
+    ) {
         Ok(db) => c::turso_database_t {
             status: turso_status_ok(),
             inner: Arc::into_raw(db) as *mut std::ffi::c_void,
@@ -515,12 +671,13 @@ mod tests {
     use crate::{
         bytes_from_turso_slice,
         c::{
-            turso_connection_deinit, turso_connection_prepare, turso_database_config_t,
-            turso_database_connect, turso_database_deinit, turso_database_init, turso_row_deinit,
-            turso_row_value, turso_rows_deinit, turso_rows_next, turso_slice_ref_t,
-            turso_statement_bind_named, turso_statement_deinit, turso_statement_execute,
-            turso_statement_io, turso_statement_query, turso_status_code_t, turso_status_t,
-            turso_value_t, turso_value_union_t,
+            turso_config_t, turso_connection_deinit, turso_connection_prepare,
+            turso_database_config_t, turso_database_connect, turso_database_deinit,
+            turso_database_init, turso_log_t, turso_row_deinit, turso_row_value, turso_rows_deinit,
+            turso_rows_next, turso_setup, turso_slice_ref_t, turso_statement_bind_named,
+            turso_statement_deinit, turso_statement_execute, turso_statement_io,
+            turso_statement_query, turso_status_code_t, turso_status_t, turso_value_t,
+            turso_value_union_t,
         },
         turso_slice_from_bytes, turso_statement_bind_positional, turso_statement_column_count,
     };
@@ -550,12 +707,29 @@ mod tests {
         }
     }
 
+    extern "C" fn logger(log: turso_log_t) {
+        println!("log: {:?}", unsafe {
+            std::ffi::CStr::from_ptr(log.message)
+        });
+    }
+
+    #[test]
+    pub fn test_db_setup() {
+        unsafe {
+            turso_setup(turso_config_t {
+                logger: Some(logger),
+                log_level: b"info\0".as_ptr(),
+            })
+        };
+    }
+
     #[test]
     pub fn test_db_init() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             turso_database_deinit(db);
@@ -568,6 +742,7 @@ mod tests {
             let path = CString::new("not/existing/path").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_ERROR);
             assert_eq!(error(&db.status), "I/O error: entity not found");
@@ -581,6 +756,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -596,6 +772,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -622,6 +799,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -649,6 +827,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -691,6 +870,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -758,6 +938,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);
@@ -891,6 +1072,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let db = turso_database_init(turso_database_config_t {
                 path: path.as_ptr(),
+                ..Default::default()
             });
             assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
             let conn = turso_database_connect(db);

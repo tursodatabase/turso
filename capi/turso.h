@@ -110,11 +110,13 @@ typedef struct {
 typedef struct {
     /** Path to the database file or `:memory:` */
     const char *path;
+    /** Optional comma separated list of experimental features to enable */
+    const char *experimental_features;
 } turso_database_config_t;
 
 typedef struct {
     void (*logger)(turso_log_t log);
-    const char *version;
+    const char *log_level;
 } turso_config_t;
 
 /** Setup some global info */

@@ -340,14 +340,18 @@ impl Default for turso_execute_t {
 pub struct turso_database_config_t {
     #[doc = " Path to the database file or `:memory:`"]
     pub path: *const ::std::os::raw::c_char,
+    #[doc = " Optional comma separated list of experimental features to enable"]
+    pub experimental_features: *const ::std::os::raw::c_char,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 8usize];
+    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 16usize];
     ["Alignment of turso_database_config_t"]
         [::std::mem::align_of::<turso_database_config_t>() - 8usize];
     ["Offset of field: turso_database_config_t::path"]
         [::std::mem::offset_of!(turso_database_config_t, path) - 0usize];
+    ["Offset of field: turso_database_config_t::experimental_features"]
+        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 8usize];
 };
 impl Default for turso_database_config_t {
     fn default() -> Self {
@@ -362,7 +366,7 @@ impl Default for turso_database_config_t {
 #[derive(Debug, Copy, Clone)]
 pub struct turso_config_t {
     pub logger: ::std::option::Option<unsafe extern "C" fn(log: turso_log_t)>,
-    pub version: *const ::std::os::raw::c_char,
+    pub log_level: *const ::std::os::raw::c_char,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -370,8 +374,8 @@ const _: () = {
     ["Alignment of turso_config_t"][::std::mem::align_of::<turso_config_t>() - 8usize];
     ["Offset of field: turso_config_t::logger"]
         [::std::mem::offset_of!(turso_config_t, logger) - 0usize];
-    ["Offset of field: turso_config_t::version"]
-        [::std::mem::offset_of!(turso_config_t, version) - 8usize];
+    ["Offset of field: turso_config_t::log_level"]
+        [::std::mem::offset_of!(turso_config_t, log_level) - 8usize];
 };
 impl Default for turso_config_t {
     fn default() -> Self {
