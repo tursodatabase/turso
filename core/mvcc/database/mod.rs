@@ -1209,7 +1209,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.next_rowid.fetch_add(1, Ordering::SeqCst) as i64
     }
 
-    /// Inserts a new row into the database.
+    /// Inserts a new row into a table in the database.
     ///
     /// This function inserts a new `row` into the database within the context
     /// of the transaction `tx_id`.
@@ -1220,6 +1220,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// * `row` - the row object containing the values to be inserted.
     ///
     pub fn insert(&self, tx_id: TxID, row: Row) -> Result<()> {
+        self.insert_to_table_or_index(tx_id, row, None)
+    }
+
+    /// Same as insert() but can insert to a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn insert_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
         let tx = self
             .txs
@@ -1228,17 +1238,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
-        let row_version = RowVersion {
-            begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-            end: None,
-            row,
-        };
-        tx.insert_to_write_set(id.clone());
-        self.insert_version(id, row_version);
+        match maybe_index_id {
+            Some(index_id) => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row: row.clone(),
+                };
+                let RowKey::Record(sortable_key) = row.id.row_id else {
+                    panic!("Index writes must be to a record");
+                };
+                self.insert_index_version(index_id, sortable_key, row_version);
+            }
+            None => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row,
+                };
+                tx.insert_to_write_set(id.clone()); // Index writes are not committed; they are always in memory only (during recovery, they are reconstructed from table data in the logical log)
+                self.insert_version(id, row_version);
+            }
+        }
         Ok(())
     }
 
-    /// Updates a row in the database with new values.
+    /// Updates a row in a table in the database with new values.
     ///
     /// This function updates an existing row in the database within the
     /// context of the transaction `tx_id`. The `row` argument identifies the
@@ -1257,20 +1282,41 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ///
     /// Returns `true` if the row was successfully updated, and `false` otherwise.
     pub fn update(&self, tx_id: TxID, row: Row) -> Result<bool> {
+        self.update_to_table_or_index(tx_id, row, None)
+    }
+
+    /// Same as update() but can update a table or an index, indicated by the `maybe_index_id` argument.    
+    pub fn update_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
-        if !self.delete(tx_id, row.id.clone())? {
+        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)? {
             return Ok(false);
         }
-        self.insert(tx_id, row)?;
+        self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
         Ok(true)
     }
 
-    /// Inserts a row in the database with new values, previously deleting
+    /// Inserts a row into a table in the database with new values, previously deleting
     /// any old data if it existed. Bails on a delete error, e.g. write-write conflict.
     pub fn upsert(&self, tx_id: TxID, row: Row) -> Result<()> {
+        self.upsert_to_table_or_index(tx_id, row, None)
+    }
+
+    /// Same as upsert() but can upsert to a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn upsert_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
         tracing::trace!("upsert(tx_id={}, row.id={:?})", tx_id, row.id);
-        self.delete(tx_id, row.id.clone())?;
-        self.insert(tx_id, row)
+        self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)?;
+        self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
+        Ok(())
     }
 
     /// Deletes a row from the table with the given `id`.
@@ -1288,41 +1334,91 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Returns `true` if the row was successfully deleted, and `false` otherwise.
     ///
     pub fn delete(&self, tx_id: TxID, id: RowID) -> Result<bool> {
-        tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
-        let row_versions_opt = self.rows.get(&id);
-        if let Some(ref row_versions) = row_versions_opt {
-            let mut row_versions = row_versions.value().write();
-            for rv in row_versions.iter_mut().rev() {
-                let tx = self
-                    .txs
-                    .get(&tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let tx = tx.value();
-                assert_eq!(tx.state, TransactionState::Active);
-                // A transaction cannot delete a version that it cannot see,
-                // nor can it conflict with it.
-                if !rv.is_visible_to(tx, &self.txs) {
-                    continue;
-                }
-                if is_write_write_conflict(&self.txs, tx, rv) {
-                    drop(row_versions);
-                    drop(row_versions_opt);
-                    return Err(LimboError::WriteWriteConflict);
-                }
+        self.delete_from_table_or_index(tx_id, id, None)
+    }
 
-                rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
-                drop(row_versions);
-                drop(row_versions_opt);
-                let tx = self
-                    .txs
-                    .get(&tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                let tx = tx.value();
-                tx.insert_to_write_set(id);
-                return Ok(true);
+    /// Same as delete() but can delete from a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn delete_from_table_or_index(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<bool> {
+        tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
+        match maybe_index_id {
+            Some(index_id) => {
+                let rows = self
+                    .index_rows
+                    .get(&index_id)
+                    .expect("index should exist in index_rows map");
+                let rows = rows.value();
+                let RowKey::Record(sortable_key) = id.row_id else {
+                    panic!("Index deletes must have a record row_id");
+                };
+                let row_versions_opt = rows.get(&sortable_key);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let mut row_versions = row_versions.value().write();
+                    for rv in row_versions.iter_mut().rev() {
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        assert_eq!(tx.state, TransactionState::Active);
+                        // A transaction cannot delete a version that it cannot see,
+                        // nor can it conflict with it.
+                        if !rv.is_visible_to(tx, &self.txs) {
+                            continue;
+                        }
+                        if is_write_write_conflict(&self.txs, tx, rv) {
+                            drop(row_versions);
+                            drop(row_versions_opt);
+                            return Err(LimboError::WriteWriteConflict);
+                        }
+
+                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            None => {
+                let row_versions_opt = self.rows.get(&id);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let mut row_versions = row_versions.value().write();
+                    for rv in row_versions.iter_mut().rev() {
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        assert_eq!(tx.state, TransactionState::Active);
+                        // A transaction cannot delete a version that it cannot see,
+                        // nor can it conflict with it.
+                        if !rv.is_visible_to(tx, &self.txs) {
+                            continue;
+                        }
+                        if is_write_write_conflict(&self.txs, tx, rv) {
+                            drop(row_versions);
+                            drop(row_versions_opt);
+                            return Err(LimboError::WriteWriteConflict);
+                        }
+
+                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        drop(row_versions);
+                        drop(row_versions_opt);
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        tx.insert_to_write_set(id);
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
-        Ok(false)
     }
 
     /// Retrieves a row from the table with the given `id`.
@@ -1340,25 +1436,62 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Returns `Some(row)` with the row data if the row with the given `id` exists,
     /// and `None` otherwise.
     pub fn read(&self, tx_id: TxID, id: RowID) -> Result<Option<Row>> {
+        self.read_from_table_or_index(tx_id, id, None)
+    }
+
+    /// Same as read() but can read from a table or an index, indicated by the `maybe_index_id` argument.
+    pub fn read_from_table_or_index(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<Option<Row>> {
         tracing::trace!("read(tx_id={}, id={:?})", tx_id, id);
+
         let tx = self
             .txs
             .get(&tx_id)
             .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
-        if let Some(row_versions) = self.rows.get(&id) {
-            let row_versions = row_versions.value().read();
-            if let Some(rv) = row_versions
-                .iter()
-                .rev()
-                .find(|rv| rv.is_visible_to(tx, &self.txs))
-            {
-                tx.insert_to_read_set(id);
-                return Ok(Some(rv.row.clone()));
+        match maybe_index_id {
+            Some(index_id) => {
+                let rows = self
+                    .index_rows
+                    .get(&index_id)
+                    .expect("index should exist in index_rows map");
+                let rows = rows.value();
+                let RowKey::Record(sortable_key) = id.row_id else {
+                    panic!("Index reads must have a record row_id");
+                };
+                let row_versions_opt = rows.get(&sortable_key);
+                if let Some(ref row_versions) = row_versions_opt {
+                    let row_versions = row_versions.value().read();
+                    if let Some(rv) = row_versions
+                        .iter()
+                        .rev()
+                        .find(|rv| rv.is_visible_to(tx, &self.txs))
+                    {
+                        return Ok(Some(rv.row.clone()));
+                    }
+                }
+                Ok(None)
+            }
+            None => {
+                if let Some(row_versions) = self.rows.get(&id) {
+                    let row_versions = row_versions.value().read();
+                    if let Some(rv) = row_versions
+                        .iter()
+                        .rev()
+                        .find(|rv| rv.is_visible_to(tx, &self.txs))
+                    {
+                        tx.insert_to_read_set(id);
+                        return Ok(Some(rv.row.clone()));
+                    }
+                }
+                Ok(None)
             }
         }
-        Ok(None)
     }
 
     /// Gets all row ids in the database.
@@ -2279,11 +2412,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // Other table row version inserts; table id must exist in mapping (otherwise there's a row version insert to an unknown table)
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
-                    self.insert(tx_id, row)?;
+                    self.insert(tx_id, row)?; // TODO: reconstruct index rows from table row on recovery
                 }
                 StreamingResult::DeleteRow { rowid } => {
                     assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
-                    self.delete(tx_id, rowid)?;
+                    self.delete(tx_id, rowid)?; // TODO: reconstruct index rows from table row on recovery
                 }
                 StreamingResult::Eof => {
                     // Set offset to the end so that next writes go to the end of the file
