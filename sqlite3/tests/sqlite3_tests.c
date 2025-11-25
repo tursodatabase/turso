@@ -20,6 +20,7 @@ void test_sqlite3_column_type();
 void test_sqlite3_column_decltype();
 void test_sqlite3_next_stmt();
 void test_sqlite3_table_column_metadata();
+void test_sqlite3_insert_returning();
 
 int allocated = 0;
 
@@ -39,6 +40,7 @@ int main(void)
     test_sqlite3_column_decltype();
     test_sqlite3_next_stmt();
     test_sqlite3_table_column_metadata();
+    test_sqlite3_insert_returning();
     return 0;
 }
 
@@ -745,4 +747,48 @@ void test_sqlite3_table_column_metadata()
 
 	printf("sqlite3_table_column_metadata test passed\n");
 	sqlite3_close(db);
+}
+
+void test_sqlite3_insert_returning()
+{
+    sqlite3 *db;
+    sqlite3_stmt *stmt;
+    char *err_msg = NULL;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_exec(db,
+                      "CREATE TABLE t(x)",
+                      NULL, NULL, &err_msg);
+    assert(rc == SQLITE_OK);
+
+    if (err_msg)
+    {
+        sqlite3_free(err_msg);
+        err_msg = NULL;
+    }
+    rc = sqlite3_prepare_v2(db, "INSERT INTO t (x) VALUES (1), (2), (3) RETURNING x;", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+
+    rc = sqlite3_finalize(stmt);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM t;", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_step(stmt);
+    assert(rc == SQLITE_ROW);
+
+    sqlite_int64 fetched = sqlite3_column_int64(stmt, 0);
+    assert(fetched == 3);
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    printf("test_sqlite3_insert_retuning test passed\n");
 }
