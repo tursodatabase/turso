@@ -7,7 +7,18 @@
 
 typedef enum {
     TURSO_OK = 0,
-    TURSO_ERROR = 1,
+    TURSO_DONE = 1,
+    TURSO_ROW = 2,
+    TURSO_IO = 3,
+    TURSO_BUSY = 4,
+    TURSO_INTERRUPT = 5,
+    TURSO_ERROR = 127,
+    TURSO_MISUSE = 128,
+    TURSO_CONSTRAINT = 129,
+    TURSO_READONLY = 130,
+    TURSO_DATABASE_FULL = 131,
+    TURSO_NOTADB = 132,
+    TURSO_CORRUPT = 133,
 } turso_status_code_t;
 
 typedef struct turso_status_t {
@@ -41,40 +52,41 @@ typedef struct {
 } turso_log_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     void *inner;
 } turso_database_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     void *inner;
 } turso_connection_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     void *inner;
 } turso_statement_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     void *inner;
 } turso_rows_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     void *inner;
 } turso_row_t;
 
+// turso owns the slice - so called must not free this memory in any way
 typedef struct {
     const void *ptr;
     size_t len;
-} turso_slice_t;
+} turso_slice_ref_t;
 
 typedef union {
     int64_t integer;
     double real;
-    turso_slice_t text;
-    turso_slice_t blob;
+    turso_slice_ref_t text;
+    turso_slice_ref_t blob;
 } turso_value_union_t;
 
 typedef struct {
@@ -83,12 +95,12 @@ typedef struct {
 } turso_value_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     turso_value_t ok;
 } turso_result_value_t;
 
 typedef struct {
-    turso_status_t err;
+    turso_status_t status;
     uint64_t rows_changed;
 } turso_execute_t;
 
@@ -116,33 +128,32 @@ turso_connection_t turso_database_connect(turso_database_t self);
 
 /** Prepare a statement in a connection */
 turso_statement_t
-turso_connection_prepare(turso_connection_t self, const char *sql);
+turso_connection_prepare(turso_connection_t self, turso_slice_ref_t sql);
 
 /** Execute a statement */
 turso_execute_t turso_statement_execute(turso_statement_t self);
 /** Query a statement */
 turso_rows_t turso_statement_query(turso_statement_t self);
+/** Execute one iteration of underlying IO backend */
+turso_status_t turso_statement_io(turso_statement_t self);
 /** Reset a statement */
 turso_status_t turso_statement_reset(turso_statement_t self);
+/** Get column count */
+int32_t turso_statement_column_count(turso_statement_t self);
+/** Get the column name at the index */
+turso_slice_ref_t turso_statement_column_name(turso_statement_t self, int32_t index);
+
 
 /** Get the next row from rows */
 turso_row_t turso_rows_next(turso_rows_t self);
-/** Get the column name at the index */
-turso_slice_t turso_rows_column_name(turso_rows_t self, int32_t index);
-/** Get rows column count */
-int32_t turso_rows_column_count(turso_rows_t self);
 
 /** Get the value at the the index */
 turso_result_value_t turso_row_value(turso_row_t self, int32_t index);
-/** Get the column name at the the index */
-turso_slice_t turso_row_name(turso_row_t self, int32_t index);
-/** Check if the row is empty, indicating the end of `turso_rows_next` */
-bool turso_row_empty(turso_row_t self);
 
 /** Bind a named argument to a statement */
 turso_status_t turso_statement_bind_named(
     turso_statement_t self,
-    const char *name,
+    turso_slice_ref_t name,
     turso_value_t value
 );
 /** Bind a positional argument to a statement */
@@ -160,7 +171,7 @@ turso_value_t turso_blob(const uint8_t *ptr, size_t len);
 /** Create a turso null value */
 turso_value_t turso_null();
 
-/** Deallocate and close a error */
+/** Deallocate and close a status */
 void turso_status_deinit(turso_status_t self);
 /** Deallocate and close a database */
 void turso_database_deinit(turso_database_t self);
@@ -172,7 +183,5 @@ void turso_statement_deinit(turso_statement_t self);
 void turso_rows_deinit(turso_rows_t self);
 /** Deallocate and close a row */
 void turso_row_deinit(turso_row_t self);
-/** Deallocate a slice */
-void turso_slice_deinit(turso_slice_t value);
 
 #endif /* TURSO_H */
