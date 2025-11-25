@@ -1843,3 +1843,23 @@ pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
     let rng = ChaCha8Rng::seed_from_u64(seed as u64);
     (rng, seed as u64)
 }
+
+#[test]
+fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    let res = conn.execute("INSERT INTO t VALUES (2)");
+    assert!(res.is_err(), "Expected error because key 2 already exists");
+}
