@@ -4,7 +4,7 @@
 use std::ffi::{self, CStr, CString};
 use std::num::{NonZero, NonZeroUsize};
 use tracing::trace;
-use turso_core::{CheckpointMode, LimboError, ProgramExecutionState, Value};
+use turso_core::{CheckpointMode, LimboError, Value};
 
 use std::sync::{Arc, Mutex};
 
