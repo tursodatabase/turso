@@ -76,7 +76,7 @@ typedef struct {
     void *inner;
 } turso_row_t;
 
-// turso owns the slice - so called must not free this memory in any way
+// turso owns the slice - so caller must not free this memory in any way
 typedef struct {
     const void *ptr;
     size_t len;
