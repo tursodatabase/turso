@@ -252,7 +252,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 in_btree: false,
                 btree_consumed: true,
             },
-            (None, None) => CursorPosition::End,
+            (None, None) => match direction {
+                IterationDirection::Forwards => CursorPosition::BeforeFirst,
+                IterationDirection::Backwards => CursorPosition::End,
+            },
         }
     }
 
@@ -319,14 +322,22 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let current_state = self.state.borrow().clone();
         if current_state.is_none() {
             let before_first = matches!(self.get_current_pos(), CursorPosition::BeforeFirst);
-            let min_key_exclusive = match self.current_pos.borrow().clone() {
+            let min_key = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id),
+                } => Some(match &self.mv_cursor_type {
+                    MvccCursorType::Table => {
+                        (true, RowKey::Int(row_id.row_id.to_int_or_panic() + 1))
+                    }
+                    MvccCursorType::Index(_) => (false, row_id.row_id),
+                }),
                 // TODO: do we need to forward twice?
-                CursorPosition::BeforeFirst => None,
+                CursorPosition::BeforeFirst => match &self.mv_cursor_type {
+                    MvccCursorType::Table => Some((false, RowKey::Int(i64::MIN))),
+                    MvccCursorType::Index(_) => None,
+                },
                 CursorPosition::End => {
                     // let's keep same state, we reached the end so no point in moving forward.
                     return Ok(IOResult::Done(false));
@@ -335,7 +346,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
             let new_position_in_mvcc = match self.db.get_next_row_id_for_table(
                 self.table_id,
-                min_key_exclusive.as_ref(),
+                min_key.as_ref().map(|(inclusive, key)| (*inclusive, key)),
                 self.tx_id,
             ) {
                 Some(id) => CursorPosition::Loaded {
@@ -455,21 +466,29 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn prev(&mut self) -> Result<IOResult<bool>> {
         let current_state = self.state.borrow().clone();
         if current_state.is_none() {
-            let max_id_exclusive = match self.current_pos.borrow().clone() {
+            let max_key = match self.current_pos.borrow().clone() {
                 CursorPosition::Loaded {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(row_id.row_id.clone()),
+                } => Some(match &self.mv_cursor_type {
+                    MvccCursorType::Table => {
+                        (true, RowKey::Int(row_id.row_id.to_int_or_panic() - 1))
+                    }
+                    MvccCursorType::Index(_) => (false, row_id.row_id),
+                }),
                 CursorPosition::BeforeFirst => {
                     return Ok(IOResult::Done(false));
                 }
-                CursorPosition::End => None,
+                CursorPosition::End => match &self.mv_cursor_type {
+                    MvccCursorType::Table => Some((true, RowKey::Int(i64::MAX))),
+                    MvccCursorType::Index(_) => None,
+                },
             };
 
             let new_position_in_mvcc = match self.db.get_prev_row_id_for_table(
                 self.table_id,
-                max_id_exclusive.as_ref(),
+                max_key.as_ref().map(|(inclusive, key)| (*inclusive, key)),
                 self.tx_id,
             ) {
                 Some(id) => CursorPosition::Loaded {
@@ -802,9 +821,18 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.current_pos.replace(CursorPosition::BeforeFirst);
         }
 
-        let new_position_in_mvcc =
-            self.db
-                .get_next_row_id_for_table(self.table_id, None, self.tx_id);
+        let start_key_mvcc = match &self.mv_cursor_type {
+            MvccCursorType::Table => Some((true, RowKey::Int(i64::MIN))),
+            MvccCursorType::Index(_) => None,
+        };
+
+        let new_position_in_mvcc = self.db.get_next_row_id_for_table(
+            self.table_id,
+            start_key_mvcc
+                .as_ref()
+                .map(|(inclusive, key)| (*inclusive, key)),
+            self.tx_id,
+        );
 
         let maybe_rowid_in_btree = match &self.mv_cursor_type {
             MvccCursorType::Table => {
@@ -828,7 +856,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             }
         };
         let new_position = self.get_new_position_from_mvcc_and_btree(
-            &new_position_in_mvcc.map(|r| r.row_id),
+            &new_position_in_mvcc.clone().map(|r| r.row_id),
             &maybe_rowid_in_btree,
             IterationDirection::Forwards,
         );

@@ -1401,7 +1401,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_next_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: Option<&RowKey>,
+        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1423,7 +1423,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_prev_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: Option<&RowKey>,
+        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1445,7 +1445,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_row_id_for_table_in_direction(
         &self,
         table_id: MVTableId,
-        start: Option<&RowKey>,
+        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
         tx_id: TxID,
         direction: IterationDirection,
     ) -> Option<RowID> {
@@ -1453,7 +1453,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             "getting_row_id_for_table_in_direction(table_id={}, range_start={:?}, direction={:?})",
             table_id,
             start,
-            direction
+            direction,
         );
 
         let tx = self
@@ -1464,13 +1464,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if direction == IterationDirection::Forwards {
             let min_bound = start.map(|start| RowID {
                 table_id,
-                row_id: start.clone(),
+                row_id: start.1.clone(),
             });
+            let inclusive = start.map(|start| start.0).unwrap_or(false);
 
             match min_bound {
                 Some(min_bound) => {
                     let mut rows = self.rows.range(min_bound..);
-                    rows.next(); // exclusive wrt. min bound
+                    if !inclusive {
+                        rows.next();
+                    }
                     loop {
                         // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
                         // to loop either until we find a row that is not deleted or until we reach the end of the table.
@@ -1519,13 +1522,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let max_bound = start.map(|start| RowID {
                 table_id,
-                row_id: start.clone(),
+                row_id: start.1.clone(),
             });
+            let inclusive = start.map(|start| start.0).unwrap_or(false);
 
             match max_bound {
                 Some(max_bound) => {
-                    let mut rows = self.rows.range(max_bound..).rev();
-                    rows.next(); // exclusive wrt. max bound
+                    let mut rows = self.rows.range(..=max_bound).rev();
+                    if !inclusive {
+                        rows.next();
+                    }
                     loop {
                         // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
                         // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
