@@ -327,7 +327,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 
 unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt_ref = &mut *stmt;
-    while stmt_ref.stmt.execution_state() == ProgramExecutionState::Run {
+    while stmt_ref.stmt.execution_state().is_running() {
         let result = sqlite3_step(stmt);
         if result != SQLITE_DONE && result != SQLITE_ROW {
             return result;

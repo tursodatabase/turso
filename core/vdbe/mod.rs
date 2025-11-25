@@ -275,12 +275,35 @@ pub enum TxnCleanup {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProgramExecutionState {
+    /// No steps of the program was executed
     Init,
-    Run,
+    /// Program started execution but didn't reach any terminal state
+    Running,
+    /// Interrupt requested for the program
     Interrupting,
+    /// Terminal state: program interrupted
     Interrupted,
+    /// Terminal state: program finished successfully
     Done,
+    /// Terminal state: program failed with error
     Failed,
+}
+
+impl ProgramExecutionState {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            ProgramExecutionState::Interrupting | ProgramExecutionState::Running
+        )
+    }
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ProgramExecutionState::Interrupted
+                | ProgramExecutionState::Failed
+                | ProgramExecutionState::Done
+        )
+    }
 }
 
 /// The program state describes the environment in which the program executes.
@@ -656,7 +679,7 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
-        state.execution_state = ProgramExecutionState::Run;
+        state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
