@@ -273,6 +273,16 @@ pub enum TxnCleanup {
     RollbackTxn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProgramExecutionState {
+    Init,
+    Run,
+    Interrupting,
+    Interrupted,
+    Done,
+    Failed,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -287,7 +297,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<u32, 4>,
     regex_cache: RegexCache,
-    interrupted: bool,
+    pub execution_state: ProgramExecutionState,
     pub parameters: HashMap<NonZero<usize>, Value>,
     commit_state: CommitState,
     #[cfg(feature = "json")]
@@ -356,7 +366,7 @@ impl ProgramState {
             ended_coroutine: Bitfield::new(),
             once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
-            interrupted: false,
+            execution_state: ProgramExecutionState::Init,
             parameters: HashMap::new(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
@@ -409,11 +419,7 @@ impl ProgramState {
     }
 
     pub fn interrupt(&mut self) {
-        self.interrupted = true;
-    }
-
-    pub fn is_interrupted(&self) -> bool {
-        self.interrupted
+        self.execution_state = ProgramExecutionState::Interrupting;
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
@@ -450,7 +456,7 @@ impl ProgramState {
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.0 = [0; 4];
         self.regex_cache.like.clear();
-        self.interrupted = false;
+        self.execution_state = ProgramExecutionState::Init;
         self.current_collation = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
@@ -650,11 +656,25 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
-        match query_mode {
+        state.execution_state = ProgramExecutionState::Run;
+        let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
             QueryMode::Explain => self.explain_step(state, mv_store, pager),
             QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
+        };
+        match &result {
+            Ok(StepResult::Done) => {
+                state.execution_state = ProgramExecutionState::Done;
+            }
+            Ok(StepResult::Interrupt) => {
+                state.execution_state = ProgramExecutionState::Interrupted;
+            }
+            Err(_) => {
+                state.execution_state = ProgramExecutionState::Failed;
+            }
+            _ => {}
         }
+        result
     }
 
     fn explain_step(
@@ -673,7 +693,7 @@ impl Program {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
 
-        if state.is_interrupted() {
+        if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
             return Ok(StepResult::Interrupt);
         }
 
@@ -823,7 +843,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
 
-            if state.is_interrupted() {
+            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 return Ok(StepResult::Interrupt);
             }
 
@@ -871,10 +891,11 @@ impl Program {
                 }
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
-            if state.is_interrupted() {
+            if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
                 self.abort(mv_store, &pager, None, state);
                 return Ok(StepResult::Interrupt);
             }
+
             if let Some(io) = &state.io_completions {
                 if !io.finished() {
                     io.set_waker(waker);

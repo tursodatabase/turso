@@ -31,6 +31,7 @@ mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 mod vdbe;
+pub type ProgramExecutionState = vdbe::ProgramExecutionState;
 pub mod vector;
 mod vtab;
 
@@ -2648,6 +2649,10 @@ impl Statement {
 
     pub fn interrupt(&mut self) {
         self.state.interrupt();
+    }
+
+    pub fn execution_state(&self) -> ProgramExecutionState {
+        self.state.execution_state
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
