@@ -397,6 +397,10 @@ impl Schema {
         }
         Ok(())
     }
+    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.triggers.remove(&table_name);
+    }
 
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = normalize_ident(table_name);
