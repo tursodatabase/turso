@@ -119,7 +119,7 @@ typedef struct {
     const char *log_level;
 } turso_config_t;
 
-/** Setup some global info */
+/** Setup global database info */
 turso_status_t turso_setup(turso_config_t config);
 
 /** Create or open a database */
@@ -140,6 +140,8 @@ turso_rows_t turso_statement_query(turso_statement_t self);
 turso_status_t turso_statement_io(turso_statement_t self);
 /** Reset a statement */
 turso_status_t turso_statement_reset(turso_statement_t self);
+/** Finalize a statement */
+turso_status_t turso_statement_finalize(turso_statement_t self);
 /** Get column count */
 int32_t turso_statement_column_count(turso_statement_t self);
 /** Get the column name at the index */

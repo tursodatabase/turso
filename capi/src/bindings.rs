@@ -387,7 +387,7 @@ impl Default for turso_config_t {
     }
 }
 unsafe extern "C" {
-    #[doc = " Setup some global info"]
+    #[doc = " Setup global database info"]
     pub fn turso_setup(config: turso_config_t) -> turso_status_t;
 }
 unsafe extern "C" {
@@ -420,6 +420,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Reset a statement"]
     pub fn turso_statement_reset(self_: turso_statement_t) -> turso_status_t;
+}
+unsafe extern "C" {
+    #[doc = " Finalize a statement"]
+    pub fn turso_statement_finalize(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
     #[doc = " Get column count"]

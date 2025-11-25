@@ -5122,7 +5122,7 @@ dependencies = [
  "napi-derive",
  "tracing",
  "tracing-subscriber",
- "turso_core",
+ "turso_capi",
 ]
 
 [[package]]

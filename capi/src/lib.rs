@@ -385,6 +385,25 @@ pub extern "C" fn turso_statement_reset(statement: c::turso_statement_t) -> c::t
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c::turso_status_t {
+    let statement = unsafe { &mut *(statement.inner as *mut Statement) };
+    if statement.execution_state().is_running() {
+        loop {
+            return match statement.step() {
+                Ok(StepResult::Row) => continue,
+                Ok(StepResult::Done) => break,
+                Ok(StepResult::IO) => turso_status(c::turso_status_code_t::TURSO_IO),
+                Ok(StepResult::Interrupt) => turso_status(c::turso_status_code_t::TURSO_INTERRUPT),
+                Ok(StepResult::Busy) => turso_status(c::turso_status_code_t::TURSO_BUSY),
+                Err(err) => turso_status_limbo_err(&err),
+            };
+        }
+    }
+    turso_status_ok()
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_column_name(
     rows: c::turso_statement_t,
     index: std::ffi::c_int,
@@ -675,9 +694,9 @@ mod tests {
             turso_database_config_t, turso_database_connect, turso_database_deinit,
             turso_database_init, turso_log_t, turso_row_deinit, turso_row_value, turso_rows_deinit,
             turso_rows_next, turso_setup, turso_slice_ref_t, turso_statement_bind_named,
-            turso_statement_deinit, turso_statement_execute, turso_statement_io,
-            turso_statement_query, turso_status_code_t, turso_status_t, turso_value_t,
-            turso_value_union_t,
+            turso_statement_deinit, turso_statement_execute, turso_statement_finalize,
+            turso_statement_io, turso_statement_query, turso_status_code_t, turso_status_t,
+            turso_value_t, turso_value_union_t,
         },
         turso_slice_from_bytes, turso_statement_bind_positional, turso_statement_column_count,
     };
@@ -1196,6 +1215,124 @@ mod tests {
             );
 
             turso_rows_deinit(rows);
+            turso_statement_deinit(stmt);
+        }
+    }
+
+    #[test]
+    pub fn test_db_stmt_insert_returning() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let db = turso_database_init(turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            });
+            assert_eq!(db.status.code, turso_status_code_t::TURSO_OK);
+            let conn = turso_database_connect(db);
+            assert_eq!(conn.status.code, turso_status_code_t::TURSO_OK);
+
+            let sql = "CREATE TABLE t(x)";
+            let stmt = turso_connection_prepare(
+                conn,
+                turso_slice_ref_t {
+                    ptr: sql.as_ptr() as *const std::ffi::c_void,
+                    len: sql.len(),
+                },
+            );
+            assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
+            while turso_statement_execute(stmt).status.code != turso_status_code_t::TURSO_OK {
+                let io_result = turso_statement_io(stmt).code;
+                assert_eq!(io_result, turso_status_code_t::TURSO_OK);
+            }
+            turso_statement_deinit(stmt);
+
+            let sql = "INSERT INTO t VALUES (1), (2), (3) RETURNING x";
+            let stmt = turso_connection_prepare(
+                conn,
+                turso_slice_ref_t {
+                    ptr: sql.as_ptr() as *const std::ffi::c_void,
+                    len: sql.len(),
+                },
+            );
+            assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
+
+            let columns = turso_statement_column_count(stmt);
+            assert_eq!(columns, 1);
+
+            let rows = turso_statement_query(stmt);
+            assert_eq!(rows.status.code, turso_status_code_t::TURSO_OK);
+            let mut collected = vec![];
+            loop {
+                let row = turso_rows_next(rows);
+                if row.status.code == turso_status_code_t::TURSO_IO {
+                    let io_result = turso_statement_io(stmt).code;
+                    assert_eq!(io_result, turso_status_code_t::TURSO_OK);
+                    turso_row_deinit(row);
+                    continue;
+                }
+                if row.status.code == turso_status_code_t::TURSO_ROW {
+                    for i in 0..columns {
+                        let row_value = turso_row_value(row, i);
+                        assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
+                        collected.push(convert_value(row_value.ok));
+                    }
+                    turso_row_deinit(row);
+                    break;
+                }
+                assert!(false);
+            }
+            turso_rows_deinit(rows);
+
+            assert_eq!(collected, vec![turso_core::Value::Integer(1)]);
+
+            while turso_statement_finalize(stmt).code != turso_status_code_t::TURSO_OK {
+                let io_result = turso_statement_io(stmt).code;
+                assert_eq!(io_result, turso_status_code_t::TURSO_OK);
+            }
+            turso_statement_deinit(stmt);
+
+            let sql = "SELECT COUNT(*) FROM t";
+            let stmt = turso_connection_prepare(
+                conn,
+                turso_slice_ref_t {
+                    ptr: sql.as_ptr() as *const std::ffi::c_void,
+                    len: sql.len(),
+                },
+            );
+            assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
+
+            let columns = turso_statement_column_count(stmt);
+            assert_eq!(columns, 1);
+
+            let rows = turso_statement_query(stmt);
+            assert_eq!(rows.status.code, turso_status_code_t::TURSO_OK);
+            let mut collected = vec![];
+            loop {
+                let row = turso_rows_next(rows);
+                if row.status.code == turso_status_code_t::TURSO_IO {
+                    let io_result = turso_statement_io(stmt).code;
+                    assert_eq!(io_result, turso_status_code_t::TURSO_OK);
+                    turso_row_deinit(row);
+                    continue;
+                }
+                if row.status.code == turso_status_code_t::TURSO_ROW {
+                    for i in 0..columns {
+                        let row_value = turso_row_value(row, i);
+                        assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
+                        collected.push(convert_value(row_value.ok));
+                    }
+                    turso_row_deinit(row);
+                    continue;
+                }
+                if row.status.code == turso_status_code_t::TURSO_DONE {
+                    turso_row_deinit(row);
+                    break;
+                }
+                assert!(false);
+            }
+            turso_rows_deinit(rows);
+
+            assert_eq!(collected, vec![turso_core::Value::Integer(3)]);
             turso_statement_deinit(stmt);
         }
     }
