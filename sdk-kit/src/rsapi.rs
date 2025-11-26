@@ -388,6 +388,13 @@ impl TursoDatabase {
     /// open the database
     /// this method must be called only once
     pub fn open(&self) -> Result<(), TursoError> {
+        let mut inner_db = self.db.lock().unwrap();
+        if inner_db.is_some() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some(format!("database must be opened only once")),
+            });
+        }
         let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
@@ -422,7 +429,6 @@ impl TursoDatabase {
             None,
         ) {
             Ok(db) => {
-                let mut inner_db = self.db.lock().unwrap();
                 *inner_db = Some(db);
                 Ok(())
             }
@@ -696,8 +702,14 @@ impl TursoStatement {
         self.statement.num_columns()
     }
     /// returns column name
-    pub fn column_name(&self, index: usize) -> Cow<'_, str> {
-        self.statement.get_column_name(index)
+    pub fn column_name(&self, index: usize) -> Result<Cow<'_, str>, TursoError> {
+        if index >= self.column_count() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some(format!("column index out of bounds")),
+            });
+        }
+        Ok(self.statement.get_column_name(index))
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)

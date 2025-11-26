@@ -78,13 +78,15 @@ typedef struct
     size_t len;
 } turso_slice_owned_t;
 
-// structure holding opaque pointer to the TursoDatabase instance
+/// structure holding opaque pointer to the TursoDatabase instance
+/// SAFETY: the database must be opened and closed only once but can be used concurrently
 typedef struct
 {
     void *inner;
 } turso_database_t;
 
-// structure holding opaque pointer to the TursoConnection instance
+/// structure holding opaque pointer to the TursoConnection instance
+/// SAFETY: the connection must be used exclusive and can't be accessed concurrently
 typedef struct
 {
     void *inner;

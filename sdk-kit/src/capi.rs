@@ -274,7 +274,15 @@ pub extern "C" fn turso_statement_column_name(
             }
         }
     };
-    let column = statement.column_name(index).to_string();
+    let column = match statement.column_name(index) {
+        Ok(column) => column.to_string(),
+        Err(err) => {
+            return c::turso_statement_column_name_result_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
     c::turso_statement_column_name_result_t {
         status: turso_status_ok(),
         column_name: str_to_c_string(&column),
