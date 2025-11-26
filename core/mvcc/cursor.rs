@@ -734,8 +734,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                             panic!("Found rowid is not a record");
                         };
                         let cmp = compare_immutable(
-                            &index_key.get_values(),
-                            &found_rowid_key.key.get_values(),
+                            index_key.get_values(),
+                            found_rowid_key.key.get_values(),
                             &key_info,
                         );
                         if cmp.is_eq() {
