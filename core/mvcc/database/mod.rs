@@ -1572,7 +1572,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_next_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
+        start: Option<&RowKey>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1594,7 +1594,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_prev_row_id_for_table(
         &self,
         table_id: MVTableId,
-        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
+        start: Option<&RowKey>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let res = self.get_row_id_for_table_in_direction(
@@ -1613,10 +1613,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         res
     }
 
-    pub fn get_row_id_for_table_in_direction(
+    pub fn get_next_row_id_for_index(
+        &self,
+        index_id: MVTableId,
+        start: Option<&RowKey>,
+        tx_id: TxID,
+    ) -> Option<RowID> {
+        self.get_row_id_for_index_in_direction(index_id, start, tx_id, IterationDirection::Forwards)
+    }
+
+    pub fn get_prev_row_id_for_index(
+        &self,
+        index_id: MVTableId,
+        start: Option<&RowKey>,
+        tx_id: TxID,
+    ) -> Option<RowID> {
+        self.get_row_id_for_index_in_direction(
+            index_id,
+            start,
+            tx_id,
+            IterationDirection::Backwards,
+        )
+    }
+
+    fn get_row_id_for_table_in_direction(
         &self,
         table_id: MVTableId,
-        start: Option<(bool, &RowKey)>, // (inclusive, row_key)
+        start: Option<&RowKey>,
         tx_id: TxID,
         direction: IterationDirection,
     ) -> Option<RowID> {
@@ -1633,18 +1656,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx.value();
         if direction == IterationDirection::Forwards {
-            let min_bound = start.map(|start| RowID {
+            let min_bound_inclusive = start.map(|start| RowID {
                 table_id,
-                row_id: start.1.clone(),
+                row_id: start.clone(),
             });
-            let inclusive = start.map(|start| start.0).unwrap_or(false);
 
-            match min_bound {
-                Some(min_bound) => {
-                    let mut rows = self.rows.range(min_bound..);
-                    if !inclusive {
-                        rows.next();
-                    }
+            match min_bound_inclusive {
+                Some(min_bound_inclusive) => {
+                    let mut rows = self.rows.range(min_bound_inclusive..);
                     loop {
                         // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
                         // to loop either until we find a row that is not deleted or until we reach the end of the table.
@@ -1691,18 +1710,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         } else {
-            let max_bound = start.map(|start| RowID {
+            let max_bound_inclusive = start.map(|start| RowID {
                 table_id,
-                row_id: start.1.clone(),
+                row_id: start.clone(),
             });
-            let inclusive = start.map(|start| start.0).unwrap_or(false);
 
-            match max_bound {
-                Some(max_bound) => {
-                    let mut rows = self.rows.range(..=max_bound).rev();
-                    if !inclusive {
-                        rows.next();
-                    }
+            match max_bound_inclusive {
+                Some(max_bound_inclusive) => {
+                    let mut rows = self.rows.range(..=max_bound_inclusive).rev();
                     loop {
                         // We are moving backwards, so if a row was deleted we just need to skip it. Therefore, we need
                         // to loop either until we find a row that is not deleted or until we reach the beginning of the table.
@@ -1746,6 +1761,54 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                 }
             }
+        }
+    }
+
+    fn get_row_id_for_index_in_direction(
+        &self,
+        index_id: MVTableId,
+        start: Option<&RowKey>,
+        tx_id: TxID,
+        direction: IterationDirection,
+    ) -> Option<RowID> {
+        tracing::trace!(
+            "getting_row_id_for_index_in_direction(index_id={}, range_start={:?}, direction={:?})",
+            index_id,
+            start,
+            direction,
+        );
+
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
+        let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index_rows = index_rows.value();
+        let start_key_exclusive = start.map(Self::row_key_to_sortable_index_key);
+        match direction {
+            IterationDirection::Forwards => match start_key_exclusive {
+                Some(ref key) => {
+                    let mut rows = index_rows.range(key.clone()..);
+                    rows.next();
+                    self.find_next_visible_index_row(tx, rows)
+                }
+                None => {
+                    let rows = index_rows.range(..);
+                    self.find_next_visible_index_row(tx, rows)
+                }
+            },
+            IterationDirection::Backwards => match start_key_exclusive {
+                Some(ref key) => {
+                    let mut rows = index_rows.range(..=key.clone()).rev();
+                    rows.next();
+                    self.find_next_visible_index_row(tx, rows)
+                }
+                None => {
+                    let rows = index_rows.range(..).rev();
+                    self.find_next_visible_index_row(tx, rows)
+                }
+            },
         }
     }
 
@@ -1874,6 +1937,44 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             Bound::Unbounded => unreachable!(),
         };
         res.filter(|rowid| rowid.table_id == table_id_expect)
+    }
+
+    pub fn seek_index(
+        &self,
+        index_id: MVTableId,
+        bound: Bound<&SortableIndexKey>,
+        lower_bound: bool,
+        tx_id: TxID,
+    ) -> Option<RowID> {
+        tracing::trace!(
+            "seek_index(index_id={}, bound={:?}, lower_bound={})",
+            index_id,
+            bound,
+            lower_bound,
+        );
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
+        let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index_rows = index_rows.value();
+        let res = if lower_bound {
+            index_rows
+                .lower_bound(bound)
+                .and_then(|entry| self.find_last_visible_index_version(tx, entry))
+        } else {
+            index_rows
+                .upper_bound(bound)
+                .and_then(|entry| self.find_last_visible_index_version(tx, entry))
+        };
+        tracing::trace!(
+            "seek_index(index_id={}, lower_bound={}, found={:?})",
+            index_id,
+            lower_bound,
+            res
+        );
+        res
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
