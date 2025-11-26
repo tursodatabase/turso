@@ -72,9 +72,6 @@ pub fn translate_create_index(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if connection.mvcc_enabled() {
-        crate::bail_parse_error!("CREATE INDEX is currently not supported when MVCC is enabled.");
-    }
     if !resolver.schema.indexes_enabled() {
         crate::bail_parse_error!(
             "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
