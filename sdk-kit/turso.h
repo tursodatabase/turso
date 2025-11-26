@@ -183,18 +183,29 @@ typedef struct
 /** Execute single statement */
 turso_statement_execute_t turso_statement_execute(turso_statement_t self);
 
-/** Step statement execution once */
+/** Step statement execution once
+ * Returns TURSO_DONE if execution finished
+ * Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)
+ * Returns TURSO_IO if async_io was set and statement needs to execute IO to make progress
+ */
 turso_status_t turso_statement_step(turso_statement_t self);
+
 /** Execute one iteration of underlying IO backend */
 turso_status_t turso_statement_run_io(turso_statement_t self);
+
 /** Reset a statement */
 turso_status_t turso_statement_reset(turso_statement_t self);
-/** Finalize a statement */
+
+/** Finalize a statement
+ * This method must be called in the end of statement execution (either successfull or not)
+ */
 turso_status_t turso_statement_finalize(turso_statement_t self);
+
 /** Get column count */
-int32_t turso_statement_column_count(turso_statement_t self);
+size_t turso_statement_column_count(turso_statement_t self);
+
 /** Get the column name at the index */
-turso_slice_ref_t turso_statement_column_name(turso_statement_t self, int32_t index);
+turso_slice_ref_t turso_statement_column_name(turso_statement_t self, size_t index);
 
 typedef struct
 {
@@ -202,8 +213,11 @@ typedef struct
     turso_value_t value;
 } turso_statement_row_value_t;
 
-/** Get the row value at the the index for a current statement state */
-turso_statement_row_value_t turso_statement_row_value(turso_statement_t self, int32_t index);
+/** Get the row value at the the index for a current statement state
+ * SAFETY: returned turso_value_t will be valid only until next invocation of statement operation (step, finalize, reset, etc)
+ * Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime
+ */
+turso_statement_row_value_t turso_statement_row_value(turso_statement_t self, size_t index);
 
 /** Bind a named argument to a statement */
 turso_status_t turso_statement_bind_named(
@@ -212,7 +226,7 @@ turso_status_t turso_statement_bind_named(
     turso_value_t value);
 /** Bind a positional argument to a statement */
 turso_status_t
-turso_statement_bind_positional(turso_statement_t self, int32_t position, turso_value_t value);
+turso_statement_bind_positional(turso_statement_t self, size_t position, turso_value_t value);
 
 /** Create a turso integer value */
 turso_value_t turso_integer(int64_t integer);

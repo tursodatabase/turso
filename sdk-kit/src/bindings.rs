@@ -486,11 +486,12 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[doc = " Get column count"]
-    pub fn turso_statement_column_count(self_: turso_statement_t) -> i32;
+    pub fn turso_statement_column_count(self_: turso_statement_t) -> usize;
 }
 unsafe extern "C" {
     #[doc = " Get the column name at the index"]
-    pub fn turso_statement_column_name(self_: turso_statement_t, index: i32) -> turso_slice_ref_t;
+    pub fn turso_statement_column_name(self_: turso_statement_t, index: usize)
+        -> turso_slice_ref_t;
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -522,7 +523,7 @@ unsafe extern "C" {
     #[doc = " Get the row value at the the index for a current statement state"]
     pub fn turso_statement_row_value(
         self_: turso_statement_t,
-        index: i32,
+        index: usize,
     ) -> turso_statement_row_value_t;
 }
 unsafe extern "C" {
@@ -537,7 +538,7 @@ unsafe extern "C" {
     #[doc = " Bind a positional argument to a statement"]
     pub fn turso_statement_bind_positional(
         self_: turso_statement_t,
-        position: i32,
+        position: usize,
         value: turso_value_t,
     ) -> turso_status_t;
 }

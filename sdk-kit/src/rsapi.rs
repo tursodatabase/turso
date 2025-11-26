@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, Once, RwLock},
 };
 
-use tracing::level_filters::LevelFilter;
+use tracing::{level_filters::LevelFilter, Level};
 use tracing_subscriber::{
     fmt::{self, format::Writer},
     layer::{Context, SubscriberExt},
@@ -30,15 +30,51 @@ pub struct TursoLog<'a> {
 }
 
 pub struct TursoSetupConfig {
-    pub logger: Option<fn(log: TursoLog)>,
+    pub logger: Option<Box<dyn Fn(TursoLog) + Send + Sync + 'static>>,
     pub log_level: Option<String>,
+}
+
+fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_log_t)) {
+    let Ok(message_cstr) = std::ffi::CString::new(log.message) else {
+        return;
+    };
+    let Ok(target_cstr) = std::ffi::CString::new(log.target) else {
+        return;
+    };
+    let Ok(file_cstr) = std::ffi::CString::new(log.file) else {
+        return;
+    };
+    unsafe {
+        logger(capi::c::turso_log_t {
+            message: message_cstr.as_ptr(),
+            target: target_cstr.as_ptr(),
+            file: file_cstr.as_ptr(),
+            timestamp: log.timestamp,
+            line: log.line,
+            level: match log.level {
+                Level::TRACE => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_TRACE,
+                Level::DEBUG => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_DEBUG,
+                Level::INFO => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_INFO,
+                Level::WARN => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_WARN,
+                Level::ERROR => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_ERROR,
+            },
+        })
+    };
 }
 
 impl TursoSetupConfig {
     pub fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
         Ok(Self {
-            log_level: None,
-            logger: None,
+            log_level: if !value.log_level.is_null() {
+                Some(str_from_c_str(value.log_level)?.to_string())
+            } else {
+                None
+            },
+            logger: if let Some(logger) = value.logger {
+                Some(Box::new(move |log| logger_wrap(log, logger)))
+            } else {
+                None
+            },
         })
     }
 }
@@ -95,7 +131,7 @@ pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
     }
 }
 
-pub fn str_from_turso_slice(slice: capi::c::turso_slice_ref_t) -> Result<&'static str, TursoError> {
+pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
     let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
     match std::str::from_utf8(s) {
         Ok(s) => Ok(s),
@@ -106,11 +142,11 @@ pub fn str_from_turso_slice(slice: capi::c::turso_slice_ref_t) -> Result<&'stati
     }
 }
 
-pub fn bytes_from_turso_slice(slice: capi::c::turso_slice_ref_t) -> &'static [u8] {
+pub fn bytes_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) }
 }
 
-pub fn str_from_c_str(ptr: *const std::ffi::c_char) -> Result<&'static str, TursoError> {
+pub fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
     if ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
@@ -190,7 +226,9 @@ pub struct TursoError {
 }
 
 pub fn str_to_c_string(message: &str) -> *const std::ffi::c_char {
-    let message = std::ffi::CString::new(message).expect("string must be zero terminated");
+    let Ok(message) = std::ffi::CString::new(message) else {
+        return std::ptr::null();
+    };
     message.into_raw()
 }
 
@@ -224,7 +262,7 @@ fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
         message: Some(format!("{err}")),
     }
 }
-static LOGGER: RwLock<Option<fn(TursoLog)>> = RwLock::new(None);
+static LOGGER: RwLock<Option<Box<dyn Fn(TursoLog) + Send + Sync + 'static>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
@@ -267,14 +305,14 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
             return;
         };
 
-        if let Some(logger) = *logger {
+        if let Some(logger) = logger.as_ref() {
             logger(log)
         }
     }
 
-    if let Some(logger) = config.logger.as_ref() {
+    if let Some(logger) = config.logger {
         let mut guard = LOGGER.write().unwrap();
-        *guard = Some(*logger);
+        *guard = Some(logger);
     }
 
     let level_filter = if let Some(log_level) = &config.log_level {
@@ -469,6 +507,7 @@ pub struct TursoExecutionResult {
 }
 
 impl TursoStatement {
+    /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
         &mut self,
         index: usize,
@@ -480,9 +519,11 @@ impl TursoStatement {
                 message: Some(format!("bind index must be non-zero")),
             });
         };
+        // bind_at is safe to call with any index as it will put pair (index, value) into the map
         self.statement.bind_at(index, value);
         Ok(())
     }
+    /// binds named parameter (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
     pub fn bind_named(
         &mut self,
         name: impl AsRef<str>,
@@ -512,6 +553,10 @@ impl TursoStatement {
             message: Some(format!("named parameter {} not found", name.as_ref())),
         })
     }
+    /// make one execution step of the statement
+    /// method returns [TursoStatusCode::Done] if execution is finished
+    /// method returns [TursoStatusCode::Row] if execution generated a row
+    /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn step(&mut self) -> Result<TursoStatusCode, TursoError> {
         let async_io = self.async_io;
         loop {
@@ -538,6 +583,9 @@ impl TursoStatement {
             };
         }
     }
+    /// execute statement to completion
+    /// method returns [TursoStatusCode::Ok] if execution completed
+    /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self) -> Result<TursoExecutionResult, TursoError> {
         loop {
             let status = self.step()?;
@@ -557,11 +605,14 @@ impl TursoStatement {
             panic!("unexpected status code: {status:?}");
         }
     }
+    /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
         self.statement
             .run_once()
             .map_err(|err| turso_error_from_limbo_error(err))
     }
+    /// get row value reference currently pointed by the statement
+    /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
         let Some(row) = self.statement.row() else {
             return Err(TursoError {
@@ -578,12 +629,16 @@ impl TursoStatement {
         let value = row.get_value(index);
         Ok(value.as_value_ref())
     }
+    /// returns column count
     pub fn column_count(&self) -> usize {
         self.statement.num_columns()
     }
+    /// returns column name
     pub fn column_name(&self, index: usize) -> Cow<'_, str> {
         self.statement.get_column_name(index)
     }
+    /// finalize statement execution
+    /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self) -> Result<TursoStatusCode, TursoError> {
         while self.statement.execution_state().is_running() {
             let status = self.step()?;
@@ -593,6 +648,7 @@ impl TursoStatement {
         }
         Ok(TursoStatusCode::Ok)
     }
+    /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
         self.statement.reset();
         self.statement.clear_bindings();

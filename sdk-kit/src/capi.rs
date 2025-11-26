@@ -222,28 +222,28 @@ pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c
 #[signature(c)]
 pub extern "C" fn turso_statement_column_name(
     statement: c::turso_statement_t,
-    index: std::ffi::c_int,
+    index: usize,
 ) -> c::turso_slice_ref_t {
     let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
-    let column = statement.column_name(index as usize);
+    let column = statement.column_name(index);
     turso_slice_from_bytes(column.as_bytes())
 }
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_statement_column_count(statement: c::turso_statement_t) -> std::ffi::c_int {
+pub extern "C" fn turso_statement_column_count(statement: c::turso_statement_t) -> usize {
     let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
-    statement.column_count() as std::ffi::c_int
+    statement.column_count()
 }
 
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_row_value(
     statement: c::turso_statement_t,
-    index: std::ffi::c_int,
+    index: usize,
 ) -> c::turso_statement_row_value_t {
     let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
-    let value = statement.row_value(index as usize);
+    let value = statement.row_value(index);
     match value {
         Ok(turso_core::ValueRef::Null) => c::turso_statement_row_value_t {
             status: turso_status_ok(),
@@ -317,7 +317,7 @@ pub extern "C" fn turso_statement_bind_named(
 #[signature(c)]
 pub extern "C" fn turso_statement_bind_positional(
     statement: c::turso_statement_t,
-    position: std::ffi::c_int,
+    position: usize,
     value: c::turso_value_t,
 ) -> c::turso_status_t {
     let value = match value_from_c_value(value) {
@@ -325,7 +325,7 @@ pub extern "C" fn turso_statement_bind_positional(
         Err(err) => return err.to_capi(),
     };
     let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
-    match statement.bind_positional(position as usize, value) {
+    match statement.bind_positional(position, value) {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
     }
@@ -452,15 +452,15 @@ mod tests {
         });
     }
 
-    // #[test]
-    // pub fn test_db_setup() {
-    //     unsafe {
-    //         turso_setup(turso_config_t {
-    //             logger: Some(logger),
-    //             log_level: b"info\0".as_ptr(),
-    //         })
-    //     };
-    // }
+    #[test]
+    pub fn test_db_setup() {
+        unsafe {
+            turso_setup(turso_config_t {
+                logger: Some(logger),
+                log_level: b"debug\0".as_ptr(),
+            })
+        };
+    }
 
     #[test]
     pub fn test_db_init() {
