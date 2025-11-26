@@ -1805,6 +1805,41 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .map(|_| row.key().clone())
     }
 
+    fn find_last_visible_index_version(
+        &self,
+        tx: &Transaction,
+        row: crossbeam_skiplist::map::Entry<
+            '_,
+            SortableIndexKey,
+            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
+        >,
+    ) -> Option<RowID> {
+        row.value()
+            .read()
+            .iter()
+            .rev()
+            .find(|version| version.is_visible_to(tx, &self.txs))
+            .map(|version| version.row.id.clone())
+    }
+
+    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
+    where
+        I: Iterator<
+            Item = crossbeam_skiplist::map::Entry<
+                'a,
+                SortableIndexKey,
+                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
+            >,
+        >,
+    {
+        loop {
+            let row = rows.next()?;
+            if let Some(visible_row) = self.find_last_visible_index_version(tx, row) {
+                return Some(visible_row);
+            }
+        }
+    }
+
     pub fn seek_rowid(
         &self,
         bound: Bound<&RowID>,
