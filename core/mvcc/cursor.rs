@@ -7,7 +7,8 @@ use crate::mvcc::database::{
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey, SeekOp, SeekResult,
+    compare_immutable, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey, SeekOp,
+    SeekResult,
 };
 use crate::{return_if_io, LimboError, Result};
 use crate::{Pager, Value};
@@ -332,15 +333,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     row_id,
                     in_btree: _,
                     btree_consumed: _,
-                } => Some(match &self.mv_cursor_type {
-                    MvccCursorType::Table => {
-                        (true, RowKey::Int(row_id.row_id.to_int_or_panic() + 1))
-                    }
-                    MvccCursorType::Index(_) => (false, row_id.row_id),
-                }),
+                } => match &self.mv_cursor_type {
+                    MvccCursorType::Table => Some(RowKey::Int(row_id.row_id.to_int_or_panic() + 1)),
+                    MvccCursorType::Index(_) => Some(row_id.row_id),
+                },
                 // TODO: do we need to forward twice?
                 CursorPosition::BeforeFirst => match &self.mv_cursor_type {
-                    MvccCursorType::Table => Some((true, RowKey::Int(i64::MIN))),
+                    MvccCursorType::Table => Some(RowKey::Int(i64::MIN)),
                     MvccCursorType::Index(_) => None,
                 },
                 CursorPosition::End => {
@@ -349,11 +348,18 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
             };
 
-            let new_position_in_mvcc = match self.db.get_next_row_id_for_table(
-                self.table_id,
-                min_key.as_ref().map(|(inclusive, key)| (*inclusive, key)),
-                self.tx_id,
-            ) {
+            let next = match &self.mv_cursor_type {
+                MvccCursorType::Table => {
+                    self.db
+                        .get_next_row_id_for_table(self.table_id, min_key.as_ref(), self.tx_id)
+                }
+                MvccCursorType::Index(_) => {
+                    self.db
+                        .get_next_row_id_for_index(self.table_id, min_key.as_ref(), self.tx_id)
+                }
+            };
+
+            let new_position_in_mvcc = match next {
                 Some(id) => CursorPosition::Loaded {
                     row_id: id,
                     in_btree: false,
@@ -477,25 +483,30 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     in_btree: _,
                     btree_consumed: _,
                 } => Some(match &self.mv_cursor_type {
-                    MvccCursorType::Table => {
-                        (true, RowKey::Int(row_id.row_id.to_int_or_panic() - 1))
-                    }
-                    MvccCursorType::Index(_) => (false, row_id.row_id),
+                    MvccCursorType::Table => RowKey::Int(row_id.row_id.to_int_or_panic() - 1),
+                    MvccCursorType::Index(_) => row_id.row_id,
                 }),
                 CursorPosition::BeforeFirst => {
                     return Ok(IOResult::Done(false));
                 }
                 CursorPosition::End => match &self.mv_cursor_type {
-                    MvccCursorType::Table => Some((true, RowKey::Int(i64::MAX))),
+                    MvccCursorType::Table => Some(RowKey::Int(i64::MAX)),
                     MvccCursorType::Index(_) => None,
                 },
             };
 
-            let new_position_in_mvcc = match self.db.get_prev_row_id_for_table(
-                self.table_id,
-                max_key.as_ref().map(|(inclusive, key)| (*inclusive, key)),
-                self.tx_id,
-            ) {
+            let prev = match &self.mv_cursor_type {
+                MvccCursorType::Table => {
+                    self.db
+                        .get_prev_row_id_for_table(self.table_id, max_key.as_ref(), self.tx_id)
+                }
+                MvccCursorType::Index(_) => {
+                    self.db
+                        .get_prev_row_id_for_index(self.table_id, max_key.as_ref(), self.tx_id)
+                }
+            };
+
+            let new_position_in_mvcc = match prev {
                 Some(id) => CursorPosition::Loaded {
                     row_id: id,
                     in_btree: false,
@@ -929,17 +940,22 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         }
 
         let start_key_mvcc = match &self.mv_cursor_type {
-            MvccCursorType::Table => Some((true, RowKey::Int(i64::MIN))),
+            MvccCursorType::Table => Some(RowKey::Int(i64::MIN)),
             MvccCursorType::Index(_) => None,
         };
 
-        let new_position_in_mvcc = self.db.get_next_row_id_for_table(
-            self.table_id,
-            start_key_mvcc
-                .as_ref()
-                .map(|(inclusive, key)| (*inclusive, key)),
-            self.tx_id,
-        );
+        let new_position_in_mvcc = match &self.mv_cursor_type {
+            MvccCursorType::Table => self.db.get_next_row_id_for_table(
+                self.table_id,
+                start_key_mvcc.as_ref(),
+                self.tx_id,
+            ),
+            MvccCursorType::Index(_) => self.db.get_next_row_id_for_index(
+                self.table_id,
+                start_key_mvcc.as_ref(),
+                self.tx_id,
+            ),
+        };
 
         let maybe_rowid_in_btree = match &self.mv_cursor_type {
             MvccCursorType::Table => {
