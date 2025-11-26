@@ -645,54 +645,106 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
-        let rowid = match seek_key {
-            SeekKey::TableRowId(row_id) => RowID {
-                table_id: self.table_id,
-                row_id: RowKey::Int(row_id),
-            },
-            SeekKey::IndexKey(index_key) => {
-                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                    panic!("SeekKey::IndexKey requires Index cursor type");
-                };
-                let sortable_key =
-                    SortableIndexKey::new_from_record(index_key.clone(), index_info.clone());
-                RowID {
+        match seek_key {
+            SeekKey::TableRowId(row_id) => {
+                let rowid = RowID {
                     table_id: self.table_id,
-                    row_id: RowKey::Record(sortable_key),
-                }
-            }
-        };
-        let (bound, lower_bound) = match op {
-            SeekOp::GT => (Bound::Excluded(&rowid), true),
-            SeekOp::GE { eq_only: _ } => (Bound::Included(&rowid), true),
-            SeekOp::LT => (Bound::Excluded(&rowid), false),
-            SeekOp::LE { eq_only: _ } => (Bound::Included(&rowid), false),
-        };
-        self.invalidate_record();
-        let found_rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
-        if let Some(found_rowid) = found_rowid {
-            self.current_pos.replace(CursorPosition::Loaded {
-                row_id: found_rowid.clone(),
-                in_btree: false,
-                btree_consumed: false,
-            });
-            if op.eq_only() {
-                if found_rowid.row_id == rowid.row_id {
-                    Ok(IOResult::Done(SeekResult::Found))
+                    row_id: RowKey::Int(row_id),
+                };
+                let (bound, lower_bound) = match op {
+                    SeekOp::GT => (Bound::Excluded(&rowid), true),
+                    SeekOp::GE { eq_only: _ } => (Bound::Included(&rowid), true),
+                    SeekOp::LT => (Bound::Excluded(&rowid), false),
+                    SeekOp::LE { eq_only: _ } => (Bound::Included(&rowid), false),
+                };
+                self.invalidate_record();
+                let found_rowid = self.db.seek_rowid(bound, lower_bound, self.tx_id);
+                if let Some(found_rowid) = found_rowid {
+                    self.current_pos.replace(CursorPosition::Loaded {
+                        row_id: found_rowid.clone(),
+                        in_btree: false,
+                        btree_consumed: false,
+                    });
+                    if op.eq_only() {
+                        if found_rowid.row_id == rowid.row_id {
+                            Ok(IOResult::Done(SeekResult::Found))
+                        } else {
+                            Ok(IOResult::Done(SeekResult::NotFound))
+                        }
+                    } else {
+                        Ok(IOResult::Done(SeekResult::Found))
+                    }
                 } else {
+                    let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
+                    if forwards {
+                        let _ = self.last()?;
+                    } else {
+                        let _ = self.rewind()?;
+                    }
                     Ok(IOResult::Done(SeekResult::NotFound))
                 }
-            } else {
-                Ok(IOResult::Done(SeekResult::Found))
             }
-        } else {
-            let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
-            if forwards {
-                let _ = self.last()?;
-            } else {
-                let _ = self.rewind()?;
+            SeekKey::IndexKey(index_key) => {
+                // TODO: we should seek in both btree and mvcc
+                let index_info = {
+                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                        panic!("SeekKey::IndexKey requires Index cursor type");
+                    };
+                    Arc::new(IndexInfo {
+                        key_info: index_info.key_info.clone(),
+                        has_rowid: index_info.has_rowid,
+                        num_cols: index_key.column_count(),
+                    })
+                };
+                let key_info = index_info
+                    .key_info
+                    .iter()
+                    .take(index_key.column_count())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let sortable_key = SortableIndexKey::new_from_record(index_key.clone(), index_info);
+                let (bound, lower_bound) = match op {
+                    SeekOp::GT => (Bound::Excluded(&sortable_key), true),
+                    SeekOp::GE { eq_only: _ } => (Bound::Included(&sortable_key), true),
+                    SeekOp::LT => (Bound::Excluded(&sortable_key), false),
+                    SeekOp::LE { eq_only: _ } => (Bound::Included(&sortable_key), false),
+                };
+                let found_rowid = self
+                    .db
+                    .seek_index(self.table_id, bound, lower_bound, self.tx_id);
+                if let Some(found_rowid) = found_rowid {
+                    self.current_pos.replace(CursorPosition::Loaded {
+                        row_id: found_rowid.clone(),
+                        in_btree: false,
+                        btree_consumed: false,
+                    });
+                    if op.eq_only() {
+                        let RowKey::Record(found_rowid_key) = found_rowid.row_id else {
+                            panic!("Found rowid is not a record");
+                        };
+                        let cmp = compare_immutable(
+                            &index_key.get_values(),
+                            &found_rowid_key.key.get_values(),
+                            &key_info,
+                        );
+                        if cmp.is_eq() {
+                            Ok(IOResult::Done(SeekResult::Found))
+                        } else {
+                            Ok(IOResult::Done(SeekResult::NotFound))
+                        }
+                    } else {
+                        Ok(IOResult::Done(SeekResult::Found))
+                    }
+                } else {
+                    let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
+                    if forwards {
+                        let _ = self.last()?;
+                    } else {
+                        let _ = self.rewind()?;
+                    }
+                    Ok(IOResult::Done(SeekResult::NotFound))
+                }
             }
-            Ok(IOResult::Done(SeekResult::NotFound))
         }
     }
 
