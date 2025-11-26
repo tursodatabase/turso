@@ -173,10 +173,17 @@ impl LogicalLog {
         let buffer_pos_for_rows_size = buffer.len();
 
         // 3. Serialize rows
-        tx.row_versions.iter().for_each(|row_version| {
-            let row_type = LogRecordType::from_row_version(row_version);
-            row_type.serialize(&mut buffer, row_version);
-        });
+        tx.row_versions
+            .iter()
+            .filter(|rv| {
+                // Index writes are not committed to the logical log;
+                // they are always in memory only (during recovery, they are reconstructed from table data in the logical log)
+                rv.row.id.row_id.is_int_key()
+            })
+            .for_each(|row_version| {
+                let row_type = LogRecordType::from_row_version(row_version);
+                row_type.serialize(&mut buffer, row_version);
+            });
 
         // 4. Serialize transaction's end marker and rows size. This marker will be the position of the offset
         //    after writing the buffer.
