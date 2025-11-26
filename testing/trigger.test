@@ -774,3 +774,9 @@ do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table{
   select * from t1;
 } {1|5000
 2|3000}
+
+do_execsql_test_in_memory_any_error trigger-cannot-create-on-system-table {
+  create trigger t after insert on sqlite_master begin
+    select 1;
+  end;
+}
