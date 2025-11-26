@@ -727,6 +727,40 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             }
                         }
                     }
+                    if let Some(index) = mvcc_store.index_rows.get(&id.table_id) {
+                        let index = index.value();
+                        let RowKey::Record(ref index_key) = id.row_id else {
+                            panic!("Index writes must have a record key");
+                        };
+                        if let Some(row_versions) = index.get(index_key) {
+                            let mut row_versions = row_versions.value().write();
+                            for row_version in row_versions.iter_mut() {
+                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                                    if id == self.tx_id {
+                                        // New version is valid STARTING FROM committing transaction's end timestamp
+                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                                        row_version.begin =
+                                            Some(TxTimestampOrID::Timestamp(*end_ts));
+                                        mvcc_store.insert_version_raw(
+                                            &mut log_record.row_versions,
+                                            row_version.clone(),
+                                        ); // FIXME: optimize cloning out
+                                    }
+                                }
+                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+                                    if id == self.tx_id {
+                                        // Old version is valid UNTIL committing transaction's end timestamp
+                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                        mvcc_store.insert_version_raw(
+                                            &mut log_record.row_versions,
+                                            row_version.clone(),
+                                        ); // FIXME: optimize cloning out
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 tracing::trace!("updated(tx_id={})", self.tx_id);
 
