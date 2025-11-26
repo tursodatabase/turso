@@ -35,7 +35,7 @@ use crate::translate::fkeys::{
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EvalAt, HashJoinOp, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
@@ -49,7 +49,6 @@ use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
@@ -125,10 +124,8 @@ impl LimitCtx {
 
 #[derive(Debug, Clone)]
 pub struct HashCtx {
-    match_reg: usize,
-    hash_table_reg: usize,
-    build_cursor_id: CursorID,
-    op: HashJoinOp,
+    pub match_reg: usize,
+    pub hash_table_reg: usize,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.

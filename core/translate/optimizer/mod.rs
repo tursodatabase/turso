@@ -24,8 +24,8 @@ use crate::{
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
         },
         plan::{
-            ColumnUsedMask, IndexMethodQuery, NonFromClauseSubquery, OuterQueryReference,
-            QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+            ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
+            OuterQueryReference, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
@@ -669,6 +669,8 @@ fn optimize_table_access(
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &access_methods_arena,
+        where_clause,
+        subqueries,
     )?
     else {
         return Ok(None);
@@ -948,7 +950,26 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
             }
-            _ => {}
+            AccessMethodParams::HashJoin {
+                build_table_idx,
+                probe_table_idx,
+                join_key_columns,
+                mem_budget,
+                where_clause_indices,
+            } => {
+                // Mark WHERE clause terms as consumed since we're using hash join
+                for &where_idx in where_clause_indices.iter() {
+                    where_clause[where_idx].consumed = true;
+                }
+                // Set up hash join operation on the probe table
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::HashJoin(HashJoinOp {
+                        build_table_idx: *build_table_idx,
+                        probe_table_idx: *probe_table_idx,
+                        join_key_columns: join_key_columns.clone(),
+                        mem_budget: *mem_budget,
+                    });
+            }
         }
     }
 

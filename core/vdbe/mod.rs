@@ -22,6 +22,7 @@ pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
 pub mod explain;
+#[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
 pub mod likeop;

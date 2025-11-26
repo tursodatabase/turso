@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{self, SortOrder, TableInternalId};
 
+use crate::translate::expr::as_binary_components;
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, Constraint, RangeConstraintRef,
 };
+use crate::translate::plan::{NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
+use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{Index, Table},
     translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
@@ -247,4 +250,209 @@ fn find_best_access_method_for_vtab(
         Err(ResultCode::ConstraintViolation) => Ok(None),
         Err(e) => Err(LimboError::from(e)),
     }
+}
+
+/// Detect equi-join conditions between two tables that could be used for a hash join.
+/// Returns a list of (build_col, probe_col, where_idx) tuples if equi-join conditions are found.
+///
+/// This function analyzes the WHERE clause constraints to find equality conditions
+/// that join columns from the build table with columns from the probe table.
+/// The caller is responsible for marking WHERE terms as consumed if hash join is selected.
+pub fn find_equijoin_conditions(
+    build_table_id: TableInternalId,
+    probe_table_id: TableInternalId,
+    constraints: &[Constraint],
+    where_clause: &[WhereTerm],
+) -> Vec<(usize, usize, usize)> {
+    let mut equijoin_cols = Vec::new();
+
+    for constraint in constraints {
+        // Check if this is an equality constraint
+        if !matches!(constraint.operator, ast::Operator::Equals) {
+            continue;
+        }
+
+        // Get the original WHERE term
+        let (where_idx, _side) = constraint.where_clause_pos;
+        let where_term = &where_clause[where_idx];
+
+        // Skip already consumed terms
+        if where_term.consumed {
+            continue;
+        }
+        let Ok(Some((lhs, ast::Operator::Equals, rhs))) = as_binary_components(&where_term.expr)
+        else {
+            continue;
+        };
+
+        // Extract column information from both sides
+        let lhs_col = match lhs {
+            ast::Expr::Column { table, column, .. } => Some((*table, *column)),
+            ast::Expr::RowId { table, .. } => Some((*table, 0)),
+            _ => None,
+        };
+
+        let rhs_col = match rhs {
+            ast::Expr::Column { table, column, .. } => Some((*table, *column)),
+            _ => None,
+        };
+
+        // Check if we have a column from each table
+        if let (Some((lhs_table, lhs_column)), Some((rhs_table, rhs_column))) = (lhs_col, rhs_col) {
+            // Check if one column is from build table and one from probe table
+            if lhs_table == build_table_id && rhs_table == probe_table_id {
+                equijoin_cols.push((lhs_column, rhs_column, where_idx));
+            } else if lhs_table == probe_table_id && rhs_table == build_table_id {
+                equijoin_cols.push((rhs_column, lhs_column, where_idx));
+            }
+        }
+    }
+
+    equijoin_cols
+}
+
+/// Estimate the cost of a hash join between two tables.
+/// TODO(preston): improve cost model when we have more metadata/factors to consider, like table
+/// size and spilling implemented for hash tables.
+pub fn estimate_hash_join_cost(
+    build_cardinality: f64,
+    probe_cardinality: f64,
+    mem_budget: usize,
+) -> Cost {
+    const CPU_HASH_COST: f64 = 0.001;
+    const CPU_INSERT_COST: f64 = 0.002;
+    const CPU_LOOKUP_COST: f64 = 0.003;
+    const IO_COST: f64 = 1.0;
+    const BYTES_PER_ROW_ESTIMATE: usize = 100;
+
+    // Estimate if the hash table will fit in memory
+    let estimated_hash_table_size = (build_cardinality as usize) * BYTES_PER_ROW_ESTIMATE;
+    let will_spill = estimated_hash_table_size > mem_budget;
+
+    // hash and insert all rows from build table
+    let build_cost = build_cardinality * (CPU_HASH_COST + CPU_INSERT_COST);
+    let probe_cost = probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
+    let spill_cost = if will_spill {
+        (build_cardinality + probe_cardinality) * IO_COST * 2.0
+    } else {
+        0.0
+    };
+    Cost(build_cost + probe_cost + spill_cost)
+}
+
+/// Try to create a hash join access method for joining two tables.
+/// Returns Some(AccessMethod) if hash join is viable, None otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn try_hash_join_access_method(
+    build_table: &JoinedTable,
+    probe_table: &JoinedTable,
+    build_table_idx: usize,
+    probe_table_idx: usize,
+    probe_constraints: &TableConstraints,
+    where_clause: &mut [WhereTerm],
+    build_cardinality: f64,
+    probe_cardinality: f64,
+    subqueries: &[NonFromClauseSubquery],
+) -> Option<AccessMethod> {
+    // Only works for B-tree tables
+    if !matches!(build_table.table, Table::BTree(_))
+        || !matches!(probe_table.table, Table::BTree(_))
+    {
+        return None;
+    }
+
+    // Avoid hash join on self-joins over the same underlying table. The current
+    // implementation assumes distinct build/probe sources; sharing storage can
+    // lead to incorrect matches.
+    if build_table
+        .table
+        .btree()
+        .and_then(|b| {
+            probe_table
+                .table
+                .btree()
+                .map(|p| b.root_page == p.root_page)
+        })
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // Hash joins only support INNER JOIN semantics.
+    // Don't use hash joins for any form of OUTER JOINs
+    if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
+        || probe_table.join_info.as_ref().is_some_and(|ji| ji.outer)
+    {
+        return None;
+    }
+
+    // USING/NATURAL joins carry implicit equality constraints that aren't represented
+    // the same way as WHERE-derived predicates; skip hash join for now to avoid
+    // hashing on the wrong keys.
+    if build_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| !ji.using.is_empty())
+        || probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| !ji.using.is_empty())
+    {
+        return None;
+    }
+
+    // Avoid hash joins when there are correlated subqueries that reference the joined tables.
+    // Executing Gosub during the probe phase while reading from the build table cursor
+    // can trigger hash table operations in invalid states.
+    for subquery in subqueries {
+        if !subquery.correlated {
+            continue;
+        }
+        // Check if the subquery references the build or probe table
+        if let SubqueryState::Unevaluated { plan } = &subquery.state {
+            if let Some(plan) = plan.as_ref() {
+                let outer_refs = plan.table_references.outer_query_refs();
+                for outer_ref in outer_refs {
+                    if outer_ref.internal_id == build_table.internal_id
+                        || outer_ref.internal_id == probe_table.internal_id
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find equi-join conditions
+    let equijoin_cols_with_indices = find_equijoin_conditions(
+        build_table.internal_id,
+        probe_table.internal_id,
+        &probe_constraints.constraints,
+        where_clause,
+    );
+
+    // Need at least one equi-join condition
+    if equijoin_cols_with_indices.is_empty() {
+        return None;
+    }
+
+    // Extract join key columns and WHERE clause indices
+    let mut join_key_columns = Vec::new();
+    let mut where_clause_indices = Vec::new();
+    for (build_col, probe_col, where_idx) in equijoin_cols_with_indices {
+        join_key_columns.push((build_col, probe_col));
+        where_clause_indices.push(where_idx);
+    }
+
+    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
+    Some(AccessMethod {
+        cost,
+        params: AccessMethodParams::HashJoin {
+            build_table_idx,
+            probe_table_idx,
+            join_key_columns,
+            mem_budget: DEFAULT_MEM_BUDGET,
+            where_clause_indices,
+        },
+    })
 }
