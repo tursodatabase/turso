@@ -117,18 +117,17 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        debug_assert!(
-            Arc::ptr_eq(&self.metadata, &other.metadata),
-            "IndexInfo pointers must be the same"
-        );
-
         let mut lhs_cursor = RecordCursor::new();
         let mut rhs_cursor = RecordCursor::new();
 
-        lhs_cursor.ensure_parsed_upto(&self.key, self.metadata.num_cols - 1)?;
-        rhs_cursor.ensure_parsed_upto(&other.key, self.metadata.num_cols - 1)?;
+        // We sometimes need to compare a shorter key to a longer one,
+        // for example when seeking with an index key that is a prefix of the full key.
+        let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
 
-        for i in 0..self.metadata.num_cols {
+        lhs_cursor.ensure_parsed_upto(&self.key, num_cols - 1)?;
+        rhs_cursor.ensure_parsed_upto(&other.key, num_cols - 1)?;
+
+        for i in 0..num_cols {
             let lhs_value = lhs_cursor.deserialize_column(&self.key, i)?;
             let rhs_value = rhs_cursor.deserialize_column(&other.key, i)?;
 
