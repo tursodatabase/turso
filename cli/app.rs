@@ -883,13 +883,13 @@ impl Limbo {
                         }
 
                         match curr_insn {
-                            "Next" | "SorterNext" | "Prev" => indent_count - 1,
+                            "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
                             "Return" => {
                                 let matching_begin_subrtn =
                                     unclosed_begin_subrtns.iter().position(|b| b == p1);
                                 if let Some(matching_begin_subrtn) = matching_begin_subrtn {
                                     unclosed_begin_subrtns.remove(matching_begin_subrtn);
-                                    indent_count - 1
+                                    indent_count.saturating_sub(1)
                                 } else {
                                     indent_count
                                 }
