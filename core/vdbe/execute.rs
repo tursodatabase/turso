@@ -22,9 +22,12 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
+use crate::vdbe::hash_table::{HashTable, HashTableConfig};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
+use crate::vdbe::{
+    registers_to_ref_values, EndStatement, OpHashBuildState, StepResult, TxnCleanup,
+};
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos,
     vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
@@ -9334,6 +9337,307 @@ pub fn op_fk_if_zero(
     } else {
         state.pc + 1
     };
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_build(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashBuild {
+            cursor_id,
+            key_start_reg,
+            num_keys,
+            hash_table_reg,
+            mem_budget,
+            collations,
+        },
+        insn
+    );
+
+    let mut op_state = state
+        .op_hash_build_state
+        .take()
+        .filter(|s| {
+            s.hash_table_reg == *hash_table_reg
+                && s.cursor_id == *cursor_id
+                && s.key_start_reg == *key_start_reg
+                && s.num_keys == *num_keys
+        })
+        .unwrap_or_else(|| OpHashBuildState {
+            key_values: Vec::with_capacity(*num_keys),
+            key_idx: 0,
+            rowid: None,
+            cursor_id: *cursor_id,
+            hash_table_reg: *hash_table_reg,
+            key_start_reg: *key_start_reg,
+            num_keys: *num_keys,
+        });
+
+    // Create hash table if it doesn't exist yet
+    if !state.hash_tables.contains_key(hash_table_reg) {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget: *mem_budget,
+            num_keys: *num_keys,
+            collations: collations.clone(),
+        };
+        let hash_table = HashTable::new(config, pager.io.clone());
+        state.hash_tables.insert(*hash_table_reg, hash_table);
+    }
+
+    // Extract join key values from the cursor's current row
+    // key_start_reg contains the column indices to extract
+    while op_state.key_idx < *num_keys {
+        let i = op_state.key_idx;
+        // Get the column index from the register
+        let column_idx_reg = &state.registers[*key_start_reg + i];
+        let column_idx = match column_idx_reg.get_value() {
+            Value::Integer(idx) => *idx as usize,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HashBuild: expected integer column index in register {}, key{}/{}",
+                    key_start_reg + i,
+                    i + 1,
+                    num_keys
+                )));
+            }
+        };
+
+        // Extract the column value from the cursor
+        let value_io: Result<IOResult<Value>, LimboError> = {
+            let cursor = state.get_cursor(*cursor_id);
+            match cursor {
+                Cursor::BTree(btree_cursor) => {
+                    // Check if this column is the rowid (column 0 might be INTEGER PRIMARY KEY)
+                    // In that case, the value is not in the record but is the rowid itself
+                    match btree_cursor.record() {
+                        Ok(IOResult::Done(record_option)) => {
+                            let record = record_option.ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "HashBuild: cursor has no record".to_string(),
+                                )
+                            })?;
+                            let value_ref = record.get_value(column_idx)?;
+                            if matches!(value_ref, ValueRef::Null) && column_idx == 0 {
+                                match btree_cursor.rowid() {
+                                    Ok(IOResult::Done(rowid_opt)) => {
+                                        let value = if let Some(rowid_val) = rowid_opt {
+                                            Value::Integer(rowid_val)
+                                        } else {
+                                            value_ref.to_owned()
+                                        };
+                                        Ok(IOResult::Done(value))
+                                    }
+                                    Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+                                    Err(e) => Err(e),
+                                }
+                            } else {
+                                Ok(IOResult::Done(value_ref.to_owned()))
+                            }
+                        }
+                        Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => Err(LimboError::InternalError(
+                    "HashBuild: unsupported cursor type".to_string(),
+                )),
+            }
+        };
+
+        match value_io {
+            Ok(IOResult::Done(v)) => {
+                op_state.key_values.push(v);
+                op_state.key_idx += 1;
+            }
+            Ok(IOResult::IO(io)) => {
+                state.op_hash_build_state = Some(op_state);
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            Err(e) => {
+                state.op_hash_build_state = Some(op_state);
+                return Err(e);
+            }
+        }
+    }
+
+    // Get the rowid from the cursor
+    if op_state.rowid.is_none() {
+        let cursor = state.get_cursor(*cursor_id);
+        let rowid_val = match cursor {
+            Cursor::BTree(btree_cursor) => {
+                let rowid_opt = match btree_cursor.rowid() {
+                    Ok(IOResult::Done(v)) => v,
+                    Ok(IOResult::IO(io)) => {
+                        state.op_hash_build_state = Some(op_state);
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    Err(e) => {
+                        state.op_hash_build_state = Some(op_state);
+                        return Err(e);
+                    }
+                };
+                rowid_opt.ok_or_else(|| {
+                    LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
+                })?
+            }
+            _ => {
+                return Err(LimboError::InternalError(
+                    "HashBuild: unsupported cursor type".to_string(),
+                ));
+            }
+        };
+        op_state.rowid = Some(rowid_val);
+    }
+
+    // Insert the rowid into the hash table
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
+        let rowid = op_state.rowid.expect("rowid set");
+        let key_values = std::mem::take(&mut op_state.key_values);
+        match ht.insert(key_values.clone(), rowid) {
+            Ok(IOResult::Done(())) => {}
+            Ok(IOResult::IO(io)) => {
+                op_state.key_values = key_values;
+                state.op_hash_build_state = Some(op_state);
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            Err(e) => {
+                op_state.key_values = key_values;
+                state.op_hash_build_state = Some(op_state);
+                return Err(e);
+            }
+        }
+    }
+
+    state.op_hash_build_state = None;
+    state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_build_finalize(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashBuildFinalize { hash_table_reg }, insn);
+
+    // Finalize hash table build
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
+        ht.finalize_build();
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashProbe {
+            hash_table_reg,
+            key_start_reg,
+            num_keys,
+            dest_reg,
+            target_pc,
+        },
+        insn
+    );
+
+    // Extract probe key values from registers
+    let mut probe_keys = Vec::with_capacity(*num_keys);
+    for i in 0..*num_keys {
+        let reg = &state.registers[*key_start_reg + i];
+        let value = reg.get_value().clone();
+        probe_keys.push(value);
+    }
+
+    // Probe the hash table
+    let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
+    })?;
+
+    match hash_table.probe(probe_keys) {
+        Some(entry) => {
+            // Match found, store the rowid in destination register
+            state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        None => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
+}
+
+pub fn op_hash_next(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashNext {
+            hash_table_reg,
+            dest_reg,
+            target_pc,
+        },
+        insn
+    );
+
+    // Get the hash table
+    let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
+    })?;
+
+    // Try to get next match
+    match hash_table.next_match() {
+        Some(entry) => {
+            // Another match found, store the rowid in dest_reg
+            // The code generator will emit a SeekRowid instruction after this
+            // to position the build table cursor at this rowid
+            state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+            // Continue to next instruction to process the match
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        None => {
+            // No more matches, jump to target_pc to advance to next probe row
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
+}
+
+pub fn op_hash_close(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashClose { hash_table_reg }, insn);
+
+    // Remove and drop the hash table to free memory
+    if let Some(mut hash_table) = state.hash_tables.remove(hash_table_reg) {
+        hash_table.close();
+    }
+
+    state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 

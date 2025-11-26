@@ -1283,6 +1283,53 @@ pub enum Insn {
         deferred: bool,
         target_pc: BranchOffset,
     },
+    /// Build a hash table from a cursor for hash join.
+    /// Extract join keys from the current row of cursor_id (registers key_start_reg..key_start_reg+num_keys-1),
+    /// and insert the current row into the in-memory hash table stored in hash_table_reg.
+    /// Creates the hash table on first call. If memory exceeds mem_budget, return an error.
+    HashBuild {
+        cursor_id: CursorID,
+        key_start_reg: usize,
+        num_keys: usize,
+        hash_table_reg: usize,
+        mem_budget: usize,
+        collations: Vec<CollationSeq>,
+    },
+
+    /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
+    /// Should be called after the HashBuild loop completes.
+    HashBuildFinalize {
+        hash_table_reg: usize,
+    },
+
+    /// Probe a hash table for matches.
+    /// Extract probe keys from registers key_start_reg..key_start_reg+num_keys-1,
+    /// hash them, and look up matches in the hash table stored in hash_table_reg.
+    /// For each match, load the build-side row into dest_reg and continue.
+    /// If no matches, jump to target_pc.
+    HashProbe {
+        hash_table_reg: usize,
+        key_start_reg: usize,
+        num_keys: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    /// Advance to next matching row in hash table bucket.
+    /// Used for handling hash collisions and duplicate keys.
+    /// If another match is found, store it in dest_reg and continue to next instruction.
+    /// If no more matches, jump to target_pc.
+    HashNext {
+        hash_table_reg: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    /// Free hash table resources.
+    /// Closes the hash table stored in hash_table_reg and releases memory.
+    HashClose {
+        hash_table_reg: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1465,6 +1512,11 @@ impl InsnVariants {
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,
             InsnVariants::Filter => execute::op_filter,
+            InsnVariants::HashBuild => execute::op_hash_build,
+            InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
+            InsnVariants::HashProbe => execute::op_hash_probe,
+            InsnVariants::HashNext => execute::op_hash_next,
+            InsnVariants::HashClose => execute::op_hash_close,
         }
     }
 }

@@ -820,60 +820,28 @@ impl ProgramBuilder {
                     resolve(target_pc_lt, "Jump");
                     resolve(target_pc_gt, "Jump");
                 }
-                Insn::SeekGE { target_pc, .. } => {
-                    resolve(target_pc, "SeekGE");
-                }
-                Insn::SeekGT { target_pc, .. } => {
-                    resolve(target_pc, "SeekGT");
-                }
-                Insn::SeekLE { target_pc, .. } => {
-                    resolve(target_pc, "SeekLE");
-                }
-                Insn::SeekLT { target_pc, .. } => {
-                    resolve(target_pc, "SeekLT");
-                }
-                Insn::IdxGE { target_pc, .. } => {
-                    resolve(target_pc, "IdxGE");
-                }
-                Insn::IdxLE { target_pc, .. } => {
-                    resolve(target_pc, "IdxLE");
-                }
-                Insn::IdxGT { target_pc, .. } => {
-                    resolve(target_pc, "IdxGT");
-                }
-                Insn::IdxLT { target_pc, .. } => {
-                    resolve(target_pc, "IdxLT");
-                }
+                Insn::SeekGE { target_pc, .. } => resolve(target_pc, "SeekGE"),
+                Insn::SeekGT { target_pc, .. } => resolve(target_pc, "SeekGT"),
+                Insn::SeekLE { target_pc, .. } => resolve(target_pc, "SeekLE"),
+                Insn::SeekLT { target_pc, .. } => resolve(target_pc, "SeekLT"),
+                Insn::IdxGE { target_pc, .. } => resolve(target_pc, "IdxGE"),
+                Insn::IdxLE { target_pc, .. } => resolve(target_pc, "IdxLE"),
+                Insn::IdxGT { target_pc, .. } => resolve(target_pc, "IdxGT"),
+                Insn::IdxLT { target_pc, .. } => resolve(target_pc, "IdxLT"),
                 Insn::IndexMethodQuery { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "IndexMethodQuery");
+                    resolve(pc_if_empty, "IndexMethodQuery")
                 }
-                Insn::IsNull { reg: _, target_pc } => {
-                    resolve(target_pc, "IsNull");
-                }
-                Insn::VNext { pc_if_next, .. } => {
-                    resolve(pc_if_next, "VNext");
-                }
-                Insn::VFilter { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "VFilter");
-                }
-                Insn::RowSetRead { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "RowSetRead");
-                }
-                Insn::NoConflict { target_pc, .. } => {
-                    resolve(target_pc, "NoConflict");
-                }
-                Insn::Found { target_pc, .. } => {
-                    resolve(target_pc, "Found");
-                }
-                Insn::NotFound { target_pc, .. } => {
-                    resolve(target_pc, "NotFound");
-                }
-                Insn::FkIfZero { target_pc, .. } => {
-                    resolve(target_pc, "FkIfZero");
-                }
-                Insn::Filter { target_pc, .. } => {
-                    resolve(target_pc, "Filter");
-                }
+                Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull"),
+                Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext"),
+                Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter"),
+                Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead"),
+                Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict"),
+                Insn::Found { target_pc, .. } => resolve(target_pc, "Found"),
+                Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound"),
+                Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero"),
+                Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter"),
+                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe"),
+                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext"),
                 _ => {}
             }
         }
