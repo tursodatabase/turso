@@ -932,6 +932,19 @@ pub struct ExpressionIndexUsage {
     pub columns_mask: ColumnUsedMask,
 }
 
+/// Hash join operation metadata
+#[derive(Debug, Clone)]
+pub struct HashJoinOp {
+    /// Index of the build table in the join order
+    pub build_table_idx: usize,
+    /// Index of the probe table in the join order (this table)
+    pub probe_table_idx: usize,
+    /// Column pairs: (build_col, probe_col)
+    pub join_key_columns: Vec<(usize, usize)>,
+    /// Memory budget for hash table
+    pub mem_budget: usize,
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
@@ -944,6 +957,11 @@ pub enum Operation {
     Search(Search),
     // Access through custom index method query
     IndexMethodQuery(IndexMethodQuery),
+    // Hash join operation
+    // This operation is used on the probe side of a hash join.
+    // The build table is accessed normally (via Scan), and the probe table
+    // uses this operation to indicate it should probe the hash table.
+    HashJoin(HashJoinOp),
 }
 
 impl Operation {
@@ -969,6 +987,7 @@ impl Operation {
             Operation::IndexMethodQuery(IndexMethodQuery { index, .. }) => Some(index),
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
+            Operation::HashJoin(_) => None,
         }
     }
 }

@@ -327,6 +327,7 @@ pub fn init_loop(
                 }
             }
             Operation::Scan(_) => {}
+            Operation::HashJoin(_) => {}
             Operation::Search(search) => {
                 match mode {
                     OperationMode::SELECT => {
@@ -728,6 +729,9 @@ pub fn open_loop(
                         });
                     }
                 }
+            }
+            Operation::HashJoin(_) => {
+                todo!();
             }
         }
 
@@ -1220,6 +1224,9 @@ pub fn close_loop(
                     pc_if_next: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::HashJoin(_) => {
+                todo!();
             }
         }
 

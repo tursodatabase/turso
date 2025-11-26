@@ -151,6 +151,9 @@ impl Display for SelectPlan {
                         index_method.definition().method_name
                     )?;
                 }
+                Operation::HashJoin(_) => {
+                    writeln!(f, "{}HASH JOIN", indent)?;
+                }
             }
         }
         Ok(())
@@ -224,6 +227,9 @@ impl Display for DeletePlan {
                         indent,
                         module.definition().method_name
                     )?;
+                }
+                Operation::HashJoin(_) => {
+                    unreachable!("Delete plan should not have hash joins");
                 }
             }
         }
@@ -311,6 +317,9 @@ impl fmt::Display for UpdatePlan {
                         indent,
                         module.definition().method_name
                     )?;
+                }
+                Operation::HashJoin(_) => {
+                    unreachable!("Update plan should not have hash joins");
                 }
             }
         }

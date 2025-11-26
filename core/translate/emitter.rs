@@ -35,7 +35,7 @@ use crate::translate::fkeys::{
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EvalAt, HashJoinOp, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
@@ -49,6 +49,7 @@ use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::CursorID;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
@@ -122,6 +123,14 @@ impl LimitCtx {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HashCtx {
+    match_reg: usize,
+    hash_table_reg: usize,
+    build_cursor_id: CursorID,
+    op: HashJoinOp,
+}
+
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
 /// It is used for maintaining state and control flow during the bytecode
 /// generation process.
@@ -152,6 +161,11 @@ pub struct TranslateCtx<'a> {
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
+    /// Hash table register and metadata for hash joins
+    pub hash_table_reg: Option<HashCtx>,
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub hash_join_match_found_label: Option<BranchOffset>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -187,6 +201,8 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
+            hash_table_reg: None,
+            hash_join_match_found_label: None,
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -806,6 +822,9 @@ fn emit_delete_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for delete statements")
+        }
+        Operation::HashJoin(_) => {
+            unreachable!("access through HashJoin is not supported for delete statements")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -1616,6 +1635,9 @@ fn emit_update_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for update operations")
+        }
+        Operation::HashJoin(_) => {
+            unreachable!("access through HashJoin is not supported for update operations")
         }
     };
 
