@@ -58,6 +58,19 @@ pub enum AccessMethodParams {
         constraint_usages: Vec<ConstraintUsage>,
     },
     Subquery,
+    HashJoin {
+        /// The table to build the hash table from.
+        build_table_idx: usize,
+        /// The table to probe the hash table with.
+        probe_table_idx: usize,
+        /// Column indices for the join keys (from both tables).
+        /// These are the columns that will be used to build and probe the hash table.
+        join_key_columns: Vec<(usize, usize)>, // (build_col, probe_col)
+        /// Memory budget for the hash table in bytes.
+        mem_budget: usize,
+        /// WHERE clause indices that should be marked as consumed if this hash join is selected.
+        where_clause_indices: Vec<usize>,
+    },
 }
 
 /// Return the best [AccessMethod] for a given join order.

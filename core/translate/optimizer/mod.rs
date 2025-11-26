@@ -948,6 +948,7 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
             }
+            _ => {}
         }
     }
 
