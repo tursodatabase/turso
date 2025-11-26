@@ -875,7 +875,6 @@ impl Schema {
                 }
             }
             "index" => {
-                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {

@@ -540,13 +540,6 @@ impl Database {
                     _ => {}
                 }
 
-                if db.mvcc_enabled() && !schema.indexes.is_empty() {
-                    return Err(LimboError::ParseError(
-                        "Database contains indexes which are not supported when MVCC is enabled."
-                            .to_string(),
-                    ));
-                }
-
                 Ok(())
             })?;
         }
