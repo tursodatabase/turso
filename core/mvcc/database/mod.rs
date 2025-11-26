@@ -1285,6 +1285,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
+                tx.insert_to_write_set(id.clone());
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
@@ -1293,7 +1294,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     end: None,
                     row,
                 };
-                tx.insert_to_write_set(id.clone()); // Index writes are not committed; they are always in memory only (during recovery, they are reconstructed from table data in the logical log)
+                tx.insert_to_write_set(id.clone());
                 self.insert_version(id, row_version);
             }
         }
@@ -1384,12 +1385,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
         match maybe_index_id {
             Some(index_id) => {
-                let rows = self
-                    .index_rows
-                    .get(&index_id)
-                    .expect("index should exist in index_rows map");
+                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
                 let rows = rows.value();
-                let RowKey::Record(sortable_key) = id.row_id else {
+                let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
                 };
                 let row_versions_opt = rows.get(&sortable_key);
@@ -1414,6 +1412,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
 
                         rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        let tx = self
+                            .txs
+                            .get(&tx_id)
+                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                        let tx = tx.value();
+                        tx.insert_to_write_set(id.clone());
                         return Ok(true);
                     }
                 }
@@ -1493,10 +1497,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
-                let rows = self
-                    .index_rows
-                    .get(&index_id)
-                    .expect("index should exist in index_rows map");
+                let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
                 let rows = rows.value();
                 let RowKey::Record(sortable_key) = id.row_id else {
                     panic!("Index reads must have a record row_id");
