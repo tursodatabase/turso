@@ -1749,6 +1749,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    fn row_key_to_sortable_index_key(row_key: &RowKey) -> SortableIndexKey {
+        match row_key {
+            RowKey::Record(key) => key.clone(),
+            _ => panic!("Index iteration requires record row keys"),
+        }
+    }
+
     pub fn find_row_last_version_state(
         &self,
         table_id: MVTableId,
