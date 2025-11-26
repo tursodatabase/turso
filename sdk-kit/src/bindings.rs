@@ -20,17 +20,17 @@ pub enum turso_status_code_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_status_t {
-    pub error: *const ::std::os::raw::c_char,
     pub code: turso_status_code_t,
+    pub error: *const ::std::os::raw::c_char,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of turso_status_t"][::std::mem::size_of::<turso_status_t>() - 16usize];
     ["Alignment of turso_status_t"][::std::mem::align_of::<turso_status_t>() - 8usize];
-    ["Offset of field: turso_status_t::error"]
-        [::std::mem::offset_of!(turso_status_t, error) - 0usize];
     ["Offset of field: turso_status_t::code"]
-        [::std::mem::offset_of!(turso_status_t, code) - 8usize];
+        [::std::mem::offset_of!(turso_status_t, code) - 0usize];
+    ["Offset of field: turso_status_t::error"]
+        [::std::mem::offset_of!(turso_status_t, error) - 8usize];
 };
 impl Default for turso_status_t {
     fn default() -> Self {
@@ -118,17 +118,14 @@ impl Default for turso_slice_ref_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_t {
-    pub status: turso_status_t,
     pub inner: *mut ::std::os::raw::c_void,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_database_t"][::std::mem::size_of::<turso_database_t>() - 24usize];
+    ["Size of turso_database_t"][::std::mem::size_of::<turso_database_t>() - 8usize];
     ["Alignment of turso_database_t"][::std::mem::align_of::<turso_database_t>() - 8usize];
-    ["Offset of field: turso_database_t::status"]
-        [::std::mem::offset_of!(turso_database_t, status) - 0usize];
     ["Offset of field: turso_database_t::inner"]
-        [::std::mem::offset_of!(turso_database_t, inner) - 16usize];
+        [::std::mem::offset_of!(turso_database_t, inner) - 0usize];
 };
 impl Default for turso_database_t {
     fn default() -> Self {
@@ -142,17 +139,17 @@ impl Default for turso_database_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_connection_t {
-    pub status: turso_status_t,
+    pub async_io: bool,
     pub inner: *mut ::std::os::raw::c_void,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_connection_t"][::std::mem::size_of::<turso_connection_t>() - 24usize];
+    ["Size of turso_connection_t"][::std::mem::size_of::<turso_connection_t>() - 16usize];
     ["Alignment of turso_connection_t"][::std::mem::align_of::<turso_connection_t>() - 8usize];
-    ["Offset of field: turso_connection_t::status"]
-        [::std::mem::offset_of!(turso_connection_t, status) - 0usize];
+    ["Offset of field: turso_connection_t::async_io"]
+        [::std::mem::offset_of!(turso_connection_t, async_io) - 0usize];
     ["Offset of field: turso_connection_t::inner"]
-        [::std::mem::offset_of!(turso_connection_t, inner) - 16usize];
+        [::std::mem::offset_of!(turso_connection_t, inner) - 8usize];
 };
 impl Default for turso_connection_t {
     fn default() -> Self {
@@ -166,67 +163,19 @@ impl Default for turso_connection_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_statement_t {
-    pub status: turso_status_t,
-    pub tail: turso_slice_ref_t,
+    pub async_io: bool,
     pub inner: *mut ::std::os::raw::c_void,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_statement_t"][::std::mem::size_of::<turso_statement_t>() - 40usize];
+    ["Size of turso_statement_t"][::std::mem::size_of::<turso_statement_t>() - 16usize];
     ["Alignment of turso_statement_t"][::std::mem::align_of::<turso_statement_t>() - 8usize];
-    ["Offset of field: turso_statement_t::status"]
-        [::std::mem::offset_of!(turso_statement_t, status) - 0usize];
-    ["Offset of field: turso_statement_t::tail"]
-        [::std::mem::offset_of!(turso_statement_t, tail) - 16usize];
+    ["Offset of field: turso_statement_t::async_io"]
+        [::std::mem::offset_of!(turso_statement_t, async_io) - 0usize];
     ["Offset of field: turso_statement_t::inner"]
-        [::std::mem::offset_of!(turso_statement_t, inner) - 32usize];
+        [::std::mem::offset_of!(turso_statement_t, inner) - 8usize];
 };
 impl Default for turso_statement_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct turso_rows_t {
-    pub status: turso_status_t,
-    pub inner: *mut ::std::os::raw::c_void,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_rows_t"][::std::mem::size_of::<turso_rows_t>() - 24usize];
-    ["Alignment of turso_rows_t"][::std::mem::align_of::<turso_rows_t>() - 8usize];
-    ["Offset of field: turso_rows_t::status"]
-        [::std::mem::offset_of!(turso_rows_t, status) - 0usize];
-    ["Offset of field: turso_rows_t::inner"][::std::mem::offset_of!(turso_rows_t, inner) - 16usize];
-};
-impl Default for turso_rows_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct turso_row_t {
-    pub status: turso_status_t,
-    pub inner: *mut ::std::os::raw::c_void,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_row_t"][::std::mem::size_of::<turso_row_t>() - 24usize];
-    ["Alignment of turso_row_t"][::std::mem::align_of::<turso_row_t>() - 8usize];
-    ["Offset of field: turso_row_t::status"][::std::mem::offset_of!(turso_row_t, status) - 0usize];
-    ["Offset of field: turso_row_t::inner"][::std::mem::offset_of!(turso_row_t, inner) - 16usize];
-};
-impl Default for turso_row_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -289,54 +238,6 @@ impl Default for turso_value_t {
         }
     }
 }
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct turso_result_value_t {
-    pub status: turso_status_t,
-    pub ok: turso_value_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_result_value_t"][::std::mem::size_of::<turso_result_value_t>() - 40usize];
-    ["Alignment of turso_result_value_t"][::std::mem::align_of::<turso_result_value_t>() - 8usize];
-    ["Offset of field: turso_result_value_t::status"]
-        [::std::mem::offset_of!(turso_result_value_t, status) - 0usize];
-    ["Offset of field: turso_result_value_t::ok"]
-        [::std::mem::offset_of!(turso_result_value_t, ok) - 16usize];
-};
-impl Default for turso_result_value_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct turso_execute_t {
-    pub status: turso_status_t,
-    pub rows_changed: u64,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_execute_t"][::std::mem::size_of::<turso_execute_t>() - 24usize];
-    ["Alignment of turso_execute_t"][::std::mem::align_of::<turso_execute_t>() - 8usize];
-    ["Offset of field: turso_execute_t::status"]
-        [::std::mem::offset_of!(turso_execute_t, status) - 0usize];
-    ["Offset of field: turso_execute_t::rows_changed"]
-        [::std::mem::offset_of!(turso_execute_t, rows_changed) - 16usize];
-};
-impl Default for turso_execute_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
 #[doc = " Database description."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -345,16 +246,20 @@ pub struct turso_database_config_t {
     pub path: *const ::std::os::raw::c_char,
     #[doc = " Optional comma separated list of experimental features to enable"]
     pub experimental_features: *const ::std::os::raw::c_char,
+    #[doc = " Parameter which defines who drives the IO - callee or the caller"]
+    pub async_io: bool,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 16usize];
+    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 24usize];
     ["Alignment of turso_database_config_t"]
         [::std::mem::align_of::<turso_database_config_t>() - 8usize];
     ["Offset of field: turso_database_config_t::path"]
         [::std::mem::offset_of!(turso_database_config_t, path) - 0usize];
     ["Offset of field: turso_database_config_t::experimental_features"]
         [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 8usize];
+    ["Offset of field: turso_database_config_t::async_io"]
+        [::std::mem::offset_of!(turso_database_config_t, async_io) - 16usize];
 };
 impl Default for turso_database_config_t {
     fn default() -> Self {
@@ -393,39 +298,183 @@ unsafe extern "C" {
     #[doc = " Setup global database info"]
     pub fn turso_setup(config: turso_config_t) -> turso_status_t;
 }
-unsafe extern "C" {
-    #[doc = " Create or open a database"]
-    pub fn turso_database_init(config: turso_database_config_t) -> turso_database_t;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_database_create_result_t {
+    pub status: turso_status_t,
+    pub database: turso_database_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_database_create_result_t"]
+        [::std::mem::size_of::<turso_database_create_result_t>() - 24usize];
+    ["Alignment of turso_database_create_result_t"]
+        [::std::mem::align_of::<turso_database_create_result_t>() - 8usize];
+    ["Offset of field: turso_database_create_result_t::status"]
+        [::std::mem::offset_of!(turso_database_create_result_t, status) - 0usize];
+    ["Offset of field: turso_database_create_result_t::database"]
+        [::std::mem::offset_of!(turso_database_create_result_t, database) - 16usize];
+};
+impl Default for turso_database_create_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
-    #[doc = " Connect with the database"]
-    pub fn turso_database_connect(self_: turso_database_t) -> turso_connection_t;
+    #[doc = " Create database holder but do not open it"]
+    pub fn turso_database_create(config: turso_database_config_t)
+        -> turso_database_create_result_t;
+}
+unsafe extern "C" {
+    #[doc = " Open database"]
+    pub fn turso_database_open(database: turso_database_t) -> turso_status_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_database_connect_result_t {
+    pub status: turso_status_t,
+    pub connection: turso_connection_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_database_connect_result_t"]
+        [::std::mem::size_of::<turso_database_connect_result_t>() - 32usize];
+    ["Alignment of turso_database_connect_result_t"]
+        [::std::mem::align_of::<turso_database_connect_result_t>() - 8usize];
+    ["Offset of field: turso_database_connect_result_t::status"]
+        [::std::mem::offset_of!(turso_database_connect_result_t, status) - 0usize];
+    ["Offset of field: turso_database_connect_result_t::connection"]
+        [::std::mem::offset_of!(turso_database_connect_result_t, connection) - 16usize];
+};
+impl Default for turso_database_connect_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    #[doc = " Connect to the database"]
+    pub fn turso_database_connect(self_: turso_database_t) -> turso_database_connect_result_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_connection_prepare_single_t {
+    pub status: turso_status_t,
+    pub statement: turso_statement_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_connection_prepare_single_t"]
+        [::std::mem::size_of::<turso_connection_prepare_single_t>() - 32usize];
+    ["Alignment of turso_connection_prepare_single_t"]
+        [::std::mem::align_of::<turso_connection_prepare_single_t>() - 8usize];
+    ["Offset of field: turso_connection_prepare_single_t::status"]
+        [::std::mem::offset_of!(turso_connection_prepare_single_t, status) - 0usize];
+    ["Offset of field: turso_connection_prepare_single_t::statement"]
+        [::std::mem::offset_of!(turso_connection_prepare_single_t, statement) - 16usize];
+};
+impl Default for turso_connection_prepare_single_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
     #[doc = " Prepare single statement in a connection"]
     pub fn turso_connection_prepare_single(
         self_: turso_connection_t,
         sql: turso_slice_ref_t,
-    ) -> turso_statement_t;
+    ) -> turso_connection_prepare_single_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_connection_prepare_first_t {
+    pub status: turso_status_t,
+    pub statement: turso_statement_t,
+    pub tail_idx: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_connection_prepare_first_t"]
+        [::std::mem::size_of::<turso_connection_prepare_first_t>() - 40usize];
+    ["Alignment of turso_connection_prepare_first_t"]
+        [::std::mem::align_of::<turso_connection_prepare_first_t>() - 8usize];
+    ["Offset of field: turso_connection_prepare_first_t::status"]
+        [::std::mem::offset_of!(turso_connection_prepare_first_t, status) - 0usize];
+    ["Offset of field: turso_connection_prepare_first_t::statement"]
+        [::std::mem::offset_of!(turso_connection_prepare_first_t, statement) - 16usize];
+    ["Offset of field: turso_connection_prepare_first_t::tail_idx"]
+        [::std::mem::offset_of!(turso_connection_prepare_first_t, tail_idx) - 32usize];
+};
+impl Default for turso_connection_prepare_first_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
     #[doc = " Prepare first statement in a string containing multiple statements in a connection"]
     pub fn turso_connection_prepare_first(
         self_: turso_connection_t,
         sql: turso_slice_ref_t,
-    ) -> turso_statement_t;
+    ) -> turso_connection_prepare_first_t;
+}
+unsafe extern "C" {
+    #[doc = " Check if no more statements was parsed after execution of turso_connection_prepare_first method"]
+    pub fn turso_connection_prepare_first_result_empty(
+        result: turso_connection_prepare_first_t,
+    ) -> bool;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_statement_execute_t {
+    pub status: turso_status_t,
+    pub rows_changed: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_statement_execute_t"]
+        [::std::mem::size_of::<turso_statement_execute_t>() - 24usize];
+    ["Alignment of turso_statement_execute_t"]
+        [::std::mem::align_of::<turso_statement_execute_t>() - 8usize];
+    ["Offset of field: turso_statement_execute_t::status"]
+        [::std::mem::offset_of!(turso_statement_execute_t, status) - 0usize];
+    ["Offset of field: turso_statement_execute_t::rows_changed"]
+        [::std::mem::offset_of!(turso_statement_execute_t, rows_changed) - 16usize];
+};
+impl Default for turso_statement_execute_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
     #[doc = " Execute single statement"]
-    pub fn turso_statement_execute(self_: turso_statement_t) -> turso_execute_t;
+    pub fn turso_statement_execute(self_: turso_statement_t) -> turso_statement_execute_t;
 }
 unsafe extern "C" {
-    #[doc = " Query a statement"]
-    pub fn turso_statement_query(self_: turso_statement_t) -> turso_rows_t;
+    #[doc = " Step statement execution once"]
+    pub fn turso_statement_step(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
     #[doc = " Execute one iteration of underlying IO backend"]
-    pub fn turso_statement_io(self_: turso_statement_t) -> turso_status_t;
+    pub fn turso_statement_run_io(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
     #[doc = " Reset a statement"]
@@ -443,13 +492,38 @@ unsafe extern "C" {
     #[doc = " Get the column name at the index"]
     pub fn turso_statement_column_name(self_: turso_statement_t, index: i32) -> turso_slice_ref_t;
 }
-unsafe extern "C" {
-    #[doc = " Get the next row from rows"]
-    pub fn turso_rows_next(self_: turso_rows_t) -> turso_row_t;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct turso_statement_row_value_t {
+    pub status: turso_status_t,
+    pub value: turso_value_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_statement_row_value_t"]
+        [::std::mem::size_of::<turso_statement_row_value_t>() - 40usize];
+    ["Alignment of turso_statement_row_value_t"]
+        [::std::mem::align_of::<turso_statement_row_value_t>() - 8usize];
+    ["Offset of field: turso_statement_row_value_t::status"]
+        [::std::mem::offset_of!(turso_statement_row_value_t, status) - 0usize];
+    ["Offset of field: turso_statement_row_value_t::value"]
+        [::std::mem::offset_of!(turso_statement_row_value_t, value) - 16usize];
+};
+impl Default for turso_statement_row_value_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
-    #[doc = " Get the value at the the index"]
-    pub fn turso_row_value(self_: turso_row_t, index: i32) -> turso_result_value_t;
+    #[doc = " Get the row value at the the index for a current statement state"]
+    pub fn turso_statement_row_value(
+        self_: turso_statement_t,
+        index: i32,
+    ) -> turso_statement_row_value_t;
 }
 unsafe extern "C" {
     #[doc = " Bind a named argument to a statement"]
@@ -502,12 +576,4 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Deallocate and close a statement"]
     pub fn turso_statement_deinit(self_: turso_statement_t);
-}
-unsafe extern "C" {
-    #[doc = " Deallocate and close rows"]
-    pub fn turso_rows_deinit(self_: turso_rows_t);
-}
-unsafe extern "C" {
-    #[doc = " Deallocate and close a row"]
-    pub fn turso_row_deinit(self_: turso_row_t);
 }

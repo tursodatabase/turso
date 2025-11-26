@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef enum {
+typedef enum
+{
     TURSO_OK = 0,
     TURSO_DONE = 1,
     TURSO_ROW = 2,
@@ -21,12 +22,18 @@ typedef enum {
     TURSO_CORRUPT = 133,
 } turso_status_code_t;
 
-typedef struct turso_status_t {
-    const char *error;
+// status of the operation
+// in most cases - this status acts as a signal for the error
+// in case of execution, status can return non-error code like ROW/DONE/IO which must be handled by the caller accordingly
+typedef struct turso_status_t
+{
     turso_status_code_t code;
+    const char *error;
 } turso_status_t;
 
-typedef enum {
+// enumeration of value types supported by the database
+typedef enum
+{
     TURSO_TYPE_INTEGER = 1,
     TURSO_TYPE_REAL = 2,
     TURSO_TYPE_TEXT = 3,
@@ -34,7 +41,8 @@ typedef enum {
     TURSO_TYPE_NULL = 5,
 } turso_type_t;
 
-typedef enum {
+typedef enum
+{
     TURSO_TRACING_LEVEL_ERROR = 1,
     TURSO_TRACING_LEVEL_WARN,
     TURSO_TRACING_LEVEL_INFO,
@@ -42,7 +50,8 @@ typedef enum {
     TURSO_TRACING_LEVEL_TRACE,
 } turso_tracing_level_t;
 
-typedef struct {
+typedef struct
+{
     const char *message;
     const char *target;
     const char *file;
@@ -55,70 +64,63 @@ typedef struct {
 // as the owner doesn't change - there is no method to free the slice reference - because:
 // 1. if tursodb owns it - it will clean it in appropriate time
 // 2. if caller owns it - it must clean it in appropriate time with appropriate method and tursodb doesn't know how to properly free the data
-typedef struct {
+typedef struct
+{
     const void *ptr;
     size_t len;
 } turso_slice_ref_t;
 
-typedef struct {
-    turso_status_t status;
+// structure holding opaque pointer to the TursoDatabase instance
+typedef struct
+{
     void *inner;
 } turso_database_t;
 
-typedef struct {
-    turso_status_t status;
+// structure holding data which makes up the TursoConnection instance
+typedef struct
+{
+    bool async_io;
     void *inner;
 } turso_connection_t;
 
-typedef struct {
-    turso_status_t status;
-    turso_slice_ref_t tail; // tail is set only in turso_connection_prepare_first method
+// structure holding data which makes up the TursoStatement instance
+typedef struct
+{
+    bool async_io;
     void *inner;
 } turso_statement_t;
 
-typedef struct {
-    turso_status_t status;
-    void *inner;
-} turso_rows_t;
-
-typedef struct {
-    turso_status_t status;
-    void *inner;
-} turso_row_t;
-
-typedef union {
+// typeless union holding one possible value from the database row
+typedef union
+{
     int64_t integer;
     double real;
     turso_slice_ref_t text;
     turso_slice_ref_t blob;
 } turso_value_union_t;
 
-typedef struct {
+// type-tagged union holding one possible value from the database row
+typedef struct
+{
     turso_value_union_t value;
     turso_type_t type;
 } turso_value_t;
 
-typedef struct {
-    turso_status_t status;
-    turso_value_t ok;
-} turso_result_value_t;
-
-typedef struct {
-    turso_status_t status;
-    uint64_t rows_changed;
-} turso_execute_t;
-
 /**
  * Database description.
  */
-typedef struct {
+typedef struct
+{
     /** Path to the database file or `:memory:` */
     const char *path;
     /** Optional comma separated list of experimental features to enable */
     const char *experimental_features;
+    /** Parameter which defines who drives the IO - callee or the caller */
+    bool async_io;
 } turso_database_config_t;
 
-typedef struct {
+typedef struct
+{
     void (*logger)(turso_log_t log);
     const char *log_level;
 } turso_config_t;
@@ -126,27 +128,65 @@ typedef struct {
 /** Setup global database info */
 turso_status_t turso_setup(turso_config_t config);
 
-/** Create or open a database */
-turso_database_t turso_database_init(turso_database_config_t config);
+typedef struct
+{
+    turso_status_t status;
+    turso_database_t database;
+} turso_database_create_result_t;
 
-/** Connect with the database */
-turso_connection_t turso_database_connect(turso_database_t self);
+/** Create database holder but do not open it */
+turso_database_create_result_t turso_database_create(turso_database_config_t config);
+
+/** Open database */
+turso_status_t turso_database_open(turso_database_t database);
+
+typedef struct
+{
+    turso_status_t status;
+    turso_connection_t connection;
+} turso_database_connect_result_t;
+
+/** Connect to the database */
+turso_database_connect_result_t turso_database_connect(turso_database_t self);
+
+typedef struct
+{
+    turso_status_t status;
+    turso_statement_t statement;
+} turso_connection_prepare_single_t;
 
 /** Prepare single statement in a connection */
-turso_statement_t
+turso_connection_prepare_single_t
 turso_connection_prepare_single(turso_connection_t self, turso_slice_ref_t sql);
 
+typedef struct
+{
+    turso_status_t status;
+    turso_statement_t statement;
+    size_t tail_idx;
+} turso_connection_prepare_first_t;
+
 /** Prepare first statement in a string containing multiple statements in a connection */
-turso_statement_t
+turso_connection_prepare_first_t
 turso_connection_prepare_first(turso_connection_t self, turso_slice_ref_t sql);
 
-/** Execute single statement */
-turso_execute_t turso_statement_execute(turso_statement_t self);
+/** Check if no more statements was parsed after execution of turso_connection_prepare_first method */
+bool turso_connection_prepare_first_result_empty(turso_connection_prepare_first_t result);
 
-/** Query a statement */
-turso_rows_t turso_statement_query(turso_statement_t self);
+// result of the statement execution
+typedef struct
+{
+    turso_status_t status;
+    uint64_t rows_changed;
+} turso_statement_execute_t;
+
+/** Execute single statement */
+turso_statement_execute_t turso_statement_execute(turso_statement_t self);
+
+/** Step statement execution once */
+turso_status_t turso_statement_step(turso_statement_t self);
 /** Execute one iteration of underlying IO backend */
-turso_status_t turso_statement_io(turso_statement_t self);
+turso_status_t turso_statement_run_io(turso_statement_t self);
 /** Reset a statement */
 turso_status_t turso_statement_reset(turso_statement_t self);
 /** Finalize a statement */
@@ -156,19 +196,20 @@ int32_t turso_statement_column_count(turso_statement_t self);
 /** Get the column name at the index */
 turso_slice_ref_t turso_statement_column_name(turso_statement_t self, int32_t index);
 
+typedef struct
+{
+    turso_status_t status;
+    turso_value_t value;
+} turso_statement_row_value_t;
 
-/** Get the next row from rows */
-turso_row_t turso_rows_next(turso_rows_t self);
-
-/** Get the value at the the index */
-turso_result_value_t turso_row_value(turso_row_t self, int32_t index);
+/** Get the row value at the the index for a current statement state */
+turso_statement_row_value_t turso_statement_row_value(turso_statement_t self, int32_t index);
 
 /** Bind a named argument to a statement */
 turso_status_t turso_statement_bind_named(
     turso_statement_t self,
     turso_slice_ref_t name,
-    turso_value_t value
-);
+    turso_value_t value);
 /** Bind a positional argument to a statement */
 turso_status_t
 turso_statement_bind_positional(turso_statement_t self, int32_t position, turso_value_t value);
@@ -192,9 +233,5 @@ void turso_database_deinit(turso_database_t self);
 void turso_connection_deinit(turso_connection_t self);
 /** Deallocate and close a statement */
 void turso_statement_deinit(turso_statement_t self);
-/** Deallocate and close rows */
-void turso_rows_deinit(turso_rows_t self);
-/** Deallocate and close a row */
-void turso_row_deinit(turso_row_t self);
 
 #endif /* TURSO_H */

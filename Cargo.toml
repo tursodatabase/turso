@@ -33,8 +33,8 @@ members = [
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
     "perf/encryption",
-    "capi",
-    "capi-macros",
+    "sdk-kit",
+    "sdk-kit-macros",
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -48,8 +48,8 @@ repository = "https://github.com/tursodatabase/turso"
 [workspace.dependencies]
 turso = { path = "bindings/rust", version = "0.4.0-pre.2" }
 turso_node = { path = "bindings/javascript", version = "0.4.0-pre.2" }
-turso_capi = { path = "capi", version = "0.4.0-pre.2" }
-turso_capi_macros = { path = "capi-macros", version = "0.4.0-pre.2" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.2" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.2" }
 limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.2" }
 turso_core = { path = "core", version = "0.4.0-pre.2" }
 turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.2" }

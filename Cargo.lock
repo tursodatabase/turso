@@ -3558,18 +3558,17 @@ dependencies = [
  "anyhow",
  "pyo3",
  "pyo3-build-config",
- "turso_core",
+ "turso_sdk_kit",
  "version_check",
 ]
 
 [[package]]
 name = "pyo3"
-version = "0.24.1"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17da310086b068fbdcefbba30aeb3721d5bb9af8db4987d6735b2183ca567229"
+checksum = "37a6df7eab65fc7bee654a421404947e10a0f7085b6951bf2ea395f4659fb0cf"
 dependencies = [
  "anyhow",
- "cfg-if",
  "indoc",
  "libc",
  "memoffset",
@@ -3583,19 +3582,18 @@ dependencies = [
 
 [[package]]
 name = "pyo3-build-config"
-version = "0.24.1"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e27165889bd793000a098bb966adc4300c312497ea25cf7a690a9f0ac5aa5fc1"
+checksum = "f77d387774f6f6eec64a004eac0ed525aab7fa1966d94b42f743797b3e395afb"
 dependencies = [
- "once_cell",
  "target-lexicon",
 ]
 
 [[package]]
 name = "pyo3-ffi"
-version = "0.24.1"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05280526e1dbf6b420062f3ef228b78c0c54ba94e157f5cb724a609d0f2faabc"
+checksum = "2dd13844a4242793e02df3e2ec093f540d948299a6a77ea9ce7afd8623f542be"
 dependencies = [
  "libc",
  "pyo3-build-config",
@@ -3603,9 +3601,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros"
-version = "0.24.1"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c3ce5686aa4d3f63359a5100c62a127c9f15e8398e5fdeb5deef1fed5cd5f44"
+checksum = "eaf8f9f1108270b90d3676b8679586385430e5c0bb78bb5f043f95499c821a71"
 dependencies = [
  "proc-macro2",
  "pyo3-macros-backend",
@@ -3615,9 +3613,9 @@ dependencies = [
 
 [[package]]
 name = "pyo3-macros-backend"
-version = "0.24.1"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4cf6faa0cbfb0ed08e89beb8103ae9724eb4750e3a78084ba4017cbe94f3855"
+checksum = "70a3b2274450ba5288bc9b8c1b69ff569d1d61189d4bff38f8d22e03d17f932b"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -4956,28 +4954,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso_capi"
-version = "0.4.0-pre.2"
-dependencies = [
- "bindgen",
- "env_logger 0.11.7",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "turso_capi_macros",
- "turso_core",
-]
-
-[[package]]
-name = "turso_capi_macros"
-version = "0.4.0-pre.2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.100",
-]
-
-[[package]]
 name = "turso_cli"
 version = "0.4.0-pre.2"
 dependencies = [
@@ -5122,7 +5098,7 @@ dependencies = [
  "napi-derive",
  "tracing",
  "tracing-subscriber",
- "turso_capi",
+ "turso_core",
 ]
 
 [[package]]
@@ -5139,6 +5115,28 @@ dependencies = [
  "strum_macros",
  "thiserror 2.0.16",
  "turso_macros",
+]
+
+[[package]]
+name = "turso_sdk_kit"
+version = "0.4.0-pre.2"
+dependencies = [
+ "bindgen",
+ "env_logger 0.11.7",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sdk_kit_macros",
+]
+
+[[package]]
+name = "turso_sdk_kit_macros"
+version = "0.4.0-pre.2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]
