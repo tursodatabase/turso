@@ -51,6 +51,15 @@ typedef struct {
     turso_tracing_level_t level;
 } turso_log_t;
 
+// ownership of the slice is not transferred - so its either caller owns the data or turso
+// as the owner doesn't change - there is no method to free the slice reference - because:
+// 1. if tursodb owns it - it will clean it in appropriate time
+// 2. if caller owns it - it must clean it in appropriate time with appropriate method and tursodb doesn't know how to properly free the data
+typedef struct {
+    const void *ptr;
+    size_t len;
+} turso_slice_ref_t;
+
 typedef struct {
     turso_status_t status;
     void *inner;
@@ -63,6 +72,7 @@ typedef struct {
 
 typedef struct {
     turso_status_t status;
+    turso_slice_ref_t tail; // tail is set only in turso_connection_prepare_first method
     void *inner;
 } turso_statement_t;
 
@@ -75,12 +85,6 @@ typedef struct {
     turso_status_t status;
     void *inner;
 } turso_row_t;
-
-// turso owns the slice - so caller must not free this memory in any way
-typedef struct {
-    const void *ptr;
-    size_t len;
-} turso_slice_ref_t;
 
 typedef union {
     int64_t integer;
@@ -128,12 +132,17 @@ turso_database_t turso_database_init(turso_database_config_t config);
 /** Connect with the database */
 turso_connection_t turso_database_connect(turso_database_t self);
 
-/** Prepare a statement in a connection */
+/** Prepare single statement in a connection */
 turso_statement_t
-turso_connection_prepare(turso_connection_t self, turso_slice_ref_t sql);
+turso_connection_prepare_single(turso_connection_t self, turso_slice_ref_t sql);
 
-/** Execute a statement */
+/** Prepare first statement in a string containing multiple statements in a connection */
+turso_statement_t
+turso_connection_prepare_first(turso_connection_t self, turso_slice_ref_t sql);
+
+/** Execute single statement */
 turso_execute_t turso_statement_execute(turso_statement_t self);
+
 /** Query a statement */
 turso_rows_t turso_statement_query(turso_statement_t self);
 /** Execute one iteration of underlying IO backend */

@@ -93,6 +93,30 @@ impl Default for turso_log_t {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct turso_slice_ref_t {
+    pub ptr: *const ::std::os::raw::c_void,
+    pub len: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_slice_ref_t"][::std::mem::size_of::<turso_slice_ref_t>() - 16usize];
+    ["Alignment of turso_slice_ref_t"][::std::mem::align_of::<turso_slice_ref_t>() - 8usize];
+    ["Offset of field: turso_slice_ref_t::ptr"]
+        [::std::mem::offset_of!(turso_slice_ref_t, ptr) - 0usize];
+    ["Offset of field: turso_slice_ref_t::len"]
+        [::std::mem::offset_of!(turso_slice_ref_t, len) - 8usize];
+};
+impl Default for turso_slice_ref_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct turso_database_t {
     pub status: turso_status_t,
     pub inner: *mut ::std::os::raw::c_void,
@@ -143,16 +167,19 @@ impl Default for turso_connection_t {
 #[derive(Debug, Copy, Clone)]
 pub struct turso_statement_t {
     pub status: turso_status_t,
+    pub tail: turso_slice_ref_t,
     pub inner: *mut ::std::os::raw::c_void,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_statement_t"][::std::mem::size_of::<turso_statement_t>() - 24usize];
+    ["Size of turso_statement_t"][::std::mem::size_of::<turso_statement_t>() - 40usize];
     ["Alignment of turso_statement_t"][::std::mem::align_of::<turso_statement_t>() - 8usize];
     ["Offset of field: turso_statement_t::status"]
         [::std::mem::offset_of!(turso_statement_t, status) - 0usize];
+    ["Offset of field: turso_statement_t::tail"]
+        [::std::mem::offset_of!(turso_statement_t, tail) - 16usize];
     ["Offset of field: turso_statement_t::inner"]
-        [::std::mem::offset_of!(turso_statement_t, inner) - 16usize];
+        [::std::mem::offset_of!(turso_statement_t, inner) - 32usize];
 };
 impl Default for turso_statement_t {
     fn default() -> Self {
@@ -200,30 +227,6 @@ const _: () = {
     ["Offset of field: turso_row_t::inner"][::std::mem::offset_of!(turso_row_t, inner) - 16usize];
 };
 impl Default for turso_row_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct turso_slice_ref_t {
-    pub ptr: *const ::std::os::raw::c_void,
-    pub len: usize,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_slice_ref_t"][::std::mem::size_of::<turso_slice_ref_t>() - 16usize];
-    ["Alignment of turso_slice_ref_t"][::std::mem::align_of::<turso_slice_ref_t>() - 8usize];
-    ["Offset of field: turso_slice_ref_t::ptr"]
-        [::std::mem::offset_of!(turso_slice_ref_t, ptr) - 0usize];
-    ["Offset of field: turso_slice_ref_t::len"]
-        [::std::mem::offset_of!(turso_slice_ref_t, len) - 8usize];
-};
-impl Default for turso_slice_ref_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -399,14 +402,21 @@ unsafe extern "C" {
     pub fn turso_database_connect(self_: turso_database_t) -> turso_connection_t;
 }
 unsafe extern "C" {
-    #[doc = " Prepare a statement in a connection"]
-    pub fn turso_connection_prepare(
+    #[doc = " Prepare single statement in a connection"]
+    pub fn turso_connection_prepare_single(
         self_: turso_connection_t,
         sql: turso_slice_ref_t,
     ) -> turso_statement_t;
 }
 unsafe extern "C" {
-    #[doc = " Execute a statement"]
+    #[doc = " Prepare first statement in a string containing multiple statements in a connection"]
+    pub fn turso_connection_prepare_first(
+        self_: turso_connection_t,
+        sql: turso_slice_ref_t,
+    ) -> turso_statement_t;
+}
+unsafe extern "C" {
+    #[doc = " Execute single statement"]
     pub fn turso_statement_execute(self_: turso_statement_t) -> turso_execute_t;
 }
 unsafe extern "C" {
