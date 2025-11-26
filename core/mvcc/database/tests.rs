@@ -1843,3 +1843,25 @@ fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
     let res = conn.execute("INSERT INTO t VALUES (2)");
     assert!(res.is_err(), "Expected error because key 2 already exists");
 }
+
+#[test]
+#[ignore = "we need to implement seek with btree cursor"]
+fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Seek to the second row.
+    let res = get_rows(&conn, "SELECT * FROM t WHERE x = 2");
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0][0].as_int().unwrap(), 2);
+}
