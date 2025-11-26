@@ -527,9 +527,7 @@ pub fn columns_from_create_table_body(
 ) -> crate::Result<Vec<Column>> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
         return Err(crate::LimboError::ParseError(
-            turso_parser::error::ParseError::Custom(
-                "CREATE TABLE body must contain columns and constraints".to_string(),
-            ),
+            "CREATE TABLE body must contain columns and constraints".to_string(),
         ));
     };
 

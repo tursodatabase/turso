@@ -400,9 +400,7 @@ impl DatabaseChangesIterator {
             let query = self.mode.query(&self.cdc_table, self.batch_size);
             let stmt = match self.conn.prepare(&query) {
                 Ok(stmt) => stmt,
-                Err(LimboError::ParseError(e)) if e.to_string().contains("no such table") => {
-                    return Ok(())
-                }
+                Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),
                 Err(err) => return Err(err.into()),
             };
             self.query_stmt = Some(stmt);

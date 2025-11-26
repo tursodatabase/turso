@@ -48,9 +48,7 @@ impl std::error::Error for Error {}
 impl From<Error> for crate::LimboError {
     fn from(err: Error) -> Self {
         match err {
-            Error::Message { msg, .. } => crate::LimboError::ParseError(
-                turso_parser::error::ParseError::Custom(msg),
-            ),
+            Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
         }
     }
 }

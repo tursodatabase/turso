@@ -82,9 +82,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
     match jsonbin {
         Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
         Err(_) => {
-            return Err(LimboError::ParseError(
-                turso_parser::error::ParseError::MalformedJson,
-            ))
+            bail_parse_error!("malformed JSON")
         }
     }
 }
@@ -121,9 +119,8 @@ pub fn convert_dbtype_to_jsonb(val: &Value, strict: Conv) -> crate::Result<Jsonb
 }
 
 fn parse_as_json_text(slice: &[u8]) -> crate::Result<Jsonb> {
-    let str = std::str::from_utf8(slice).map_err(|_| {
-        LimboError::ParseError(turso_parser::error::ParseError::MalformedJson)
-    })?;
+    let str = std::str::from_utf8(slice)
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, Conv::Strict).map_err(Into::into)
 }
 
@@ -140,9 +137,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
                 str.push('"');
                 Jsonb::from_str(&str)
             };
-            res.map_err(|_| {
-                LimboError::ParseError(turso_parser::error::ParseError::MalformedJson)
-            })
+            res.map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
         RefValue::Blob(blob) => {
             let bytes = blob.to_slice();
@@ -187,13 +182,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: &RefValue, strict: Conv) -> crate::Resul
         )),
         RefValue::Float(float) => {
             let mut buff = ryu::Buffer::new();
-            Jsonb::from_str(buff.format(*float)).map_err(|_| {
-                LimboError::ParseError(turso_parser::error::ParseError::MalformedJson)
-            })
+            Jsonb::from_str(buff.format(*float))
+                .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
         }
-        RefValue::Integer(int) => Jsonb::from_str(&int.to_string()).map_err(|_| {
-            LimboError::ParseError(turso_parser::error::ParseError::MalformedJson)
-        }),
+        RefValue::Integer(int) => Jsonb::from_str(&int.to_string())
+            .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
     }
 }
 

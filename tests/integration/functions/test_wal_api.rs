@@ -104,11 +104,11 @@ fn test_wal_frame_transfer_various_schema_changes() {
     sync();
     assert!(matches!(
         conn2.prepare("SELECT * FROM t").err().unwrap(),
-        turso_core::LimboError::ParseError(error) if error.to_string() == "no such table: t"
+        turso_core::LimboError::ParseError(error) if error == "no such table: t"
     ));
     assert!(matches!(
         conn3.prepare("SELECT * FROM t").err().unwrap(),
-        turso_core::LimboError::ParseError(error) if error.to_string() == "no such table: t"
+        turso_core::LimboError::ParseError(error) if error == "no such table: t"
     ));
 
     conn1.execute("CREATE TABLE a(x)").unwrap();

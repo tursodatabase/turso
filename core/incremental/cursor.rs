@@ -250,9 +250,7 @@ impl MaterializedViewCursor {
             SeekKey::TableRowId(rowid) => *rowid,
             SeekKey::IndexKey(_) => {
                 return Err(LimboError::ParseError(
-                    turso_parser::error::ParseError::Custom(
-                        "Cannot search a materialized view with an index key".to_string(),
-                    ),
+                    "Cannot search a materialized view with an index key".to_string(),
                 ));
             }
         };

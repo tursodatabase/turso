@@ -316,12 +316,12 @@ impl PragmaVirtualTableCursor {
 
     pub(crate) fn filter(&mut self, args: Vec<Value>) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
-            return Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(format!(
+            return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
                 self.pragma_name,
                 self.max_arg_count,
                 args.len()
-            ))));
+            )));
         }
 
         let to_text = |v: &Value| v.to_text().map(str::to_owned);
@@ -336,8 +336,8 @@ impl PragmaVirtualTableCursor {
 
         if let Some(schema) = schema {
             // Schema-qualified PRAGMA statements are not supported yet
-            return Err(LimboError::ParseError(turso_parser::error::ParseError::Custom(
-                format!("Schema argument is not supported yet (got schema: '{schema}')")
+            return Err(LimboError::ParseError(format!(
+                "Schema argument is not supported yet (got schema: '{schema}')"
             )));
         }
 

@@ -15,7 +15,7 @@ pub enum LimboError {
     #[error("Database is full: {0}")]
     DatabaseFull(String),
     #[error("Parse error: {0}")]
-    ParseError(#[from] turso_parser::error::ParseError),
+    ParseError(String),
     #[error(transparent)]
     #[diagnostic(transparent)]
     LexerError(#[from] turso_parser::error::Error),
@@ -137,9 +137,7 @@ pub enum CompletionError {
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::ParseError(
-            turso_parser::error::ParseError::Custom(format!($($arg)*))
-        ))
+        return Err($crate::error::LimboError::ParseError(format!($($arg)*)))
     };
 }
 

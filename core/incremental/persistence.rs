@@ -42,9 +42,7 @@ impl ReadRecord {
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
                             _ => Err(LimboError::ParseError(
-                                turso_parser::error::ParseError::Custom(
-                                    "Value in aggregator not blob".to_string(),
-                                ),
+                                "Value in aggregator not blob".to_string(),
                             )),
                         }?;
                         *self = ReadRecord::Done { state: Some(state) }

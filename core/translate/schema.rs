@@ -768,12 +768,10 @@ pub fn translate_drop_table(
             // But this line here below is a safeguard in case this behavior changes in the future
             // And mirrors what SQLite does.
             if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) {
-                return Err(crate::LimboError::ParseError(
-                    turso_parser::error::ParseError::Custom(format!(
-                        "table {} may not be dropped",
-                        vtab.name
-                    )),
-                ));
+                return Err(crate::LimboError::ParseError(format!(
+                    "table {} may not be dropped",
+                    vtab.name
+                )));
             }
             program.emit_insn(Insn::VDestroy {
                 table_name: vtab.name.clone(),

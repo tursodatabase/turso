@@ -203,9 +203,9 @@ impl Schema {
 
             Ok(())
         } else {
-            Err(crate::LimboError::ParseError(
-                turso_parser::error::ParseError::NoSuchView(name),
-            ))
+            Err(crate::LimboError::ParseError(format!(
+                "no such view: {name}"
+            )))
         }
     }
 
@@ -471,12 +471,10 @@ impl Schema {
             for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
                 let col_name = &unique_set.columns.first().unwrap().0;
                 let Some((pos_in_table, column)) = table.get_column(col_name) else {
-                    return Err(LimboError::ParseError(
-                        turso_parser::error::ParseError::ColumnNotFoundInTable(
-                            col_name.to_string(),
-                            table.name.clone(),
-                        ),
-                    ));
+                    return Err(LimboError::ParseError(format!(
+                        "Column {col_name} not found in table {}",
+                        table.name
+                    )));
                 };
                 if column.primary_key && unique_set.is_primary_key {
                     if column.is_rowid_alias {
@@ -528,12 +526,10 @@ impl Schema {
                         Vec::with_capacity(unique_set.columns.len());
                     for (col_name, sort_order) in unique_set.columns.iter() {
                         let Some((pos_in_table, _)) = table.get_column(col_name) else {
-                            return Err(crate::LimboError::ParseError(
-                                turso_parser::error::ParseError::ColumnNotFoundInTable(
-                                    col_name.to_string(),
-                                    table.name.clone(),
-                                ),
-                            ));
+                            return Err(crate::LimboError::ParseError(format!(
+                                "Column {} not found in table {}",
+                                col_name, table.name
+                            )));
                         };
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
@@ -1114,11 +1110,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 } = &c.constraint
                 {
                     if !primary_key_columns.is_empty() {
-                        return Err(crate::LimboError::ParseError(
-                            turso_parser::error::ParseError::MultiplePrimaryKeys(
-                                tbl_name.to_string(),
-                            ),
-                        ));
+                        crate::bail_parse_error!(
+                            "table \"{}\" has more than one primary key",
+                            tbl_name
+                        );
                     }
                     if *auto_increment {
                         has_autoincrement = true;
@@ -1217,11 +1212,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             ..
                         } => {
                             if !primary_key_columns.is_empty() {
-                                return Err(crate::LimboError::ParseError(
-                                    turso_parser::error::ParseError::MultiplePrimaryKeys(
-                                        tbl_name.to_string(),
-                                    ),
-                                ));
+                                crate::bail_parse_error!(
+                                    "table \"{}\" has more than one primary key",
+                                    tbl_name
+                                );
                             }
                             primary_key = true;
                             if auto_increment {
@@ -1834,12 +1828,10 @@ impl Index {
         let mut primary_keys = Vec::with_capacity(column_count);
         for (col_name, order) in table.primary_key_columns.iter() {
             let Some((pos_in_table, _)) = table.get_column(col_name) else {
-                return Err(crate::LimboError::ParseError(
-                    turso_parser::error::ParseError::ColumnNotFoundInTable(
-                        col_name.to_string(),
-                        table.name.clone(),
-                    ),
-                ));
+                return Err(crate::LimboError::ParseError(format!(
+                    "Column {} not found in table {}",
+                    col_name, table.name
+                )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
             primary_keys.push(IndexColumn {
@@ -2100,10 +2092,9 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY);"#;
         let table = BTreeTable::from_sql(sql, 0);
         let error = table.unwrap_err();
-        assert!(matches!(
-            error,
-            LimboError::ParseError(turso_parser::error::ParseError::MultiplePrimaryKeys(t)) if t == "t1"
-        ));
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
+        );
         Ok(())
     }
 
@@ -2142,10 +2133,9 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT PRIMARY KEY, c REAL);"#;
         let table = BTreeTable::from_sql(sql, 0);
         let error = table.unwrap_err();
-        assert!(matches!(
-            error,
-            LimboError::ParseError(turso_parser::error::ParseError::MultiplePrimaryKeys(t)) if t == "t1"
-        ));
+        assert!(
+            matches!(error, LimboError::ParseError(e) if e.contains("table \"t1\" has more than one primary key"))
+        );
         Ok(())
     }
 

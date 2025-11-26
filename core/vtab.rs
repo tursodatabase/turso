@@ -91,11 +91,9 @@ impl VirtualTable {
             ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
                 .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
         } else {
-            return Err(LimboError::ParseError(
-                turso_parser::error::ParseError::Custom(format!(
-                    "No such table-valued function: {name}"
-                )),
-            ));
+            return Err(LimboError::ParseError(format!(
+                "No such table-valued function: {name}"
+            )));
         };
 
         let vtab = VirtualTable {
@@ -128,14 +126,12 @@ impl VirtualTable {
     fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next_cmd()?.ok_or(
-            LimboError::ParseError(
-                turso_parser::error::ParseError::VirtualTableSchemaParseFailed,
-            ),
+            LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
         )? {
             columns_from_create_table_body(&body)
         } else {
             Err(LimboError::ParseError(
-                turso_parser::error::ParseError::VirtualTableSchemaParseFailed,
+                "Failed to parse schema from virtual table module".to_string(),
             ))
         }
     }
