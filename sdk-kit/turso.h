@@ -83,17 +83,15 @@ typedef struct
     void *inner;
 } turso_database_t;
 
-// structure holding data which makes up the TursoConnection instance
+// structure holding opaque pointer to the TursoConnection instance
 typedef struct
 {
-    bool async_io;
     void *inner;
 } turso_connection_t;
 
-// structure holding data which makes up the TursoStatement instance
+// structure holding opaque pointer to the TursoStatement instance
 typedef struct
 {
-    bool async_io;
     void *inner;
 } turso_statement_t;
 

@@ -64,7 +64,7 @@ pub extern "C" fn turso_database_create(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_database_open(database: turso_database_t) -> c::turso_status_t {
-    let database = ManuallyDrop::new(unsafe { TursoDatabase::from_capi(database) });
+    let database = ManuallyDrop::new(unsafe { TursoDatabase::ref_from_capi(database) });
     match database.open() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -76,7 +76,7 @@ pub extern "C" fn turso_database_open(database: turso_database_t) -> c::turso_st
 pub extern "C" fn turso_database_connect(
     database: c::turso_database_t,
 ) -> c::turso_database_connect_result_t {
-    let database = ManuallyDrop::new(unsafe { TursoDatabase::from_capi(database) });
+    let database = ManuallyDrop::new(unsafe { TursoDatabase::ref_from_capi(database) });
     match database.connect() {
         Ok(connection) => c::turso_database_connect_result_t {
             status: turso_status_ok(),
@@ -95,7 +95,7 @@ pub extern "C" fn turso_connection_prepare_single(
     connection: c::turso_connection_t,
     sql: c::turso_slice_ref_t,
 ) -> c::turso_connection_prepare_single_t {
-    let connection = ManuallyDrop::new(unsafe { TursoConnection::from_capi(connection) });
+    let connection = ManuallyDrop::new(unsafe { TursoConnection::ref_from_capi(connection) });
 
     let sql = match str_from_turso_slice(sql) {
         Ok(sql) => sql,
@@ -124,7 +124,7 @@ pub extern "C" fn turso_connection_prepare_first(
     connection: c::turso_connection_t,
     sql: c::turso_slice_ref_t,
 ) -> c::turso_connection_prepare_first_t {
-    let connection = ManuallyDrop::new(unsafe { TursoConnection::from_capi(connection) });
+    let connection = ManuallyDrop::new(unsafe { TursoConnection::ref_from_capi(connection) });
 
     let sql = match str_from_turso_slice(sql) {
         Ok(sql) => sql,
@@ -163,7 +163,7 @@ pub extern "C" fn turso_connection_prepare_first_result_empty(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_run_io(statement: c::turso_statement_t) -> c::turso_status_t {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.run_io() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -175,7 +175,7 @@ pub extern "C" fn turso_statement_run_io(statement: c::turso_statement_t) -> c::
 pub extern "C" fn turso_statement_execute(
     statement: c::turso_statement_t,
 ) -> c::turso_statement_execute_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let statement = unsafe { TursoStatement::ref_from_capi(statement) };
     match statement.execute() {
         Ok(result) => c::turso_statement_execute_t {
             status: result.status.to_capi(),
@@ -191,7 +191,7 @@ pub extern "C" fn turso_statement_execute(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_step(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.step() {
         Ok(status) => status.to_capi(),
         Err(err) => err.to_capi(),
@@ -201,7 +201,7 @@ pub extern "C" fn turso_statement_step(statement: c::turso_statement_t) -> c::tu
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_reset(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.reset() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -211,7 +211,7 @@ pub extern "C" fn turso_statement_reset(statement: c::turso_statement_t) -> c::t
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.finalize() {
         Ok(status) => status.to_capi(),
         Err(err) => err.to_capi(),
@@ -224,7 +224,7 @@ pub extern "C" fn turso_statement_column_name(
     statement: c::turso_statement_t,
     index: usize,
 ) -> *const std::ffi::c_char {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     let column = statement.column_name(index).to_string();
     str_to_c_string(&column)
 }
@@ -232,7 +232,7 @@ pub extern "C" fn turso_statement_column_name(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_column_count(statement: c::turso_statement_t) -> usize {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     statement.column_count()
 }
 
@@ -242,7 +242,7 @@ pub extern "C" fn turso_statement_row_value(
     statement: c::turso_statement_t,
     index: usize,
 ) -> c::turso_statement_row_value_t {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     let value = statement.row_value(index);
     match value {
         Ok(turso_core::ValueRef::Null) => c::turso_statement_row_value_t {
@@ -306,7 +306,7 @@ pub extern "C" fn turso_statement_bind_named(
         Ok(value) => value,
         Err(err) => return err.to_capi(),
     };
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.bind_named(name, value) {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -324,7 +324,7 @@ pub extern "C" fn turso_statement_bind_positional(
         Ok(value) => value,
         Err(err) => return err.to_capi(),
     };
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
+    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
     match statement.bind_positional(position, value) {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -404,7 +404,7 @@ pub extern "C" fn turso_str_deinit(s: *const std::ffi::c_char) {
 #[signature(c)]
 pub extern "C" fn turso_database_deinit(database: c::turso_database_t) {
     if !database.inner.is_null() {
-        drop(unsafe { TursoDatabase::from_capi(database) })
+        drop(unsafe { TursoDatabase::arc_from_capi(database) })
     }
 }
 
@@ -412,7 +412,7 @@ pub extern "C" fn turso_database_deinit(database: c::turso_database_t) {
 #[signature(c)]
 pub extern "C" fn turso_connection_deinit(connection: c::turso_connection_t) {
     if !connection.inner.is_null() {
-        drop(unsafe { TursoConnection::from_capi(connection) })
+        drop(unsafe { TursoConnection::arc_from_capi(connection) })
     }
 }
 
@@ -420,7 +420,7 @@ pub extern "C" fn turso_connection_deinit(connection: c::turso_connection_t) {
 #[signature(c)]
 pub extern "C" fn turso_statement_deinit(statement: c::turso_statement_t) {
     if !statement.inner.is_null() {
-        drop(unsafe { TursoStatement::from_capi(statement) })
+        drop(unsafe { TursoStatement::box_from_capi(statement) })
     }
 }
 

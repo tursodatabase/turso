@@ -185,14 +185,9 @@ impl TursoDatabaseConfig {
     }
 }
 
-struct TursoDatabaseInner {
+pub struct TursoDatabase {
     config: TursoDatabaseConfig,
     db: Arc<Mutex<Option<Arc<Database>>>>,
-}
-
-#[derive(Clone)]
-pub struct TursoDatabase {
-    inner: Arc<TursoDatabaseInner>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,7 +251,7 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
 impl TursoError {
     pub fn to_capi(self) -> capi::c::turso_status_t {
         capi::c::turso_status_t {
-            code: unsafe { std::mem::transmute(self.code as u32) },
+            code: self.code.to_capi().code,
             error: match self.message {
                 Some(message) => str_to_c_string(&message),
                 None => std::ptr::null(),
@@ -368,21 +363,19 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
 impl TursoDatabase {
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
-    pub fn create(config: TursoDatabaseConfig) -> Self {
-        Self {
-            inner: Arc::new(TursoDatabaseInner {
-                config,
-                db: Arc::new(Mutex::new(None)),
-            }),
-        }
+    pub fn create(config: TursoDatabaseConfig) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            db: Arc::new(Mutex::new(None)),
+        })
     }
     /// open the database
     /// this method must be called only once
     pub fn open(&self) -> Result<(), TursoError> {
-        let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.inner.config.io {
+        let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.inner.config.path.as_str() {
+            match self.config.path.as_str() {
                 ":memory:" => Arc::new(turso_core::MemoryIO::new()),
                 _ => match turso_core::PlatformIO::new() {
                     Ok(io) => Arc::new(io),
@@ -393,7 +386,7 @@ impl TursoDatabase {
             }
         };
         let mut opts = DatabaseOpts::new();
-        if let Some(experimental_features) = &self.inner.config.experimental_features {
+        if let Some(experimental_features) = &self.config.experimental_features {
             for features in experimental_features.split(",").map(|s| s.trim()) {
                 opts = match features {
                     "views" => opts.with_views(true),
@@ -407,13 +400,13 @@ impl TursoDatabase {
         }
         match turso_core::Database::open_file_with_flags(
             io.clone(),
-            &self.inner.config.path,
+            &self.config.path,
             OpenFlags::default(),
             opts,
             None,
         ) {
             Ok(db) => {
-                let mut inner_db = self.inner.db.lock().unwrap();
+                let mut inner_db = self.db.lock().unwrap();
                 *inner_db = Some(db);
                 Ok(())
             }
@@ -423,8 +416,8 @@ impl TursoDatabase {
 
     /// creates database connection
     /// database must be already opened with [Self::open] method
-    pub fn connect(&self) -> Result<TursoConnection, TursoError> {
-        let inner_db = self.inner.db.lock().unwrap();
+    pub fn connect(&self) -> Result<Arc<TursoConnection>, TursoError> {
+        let inner_db = self.db.lock().unwrap();
         let Some(db) = inner_db.as_ref() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
@@ -434,28 +427,32 @@ impl TursoDatabase {
         let connection = db.connect();
 
         match connection {
-            Ok(connection) => Ok(TursoConnection {
-                async_io: self.inner.config.async_io,
+            Ok(connection) => Ok(Arc::new(TursoConnection {
+                async_io: self.config.async_io,
                 connection,
-            }),
+            })),
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
     }
 
     /// helper method to get C raw container with TursoDatabase instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self) -> capi::c::turso_database_t {
+    pub fn to_capi(self: &Arc<Self>) -> capi::c::turso_database_t {
         capi::c::turso_database_t {
-            inner: Arc::into_raw(self.inner) as *mut std::ffi::c_void,
+            inner: Arc::into_raw(self.clone()) as *mut std::ffi::c_void,
         }
+    }
+
+    /// helper method to restore TursoDatabase ref from C raw container
+    /// this method is used in the capi wrappers
+    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_database_t) -> &'a Self {
+        &*(value.inner as *const Self)
     }
 
     /// helper method to restore TursoDatabase instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn from_capi(value: capi::c::turso_database_t) -> Self {
-        Self {
-            inner: Arc::from_raw(value.inner as *const TursoDatabaseInner),
-        }
+    pub unsafe fn arc_from_capi<'a>(value: capi::c::turso_database_t) -> Arc<Self> {
+        Arc::from_raw(value.inner as *const Self)
     }
 }
 
@@ -466,12 +463,12 @@ pub struct TursoConnection {
 
 impl TursoConnection {
     /// prepares single SQL statement
-    pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<TursoStatement, TursoError> {
+    pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         match self.connection.prepare(sql) {
-            Ok(statement) => Ok(TursoStatement {
+            Ok(statement) => Ok(Box::new(TursoStatement {
                 async_io: self.async_io,
-                statement: Box::new(statement),
-            }),
+                statement,
+            })),
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
     }
@@ -480,13 +477,13 @@ impl TursoConnection {
     pub fn prepare_first(
         &self,
         sql: impl AsRef<str>,
-    ) -> Result<Option<(TursoStatement, usize)>, TursoError> {
+    ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
         match self.connection.consume_stmt(sql) {
             Ok(Some((statement, position))) => Ok(Some((
-                TursoStatement {
+                Box::new(TursoStatement {
                     async_io: self.async_io,
-                    statement: Box::new(statement),
-                },
+                    statement: statement,
+                }),
                 position,
             ))),
             Ok(None) => Ok(None),
@@ -496,26 +493,28 @@ impl TursoConnection {
 
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self) -> capi::c::turso_connection_t {
+    pub fn to_capi(self: &Arc<Self>) -> capi::c::turso_connection_t {
         capi::c::turso_connection_t {
-            async_io: self.async_io,
-            inner: Arc::into_raw(self.connection) as *mut std::ffi::c_void,
+            inner: Arc::into_raw(self.clone()) as *mut std::ffi::c_void,
         }
+    }
+
+    /// helper method to restore TursoConnection ref from C raw container
+    /// this method is used in the capi wrappers
+    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_connection_t) -> &'a Self {
+        &*(value.inner as *const Self)
     }
 
     /// helper method to restore TursoConnection instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn from_capi(value: capi::c::turso_connection_t) -> Self {
-        Self {
-            async_io: value.async_io,
-            connection: Arc::from_raw(value.inner as *const Connection),
-        }
+    pub unsafe fn arc_from_capi<'a>(value: capi::c::turso_connection_t) -> Arc<Self> {
+        Arc::from_raw(value.inner as *const Self)
     }
 }
 
 pub struct TursoStatement {
     async_io: bool,
-    statement: Box<Statement>,
+    statement: Statement,
 }
 
 pub struct TursoExecutionResult {
@@ -674,19 +673,21 @@ impl TursoStatement {
 
     /// helper method to get C raw container to the TursoStatement instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self) -> capi::c::turso_statement_t {
+    pub fn to_capi(self: Box<Self>) -> capi::c::turso_statement_t {
         capi::c::turso_statement_t {
-            async_io: self.async_io,
-            inner: Box::into_raw(self.statement) as *mut std::ffi::c_void,
+            inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
+    }
+
+    /// helper method to restore TursoStatement ref from C raw container
+    /// this method is used in the capi wrappers
+    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_statement_t) -> &'a mut Self {
+        &mut *(value.inner as *mut Self)
     }
 
     /// helper method to restore TursoStatement instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn from_capi(value: capi::c::turso_statement_t) -> Self {
-        Self {
-            async_io: value.async_io,
-            statement: Box::from_raw(value.inner as *mut Statement),
-        }
+    pub unsafe fn box_from_capi<'a>(value: capi::c::turso_statement_t) -> Box<Self> {
+        Box::from_raw(value.inner as *mut Self)
     }
 }
