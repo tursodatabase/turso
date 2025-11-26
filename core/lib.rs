@@ -2943,6 +2943,30 @@ impl Statement {
     }
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // Run the statement to completion if it's still in progress.
+        // This ensures INSERT...RETURNING and similar statements complete their work
+        // even if not all returned rows were consumed.
+        // We use catch_unwind to handle panics from corrupted databases gracefully.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while self.state.execution_state.is_running() {
+                match self.program.step(
+                    &mut self.state,
+                    self.mv_store.as_ref(),
+                    self.pager.clone(),
+                    QueryMode::Normal,
+                    None,
+                ) {
+                    Ok(vdbe::StepResult::Done) | Ok(vdbe::StepResult::Row) => continue,
+                    Ok(vdbe::StepResult::IO) => {
+                        if let Err(e) = self.run_once() {
+                            tracing::error!("Error running statement to completion: {}", e);
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }));
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
         self.program
             .abort(self.mv_store.as_ref(), &self.pager, None, &mut self.state);
