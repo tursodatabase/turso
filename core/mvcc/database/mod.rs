@@ -2425,7 +2425,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 last_rowid
             }
             MvccCursorType::Index(_) => {
-                let index = self.index_rows.get(&table_id).unwrap();
+                let index = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
                 let index = index.value();
                 index
                     .iter()
