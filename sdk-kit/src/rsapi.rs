@@ -115,7 +115,10 @@ pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::V
                     })
                 }
             };
-            Ok(turso_core::Value::Text(turso_core::types::Text::new(text)))
+            Ok(turso_core::Value::Text(turso_core::types::Text::new(
+                // convert to_string explicitly in order to avoid potential dangling references
+                text.to_string(),
+            )))
         }
         capi::c::turso_type_t::TURSO_TYPE_BLOB => {
             let blob = bytes_from_turso_slice(unsafe { value.value.blob });
@@ -213,7 +216,21 @@ pub enum TursoStatusCode {
 impl TursoStatusCode {
     pub fn to_capi(self) -> capi::c::turso_status_t {
         capi::c::turso_status_t {
-            code: unsafe { std::mem::transmute(self as u32) },
+            code: match self {
+                TursoStatusCode::Ok => capi::c::turso_status_code_t::TURSO_OK,
+                TursoStatusCode::Done => capi::c::turso_status_code_t::TURSO_DONE,
+                TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
+                TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
+                TursoStatusCode::Busy => capi::c::turso_status_code_t::TURSO_BUSY,
+                TursoStatusCode::Interrupt => capi::c::turso_status_code_t::TURSO_INTERRUPT,
+                TursoStatusCode::Error => capi::c::turso_status_code_t::TURSO_ERROR,
+                TursoStatusCode::Misuse => capi::c::turso_status_code_t::TURSO_MISUSE,
+                TursoStatusCode::Constraint => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
+                TursoStatusCode::Readonly => capi::c::turso_status_code_t::TURSO_READONLY,
+                TursoStatusCode::DatabaseFull => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
+                TursoStatusCode::NotAdb => capi::c::turso_status_code_t::TURSO_NOTADB,
+                TursoStatusCode::Corrupt => capi::c::turso_status_code_t::TURSO_CORRUPT,
+            },
             error: std::ptr::null(),
         }
     }

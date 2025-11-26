@@ -7,8 +7,8 @@ use c::{turso_slice_ref_t, turso_status_t, turso_value_t, turso_value_union_t};
 use crate::{
     capi::c::turso_database_t,
     rsapi::{
-        self, c_string_to_str, str_from_turso_slice, turso_slice_from_bytes, value_from_c_value,
-        TursoConnection, TursoDatabase, TursoStatement,
+        self, c_string_to_str, str_from_turso_slice, str_to_c_string, turso_slice_from_bytes,
+        value_from_c_value, TursoConnection, TursoDatabase, TursoStatement,
     },
 };
 
@@ -223,10 +223,10 @@ pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c
 pub extern "C" fn turso_statement_column_name(
     statement: c::turso_statement_t,
     index: usize,
-) -> c::turso_slice_ref_t {
+) -> *const std::ffi::c_char {
     let statement = ManuallyDrop::new(unsafe { TursoStatement::from_capi(statement) });
-    let column = statement.column_name(index);
-    turso_slice_from_bytes(column.as_bytes())
+    let column = statement.column_name(index).to_string();
+    str_to_c_string(&column)
 }
 
 #[no_mangle]
@@ -389,8 +389,14 @@ pub extern "C" fn turso_null() -> c::turso_value_t {
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_status_deinit(status: c::turso_status_t) {
-    if !status.error.is_null() {
-        drop(c_string_to_str(status.error));
+    turso_str_deinit(status.error);
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_str_deinit(s: *const std::ffi::c_char) {
+    if !s.is_null() {
+        drop(c_string_to_str(s));
     }
 }
 

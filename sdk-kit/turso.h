@@ -70,6 +70,13 @@ typedef struct
     size_t len;
 } turso_slice_ref_t;
 
+// owned slice - must be freed by the caller with corresponding method
+typedef struct
+{
+    const void *ptr;
+    size_t len;
+} turso_slice_owned_t;
+
 // structure holding opaque pointer to the TursoDatabase instance
 typedef struct
 {
@@ -204,8 +211,10 @@ turso_status_t turso_statement_finalize(turso_statement_t self);
 /** Get column count */
 size_t turso_statement_column_count(turso_statement_t self);
 
-/** Get the column name at the index */
-turso_slice_ref_t turso_statement_column_name(turso_statement_t self, size_t index);
+/** Get the column name at the index
+ * C string must be freed after the usage with corresponding turso_str_deinit(...) method
+ */
+const char *turso_statement_column_name(turso_statement_t self, size_t index);
 
 typedef struct
 {
@@ -239,13 +248,21 @@ turso_value_t turso_blob(const uint8_t *ptr, size_t len);
 /** Create a turso null value */
 turso_value_t turso_null();
 
-/** Deallocate and close a status */
+/** Deallocate a status */
 void turso_status_deinit(turso_status_t self);
-/** Deallocate and close a database */
+/** Deallocate C string */
+void turso_str_deinit(const char *self);
+/** Deallocate and close a database
+ * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited database
+ */
 void turso_database_deinit(turso_database_t self);
-/** Deallocate and close a connection */
+/** Deallocate and close a connection
+ * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited connection
+ */
 void turso_connection_deinit(turso_connection_t self);
-/** Deallocate and close a statement */
+/** Deallocate and close a statement
+ * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited statement
+ */
 void turso_statement_deinit(turso_statement_t self);
 
 #endif /* TURSO_H */

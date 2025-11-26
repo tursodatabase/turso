@@ -117,6 +117,30 @@ impl Default for turso_slice_ref_t {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct turso_slice_owned_t {
+    pub ptr: *const ::std::os::raw::c_void,
+    pub len: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_slice_owned_t"][::std::mem::size_of::<turso_slice_owned_t>() - 16usize];
+    ["Alignment of turso_slice_owned_t"][::std::mem::align_of::<turso_slice_owned_t>() - 8usize];
+    ["Offset of field: turso_slice_owned_t::ptr"]
+        [::std::mem::offset_of!(turso_slice_owned_t, ptr) - 0usize];
+    ["Offset of field: turso_slice_owned_t::len"]
+        [::std::mem::offset_of!(turso_slice_owned_t, len) - 8usize];
+};
+impl Default for turso_slice_owned_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct turso_database_t {
     pub inner: *mut ::std::os::raw::c_void,
 }
@@ -469,7 +493,7 @@ unsafe extern "C" {
     pub fn turso_statement_execute(self_: turso_statement_t) -> turso_statement_execute_t;
 }
 unsafe extern "C" {
-    #[doc = " Step statement execution once"]
+    #[doc = " Step statement execution once\n Returns TURSO_DONE if execution finished\n Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)\n Returns TURSO_IO if async_io was set and statement needs to execute IO to make progress"]
     pub fn turso_statement_step(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
@@ -481,7 +505,7 @@ unsafe extern "C" {
     pub fn turso_statement_reset(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
-    #[doc = " Finalize a statement"]
+    #[doc = " Finalize a statement\n This method must be called in the end of statement execution (either successfull or not)"]
     pub fn turso_statement_finalize(self_: turso_statement_t) -> turso_status_t;
 }
 unsafe extern "C" {
@@ -490,8 +514,10 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[doc = " Get the column name at the index"]
-    pub fn turso_statement_column_name(self_: turso_statement_t, index: usize)
-        -> turso_slice_ref_t;
+    pub fn turso_statement_column_name(
+        self_: turso_statement_t,
+        index: usize,
+    ) -> *const ::std::os::raw::c_char;
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -520,7 +546,7 @@ impl Default for turso_statement_row_value_t {
     }
 }
 unsafe extern "C" {
-    #[doc = " Get the row value at the the index for a current statement state"]
+    #[doc = " Get the row value at the the index for a current statement state\n SAFETY: returned turso_value_t will be valid only until next invocation of statement operation (step, finalize, reset, etc)\n Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime"]
     pub fn turso_statement_row_value(
         self_: turso_statement_t,
         index: usize,
@@ -563,8 +589,12 @@ unsafe extern "C" {
     pub fn turso_null() -> turso_value_t;
 }
 unsafe extern "C" {
-    #[doc = " Deallocate and close a status"]
+    #[doc = " Deallocate a status"]
     pub fn turso_status_deinit(self_: turso_status_t);
+}
+unsafe extern "C" {
+    #[doc = " Deallocate C string"]
+    pub fn turso_str_deinit(self_: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {
     #[doc = " Deallocate and close a database"]
