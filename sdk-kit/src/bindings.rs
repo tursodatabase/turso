@@ -91,6 +91,7 @@ impl Default for turso_log_t {
         }
     }
 }
+#[doc = " SAFETY: slice with non-null ptr must points to the valid memory range [ptr..ptr + len)\n ownership of the slice is not transferred - so its either caller owns the data or turso\n as the owner doesn't change - there is no method to free the slice reference - because:\n 1. if tursodb owns it - it will clean it in appropriate time\n 2. if caller owns it - it must clean it in appropriate time with appropriate method and tursodb doesn't know how to properly free the data"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_slice_ref_t {
@@ -181,6 +182,7 @@ impl Default for turso_connection_t {
         }
     }
 }
+#[doc = " structure holding opaque pointer to the TursoStatement instance\n SAFETY: the statement must be used exclusive and can't be accessed concurrently"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_statement_t {
@@ -291,6 +293,7 @@ impl Default for turso_database_config_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_config_t {
+    #[doc = " SAFETY: turso_log_t log argument fields have lifetime scoped to the logger invocation\n caller must ensure that data is properly copied if it wants it to have longer lifetime"]
     pub logger: ::std::option::Option<unsafe extern "C" fn(log: turso_log_t)>,
     pub log_level: *const ::std::os::raw::c_char,
 }
@@ -502,16 +505,70 @@ unsafe extern "C" {
     #[doc = " Finalize a statement\n This method must be called in the end of statement execution (either successfull or not)"]
     pub fn turso_statement_finalize(self_: turso_statement_t) -> turso_status_t;
 }
-unsafe extern "C" {
-    #[doc = " Get column count"]
-    pub fn turso_statement_column_count(self_: turso_statement_t) -> usize;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_statement_column_count_result_t {
+    pub status: turso_status_t,
+    pub column_count: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_statement_column_count_result_t"]
+        [::std::mem::size_of::<turso_statement_column_count_result_t>() - 24usize];
+    ["Alignment of turso_statement_column_count_result_t"]
+        [::std::mem::align_of::<turso_statement_column_count_result_t>() - 8usize];
+    ["Offset of field: turso_statement_column_count_result_t::status"]
+        [::std::mem::offset_of!(turso_statement_column_count_result_t, status) - 0usize];
+    ["Offset of field: turso_statement_column_count_result_t::column_count"]
+        [::std::mem::offset_of!(turso_statement_column_count_result_t, column_count) - 16usize];
+};
+impl Default for turso_statement_column_count_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 unsafe extern "C" {
-    #[doc = " Get the column name at the index\n C string must be freed after the usage with corresponding turso_str_deinit(...) method"]
+    #[doc = " Get column count"]
+    pub fn turso_statement_column_count(
+        self_: turso_statement_t,
+    ) -> turso_statement_column_count_result_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_statement_column_name_result_t {
+    pub status: turso_status_t,
+    pub column_name: *const ::std::os::raw::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_statement_column_name_result_t"]
+        [::std::mem::size_of::<turso_statement_column_name_result_t>() - 24usize];
+    ["Alignment of turso_statement_column_name_result_t"]
+        [::std::mem::align_of::<turso_statement_column_name_result_t>() - 8usize];
+    ["Offset of field: turso_statement_column_name_result_t::status"]
+        [::std::mem::offset_of!(turso_statement_column_name_result_t, status) - 0usize];
+    ["Offset of field: turso_statement_column_name_result_t::column_name"]
+        [::std::mem::offset_of!(turso_statement_column_name_result_t, column_name) - 16usize];
+};
+impl Default for turso_statement_column_name_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    #[doc = " Get the column name at the index\n C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method"]
     pub fn turso_statement_column_name(
         self_: turso_statement_t,
         index: usize,
-    ) -> *const ::std::os::raw::c_char;
+    ) -> turso_statement_column_name_result_t;
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -587,7 +644,7 @@ unsafe extern "C" {
     pub fn turso_status_deinit(self_: turso_status_t);
 }
 unsafe extern "C" {
-    #[doc = " Deallocate C string"]
+    #[doc = " Deallocate C string allocated by Turso"]
     pub fn turso_str_deinit(self_: *const ::std::os::raw::c_char);
 }
 unsafe extern "C" {

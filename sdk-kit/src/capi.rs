@@ -1,15 +1,10 @@
-use std::mem::ManuallyDrop;
-
 use turso_sdk_kit_macros::signature;
 
 use c::{turso_slice_ref_t, turso_status_t, turso_value_t, turso_value_union_t};
 
-use crate::{
-    capi::c::turso_database_t,
-    rsapi::{
-        self, c_string_to_str, str_from_turso_slice, str_to_c_string, turso_slice_from_bytes,
-        value_from_c_value, TursoConnection, TursoDatabase, TursoStatement,
-    },
+use crate::rsapi::{
+    self, c_string_to_str, str_from_turso_slice, str_to_c_string, turso_slice_from_bytes,
+    value_from_c_value, TursoConnection, TursoDatabase, TursoStatement,
 };
 
 pub mod c {
@@ -63,8 +58,11 @@ pub extern "C" fn turso_database_create(
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_database_open(database: turso_database_t) -> c::turso_status_t {
-    let database = ManuallyDrop::new(unsafe { TursoDatabase::ref_from_capi(database) });
+pub extern "C" fn turso_database_open(database: c::turso_database_t) -> c::turso_status_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return err.to_capi(),
+    };
     match database.open() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -76,7 +74,15 @@ pub extern "C" fn turso_database_open(database: turso_database_t) -> c::turso_st
 pub extern "C" fn turso_database_connect(
     database: c::turso_database_t,
 ) -> c::turso_database_connect_result_t {
-    let database = ManuallyDrop::new(unsafe { TursoDatabase::ref_from_capi(database) });
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => {
+            return c::turso_database_connect_result_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
     match database.connect() {
         Ok(connection) => c::turso_database_connect_result_t {
             status: turso_status_ok(),
@@ -95,8 +101,6 @@ pub extern "C" fn turso_connection_prepare_single(
     connection: c::turso_connection_t,
     sql: c::turso_slice_ref_t,
 ) -> c::turso_connection_prepare_single_t {
-    let connection = ManuallyDrop::new(unsafe { TursoConnection::ref_from_capi(connection) });
-
     let sql = match str_from_turso_slice(sql) {
         Ok(sql) => sql,
         Err(err) => {
@@ -106,6 +110,16 @@ pub extern "C" fn turso_connection_prepare_single(
             }
         }
     };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => {
+            return c::turso_connection_prepare_single_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
+
     match connection.prepare_single(sql) {
         Ok(statement) => c::turso_connection_prepare_single_t {
             status: turso_status_ok(),
@@ -124,10 +138,17 @@ pub extern "C" fn turso_connection_prepare_first(
     connection: c::turso_connection_t,
     sql: c::turso_slice_ref_t,
 ) -> c::turso_connection_prepare_first_t {
-    let connection = ManuallyDrop::new(unsafe { TursoConnection::ref_from_capi(connection) });
-
     let sql = match str_from_turso_slice(sql) {
         Ok(sql) => sql,
+        Err(err) => {
+            return c::turso_connection_prepare_first_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
         Err(err) => {
             return c::turso_connection_prepare_first_t {
                 status: err.to_capi(),
@@ -163,7 +184,10 @@ pub extern "C" fn turso_connection_prepare_first_result_empty(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_run_io(statement: c::turso_statement_t) -> c::turso_status_t {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.run_io() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -175,7 +199,15 @@ pub extern "C" fn turso_statement_run_io(statement: c::turso_statement_t) -> c::
 pub extern "C" fn turso_statement_execute(
     statement: c::turso_statement_t,
 ) -> c::turso_statement_execute_t {
-    let statement = unsafe { TursoStatement::ref_from_capi(statement) };
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => {
+            return c::turso_statement_execute_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
     match statement.execute() {
         Ok(result) => c::turso_statement_execute_t {
             status: result.status.to_capi(),
@@ -191,7 +223,10 @@ pub extern "C" fn turso_statement_execute(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_step(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.step() {
         Ok(status) => status.to_capi(),
         Err(err) => err.to_capi(),
@@ -201,7 +236,10 @@ pub extern "C" fn turso_statement_step(statement: c::turso_statement_t) -> c::tu
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_reset(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.reset() {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -211,7 +249,10 @@ pub extern "C" fn turso_statement_reset(statement: c::turso_statement_t) -> c::t
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c::turso_status_t {
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.finalize() {
         Ok(status) => status.to_capi(),
         Err(err) => err.to_capi(),
@@ -223,17 +264,41 @@ pub extern "C" fn turso_statement_finalize(statement: c::turso_statement_t) -> c
 pub extern "C" fn turso_statement_column_name(
     statement: c::turso_statement_t,
     index: usize,
-) -> *const std::ffi::c_char {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+) -> c::turso_statement_column_name_result_t {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => {
+            return c::turso_statement_column_name_result_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
     let column = statement.column_name(index).to_string();
-    str_to_c_string(&column)
+    c::turso_statement_column_name_result_t {
+        status: turso_status_ok(),
+        column_name: str_to_c_string(&column),
+    }
 }
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_statement_column_count(statement: c::turso_statement_t) -> usize {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
-    statement.column_count()
+pub extern "C" fn turso_statement_column_count(
+    statement: c::turso_statement_t,
+) -> c::turso_statement_column_count_result_t {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => {
+            return c::turso_statement_column_count_result_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
+    c::turso_statement_column_count_result_t {
+        status: turso_status_ok(),
+        column_count: statement.column_count(),
+    }
 }
 
 #[no_mangle]
@@ -242,7 +307,15 @@ pub extern "C" fn turso_statement_row_value(
     statement: c::turso_statement_t,
     index: usize,
 ) -> c::turso_statement_row_value_t {
-    let statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => {
+            return c::turso_statement_row_value_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    };
     let value = statement.row_value(index);
     match value {
         Ok(turso_core::ValueRef::Null) => c::turso_statement_row_value_t {
@@ -306,7 +379,10 @@ pub extern "C" fn turso_statement_bind_named(
         Ok(value) => value,
         Err(err) => return err.to_capi(),
     };
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.bind_named(name, value) {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -324,7 +400,10 @@ pub extern "C" fn turso_statement_bind_positional(
         Ok(value) => value,
         Err(err) => return err.to_capi(),
     };
-    let mut statement = ManuallyDrop::new(unsafe { TursoStatement::ref_from_capi(statement) });
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(err) => return err.to_capi(),
+    };
     match statement.bind_positional(position, value) {
         Ok(()) => turso_status_ok(),
         Err(err) => err.to_capi(),
@@ -668,7 +747,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 5);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 5);
 
             let mut collected = vec![];
             loop {
@@ -682,7 +762,7 @@ mod tests {
                     break;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());
@@ -736,7 +816,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 5);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 5);
 
             assert_eq!(
                 turso_statement_bind_positional(
@@ -816,7 +897,7 @@ mod tests {
                     break;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());
@@ -870,7 +951,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 5);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 5);
 
             assert_eq!(
                 turso_statement_bind_named(
@@ -950,7 +1032,7 @@ mod tests {
                     break;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());
@@ -1021,7 +1103,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 1);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 1);
 
             let mut collected = vec![];
             loop {
@@ -1032,7 +1115,7 @@ mod tests {
                     continue;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());
@@ -1061,7 +1144,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 1);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 1);
 
             let mut collected = vec![];
             loop {
@@ -1072,7 +1156,7 @@ mod tests {
                     continue;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());
@@ -1144,7 +1228,8 @@ mod tests {
             assert_eq!(stmt.status.code, turso_status_code_t::TURSO_OK);
 
             let columns = turso_statement_column_count(stmt.statement);
-            assert_eq!(columns, 1);
+            assert_eq!(columns.status.code, turso_status_code_t::TURSO_OK);
+            assert_eq!(columns.column_count, 1);
 
             let mut collected = vec![];
             loop {
@@ -1155,7 +1240,7 @@ mod tests {
                     continue;
                 }
                 if status.code == turso_status_code_t::TURSO_ROW {
-                    for i in 0..columns {
+                    for i in 0..columns.column_count {
                         let row_value = turso_statement_row_value(stmt.statement, i);
                         assert_eq!(row_value.status.code, turso_status_code_t::TURSO_OK);
                         collected.push(value_from_c_value(row_value.value).unwrap());

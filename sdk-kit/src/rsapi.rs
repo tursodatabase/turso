@@ -105,7 +105,7 @@ pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::V
             Ok(turso_core::Value::Float(unsafe { value.value.real }))
         }
         capi::c::turso_type_t::TURSO_TYPE_TEXT => {
-            let text = std::str::from_utf8(bytes_from_turso_slice(unsafe { value.value.text }));
+            let text = std::str::from_utf8(bytes_from_turso_slice(unsafe { value.value.text })?);
             let text = match text {
                 Ok(text) => text,
                 Err(err) => {
@@ -121,7 +121,7 @@ pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::V
             )))
         }
         capi::c::turso_type_t::TURSO_TYPE_BLOB => {
-            let blob = bytes_from_turso_slice(unsafe { value.value.blob });
+            let blob = bytes_from_turso_slice(unsafe { value.value.blob })?;
             Ok(turso_core::Value::Blob(blob.to_vec()))
         }
     }
@@ -134,7 +134,14 @@ pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
     }
 }
 
+/// SAFETY: slice must points to the valid memory
 pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some(format!("expected slice representing utf-8 value, got null")),
+        });
+    }
     let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
     match std::str::from_utf8(s) {
         Ok(s) => Ok(s),
@@ -145,8 +152,17 @@ pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a
     }
 }
 
-pub fn bytes_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> &'a [u8] {
-    unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) }
+/// SAFETY: slice must points to the valid memory
+pub fn bytes_from_turso_slice<'a>(
+    slice: capi::c::turso_slice_ref_t,
+) -> Result<&'a [u8], TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some(format!("expected slice representing utf-8 value, got null")),
+        });
+    }
+    Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
 
 pub fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
@@ -445,8 +461,17 @@ impl TursoDatabase {
 
     /// helper method to restore TursoDatabase ref from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_database_t) -> &'a Self {
-        &*(value.inner as *const Self)
+    pub unsafe fn ref_from_capi<'a>(
+        value: capi::c::turso_database_t,
+    ) -> Result<&'a Self, TursoError> {
+        if value.inner.is_null() {
+            Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some(format!("got null pointer")),
+            })
+        } else {
+            Ok(&*(value.inner as *const Self))
+        }
     }
 
     /// helper method to restore TursoDatabase instance from C raw container
@@ -501,8 +526,17 @@ impl TursoConnection {
 
     /// helper method to restore TursoConnection ref from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_connection_t) -> &'a Self {
-        &*(value.inner as *const Self)
+    pub unsafe fn ref_from_capi<'a>(
+        value: capi::c::turso_connection_t,
+    ) -> Result<&'a Self, TursoError> {
+        if value.inner.is_null() {
+            Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some(format!("got null pointer")),
+            })
+        } else {
+            Ok(&*(value.inner as *const Self))
+        }
     }
 
     /// helper method to restore TursoConnection instance from C raw container
@@ -552,12 +586,19 @@ impl TursoStatement {
             let Some(parameter) = parameters.name(index) else {
                 continue;
             };
-            assert!(
-                parameter.starts_with(":")
-                    || parameter.starts_with("@")
-                    || parameter.starts_with("$")
-                    || parameter.starts_with("?")
-            );
+            if !(parameter.starts_with(":")
+                || parameter.starts_with("@")
+                || parameter.starts_with("$")
+                || parameter.starts_with("?"))
+            {
+                return Err(TursoError {
+                    code: TursoStatusCode::Error,
+                    message: Some(format!(
+                        "internal error: unexpected internal parameter name: {}",
+                        parameter
+                    )),
+                });
+            }
             if name.as_ref() == &parameter[1..] {
                 self.statement.bind_at(index, value);
                 return Ok(());
@@ -618,7 +659,12 @@ impl TursoStatement {
                     rows_changed: self.statement.n_change() as u64,
                 });
             }
-            panic!("unexpected status code: {status:?}");
+            return Err(TursoError {
+                code: TursoStatusCode::Error,
+                message: Some(format!(
+                    "internal error: unexpected status code: {status:?}",
+                )),
+            });
         }
     }
     /// run iteration of the IO backend
@@ -681,8 +727,17 @@ impl TursoStatement {
 
     /// helper method to restore TursoStatement ref from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn ref_from_capi<'a>(value: capi::c::turso_statement_t) -> &'a mut Self {
-        &mut *(value.inner as *mut Self)
+    pub unsafe fn ref_from_capi<'a>(
+        value: capi::c::turso_statement_t,
+    ) -> Result<&'a mut Self, TursoError> {
+        if value.inner.is_null() {
+            Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some(format!("got null pointer")),
+            })
+        } else {
+            Ok(&mut *(value.inner as *mut Self))
+        }
     }
 
     /// helper method to restore TursoStatement instance from C raw container

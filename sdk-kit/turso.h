@@ -60,10 +60,11 @@ typedef struct
     turso_tracing_level_t level;
 } turso_log_t;
 
-// ownership of the slice is not transferred - so its either caller owns the data or turso
-// as the owner doesn't change - there is no method to free the slice reference - because:
-// 1. if tursodb owns it - it will clean it in appropriate time
-// 2. if caller owns it - it must clean it in appropriate time with appropriate method and tursodb doesn't know how to properly free the data
+/// SAFETY: slice with non-null ptr must points to the valid memory range [ptr..ptr + len)
+/// ownership of the slice is not transferred - so its either caller owns the data or turso
+/// as the owner doesn't change - there is no method to free the slice reference - because:
+/// 1. if tursodb owns it - it will clean it in appropriate time
+/// 2. if caller owns it - it must clean it in appropriate time with appropriate method and tursodb doesn't know how to properly free the data
 typedef struct
 {
     const void *ptr;
@@ -89,7 +90,8 @@ typedef struct
     void *inner;
 } turso_connection_t;
 
-// structure holding opaque pointer to the TursoStatement instance
+/// structure holding opaque pointer to the TursoStatement instance
+/// SAFETY: the statement must be used exclusive and can't be accessed concurrently
 typedef struct
 {
     void *inner;
@@ -126,6 +128,8 @@ typedef struct
 
 typedef struct
 {
+    /// SAFETY: turso_log_t log argument fields have lifetime scoped to the logger invocation
+    /// caller must ensure that data is properly copied if it wants it to have longer lifetime
     void (*logger)(turso_log_t log);
     const char *log_level;
 } turso_config_t;
@@ -206,13 +210,27 @@ turso_status_t turso_statement_reset(turso_statement_t self);
  */
 turso_status_t turso_statement_finalize(turso_statement_t self);
 
+typedef struct
+{
+    turso_status_t status;
+    size_t column_count;
+} turso_statement_column_count_result_t;
+
 /** Get column count */
-size_t turso_statement_column_count(turso_statement_t self);
+turso_statement_column_count_result_t
+turso_statement_column_count(turso_statement_t self);
+
+typedef struct
+{
+    turso_status_t status;
+    const char *column_name;
+} turso_statement_column_name_result_t;
 
 /** Get the column name at the index
- * C string must be freed after the usage with corresponding turso_str_deinit(...) method
+ * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
  */
-const char *turso_statement_column_name(turso_statement_t self, size_t index);
+turso_statement_column_name_result_t
+turso_statement_column_name(turso_statement_t self, size_t index);
 
 typedef struct
 {
@@ -248,7 +266,7 @@ turso_value_t turso_null();
 
 /** Deallocate a status */
 void turso_status_deinit(turso_status_t self);
-/** Deallocate C string */
+/** Deallocate C string allocated by Turso */
 void turso_str_deinit(const char *self);
 /** Deallocate and close a database
  * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited database
