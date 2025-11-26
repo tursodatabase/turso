@@ -397,7 +397,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader, int length)
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader, int length)
       throws SQLException {
     requireNonNull(this.statement);
     if (reader == null) {
@@ -544,7 +544,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader, long length)
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader, long length)
       throws SQLException {
     requireLengthIsPositiveInt(length);
     setCharacterStream(parameterIndex, reader, (int) length);
@@ -607,7 +607,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader) throws SQLException {
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader) throws SQLException {
     requireNonNull(this.statement);
     if (reader == null) {
       setParam(parameterIndex, null);
