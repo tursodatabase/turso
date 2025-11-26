@@ -126,6 +126,23 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
     Ok(ctx)
 }
 
+#[inline]
+fn is_hash_join_build_table(
+    join_index: usize,
+    join_order: &[JoinOrderMember],
+    table_references: &TableReferences,
+) -> bool {
+    let current_idx = join_order[join_index].original_idx;
+    join_order.iter().skip(join_index + 1).any(|member| {
+        table_references
+            .joined_tables()
+            .get(member.original_idx)
+            .is_some_and(
+                |t| matches!(&t.op, Operation::HashJoin(hj) if hj.build_table_idx == current_idx),
+            )
+    })
+}
+
 /// Initialize resources needed for the source operators (tables, joins, etc)
 #[allow(clippy::too_many_arguments)]
 pub fn init_loop(
