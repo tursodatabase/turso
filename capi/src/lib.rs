@@ -370,8 +370,7 @@ pub extern "C" fn turso_connection_prepare_first(
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_statement_io(statement: c::turso_statement_t) -> c::turso_status_t {
-    let statement =
-        unsafe { ManuallyDrop::new(Arc::from_raw(statement.inner as *const Statement)) };
+    let statement = unsafe { ManuallyDrop::new(Box::from_raw(statement.inner as *mut Statement)) };
     let result = statement.run_once();
 
     match result {
