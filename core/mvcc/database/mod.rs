@@ -185,6 +185,10 @@ impl RowKey {
             _ => panic!("RowKey is not an integer"),
         }
     }
+
+    pub fn is_int_key(&self) -> bool {
+        matches!(self, RowKey::Int(_))
+    }
 }
 
 impl std::fmt::Display for RowKey {
