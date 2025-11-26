@@ -308,6 +308,19 @@ impl ProgramExecutionState {
     }
 }
 
+/// Re-entrant state for [Insn::HashBuild].
+/// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
+#[derive(Debug, Default)]
+pub struct OpHashBuildState {
+    pub key_values: Vec<Value>,
+    pub key_idx: usize,
+    pub rowid: Option<i64>,
+    pub cursor_id: CursorID,
+    pub hash_table_reg: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
