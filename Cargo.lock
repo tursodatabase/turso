@@ -4980,6 +4980,7 @@ dependencies = [
  "test-log",
  "thiserror 2.0.16",
  "tracing",
+ "tracing-subscriber",
  "turso_ext",
  "turso_macros",
  "turso_parser",
