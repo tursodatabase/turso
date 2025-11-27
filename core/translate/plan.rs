@@ -9,8 +9,9 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         emitter::UpdateRowSource,
+        expr::as_binary_components,
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::SeekRangeConstraint,
+        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
     },
     vdbe::{
         affinity::Affinity,
@@ -932,6 +933,46 @@ pub struct ExpressionIndexUsage {
     pub columns_mask: ColumnUsedMask,
 }
 
+/// Represents one key pair in a hash join equality condition.
+/// For `expr1 = expr2`, this tracks which WHERE term contains the equality
+/// and which side of the equality belongs to the build table.
+#[derive(Debug, Clone, Copy)]
+pub struct HashJoinKey {
+    /// Index into the where_clause vector
+    pub where_clause_idx: usize,
+    /// Which side of the binary equality expression belongs to the build table.
+    /// The other side belongs to the probe table.
+    pub build_side: BinaryExprSide,
+}
+
+impl HashJoinKey {
+    /// Get the build table's expression from the WHERE clause.
+    pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let where_term = &where_clause[self.where_clause_idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("HashJoinKey: expected a valid binary expression");
+        };
+        if self.build_side == BinaryExprSide::Lhs {
+            lhs
+        } else {
+            rhs
+        }
+    }
+
+    /// Get the probe table's expression from the WHERE clause.
+    pub fn get_probe_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let where_term = &where_clause[self.where_clause_idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("HashJoinKey: expected a valid binary expression");
+        };
+        if self.build_side == BinaryExprSide::Lhs {
+            rhs // probe is the opposite side
+        } else {
+            lhs
+        }
+    }
+}
+
 /// Hash join operation metadata
 #[derive(Debug, Clone)]
 pub struct HashJoinOp {
@@ -939,8 +980,9 @@ pub struct HashJoinOp {
     pub build_table_idx: usize,
     /// Index of the probe table in the join order (this table)
     pub probe_table_idx: usize,
-    /// Column pairs: (build_col, probe_col)
-    pub join_key_columns: Vec<(usize, usize)>,
+    /// Join key references, each entry points to an equality condition in the where_clause
+    /// and indicates which side of the equality belongs to the build table.
+    pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
 }

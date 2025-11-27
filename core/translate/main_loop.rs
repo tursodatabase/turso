@@ -804,18 +804,8 @@ pub fn open_loop(
 
                 // Allocate registers for hash table and join keys
                 let hash_table_reg = program.alloc_register();
-                let num_keys = hash_join_op.join_key_columns.len();
+                let num_keys = hash_join_op.join_keys.len();
                 let build_key_start_reg = program.alloc_registers(num_keys);
-
-                // Store column indices for join keys
-                for (idx, (build_col, _probe_col)) in
-                    hash_join_op.join_key_columns.iter().enumerate()
-                {
-                    program.emit_insn(Insn::Integer {
-                        value: *build_col as i64,
-                        dest: build_key_start_reg + idx,
-                    });
-                }
 
                 // Create new loop for hash table build phase
                 let build_loop_start = program.allocate_label();
@@ -858,20 +848,29 @@ pub fn open_loop(
                     }
                 }
 
-                // Extract collations for each join key column from build table
+                // Translate build key expressions into registers
+                // (expressions can be simple column refs or complex like substr(t.a, 1, 3))
+                for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+                    let build_expr = join_key.get_build_expr(predicates);
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        build_expr,
+                        build_key_start_reg + idx,
+                        &t_ctx.resolver,
+                    )?;
+                }
+
+                // Extract collations for each join key expression
                 let collations: Vec<CollationSeq> = hash_join_op
-                    .join_key_columns
+                    .join_keys
                     .iter()
-                    .map(|(build_col_idx, _)| {
-                        if let Some(btree) = build_table.table.btree() {
-                            btree
-                                .columns
-                                .get(*build_col_idx)
-                                .and_then(|col| col.collation_opt())
-                                .unwrap_or(CollationSeq::Binary)
-                        } else {
-                            CollationSeq::Binary
-                        }
+                    .map(|join_key| {
+                        let build_expr = join_key.get_build_expr(predicates);
+                        get_collseq_from_expr(build_expr, table_references)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(CollationSeq::Binary)
                     })
                     .collect();
 
@@ -909,16 +908,18 @@ pub fn open_loop(
                 });
                 program.preassign_label_to_next_insn(loop_start);
 
-                // Extract probe keys from current row
+                // Translate probe key expressions into registers
+                // (expressions can be simple column refs or complex like substr(t.a, 1, 3))
                 let probe_key_start_reg = program.alloc_registers(num_keys);
-                for (idx, (_build_col, probe_col)) in
-                    hash_join_op.join_key_columns.iter().enumerate()
-                {
-                    program.emit_column_or_rowid(
-                        probe_cursor_id,
-                        *probe_col,
+                for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+                    let probe_expr = join_key.get_probe_expr(predicates);
+                    translate_expr(
+                        program,
+                        Some(table_references),
+                        probe_expr,
                         probe_key_start_reg + idx,
-                    );
+                        &t_ctx.resolver,
+                    )?;
                 }
 
                 // Probe hash table with keys, store matched rowid in register

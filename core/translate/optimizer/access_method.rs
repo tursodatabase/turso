@@ -3,11 +3,11 @@ use std::sync::Arc;
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use crate::translate::expr::as_binary_components;
+use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, Constraint, RangeConstraintRef,
+    convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
-use crate::translate::plan::{NonFromClauseSubquery, SubqueryState, WhereTerm};
+use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
@@ -66,13 +66,11 @@ pub enum AccessMethodParams {
         build_table_idx: usize,
         /// The table to probe the hash table with.
         probe_table_idx: usize,
-        /// Column indices for the join keys (from both tables).
-        /// These are the columns that will be used to build and probe the hash table.
-        join_key_columns: Vec<(usize, usize)>, // (build_col, probe_col)
+        /// Join key references - each entry contains the where_clause index and which side
+        /// of the equality belongs to the build table. Supports expression-based join keys.
+        join_keys: Vec<HashJoinKey>,
         /// Memory budget for the hash table in bytes.
         mem_budget: usize,
-        /// WHERE clause indices that should be marked as consumed if this hash join is selected.
-        where_clause_indices: Vec<usize>,
     },
 }
 
@@ -252,63 +250,97 @@ fn find_best_access_method_for_vtab(
     }
 }
 
+/// Collect all table IDs referenced in an expression.
+fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
+    let mut tables = Vec::new();
+    let result = walk_expr(expr, &mut |e| {
+        match e {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                if !tables.contains(table) {
+                    tables.push(*table);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    result.ok().map(|_| tables)
+}
+
 /// Detect equi-join conditions between two tables that could be used for a hash join.
-/// Returns a list of (build_col, probe_col, where_idx) tuples if equi-join conditions are found.
+/// Returns a list of `HashJoinKey` entries pointing to equality conditions in the WHERE clause.
 ///
 /// This function analyzes the WHERE clause constraints to find equality conditions
-/// that join columns from the build table with columns from the probe table.
+/// where one side references only the build table and the other side references only the probe table.
+/// This supports expression-based join keys like `lower(t.a) = substr(t2.b, 1, 3)`.
 /// The caller is responsible for marking WHERE terms as consumed if hash join is selected.
 pub fn find_equijoin_conditions(
     build_table_id: TableInternalId,
     probe_table_id: TableInternalId,
     constraints: &[Constraint],
     where_clause: &[WhereTerm],
-) -> Vec<(usize, usize, usize)> {
-    let mut equijoin_cols = Vec::new();
+) -> Vec<HashJoinKey> {
+    let mut join_keys = Vec::new();
+    // Track which WHERE clause indices we've already processed to avoid duplicates
+    let mut seen_where_indices = Vec::new();
 
     for constraint in constraints {
         // Check if this is an equality constraint
         if !matches!(constraint.operator, ast::Operator::Equals) {
             continue;
         }
-
         // Get the original WHERE term
         let (where_idx, _side) = constraint.where_clause_pos;
-        let where_term = &where_clause[where_idx];
+        // Skip already processed indices (constraints can share the same WHERE term)
+        if seen_where_indices.contains(&where_idx) {
+            continue;
+        }
 
+        let where_term = &where_clause[where_idx];
         // Skip already consumed terms
         if where_term.consumed {
             continue;
         }
+
         let Ok(Some((lhs, ast::Operator::Equals, rhs))) = as_binary_components(&where_term.expr)
         else {
             continue;
         };
 
-        // Extract column information from both sides
-        let lhs_col = match lhs {
-            ast::Expr::Column { table, column, .. } => Some((*table, *column)),
-            ast::Expr::RowId { table, .. } => Some((*table, 0)),
-            _ => None,
+        // Collect table references from each side of the equality
+        let Some(lhs_tables) = collect_table_refs(lhs) else {
+            continue;
+        };
+        let Some(rhs_tables) = collect_table_refs(rhs) else {
+            continue;
         };
 
-        let rhs_col = match rhs {
-            ast::Expr::Column { table, column, .. } => Some((*table, *column)),
-            _ => None,
+        // Each side must reference exactly one table for a valid equi-join key
+        if lhs_tables.len() != 1 || rhs_tables.len() != 1 {
+            continue;
+        }
+
+        let lhs_table = lhs_tables[0];
+        let rhs_table = rhs_tables[0];
+        // Check if one side references build table and the other references probe table
+        let build_side = if lhs_table == build_table_id && rhs_table == probe_table_id {
+            Some(BinaryExprSide::Lhs)
+        } else if lhs_table == probe_table_id && rhs_table == build_table_id {
+            Some(BinaryExprSide::Rhs)
+        } else {
+            None
         };
 
-        // Check if we have a column from each table
-        if let (Some((lhs_table, lhs_column)), Some((rhs_table, rhs_column))) = (lhs_col, rhs_col) {
-            // Check if one column is from build table and one from probe table
-            if lhs_table == build_table_id && rhs_table == probe_table_id {
-                equijoin_cols.push((lhs_column, rhs_column, where_idx));
-            } else if lhs_table == probe_table_id && rhs_table == build_table_id {
-                equijoin_cols.push((rhs_column, lhs_column, where_idx));
-            }
+        if let Some(build_side) = build_side {
+            seen_where_indices.push(where_idx);
+            join_keys.push(HashJoinKey {
+                where_clause_idx: where_idx,
+                build_side,
+            });
         }
     }
 
-    equijoin_cols
+    join_keys
 }
 
 /// Estimate the cost of a hash join between two tables.
@@ -402,8 +434,6 @@ pub fn try_hash_join_access_method(
     }
 
     // Avoid hash joins when there are correlated subqueries that reference the joined tables.
-    // Executing Gosub during the probe phase while reading from the build table cursor
-    // can trigger hash table operations in invalid states.
     for subquery in subqueries {
         if !subquery.correlated {
             continue;
@@ -423,8 +453,7 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    // Find equi-join conditions
-    let equijoin_cols_with_indices = find_equijoin_conditions(
+    let join_keys = find_equijoin_conditions(
         build_table.internal_id,
         probe_table.internal_id,
         &probe_constraints.constraints,
@@ -432,27 +461,17 @@ pub fn try_hash_join_access_method(
     );
 
     // Need at least one equi-join condition
-    if equijoin_cols_with_indices.is_empty() {
+    if join_keys.is_empty() {
         return None;
     }
-
-    // Extract join key columns and WHERE clause indices
-    let mut join_key_columns = Vec::new();
-    let mut where_clause_indices = Vec::new();
-    for (build_col, probe_col, where_idx) in equijoin_cols_with_indices {
-        join_key_columns.push((build_col, probe_col));
-        where_clause_indices.push(where_idx);
-    }
-
     let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
     Some(AccessMethod {
         cost,
         params: AccessMethodParams::HashJoin {
             build_table_idx,
             probe_table_idx,
-            join_key_columns,
+            join_keys,
             mem_budget: DEFAULT_MEM_BUDGET,
-            where_clause_indices,
         },
     })
 }

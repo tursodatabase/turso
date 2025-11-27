@@ -953,20 +953,19 @@ fn optimize_table_access(
             AccessMethodParams::HashJoin {
                 build_table_idx,
                 probe_table_idx,
-                join_key_columns,
+                join_keys,
                 mem_budget,
-                where_clause_indices,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
-                for &where_idx in where_clause_indices.iter() {
-                    where_clause[where_idx].consumed = true;
+                for join_key in join_keys.iter() {
+                    where_clause[join_key.where_clause_idx].consumed = true;
                 }
                 // Set up hash join operation on the probe table
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::HashJoin(HashJoinOp {
                         build_table_idx: *build_table_idx,
                         probe_table_idx: *probe_table_idx,
-                        join_key_columns: join_key_columns.clone(),
+                        join_keys: join_keys.clone(),
                         mem_budget: *mem_budget,
                     });
             }

@@ -9390,80 +9390,13 @@ pub fn op_hash_build(
         state.hash_tables.insert(*hash_table_reg, hash_table);
     }
 
-    // Extract join key values from the cursor's current row
-    // key_start_reg contains the column indices to extract
+    // Read pre-computed key values directly from registers
     while op_state.key_idx < *num_keys {
         let i = op_state.key_idx;
-        // Get the column index from the register
-        let column_idx_reg = &state.registers[*key_start_reg + i];
-        let column_idx = match column_idx_reg.get_value() {
-            Value::Integer(idx) => *idx as usize,
-            _ => {
-                return Err(LimboError::InternalError(format!(
-                    "HashBuild: expected integer column index in register {}, key{}/{}",
-                    key_start_reg + i,
-                    i + 1,
-                    num_keys
-                )));
-            }
-        };
-
-        // Extract the column value from the cursor
-        let value_io: Result<IOResult<Value>, LimboError> = {
-            let cursor = state.get_cursor(*cursor_id);
-            match cursor {
-                Cursor::BTree(btree_cursor) => {
-                    // Check if this column is the rowid (column 0 might be INTEGER PRIMARY KEY)
-                    // In that case, the value is not in the record but is the rowid itself
-                    match btree_cursor.record() {
-                        Ok(IOResult::Done(record_option)) => {
-                            let record = record_option.ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "HashBuild: cursor has no record".to_string(),
-                                )
-                            })?;
-                            let value_ref = record.get_value(column_idx)?;
-                            if matches!(value_ref, ValueRef::Null) && column_idx == 0 {
-                                match btree_cursor.rowid() {
-                                    Ok(IOResult::Done(rowid_opt)) => {
-                                        let value = if let Some(rowid_val) = rowid_opt {
-                                            Value::Integer(rowid_val)
-                                        } else {
-                                            value_ref.to_owned()
-                                        };
-                                        Ok(IOResult::Done(value))
-                                    }
-                                    Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
-                                    Err(e) => Err(e),
-                                }
-                            } else {
-                                Ok(IOResult::Done(value_ref.to_owned()))
-                            }
-                        }
-                        Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
-                        Err(e) => Err(e),
-                    }
-                }
-                _ => Err(LimboError::InternalError(
-                    "HashBuild: unsupported cursor type".to_string(),
-                )),
-            }
-        };
-
-        match value_io {
-            Ok(IOResult::Done(v)) => {
-                op_state.key_values.push(v);
-                op_state.key_idx += 1;
-            }
-            Ok(IOResult::IO(io)) => {
-                state.op_hash_build_state = Some(op_state);
-                return Ok(InsnFunctionStepResult::IO(io));
-            }
-            Err(e) => {
-                state.op_hash_build_state = Some(op_state);
-                return Err(e);
-            }
-        }
+        let reg = &state.registers[*key_start_reg + i];
+        let value = reg.get_value().clone();
+        op_state.key_values.push(value);
+        op_state.key_idx += 1;
     }
 
     // Get the rowid from the cursor
@@ -9528,8 +9461,6 @@ pub fn op_hash_build_finalize(
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashBuildFinalize { hash_table_reg }, insn);
-
-    // Finalize hash table build
     if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
         ht.finalize_build();
     }
@@ -9564,11 +9495,9 @@ pub fn op_hash_probe(
         probe_keys.push(value);
     }
 
-    // Probe the hash table
     let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
     })?;
-
     match hash_table.probe(probe_keys) {
         Some(entry) => {
             // Match found, store the rowid in destination register

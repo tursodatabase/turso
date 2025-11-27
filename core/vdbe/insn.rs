@@ -1284,9 +1284,10 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
     /// Build a hash table from a cursor for hash join.
-    /// Extract join keys from the current row of cursor_id (registers key_start_reg..key_start_reg+num_keys-1),
-    /// and insert the current row into the in-memory hash table stored in hash_table_reg.
-    /// Creates the hash table on first call. If memory exceeds mem_budget, return an error.
+    /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
+    /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
+    /// The hash table is stored in hash_table_reg and created on first call.
+    /// If memory exceeds mem_budget, return an error.
     HashBuild {
         cursor_id: CursorID,
         key_start_reg: usize,

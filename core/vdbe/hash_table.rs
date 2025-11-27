@@ -279,7 +279,7 @@ impl HashTable {
         &self.state
     }
 
-    /// Insert a row into the hash table.
+    /// Insert a row into the hash table, returns IOResult because this will eventually spill to disk.
     pub fn insert(&mut self, key_values: Vec<Value>, rowid: i64) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building,
