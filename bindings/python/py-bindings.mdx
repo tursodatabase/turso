@@ -4,7 +4,7 @@ name: 2025-11-26-py-bindings
 
 <Output path="./turso/lib.py">
 
-<Code model="anthropic/claude-sonnet-4-5" language="python">
+<Code model="openai/gpt-5" language="python">
 
 Turso - is the SQLite compatible database written in Rust.
 One of the important features of the Turso - is async IO execution which can be used with modern storage backend like IO uring.
@@ -43,7 +43,12 @@ class Cursor: ...
 # Row goes THIRD
 class Row: ...
 
-def connect(...): ...
+def connect(
+    database: str,
+    *,
+    experimental_features: Optional[str] = None,
+    isolation_level: Optional[str] = "DEFERRED",
+): ...
 
 # Make it easy to enable logging with native `logging` Python module
 def setup_logging(level: int = logging.INFO) -> None: ...
@@ -58,6 +63,7 @@ def setup_logging(level: int = logging.INFO) -> None: ...
     * DO NOT check for any symbols to detect multi statements, named parameters, etc - this is error prone. Use provided methods and avoid certain checks if they are impossible with current API provided from the Rust
 - FOCUS on code readability: if possible extract helper function but make sure that it will be used more than once and that it really contribute to the code readability
 - WATCH OUT for variables scopes and do not use variables which are no longer accessible
+- DO NOT TRACK transaction state manually and use `get_auto_commit` method - otherwise it can be hard to properly implement implicit transaction rules of DB API2
 - USE forward reference string in when return method type depends on its class:
 ```py
 class T: 
@@ -67,7 +73,13 @@ class T:
 # Implementation
 
 - Put compact citations from the official DB-API doc if this is helpful
+- Driver must implement context API for Python to be used like `with ... as conn:` ...
 - Driver implementation must be type-friendly - emit types everywhere at API boundary (public methods, class fields, etc)
+    * DO NOT forget that constructor of Row must have following signature: 
+```py
+class Row(Sequence[Any]):
+    def __new__(cls, cursor: Cursor, data: tuple[Any, ...], /) -> Self: ...
+```
     * Make typings compatible with official types:
     <Link url="https://raw.githubusercontent.com/python/typeshed/refs/heads/main/stdlib/sqlite3/__init__.pyi" /> 
 
@@ -88,11 +100,14 @@ Make driver API similar to the SQLite DB-API2 for the python.
 Pay additional attention to the following aspects:
 * SQLite DB-API2 implementation implicitly opens transaction for DML queries in the execute(...) method:
     > If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is an INSERT, UPDATE, DELETE, or REPLACE statement, and there is no open transaction, a transaction is implicitly opened before executing sql.
+    - MAKE SURE this logic implemented properly
+* Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of last executed statement (not all of them)
 * Convert exceptions from rust layer to appropriate exceptions documented in the sqlite3 db-api2 docs
+* BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly commited in case of cursor close
 
 <Shell 
     cmd="curl https://docs.python.org/3/library/sqlite3.html | pandoc --from html --to markdown" 
-    selector="~Connection objects|~Cursor objects|~Row objects|~Exceptions" 
+    selector="~Connection objects|~Cursor objects|~Row objects|~Exceptions|~Transaction" 
     ext=".md"
 />
 

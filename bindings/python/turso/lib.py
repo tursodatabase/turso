@@ -1,88 +1,76 @@
-from typing import Any, Callable, Iterator, Optional, Sequence, Tuple, Union
-from collections.abc import Iterable
+from __future__ import annotations
+
 import logging
-import re
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, Callable, Optional, TypeVar
 
 from ._turso import (
-    PyTursoStatusCode,
-    PyTursoSetupConfig,
-    PyTursoDatabaseConfig,
-    PyTursoStatement,
-    py_turso_setup,
-    py_turso_database_open,
     Busy,
-    Interrupt,
-    Error,
-    Misuse,
     Constraint,
-    Readonly,
-    DatabaseFull,
-    NotAdb,
     Corrupt,
+    DatabaseFull,
+    Error as TursoError,
+    Interrupt,
+    Misuse,
+    NotAdb,
+    PyTursoConnection,
+    PyTursoDatabase,
+    PyTursoDatabaseConfig,
+    PyTursoExecutionResult,
+    PyTursoStatusCode,
+    PyTursoStatement,
+    PyTursoSetupConfig,
+    PyTursoLog,
+    PyTursoStatusCode as Status,
+    py_turso_database_open,
+    py_turso_setup,
 )
-
 
 # DB-API 2.0 module attributes
 apilevel = "2.0"
-threadsafety = 1
-paramstyle = "qmark"
-
-# DB-API 2.0 transaction control constants
-LEGACY_TRANSACTION_CONTROL = "legacy"
-
+threadsafety = 1  # 1 means: Threads may share the module, but not connections.
+paramstyle = "qmark"  # Only positional parameters are supported.
 
 # Exception hierarchy following DB-API 2.0
 class Warning(Exception):
-    """Exception raised for important warnings."""
-
     pass
 
 
-class DatabaseError(Error):
-    """Exception raised for errors that are related to the database."""
-
+class Error(Exception):
     pass
 
 
 class InterfaceError(Error):
-    """Exception raised for errors that are related to the database interface."""
+    pass
 
+
+class DatabaseError(Error):
     pass
 
 
 class DataError(DatabaseError):
-    """Exception raised for errors that are due to problems with the processed data."""
-
     pass
 
 
 class OperationalError(DatabaseError):
-    """Exception raised for errors that are related to the database's operation."""
-
     pass
 
 
 class IntegrityError(DatabaseError):
-    """Exception raised when the relational integrity of the database is affected."""
-
     pass
 
 
 class InternalError(DatabaseError):
-    """Exception raised when the database encounters an internal error."""
-
     pass
 
 
 class ProgrammingError(DatabaseError):
-    """Exception raised for programming errors."""
-
     pass
 
 
 class NotSupportedError(DatabaseError):
-    """Exception raised when a method or database API is not supported."""
-
     pass
 
 
@@ -90,853 +78,826 @@ def _map_turso_exception(exc: Exception) -> Exception:
     """Maps Turso-specific exceptions to DB-API 2.0 exception hierarchy"""
     if isinstance(exc, Busy):
         return OperationalError(str(exc))
-    elif isinstance(exc, Interrupt):
+    if isinstance(exc, Interrupt):
         return OperationalError(str(exc))
-    elif isinstance(exc, Misuse):
-        return ProgrammingError(str(exc))
-    elif isinstance(exc, Constraint):
+    if isinstance(exc, Misuse):
+        return InterfaceError(str(exc))
+    if isinstance(exc, Constraint):
         return IntegrityError(str(exc))
-    elif isinstance(exc, Readonly):
-        return OperationalError(str(exc))
-    elif isinstance(exc, DatabaseFull):
-        return OperationalError(str(exc))
-    elif isinstance(exc, NotAdb):
+    if isinstance(exc, TursoError):
+        # Generic Turso error -> DatabaseError
         return DatabaseError(str(exc))
-    elif isinstance(exc, Corrupt):
+    if isinstance(exc, DatabaseFull):
+        return OperationalError(str(exc))
+    if isinstance(exc, NotAdb):
         return DatabaseError(str(exc))
-    elif isinstance(exc, Error):
+    if isinstance(exc, Corrupt):
         return DatabaseError(str(exc))
     return exc
 
 
-# DML statement detection pattern
-_DML_PATTERN = re.compile(r"^\s*(INSERT|UPDATE|DELETE|REPLACE)\s", re.IGNORECASE | re.MULTILINE)
+# Internal helpers
+
+_DBCursorT = TypeVar("_DBCursorT", bound="Cursor")
 
 
-def _is_dml_statement(sql: str) -> bool:
-    """Check if SQL statement is a DML statement that requires transaction handling."""
-    return bool(_DML_PATTERN.match(sql.strip()))
+def _first_keyword(sql: str) -> str:
+    """
+    Return the first SQL keyword (uppercased) ignoring leading whitespace
+    and single-line and multi-line comments.
+
+    This is intentionally minimal and only used to detect DML for implicit
+    transaction handling. It may not handle all edge cases (e.g. complex WITH).
+    """
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            # line comment
+            i += 2
+            while i < n and sql[i] not in ("\r", "\n"):
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            # block comment
+            i += 2
+            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        break
+    # read token
+    j = i
+    while j < n and (sql[j].isalpha() or sql[j] == "_"):
+        j += 1
+    return sql[i:j].upper()
 
 
+def _is_dml(sql: str) -> bool:
+    kw = _first_keyword(sql)
+    if kw in ("INSERT", "UPDATE", "DELETE", "REPLACE"):
+        return True
+    # "WITH" can also prefix DML, but we conservatively skip it to avoid false positives.
+    return False
+
+
+def _is_insert_or_replace(sql: str) -> bool:
+    kw = _first_keyword(sql)
+    return kw in ("INSERT", "REPLACE")
+
+
+def _run_execute_with_io(stmt: PyTursoStatement) -> PyTursoExecutionResult:
+    """
+    Run PyTursoStatement.execute() handling potential async IO loops.
+    """
+    while True:
+        result = stmt.execute()
+        status = result.status
+        if status == Status.Io:
+            # Drive IO loop; repeat.
+            stmt.run_io()
+            continue
+        return result
+
+
+def _step_once_with_io(stmt: PyTursoStatement) -> PyTursoStatusCode:
+    """
+    Run PyTursoStatement.step() once handling potential async IO loops.
+    """
+    while True:
+        status = stmt.step()
+        if status == Status.Io:
+            stmt.run_io()
+            continue
+        return status
+
+
+@dataclass
+class _Prepared:
+    stmt: PyTursoStatement
+    tail_index: int
+    has_columns: bool
+    column_names: tuple[str, ...]
+
+
+# Connection goes FIRST
 class Connection:
     """
-    A Connection object represents a connection to a Turso database.
+    A connection to a Turso (SQLite-compatible) database.
 
-    Connection objects are created using the connect() function.
-    They are used to create Cursor objects and manage transactions.
+    Similar to sqlite3.Connection with a subset of features focusing on DB-API 2.0.
     """
+
+    # Expose exception classes as attributes like sqlite3.Connection does
+    @property
+    def DataError(self) -> type[DataError]:
+        return DataError
+
+    @property
+    def DatabaseError(self) -> type[DatabaseError]:
+        return DatabaseError
+
+    @property
+    def Error(self) -> type[Error]:
+        return Error
+
+    @property
+    def IntegrityError(self) -> type[IntegrityError]:
+        return IntegrityError
+
+    @property
+    def InterfaceError(self) -> type[InterfaceError]:
+        return InterfaceError
+
+    @property
+    def InternalError(self) -> type[InternalError]:
+        return InternalError
+
+    @property
+    def NotSupportedError(self) -> type[NotSupportedError]:
+        return NotSupportedError
+
+    @property
+    def OperationalError(self) -> type[OperationalError]:
+        return OperationalError
+
+    @property
+    def ProgrammingError(self) -> type[ProgrammingError]:
+        return ProgrammingError
+
+    @property
+    def Warning(self) -> type[Warning]:
+        return Warning
 
     def __init__(
         self,
-        database: str,
+        conn: PyTursoConnection,
         *,
-        experimental_features: Optional[str] = None,
-        async_io: bool = False,
-        autocommit: Union[bool, str] = LEGACY_TRANSACTION_CONTROL,
-        isolation_level: Optional[str] = "",
-    ):
-        """Initialize a connection to a Turso database."""
-        self._database_path = database
-        self._experimental_features = experimental_features
-        self._async_io = async_io
-        self._autocommit = autocommit
-        self._isolation_level = isolation_level
-        self._closed = False
+        isolation_level: Optional[str] = "DEFERRED",
+    ) -> None:
+        self._conn: PyTursoConnection = conn
+        # autocommit behavior:
+        # - True: SQLite autocommit mode; commit/rollback are no-ops.
+        # - False: PEP 249 compliant: ensure a transaction is always open. We'll use BEGIN DEFERRED after commit/rollback.
+        # - "LEGACY": implicit transactions on DML when isolation_level is not None.
+        self._autocommit_mode: object | bool = "LEGACY"
+        self.isolation_level: Optional[str] = isolation_level
+        self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
+        self.text_factory: Any = str
 
-        # Open database and create connection
-        config = PyTursoDatabaseConfig(path=database, experimental_features=experimental_features, async_io=async_io)
+        # If autocommit is False, ensure a transaction is open
+        if self._autocommit_mode is False:
+            self._ensure_transaction_open()
+
+    def _ensure_transaction_open(self) -> None:
+        """
+        Ensure a transaction is open when autocommit is False.
+        """
         try:
-            self._db = py_turso_database_open(config)
-            self._conn = self._db.connect()
-        except Exception as e:
-            raise _map_turso_exception(e)
+            if self._conn.get_auto_commit():
+                # No transaction active -> open new one according to isolation_level (default to DEFERRED)
+                level = self.isolation_level or "DEFERRED"
+                self._exec_ddl_only(f"BEGIN {level}")
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
 
-        # Track transaction state for legacy mode
-        self._in_transaction = False
-
-    def cursor(self, factory: type = None) -> "Cursor":
+    def _exec_ddl_only(self, sql: str) -> None:
         """
-        Create and return a Cursor object.
-
-        Args:
-            factory: Optional cursor factory. If supplied, this must be a callable
-                    returning an instance of Cursor or its subclasses.
-
-        Returns:
-            A new Cursor object.
+        Execute a SQL statement that does not produce rows and ignore any result rows.
         """
-        self._check_closed()
+        try:
+            stmt = self._conn.prepare_single(sql)
+            _run_execute_with_io(stmt)
+            # finalize to ensure completion; finalize never mixes with execute
+            stmt.finalize()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def _prepare_first(self, sql: str) -> _Prepared:
+        """
+        Prepare the first statement in the given SQL string and return metadata.
+        """
+        try:
+            opt = self._conn.prepare_first(sql)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+        if opt is None:
+            raise ProgrammingError("no SQL statements to execute")
+
+        stmt, tail_idx = opt
+        # Determine whether statement returns columns (rows)
+        try:
+            columns = tuple(stmt.columns())
+        except Exception as exc:  # noqa: BLE001
+            # Clean up statement before re-raising
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+        has_cols = len(columns) > 0
+        return _Prepared(stmt=stmt, tail_index=tail_idx, has_columns=has_cols, column_names=columns)
+
+    def _raise_if_multiple_statements(self, sql: str, tail_index: int) -> None:
+        """
+        Ensure there is no second statement after the first one; otherwise raise ProgrammingError.
+        """
+        # Skip any trailing whitespace/comments after tail_index, and check if another statement exists.
+        rest = sql[tail_index:]
+        try:
+            nxt = self._conn.prepare_first(rest)
+            if nxt is not None:
+                # Clean-up the prepared second statement immediately
+                second_stmt, _ = nxt
+                try:
+                    second_stmt.finalize()
+                except Exception:
+                    pass
+                raise ProgrammingError("You can only execute one statement at a time")
+        except ProgrammingError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    @property
+    def in_transaction(self) -> bool:
+        try:
+            return not self._conn.get_auto_commit()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    # Provide autocommit property for sqlite3-like API (optional)
+    @property
+    def autocommit(self) -> object | bool:
+        return self._autocommit_mode
+
+    @autocommit.setter
+    def autocommit(self, val: object | bool) -> None:
+        # Accept True, False, or "LEGACY"
+        if val not in (True, False, "LEGACY"):
+            raise ProgrammingError("autocommit must be True, False, or 'LEGACY'")
+        self._autocommit_mode = val
+        # If switching to False, ensure a transaction is open
+        if val is False:
+            self._ensure_transaction_open()
+        # If switching to True or LEGACY, nothing else to do immediately.
+
+    def close(self) -> None:
+        # In sqlite3: If autocommit is False, pending transaction is implicitly rolled back.
+        try:
+            if self._autocommit_mode is False and self.in_transaction:
+                try:
+                    self._exec_ddl_only("ROLLBACK")
+                except Exception:
+                    # As sqlite3 does, ignore rollback failure on close
+                    pass
+            self._conn.close()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def commit(self) -> None:
+        try:
+            if self._autocommit_mode is True:
+                # No-op in SQLite autocommit mode
+                return
+            if self.in_transaction:
+                self._exec_ddl_only("COMMIT")
+            if self._autocommit_mode is False:
+                # Re-open a transaction to maintain PEP 249 behavior
+                self._ensure_transaction_open()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def rollback(self) -> None:
+        try:
+            if self._autocommit_mode is True:
+                # No-op in SQLite autocommit mode
+                return
+            if self.in_transaction:
+                self._exec_ddl_only("ROLLBACK")
+            if self._autocommit_mode is False:
+                # Re-open a transaction to maintain PEP 249 behavior
+                self._ensure_transaction_open()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def _maybe_implicit_begin(self, sql: str) -> None:
+        """
+        Implement sqlite3 legacy implicit transaction behavior:
+
+        If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is a DML
+        (INSERT/UPDATE/DELETE/REPLACE), and there is no open transaction, issue:
+            BEGIN <isolation_level>
+        """
+        if self._autocommit_mode == "LEGACY" and self.isolation_level is not None:
+            if not self.in_transaction and _is_dml(sql):
+                level = self.isolation_level or "DEFERRED"
+                self._exec_ddl_only(f"BEGIN {level}")
+
+    def cursor(self, factory: Optional[Callable[[Connection], _DBCursorT]] = None) -> _DBCursorT | Cursor:
         if factory is None:
             return Cursor(self)
         return factory(self)
 
-    def commit(self) -> None:
-        """
-        Commit any pending transaction to the database.
+    def execute(self, sql: str, parameters: Sequence[Any] | Mapping[str, Any] = ()) -> Cursor:
+        cur = self.cursor()
+        cur.execute(sql, parameters)
+        return cur
 
-        If autocommit is True or LEGACY_TRANSACTION_CONTROL with no open transaction,
-        this method does nothing.
-        """
-        self._check_closed()
+    def executemany(self, sql: str, parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> Cursor:
+        cur = self.cursor()
+        cur.executemany(sql, parameters)
+        return cur
 
-        # Handle autocommit mode
-        if self._autocommit is True:
-            return
+    def executescript(self, sql_script: str) -> Cursor:
+        cur = self.cursor()
+        cur.executescript(sql_script)
+        return cur
 
-        # Handle legacy transaction control
-        if self._autocommit == LEGACY_TRANSACTION_CONTROL:
-            if not self._in_transaction:
-                return
-            try:
-                stmt = self._conn.prepare_single("COMMIT")
-                result = stmt.execute()
-                self._handle_io_loop(stmt, result.status)
-                stmt.finalize()
-                self._in_transaction = False
-            except Exception as e:
-                raise _map_turso_exception(e)
-        else:
-            # PEP 249 compliant mode (autocommit=False)
-            try:
-                stmt = self._conn.prepare_single("COMMIT")
-                result = stmt.execute()
-                self._handle_io_loop(stmt, result.status)
-                stmt.finalize()
-                # Implicitly start a new transaction
-                self._begin_transaction()
-            except Exception as e:
-                raise _map_turso_exception(e)
-
-    def rollback(self) -> None:
-        """
-        Roll back to the start of any pending transaction.
-
-        If autocommit is True or LEGACY_TRANSACTION_CONTROL with no open transaction,
-        this method does nothing.
-        """
-        self._check_closed()
-
-        # Handle autocommit mode
-        if self._autocommit is True:
-            return
-
-        # Handle legacy transaction control
-        if self._autocommit == LEGACY_TRANSACTION_CONTROL:
-            if not self._in_transaction:
-                return
-            try:
-                stmt = self._conn.prepare_single("ROLLBACK")
-                result = stmt.execute()
-                self._handle_io_loop(stmt, result.status)
-                stmt.finalize()
-                self._in_transaction = False
-            except Exception as e:
-                raise _map_turso_exception(e)
-        else:
-            # PEP 249 compliant mode (autocommit=False)
-            try:
-                stmt = self._conn.prepare_single("ROLLBACK")
-                result = stmt.execute()
-                self._handle_io_loop(stmt, result.status)
-                stmt.finalize()
-                # Implicitly start a new transaction
-                self._begin_transaction()
-            except Exception as e:
-                raise _map_turso_exception(e)
-
-    def close(self) -> None:
-        """
-        Close the database connection.
-
-        If autocommit is False, any pending transaction is implicitly rolled back.
-        """
-        if self._closed:
-            return
-
-        # Roll back pending transaction if in PEP 249 mode
-        if self._autocommit is False:
-            try:
-                self.rollback()
-            except Exception:
-                pass
-
+    def __call__(self, sql: str) -> PyTursoStatement:
+        # Shortcut to prepare a single statement
         try:
-            self._conn.close()
-        except Exception as e:
-            raise _map_turso_exception(e)
-        finally:
-            self._closed = True
-
-    def execute(self, sql: str, parameters: Union[Sequence, dict] = ()) -> "Cursor":
-        """
-        Create a new Cursor object and call execute() on it with the given sql and parameters.
-
-        Returns:
-            The new cursor object.
-        """
-        cursor = self.cursor()
-        cursor.execute(sql, parameters)
-        return cursor
-
-    def executemany(self, sql: str, parameters: Iterable) -> "Cursor":
-        """
-        Create a new Cursor object and call executemany() on it with the given sql and parameters.
-
-        Returns:
-            The new cursor object.
-        """
-        cursor = self.cursor()
-        cursor.executemany(sql, parameters)
-        return cursor
-
-    def executescript(self, sql_script: str) -> "Cursor":
-        """
-        Create a new Cursor object and call executescript() on it with the given sql_script.
-
-        Returns:
-            The new cursor object.
-        """
-        cursor = self.cursor()
-        cursor.executescript(sql_script)
-        return cursor
-
-    def _check_closed(self) -> None:
-        """Check if connection is closed and raise exception if it is."""
-        if self._closed:
-            raise ProgrammingError("Cannot operate on a closed connection")
-
-    def _begin_transaction(self) -> None:
-        """Begin a new transaction with the appropriate isolation level."""
-        if self._isolation_level is None:
-            return
-
-        # Determine BEGIN statement based on isolation level
-        if self._isolation_level == "" or self._isolation_level == "DEFERRED":
-            begin_sql = "BEGIN DEFERRED"
-        elif self._isolation_level == "IMMEDIATE":
-            begin_sql = "BEGIN IMMEDIATE"
-        elif self._isolation_level == "EXCLUSIVE":
-            begin_sql = "BEGIN EXCLUSIVE"
-        else:
-            begin_sql = "BEGIN DEFERRED"
-
-        try:
-            stmt = self._conn.prepare_single(begin_sql)
-            result = stmt.execute()
-            self._handle_io_loop(stmt, result.status)
-            stmt.finalize()
-            if self._autocommit == LEGACY_TRANSACTION_CONTROL:
-                self._in_transaction = True
-        except Exception as e:
-            raise _map_turso_exception(e)
-
-    def _handle_io_loop(self, stmt: PyTursoStatement, status: PyTursoStatusCode) -> None:
-        """Handle async IO loop if needed."""
-        if not self._async_io:
-            return
-
-        while status == PyTursoStatusCode.Io:
-            stmt.run_io()
-            # For execute, we need to call execute again to get updated status
-            # But since we're in execute path, status should not be Io unless async_io is true
-            # The Rust layer handles this, so we just need to run_io
-            break
-
-    @property
-    def autocommit(self) -> Union[bool, str]:
-        """Get or set autocommit mode."""
-        return self._autocommit
-
-    @autocommit.setter
-    def autocommit(self, value: Union[bool, str]) -> None:
-        """Set autocommit mode."""
-        self._check_closed()
-
-        old_value = self._autocommit
-        self._autocommit = value
-
-        # Handle transition from False to True: commit pending transaction
-        if old_value is False and value is True:
-            if not self._conn.get_auto_commit():
-                self.commit()
-
-        # Handle transition to False: start new transaction
-        if value is False:
-            if self._conn.get_auto_commit():
-                self._begin_transaction()
-
-    @property
-    def in_transaction(self) -> bool:
-        """
-        Returns True if a transaction is active (uncommitted changes exist).
-
-        This corresponds to SQLite's autocommit mode being off.
-        """
-        self._check_closed()
-        return not self._conn.get_auto_commit()
-
-    @property
-    def isolation_level(self) -> Optional[str]:
-        """Get or set the isolation level for legacy transaction control."""
-        return self._isolation_level
-
-    @isolation_level.setter
-    def isolation_level(self, value: Optional[str]) -> None:
-        """Set the isolation level for legacy transaction control."""
-        self._check_closed()
-        self._isolation_level = value
-
-    @property
-    def row_factory(self) -> Optional[Callable]:
-        """Get or set the initial row_factory for Cursor objects created from this connection."""
-        return getattr(self, "_row_factory", None)
-
-    @row_factory.setter
-    def row_factory(self, value: Optional[Callable]) -> None:
-        """Set the initial row_factory for Cursor objects created from this connection."""
-        self._row_factory = value
-
-    @property
-    def total_changes(self) -> int:
-        """
-        Return the total number of database rows that have been modified, inserted,
-        or deleted since the database connection was opened.
-        """
-        self._check_closed()
-        # This would require additional Rust API support
-        # For now, return 0 as a placeholder
-        return 0
+            return self._conn.prepare_single(sql)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
 
     def __enter__(self) -> "Connection":
-        """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit - commits or rolls back based on exception."""
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
-        self.close()
-
-
-class Cursor:
-    """
-    A Cursor object represents a database cursor which is used to execute
-    SQL statements and manage the context of a fetch operation.
-
-    Cursors are created using Connection.cursor().
-    """
-
-    def __init__(self, connection: Connection):
-        """Initialize a cursor with the given connection."""
-        self._connection = connection
-        self._row_factory = getattr(connection, "_row_factory", None)
-        self._arraysize = 1
-        self._description = None
-        self._rowcount = -1
-        self._lastrowid = None
-        self._current_stmt = None
-        self._current_rows = []
-        self._current_row_index = 0
-        self._closed = False
-
-    def execute(self, sql: str, parameters: Union[Sequence, dict] = ()) -> "Cursor":
-        """
-        Execute a single SQL statement, optionally binding Python values using placeholders.
-
-        Args:
-            sql: A single SQL statement.
-            parameters: Python values to bind to placeholders in sql.
-
-        Returns:
-            self
-
-        Raises:
-            ProgrammingError: When sql contains more than one SQL statement,
-                            or when parameter binding fails.
-        """
-        self._check_closed()
-        self._check_connection_closed()
-
-        # Reset state
-        self._description = None
-        self._rowcount = -1
-        self._lastrowid = None
-        self._current_rows = []
-        self._current_row_index = 0
-
-        # Clean up previous statement if any
-        if self._current_stmt is not None:
-            try:
-                self._current_stmt.finalize()
-            except Exception:
-                pass
-            self._current_stmt = None
-
-        # Handle legacy transaction control for DML statements
-        if (
-            self._connection._autocommit == LEGACY_TRANSACTION_CONTROL
-            and self._connection._isolation_level is not None
-            and _is_dml_statement(sql)
-            and not self._connection._in_transaction
-        ):
-            self._connection._begin_transaction()
-
+    def __exit__(
+        self,
+        type: type[BaseException] | None,
+        value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        # sqlite3 behavior: In context manager, if no exception -> commit, else rollback (legacy and PEP 249 modes)
         try:
-            # Prepare statement
-            self._current_stmt = self._connection._conn.prepare_single(sql)
-
-            # Bind parameters
-            if parameters:
-                self._bind_parameters(self._current_stmt, parameters)
-
-            # Get column information
-            columns = self._current_stmt.columns()
-            if columns:
-                self._description = tuple((name, None, None, None, None, None, None) for name in columns)
-
-            # Execute and fetch all rows for SELECT statements
-            if self._description:
-                self._fetch_all_rows()
+            if type is None:
+                self.commit()
             else:
-                # For non-SELECT statements, just execute
-                result = self._current_stmt.execute()
-                self._connection._handle_io_loop(self._current_stmt, result.status)
-                self._rowcount = int(result.rows_changed)
+                self.rollback()
+        finally:
+            # Always propagate exceptions (returning False)
+            return False
 
-                # Update lastrowid for INSERT/REPLACE statements
-                if _DML_PATTERN.match(sql.strip()) and self._rowcount > 0:
-                    # Note: lastrowid tracking would require additional Rust API
-                    pass
 
-        except Exception as e:
-            if self._current_stmt is not None:
-                try:
-                    self._current_stmt.finalize()
-                except Exception:
-                    pass
-                self._current_stmt = None
-            raise _map_turso_exception(e)
+# Cursor goes SECOND
+class Cursor:
+    arraysize: int
 
-        return self
+    def __init__(self, connection: Connection, /) -> None:
+        self._connection: Connection = connection
+        self.arraysize = 1
+        self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = connection.row_factory
 
-    def executemany(self, sql: str, parameters: Iterable) -> "Cursor":
-        """
-        For every item in parameters, repeatedly execute the parameterized DML SQL statement.
-
-        Args:
-            sql: A single SQL DML statement.
-            parameters: An iterable of parameters to bind with the placeholders in sql.
-
-        Returns:
-            self
-
-        Raises:
-            ProgrammingError: When sql contains more than one SQL statement or is not a DML statement.
-        """
-        self._check_closed()
-        self._check_connection_closed()
-
-        # Reset state
-        self._description = None
-        self._rowcount = 0
-        self._lastrowid = None
-
-        # Verify DML statement
-        if not _is_dml_statement(sql):
-            # For compatibility, we'll still execute but won't enforce DML-only
-            pass
-
-        try:
-            for param_set in parameters:
-                # Prepare statement for each parameter set
-                stmt = self._connection._conn.prepare_single(sql)
-
-                # Bind parameters
-                self._bind_parameters(stmt, param_set)
-
-                # Execute without fetching rows
-                result = stmt.execute()
-                self._connection._handle_io_loop(stmt, result.status)
-                self._rowcount += int(result.rows_changed)
-
-                # Finalize statement
-                stmt.finalize()
-
-        except Exception as e:
-            raise _map_turso_exception(e)
-
-        return self
-
-    def executescript(self, sql_script: str) -> "Cursor":
-        """
-        Execute the SQL statements in sql_script.
-
-        If autocommit is LEGACY_TRANSACTION_CONTROL and there is a pending transaction,
-        an implicit COMMIT is executed first.
-
-        Args:
-            sql_script: A string containing one or more SQL statements.
-
-        Returns:
-            self
-        """
-        self._check_closed()
-        self._check_connection_closed()
-
-        # Reset state
-        self._description = None
-        self._rowcount = -1
-        self._lastrowid = None
-
-        # Commit pending transaction in legacy mode
-        if self._connection._autocommit == LEGACY_TRANSACTION_CONTROL and self._connection._in_transaction:
-            self._connection.commit()
-
-        try:
-            # Process all statements in the script
-            remaining_sql = sql_script
-
-            while remaining_sql.strip():
-                result = self._connection._conn.prepare_first(remaining_sql)
-                if result is None:
-                    break
-
-                stmt, tail_idx = result
-
-                # Execute statement
-                exec_result = stmt.execute()
-                self._connection._handle_io_loop(stmt, exec_result.status)
-                stmt.finalize()
-
-                # Move to next statement
-                remaining_sql = remaining_sql[tail_idx:]
-
-        except Exception as e:
-            raise _map_turso_exception(e)
-
-        return self
-
-    def fetchone(self) -> Optional[Any]:
-        """
-        Fetch the next row of a query result set.
-
-        Returns:
-            A single row or None when no more data is available.
-        """
-        self._check_closed()
-
-        if self._current_row_index >= len(self._current_rows):
-            return None
-
-        row = self._current_rows[self._current_row_index]
-        self._current_row_index += 1
-
-        return self._make_row(row)
-
-    def fetchmany(self, size: int = None) -> list:
-        """
-        Fetch the next set of rows of a query result.
-
-        Args:
-            size: Number of rows to fetch. If not given, arraysize determines the number.
-
-        Returns:
-            A list of rows. An empty list is returned when no more rows are available.
-        """
-        self._check_closed()
-
-        if size is None:
-            size = self._arraysize
-
-        if size < 0:
-            raise ValueError("size must be non-negative")
-
-        result = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            result.append(row)
-
-        return result
-
-    def fetchall(self) -> list:
-        """
-        Fetch all (remaining) rows of a query result.
-
-        Returns:
-            A list of rows. An empty list is returned when no rows are available.
-        """
-        self._check_closed()
-
-        result = []
-        while True:
-            row = self.fetchone()
-            if row is None:
-                break
-            result.append(row)
-
-        return result
-
-    def close(self) -> None:
-        """Close the cursor now."""
-        if self._closed:
-            return
-
-        # Clean up current statement
-        if self._current_stmt is not None:
-            try:
-                self._current_stmt.finalize()
-            except Exception:
-                pass
-            self._current_stmt = None
-
-        self._closed = True
-
-    def setinputsizes(self, sizes: Sequence) -> None:
-        """Required by DB-API. Does nothing in turso."""
-        pass
-
-    def setoutputsize(self, size: int, column: int = None) -> None:
-        """Required by DB-API. Does nothing in turso."""
-        pass
-
-    @property
-    def arraysize(self) -> int:
-        """Get or set the number of rows returned by fetchmany()."""
-        return self._arraysize
-
-    @arraysize.setter
-    def arraysize(self, value: int) -> None:
-        """Set the number of rows returned by fetchmany()."""
-        if value < 0:
-            raise ValueError("arraysize must be non-negative")
-        self._arraysize = value
+        # State for the last executed statement
+        self._active_stmt: Optional[PyTursoStatement] = None
+        self._active_has_rows: bool = False
+        self._description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]] = None
+        self._lastrowid: Optional[int] = None
+        self._rowcount: int = -1
+        self._closed: bool = False
 
     @property
     def connection(self) -> Connection:
-        """The Connection object this cursor belongs to."""
         return self._connection
 
-    @property
-    def description(self) -> Optional[Tuple]:
-        """
-        Column names and type information for the last query.
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            # Finalize any active statement to ensure completion.
+            if self._active_stmt is not None:
+                try:
+                    self._active_stmt.finalize()
+                except Exception:
+                    pass
+        finally:
+            self._active_stmt = None
+            self._active_has_rows = False
+            self._closed = True
 
-        Returns a 7-tuple for each column where the last six items are None.
-        """
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ProgrammingError("Cannot operate on a closed cursor")
+
+    @property
+    def description(self) -> tuple[tuple[str, None, None, None, None, None, None], ...] | None:
         return self._description
 
     @property
-    def lastrowid(self) -> Optional[int]:
-        """The row id of the last inserted row."""
+    def lastrowid(self) -> int | None:
         return self._lastrowid
 
     @property
     def rowcount(self) -> int:
-        """
-        The number of modified rows for INSERT, UPDATE, DELETE, and REPLACE statements.
-
-        Returns -1 for other statements.
-        """
         return self._rowcount
 
-    @property
-    def row_factory(self) -> Optional[Callable]:
-        """Get or set how a row fetched from this Cursor is represented."""
-        return self._row_factory
+    def _reset_last_result(self) -> None:
+        # Ensure any previous statement is finalized to not leak resources
+        if self._active_stmt is not None:
+            try:
+                self._active_stmt.finalize()
+            except Exception:
+                pass
+        self._active_stmt = None
+        self._active_has_rows = False
+        self._description = None
+        self._rowcount = -1
+        # Do not reset lastrowid here; sqlite3 preserves lastrowid until next insert.
 
-    @row_factory.setter
-    def row_factory(self, value: Optional[Callable]) -> None:
-        """Set how a row fetched from this Cursor is represented."""
-        self._row_factory = value
+    @staticmethod
+    def _to_positional_params(parameters: Sequence[Any] | Mapping[str, Any]) -> tuple[Any, ...]:
+        if isinstance(parameters, Mapping):
+            # Named placeholders are not supported
+            raise ProgrammingError("Named parameters are not supported; use positional parameters with '?'")
+        if parameters is None:
+            return ()
+        if isinstance(parameters, tuple):
+            return parameters
+        # Convert arbitrary sequences to tuple efficiently
+        return tuple(parameters)
 
-    def _check_closed(self) -> None:
-        """Check if cursor is closed and raise exception if it is."""
-        if self._closed:
-            raise ProgrammingError("Cannot operate on a closed cursor")
+    def _maybe_implicit_begin(self, sql: str) -> None:
+        self._connection._maybe_implicit_begin(sql)
 
-    def _check_connection_closed(self) -> None:
-        """Check if connection is closed and raise exception if it is."""
-        if self._connection._closed:
-            raise ProgrammingError("Cannot operate on a closed connection")
+    def _prepare_single_statement(self, sql: str) -> _Prepared:
+        prepared = self._connection._prepare_first(sql)
+        # Ensure there are no further statements
+        self._connection._raise_if_multiple_statements(sql, prepared.tail_index)
+        return prepared
 
-    def _bind_parameters(self, stmt: PyTursoStatement, parameters: Union[Sequence, dict]) -> None:
-        """Bind parameters to a prepared statement."""
-        if isinstance(parameters, dict):
-            # Named parameters not directly supported by current API
-            # Would need to convert to positional or extend Rust API
-            raise ProgrammingError("Named parameters are not yet supported")
-        else:
-            # Positional parameters
-            stmt.bind(tuple(parameters))
+    def execute(self, sql: str, parameters: Sequence[Any] | Mapping[str, Any] = ()) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
 
-    def _fetch_all_rows(self) -> None:
-        """Fetch all rows from the current statement."""
-        self._current_rows = []
-        self._current_row_index = 0
+        # Implement legacy implicit transactions if needed
+        self._maybe_implicit_begin(sql)
 
+        # Prepare exactly one statement
+        prepared = self._prepare_single_statement(sql)
+
+        stmt = prepared.stmt
         try:
+            # Bind positional parameters
+            params = self._to_positional_params(parameters)
+            if params:
+                stmt.bind(params)
+
+            if prepared.has_columns:
+                # Stepped statement (e.g., SELECT or DML with RETURNING)
+                self._active_stmt = stmt
+                self._active_has_rows = True
+                # Set description immediately (even if there are no rows)
+                self._description = tuple((name, None, None, None, None, None, None) for name in prepared.column_names)
+                # For statements that return rows, DB-API specifies rowcount is -1
+                self._rowcount = -1
+                # Do not compute lastrowid here
+            else:
+                # Executed statement (no rows returned)
+                result = _run_execute_with_io(stmt)
+                # rows_changed from execution result
+                self._rowcount = int(result.rows_changed)
+                # Set description to None
+                self._description = None
+                # Set lastrowid for INSERT/REPLACE (best-effort)
+                self._lastrowid = self._fetch_last_insert_rowid_if_needed(sql, result.rows_changed)
+                # Finalize the statement to release resources
+                stmt.finalize()
+        except Exception as exc:  # noqa: BLE001
+            # Ensure cleanup on error
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+
+        return self
+
+    def _fetch_last_insert_rowid_if_needed(self, sql: str, rows_changed: int) -> Optional[int]:
+        if rows_changed <= 0 or not _is_insert_or_replace(sql):
+            return self._lastrowid
+        # Query last_insert_rowid(); this is connection-scoped and cheap
+        try:
+            q = self._connection._conn.prepare_single("SELECT last_insert_rowid()")
+            # No parameters; this produces a single-row single-column result
+            # Use stepping to fetch the row
+            status = _step_once_with_io(q)
+            if status == Status.Row:
+                py_row = q.row()
+                # row() returns a Python tuple with one element
+                # We avoid complex conversions: take first item
+                value = tuple(py_row)[0]  # type: ignore[call-arg]
+                # Finalize to complete
+                q.finalize()
+                if isinstance(value, int):
+                    return value
+                try:
+                    return int(value)
+                except Exception:
+                    return self._lastrowid
+            # Finalize anyway
+            q.finalize()
+        except Exception:
+            # Ignore errors; lastrowid remains unchanged on failure
+            pass
+        return self._lastrowid
+
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
+
+        # executemany only accepts DML; enforce this to match sqlite3 semantics
+        if not _is_dml(sql):
+            raise ProgrammingError("executemany() requires a single DML (INSERT/UPDATE/DELETE/REPLACE) statement")
+
+        # Implement legacy implicit transaction: same as execute()
+        self._maybe_implicit_begin(sql)
+
+        prepared = self._prepare_single_statement(sql)
+        stmt = prepared.stmt
+        try:
+            # For executemany, discard any rows produced (even if RETURNING was used)
+            # Therefore we ALWAYS use execute() path per-iteration.
+            for parameters in seq_of_parameters:
+                # Reset previous bindings and program memory before reusing
+                stmt.reset()
+                params = self._to_positional_params(parameters)
+                if params:
+                    stmt.bind(params)
+                result = _run_execute_with_io(stmt)
+                # rowcount is "the number of modified rows" for the LAST executed statement only
+                self._rowcount = int(result.rows_changed)
+            # After loop, finalize statement
+            stmt.finalize()
+            # Cursor description is None for DML executed via executemany()
+            self._description = None
+            # sqlite3 leaves lastrowid unchanged for executemany
+        except Exception as exc:  # noqa: BLE001
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+        return self
+
+    def executescript(self, sql_script: str) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
+
+        # sqlite3 behavior: If autocommit is LEGACY and there is a pending transaction, implicitly COMMIT first
+        if self._connection._autocommit_mode == "LEGACY" and self._connection.in_transaction:
+            try:
+                self._connection._exec_ddl_only("COMMIT")
+            except Exception as exc:  # noqa: BLE001
+                raise _map_turso_exception(exc)
+
+        # Iterate over statements in the script and execute them, discarding rows
+        sql = sql_script
+        total_rowcount = -1
+        try:
+            offset = 0
             while True:
-                status = self._current_stmt.step()
-                self._connection._handle_io_loop(self._current_stmt, status)
-
-                if status == PyTursoStatusCode.Row:
-                    row = self._current_stmt.row()
-                    self._current_rows.append(row)
-                elif status == PyTursoStatusCode.Done:
+                opt = self._connection._conn.prepare_first(sql[offset:])
+                if opt is None:
                     break
-                else:
-                    # Unexpected status
-                    break
+                stmt, tail = opt
+                # Note: per DB-API, any resulting rows are discarded
+                result = _run_execute_with_io(stmt)
+                total_rowcount = int(result.rows_changed) if result.rows_changed > 0 else total_rowcount
+                # finalize to ensure completion
+                stmt.finalize()
+                offset += tail
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
 
-            # Update rowcount for SELECT statements
-            self._rowcount = len(self._current_rows)
+        self._description = None
+        self._rowcount = total_rowcount
+        return self
 
-        except Exception as e:
-            raise _map_turso_exception(e)
+    def _fetchone_tuple(self) -> Optional[tuple[Any, ...]]:
+        """
+        Fetch one row as a plain Python tuple, or return None if no more rows.
+        """
+        if not self._active_has_rows or self._active_stmt is None:
+            return None
+        try:
+            status = _step_once_with_io(self._active_stmt)
+            if status == Status.Row:
+                row_tuple = tuple(self._active_stmt.row())  # type: ignore[call-arg]
+                return row_tuple
+            # status == Done: finalize and clean up
+            self._active_stmt.finalize()
+            self._active_stmt = None
+            self._active_has_rows = False
+            return None
+        except Exception as exc:  # noqa: BLE001
+            # Finalize and clean up on error
+            try:
+                if self._active_stmt is not None:
+                    self._active_stmt.finalize()
+            except Exception:
+                pass
+            self._active_stmt = None
+            self._active_has_rows = False
+            raise _map_turso_exception(exc)
 
-    def _make_row(self, row_tuple: tuple) -> Any:
-        """Apply row_factory to create row object."""
-        if self._row_factory is None:
-            return row_tuple
-        return self._row_factory(self, row_tuple)
+    def _apply_row_factory(self, row_values: tuple[Any, ...]) -> Any:
+        rf = self.row_factory
+        if rf is None:
+            return row_values
+        if isinstance(rf, type) and issubclass(rf, Row):
+            return rf(self, Row(self, row_values))  # type: ignore[call-arg]
+        if callable(rf):
+            return rf(self, Row(self, row_values))  # type: ignore[misc]
+        # Fallback: return tuple
+        return row_values
 
-    def __iter__(self) -> Iterator:
-        """Make cursor an iterator."""
+    def fetchone(self) -> Any:
+        self._ensure_open()
+        row = self._fetchone_tuple()
+        if row is None:
+            return None
+        return self._apply_row_factory(row)
+
+    def fetchmany(self, size: Optional[int] = None) -> list[Any]:
+        self._ensure_open()
+        if size is None:
+            size = self.arraysize
+        if size < 0:
+            raise ValueError("size must be non-negative")
+        result: list[Any] = []
+        for _ in range(size):
+            row = self._fetchone_tuple()
+            if row is None:
+                break
+            result.append(self._apply_row_factory(row))
+        return result
+
+    def fetchall(self) -> list[Any]:
+        self._ensure_open()
+        result: list[Any] = []
+        while True:
+            row = self._fetchone_tuple()
+            if row is None:
+                break
+            result.append(self._apply_row_factory(row))
+        return result
+
+    def setinputsizes(self, sizes: Any, /) -> None:
+        # No-op for DB-API compliance
+        return None
+
+    def setoutputsize(self, size: Any, column: Any = None, /) -> None:
+        # No-op for DB-API compliance
+        return None
+
+    def __iter__(self) -> "Cursor":
         return self
 
     def __next__(self) -> Any:
-        """Fetch next row for iterator protocol."""
         row = self.fetchone()
         if row is None:
             raise StopIteration
         return row
 
 
-class Row:
+# Row goes THIRD
+class Row(Sequence[Any]):
     """
-    A Row instance serves as a highly optimized row_factory for Connection objects.
-
-    It supports iteration, equality testing, len(), and mapping access by column name and index.
+    sqlite3.Row-like container supporting index and name-based access.
     """
 
-    def __init__(self, cursor: Cursor, data: tuple):
-        """Initialize a Row with cursor and data."""
-        self._data = data
-        self._description = cursor.description
-        if self._description:
-            self._name_map = {desc[0]: idx for idx, desc in enumerate(self._description)}
-        else:
-            self._name_map = {}
+    def __new__(cls, cursor: Cursor, data: tuple[Any, ...], /) -> "Row":
+        obj = super().__new__(cls)
+        # Attach metadata
+        obj._cursor = cursor
+        obj._data = data
+        # Build mapping from column name to index
+        desc = cursor.description or ()
+        obj._keys = tuple(col[0] for col in desc)
+        obj._index = {name: idx for idx, name in enumerate(obj._keys)}
+        return obj
 
-    def keys(self) -> list:
-        """Return a list of column names as strings."""
-        if self._description:
-            return [desc[0] for desc in self._description]
-        return []
+    def keys(self) -> list[str]:
+        return list(self._keys)
 
-    def __getitem__(self, key: Union[int, str]) -> Any:
-        """Get item by column index or name."""
+    def __getitem__(self, key: int | str | slice, /) -> Any:
+        if isinstance(key, slice):
+            return self._data[key]
         if isinstance(key, int):
             return self._data[key]
-        elif isinstance(key, str):
-            if key in self._name_map:
-                return self._data[self._name_map[key]]
-            raise KeyError(f"No column named {key}")
-        elif isinstance(key, slice):
-            return self._data[key]
-        else:
-            raise TypeError(f"indices must be integers or strings, not {type(key).__name__}")
-
-    def __len__(self) -> int:
-        """Return the number of columns."""
-        return len(self._data)
-
-    def __iter__(self) -> Iterator:
-        """Iterate over row values."""
-        return iter(self._data)
-
-    def __eq__(self, other: Any) -> bool:
-        """Compare rows for equality."""
-        if not isinstance(other, Row):
-            return NotImplemented
-        return self._data == other._data and self.keys() == other.keys()
+        # key is column name
+        idx = self._index.get(key)
+        if idx is None:
+            raise KeyError(key)
+        return self._data[idx]
 
     def __hash__(self) -> int:
-        """Return hash of row."""
-        return hash((tuple(self.keys()), self._data))
+        return hash((self._keys, self._data))
 
-    def __repr__(self) -> str:
-        """Return string representation of row."""
-        return f"<turso.Row {self._data}>"
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return self._keys == value._keys and self._data == value._data
+
+    def __ne__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return not self.__eq__(value)
+
+    # The rest return NotImplemented for non-Row comparisons
+    def __lt__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) < (value._keys, value._data)
+
+    def __le__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) <= (value._keys, value._data)
+
+    def __gt__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) > (value._keys, value._data)
+
+    def __ge__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) >= (value._keys, value._data)
 
 
 def connect(
     database: str,
     *,
     experimental_features: Optional[str] = None,
-    async_io: bool = False,
-    autocommit: Union[bool, str] = LEGACY_TRANSACTION_CONTROL,
-    isolation_level: Optional[str] = "",
+    isolation_level: Optional[str] = "DEFERRED",
 ) -> Connection:
     """
-    Open a connection to a Turso database.
+    Open a Turso (SQLite-compatible) database and return a Connection.
 
-    Args:
-        database: Path to the database file.
-        experimental_features: Comma-separated list of experimental features to enable.
-        async_io: If True, use async IO mode.
-        autocommit: Transaction control mode. Can be True, False, or LEGACY_TRANSACTION_CONTROL.
-        isolation_level: Transaction isolation level for legacy mode ("DEFERRED", "IMMEDIATE", "EXCLUSIVE", or None).
-
-    Returns:
-        A Connection object.
+    Parameters:
+    - database: path or identifier of the database.
+    - experimental_features: comma-separated list of features to enable.
+    - isolation_level: one of "DEFERRED" (default), "IMMEDIATE", "EXCLUSIVE", or None.
     """
-    return Connection(
-        database=database,
-        experimental_features=experimental_features,
-        async_io=async_io,
-        autocommit=autocommit,
-        isolation_level=isolation_level,
-    )
+    try:
+        cfg = PyTursoDatabaseConfig(
+            path=database,
+            experimental_features=experimental_features,
+            async_io=False,  # Let the Rust layer drive IO internally by default
+        )
+        db: PyTursoDatabase = py_turso_database_open(cfg)
+        conn: PyTursoConnection = db.connect()
+        return Connection(conn, isolation_level=isolation_level)
+    except Exception as exc:  # noqa: BLE001
+        raise _map_turso_exception(exc)
 
 
+# Make it easy to enable logging with native `logging` Python module
 def setup_logging(level: int = logging.INFO) -> None:
     """
-    Setup logging for the turso driver.
+    Setup Turso logging to integrate with Python's logging module.
 
-    Args:
-        level: Logging level (e.g., logging.INFO, logging.DEBUG).
+    Usage:
+        import turso
+        turso.setup_logging(logging.DEBUG)
     """
     logger = logging.getLogger("turso")
     logger.setLevel(level)
 
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    def log_callback(log):
-        """Callback to handle Turso logs."""
-        turso_logger = logging.getLogger(f"turso.{log.target}")
-
-        level_map = {
+    def _py_logger(log: PyTursoLog) -> None:
+        # Map Rust/Turso log level strings to Python logging levels (best-effort)
+        lvl_map = {
             "ERROR": logging.ERROR,
             "WARN": logging.WARNING,
+            "WARNING": logging.WARNING,
             "INFO": logging.INFO,
             "DEBUG": logging.DEBUG,
             "TRACE": logging.DEBUG,
         }
-
-        log_level = level_map.get(log.level.upper(), logging.INFO)
-        turso_logger.log(log_level, f"{log.message} ({log.file}:{log.line})")
+        py_level = lvl_map.get(log.level.upper(), level)
+        logger.log(
+            py_level,
+            "%s [%s:%s] %s",
+            log.target,
+            log.file,
+            log.line,
+            log.message,
+        )
 
     try:
-        config = PyTursoSetupConfig(logger=log_callback, log_level=logging.getLevelName(level))
-        py_turso_setup(config)
-    except Exception as e:
-        logger.warning(f"Failed to setup Turso logging: {e}")
+        py_turso_setup(PyTursoSetupConfig(logger=_py_logger, log_level=None))
+    except Exception as exc:  # noqa: BLE001
+        raise _map_turso_exception(exc)
