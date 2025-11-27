@@ -49,7 +49,6 @@ __all__ = [
     "DatabaseFull",
     "NotAdb",
     "Corrupt",
-
     "connect",
     "Connection",
     "Cursor",
