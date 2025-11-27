@@ -163,6 +163,16 @@ turso_database_connect_result_t turso_database_connect(turso_database_t self);
 typedef struct
 {
     turso_status_t status;
+    bool auto_commit;
+} turso_connection_get_autocommit_result_t;
+
+/** Get autocommit state of the connection */
+turso_connection_get_autocommit_result_t
+turso_connection_get_autocommit(turso_connection_t self);
+
+typedef struct
+{
+    turso_status_t status;
     turso_statement_t statement;
 } turso_connection_prepare_single_t;
 

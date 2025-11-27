@@ -20,6 +20,11 @@ use crate::{assert_send, assert_sync, capi};
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
+pub type Value = turso_core::Value;
+pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
+pub type Text = turso_core::types::Text;
+pub type TextRef<'a> = turso_core::types::TextRef<'a>;
+
 pub struct TursoLog<'a> {
     pub message: &'a str,
     pub target: &'a str,
@@ -493,6 +498,9 @@ pub struct TursoConnection {
 }
 
 impl TursoConnection {
+    pub fn get_auto_commit(&self) -> bool {
+        self.connection.get_auto_commit()
+    }
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         match self.connection.prepare(sql) {
@@ -520,6 +528,10 @@ impl TursoConnection {
             Ok(None) => Ok(None),
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
+    }
+
+    pub fn close(&self) {
+        // self.connection.close()
     }
 
     /// helper method to get C raw container to the TursoConnection instance

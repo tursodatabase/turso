@@ -97,6 +97,25 @@ pub extern "C" fn turso_database_connect(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_connection_get_autocommit(
+    connection: c::turso_connection_t,
+) -> c::turso_connection_get_autocommit_result_t {
+    match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => c::turso_connection_get_autocommit_result_t {
+            status: turso_status_ok(),
+            auto_commit: connection.get_auto_commit(),
+        },
+        Err(err) => {
+            return c::turso_connection_get_autocommit_result_t {
+                status: err.to_capi(),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_connection_prepare_single(
     connection: c::turso_connection_t,
     sql: c::turso_slice_ref_t,

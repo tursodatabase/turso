@@ -140,6 +140,7 @@ impl Default for turso_slice_owned_t {
         }
     }
 }
+#[doc = " structure holding opaque pointer to the TursoDatabase instance\n SAFETY: the database must be opened and closed only once but can be used concurrently"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_t {
@@ -161,6 +162,7 @@ impl Default for turso_database_t {
         }
     }
 }
+#[doc = " structure holding opaque pointer to the TursoConnection instance\n SAFETY: the connection must be used exclusive and can't be accessed concurrently"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_connection_t {
@@ -383,6 +385,38 @@ impl Default for turso_database_connect_result_t {
 unsafe extern "C" {
     #[doc = " Connect to the database"]
     pub fn turso_database_connect(self_: turso_database_t) -> turso_database_connect_result_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct turso_connection_get_autocommit_result_t {
+    pub status: turso_status_t,
+    pub auto_commit: bool,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_connection_get_autocommit_result_t"]
+        [::std::mem::size_of::<turso_connection_get_autocommit_result_t>() - 24usize];
+    ["Alignment of turso_connection_get_autocommit_result_t"]
+        [::std::mem::align_of::<turso_connection_get_autocommit_result_t>() - 8usize];
+    ["Offset of field: turso_connection_get_autocommit_result_t::status"]
+        [::std::mem::offset_of!(turso_connection_get_autocommit_result_t, status) - 0usize];
+    ["Offset of field: turso_connection_get_autocommit_result_t::auto_commit"]
+        [::std::mem::offset_of!(turso_connection_get_autocommit_result_t, auto_commit) - 16usize];
+};
+impl Default for turso_connection_get_autocommit_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    #[doc = " Get autocommit state of the connection"]
+    pub fn turso_connection_get_autocommit(
+        self_: turso_connection_t,
+    ) -> turso_connection_get_autocommit_result_t;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
