@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
+use crate::mvcc::cursor::MvccCursorType;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
@@ -834,7 +835,7 @@ fn test_lazy_scan_cursor_basic() {
         tx_id,
         table_id,
         MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -877,7 +878,7 @@ fn test_lazy_scan_cursor_with_gaps() {
         tx_id,
         table_id,
         MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -929,7 +930,7 @@ fn test_cursor_basic() {
         tx_id,
         table_id,
         MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -984,7 +985,7 @@ fn test_cursor_with_empty_table() {
         tx_id,
         table_id,
         MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
     assert!(cursor.is_empty());
@@ -994,6 +995,7 @@ fn test_cursor_with_empty_table() {
 
 #[test]
 fn test_cursor_modification_during_scan() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (db, tx_id) = setup_lazy_db(&[1, 2, 4, 5]);
     let table_id = -1;
 
@@ -1002,7 +1004,7 @@ fn test_cursor_modification_during_scan() {
         tx_id,
         table_id,
         MvccCursorType::Table,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -1021,34 +1023,27 @@ fn test_cursor_modification_during_scan() {
             Some(&new_row),
         )))
         .unwrap();
-    let row = db.mvcc_store.read(tx_id, new_row_id).unwrap().unwrap();
-    let mut record = ImmutableRecord::new(1024);
-    record.start_serialization(&row.data);
-    let value = record.get_value(0).unwrap();
-    match value {
-        ValueRef::Text(text) => {
-            assert_eq!(text.as_str(), "new_row");
+
+    let mut read_rowids = vec![];
+    loop {
+        let res = cursor.next().unwrap();
+        let IOResult::Done(res) = res else {
+            panic!("unexpected next result {res:?}");
+        };
+        if !res {
+            break;
         }
-        _ => panic!("Expected Text value"),
+        read_rowids.push(
+            cursor
+                .read_mvcc_current_row()
+                .unwrap()
+                .unwrap()
+                .id
+                .row_id
+                .to_int_or_panic(),
+        );
     }
-    assert_eq!(row.id.row_id.to_int_or_panic(), 3);
-
-    // Continue scanning - the cursor should still work correctly
-    let _ = cursor.next().unwrap(); // Move to 4
-    let row = db
-        .mvcc_store
-        .read(tx_id, RowID::new(table_id.into(), RowKey::Int(4)))
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.id.row_id.to_int_or_panic(), 4);
-
-    let _ = cursor.next().unwrap(); // Move to 5 (our new row)
-    let row = db
-        .mvcc_store
-        .read(tx_id, RowID::new(table_id.into(), RowKey::Int(5)))
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.id.row_id.to_int_or_panic(), 5);
+    assert_eq!(read_rowids, vec![2, 3, 4, 5]);
     assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(cursor.is_empty());
 }
