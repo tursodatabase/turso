@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, Once, RwLock},
 };
 
-use tracing::{level_filters::LevelFilter, Level};
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     fmt::{self, format::Writer},
     layer::{Context, SubscriberExt},
@@ -31,7 +31,7 @@ pub struct TursoLog<'a> {
     pub file: &'a str,
     pub timestamp: u64,
     pub line: usize,
-    pub level: tracing::Level,
+    pub level: &'a str,
 }
 
 pub struct TursoSetupConfig {
@@ -57,11 +57,11 @@ fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_lo
             timestamp: log.timestamp,
             line: log.line,
             level: match log.level {
-                Level::TRACE => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_TRACE,
-                Level::DEBUG => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_DEBUG,
-                Level::INFO => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_INFO,
-                Level::WARN => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_WARN,
-                Level::ERROR => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_ERROR,
+                "TRACE" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_TRACE,
+                "DEBUG" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_DEBUG,
+                "INFO" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_INFO,
+                "WARN" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_WARN,
+                _ => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_ERROR,
             },
         })
     };
@@ -317,7 +317,7 @@ where
         event.record(&mut visitor);
 
         let log = TursoLog {
-            level: event.metadata().level().clone(),
+            level: event.metadata().level().as_str(),
             target: event.metadata().target(),
             message: &buffer,
             timestamp: std::time::SystemTime::now()
