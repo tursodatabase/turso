@@ -1,5 +1,6 @@
 import os
 import sqlite3
+
 import pytest
 import turso
 
@@ -1279,7 +1280,7 @@ def test_multiple_ctes(provider):
     cursor.execute("INSERT INTO test VALUES (10), (20), (30)")
 
     cursor.execute("""
-        WITH 
+        WITH
             doubled AS (SELECT value * 2 as v FROM test),
             tripled AS (SELECT value * 3 as v FROM test)
         SELECT doubled.v, tripled.v FROM doubled, tripled WHERE doubled.v = 20 AND tripled.v = 30
@@ -1298,9 +1299,9 @@ def test_nested_subqueries(provider):
     cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
 
     cursor.execute("""
-        SELECT id FROM test 
+        SELECT id FROM test
         WHERE value > (
-            SELECT AVG(value) FROM test 
+            SELECT AVG(value) FROM test
             WHERE value > (SELECT MIN(value) FROM test)
         )
     """)

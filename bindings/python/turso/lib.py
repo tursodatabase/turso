@@ -11,7 +11,6 @@ from ._turso import (
     Constraint,
     Corrupt,
     DatabaseFull,
-    Error as TursoError,
     Interrupt,
     Misuse,
     NotAdb,
@@ -19,13 +18,18 @@ from ._turso import (
     PyTursoDatabase,
     PyTursoDatabaseConfig,
     PyTursoExecutionResult,
-    PyTursoStatusCode,
-    PyTursoStatement,
-    PyTursoSetupConfig,
     PyTursoLog,
-    PyTursoStatusCode as Status,
+    PyTursoSetupConfig,
+    PyTursoStatement,
+    PyTursoStatusCode,
     py_turso_database_open,
     py_turso_setup,
+)
+from ._turso import (
+    Error as TursoError,
+)
+from ._turso import (
+    PyTursoStatusCode as Status,
 )
 
 # DB-API 2.0 module attributes
@@ -243,7 +247,8 @@ class Connection:
         self._conn: PyTursoConnection = conn
         # autocommit behavior:
         # - True: SQLite autocommit mode; commit/rollback are no-ops.
-        # - False: PEP 249 compliant: ensure a transaction is always open. We'll use BEGIN DEFERRED after commit/rollback.
+        # - False: PEP 249 compliant: ensure a transaction is always open.
+        #   We'll use BEGIN DEFERRED after commit/rollback.
         # - "LEGACY": implicit transactions on DML when isolation_level is not None.
         self._autocommit_mode: object | bool = "LEGACY"
         self.isolation_level: Optional[str] = isolation_level
