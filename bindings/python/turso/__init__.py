@@ -25,6 +25,7 @@ from .lib import (
     connect,
     Connection,
     Cursor,
+    Row,
 )
 
 __all__ = [
@@ -52,4 +53,5 @@ __all__ = [
     "connect",
     "Connection",
     "Cursor",
+    "Row",
 ]
