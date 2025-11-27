@@ -1244,6 +1244,11 @@ do_execsql_test_on_specific_db {:memory:} affinity-conversion-2 {
   SELECT * FROM t WHERE a == 2;
 } {2}
 
+ # https://github.com/tursodatabase/turso/issues/3950
+do_execsql_test select-values-column-name {
+  SELECT column1 FROM (VALUES(123));
+} {123}
+
 # Test suite for SQLite affinity conversion in WHERE clauses
 
 # ============================================

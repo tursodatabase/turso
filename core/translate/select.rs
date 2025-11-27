@@ -518,7 +518,7 @@ fn prepare_one_select_plan(
                 result_columns.push(ResultSetColumn {
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
-                    alias: None,
+                    alias: Some(format!("column{}", i + 1)),
                     contains_aggregates: false,
                 });
             }
