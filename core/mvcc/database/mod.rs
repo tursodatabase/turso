@@ -1,6 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
+use crate::schema::Schema;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -1231,6 +1232,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         bootstrap_conn.reparse_schema()?;
         *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
 
+        // Populate index rows from recovered table rows.
+        // Index entries are not persisted to the logical log, so we reconstruct them here.
+        let schema = bootstrap_conn.schema.read();
+        self.populate_index_rows_from_tables(&schema)?;
+
         Ok(())
     }
 
@@ -2062,6 +2068,122 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Populates index rows from table rows after logical log recovery.
+    ///
+    /// Only table rows are persisted to the logical log (not index rows).
+    /// This method reconstructs index entries by iterating over all recovered table rows
+    /// and inserting corresponding index entries for each index defined in the schema.
+    pub fn populate_index_rows_from_tables(&self, schema: &Schema) -> Result<()> {
+        // Iterate over all indexes in the schema
+        for (table_name, indexes) in &schema.indexes {
+            for index in indexes {
+                // Skip ephemeral indexes
+                if index.ephemeral {
+                    crate::bail_corrupt_error!(
+                        "Somehow we deserialized an ephemeral index from the logical log"
+                    );
+                }
+
+                if !index.has_rowid {
+                    crate::bail_parse_error!("Without rowid indexes are not supported with MVCC");
+                }
+
+                // Expression indexes are unsupported - we would have to evaluate the expression here
+                // and we don't have the machinery
+                if index.columns.iter().any(|c| c.expr.is_some()) {
+                    crate::bail_parse_error!("Expression indexes are not supported with MVCC");
+                }
+
+                // Partial indexes are unsupported - we would have to evaluate the where clause here
+                // and we don't have the machinery
+                if index.where_clause.is_some() {
+                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
+                }
+
+                let table = schema.get_table(table_name).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "Table {} not found for index {}",
+                        index.table_name, index.name
+                    ))
+                })?;
+
+                let Some(btree_table) = table.btree() else {
+                    crate::bail_corrupt_error!("Table {} is not a btree table", table_name);
+                };
+
+                if !btree_table.has_rowid {
+                    crate::bail_parse_error!("Without rowid tables are not supported with MVCC");
+                }
+
+                let table_id = self.get_table_id_from_root_page(btree_table.root_page);
+                let index_id = self.get_table_id_from_root_page(index.root_page);
+
+                // Create IndexInfo for proper key ordering
+                let index_info = Arc::new(IndexInfo::new_from_index(index));
+
+                // Iterate all rows for this table
+                for entry in self.rows.iter() {
+                    let rowid = entry.key();
+                    // Yeah this is inefficient to loop over all rows for each index lol
+                    if rowid.table_id != table_id {
+                        continue;
+                    }
+
+                    let row_versions = entry.value().read();
+                    for row_version in row_versions.iter() {
+                        // Only process committed versions (both live and deleted)
+                        // Deleted versions need index entries too so readers can see the deletion
+                        assert!(
+                            matches!(row_version.begin, Some(TxTimestampOrID::Timestamp(1))),
+                            "all table rows should be committed by the bootstrap transaction, but got {:?}", row_version.begin
+                        );
+                        if let Some(ref end) = row_version.end {
+                            assert!(
+                                matches!(end, TxTimestampOrID::Timestamp(1)),
+                                "all table rows should be committed by the bootstrap transaction, but got {end:?}",
+                            );
+                        }
+
+                        // Deserialize row data to extract index columns
+                        let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
+                        let mut record_cursor = RecordCursor::new();
+
+                        // Build index key: extract columns at pos_in_table positions, then append rowid
+                        let mut key_values: Vec<ValueRef> =
+                            Vec::with_capacity(index.columns.len() + 1);
+                        for idx_col in &index.columns {
+                            let val = record_cursor.get_value(&record, idx_col.pos_in_table)?;
+                            key_values.push(val);
+                        }
+
+                        let RowKey::Int(row_id) = &rowid.row_id else {
+                            crate::bail_parse_error!("Rowid of table row is not an integer");
+                        };
+                        key_values.push(ValueRef::Integer(*row_id));
+
+                        let index_key =
+                            SortableIndexKey::new_from_values(key_values, index_info.clone());
+
+                        // Create a committed row version for the index entry, preserving begin/end timestamps
+                        let index_row = Row::new(
+                            RowID::new(index_id, RowKey::Record(index_key.clone())),
+                            row_version.row.data.clone(),
+                            row_version.row.column_count,
+                        );
+                        let index_row_version = RowVersion {
+                            begin: row_version.begin.clone(),
+                            end: row_version.end.clone(),
+                            row: index_row,
+                        };
+
+                        self.insert_index_version(index_id, index_key, index_row_version);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Rolls back a transaction with the specified ID.
     ///
     /// This function rolls back a transaction with the specified `tx_id` by
@@ -2279,8 +2401,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.insert_version_raw(&mut versions, row_version)
     }
 
-    #[allow(dead_code)]
-    fn insert_index_version(
+    pub fn insert_index_version(
         &self,
         index_id: MVTableId,
         key: SortableIndexKey,
