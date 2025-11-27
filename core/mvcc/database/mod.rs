@@ -1,5 +1,5 @@
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::MvccIterator;
+use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -1757,13 +1757,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     as Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
             }
         };
-        *table_iterator = Some(unsafe {
-            // SAFETY: The lifetime of 'rows' is always longer than the lifetime of the iterator.
-            std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
-                Box<dyn Iterator<Item = Entry<'static, RowID, RwLock<Vec<RowVersion>>>>>,
-            >(iter_box)
-        });
+        *table_iterator = Some(static_iterator_hack!(iter_box, RowID));
 
         let mv_store_iterator = table_iterator
             .as_mut()
@@ -1806,18 +1800,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
                     >,
             };
-            *index_iterator = Some(unsafe {
-                // SAFETY: Although the index_rows Entry is dropped, by calling .range() on it
-                // it returns an iterator of the 'inner' property for the entry, which lives longer than the iterator.
-                std::mem::transmute::<
-                    Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
-                    Box<
-                        dyn Iterator<
-                            Item = Entry<'static, SortableIndexKey, RwLock<Vec<RowVersion>>>,
-                        >,
-                    >,
-                >(iter_box)
-            });
+            *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
         }
         let mv_store_iterator = index_iterator
             .as_mut()
@@ -2372,15 +2355,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             row_id: RowKey::Int(i64::MAX),
         };
         let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
-        let iter = self.rows.range(range).rev();
-        let iter_box = Box::new(iter);
-        *table_iterator = Some(unsafe {
-            // SAFETY: The lifetime of 'rows' is always longer than the lifetime of the iterator.
-            std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
-                Box<dyn Iterator<Item = Entry<'static, RowID, RwLock<Vec<RowVersion>>>>>,
-            >(iter_box)
-        });
+        let iter_box = Box::new(self.rows.range(range).rev());
+        *table_iterator = Some(static_iterator_hack!(iter_box, RowID));
         let iter = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above");
@@ -2401,16 +2377,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     ) -> Option<RowKey> {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
-        let iter = index.iter().rev();
-        let iter_box = Box::new(iter);
-        *index_iterator = Some(unsafe {
-            // SAFETY: Although the index_rows Entry is dropped, by calling .iter() on it
-            // it returns an iterator of the 'inner' property for the entry, which lives longer than the iterator.
-            std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
-                Box<dyn Iterator<Item = Entry<'static, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
-            >(iter_box)
-        });
+        let iter_box = Box::new(index.iter().rev());
+        *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");

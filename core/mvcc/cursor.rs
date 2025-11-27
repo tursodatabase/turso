@@ -146,6 +146,40 @@ pub enum MvccCursorType {
 pub(crate) type MvccIterator<'l, T> =
     Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>>>;
 
+/// Extends the lifetime of a SkipMap iterator to `'static`.
+///
+/// # Why a macro instead of a function?
+///
+/// Rust's `crossbeam_skiplist::map::Entry<'a, K, V>` is *invariant* over `K`, meaning
+/// the lifetime `'a` cannot be coerced through a function boundary. When we try to pass
+/// `Box<dyn Iterator<Item = Entry<'_, K, V>>>` to a function expecting a generic lifetime,
+/// the compiler cannot unify the lifetimes across the function call.
+///
+/// A macro expands inline at the call site, avoiding the function boundary entirely and
+/// allowing the explicit transmute with both source and destination types specified.
+///
+/// # Safety
+///
+/// The caller must ensure that the underlying `SkipMap` from which the iterator was created
+/// outlives the returned iterator. This is guaranteed when:
+/// - For table iterators: The `MvStore.rows` SkipMap is held in an `Arc<MvStore>` that
+///   outlives the cursor.
+/// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
+///   that outlives the cursor.
+macro_rules! static_iterator_hack {
+    ($iter:expr, $key_type:ty) => {
+        // SAFETY: See macro documentation above.
+        unsafe {
+            std::mem::transmute::<
+                Box<dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>>,
+                Box<dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>>,
+            >($iter)
+        }
+    };
+}
+
+pub(crate) use static_iterator_hack;
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
@@ -517,13 +551,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(unsafe {
-                    // SAFETY: The lifetime of 'rows' is always longer than the lifetime of the iterator.
-                    std::mem::transmute::<
-                        Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
-                        Box<dyn Iterator<Item = Entry<'static, RowID, RwLock<Vec<RowVersion>>>>>,
-                    >(iter_box)
-                });
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self
@@ -532,22 +560,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(unsafe {
-                    // SAFETY: Although the index_rows Entry is dropped, by calling .iter() on it
-                    // it returns an iterator of the 'inner' property for the entry, which lives longer than the iterator.
-                    std::mem::transmute::<
-                        Box<
-                            dyn Iterator<
-                                Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>,
-                            >,
-                        >,
-                        Box<
-                            dyn Iterator<
-                                Item = Entry<'static, SortableIndexKey, RwLock<Vec<RowVersion>>>,
-                            >,
-                        >,
-                    >(iter_box)
-                });
+                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
             }
         }
     }
@@ -1044,7 +1057,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // generic over the type instead of having two on the struct.
         match &self.mv_cursor_type {
             MvccCursorType::Table => {
-                // For table cursors, initialize iterator from the correct table id + i64::MIN; this is because table rows from all tables are stored in the same map
+                // For table cursors, initialize iterator from the correct table id + i64::MIN;
+                // this is because table rows from all tables are stored in the same map
                 let start_rowid = RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(i64::MIN),
@@ -1053,17 +1067,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     std::ops::Bound::Included(start_rowid),
                     std::ops::Bound::Unbounded,
                 );
-                let iter = self.db.rows.range(range);
-                let iter_box: Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>> =
-                    Box::new(iter);
-                let mv_store_iter = unsafe {
-                    // SAFETY: The lifetime of 'rows' is always longer than the lifetime of the iterator.
-                    std::mem::transmute::<
-                        Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
-                        Box<dyn Iterator<Item = Entry<'static, RowID, RwLock<Vec<RowVersion>>>>>,
-                    >(iter_box)
-                };
-                self.table_iterator = Some(mv_store_iter);
+                let iter_box = Box::new(self.db.rows.range(range));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
@@ -1072,27 +1077,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .index_rows
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
-                let iter = index_rows.iter();
-                let iter_box: Box<
-                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
-                > = Box::new(iter);
-                let mv_store_iter = unsafe {
-                    // SAFETY: Although the index_rows Entry is dropped, by calling .iter() on it
-                    // it returns an iterator of the 'inner' property for the entry, which lives longer than the iterator.
-                    std::mem::transmute::<
-                        Box<
-                            dyn Iterator<
-                                Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>,
-                            >,
-                        >,
-                        Box<
-                            dyn Iterator<
-                                Item = Entry<'static, SortableIndexKey, RwLock<Vec<RowVersion>>>,
-                            >,
-                        >,
-                    >(iter_box)
-                };
-                self.index_iterator = Some(mv_store_iter);
+                let iter_box = Box::new(index_rows.iter());
+                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
             }
         }
 
