@@ -101,7 +101,7 @@ Pay additional attention to the following aspects:
 * SQLite DB-API2 implementation implicitly opens transaction for DML queries in the execute(...) method:
     > If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is an INSERT, UPDATE, DELETE, or REPLACE statement, and there is no open transaction, a transaction is implicitly opened before executing sql.
     - MAKE SURE this logic implemented properly
-* Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of last executed statement (not all of them)
+* Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of all executed statements (not just last statement)
 * Convert exceptions from rust layer to appropriate exceptions documented in the sqlite3 db-api2 docs
 * BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly commited in case of cursor close
 

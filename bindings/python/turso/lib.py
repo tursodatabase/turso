@@ -631,7 +631,7 @@ class Cursor:
                     stmt.bind(params)
                 result = _run_execute_with_io(stmt)
                 # rowcount is "the number of modified rows" for the LAST executed statement only
-                self._rowcount = int(result.rows_changed)
+                self._rowcount = int(result.rows_changed) + (self._rowcount if self._rowcount != -1 else 0)
             # After loop, finalize statement
             stmt.finalize()
             # Cursor description is None for DML executed via executemany()
