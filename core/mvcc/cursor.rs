@@ -50,12 +50,13 @@ enum MvccLazyCursorState {
 /// With DualCursorPeek we track the "peeked" next value for each cursor in the dual-cursor iteration,
 /// so that we always return the correct 'next' value (e.g. if mvcc has 1 and 3 and btree has 2 and 4,
 /// we should return 1, 2, 3, 4 in order).
-#[derive(Debug, Clone)]
 struct DualCursorPeek {
     /// Next row available from MVCC
     mvcc_peek: CursorPeek,
     /// Next row available from btree
     btree_peek: CursorPeek,
+    /// The MVCC iterator (table or index)
+    mvcc_iterator: MvccIteratorKind,
 }
 
 impl DualCursorPeek {
@@ -180,13 +181,16 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
+/// Enum holding either a table or index MVCC iterator.
+/// This allows us to store a single iterator field instead of two optional fields.
+enum MvccIteratorKind {
+    Table(Option<MvccIterator<'static, RowID>>),
+    Index(Option<MvccIterator<'static, SortableIndexKey>>),
+}
+
 pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
-    /// Stateful MVCC table iterator if this is a table cursor.
-    table_iterator: Option<MvccIterator<'static, RowID>>,
-    /// Stateful MVCC index iterator if this is an index cursor.
-    index_iterator: Option<MvccIterator<'static, SortableIndexKey>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
@@ -197,7 +201,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     record_cursor: RefCell<RecordCursor>,
     next_rowid_lock: Arc<RwLock<()>>,
     state: RefCell<Option<MvccLazyCursorState>>,
-    /// Dual-cursor peek state for proper iteration
+    /// Dual-cursor peek state for proper iteration (contains MVCC iterator)
     dual_peek: RefCell<DualCursorPeek>,
 }
 
@@ -214,11 +218,13 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "BTreeCursor expected for mvcc cursor"
         );
         let table_id = db.get_table_id_from_root_page(root_page_or_table_id);
+        let mvcc_iterator = match &mv_cursor_type {
+            MvccCursorType::Table => MvccIteratorKind::Table(None),
+            MvccCursorType::Index(_) => MvccIteratorKind::Index(None),
+        };
         Ok(Self {
             db,
             tx_id,
-            table_iterator: None,
-            index_iterator: None,
             mv_cursor_type,
             current_pos: RefCell::new(CursorPosition::BeforeFirst),
             table_id,
@@ -231,6 +237,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             dual_peek: RefCell::new(DualCursorPeek {
                 mvcc_peek: CursorPeek::Uninitialized,
                 btree_peek: CursorPeek::Uninitialized,
+                mvcc_iterator,
             }),
         })
     }
@@ -349,22 +356,21 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
-    fn advance_mvcc_iterator(&mut self) {
-        let next = match &self.mv_cursor_type {
-            MvccCursorType::Table => self.db.advance_cursor_and_get_row_id_for_table(
-                self.table_id,
-                &mut self.table_iterator,
-                self.tx_id,
-            ),
-            MvccCursorType::Index(_) => self
+    fn advance_mvcc_iterator(&self) {
+        let mut peek = self.dual_peek.borrow_mut();
+        let next = match &mut peek.mvcc_iterator {
+            MvccIteratorKind::Table(iter) => {
+                self.db
+                    .advance_cursor_and_get_row_id_for_table(self.table_id, iter, self.tx_id)
+            }
+            MvccIteratorKind::Index(iter) => self
                 .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id),
+                .advance_cursor_and_get_row_id_for_index(iter, self.tx_id),
         };
         let new_peek_state = match next {
             Some(k) => CursorPeek::Row(k.row_id),
             None => CursorPeek::Exhausted,
         };
-        let mut peek = self.dual_peek.borrow_mut();
         peek.mvcc_peek = new_peek_state;
     }
 
@@ -530,20 +536,25 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     /// Reset dual peek state (called on rewind/last/seek)
-    fn reset_dual_peek(&mut self) {
-        self.dual_peek.replace(DualCursorPeek {
-            mvcc_peek: CursorPeek::Uninitialized,
-            btree_peek: CursorPeek::Uninitialized,
-        });
+    fn reset_dual_peek(&self) {
+        let mut peek = self.dual_peek.borrow_mut();
+        peek.mvcc_peek = CursorPeek::Uninitialized;
+        peek.btree_peek = CursorPeek::Uninitialized;
+        // Reset the iterator to None
+        match &mut peek.mvcc_iterator {
+            MvccIteratorKind::Table(iter) => *iter = None,
+            MvccIteratorKind::Index(iter) => *iter = None,
+        }
     }
 
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
-    fn init_mvcc_iterator_forward(&mut self) {
-        if self.table_iterator.is_some() || self.index_iterator.is_some() {
-            return; // Already initialized
-        }
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => {
+    fn init_mvcc_iterator_forward(&self) {
+        let mut peek = self.dual_peek.borrow_mut();
+        match &mut peek.mvcc_iterator {
+            MvccIteratorKind::Table(iter) => {
+                if iter.is_some() {
+                    return; // Already initialized
+                }
                 let start_rowid = RowID {
                     table_id: self.table_id,
                     row_id: RowKey::Int(i64::MIN),
@@ -551,16 +562,19 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+                *iter = Some(static_iterator_hack!(iter_box, RowID));
             }
-            MvccCursorType::Index(_) => {
+            MvccIteratorKind::Index(iter) => {
+                if iter.is_some() {
+                    return; // Already initialized
+                }
                 let index_rows = self
                     .db
                     .index_rows
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                *iter = Some(static_iterator_hack!(iter_box, SortableIndexKey));
             }
         }
     }
@@ -568,8 +582,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
-        let _ = self.table_iterator.take();
-        let _ = self.index_iterator.take();
         self.reset_dual_peek();
 
         // Initialize btree cursor to last position
@@ -579,34 +591,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.current_pos.replace(CursorPosition::End);
 
         // Initialize MVCC iterator to last position
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => match self
-                .db
-                .get_last_table_rowid(self.table_id, &mut self.table_iterator)
-            {
-                Some(k) => {
-                    let mut peek = self.dual_peek.borrow_mut();
-                    peek.mvcc_peek = CursorPeek::Row(k);
-                }
-                None => {
-                    let mut peek = self.dual_peek.borrow_mut();
-                    peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-            MvccCursorType::Index(_) => match self
-                .db
-                .get_last_index_rowid(self.table_id, &mut self.index_iterator)
-            {
-                Some(k) => {
-                    let mut peek = self.dual_peek.borrow_mut();
-                    peek.mvcc_peek = CursorPeek::Row(k);
-                }
-                None => {
-                    let mut peek = self.dual_peek.borrow_mut();
-                    peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
+        let mut peek = self.dual_peek.borrow_mut();
+        let last_key = match &mut peek.mvcc_iterator {
+            MvccIteratorKind::Table(iter) => self.db.get_last_table_rowid(self.table_id, iter),
+            MvccIteratorKind::Index(iter) => self.db.get_last_index_rowid(self.table_id, iter),
         };
+        peek.mvcc_peek = match last_key {
+            Some(k) => CursorPeek::Row(k),
+            None => CursorPeek::Exhausted,
+        };
+        drop(peek);
 
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
@@ -773,13 +767,19 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     SeekOp::LE { eq_only: _ } => true,
                 };
                 self.invalidate_record();
-                let found_rowid = self.db.seek_rowid(
-                    rowid.clone(),
-                    inclusive,
-                    op.iteration_direction(),
-                    self.tx_id,
-                    &mut self.table_iterator,
-                );
+                let found_rowid = {
+                    let mut peek = self.dual_peek.borrow_mut();
+                    let MvccIteratorKind::Table(iter) = &mut peek.mvcc_iterator else {
+                        panic!("SeekKey::TableRowId requires Table cursor type");
+                    };
+                    self.db.seek_rowid(
+                        rowid.clone(),
+                        inclusive,
+                        op.iteration_direction(),
+                        self.tx_id,
+                        iter,
+                    )
+                };
                 if let Some(found_rowid) = found_rowid {
                     self.current_pos.replace(CursorPosition::Loaded {
                         row_id: found_rowid.clone(),
@@ -829,14 +829,20 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     SeekOp::LT => false,
                     SeekOp::LE { eq_only: _ } => true,
                 };
-                let found_rowid = self.db.seek_index(
-                    self.table_id,
-                    sortable_key.clone(),
-                    inclusive,
-                    op.iteration_direction(),
-                    self.tx_id,
-                    &mut self.index_iterator,
-                );
+                let found_rowid = {
+                    let mut peek = self.dual_peek.borrow_mut();
+                    let MvccIteratorKind::Index(iter) = &mut peek.mvcc_iterator else {
+                        panic!("SeekKey::IndexKey requires Index cursor type");
+                    };
+                    self.db.seek_index(
+                        self.table_id,
+                        sortable_key.clone(),
+                        inclusive,
+                        op.iteration_direction(),
+                        self.tx_id,
+                        iter,
+                    )
+                };
                 if let Some(found_rowid) = found_rowid {
                     self.current_pos.replace(CursorPosition::Loaded {
                         row_id: found_rowid.clone(),
@@ -965,16 +971,22 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
             let inclusive = true;
-            let rowid = self.db.seek_rowid(
-                RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(*int_key),
-                },
-                inclusive,
-                IterationDirection::Forwards,
-                self.tx_id,
-                &mut self.table_iterator,
-            );
+            let rowid = {
+                let mut peek = self.dual_peek.borrow_mut();
+                let MvccIteratorKind::Table(iter) = &mut peek.mvcc_iterator else {
+                    panic!("exists() requires Table cursor type");
+                };
+                self.db.seek_rowid(
+                    RowID {
+                        table_id: self.table_id,
+                        row_id: RowKey::Int(*int_key),
+                    },
+                    inclusive,
+                    IterationDirection::Forwards,
+                    self.tx_id,
+                    iter,
+                )
+            };
             let exists = if let Some(rowid) = rowid {
                 let RowKey::Int(rowid) = rowid.row_id else {
                     panic!("Rowid is not an integer in mvcc table cursor");
@@ -1042,8 +1054,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
-        let _ = self.table_iterator.take();
-        let _ = self.index_iterator.take();
         self.reset_dual_peek();
 
         // First run btree_cursor rewind so that we don't need a explicit state machine.
@@ -1052,33 +1062,34 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.current_pos.replace(CursorPosition::BeforeFirst);
 
-        // Initialize MVCC iterators for rewind operation; in practice there is only one of these
-        // depending on the cursor type, so we should at some point refactor the iterator thing to be
-        // generic over the type instead of having two on the struct.
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => {
-                // For table cursors, initialize iterator from the correct table id + i64::MIN;
-                // this is because table rows from all tables are stored in the same map
-                let start_rowid = RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(i64::MIN),
-                };
-                let range = (
-                    std::ops::Bound::Included(start_rowid),
-                    std::ops::Bound::Unbounded,
-                );
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
-            }
-            MvccCursorType::Index(_) => {
-                // For index cursors, initialize the iterator to the beginning
-                let index_rows = self
-                    .db
-                    .index_rows
-                    .get_or_insert_with(self.table_id, SkipMap::new);
-                let index_rows = index_rows.value();
-                let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+        // Initialize MVCC iterator for rewind operation
+        {
+            let mut peek = self.dual_peek.borrow_mut();
+            match &mut peek.mvcc_iterator {
+                MvccIteratorKind::Table(iter) => {
+                    // For table cursors, initialize iterator from the correct table id + i64::MIN;
+                    // this is because table rows from all tables are stored in the same map
+                    let start_rowid = RowID {
+                        table_id: self.table_id,
+                        row_id: RowKey::Int(i64::MIN),
+                    };
+                    let range = (
+                        std::ops::Bound::Included(start_rowid),
+                        std::ops::Bound::Unbounded,
+                    );
+                    let iter_box = Box::new(self.db.rows.range(range));
+                    *iter = Some(static_iterator_hack!(iter_box, RowID));
+                }
+                MvccIteratorKind::Index(iter) => {
+                    // For index cursors, initialize the iterator to the beginning
+                    let index_rows = self
+                        .db
+                        .index_rows
+                        .get_or_insert_with(self.table_id, SkipMap::new);
+                    let index_rows = index_rows.value();
+                    let iter_box = Box::new(index_rows.iter());
+                    *iter = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                }
             }
         }
 
@@ -1117,13 +1128,19 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             row_id: RowKey::Int(i64::MAX),
         };
         let inclusive = true;
-        let rowid = self.db.seek_rowid(
-            max_rowid,
-            inclusive,
-            IterationDirection::Forwards,
-            self.tx_id,
-            &mut self.table_iterator,
-        );
+        let rowid = {
+            let mut peek = self.dual_peek.borrow_mut();
+            let MvccIteratorKind::Table(iter) = &mut peek.mvcc_iterator else {
+                panic!("seek_to_last() requires Table cursor type");
+            };
+            self.db.seek_rowid(
+                max_rowid,
+                inclusive,
+                IterationDirection::Forwards,
+                self.tx_id,
+                iter,
+            )
+        };
         if let Some(rowid) = rowid {
             self.current_pos.replace(CursorPosition::Loaded {
                 row_id: rowid,
