@@ -94,98 +94,96 @@ pub fn join_lhs_and_rhs<'a>(
     // RHS table number (used for order checks below)
     let rhs_table_number = join_order.last().unwrap().original_idx;
 
-    if lhs.is_some() {
-        // Allow a hash join between the immediately preceding table and the current RHS.
-        if join_order.len() >= 2 {
-            let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
-            let rhs_table_idx = join_order.last().unwrap().original_idx;
-            let lhs_table = &joined_tables[lhs_table_idx];
+    // Allow a hash join between the immediately preceding table and the current RHS.
+    if lhs.is_some() && join_order.len() >= 2 {
+        let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
+        let rhs_table_idx = join_order.last().unwrap().original_idx;
+        let lhs_table = &joined_tables[lhs_table_idx];
 
-            // If the chosen access method for the build table already uses constraints
-            // (e.g. seeks on an index or rowid), skip hash join to avoid dropping those filters.
-            let build_access_method_uses_constraints = lhs
-                .and_then(|join| {
-                    join.data
-                        .iter()
-                        .find(|(table_no, _)| *table_no == lhs_table_idx)
-                        .map(|(_, am_idx)| *am_idx)
-                })
-                .map(|am_idx| {
-                    let arena = access_methods_arena.borrow();
-                    arena.get(am_idx).is_some_and(|am| {
-                        if let AccessMethodParams::BTreeTable {
-                            constraint_refs, ..
-                        } = &am.params
-                        {
-                            !constraint_refs.is_empty()
-                        } else {
-                            false
-                        }
-                    })
-                })
-                .unwrap_or(false);
-
-            // If the query needs a specific ordering, only allow hash join when the nested-loop
-            // alternative would NOT satisfy the order target.
-            let nested_loop_preserves_order = maybe_order_target.is_some_and(|order_target| {
-                // Temporarily add the nested-loop method to the arena to evaluate ordering.
-                {
-                    let mut arena = access_methods_arena.borrow_mut();
-                    arena.push(best_access_method.clone());
-                }
-                let am_idx = access_methods_arena.borrow().len() - 1;
-                let mut data = lhs.map_or(Vec::new(), |l| l.data.clone());
-                data.push((rhs_table_number, am_idx));
-                let tmp_plan = JoinN {
-                    data,
-                    output_cardinality: 0,
-                    cost: Cost(0.0),
-                };
-                let preserves = plan_satisfies_order_target(
-                    &tmp_plan,
-                    access_methods_arena,
-                    joined_tables,
-                    order_target,
-                );
-                access_methods_arena.borrow_mut().pop();
-                preserves
-            });
-
-            // Cardinality estimates
-            let build_cardinality = lhs
-                .map(|l| l.output_cardinality as f64)
-                .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
-            let probe_cardinality = (input_cardinality as f64
-                * ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
-                * output_cardinality_multiplier)
-                .max(1.0);
-
-            let rhs_has_selective_seek = matches!(
-                best_access_method.params,
-                AccessMethodParams::BTreeTable {
-                    ref constraint_refs,
-                    ..
-                } if !constraint_refs.is_empty()
-            );
-
-            if !build_access_method_uses_constraints
-                && !nested_loop_preserves_order
-                && !rhs_has_selective_seek
-            {
-                if let Some(hash_join_method) = try_hash_join_access_method(
-                    lhs_table,
-                    rhs_table_reference,
-                    lhs_table_idx,
-                    rhs_table_idx,
-                    rhs_constraints,
-                    where_clause,
-                    build_cardinality,
-                    probe_cardinality,
-                    subqueries,
-                ) {
-                    if hash_join_method.cost < best_access_method.cost {
-                        best_access_method = hash_join_method;
+        // If the chosen access method for the build table already uses constraints
+        // (e.g. seeks on an index or rowid), skip hash join to avoid dropping those filters.
+        let build_access_method_uses_constraints = lhs
+            .and_then(|join| {
+                join.data
+                    .iter()
+                    .find(|(table_no, _)| *table_no == lhs_table_idx)
+                    .map(|(_, am_idx)| *am_idx)
+            })
+            .map(|am_idx| {
+                let arena = access_methods_arena.borrow();
+                arena.get(am_idx).is_some_and(|am| {
+                    if let AccessMethodParams::BTreeTable {
+                        constraint_refs, ..
+                    } = &am.params
+                    {
+                        !constraint_refs.is_empty()
+                    } else {
+                        false
                     }
+                })
+            })
+            .unwrap_or(false);
+
+        // If the query needs a specific ordering, only allow hash join when the nested-loop
+        // alternative would NOT satisfy the order target.
+        let nested_loop_preserves_order = maybe_order_target.is_some_and(|order_target| {
+            // Temporarily add the nested-loop method to the arena to evaluate ordering.
+            {
+                let mut arena = access_methods_arena.borrow_mut();
+                arena.push(best_access_method.clone());
+            }
+            let am_idx = access_methods_arena.borrow().len() - 1;
+            let mut data = lhs.map_or(Vec::new(), |l| l.data.clone());
+            data.push((rhs_table_number, am_idx));
+            let tmp_plan = JoinN {
+                data,
+                output_cardinality: 0,
+                cost: Cost(0.0),
+            };
+            let preserves = plan_satisfies_order_target(
+                &tmp_plan,
+                access_methods_arena,
+                joined_tables,
+                order_target,
+            );
+            access_methods_arena.borrow_mut().pop();
+            preserves
+        });
+
+        // Cardinality estimates for hash join cost.
+        // - build_cardinality: number of rows in the build table
+        // - probe_cardinality: number of rows in the probe table
+        // The join will scan all probe rows and look them up in the hash table.
+        let build_cardinality = lhs
+            .map(|l| l.output_cardinality as f64)
+            .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+        let probe_cardinality = ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
+
+        let rhs_has_selective_seek = matches!(
+            best_access_method.params,
+            AccessMethodParams::BTreeTable {
+                ref constraint_refs,
+                ..
+            } if !constraint_refs.is_empty()
+        );
+
+        if !build_access_method_uses_constraints
+            && !nested_loop_preserves_order
+            && !rhs_has_selective_seek
+        {
+            if let Some(hash_join_method) = try_hash_join_access_method(
+                lhs_table,
+                rhs_table_reference,
+                lhs_table_idx,
+                rhs_table_idx,
+                rhs_constraints,
+                where_clause,
+                build_cardinality,
+                probe_cardinality,
+                subqueries,
+            ) {
+                if hash_join_method.cost < best_access_method.cost {
+                    best_access_method = hash_join_method;
                 }
             }
         }
