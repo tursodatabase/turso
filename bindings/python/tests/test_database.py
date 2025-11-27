@@ -1,8 +1,14 @@
 import os
 import sqlite3
-
 import pytest
 import turso
+
+def connect(provider, database):
+    if provider == "turso":
+        return turso.connect(database)
+    if provider == "sqlite3":
+        return sqlite3.connect(database)
+    raise Exception(f"Provider `{provider}` is not supported")
 
 
 @pytest.fixture(autouse=True)
@@ -206,10 +212,3 @@ def test_with_statement(provider):
         assert max_id
         assert max_id == (2,)
 
-
-def connect(provider, database):
-    if provider == "turso":
-        return turso.connect(database)
-    if provider == "sqlite3":
-        return sqlite3.connect(database)
-    raise Exception(f"Provider `{provider}` is not supported")
