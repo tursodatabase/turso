@@ -294,6 +294,8 @@ impl PyTursoStatement {
     /// This method must be called when statement is no longer need
     /// It will perform necessary cleanup and run any unfinished statement operations to completion
     /// (for example, in `INSERT INTO ... RETURNING ...` query, finalize is essential as it will make sure that all inserts will be completed, even if only few first rows were consumed by the caller)
+    ///
+    /// Note, that if statement wasn't started (no step / execute methods was called) - finalize will not execute the statement
     pub fn finalize(&mut self) -> PyResult<PyTursoStatusCode> {
         Ok(turso_status_to_py(
             self.statement.finalize().map_err(turso_error_to_py_err)?,
