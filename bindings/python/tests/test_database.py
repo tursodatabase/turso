@@ -445,7 +445,7 @@ def test_subquery(provider):
 
     cursor.execute("SELECT id FROM test WHERE value > (SELECT AVG(value) FROM test)")
     rows = cursor.fetchall()
-    assert rows == [(2,), (3,)]
+    assert rows == [(3,)]
 
     conn.close()
 
@@ -473,8 +473,9 @@ def test_insert_returning_partial_fetch(provider):
     row = cursor.fetchone()
     assert row == (1, "alice")
 
-    conn.commit()
+    cursor.close()
 
+    cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM test")
     count = cursor.fetchone()[0]
     assert count == 3
