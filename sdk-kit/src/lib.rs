@@ -48,10 +48,10 @@ impl ConcurrentGuard {
         {
             return Err(TursoError {
                 code: rsapi::TursoStatusCode::Misuse,
-                message: Some(format!("concurrent use forbidden")),
+                message: Some("concurrent use forbidden".to_string()),
             });
         };
-        Ok(ConcurrentGuardToken { guard: &self })
+        Ok(ConcurrentGuardToken { guard: self })
     }
 }
 

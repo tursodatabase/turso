@@ -145,7 +145,7 @@ pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a
     if slice.ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
-            message: Some(format!("expected slice representing utf-8 value, got null")),
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
         });
     }
     let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
@@ -165,7 +165,7 @@ pub fn bytes_from_turso_slice<'a>(
     if slice.ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
-            message: Some(format!("expected slice representing utf-8 value, got null")),
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
         });
     }
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
@@ -175,9 +175,7 @@ pub(crate) fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str
     if ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
-            message: Some(format!(
-                "expected zero terminated c string, got null pointer"
-            )),
+            message: Some("expected zero terminated c string, got null pointer".to_string()),
         });
     }
     let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
@@ -296,7 +294,7 @@ fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
         message: Some(format!("{err}")),
     }
 }
-static LOGGER: RwLock<Option<Box<dyn Fn(TursoLog) + Send + Sync + 'static>>> = RwLock::new(None);
+static LOGGER: RwLock<Option<Box<Logger>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
 struct CallbackLayer<F>
@@ -359,7 +357,7 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
             _ => {
                 return Err(TursoError {
                     code: TursoStatusCode::Error,
-                    message: Some(format!("unknown log level")),
+                    message: Some("unknown log level".to_string()),
                 })
             }
         }
@@ -398,7 +396,7 @@ impl TursoDatabase {
         if inner_db.is_some() {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("database must be opened only once")),
+                message: Some("database must be opened only once".to_string()),
             });
         }
         let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
@@ -449,7 +447,7 @@ impl TursoDatabase {
         let Some(db) = inner_db.as_ref() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("database must be opened first")),
+                message: Some("database must be opened first".to_string()),
             });
         };
         let connection = db.connect();
@@ -474,13 +472,16 @@ impl TursoDatabase {
 
     /// helper method to restore TursoDatabase ref from C raw container
     /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: capi::c::turso_database_t,
     ) -> Result<&'a Self, TursoError> {
         if value.inner.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("got null pointer")),
+                message: Some("got null pointer".to_string()),
             })
         } else {
             Ok(&*(value.inner as *const Self))
@@ -489,7 +490,10 @@ impl TursoDatabase {
 
     /// helper method to restore TursoDatabase instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn arc_from_capi<'a>(value: capi::c::turso_database_t) -> Arc<Self> {
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
+    pub unsafe fn arc_from_capi(value: capi::c::turso_database_t) -> Arc<Self> {
         Arc::from_raw(value.inner as *const Self)
     }
 }
@@ -553,13 +557,16 @@ impl TursoConnection {
 
     /// helper method to restore TursoConnection ref from C raw container
     /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: capi::c::turso_connection_t,
     ) -> Result<&'a Self, TursoError> {
         if value.inner.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("got null pointer")),
+                message: Some("got null pointer".to_string()),
             })
         } else {
             Ok(&*(value.inner as *const Self))
@@ -568,7 +575,10 @@ impl TursoConnection {
 
     /// helper method to restore TursoConnection instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn arc_from_capi<'a>(value: capi::c::turso_connection_t) -> Arc<Self> {
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
+    pub unsafe fn arc_from_capi(value: capi::c::turso_connection_t) -> Arc<Self> {
         Arc::from_raw(value.inner as *const Self)
     }
 }
@@ -595,7 +605,7 @@ impl TursoStatement {
         let Ok(index) = index.try_into() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("bind index must be non-zero")),
+                message: Some("bind index must be non-zero".to_string()),
             });
         };
         // bind_at is safe to call with any index as it will put pair (index, value) into the map
@@ -623,8 +633,7 @@ impl TursoStatement {
                 return Err(TursoError {
                     code: TursoStatusCode::Error,
                     message: Some(format!(
-                        "internal error: unexpected internal parameter name: {}",
-                        parameter
+                        "internal error: unexpected internal parameter name: {parameter}"
                     )),
                 });
             }
@@ -709,7 +718,7 @@ impl TursoStatement {
     pub fn run_io(&self) -> Result<(), TursoError> {
         self.statement
             .run_once()
-            .map_err(|err| turso_error_from_limbo_error(err))
+            .map_err(turso_error_from_limbo_error)
     }
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
@@ -717,13 +726,13 @@ impl TursoStatement {
         let Some(row) = self.statement.row() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("statement holds no row")),
+                message: Some("statement holds no row".to_string()),
             });
         };
         if index >= row.len() {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("attempt to access row value out of bounds")),
+                message: Some("attempt to access row value out of bounds".to_string()),
             });
         }
         let value = row.get_value(index);
@@ -738,7 +747,7 @@ impl TursoStatement {
         if index >= self.column_count() {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("column index out of bounds")),
+                message: Some("column index out of bounds".to_string()),
             });
         }
         Ok(self.statement.get_column_name(index))
@@ -774,13 +783,16 @@ impl TursoStatement {
 
     /// helper method to restore TursoStatement ref from C raw container
     /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: capi::c::turso_statement_t,
     ) -> Result<&'a mut Self, TursoError> {
         if value.inner.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
-                message: Some(format!("got null pointer")),
+                message: Some("got null pointer".to_string()),
             })
         } else {
             Ok(&mut *(value.inner as *mut Self))
@@ -789,7 +801,10 @@ impl TursoStatement {
 
     /// helper method to restore TursoStatement instance from C raw container
     /// this method is used in the capi wrappers
-    pub unsafe fn box_from_capi<'a>(value: capi::c::turso_statement_t) -> Box<Self> {
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
+    pub unsafe fn box_from_capi(value: capi::c::turso_statement_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }
 }

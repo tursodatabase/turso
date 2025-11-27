@@ -580,7 +580,7 @@ mod tests {
         unsafe {
             turso_setup(turso_config_t {
                 logger: Some(logger),
-                log_level: b"debug\0".as_ptr(),
+                log_level: c"debug".as_ptr(),
             })
         };
     }
@@ -658,7 +658,7 @@ mod tests {
             let conn = turso_database_connect(db.database);
             assert_eq!(conn.status.code, turso_status_code_t::TURSO_OK);
 
-            let sql = "SELECT NULL, 2, 3.14, '5', x'06'";
+            let sql = "SELECT NULL, 2, 2.71, '5', x'06'";
             let stmt = turso_connection_prepare_single(
                 conn.connection,
                 turso_slice_ref_t {
@@ -774,7 +774,7 @@ mod tests {
             let conn = turso_database_connect(db.database);
             assert_eq!(conn.status.code, turso_status_code_t::TURSO_OK);
 
-            let sql = "SELECT NULL, 2, 3.14, '5', x'06'";
+            let sql = "SELECT NULL, 2, 2.71, '5', x'06'";
             let stmt = turso_connection_prepare_single(
                 conn.connection,
                 turso_slice_ref_t {
@@ -807,7 +807,7 @@ mod tests {
                     }
                     continue;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
 
             assert_eq!(
@@ -815,7 +815,7 @@ mod tests {
                 vec![
                     turso_core::Value::Null,
                     turso_core::Value::Integer(2),
-                    turso_core::Value::Float(3.14),
+                    turso_core::Value::Float(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -887,7 +887,7 @@ mod tests {
                     3,
                     turso_value_t {
                         type_: capi::c::turso_type_t::TURSO_TYPE_REAL,
-                        value: turso_value_union_t { real: 3.14 }
+                        value: turso_value_union_t { real: 2.71 }
                     },
                 )
                 .code,
@@ -942,7 +942,7 @@ mod tests {
                     }
                     continue;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
 
             assert_eq!(
@@ -950,7 +950,7 @@ mod tests {
                 vec![
                     turso_core::Value::Null,
                     turso_core::Value::Integer(2),
-                    turso_core::Value::Float(3.14),
+                    turso_core::Value::Float(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -1022,7 +1022,7 @@ mod tests {
                     turso_slice_from_bytes("c".as_bytes()),
                     turso_value_t {
                         type_: capi::c::turso_type_t::TURSO_TYPE_REAL,
-                        value: turso_value_union_t { real: 3.14 }
+                        value: turso_value_union_t { real: 2.71 }
                     },
                 )
                 .code,
@@ -1077,7 +1077,7 @@ mod tests {
                     }
                     continue;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
 
             assert_eq!(
@@ -1085,7 +1085,7 @@ mod tests {
                 vec![
                     turso_core::Value::Null,
                     turso_core::Value::Integer(2),
-                    turso_core::Value::Float(3.14),
+                    turso_core::Value::Float(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -1160,7 +1160,7 @@ mod tests {
                     }
                     break;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
 
             assert_eq!(collected, vec![turso_core::Value::Integer(1)]);
@@ -1204,7 +1204,7 @@ mod tests {
                 if status.code == turso_status_code_t::TURSO_DONE {
                     break;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
 
             assert_eq!(collected, vec![turso_core::Value::Integer(3)]);
@@ -1231,7 +1231,7 @@ mod tests {
             assert_eq!(conn.status.code, turso_status_code_t::TURSO_OK);
 
             let sql = "CREATE TABLE t(x); CREATE TABLE q(x); INSERT INTO t VALUES (1); INSERT INTO q VALUES (2);";
-            let mut sql_slice = sql[..].as_bytes();
+            let mut sql_slice = sql.as_bytes();
             loop {
                 let stmt = turso_connection_prepare_first(
                     conn.connection,
@@ -1288,7 +1288,7 @@ mod tests {
                 if status.code == turso_status_code_t::TURSO_DONE {
                     break;
                 }
-                assert!(false);
+                panic!("unexpected");
             }
             assert_eq!(
                 collected,
