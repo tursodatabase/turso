@@ -15,7 +15,7 @@ use turso_core::{
     StepResult, IO,
 };
 
-use crate::{assert_send, assert_sync, capi};
+use crate::{assert_send, assert_sync, capi, ConcurrentGuard};
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
@@ -456,6 +456,7 @@ impl TursoDatabase {
         match connection {
             Ok(connection) => Ok(Arc::new(TursoConnection {
                 async_io: self.config.async_io,
+                concurrent_guard: Arc::new(ConcurrentGuard::new()),
                 connection,
             })),
             Err(err) => Err(turso_error_from_limbo_error(err)),
@@ -494,6 +495,7 @@ impl TursoDatabase {
 
 pub struct TursoConnection {
     async_io: bool,
+    concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
 }
 
@@ -505,6 +507,7 @@ impl TursoConnection {
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         match self.connection.prepare(sql) {
             Ok(statement) => Ok(Box::new(TursoStatement {
+                concurrent_guard: self.concurrent_guard.clone(),
                 async_io: self.async_io,
                 statement,
             })),
@@ -521,6 +524,7 @@ impl TursoConnection {
             Ok(Some((statement, position))) => Ok(Some((
                 Box::new(TursoStatement {
                     async_io: self.async_io,
+                    concurrent_guard: Arc::new(ConcurrentGuard::new()),
                     statement: statement,
                 }),
                 position,
@@ -530,8 +534,12 @@ impl TursoConnection {
         }
     }
 
-    pub fn close(&self) {
-        // self.connection.close()
+    /// close the connection preventing any further operations executed over it
+    /// SAFETY: caller must guarantee that no ongoing operations are running over connection before calling close(...) method
+    pub fn close(&self) -> Result<(), TursoError> {
+        self.connection
+            .close()
+            .map_err(turso_error_from_limbo_error)
     }
 
     /// helper method to get C raw container to the TursoConnection instance
@@ -566,9 +574,11 @@ impl TursoConnection {
 
 pub struct TursoStatement {
     async_io: bool,
+    concurrent_guard: Arc<ConcurrentGuard>,
     statement: Statement,
 }
 
+#[derive(Debug)]
 pub struct TursoExecutionResult {
     pub status: TursoStatusCode,
     pub rows_changed: u64,
@@ -633,6 +643,12 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Row] if execution generated a row
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn step(&mut self) -> Result<TursoStatusCode, TursoError> {
+        let guard = self.concurrent_guard.clone();
+        let _guard = guard.try_use()?;
+        self.step_no_guard()
+    }
+
+    fn step_no_guard(&mut self) -> Result<TursoStatusCode, TursoError> {
         let async_io = self.async_io;
         loop {
             return match self.statement.step() {
@@ -662,8 +678,11 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Ok] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self) -> Result<TursoExecutionResult, TursoError> {
+        let guard = self.concurrent_guard.clone();
+        let _guard = guard.try_use()?;
+
         loop {
-            let status = self.step()?;
+            let status = self.step_no_guard()?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -726,8 +745,11 @@ impl TursoStatement {
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self) -> Result<TursoStatusCode, TursoError> {
+        let guard = self.concurrent_guard.clone();
+        let _guard = guard.try_use()?;
+
         while self.statement.execution_state().is_running() {
-            let status = self.step()?;
+            let status = self.step_no_guard()?;
             if status == TursoStatusCode::Io {
                 return Ok(status);
             }
@@ -768,5 +790,41 @@ impl TursoStatement {
     /// this method is used in the capi wrappers
     pub unsafe fn box_from_capi<'a>(value: capi::c::turso_statement_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig};
+
+    #[test]
+    pub fn test_db_concurrent_use() {
+        let db = TursoDatabase::create(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            io: None,
+            async_io: false,
+        });
+        db.open().unwrap();
+        let conn = db.connect().unwrap();
+        let stmt1 = conn
+            .prepare_single("SELECT * FROM generate_series(1, 10000)")
+            .unwrap();
+        let stmt2 = conn
+            .prepare_single("SELECT * FROM generate_series(1, 10000)")
+            .unwrap();
+
+        let mut threads = Vec::new();
+        for mut stmt in [stmt1, stmt2] {
+            let thread = std::thread::spawn(move || stmt.execute());
+            threads.push(thread);
+        }
+        let mut results = Vec::new();
+        for thread in threads {
+            results.push(thread.join().unwrap());
+        }
+        assert!(
+            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err()
+        );
     }
 }

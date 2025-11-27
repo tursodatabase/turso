@@ -202,6 +202,19 @@ pub extern "C" fn turso_connection_prepare_first_result_empty(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_connection_close(connection: c::turso_connection_t) -> c::turso_status_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return err.to_capi(),
+    };
+    match connection.close() {
+        Ok(()) => turso_status_ok(),
+        Err(err) => err.to_capi(),
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_run_io(statement: c::turso_statement_t) -> c::turso_status_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,

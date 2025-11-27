@@ -191,6 +191,12 @@ typedef struct
 turso_connection_prepare_first_t
 turso_connection_prepare_first(turso_connection_t self, turso_slice_ref_t sql);
 
+/** close the connection preventing any further operations executed over it
+ * caller still need to call deinit method to reclaim memory from the instance holding connection
+ * SAFETY: caller must guarantee that no ongoing operations are running over connection before calling turso_connection_close(...) method
+ */
+turso_status_t turso_connection_close(turso_connection_t self);
+
 /** Check if no more statements was parsed after execution of turso_connection_prepare_first method */
 bool turso_connection_prepare_first_result_empty(turso_connection_prepare_first_t result);
 

@@ -488,6 +488,10 @@ unsafe extern "C" {
     ) -> turso_connection_prepare_first_t;
 }
 unsafe extern "C" {
+    #[doc = " close the connection preventing any further operations executed over it\n caller still need to call deinit method to reclaim memory from the instance holding connection\n SAFETY: caller must guarantee that no ongoing operations are running over connection before calling turso_connection_close(...) method"]
+    pub fn turso_connection_close(self_: turso_connection_t) -> turso_status_t;
+}
+unsafe extern "C" {
     #[doc = " Check if no more statements was parsed after execution of turso_connection_prepare_first method"]
     pub fn turso_connection_prepare_first_result_empty(
         result: turso_connection_prepare_first_t,
