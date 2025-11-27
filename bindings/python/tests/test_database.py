@@ -284,7 +284,6 @@ def test_cursor_fetchmany(provider):
     cursor.execute("SELECT * FROM test")
 
     cursor.arraysize = 2
-    print(cursor.arraysize)
     rows = cursor.fetchmany()
     assert len(rows) == 2
     assert rows == [(1,), (2,)]
