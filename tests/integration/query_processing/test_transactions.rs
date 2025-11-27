@@ -12,9 +12,8 @@ use crate::common::TempDatabase;
 // 4. T1 commits
 // 5. T2 attempts to write again and succeeds. This is because the transaction
 //    was still fresh (no reads or writes happened).
-#[test]
-fn test_deferred_transaction_restart() {
-    let tmp_db = TempDatabase::new("test_deferred_tx.db");
+#[turso_macros::test]
+fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -55,9 +54,8 @@ fn test_deferred_transaction_restart() {
 // 5. T1 commits (invalidating T2's snapshot).
 // 6. T2 attempts to write again but still gets BUSY - it cannot restart
 //    because it has performed reads and has a committed snapshot.
-#[test]
-fn test_deferred_transaction_no_restart() {
-    let tmp_db = TempDatabase::new("test_deferred_tx_no_restart.db");
+#[turso_macros::test]
+fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -104,9 +102,8 @@ fn test_deferred_transaction_no_restart() {
     }
 }
 
-#[test]
-fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("create table t (x);");
+#[turso_macros::test(init_sql = "create table t (x);")]
+fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     let conn = tmp_db.connect_limbo();
 
     conn.execute("begin")?;
@@ -127,11 +124,10 @@ fn test_txn_error_doesnt_rollback_txn() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test]
 /// Connection 2 should see the initial data (table 'test' in schema + 2 rows). Regression test for #2997
 /// It should then see another created table 'test2' in schema, as well.
-fn test_transaction_visibility() {
-    let tmp_db = TempDatabase::new("test_transaction_visibility.db");
+fn test_transaction_visibility(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -176,11 +172,9 @@ fn test_transaction_visibility() {
     }
 }
 
-#[test]
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
-fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
-    let tmp_db =
-        TempDatabase::new("test_constraint_error_aborts_only_stmt_not_entire_transaction.db");
+fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     // Create table succeeds
@@ -216,13 +210,12 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction() {
     );
 }
 
-#[test]
+#[turso_macros::test]
 /// Regression test for https://github.com/tursodatabase/turso/issues/3784 where dirty pages
 /// were flushed to WAL _before_ deferred FK violations were checked. This resulted in the
 /// violations being persisted to the database, even though the transaction was aborted.
 /// This test ensures that dirty pages are not flushed to WAL until after deferred violations are checked.
-fn test_deferred_fk_violation_rollback_in_autocommit() {
-    let tmp_db = TempDatabase::new("test_deferred_fk_violation_rollback.db");
+fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     // Enable foreign keys
@@ -247,12 +240,8 @@ fn test_deferred_fk_violation_rollback_in_autocommit() {
     assert_eq!(row, vec![Value::Integer(0)]);
 }
 
-#[test]
-fn test_mvcc_transactions_autocommit() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_transactions_autocommit.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_transactions_autocommit(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
 
     // This should work - basic CREATE TABLE in MVCC autocommit mode
@@ -261,12 +250,8 @@ fn test_mvcc_transactions_autocommit() {
         .unwrap();
 }
 
-#[test]
-fn test_mvcc_transactions_immediate() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_transactions_immediate.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_transactions_immediate(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -282,12 +267,8 @@ fn test_mvcc_transactions_immediate() {
     assert!(matches!(result, Err(LimboError::Busy)));
 }
 
-#[test]
-fn test_mvcc_transactions_deferred() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_transactions_deferred.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_transactions_deferred(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -319,12 +300,8 @@ fn test_mvcc_transactions_deferred() {
     }
 }
 
-#[test]
-fn test_mvcc_insert_select_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_update_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_insert_select_basic(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
 
     conn1
@@ -343,12 +320,8 @@ fn test_mvcc_insert_select_basic() {
     assert_eq!(row, vec![Value::Integer(1), Value::build_text("first")]);
 }
 
-#[test]
-fn test_mvcc_update_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_update_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_update_basic(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
 
     conn1
@@ -415,12 +388,8 @@ fn test_mvcc_concurrent_insert_basic() {
     );
 }
 
-#[test]
-fn test_mvcc_update_same_row_twice() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_update_same_row_twice.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+#[turso_macros::test(mvcc)]
+fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
     let conn1 = tmp_db.connect_limbo();
 
     conn1

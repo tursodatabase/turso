@@ -1,12 +1,11 @@
 use crate::common::TempDatabase;
 
-#[test]
-fn test_create_trigger() {
+#[turso_macros::test(mvcc)]
+fn test_create_trigger(db: TempDatabase) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x, y TEXT)").unwrap();
@@ -45,9 +44,8 @@ fn test_create_trigger() {
     assert_eq!(results[1], (1, "hello".to_string()));
 }
 
-#[test]
-fn test_drop_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_drop_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
@@ -99,9 +97,8 @@ fn test_drop_trigger() {
     assert_eq!(results.len(), 0);
 }
 
-#[test]
-fn test_trigger_after_insert() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_after_insert(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y TEXT)")
@@ -142,9 +139,8 @@ fn test_trigger_after_insert() {
     assert_eq!(results[0], (1, "hello".to_string()));
 }
 
-#[test]
-fn test_trigger_when_clause() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_when_clause(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y INTEGER)")
@@ -181,9 +177,8 @@ fn test_trigger_when_clause() {
     assert_eq!(results[0], 2);
 }
 
-#[test]
-fn test_trigger_drop_table_drops_triggers() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_drop_table_drops_triggers(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
@@ -234,9 +229,8 @@ fn test_trigger_drop_table_drops_triggers() {
     assert_eq!(results.len(), 0);
 }
 
-#[test]
-fn test_trigger_new_old_references() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_new_old_references(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY, y TEXT)")
@@ -276,9 +270,8 @@ fn test_trigger_new_old_references() {
     assert_eq!(results[0], "old=hello new=world");
 }
 
-#[test]
-fn test_multiple_triggers_same_event() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_multiple_triggers_same_event(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x INTEGER PRIMARY KEY)")
@@ -322,9 +315,8 @@ fn test_multiple_triggers_same_event() {
     assert_eq!(results[1], "trigger2");
 }
 
-#[test]
-fn test_two_triggers_on_same_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_two_triggers_on_same_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE test (x, msg TEXT)").unwrap();
@@ -385,9 +377,8 @@ fn test_two_triggers_on_same_table() {
     );
 }
 
-#[test]
-fn test_trigger_mutual_recursion() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_mutual_recursion(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     conn.execute("CREATE TABLE t (id INTEGER, msg TEXT)")
@@ -464,9 +455,8 @@ fn test_trigger_mutual_recursion() {
     assert_eq!(u_results[0], (1001, "from_t".to_string()));
 }
 
-#[test]
-fn test_after_insert_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_after_insert_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table and log table
@@ -519,9 +509,8 @@ fn test_after_insert_trigger() {
     assert_eq!(results[1], ("INSERT".to_string(), 2, "banana".to_string()));
 }
 
-#[test]
-fn test_before_update_of_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_before_update_of_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table with multiple columns
@@ -589,9 +578,8 @@ fn test_before_update_of_trigger() {
     assert_eq!(results[1], (2, 200, 250));
 }
 
-#[test]
-fn test_after_update_of_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_after_update_of_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -656,9 +644,8 @@ fn log(s: &str) -> &str {
     s
 }
 
-#[test]
-fn test_before_delete_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_before_delete_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create tables
@@ -736,9 +723,8 @@ fn test_before_delete_trigger() {
     }
 }
 
-#[test]
-fn test_after_delete_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_after_delete_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create tables
@@ -801,9 +787,8 @@ fn test_after_delete_trigger() {
     assert_eq!(results[1], (3, 100, 100));
 }
 
-#[test]
-fn test_trigger_with_multiple_statements() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_trigger_with_multiple_statements(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create tables
@@ -887,9 +872,8 @@ fn test_trigger_with_multiple_statements() {
     assert_eq!(audit_results[1], "Balance changed for account 2");
 }
 
-#[test]
-fn test_alter_table_drop_column_fails_when_trigger_references_new_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_new_column(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table with columns
@@ -918,9 +902,8 @@ fn test_alter_table_drop_column_fails_when_trigger_references_new_column() {
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_fails_when_trigger_references_old_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_old_column(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table with columns
@@ -949,9 +932,8 @@ fn test_alter_table_drop_column_fails_when_trigger_references_old_column() {
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table with columns
@@ -980,9 +962,8 @@ fn test_alter_table_drop_column_fails_when_trigger_references_unqualified_column
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_succeeds_when_trigger_references_other_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_succeeds_when_trigger_references_other_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables
@@ -1023,9 +1004,10 @@ fn test_alter_table_drop_column_succeeds_when_trigger_references_other_table() {
     assert_eq!(columns[0], "x");
 }
 
-#[test]
-fn test_alter_table_drop_column_from_other_table_causes_parse_error_when_trigger_fires() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_from_other_table_causes_parse_error_when_trigger_fires(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create two tables
@@ -1080,9 +1062,8 @@ fn test_alter_table_drop_column_from_other_table_causes_parse_error_when_trigger
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_propagates_to_trigger_on_owning_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_on_owning_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1128,9 +1109,8 @@ fn test_alter_table_rename_column_propagates_to_trigger_on_owning_table() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_propagates_to_trigger_referencing_other_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_referencing_other_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables
@@ -1178,9 +1158,8 @@ fn test_alter_table_rename_column_propagates_to_trigger_referencing_other_table(
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables
@@ -1228,9 +1207,10 @@ fn test_alter_table_rename_column_propagates_to_trigger_with_multiple_references
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_column(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1259,9 +1239,8 @@ fn test_alter_table_rename_column_fails_when_trigger_when_clause_references_colu
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_propagates_to_multiple_triggers() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_propagates_to_multiple_triggers(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1326,9 +1305,8 @@ fn test_alter_table_rename_column_propagates_to_multiple_triggers() {
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_fails_with_old_reference_in_update_trigger() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_fails_with_old_reference_in_update_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1351,9 +1329,8 @@ fn test_alter_table_drop_column_fails_with_old_reference_in_update_trigger() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_in_insert_column_list() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_insert_column_list(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables
@@ -1401,9 +1378,10 @@ fn test_alter_table_rename_column_in_insert_column_list() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_in_trigger_table_does_not_rewrite_other_table_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_trigger_table_does_not_rewrite_other_table_column(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1462,9 +1440,10 @@ fn test_alter_table_rename_column_in_trigger_table_does_not_rewrite_other_table_
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_in_insert_target_table_does_not_rewrite_trigger_table_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_in_insert_target_table_does_not_rewrite_trigger_table_column(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1528,9 +1507,10 @@ fn test_alter_table_rename_column_in_insert_target_table_does_not_rewrite_trigge
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_update_where_clause_does_not_rewrite_target_table_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_where_clause_does_not_rewrite_target_table_column(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1587,9 +1567,8 @@ fn test_alter_table_rename_column_update_where_clause_does_not_rewrite_target_ta
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_update_set_column_name_rewritten() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_set_column_name_rewritten(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1646,9 +1625,10 @@ fn test_alter_table_rename_column_update_set_column_name_rewritten() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_delete_where_clause_does_not_rewrite_target_table_column() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_delete_where_clause_does_not_rewrite_target_table_column(
+    db: TempDatabase,
+) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1705,9 +1685,8 @@ fn test_alter_table_rename_column_delete_where_clause_does_not_rewrite_target_ta
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_update_of_column_list_rewritten() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_of_column_list_rewritten(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1759,9 +1738,8 @@ fn test_alter_table_rename_column_update_of_column_list_rewritten() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_update_of_multiple_columns_rewritten() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_update_of_multiple_columns_rewritten(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1814,9 +1792,8 @@ fn test_alter_table_rename_column_update_of_multiple_columns_rewritten() {
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_allows_when_insert_targets_other_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_insert_targets_other_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1837,9 +1814,8 @@ fn test_alter_table_drop_column_allows_when_insert_targets_other_table() {
     conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
 }
 
-#[test]
-fn test_alter_table_drop_column_allows_when_update_targets_other_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_update_targets_other_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables, both with column 'x'
@@ -1860,9 +1836,8 @@ fn test_alter_table_drop_column_allows_when_update_targets_other_table() {
     conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
 }
 
-#[test]
-fn test_alter_table_drop_column_allows_when_insert_targets_owning_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_insert_targets_owning_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1889,9 +1864,8 @@ fn test_alter_table_drop_column_allows_when_insert_targets_owning_table() {
     );
 }
 
-#[test]
-fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create table
@@ -1918,9 +1892,8 @@ fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table() {
     );
 }
 
-#[test]
-fn test_alter_table_rename_column_qualified_reference_to_trigger_table() {
-    let db = TempDatabase::new_empty();
+#[turso_macros::test(mvcc)]
+fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempDatabase) {
     let conn = db.connect_limbo();
 
     // Create two tables

@@ -3,10 +3,7 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{
-    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, Row, Statement, StepResult,
-    Value,
-};
+use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, StepResult, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -23,12 +20,10 @@ macro_rules! change_state {
     };
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
 #[ignore]
-fn test_simple_overflow_page() -> anyhow::Result<()> {
+fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
 
     let mut huge_text = String::new();
@@ -85,12 +80,10 @@ fn test_simple_overflow_page() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_sequential_overflow_page() -> anyhow::Result<()> {
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
+fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
-    let tmp_db =
-        TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);");
     let conn = tmp_db.connect_limbo();
     let iterations = 10_usize;
 
@@ -153,13 +146,12 @@ fn test_sequential_overflow_page() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_sequential_write() -> anyhow::Result<()> {
+fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -189,12 +181,11 @@ fn test_sequential_write() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x REAL);")]
 /// There was a regression with inserting multiple rows with a column containing an unary operator :)
 /// https://github.com/tursodatabase/turso/pull/679
-fn test_regression_multi_row_insert() -> anyhow::Result<()> {
+fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL);");
     let conn = tmp_db.connect_limbo();
 
     let insert_query = "INSERT INTO test VALUES (-2), (-3), (-1)";
@@ -224,10 +215,9 @@ fn test_regression_multi_row_insert() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_statement_reset() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "create table test (i integer);")]
+fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("create table test (i integer);");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into test values (1)")?;
@@ -270,10 +260,9 @@ fn test_statement_reset() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_checkpoint() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_checkpoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
     let iterations = 1001_usize;
     let conn = tmp_db.connect_limbo();
@@ -300,10 +289,9 @@ fn test_wal_checkpoint() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_restart() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY);")]
+fn test_wal_restart(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x INTEGER PRIMARY KEY);");
     // threshold is 1000 by default
 
     fn insert(i: usize, conn: &Arc<Connection>, tmp_db: &TempDatabase) -> anyhow::Result<()> {
@@ -345,10 +333,9 @@ fn test_wal_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_after_big_blob() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE temp (t1 BLOB, t2 INTEGER)")]
+fn test_insert_after_big_blob(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE temp (t1 BLOB, t2 INTEGER)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("insert into temp(t1) values (zeroblob (262144))")?;
@@ -357,14 +344,13 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test_log::test]
+#[turso_macros::test(init_sql = "CREATE TABLE test (x PRIMARY KEY);")]
 #[ignore = "this takes too long :)"]
-fn test_write_delete_with_index() -> anyhow::Result<()> {
+fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x PRIMARY KEY);");
     let conn = tmp_db.connect_limbo();
 
     let list_query = "SELECT * FROM test";
@@ -412,13 +398,12 @@ fn test_write_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_update_with_index() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE test (x REAL PRIMARY KEY, y TEXT);")]
+fn test_update_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x REAL PRIMARY KEY, y TEXT);");
     let conn = tmp_db.connect_limbo();
 
     common::run_query(&tmp_db, &conn, "INSERT INTO test VALUES (1.0, 'foo')")?;
@@ -448,13 +433,12 @@ fn test_update_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_delete_with_index() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x UNIQUE)")]
+fn test_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x UNIQUE)");
     let conn = tmp_db.connect_limbo();
 
     common::run_query(&tmp_db, &conn, "INSERT INTO t VALUES (1), (2)")?;
@@ -467,10 +451,11 @@ fn test_delete_with_index() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_update_regression() -> anyhow::Result<()> {
+#[turso_macros::test(
+    init_sql = "CREATE TABLE imaginative_baroja (blithesome_hall BLOB,remarkable_lester INTEGER,generous_balagun TEXT,ample_earth INTEGER,marvelous_khadzhiev BLOB,glowing_parissi TEXT,insightful_ryner BLOB)"
+)]
+fn test_update_regression(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE imaginative_baroja (blithesome_hall BLOB,remarkable_lester INTEGER,generous_balagun TEXT,ample_earth INTEGER,marvelous_khadzhiev BLOB,glowing_parissi TEXT,insightful_ryner BLOB)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO imaginative_baroja VALUES (X'617070726F61636861626C655F6F6D6164', 5581285929211692372, 'approachable_podur', -4145754929970306534, X'666F72747569746F75735F7368617270', 'sensible_amesly', X'636F6D70657469746976655F6669746368'), (X'6D6972746866756C5F686F6673746565', -8554670009677647372, 'shimmering_modkraftdk', 4993627046425025026, X'636F6E73696465726174655F63616765', 'breathtaking_boggs', X'616D617A696E675F73696D6F6E65'), (X'7669766163696F75735F7363687761727A', 5860599187854155616, 'sparkling_aurora', 3757552048117668067, X'756E697175655F6769617A', 'lovely_leroy', X'68617264776F726B696E675F6D696C6C6572'), (X'677265676172696F75735F7061657065', -488992130149088413, 'focused_brinker', 4503849242092922100, X'66756E6E795F6A616B736963', 'competitive_communications', X'657863656C6C656E745F7873696C656E74'), (X'7374756E6E696E675F74616E6E656E6261756D', -5634782647279946253, 'fabulous_crute', -3978009805517476564, X'72656C617865645F63617272796F7574', 'spellbinding_erkan', X'66756E6E795F646F626273'), (X'696D6167696E61746976655F746F6C6F6B6F6E6E696B6F7661', 4236471363502323025, 'excellent_wolke', 7606168469334609395, X'736C65656B5F6D6361666565', 'magnificent_riley', X'616D6961626C655F706173736164616B6973'), (X'77696C6C696E675F736872657665', 5048296470820985219, 'ambitious_jeppesen', 6961857167361512834, X'70617469656E745F6272696E6B6572', 'giving_kramm', X'726573706F6E7369626C655F7363686D696474'), (X'73656E7369626C655F6D757865726573', -5519194136843846790, 'frank_ruggero', 4354855935194921345, X'76697669645F63617365', 'focused_lovecruft', X'6D61676E69666963656E745F736B79')")?;
@@ -501,19 +486,13 @@ fn test_update_regression() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test(init_sql = "CREATE TABLE t(x UNIQUE)")]
 /// Test that a large insert statement containing a UNIQUE constraint violation
 /// is properly rolled back so that the database size is also shrunk to the size
 /// before that statement is executed.
-fn test_rollback_on_unique_constraint_violation() -> anyhow::Result<()> {
+fn test_rollback_on_unique_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_opts(
-        "big_statement_rollback.db",
-        DatabaseOpts::new().with_indexes(true),
-    );
     let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE TABLE t(x UNIQUE)")?;
 
     conn.execute("BEGIN")?;
     conn.execute("INSERT INTO t VALUES (10000)")?;
@@ -549,15 +528,11 @@ fn test_rollback_on_unique_constraint_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[turso_macros::test]
 /// Test that a large delete statement containing a foreign key constraint violation
 /// is properly rolled back.
-fn test_rollback_on_foreign_key_constraint_violation() -> anyhow::Result<()> {
+fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_opts(
-        "big_delete_rollback.db",
-        DatabaseOpts::new().with_indexes(true),
-    );
     let conn = tmp_db.connect_limbo();
 
     // Enable foreign keys
@@ -624,10 +599,9 @@ fn test_rollback_on_foreign_key_constraint_violation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_multiple_statements() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
+fn test_multiple_statements(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)");
     let conn = tmp_db.connect_limbo();
 
     conn.execute("INSERT INTO t values(1); insert into t values(2);")?;
@@ -715,13 +689,12 @@ impl ConnectionPlan {
     }
 }
 
-#[test]
-fn test_write_concurrent_connections() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
+fn test_write_concurrent_connections(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     maybe_setup_tracing();
 
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t (x)");
     let num_connections = 4;
     let num_inserts_per_connection = 100;
     let mut connections = vec![];
@@ -767,12 +740,13 @@ fn test_write_concurrent_connections() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_wal_bad_frame() -> anyhow::Result<()> {
+#[turso_macros::test(init_sql = "CREATE TABLE t1 (x)")]
+fn test_wal_bad_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
+    let db_opts = tmp_db.db_opts;
     let db_path = {
-        let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t1 (x)");
+        let tmp_db = tmp_db;
         let db_path = tmp_db.path.clone();
         let conn = tmp_db.connect_limbo();
         conn.execute("BEGIN")?;
@@ -817,20 +791,10 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
     };
     {
         let result = {
-            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                db_path.to_str().unwrap(),
-                turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new().with_indexes(false),
-                None,
-            )
-            .unwrap();
-            let tmp_db = TempDatabase {
-                path: db_path,
-                io,
-                db,
-            };
+            let tmp_db = TempDatabase::builder()
+                .with_db_path(db_path)
+                .with_opts(db_opts)
+                .build();
             let conn = tmp_db.connect_limbo();
             common::run_query_on_row(&tmp_db, &conn, "SELECT count(1) from t2", |row| {
                 let x = row.get::<i64>(0).unwrap();
@@ -859,25 +823,26 @@ fn test_wal_bad_frame() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
+#[turso_macros::test]
+fn test_read_wal_dumb_no_frames(tmp_db: TempDatabase) -> anyhow::Result<()> {
     maybe_setup_tracing();
     let _ = env_logger::try_init();
+    let opts = tmp_db.db_opts;
     let db_path = {
-        let tmp_db = TempDatabase::new_empty();
+        let tmp_db = tmp_db;
         let conn = tmp_db.connect_limbo();
         conn.close()?;
         tmp_db.path.clone()
     };
     // Second connection must recover from the WAL file. Last checksum should be filled correctly.
     {
-        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
         let conn = tmp_db.connect_limbo();
         conn.execute("CREATE TABLE t0 (x)")?;
         conn.close()?;
     }
     {
-        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
         let conn = tmp_db.connect_limbo();
         conn.execute("INSERT INTO t0(x) VALUES (1)")?;
         conn.close()?;
@@ -886,9 +851,8 @@ fn test_read_wal_dumb_no_frames() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_with_column_names() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE a(z)");
+#[turso_macros::test(init_sql = "CREATE TABLE a(z)")]
+fn test_insert_with_column_names(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let result = conn.execute("INSERT INTO a VALUES (b.x)");
 
@@ -907,9 +871,8 @@ fn test_insert_with_column_names() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-pub fn delete_search_op_ignore_nulls() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test()]
+pub fn delete_search_op_ignore_nulls(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
@@ -928,9 +891,8 @@ pub fn delete_search_op_ignore_nulls() {
     );
 }
 
-#[test]
-pub fn delete_eq_correct() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test]
+pub fn delete_eq_correct(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT);",
@@ -956,9 +918,8 @@ pub fn delete_eq_correct() {
     );
 }
 
-#[test]
-pub fn upsert_conflict() {
-    let limbo = TempDatabase::new_empty();
+#[turso_macros::test]
+pub fn upsert_conflict(limbo: TempDatabase) {
     let conn = limbo.db.connect().unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c INT UNIQUE, value INT);",
