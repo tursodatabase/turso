@@ -2133,8 +2133,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     for row_version in row_versions.iter() {
                         // Only process committed versions (both live and deleted)
                         // Deleted versions need index entries too so readers can see the deletion
-                        tracing::info!("row_version.begin={:?}", row_version.begin);
-                        tracing::info!("row_version.end={:?}", row_version.end);
                         assert!(
                             matches!(row_version.begin, Some(TxTimestampOrID::Timestamp(1))),
                             "all table rows should be committed by the bootstrap transaction, but got {:?}", row_version.begin
