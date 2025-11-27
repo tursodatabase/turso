@@ -33,6 +33,7 @@ apilevel = "2.0"
 threadsafety = 1  # 1 means: Threads may share the module, but not connections.
 paramstyle = "qmark"  # Only positional parameters are supported.
 
+
 # Exception hierarchy following DB-API 2.0
 class Warning(Exception):
     pass

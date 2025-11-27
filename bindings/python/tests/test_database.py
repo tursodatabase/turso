@@ -848,20 +848,21 @@ def test_exists_operator(provider):
 
     conn.close()
 
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_transaction_begin_commit(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
-    
+
     cursor.execute("BEGIN")
     cursor.execute("INSERT INTO test VALUES (1, 'test')")
     cursor.execute("COMMIT")
-    
+
     cursor.execute("SELECT * FROM test")
     rows = cursor.fetchall()
     assert rows == [(1, "test")]
-    
+
     conn.close()
 
 
@@ -870,15 +871,15 @@ def test_transaction_begin_rollback(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
-    
+
     cursor.execute("BEGIN")
     cursor.execute("INSERT INTO test VALUES (2, 'rollback')")
     cursor.execute("ROLLBACK")
-    
+
     cursor.execute("SELECT * FROM test")
     rows = cursor.fetchall()
     assert rows == []
-    
+
     conn.close()
 
 
@@ -887,14 +888,14 @@ def test_multiple_cursors_same_connection(provider):
     conn = connect(provider, ":memory:")
     cursor1 = conn.cursor()
     cursor2 = conn.cursor()
-    
+
     cursor1.execute("CREATE TABLE test (id INTEGER)")
     cursor1.execute("INSERT INTO test VALUES (1), (2)")
-    
+
     cursor2.execute("SELECT * FROM test")
     rows = cursor2.fetchall()
     assert len(rows) == 2
-    
+
     cursor1.close()
     cursor2.close()
     conn.close()
@@ -904,14 +905,14 @@ def test_multiple_cursors_same_connection(provider):
 def test_cursor_description_before_execute(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
-    
+
     assert cursor.description is None
-    
+
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("SELECT * FROM test")
-    
+
     assert cursor.description is not None
-    
+
     conn.close()
 
 
@@ -919,9 +920,9 @@ def test_cursor_description_before_execute(provider):
 def test_cursor_arraysize_default(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
-    
+
     assert cursor.arraysize == 1
-    
+
     conn.close()
 
 
@@ -931,10 +932,10 @@ def test_empty_fetchall(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("SELECT * FROM test")
-    
+
     rows = cursor.fetchall()
     assert rows == []
-    
+
     conn.close()
 
 
@@ -944,10 +945,10 @@ def test_empty_fetchone(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("SELECT * FROM test")
-    
+
     row = cursor.fetchone()
     assert row is None
-    
+
     conn.close()
 
 
@@ -957,10 +958,10 @@ def test_empty_fetchmany(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("SELECT * FROM test")
-    
+
     rows = cursor.fetchmany(5)
     assert rows == []
-    
+
     conn.close()
 
 
@@ -970,11 +971,11 @@ def test_unicode_data(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, text TEXT)")
     cursor.execute("INSERT INTO test VALUES (?, ?)", (1, "Hello 世界 🌍"))
-    
+
     cursor.execute("SELECT text FROM test")
     row = cursor.fetchone()
     assert row[0] == "Hello 世界 🌍"
-    
+
     conn.close()
 
 
@@ -984,11 +985,11 @@ def test_null_values(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
     cursor.execute("INSERT INTO test VALUES (1, NULL)")
-    
+
     cursor.execute("SELECT * FROM test")
     row = cursor.fetchone()
     assert row == (1, None)
-    
+
     conn.close()
 
 
@@ -997,14 +998,14 @@ def test_blob_data(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
-    
-    blob_data = b'\x00\x01\x02\x03\x04'
+
+    blob_data = b"\x00\x01\x02\x03\x04"
     cursor.execute("INSERT INTO test VALUES (?, ?)", (1, blob_data))
-    
+
     cursor.execute("SELECT data FROM test")
     row = cursor.fetchone()
     assert row[0] == blob_data
-    
+
     conn.close()
 
 
@@ -1014,11 +1015,11 @@ def test_limit_offset(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("INSERT INTO test VALUES (1), (2), (3), (4), (5)")
-    
+
     cursor.execute("SELECT * FROM test LIMIT 2 OFFSET 2")
     rows = cursor.fetchall()
     assert rows == [(3,), (4,)]
-    
+
     conn.close()
 
 
@@ -1028,11 +1029,11 @@ def test_order_by_desc(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
     cursor.execute("INSERT INTO test VALUES (1, 30), (2, 10), (3, 20)")
-    
+
     cursor.execute("SELECT * FROM test ORDER BY value DESC")
     rows = cursor.fetchall()
     assert rows == [(1, 30), (3, 20), (2, 10)]
-    
+
     conn.close()
 
 
@@ -1042,11 +1043,11 @@ def test_distinct(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (value TEXT)")
     cursor.execute("INSERT INTO test VALUES ('a'), ('b'), ('a'), ('c'), ('b')")
-    
+
     cursor.execute("SELECT DISTINCT value FROM test ORDER BY value")
     rows = cursor.fetchall()
     assert rows == [("a",), ("b",), ("c",)]
-    
+
     conn.close()
 
 
@@ -1056,11 +1057,11 @@ def test_coalesce_function(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, a TEXT, b TEXT)")
     cursor.execute("INSERT INTO test VALUES (1, NULL, 'fallback'), (2, 'value', 'fallback')")
-    
+
     cursor.execute("SELECT COALESCE(a, b) FROM test ORDER BY id")
     rows = cursor.fetchall()
     assert rows == [("fallback",), ("value",)]
-    
+
     conn.close()
 
 
@@ -1072,11 +1073,11 @@ def test_union_operator(provider):
     cursor.execute("CREATE TABLE t2 (value INTEGER)")
     cursor.execute("INSERT INTO t1 VALUES (1), (2)")
     cursor.execute("INSERT INTO t2 VALUES (2), (3)")
-    
+
     cursor.execute("SELECT value FROM t1 UNION SELECT value FROM t2")
     rows = cursor.fetchall()
     assert len(rows) == 3
-    
+
     conn.close()
 
 
@@ -1088,11 +1089,11 @@ def test_union_all_operator(provider):
     cursor.execute("CREATE TABLE t2 (value INTEGER)")
     cursor.execute("INSERT INTO t1 VALUES (1), (2)")
     cursor.execute("INSERT INTO t2 VALUES (2), (3)")
-    
+
     cursor.execute("SELECT value FROM t1 UNION ALL SELECT value FROM t2")
     rows = cursor.fetchall()
     assert len(rows) == 4
-    
+
     conn.close()
 
 
@@ -1102,11 +1103,11 @@ def test_is_null_operator(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
     cursor.execute("INSERT INTO test VALUES (1, 'a'), (2, NULL), (3, 'c')")
-    
+
     cursor.execute("SELECT id FROM test WHERE value IS NULL")
     rows = cursor.fetchall()
     assert rows == [(2,)]
-    
+
     conn.close()
 
 
@@ -1116,11 +1117,11 @@ def test_is_not_null_operator(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
     cursor.execute("INSERT INTO test VALUES (1, 'a'), (2, NULL), (3, 'c')")
-    
+
     cursor.execute("SELECT id FROM test WHERE value IS NOT NULL ORDER BY id")
     rows = cursor.fetchall()
     assert rows == [(1,), (3,)]
-    
+
     conn.close()
 
 
@@ -1130,11 +1131,11 @@ def test_not_in_operator(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
     cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
-    
+
     cursor.execute("SELECT * FROM test WHERE name NOT IN ('alice', 'charlie') ORDER BY id")
     rows = cursor.fetchall()
     assert rows == [(2, "bob")]
-    
+
     conn.close()
 
 
@@ -1146,14 +1147,14 @@ def test_not_exists_operator(provider):
     cursor.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
     cursor.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
     cursor.execute("INSERT INTO orders VALUES (1, 1)")
-    
+
     cursor.execute("""
         SELECT name FROM users
         WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
     """)
     rows = cursor.fetchall()
     assert rows == [("bob",)]
-    
+
     conn.close()
 
 
@@ -1162,10 +1163,10 @@ def test_substr_function(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT substr('Hello World', 1, 5)")
-    
+
     row = cursor.fetchone()
     assert row[0] == "Hello"
-    
+
     conn.close()
 
 
@@ -1174,10 +1175,10 @@ def test_length_function(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT length('Hello')")
-    
+
     row = cursor.fetchone()
     assert row[0] == 5
-    
+
     conn.close()
 
 
@@ -1186,10 +1187,10 @@ def test_upper_lower_functions(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT upper('hello'), lower('WORLD')")
-    
+
     row = cursor.fetchone()
     assert row == ("HELLO", "world")
-    
+
     conn.close()
 
 
@@ -1198,10 +1199,10 @@ def test_trim_functions(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT trim('  hello  '), ltrim('  hello'), rtrim('hello  ')")
-    
+
     row = cursor.fetchone()
     assert row == ("hello", "hello", "hello")
-    
+
     conn.close()
 
 
@@ -1210,10 +1211,10 @@ def test_replace_function(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT replace('Hello World', 'World', 'Python')")
-    
+
     row = cursor.fetchone()
     assert row[0] == "Hello Python"
-    
+
     conn.close()
 
 
@@ -1222,10 +1223,10 @@ def test_abs_function(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT abs(-42), abs(42)")
-    
+
     row = cursor.fetchone()
     assert row == (42, 42)
-    
+
     conn.close()
 
 
@@ -1234,10 +1235,10 @@ def test_typeof_function(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
     cursor.execute("SELECT typeof(123), typeof('text'), typeof(NULL), typeof(3.14)")
-    
+
     row = cursor.fetchone()
     assert row == ("integer", "text", "null", "real")
-    
+
     conn.close()
 
 
@@ -1247,11 +1248,11 @@ def test_create_table_if_not_exists(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER)")
     cursor.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER)")
-    
+
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
     row = cursor.fetchone()
     assert row is not None
-    
+
     conn.close()
 
 
@@ -1262,11 +1263,11 @@ def test_drop_table_if_exists(provider):
     cursor.execute("CREATE TABLE test (id INTEGER)")
     cursor.execute("DROP TABLE IF EXISTS test")
     cursor.execute("DROP TABLE IF EXISTS test")
-    
+
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
     row = cursor.fetchone()
     assert row is None
-    
+
     conn.close()
 
 
@@ -1276,7 +1277,7 @@ def test_multiple_ctes(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (value INTEGER)")
     cursor.execute("INSERT INTO test VALUES (10), (20), (30)")
-    
+
     cursor.execute("""
         WITH 
             doubled AS (SELECT value * 2 as v FROM test),
@@ -1285,7 +1286,7 @@ def test_multiple_ctes(provider):
     """)
     row = cursor.fetchone()
     assert row == (20, 30)
-    
+
     conn.close()
 
 
@@ -1295,7 +1296,7 @@ def test_nested_subqueries(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
     cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
-    
+
     cursor.execute("""
         SELECT id FROM test 
         WHERE value > (
@@ -1305,7 +1306,7 @@ def test_nested_subqueries(provider):
     """)
     rows = cursor.fetchall()
     assert len(rows) > 0
-    
+
     conn.close()
 
 
@@ -1315,7 +1316,7 @@ def test_correlated_subquery(provider):
     cursor = conn.cursor()
     cursor.execute("CREATE TABLE test (id INTEGER, category TEXT, value INTEGER)")
     cursor.execute("INSERT INTO test VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 15), (4, 'B', 25)")
-    
+
     cursor.execute("""
         SELECT t1.id, t1.value
         FROM test t1
@@ -1323,11 +1324,12 @@ def test_correlated_subquery(provider):
     """)
     rows = cursor.fetchall()
     assert len(rows) == 2
-    
+
     conn.close()
 
 
 # Additional tests appended
+
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_executemany_requires_dml(provider):
@@ -1381,6 +1383,7 @@ def test_cursor_setinput_output_size_noop(provider):
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_custom_row_factory_callable(provider):
     conn = connect(provider, ":memory:")
+
     # row factory that returns a dict for each row
     def dict_factory(cursor, row):
         return {cursor.description[i][0]: row[i] for i in range(len(row))}
@@ -1448,6 +1451,7 @@ def test_generate_series_virtual_table(provider):
         with pytest.raises(Exception):
             cur.execute("SELECT value FROM generate_series(1, 3)")
     conn.close()
+
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_connection_exception_attributes_present(provider):
