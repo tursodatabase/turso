@@ -126,6 +126,9 @@ impl LimitCtx {
 pub struct HashCtx {
     pub match_reg: usize,
     pub hash_table_reg: usize,
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub match_found_label: BranchOffset,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -159,10 +162,7 @@ pub struct TranslateCtx<'a> {
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
     /// Hash table register and metadata for hash joins
-    pub hash_table_reg: Option<HashCtx>,
-    /// Label for hash join match processing (points to just after HashProbe instruction)
-    /// Used by HashNext to jump back to process additional matches without re-probing
-    pub hash_join_match_found_label: Option<BranchOffset>,
+    pub hash_table_ctx: Option<HashCtx>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -198,8 +198,7 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
-            hash_table_reg: None,
-            hash_join_match_found_label: None,
+            hash_table_ctx: None,
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,

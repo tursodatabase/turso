@@ -324,6 +324,18 @@ pub struct OpHashBuildState {
     pub num_keys: usize,
 }
 
+/// Re-entrant state for [Insn::HashProbe].
+/// Allows HashProbe to resume cleanly after async I/O when loading spilled partitions.
+#[derive(Debug, Default)]
+pub struct OpHashProbeState {
+    /// Cached probe key values to avoid re-reading from registers
+    pub probe_keys: Vec<Value>,
+    /// Hash table register being probed
+    pub hash_table_reg: usize,
+    /// Partition index being loaded (if any)
+    pub partition_idx: usize,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -381,6 +393,7 @@ pub struct ProgramState {
     /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
     pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
     op_hash_build_state: Option<OpHashBuildState>,
+    op_hash_probe_state: Option<OpHashProbeState>,
     hash_tables: HashMap<usize, HashTable>,
 }
 
@@ -435,6 +448,7 @@ impl ProgramState {
             },
             op_no_conflict_state: OpNoConflictState::Start,
             op_hash_build_state: None,
+            op_hash_probe_state: None,
             seek_state: OpSeekState::Start,
             current_collation: None,
             op_column_state: OpColumnState::Start,
@@ -537,13 +551,10 @@ impl ProgramState {
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
         self.rowsets.clear();
-<<<<<<< HEAD
         self.bloom_filters.clear();
-||||||| parent of d147ba569 (Add opcodes needed for hash join in vdbe)
-=======
         self.hash_tables.clear();
         self.op_hash_build_state = None;
->>>>>>> d147ba569 (Add opcodes needed for hash join in vdbe)
+        self.op_hash_probe_state = None;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {

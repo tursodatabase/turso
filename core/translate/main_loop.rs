@@ -789,8 +789,6 @@ pub fn open_loop(
                             _ => panic!("Hash join build table must be a BTree table"),
                         },
                     );
-
-                    // Open the cursor
                     if let Table::BTree(btree) = &build_table.table {
                         program.emit_insn(Insn::OpenRead {
                             cursor_id,
@@ -820,7 +818,7 @@ pub fn open_loop(
                 program.preassign_label_to_next_insn(build_loop_start);
 
                 // Apply WHERE clause filters that reference only the build table
-                // Rows that don't match are skipped (not added to hash table)
+                // Rows that don't match are skipped and not added to hash table
                 let build_table_join_index = join_order
                     .iter()
                     .position(|j| j.original_idx == hash_join_op.build_table_idx);
@@ -847,9 +845,7 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(jump_target_when_true);
                     }
                 }
-
                 // Translate build key expressions into registers
-                // (expressions can be simple column refs or complex like substr(t.a, 1, 3))
                 for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
                     let build_expr = join_key.get_build_expr(predicates);
                     translate_expr(
@@ -874,7 +870,7 @@ pub fn open_loop(
                     })
                     .collect();
 
-                // Insert current row into hash table
+                // Insert current row into hash table, passing in the relevant collation.
                 program.emit_insn(Insn::HashBuild {
                     cursor_id: build_cursor_id,
                     key_start_reg: build_key_start_reg,
@@ -909,7 +905,6 @@ pub fn open_loop(
                 program.preassign_label_to_next_insn(loop_start);
 
                 // Translate probe key expressions into registers
-                // (expressions can be simple column refs or complex like substr(t.a, 1, 3))
                 let probe_key_start_reg = program.alloc_registers(num_keys);
                 for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
                     let probe_expr = join_key.get_probe_expr(predicates);
@@ -948,11 +943,11 @@ pub fn open_loop(
                 // - SeekRowid instruction to position build cursor
                 // - Emitting HashNext/HashClose in close_loop
                 // - Jumping to match_found_label when HashNext finds additional matches
-                t_ctx.hash_table_reg = Some(HashCtx {
+                t_ctx.hash_table_ctx = Some(HashCtx {
                     hash_table_reg,
                     match_reg,
+                    match_found_label,
                 });
-                t_ctx.hash_join_match_found_label = Some(match_found_label);
             }
         }
 
@@ -1461,12 +1456,13 @@ pub fn close_loop(
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
-            Operation::HashJoin(_hash_join_op) => {
+            Operation::HashJoin(_) => {
                 // Probe table: emit logic for iterating through hash matches
                 if let Some(HashCtx {
                     hash_table_reg,
                     match_reg,
-                }) = &t_ctx.hash_table_reg
+                    match_found_label,
+                }) = &t_ctx.hash_table_ctx
                 {
                     let hash_table_reg = *hash_table_reg;
                     let match_reg = *match_reg;
@@ -1481,12 +1477,9 @@ pub fn close_loop(
                         target_pc: label_next_probe_row,
                     });
 
-                    // Jump to match processing (skips HashProbe to preserve iteration state)
-                    let match_found_label = t_ctx
-                        .hash_join_match_found_label
-                        .expect("match_found_label should be set for hash join probe tables");
+                    // Jump to match processing, skips HashProbe to preserve iteration state.
                     program.emit_insn(Insn::Goto {
-                        target_pc: match_found_label,
+                        target_pc: *match_found_label,
                     });
 
                     program.preassign_label_to_next_insn(label_next_probe_row);
@@ -1502,11 +1495,11 @@ pub fn close_loop(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
 
                 // Clean up hash table
-                if let Some(HashCtx { hash_table_reg, .. }) = &t_ctx.hash_table_reg {
+                if let Some(HashCtx { hash_table_reg, .. }) = &t_ctx.hash_table_ctx {
                     program.emit_insn(Insn::HashClose {
                         hash_table_reg: *hash_table_reg,
                     });
-                    t_ctx.hash_table_reg = None;
+                    t_ctx.hash_table_ctx = None;
                 }
             }
         }

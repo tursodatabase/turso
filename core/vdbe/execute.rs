@@ -26,7 +26,8 @@ use crate::vdbe::hash_table::{HashTable, HashTableConfig};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
-    registers_to_ref_values, EndStatement, OpHashBuildState, StepResult, TxnCleanup,
+    registers_to_ref_values, EndStatement, OpHashBuildState, OpHashProbeState, StepResult,
+    TxnCleanup,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos,
@@ -9462,7 +9463,15 @@ pub fn op_hash_build_finalize(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashBuildFinalize { hash_table_reg }, insn);
     if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
-        ht.finalize_build();
+        // Finalize the build phase, may flush remaining partitions to disk if spilled
+        match ht.finalize_build()? {
+            crate::types::IOResult::Done(()) => {
+                // Partitions will be loaded on-demand during probing
+            }
+            crate::types::IOResult::IO(io) => {
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+        }
     }
 
     state.pc += 1;
@@ -9487,27 +9496,79 @@ pub fn op_hash_probe(
         insn
     );
 
-    // Extract probe key values from registers
-    let mut probe_keys = Vec::with_capacity(*num_keys);
-    for i in 0..*num_keys {
-        let reg = &state.registers[*key_start_reg + i];
-        let value = reg.get_value().clone();
-        probe_keys.push(value);
-    }
+    // Check if we're re-entering after I/O - use cached state if available
+    let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
+        if op_state.hash_table_reg == *hash_table_reg {
+            (op_state.probe_keys, Some(op_state.partition_idx))
+        } else {
+            // Different hash table, read fresh keys
+            let mut keys = Vec::with_capacity(*num_keys);
+            for i in 0..*num_keys {
+                let reg = &state.registers[*key_start_reg + i];
+                keys.push(reg.get_value().clone());
+            }
+            (keys, None)
+        }
+    } else {
+        // First entry, read probe keys from registers
+        let mut keys = Vec::with_capacity(*num_keys);
+        for i in 0..*num_keys {
+            let reg = &state.registers[*key_start_reg + i];
+            keys.push(reg.get_value().clone());
+        }
+        (keys, None)
+    };
 
     let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
     })?;
-    match hash_table.probe(probe_keys) {
-        Some(entry) => {
-            // Match found, store the rowid in destination register
-            state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
+
+    // For spilled hash tables, load the appropriate partition on demand
+    if hash_table.has_spilled() {
+        let partition_idx =
+            partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
+
+        // Load partition if not already loaded (may require multiple re-entries for multi-chunk partitions)
+        if !hash_table.is_partition_loaded(partition_idx) {
+            match hash_table.load_spilled_partition(partition_idx)? {
+                IOResult::Done(()) => {
+                    // Partition loaded or nothing to load
+                }
+                IOResult::IO(io) => {
+                    state.op_hash_probe_state = Some(OpHashProbeState {
+                        probe_keys,
+                        hash_table_reg: *hash_table_reg,
+                        partition_idx,
+                    });
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+            }
         }
-        None => {
-            state.pc = target_pc.as_offset_int();
-            Ok(InsnFunctionStepResult::Step)
+
+        // Probe the loaded partition
+        match hash_table.probe_partition(partition_idx, &probe_keys) {
+            Some(entry) => {
+                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            }
+            None => {
+                state.pc = target_pc.as_offset_int();
+                Ok(InsnFunctionStepResult::Step)
+            }
+        }
+    } else {
+        // Non-spilled hash table, use normal probe
+        match hash_table.probe(probe_keys) {
+            Some(entry) => {
+                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            }
+            None => {
+                state.pc = target_pc.as_offset_int();
+                Ok(InsnFunctionStepResult::Step)
+            }
         }
     }
 }

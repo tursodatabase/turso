@@ -978,9 +978,9 @@ impl HashJoinKey {
 pub struct HashJoinOp {
     /// Index of the build table in the join order
     pub build_table_idx: usize,
-    /// Index of the probe table in the join order (this table)
+    /// Index of the probe table in the join order
     pub probe_table_idx: usize,
-    /// Join key references, each entry points to an equality condition in the where_clause
+    /// Join key references, each entry points to an equality condition in the [WhereTerm]
     /// and indicates which side of the equality belongs to the build table.
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
