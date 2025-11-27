@@ -791,3 +791,54 @@ fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
 
     ret.unwrap()
 }
+
+#[test]
+fn test_mvcc_recovery_with_index_and_deletes() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_recovery_with_index_and_deletes.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with unique constraint (creates an index)
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER UNIQUE)").unwrap();
+
+    // Insert 5 values
+    for i in 1..=5 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+
+    // Delete values 2 and 4
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 4").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen database (triggers logical log recovery)
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Verify only rows 1, 3, 5 exist
+    let stmt = query_and_log(&conn, "SELECT x FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(5)],
+        ]
+    );
+}
