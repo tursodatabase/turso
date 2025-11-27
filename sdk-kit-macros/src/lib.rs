@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use std::iter::repeat;
+use std::iter::repeat_n;
 use syn::parse_macro_input;
 
 /// macros that checks that bindings signature matches with implementation signature
@@ -12,7 +12,7 @@ pub fn signature(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &input.sig.ident;
     let arg_count = input.sig.inputs.len();
 
-    let args = repeat(quote!(_)).take(arg_count);
+    let args = repeat_n(quote!(_), arg_count);
 
     quote! {
         const _:() = {

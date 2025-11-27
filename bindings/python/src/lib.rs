@@ -38,7 +38,7 @@ fn turso_error_to_py_err(err: TursoError) -> PyErr {
         rsapi::TursoStatusCode::DatabaseFull => DatabaseFull::new_err(err.message),
         rsapi::TursoStatusCode::NotAdb => NotAdb::new_err(err.message),
         rsapi::TursoStatusCode::Corrupt => Corrupt::new_err(err.message),
-        _ => Error::new_err(format!("unexpected status from the sdk-kit")),
+        _ => Error::new_err("unexpected status from the sdk-kit".to_string()),
     }
 }
 
@@ -48,7 +48,7 @@ fn turso_status_to_py(status: TursoStatusCode) -> PyTursoStatusCode {
         TursoStatusCode::Done => PyTursoStatusCode::Done,
         TursoStatusCode::Row => PyTursoStatusCode::Row,
         TursoStatusCode::Io => PyTursoStatusCode::Io,
-        _ => panic!("unexpected status code: {:?}", status),
+        _ => panic!("unexpected status code: {status:?}"),
     }
 }
 
@@ -332,9 +332,7 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else {
-        Err(Error::new_err(format!(
-            "unexpected parameter value, only None, numbers, strings and bytes are supported"
-        )))
+        Err(Error::new_err("unexpected parameter value, only None, numbers, strings and bytes are supported".to_string()))
     }
 }
 
