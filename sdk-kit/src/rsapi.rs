@@ -34,8 +34,9 @@ pub struct TursoLog<'a> {
     pub level: &'a str,
 }
 
+type Logger = dyn Fn(TursoLog) + Send + Sync + 'static;
 pub struct TursoSetupConfig {
-    pub logger: Option<Box<dyn Fn(TursoLog) + Send + Sync + 'static>>,
+    pub logger: Option<Box<Logger>>,
     pub log_level: Option<String>,
 }
 
@@ -170,7 +171,7 @@ pub fn bytes_from_turso_slice<'a>(
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
 
-pub fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
+pub(crate) fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
     if ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
@@ -525,7 +526,7 @@ impl TursoConnection {
                 Box::new(TursoStatement {
                     async_io: self.async_io,
                     concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                    statement: statement,
+                    statement,
                 }),
                 position,
             ))),

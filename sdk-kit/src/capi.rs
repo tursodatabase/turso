@@ -105,12 +105,10 @@ pub extern "C" fn turso_connection_get_autocommit(
             status: turso_status_ok(),
             auto_commit: connection.get_auto_commit(),
         },
-        Err(err) => {
-            return c::turso_connection_get_autocommit_result_t {
-                status: err.to_capi(),
-                ..Default::default()
-            }
-        }
+        Err(err) => c::turso_connection_get_autocommit_result_t {
+            status: err.to_capi(),
+            ..Default::default()
+        },
     }
 }
 
@@ -179,7 +177,7 @@ pub extern "C" fn turso_connection_prepare_first(
         Ok(Some((statement, tail_idx))) => c::turso_connection_prepare_first_t {
             status: turso_status_ok(),
             statement: statement.to_capi(),
-            tail_idx: tail_idx,
+            tail_idx,
         },
         Ok(None) => c::turso_connection_prepare_first_t {
             status: turso_status_ok(),
@@ -393,7 +391,7 @@ pub extern "C" fn turso_statement_row_value(
             value: turso_value_t {
                 type_: c::turso_type_t::TURSO_TYPE_BLOB,
                 value: turso_value_union_t {
-                    blob: turso_slice_from_bytes(&items),
+                    blob: turso_slice_from_bytes(items),
                 },
             },
         },
