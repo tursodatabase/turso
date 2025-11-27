@@ -1825,9 +1825,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        mv_store_iterator
-            .next()
-            .and_then(|entry| self.find_last_visible_index_version(tx, entry))
+        self.find_next_visible_index_row(tx, mv_store_iterator)
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
