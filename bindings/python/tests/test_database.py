@@ -283,6 +283,7 @@ def test_cursor_fetchmany(provider):
     cursor.execute("SELECT * FROM test")
 
     cursor.arraysize = 2
+    print(cursor.arraysize)
     rows = cursor.fetchmany()
     assert len(rows) == 2
     assert rows == [(1,), (2,)]
@@ -1323,4 +1324,136 @@ def test_correlated_subquery(provider):
     rows = cursor.fetchall()
     assert len(rows) == 2
     
+    conn.close()
+
+
+# Additional tests appended
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_requires_dml(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    with pytest.raises(Exception):
+        cur.executemany("SELECT 1", [()])
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_execute_multiple_statements_prohibited(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    with pytest.raises(Exception):
+        cur.execute("SELECT 1; SELECT 2")
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_description_none_after_insert(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1), (2)")
+    assert cur.description is None
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_rowcount_select_is_minus_one(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1), (2)")
+    cur.execute("SELECT * FROM test")
+    assert cur.rowcount == -1
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_setinput_output_size_noop(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    # Should not raise
+    cur.setinputsizes([None])
+    cur.setoutputsize(1024, 0)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_custom_row_factory_callable(provider):
+    conn = connect(provider, ":memory:")
+    # row factory that returns a dict for each row
+    def dict_factory(cursor, row):
+        return {cursor.description[i][0]: row[i] for i in range(len(row))}
+
+    conn.row_factory = dict_factory
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cur.execute("INSERT INTO test VALUES (1, 'alice')")
+    cur.execute("SELECT * FROM test")
+    row = cur.fetchone()
+    assert isinstance(row, dict)
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_in_transaction_toggle_with_commit(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    # Before DML, should not be in a transaction
+    assert not conn.in_transaction
+    # DML should start a transaction in legacy mode
+    cur.execute("INSERT INTO test VALUES (1)")
+    assert conn.in_transaction
+    conn.commit()
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_isolation_level_none_autocommit(provider, tmp_path):
+    db_file = tmp_path / "auto_commit.db"
+
+    if provider == "turso":
+        conn = turso.connect(str(db_file), isolation_level=None)
+    else:
+        conn = sqlite3.connect(str(db_file))
+        conn.isolation_level = None
+
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1)")
+    # No explicit commit; in autocommit mode data should persist
+    conn.close()
+
+    conn2 = connect(provider, str(db_file))
+    cur2 = conn2.cursor()
+    cur2.execute("SELECT COUNT(*) FROM test")
+    count = cur2.fetchone()[0]
+    assert count == 1
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_generate_series_virtual_table(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "turso":
+        cur.execute("SELECT value FROM generate_series(1, 3)")
+        rows = cur.fetchall()
+        assert rows == [(1,), (2,), (3,)]
+    else:
+        with pytest.raises(Exception):
+            cur.execute("SELECT value FROM generate_series(1, 3)")
+    conn.close()
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_connection_exception_attributes_present(provider):
+    conn = connect(provider, ":memory:")
+    # Ensure DB-API exception classes are exposed on the connection
+    assert issubclass(conn.Error, Exception)
+    assert issubclass(conn.DatabaseError, Exception)
+    assert issubclass(conn.ProgrammingError, Exception)
     conn.close()
