@@ -1708,6 +1708,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    fn find_next_visible_table_row<'a, I>(
+        &self,
+        tx: &Transaction,
+        mut rows: I,
+        table_id: MVTableId,
+    ) -> Option<RowID>
+    where
+        I: Iterator<
+            Item = crossbeam_skiplist::map::Entry<
+                'a,
+                RowID,
+                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
+            >,
+        >,
+    {
+        loop {
+            let row = rows.next()?;
+            if row.key().table_id != table_id {
+                return None;
+            }
+            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+                return Some(visible_row);
+            }
+        }
+    }
+
     pub fn seek_rowid(
         &self,
         start: RowID,
@@ -1748,10 +1774,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        let res = mv_store_iterator
-            .next()
-            .and_then(|entry| self.find_last_visible_version(tx, entry));
-        res.filter(|rowid| rowid.table_id == table_id)
+
+        self.find_next_visible_table_row(tx, mv_store_iterator, table_id)
     }
 
     pub fn seek_index(
