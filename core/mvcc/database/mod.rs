@@ -201,6 +201,22 @@ impl std::fmt::Display for RowKey {
     }
 }
 
+pub(crate) trait GenericRowKey {
+    fn matches_table_id(&self, table_id: MVTableId) -> bool;
+}
+
+impl GenericRowKey for RowID {
+    fn matches_table_id(&self, table_id: MVTableId) -> bool {
+        self.table_id == table_id
+    }
+}
+
+impl GenericRowKey for SortableIndexKey {
+    fn matches_table_id(&self, _: MVTableId) -> bool {
+        true // Indexes have their own SkipMap, so this is never called with an incorrect table id
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowID {
     /// The table ID. Analogous to table's root page number.
@@ -1570,10 +1586,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
-    pub(crate) fn advance_cursor_and_get_row_id_for_table(
+    pub(crate) fn advance_cursor_and_get_row_id<T: GenericRowKey>(
         &self,
         table_id: MVTableId,
-        mv_store_iterator: &mut Option<MvccIterator<'static, RowID>>,
+        mv_store_iterator: &mut Option<MvccIterator<'static, T>>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
@@ -1585,43 +1601,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        loop {
-            // We are moving forward, so if a row was deleted we just need to skip it. Therefore, we need
-            // to loop either until we find a row that is not deleted or until we reach the end of the table.
-            let next_row = mv_store_iterator.next();
-            let row = next_row?;
-            if row.key().table_id != table_id {
-                // In case of table rows, we store the rows of all tables in a single map,
-                // so we must stop iteration if we reach a row that is on a different table.
-                // In the case of indexes we have a separate map per table so this is not
-                // relevant.
-                return None;
-            }
-
-            // We found a row, let's check if it's visible to the transaction.
-            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
-                return Some(visible_row);
-            }
-            // If this row is not visible, continue to the next row
-        }
-    }
-
-    pub(crate) fn advance_cursor_and_get_row_id_for_index(
-        &self,
-        mv_store_iterator: &mut Option<MvccIterator<'static, SortableIndexKey>>,
-        tx_id: TxID,
-    ) -> Option<RowID> {
-        let mv_store_iterator = mv_store_iterator.as_mut().expect(
-            "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
-        );
-
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-
-        self.find_next_visible_index_row(tx, mv_store_iterator)
+        self.find_next_visible_row(tx, mv_store_iterator, table_id)
     }
 
     pub fn find_row_last_version_state(
@@ -1656,29 +1636,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    fn find_last_visible_version(
+    fn find_last_visible_version<T>(
         &self,
         tx: &Transaction,
         row: crossbeam_skiplist::map::Entry<
             '_,
-            RowID,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
-    ) -> Option<RowID> {
-        row.value()
-            .read()
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs))
-            .map(|_| row.key().clone())
-    }
-
-    fn find_last_visible_index_version(
-        &self,
-        tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<
-            '_,
-            SortableIndexKey,
+            T,
             parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
         >,
     ) -> Option<RowID> {
@@ -1690,25 +1653,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .map(|version| version.row.id.clone())
     }
 
-    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
-    where
-        I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<
-                'a,
-                SortableIndexKey,
-                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-            >,
-        >,
-    {
-        loop {
-            let row = rows.next()?;
-            if let Some(visible_row) = self.find_last_visible_index_version(tx, row) {
-                return Some(visible_row);
-            }
-        }
-    }
-
-    fn find_next_visible_table_row<'a, I>(
+    fn find_next_visible_row<'a, I, T: 'a + GenericRowKey>(
         &self,
         tx: &Transaction,
         mut rows: I,
@@ -1718,14 +1663,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         I: Iterator<
             Item = crossbeam_skiplist::map::Entry<
                 'a,
-                RowID,
+                T,
                 parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
             >,
         >,
     {
         loop {
             let row = rows.next()?;
-            if row.key().table_id != table_id {
+            if !row.key().matches_table_id(table_id) {
                 return None;
             }
             if let Some(visible_row) = self.find_last_visible_version(tx, row) {
@@ -1769,7 +1714,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx.value();
 
-        self.find_next_visible_table_row(tx, mv_store_iterator, table_id)
+        self.find_next_visible_row(tx, mv_store_iterator, table_id)
     }
 
     pub fn seek_index(
@@ -1811,7 +1756,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        self.find_next_visible_index_row(tx, mv_store_iterator)
+        self.find_next_visible_row(tx, mv_store_iterator, index_id)
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.

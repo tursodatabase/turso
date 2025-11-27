@@ -361,11 +361,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         let next = match &mut peek.mvcc_iterator {
             MvccIteratorKind::Table(iter) => {
                 self.db
-                    .advance_cursor_and_get_row_id_for_table(self.table_id, iter, self.tx_id)
+                    .advance_cursor_and_get_row_id(self.table_id, iter, self.tx_id)
             }
-            MvccIteratorKind::Index(iter) => self
-                .db
-                .advance_cursor_and_get_row_id_for_index(iter, self.tx_id),
+            MvccIteratorKind::Index(iter) => {
+                self.db
+                    .advance_cursor_and_get_row_id(self.table_id, iter, self.tx_id)
+            }
         };
         let new_peek_state = match next {
             Some(k) => CursorPeek::Row(k.row_id),
