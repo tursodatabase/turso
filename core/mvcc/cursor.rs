@@ -4,7 +4,8 @@ use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionState, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionState,
+    SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
@@ -17,6 +18,7 @@ use crate::{Pager, Value};
 use std::any::Any;
 use std::cell::{Ref, RefCell};
 use std::fmt::Debug;
+use std::ops::Bound;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -512,21 +514,16 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     table_id: self.table_id,
                     row_id: RowKey::Int(i64::MIN),
                 };
-                let range = (
-                    std::ops::Bound::Included(start_rowid),
-                    std::ops::Bound::Unbounded,
-                );
-                let iter = self.db.rows.range(range);
-                let iter_box: Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>> =
-                    Box::new(iter);
-                let mv_store_iter = unsafe {
+                let range =
+                    create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
+                let iter_box = Box::new(self.db.rows.range(range));
+                self.table_iterator = Some(unsafe {
                     // SAFETY: The lifetime of 'rows' is always longer than the lifetime of the iterator.
                     std::mem::transmute::<
                         Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
                         Box<dyn Iterator<Item = Entry<'static, RowID, RwLock<Vec<RowVersion>>>>>,
                     >(iter_box)
-                };
-                self.table_iterator = Some(mv_store_iter);
+                });
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self
@@ -534,11 +531,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     .index_rows
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
-                let iter = index_rows.iter();
-                let iter_box: Box<
-                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
-                > = Box::new(iter);
-                let mv_store_iter = unsafe {
+                let iter_box = Box::new(index_rows.iter());
+                self.index_iterator = Some(unsafe {
                     // SAFETY: Although the index_rows Entry is dropped, by calling .iter() on it
                     // it returns an iterator of the 'inner' property for the entry, which lives longer than the iterator.
                     std::mem::transmute::<
@@ -553,8 +547,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                             >,
                         >,
                     >(iter_box)
-                };
-                self.index_iterator = Some(mv_store_iter);
+                });
             }
         }
     }
