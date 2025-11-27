@@ -1,8 +1,13 @@
+use std::collections::HashSet;
+
 use super::*;
 use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
+use crate::mvcc::cursor::MvccCursorType;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use parking_lot::RwLock;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
@@ -108,7 +113,7 @@ pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &st
     Row {
         id: RowID {
             table_id,
-            row_id: id,
+            row_id: RowKey::Int(id),
         },
         column_count: 1,
         data: record.as_blob().to_vec(),
@@ -135,7 +140,7 @@ fn test_insert_read() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -153,7 +158,7 @@ fn test_insert_read() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -172,7 +177,7 @@ fn test_read_nonexistent() {
         tx,
         RowID {
             table_id: (-2).into(),
-            row_id: 1,
+            row_id: RowKey::Int(1),
         },
     );
     assert!(row.unwrap().is_none());
@@ -194,7 +199,7 @@ fn test_delete() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -205,7 +210,7 @@ fn test_delete() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -215,7 +220,7 @@ fn test_delete() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -232,7 +237,7 @@ fn test_delete() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -252,7 +257,7 @@ fn test_delete_nonexistent() {
             tx,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1
+                row_id: RowKey::Int(1)
             },
         )
         .unwrap());
@@ -273,7 +278,7 @@ fn test_commit() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -287,7 +292,7 @@ fn test_commit() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -305,7 +310,7 @@ fn test_commit() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -330,7 +335,7 @@ fn test_rollback() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -344,7 +349,7 @@ fn test_rollback() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -362,7 +367,7 @@ fn test_rollback() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -386,7 +391,7 @@ fn test_dirty_write() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -405,7 +410,7 @@ fn test_dirty_write() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -434,7 +439,7 @@ fn test_dirty_read() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -463,7 +468,7 @@ fn test_dirty_read_deleted() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1
+                row_id: RowKey::Int(1)
             },
         )
         .unwrap());
@@ -477,7 +482,7 @@ fn test_dirty_read_deleted() {
             tx3,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -502,7 +507,7 @@ fn test_fuzzy_read() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -519,7 +524,7 @@ fn test_fuzzy_read() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -540,7 +545,7 @@ fn test_fuzzy_read() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -571,7 +576,7 @@ fn test_lost_update() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -611,7 +616,7 @@ fn test_lost_update() {
             tx4,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -645,7 +650,7 @@ fn test_committed_visibility() {
             tx2,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -661,7 +666,7 @@ fn test_committed_visibility() {
             tx3,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap()
@@ -691,7 +696,7 @@ fn test_future_row() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -705,7 +710,7 @@ fn test_future_row() {
             tx1,
             RowID {
                 table_id: (-2).into(),
-                row_id: 1,
+                row_id: RowKey::Int(1),
             },
         )
         .unwrap();
@@ -739,7 +744,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
     ];
 
     for (row_id, data) in test_rows.iter() {
-        let id = RowID::new(table_id, *row_id);
+        let id = RowID::new(table_id, RowKey::Int(*row_id));
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
         let row = Row::new(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
@@ -763,7 +768,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
 
     let table_id = -1;
     for i in initial_keys {
-        let id = RowID::new(table_id.into(), *i);
+        let id = RowID::new(table_id.into(), RowKey::Int(*i));
         let data = format!("row{i}");
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
         let row = Row::new(id, record.as_blob().to_vec(), 1);
@@ -829,7 +834,8 @@ fn test_lazy_scan_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -837,7 +843,7 @@ fn test_lazy_scan_cursor_basic() {
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
     let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id, 1);
+    assert_eq!(row.id.row_id.to_int_or_panic(), 1);
 
     // Iterate through all rows
     let mut count = 1;
@@ -851,7 +857,7 @@ fn test_lazy_scan_cursor_basic() {
         }
         count += 1;
         let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-        assert_eq!(row.id.row_id, count);
+        assert_eq!(row.id.row_id.to_int_or_panic(), count);
     }
 
     // Should have found 5 rows
@@ -871,7 +877,8 @@ fn test_lazy_scan_cursor_with_gaps() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -879,7 +886,7 @@ fn test_lazy_scan_cursor_with_gaps() {
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(!cursor.is_empty());
     let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id, 5);
+    assert_eq!(row.id.row_id.to_int_or_panic(), 5);
 
     // Test moving forward and checking IDs
     let expected_ids = [5, 10, 15, 20, 30];
@@ -922,7 +929,8 @@ fn test_cursor_basic() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
@@ -931,7 +939,7 @@ fn test_cursor_basic() {
     // Check first row
     assert!(!cursor.is_empty());
     let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(row.id.row_id, 1);
+    assert_eq!(row.id.row_id.to_int_or_panic(), 1);
 
     // Iterate through all rows
     let mut count = 1;
@@ -945,7 +953,7 @@ fn test_cursor_basic() {
         }
         count += 1;
         let row = cursor.read_mvcc_current_row().unwrap().unwrap();
-        assert_eq!(row.id.row_id, count);
+        assert_eq!(row.id.row_id.to_int_or_panic(), count);
     }
 
     // Should have found 5 rows
@@ -976,7 +984,8 @@ fn test_cursor_with_empty_table() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
     assert!(cursor.is_empty());
@@ -986,6 +995,7 @@ fn test_cursor_with_empty_table() {
 
 #[test]
 fn test_cursor_modification_during_scan() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (db, tx_id) = setup_lazy_db(&[1, 2, 4, 5]);
     let table_id = -1;
 
@@ -993,50 +1003,47 @@ fn test_cursor_modification_during_scan() {
         db.mvcc_store.clone(),
         tx_id,
         table_id,
-        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), table_id, 1)),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), -table_id, 1)),
     )
     .unwrap();
 
     // Read first row
     assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
     let first_row = cursor.read_mvcc_current_row().unwrap().unwrap();
-    assert_eq!(first_row.id.row_id, 1);
+    assert_eq!(first_row.id.row_id.to_int_or_panic(), 1);
 
     // Insert a new row with ID between existing rows
-    let new_row_id = RowID::new(table_id.into(), 3);
+    let new_row_id = RowID::new(table_id.into(), RowKey::Int(3));
     let new_row = generate_simple_string_record("new_row");
 
     let _ = cursor
-        .insert(&BTreeKey::TableRowId((new_row_id.row_id, Some(&new_row))))
+        .insert(&BTreeKey::TableRowId((
+            new_row_id.row_id.to_int_or_panic(),
+            Some(&new_row),
+        )))
         .unwrap();
-    let row = db.mvcc_store.read(tx_id, new_row_id).unwrap().unwrap();
-    let mut record = ImmutableRecord::new(1024);
-    record.start_serialization(&row.data);
-    let value = record.get_value(0).unwrap();
-    match value {
-        ValueRef::Text(text) => {
-            assert_eq!(text.as_str(), "new_row");
+
+    let mut read_rowids = vec![];
+    loop {
+        let res = cursor.next().unwrap();
+        let IOResult::Done(res) = res else {
+            panic!("unexpected next result {res:?}");
+        };
+        if !res {
+            break;
         }
-        _ => panic!("Expected Text value"),
+        read_rowids.push(
+            cursor
+                .read_mvcc_current_row()
+                .unwrap()
+                .unwrap()
+                .id
+                .row_id
+                .to_int_or_panic(),
+        );
     }
-    assert_eq!(row.id.row_id, 3);
-
-    // Continue scanning - the cursor should still work correctly
-    let _ = cursor.next().unwrap(); // Move to 4
-    let row = db
-        .mvcc_store
-        .read(tx_id, RowID::new(table_id.into(), 4))
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.id.row_id, 4);
-
-    let _ = cursor.next().unwrap(); // Move to 5 (our new row)
-    let row = db
-        .mvcc_store
-        .read(tx_id, RowID::new(table_id.into(), 5))
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.id.row_id, 5);
+    assert_eq!(read_rowids, vec![2, 3, 4, 5]);
     assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
     assert!(cursor.is_empty());
 }
@@ -1217,7 +1224,7 @@ fn test_restart() {
                 Row {
                     id: RowID {
                         table_id: (-1).into(),
-                        row_id: 1,
+                        row_id: RowKey::Int(1),
                     },
                     data: data.as_blob().to_vec(),
                     column_count: 5,
@@ -1243,7 +1250,7 @@ fn test_restart() {
 
         let tx_id = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
         let row = mvcc_store
-            .read(tx_id, RowID::new((-2).into(), 2))
+            .read(tx_id, RowID::new((-2).into(), RowKey::Int(2)))
             .unwrap()
             .unwrap();
         let record = get_record_value(&row);
@@ -1523,12 +1530,12 @@ fn transaction_display() {
     let begin_ts = 20250914;
 
     let write_set = SkipSet::new();
-    write_set.insert(RowID::new((-2).into(), 11));
-    write_set.insert(RowID::new((-2).into(), 13));
+    write_set.insert(RowID::new((-2).into(), RowKey::Int(11)));
+    write_set.insert(RowID::new((-2).into(), RowKey::Int(13)));
 
     let read_set = SkipSet::new();
-    read_set.insert(RowID::new((-2).into(), 17));
-    read_set.insert(RowID::new((-2).into(), 19));
+    read_set.insert(RowID::new((-2).into(), RowKey::Int(17)));
+    read_set.insert(RowID::new((-2).into(), RowKey::Int(19)));
 
     let tx = Transaction {
         state,
@@ -1539,7 +1546,7 @@ fn transaction_display() {
         header: RwLock::new(DatabaseHeader::default()),
     };
 
-    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: 11 }, RowID { table_id: MVTableId(-2), row_id: 13 }], read_set: [RowID { table_id: MVTableId(-2), row_id: 17 }, RowID { table_id: MVTableId(-2), row_id: 19 }] }";
+    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }
@@ -1688,4 +1695,171 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     assert_eq!(rows[1], vec![Value::Integer(4)]);
     assert_eq!(rows[2], vec![Value::Integer(3)]);
     assert_eq!(rows[3], vec![Value::Integer(1)]);
+}
+
+#[test]
+#[ignore = "we need to implement seek with btree cursor"]
+fn test_cursor_with_btree_and_mvcc_fuzz() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let mut rows_in_db = sorted_vec::SortedVec::new();
+    let mut seen = HashSet::new();
+    let (mut rng, _seed) = rng_from_time_or_env();
+
+    let mut maybe_conn = Some(db.connect());
+    {
+        maybe_conn
+            .as_mut()
+            .unwrap()
+            .execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+    }
+
+    #[repr(u8)]
+    #[derive(Debug)]
+    enum Op {
+        Insert = 0,
+        Delete = 1,
+        SelectForward = 2,
+        SelectBackward = 3,
+        SeekForward = 4,
+        SeekBackward = 5,
+        Checkpoint = 6,
+    }
+
+    impl From<u8> for Op {
+        fn from(value: u8) -> Self {
+            match value {
+                0 => Op::Insert,
+                1 => Op::Delete,
+                2 => Op::SelectForward,
+                3 => Op::SelectBackward,
+                4 => Op::SeekForward,
+                5 => Op::SeekBackward,
+                6 => Op::Checkpoint,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    for i in 0..10000 {
+        let conn = maybe_conn.as_mut().unwrap();
+        let op = rng.random_range(0..=Op::Checkpoint as usize);
+        let op = Op::from(op as u8);
+        println!("tick: {i} op: {op:?} ");
+        match op {
+            Op::Insert => {
+                let value = loop {
+                    let value = rng.random_range(0..10000);
+                    if !seen.contains(&value) {
+                        seen.insert(value);
+                        break value;
+                    }
+                };
+                conn.execute(format!("INSERT INTO t VALUES ({value})").as_str())
+                    .unwrap();
+                rows_in_db.push(value);
+            }
+            Op::Delete => {
+                if rows_in_db.is_empty() {
+                    continue;
+                }
+                let index = rng.random_range(0..rows_in_db.len());
+                let value = rows_in_db[index];
+                conn.execute(format!("DELETE FROM t WHERE x = {value}").as_str())
+                    .unwrap();
+                rows_in_db.remove_index(index);
+                seen.remove(&value);
+            }
+            Op::SelectForward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x asc");
+                assert_eq!(rows.len(), rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SelectBackward => {
+                let rows = get_rows(conn, "SELECT * FROM t order by x desc");
+                assert_eq!(rows.len(), rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter().rev()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SeekForward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x asc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::SeekBackward => {
+                let value = rng.random_range(0..10000);
+                let rows = get_rows(
+                    conn,
+                    format!("SELECT * FROM t where x > {value} order by x desc").as_str(),
+                );
+                let filtered_rows_in_db = rows_in_db
+                    .iter()
+                    .filter(|&id| *id > value)
+                    .cloned()
+                    .collect::<Vec<i64>>();
+
+                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter().rev()) {
+                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                }
+            }
+            Op::Checkpoint => {
+                // This forces things to move to the BTree file (.db)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                // This forces MVCC to be cleared
+                db.restart();
+                maybe_conn = Some(db.connect());
+            }
+        }
+    }
+}
+
+pub fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
+    let seed = std::env::var("SEED").map_or(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        |v| {
+            v.parse()
+                .expect("Failed to parse SEED environment variable as u64")
+        },
+    );
+    let rng = ChaCha8Rng::seed_from_u64(seed as u64);
+    (rng, seed as u64)
+}
+
+#[test]
+fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    // Insert a new row so that we have a gap in the BTree.
+    let res = conn.execute("INSERT INTO t VALUES (2)");
+    assert!(res.is_err(), "Expected error because key 2 already exists");
 }

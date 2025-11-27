@@ -3,7 +3,8 @@ use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
-    DeletePlan, JoinOrderMember, Operation, Plan, QueryDestination, ResultSetColumn, SelectPlan,
+    DeletePlan, IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination,
+    ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{parse_limit, parse_where};
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
@@ -15,7 +16,6 @@ use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 
-#[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
@@ -50,6 +50,31 @@ pub fn translate_delete(
         connection,
     )?;
     optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
+    if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
+        // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
+        // are present), so the joined table is treated as a plain table scan again.
+        //
+        // RowSets re-seek the base table cursor for every delete, so expressions that reference
+        // columns during index maintenance must bind to the table cursor again (not the index we
+        // originally used to find the rowids).
+        //
+        // e.g. DELETE using idx_x gathers rowids, but BEFORE DELETE trigger causes re-seek on
+        // table, so expression indexes must read from that table cursor.
+        if delete_plan_inner.rowset_plan.is_some() {
+            if let Some(joined_table) = delete_plan_inner
+                .table_references
+                .joined_tables_mut()
+                .first_mut()
+            {
+                if matches!(joined_table.table, Table::BTree(_)) {
+                    joined_table.op = Operation::Scan(Scan::BTreeTable {
+                        iter_dir: IterationDirection::Forwards,
+                        index: None,
+                    });
+                }
+            }
+        }
+    }
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
@@ -113,6 +138,8 @@ pub fn prepare_delete_plan(
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        column_use_counts: Vec::new(),
+        expression_index_usages: Vec::new(),
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);

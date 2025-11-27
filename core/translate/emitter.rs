@@ -23,11 +23,11 @@ use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Index, Schema, Table, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
-    WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
+    BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters,
@@ -46,6 +46,7 @@ use crate::translate::trigger_exec::{
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
 use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
 use crate::vdbe::{insn::Insn, BranchOffset};
@@ -996,18 +997,17 @@ fn emit_delete_row_common(
             };
             let num_regs = index.columns.len() + 1;
             let start_reg = program.alloc_registers(num_regs);
-            // Emit columns that are part of the index
-            index
-                .columns
-                .iter()
-                .enumerate()
-                .for_each(|(reg_offset, column_index)| {
-                    program.emit_column_or_rowid(
-                        main_table_cursor_id,
-                        column_index.pos_in_table,
-                        start_reg + reg_offset,
-                    );
-                });
+            for (reg_offset, column_index) in index.columns.iter().enumerate() {
+                emit_index_column_value_old_image(
+                    program,
+                    &t_ctx.resolver,
+                    table_references,
+                    connection,
+                    main_table_cursor_id,
+                    column_index,
+                    start_reg + reg_offset,
+                )?;
+            }
             program.emit_insn(Insn::RowId {
                 cursor_id: main_table_cursor_id,
                 dest: start_reg + num_regs - 1,
@@ -1982,11 +1982,15 @@ fn emit_update_insns<'a>(
         let num_regs = index.columns.len() + 1;
         let delete_start_reg = program.alloc_registers(num_regs);
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
-            program.emit_column_or_rowid(
+            emit_index_column_value_old_image(
+                program,
+                &t_ctx.resolver,
+                table_references,
+                connection,
                 target_table_cursor_id,
-                column_index.pos_in_table,
+                column_index,
                 delete_start_reg + reg_offset,
-            );
+            )?;
         }
         program.emit_insn(Insn::RowId {
             cursor_id: target_table_cursor_id,
@@ -2021,20 +2025,15 @@ fn emit_update_insns<'a>(
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
 
         for (i, col) in index.columns.iter().enumerate() {
-            let col_in_table = target_table
-                .table
-                .columns()
-                .get(col.pos_in_table)
-                .expect("column index out of bounds");
-            program.emit_insn(Insn::Copy {
-                src_reg: if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    start + col.pos_in_table
-                },
-                dst_reg: idx_start_reg + i,
-                extra_amount: 0,
-            });
+            emit_index_column_value_new_image(
+                program,
+                &t_ctx.resolver,
+                target_table.table.columns(),
+                start,
+                rowid_reg,
+                col,
+                idx_start_reg + i,
+            )?;
         }
         // last register is the rowid
         program.emit_insn(Insn::Copy {
@@ -2057,9 +2056,13 @@ fn emit_update_insns<'a>(
                 .columns
                 .iter()
                 .map(|ic| {
-                    target_table.table.columns()[ic.pos_in_table]
-                        .affinity()
-                        .aff_mask()
+                    if ic.expr.is_some() {
+                        Affinity::Blob.aff_mask()
+                    } else {
+                        target_table.table.columns()[ic.pos_in_table]
+                            .affinity()
+                            .aff_mask()
+                    }
                 })
                 .collect::<String>();
             program.emit_insn(Insn::Affinity {
@@ -2771,4 +2774,78 @@ fn rewrite_where_for_update_registers(
         }
         Ok(WalkControl::Continue)
     })
+}
+
+/// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
+/// Handling expression indexes and regular columns
+fn emit_index_column_value_old_image(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    connection: &Arc<Connection>,
+    table_cursor_id: usize,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(table_references),
+            None,
+            connection,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    } else {
+        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+    }
+    Ok(())
+}
+
+/// Emit code to load the value of an IndexColumn from the NEW image of the row being updated.
+/// Handling expression indexes and regular columns
+fn emit_index_column_value_new_image(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[Column],
+    columns_start_reg: usize,
+    rowid_reg: usize,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        rewrite_where_for_update_registers(&mut expr, columns, columns_start_reg, rowid_reg)?;
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    } else {
+        let col_in_table = columns
+            .get(idx_col.pos_in_table)
+            .expect("column index out of bounds");
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            columns_start_reg + idx_col.pos_in_table
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
 }

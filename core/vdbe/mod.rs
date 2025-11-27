@@ -835,11 +835,11 @@ impl Program {
 
         state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
         state.registers[1] = Register::Value(Value::from_text(opcode));
-        state.registers[2] = Register::Value(Value::Integer(p1 as i64));
-        state.registers[3] = Register::Value(Value::Integer(p2 as i64));
-        state.registers[4] = Register::Value(Value::Integer(p3 as i64));
+        state.registers[2] = Register::Value(Value::Integer(p1));
+        state.registers[3] = Register::Value(Value::Integer(p2));
+        state.registers[4] = Register::Value(Value::Integer(p3));
         state.registers[5] = Register::Value(p4);
-        state.registers[6] = Register::Value(Value::Integer(p5 as i64));
+        state.registers[6] = Register::Value(Value::Integer(p5));
         state.registers[7] = Register::Value(Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
@@ -1041,7 +1041,7 @@ impl Program {
                         .connection
                         .view_transaction_states
                         .get(view_name)
-                        .unwrap()
+                        .expect("view should have transaction state")
                         .get_table_deltas();
 
                     let schema = self.connection.schema.read();
@@ -1111,7 +1111,7 @@ impl Program {
                     let Some(tx_id) = conn.get_mv_tx_id() else {
                         return Ok(IOResult::Done(()));
                     };
-                    let state_machine = mv_store.commit_tx(tx_id, &conn).unwrap();
+                    let state_machine = mv_store.commit_tx(tx_id, &conn)?;
                     program_state.commit_state = CommitState::CommitingMvcc { state_machine };
                 }
                 let CommitState::CommitingMvcc { state_machine } = &mut program_state.commit_state
@@ -1358,7 +1358,12 @@ impl<'a> FromValueRow<'a> for &'a Value {
 
 impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-        let value = unsafe { self.values.add(idx).as_ref().unwrap() };
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
+        };
         let value = match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -1367,7 +1372,12 @@ impl Row {
     }
 
     pub fn get_value(&self, idx: usize) -> &Value {
-        let value = unsafe { self.values.add(idx).as_ref().unwrap() };
+        let value = unsafe {
+            self.values
+                .add(idx)
+                .as_ref()
+                .expect("row value pointer should be valid")
+        };
         match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),

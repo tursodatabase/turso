@@ -17,6 +17,7 @@ pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub(crate) mod expr;
+pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;

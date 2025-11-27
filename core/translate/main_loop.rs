@@ -92,6 +92,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
             pos_in_table: i,
             collation: None,
             default: None,
+            expr: None,
         })
         .collect::<Vec<_>>();
     for (i, column) in columns.iter_mut().enumerate() {
@@ -181,6 +182,7 @@ pub fn init_loop(
                 pos_in_table: 0,
                 collation: get_collseq_from_expr(&agg.original_expr, tables)?,
                 default: None, // FIXME: this should be inferred from the expression
+                expr: None,
             }],
             has_rowid: false,
             unique: false,

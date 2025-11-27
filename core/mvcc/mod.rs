@@ -44,7 +44,7 @@ mod tests {
     use crate::mvcc::database::tests::{
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
     };
-    use crate::mvcc::database::RowID;
+    use crate::mvcc::database::{RowID, RowKey};
     use std::sync::atomic::AtomicI64;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -69,9 +69,13 @@ mod tests {
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
                         table_id: (-2).into(),
-                        row_id: id,
+                        row_id: RowKey::Int(id),
                     };
-                    let row = generate_simple_string_row((-2).into(), id.row_id, "Hello");
+                    let row = generate_simple_string_row(
+                        (-2).into(),
+                        id.row_id.to_int_or_panic(),
+                        "Hello",
+                    );
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
@@ -90,9 +94,13 @@ mod tests {
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
                     let id = RowID {
                         table_id: (-2).into(),
-                        row_id: id,
+                        row_id: RowKey::Int(id),
                     };
-                    let row = generate_simple_string_row((-2).into(), id.row_id, "World");
+                    let row = generate_simple_string_row(
+                        (-2).into(),
+                        id.row_id.to_int_or_panic(),
+                        "World",
+                    );
                     mvcc_store.insert(tx, row.clone()).unwrap();
                     commit_tx_no_conn(&db, tx, &conn).unwrap();
                     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
@@ -131,11 +139,11 @@ mod tests {
                     let id = i % 16;
                     let id = RowID {
                         table_id: (-2).into(),
-                        row_id: id,
+                        row_id: RowKey::Int(id),
                     };
                     let row = generate_simple_string_row(
                         (-2).into(),
-                        id.row_id,
+                        id.row_id.to_int_or_panic(),
                         &format!("{prefix} @{tx}"),
                     );
                     if let Err(e) = mvcc_store.upsert(tx, row.clone()) {

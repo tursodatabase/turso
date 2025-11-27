@@ -1333,7 +1333,7 @@ impl AggregateOperator {
         group_by: Vec<usize>,
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         // Precompute flags for runtime efficiency
         // Plain DISTINCT is indicated by empty aggregates vector
         let is_distinct_only = aggregates.is_empty();
@@ -1361,7 +1361,11 @@ impl AggregateOperator {
         for agg in &aggregates {
             match agg {
                 AggregateFunction::Min(col_idx) => {
-                    let storage_index = *storage_indices.get(col_idx).unwrap();
+                    let storage_index = *storage_indices.get(col_idx).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "storage index for MIN column should exist from first pass".to_string(),
+                        )
+                    })?;
                     let entry = column_min_max.entry(*col_idx).or_insert(AggColumnInfo {
                         index: storage_index,
                         has_min: false,
@@ -1370,7 +1374,11 @@ impl AggregateOperator {
                     entry.has_min = true;
                 }
                 AggregateFunction::Max(col_idx) => {
-                    let storage_index = *storage_indices.get(col_idx).unwrap();
+                    let storage_index = *storage_indices.get(col_idx).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "storage index for MAX column should exist from first pass".to_string(),
+                        )
+                    })?;
                     let entry = column_min_max.entry(*col_idx).or_insert(AggColumnInfo {
                         index: storage_index,
                         has_min: false,
@@ -1395,7 +1403,7 @@ impl AggregateOperator {
             }
         }
 
-        Self {
+        Ok(Self {
             operator_id,
             group_by,
             aggregates,
@@ -1405,7 +1413,7 @@ impl AggregateOperator {
             tracker: None,
             commit_state: AggregateCommitState::Idle,
             is_distinct_only,
-        }
+        })
     }
 
     pub fn has_min_max(&self) -> bool {
@@ -2639,8 +2647,12 @@ impl FetchDistinctState {
                         for (col_idx, values) in cols_values {
                             for hashable_row in values {
                                 // Extract the value from HashableRow
-                                values_to_fetch
-                                    .push((*col_idx, hashable_row.values.first().unwrap().clone()));
+                                let value = hashable_row.values.first().ok_or_else(|| {
+                                    LimboError::InternalError(
+                                        "hashable_row should have at least one value".to_string(),
+                                    )
+                                })?;
+                                values_to_fetch.push((*col_idx, value.clone()));
                             }
                         }
                     }
@@ -2900,7 +2912,15 @@ impl DistinctPersistState {
                     let (col_idx, hashable_row) = value_keys[*value_idx].clone();
                     let weight = distinct_deltas[&group_key][&(col_idx, hashable_row.clone())];
                     // Extract the value from HashableRow (it's the first element in values vector)
-                    let value = hashable_row.values.first().unwrap().clone();
+                    let value = hashable_row
+                        .values
+                        .first()
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "hashable_row should have at least one value".to_string(),
+                            )
+                        })?
+                        .clone();
 
                     let distinct_deltas = std::mem::take(distinct_deltas);
                     let group_keys = std::mem::take(group_keys);

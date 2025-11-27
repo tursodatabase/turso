@@ -1,10 +1,6 @@
 package tech.turso.core;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.Properties;
 import org.junit.jupiter.api.BeforeEach;
@@ -117,6 +113,14 @@ class TursoStatementTest {
     selectStmt.execute();
     assertArrayEquals(blob, (byte[]) selectStmt.getResultSet().get(1));
     selectStmt.close();
+  }
+
+  @Test
+  void test_parameterCount() throws Exception {
+    runSql("CREATE TABLE test (col1 INT);");
+    assertEquals(0, connection.prepare("INSERT INTO test VALUES (1)").parameterCount());
+    assertEquals(1, connection.prepare("INSERT INTO test VALUES (?)").parameterCount());
+    assertEquals(2, connection.prepare("INSERT INTO test VALUES (?), (?)").parameterCount());
   }
 
   private void runSql(String sql) throws Exception {

@@ -9,8 +9,8 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, Pager, Result, TransactionState, Value,
-    ValueRef,
+    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, TransactionState,
+    Value, ValueRef,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -194,9 +194,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                         let row_data = ImmutableRecord::from_bin_record(version.row.data.clone());
                         let mut record_cursor = RecordCursor::new();
-                        record_cursor.parse_full_header(&row_data).unwrap();
-                        if let ValueRef::Integer(root_page) =
-                            record_cursor.get_value(&row_data, 3).unwrap()
+                        record_cursor
+                            .parse_full_header(&row_data)
+                            .expect("failed to parse record header");
+                        if let ValueRef::Integer(root_page) = record_cursor
+                            .get_value(&row_data, 3)
+                            .expect("failed to get column 3 from sqlite_schema")
                         {
                             if is_delete {
                                 let table_id = self
@@ -207,7 +210,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                         entry.value().is_some_and(|r| r == root_page as u64)
                                     })
                                     .map(|entry| *entry.key())
-                                    .unwrap(); // This assumes a valid mapping exists.
+                                    .expect("table_id to rootpage mapping should exist");
                                 self.destroyed_tables.insert(table_id);
 
                                 // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
@@ -234,7 +237,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Sort by table_id descending (schema changes first)
                 std::cmp::Reverse(version.0.row.id.table_id),
                 // Then by row_id ascending
-                version.0.row.id.row_id,
+                version.0.row.id.row_id.clone(),
             )
         });
         self.checkpointed_txid_max_new = max_timestamp;
@@ -351,8 +354,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 let (num_columns, table_id, special_write) = {
-                    let (row_version, special_write) =
-                        self.get_current_row_version(write_set_index).unwrap();
+                    let (row_version, special_write) = self
+                        .get_current_row_version(write_set_index)
+                        .ok_or(LimboError::InternalError(
+                            "row version not found in write set".to_string(),
+                        ))?;
                     (
                         row_version.row.column_count,
                         row_version.row.id.table_id,
@@ -421,13 +427,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .unwrap_or_else(|| {
                             panic!(
                                 "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                                self.get_current_row_version(write_set_index).unwrap()
+                                self.get_current_row_version(write_set_index)
+                                    .expect("row version should exist")
                             )
                         });
                     root_page.value().unwrap_or_else(|| {
                         panic!(
                             "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                            self.get_current_row_version(write_set_index).unwrap()
+                            self.get_current_row_version(write_set_index)
+                                .expect("row version should exist")
                         )
                     })
                 };
@@ -445,11 +453,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .value()
                             .expect("Table ID does not have a root page")
                     };
-                    let (row_version, _) =
-                        self.get_current_row_version_mut(write_set_index).unwrap();
+                    let (row_version, _) = self
+                        .get_current_row_version_mut(write_set_index)
+                        .ok_or(LimboError::InternalError(
+                            "row version not found in write set".to_string(),
+                        ))?;
                     let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
                     let mut record_cursor = RecordCursor::new();
-                    record_cursor.parse_full_header(&record).unwrap();
+                    record_cursor
+                        .parse_full_header(&record)
+                        .map_err(|e| LimboError::InternalError(e.to_string()))?;
                     let values = record_cursor.get_values(&record);
                     let mut values = values
                         .into_iter()
@@ -471,14 +484,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     cursor
                 };
 
-                let (row_version, _) = self.get_current_row_version(write_set_index).unwrap();
+                let (row_version, _) = self.get_current_row_version(write_set_index).ok_or(
+                    LimboError::InternalError("row version not found in write set".to_string()),
+                )?;
 
                 // Check if this is an insert or delete
                 if row_version.end.is_some() {
                     // This is a delete operation
                     let state_machine = self
                         .mvstore
-                        .delete_row_from_pager(row_version.row.id, cursor)?;
+                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
                     self.delete_row_state_machine = Some(state_machine);
                     self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
                 } else {
@@ -495,7 +510,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::WriteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
-                let write_row_state_machine = self.write_row_state_machine.as_mut().unwrap();
+                let write_row_state_machine =
+                    self.write_row_state_machine
+                        .as_mut()
+                        .ok_or(LimboError::InternalError(
+                            "write_row_state_machine not initialized".to_string(),
+                        ))?;
 
                 match write_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -511,7 +531,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::DeleteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
-                let delete_row_state_machine = self.delete_row_state_machine.as_mut().unwrap();
+                let delete_row_state_machine =
+                    self.delete_row_state_machine
+                        .as_mut()
+                        .ok_or(LimboError::InternalError(
+                            "delete_row_state_machine not initialized".to_string(),
+                        ))?;
 
                 match delete_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -536,17 +561,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         if self.update_transaction_state {
                             self.connection.set_tx_state(TransactionState::None);
                         }
-                        let header = self
-                            .pager
-                            .io
-                            .block(|| {
-                                self.pager.with_header_mut(|header| {
-                                    header.schema_cookie =
-                                        self.connection.db.schema.lock().schema_version.into();
-                                    *header
-                                })
+                        let header = self.pager.io.block(|| {
+                            self.pager.with_header_mut(|header| {
+                                header.schema_cookie =
+                                    self.connection.db.schema.lock().schema_version.into();
+                                *header
                             })
-                            .unwrap();
+                        })?;
                         self.mvstore.global_header.write().replace(header);
                         Ok(TransitionResult::Continue)
                     }
@@ -598,7 +619,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
-                    self.checkpoint_result.take().unwrap(),
+                    self.checkpoint_result
+                        .take()
+                        .ok_or(LimboError::InternalError(
+                            "checkpoint_result not set".to_string(),
+                        ))?,
                 ))
             }
         }

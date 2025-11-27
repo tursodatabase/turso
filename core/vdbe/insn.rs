@@ -1276,7 +1276,9 @@ const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
 
     let mut insn = 0;
     while insn < InsnVariants::COUNT {
-        result[insn] = InsnVariants::from_repr(insn as u8).unwrap().to_function();
+        result[insn] = InsnVariants::from_repr(insn as u8)
+            .expect("insn index should be valid within COUNT")
+            .to_function();
         insn += 1;
     }
 

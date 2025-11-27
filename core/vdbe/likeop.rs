@@ -46,10 +46,17 @@ fn construct_like_regex_with_escape(pattern: &str, escape: char) -> Regex {
             '%' => regex_pattern.push_str(".*"),
             '_' => regex_pattern.push('.'),
             c => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
+                if c.is_ascii_alphabetic() {
+                    regex_pattern.push('[');
+                    regex_pattern.push(c.to_ascii_lowercase());
+                    regex_pattern.push(c.to_ascii_uppercase());
+                    regex_pattern.push(']');
+                } else {
+                    if regex_syntax::is_meta_character(c) {
+                        regex_pattern.push('\\');
+                    }
+                    regex_pattern.push(c);
                 }
-                regex_pattern.push(c);
             }
         }
     }
@@ -57,10 +64,9 @@ fn construct_like_regex_with_escape(pattern: &str, escape: char) -> Regex {
     regex_pattern.push('$');
 
     RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
-        .unwrap()
+        .expect("constructed LIKE regex pattern should be valid")
 }
 
 // Implements GLOB pattern matching. Caches the constructed regex if a cache is provided
@@ -173,7 +179,8 @@ fn construct_glob_regex(pattern: &str) -> Result<Regex, LimboError> {
     regex_pattern.push('$');
 
     if bracket_closed {
-        Ok(Regex::new(&regex_pattern).unwrap())
+        Regex::new(&regex_pattern)
+            .map_err(|e| LimboError::InternalError(format!("invalid GLOB regex pattern: {e}")))
     } else {
         Err(LimboError::Constraint(
             "blob pattern is not closed".to_string(),

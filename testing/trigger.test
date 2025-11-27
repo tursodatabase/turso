@@ -759,3 +759,24 @@ do_execsql_test_on_specific_db {:memory:} trigger-multiple-before-insert-lifo {
 3|4|6|8|t67_second
 4|2|3|4|t67_first
 5|1|1|1|jussi}
+
+# dropping table should drop triggers
+do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table{
+  create table a(id int primary key, x int);
+  create table t(id int primary key, b int, d int, c int);
+  create table t1(id int, y int); create trigger trg after insert on t begin update a set x = x - new.d + new.c where id = new.b; insert into t1(id, y) values (new.id, new.c - new.d); end; insert into a values (1, 5000);
+  insert into a values (2, 3000); 
+  drop table t; 
+  create table t(id int primary key, b int, c int, d int); 
+  insert into t values (1, 1, 1000, 50); 
+  insert into t values (2, 2, 500, 100); 
+  select * from a;
+  select * from t1;
+} {1|5000
+2|3000}
+
+do_execsql_test_in_memory_any_error trigger-cannot-create-on-system-table {
+  create trigger t after insert on sqlite_master begin
+    select 1;
+  end;
+}

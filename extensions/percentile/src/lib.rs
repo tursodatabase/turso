@@ -25,7 +25,7 @@ impl AggFunc for Median {
         }
 
         let mut sorted = state;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.total_cmp(b));
 
         let len = sorted.len();
         if len % 2 == 1 {
@@ -82,8 +82,8 @@ impl AggFunc for Percentile {
             return Ok(Value::from_float(values[0]));
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = p * (n - 1.0) / 100.0;
         let lower = index.floor() as usize;
@@ -144,8 +144,8 @@ impl AggFunc for PercentileCont {
             return Ok(Value::from_float(values[0]));
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = p * (n - 1.0);
         let lower = index.floor() as usize;
@@ -184,8 +184,8 @@ impl AggFunc for PercentileDisc {
             return Err(err);
         }
 
-        let p = p_value.unwrap();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p = p_value.ok_or("percentile value must be provided")?;
+        values.sort_by(|a, b| a.total_cmp(b));
         let n = values.len() as f64;
         let index = (p * (n - 1.0)).floor() as usize;
         Ok(Value::from_float(values[index]))

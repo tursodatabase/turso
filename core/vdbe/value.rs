@@ -205,7 +205,10 @@ impl Value {
 
         // Convert the word to lowercase for consistent lookups
         let word = word.to_lowercase();
-        let first_letter = word.chars().next().unwrap();
+        let first_letter = word
+            .chars()
+            .next()
+            .expect("word should not be empty after validation");
 
         // Remove all occurrences of 'h' and 'w' except the first letter
         let code: String = word
@@ -559,7 +562,7 @@ impl Value {
         }
 
         let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
-            .unwrap()
+            .expect("formatted float should always parse successfully")
             .into();
 
         Value::Float(f)
@@ -987,7 +990,10 @@ impl Value {
             return Value::Null;
         }
 
-        let separator = match registers.next().unwrap() {
+        let separator = match registers
+            .next()
+            .expect("registers should have at least one element after length check")
+        {
             Value::Null | Value::Blob(_) => return Value::Null,
             v => format!("{v}"),
         };
@@ -1026,10 +1032,17 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
             '%' => regex_pattern.push_str(".*"),
             '_' => regex_pattern.push('.'),
             ch => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
+                if ch.is_ascii_alphabetic() {
+                    regex_pattern.push('[');
+                    regex_pattern.push(ch.to_ascii_lowercase());
+                    regex_pattern.push(ch.to_ascii_uppercase());
+                    regex_pattern.push(']');
+                } else {
+                    if regex_syntax::is_meta_character(c) {
+                        regex_pattern.push('\\');
+                    }
+                    regex_pattern.push(ch);
                 }
-                regex_pattern.push(ch);
             }
         }
     }
@@ -1037,10 +1050,9 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
     regex_pattern.push('$');
 
     RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
-        .unwrap()
+        .expect("constructed LIKE regex pattern should be valid")
 }
 
 #[cfg(test)]

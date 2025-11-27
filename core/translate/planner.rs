@@ -440,6 +440,8 @@ fn parse_table(
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id,
         });
         return Ok(());
@@ -534,6 +536,8 @@ fn parse_table(
             internal_id: program.table_reference_counter.next(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id,
         });
         return Ok(());
@@ -557,6 +561,8 @@ fn parse_table(
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
                 database_id,
             });
             return Ok(());

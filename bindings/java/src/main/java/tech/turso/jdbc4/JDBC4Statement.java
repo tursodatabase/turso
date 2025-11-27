@@ -34,7 +34,7 @@ public class JDBC4Statement implements Statement {
               + ")\\b",
           Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
-  private final JDBC4Connection connection;
+  protected final JDBC4Connection connection;
 
   /** The underlying Turso statement. */
   @Nullable protected TursoStatement statement = null;
@@ -330,7 +330,7 @@ public class JDBC4Statement implements Statement {
     return updateCounts;
   }
 
-  boolean isBatchCompatibleStatement(String sql) {
+  protected boolean isBatchCompatibleStatement(String sql) {
     if (sql == null || sql.trim().isEmpty()) {
       return false;
     }

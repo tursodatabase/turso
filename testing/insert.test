@@ -1051,3 +1051,54 @@ do_execsql_test_on_specific_db {:memory:} onconflict-replace-unique-index-selfdu
     SELECT a,b FROM t;
 } {5|three}
 
+do_execsql_test_in_memory_any_error partial-expr-index-upsert-conflict {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'bar', 'wxyz', 1);
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'baz', 'xx', 5)
+        ON CONFLICT(id) DO UPDATE SET k = 'foo', c0 = 'zzzz', c1 = 1;
+}
+
+do_execsql_test_on_specific_db {:memory:} partial-expr-index-update-removes-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+    UPDATE t SET c1 = NULL WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 5);
+    SELECT k || '|' || c0 || '|' || coalesce(c1, 'NULL') FROM t ORDER BY id;
+} {foo|abcd|NULL
+FOO|zzzz|5}
+
+do_execsql_test_on_specific_db {:memory:} partial-expr-index-delete-clears-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 3);
+    DELETE FROM t WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 3);
+    SELECT upper(k) || '|' || length(c0) || '|' || c1 FROM t;
+} {FOO|4|3}
+
+do_execsql_test_on_specific_db {:memory:} collate-unique-index-upsert {
+    CREATE TABLE co (name TEXT, v);
+    CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
+    INSERT INTO co VALUES ('Alice', 1);
+    INSERT INTO co VALUES ('aLiCe', 9)
+      ON CONFLICT DO UPDATE SET v = excluded.v;
+    SELECT name, v FROM co;
+} {Alice|9}

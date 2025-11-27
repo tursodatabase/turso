@@ -4,7 +4,7 @@ use criterion::async_executor::FuturesExecutor;
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::mvcc::clock::LocalClock;
-use turso_core::mvcc::database::{MvStore, Row, RowID};
+use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{Connection, Database, MemoryIO, Value};
 
@@ -68,7 +68,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     RowID {
                         table_id: (-2).into(),
-                        row_id: 1,
+                        row_id: RowKey::Int(1),
                     },
                 )
                 .unwrap();
@@ -98,7 +98,7 @@ fn bench(c: &mut Criterion) {
                     Row {
                         id: RowID {
                             table_id: (-2).into(),
-                            row_id: 1,
+                            row_id: RowKey::Int(1),
                         },
                         data: record_data.clone(),
                         column_count: 1,
@@ -126,7 +126,7 @@ fn bench(c: &mut Criterion) {
             Row {
                 id: RowID {
                     table_id: (-2).into(),
-                    row_id: 1,
+                    row_id: RowKey::Int(1),
                 },
                 data: record_data.clone(),
                 column_count: 1,
@@ -140,7 +140,7 @@ fn bench(c: &mut Criterion) {
                     tx_id,
                     RowID {
                         table_id: (-2).into(),
-                        row_id: 1,
+                        row_id: RowKey::Int(1),
                     },
                 )
                 .unwrap();
@@ -155,7 +155,7 @@ fn bench(c: &mut Criterion) {
             Row {
                 id: RowID {
                     table_id: (-2).into(),
-                    row_id: 1,
+                    row_id: RowKey::Int(1),
                 },
                 data: record_data.clone(),
                 column_count: 1,
@@ -170,7 +170,7 @@ fn bench(c: &mut Criterion) {
                     Row {
                         id: RowID {
                             table_id: (-2).into(),
-                            row_id: 1,
+                            row_id: RowKey::Int(1),
                         },
                         data: record_data.clone(),
                         column_count: 1,

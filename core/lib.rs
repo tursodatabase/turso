@@ -540,13 +540,6 @@ impl Database {
                     _ => {}
                 }
 
-                if db.mvcc_enabled() && !schema.indexes.is_empty() {
-                    return Err(LimboError::ParseError(
-                        "Database contains indexes which are not supported when MVCC is enabled."
-                            .to_string(),
-                    ));
-                }
-
                 Ok(())
             })?;
         }
@@ -2957,6 +2950,7 @@ impl Statement {
         self.program
             .abort(self.mv_store.as_ref(), &self.pager, None, &mut self.state);
         self.state.reset(max_registers, max_cursors);
+        self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_timeout = None;
     }

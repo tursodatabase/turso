@@ -272,7 +272,9 @@ impl Completion {
     }
 
     pub(super) fn get_inner(&self) -> &Arc<CompletionInner> {
-        self.inner.as_ref().unwrap()
+        self.inner
+            .as_ref()
+            .expect("completion inner should be initialized")
     }
 
     pub fn needs_link(&self) -> bool {

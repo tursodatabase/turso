@@ -8543,6 +8543,7 @@ mod tests {
                         collation: None,
                         pos_in_table: i,
                         default: None,
+                        expr: None,
                     })
                     .collect(),
                 table_name: "test".to_string(),
@@ -8704,6 +8705,7 @@ mod tests {
                     collation: None,
                     pos_in_table: 0,
                     default: None,
+                    expr: None,
                 }],
                 table_name: "test".to_string(),
                 root_page: index_root_page,

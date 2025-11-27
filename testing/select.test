@@ -1244,6 +1244,11 @@ do_execsql_test_on_specific_db {:memory:} affinity-conversion-2 {
   SELECT * FROM t WHERE a == 2;
 } {2}
 
+ # https://github.com/tursodatabase/turso/issues/3950
+do_execsql_test select-values-column-name {
+  SELECT column1 FROM (VALUES(123));
+} {123}
+
 # Test suite for SQLite affinity conversion in WHERE clauses
 
 # ============================================
@@ -1469,3 +1474,11 @@ do_execsql_test_on_specific_db {:memory:} affinity-conversion-22 {
 #   CREATE INDEX idx20 ON t20(lower(name));
 #   SELECT * FROM t20 WHERE lower(name) = 'abc';
 # } {ABC abc}
+
+do_execsql_test_regex sqlite-version-should-return-valid-output {
+  SELECT sqlite_version();
+} {\d+\.\d+\.\d+}
+
+do_execsql_test_regex explain-64-bit-integer-no-overflow {
+  EXPLAIN SELECT 123123123123;
+} {\s123123123123\s}

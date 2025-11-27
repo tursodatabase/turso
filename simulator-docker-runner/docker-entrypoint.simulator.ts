@@ -176,6 +176,15 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
     args.push("--profile", "faultless");
   }
 
+  // Memory IO is faster
+  if (!args.includes("--memory-io")) {
+    args.push("--memory-io");
+  }
+
+  if (Math.random() < 0.5 && !args.includes("--differential")) {
+    args.push("--differential");
+  }
+
   args.push(...["--minimum-tests", "100", "--maximum-tests", "1000"]);
   const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
   args.push(...loop);

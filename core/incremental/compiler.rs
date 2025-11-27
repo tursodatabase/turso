@@ -886,13 +886,21 @@ impl DbspCompiler {
         // Determine the correct pairing: one column must be from left, one from right
         if first_in_left.is_some() && second_in_right.is_some() {
             // first is from left, second is from right
-            let (left_idx, _) = first_in_left.unwrap();
-            let (right_idx, _) = second_in_right.unwrap();
+            let (left_idx, _) = first_in_left.ok_or_else(|| {
+                LimboError::InternalError("first_in_left should exist".to_string())
+            })?;
+            let (right_idx, _) = second_in_right.ok_or_else(|| {
+                LimboError::InternalError("second_in_right should exist".to_string())
+            })?;
             Ok((first_col.clone(), left_idx, second_col.clone(), right_idx))
         } else if first_in_right.is_some() && second_in_left.is_some() {
             // first is from right, second is from left
-            let (left_idx, _) = second_in_left.unwrap();
-            let (right_idx, _) = first_in_right.unwrap();
+            let (left_idx, _) = second_in_left.ok_or_else(|| {
+                LimboError::InternalError("second_in_left should exist".to_string())
+            })?;
+            let (right_idx, _) = first_in_right.ok_or_else(|| {
+                LimboError::InternalError("first_in_right should exist".to_string())
+            })?;
             Ok((second_col.clone(), left_idx, first_col.clone(), right_idx))
         } else {
             // Provide specific error messages for different failure cases
@@ -1276,7 +1284,7 @@ impl DbspCompiler {
                     group_by_indices.clone(),
                     aggregate_functions.clone(),
                     input_column_names.clone(),
-                ));
+                )?);
 
                 let result_node_id = self.circuit.add_node(
                     DbspOperator::Aggregate {
@@ -1421,7 +1429,7 @@ impl DbspCompiler {
                         group_by,
                         vec![], // Empty aggregates indicates plain DISTINCT
                         input_column_names,
-                    ),
+                    )?,
                 );
 
                 // Add the node to the circuit

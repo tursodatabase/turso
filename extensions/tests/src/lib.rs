@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};

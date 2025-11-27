@@ -6,6 +6,7 @@ use turso_parser::ast::SortOrder;
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, Constraint, RangeConstraintRef,
 };
+use crate::util::exprs_are_equivalent;
 use crate::{
     schema::{Index, Table},
     translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
@@ -18,6 +19,7 @@ use super::{
     cost::{estimate_cost_for_scan_or_seek, Cost, IndexInfo},
     order::OrderTarget,
 };
+use crate::translate::optimizer::order::ColumnTarget;
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
@@ -137,14 +139,24 @@ fn find_best_access_method_for_btree(
             let mut all_same_direction = true;
             let mut all_opposite_direction = true;
             for i in 0..order_target.0.len().min(index_info.column_count) {
-                let correct_table = order_target.0[i].table_id == table_no;
-                let correct_column = {
-                    match &candidate.index {
-                        Some(index) => index.columns[i].pos_in_table == order_target.0[i].column_no,
-                        None => {
-                            rowid_column_idx.is_some_and(|idx| idx == order_target.0[i].column_no)
-                        }
+                let target = &order_target.0[i];
+                let correct_table = target.table_id == table_no;
+                let correct_column = match (&target.target, &candidate.index) {
+                    // Regular column target on normal index, simply check column number
+                    // against index column's pos_in_table
+                    (ColumnTarget::Column(col_no), Some(index)) => {
+                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
                     }
+                    // Expression column target on expression index, check expr equivalence
+                    (ColumnTarget::Expr(expr), Some(index)) => index.columns[i]
+                        .expr
+                        .as_ref()
+                        .is_some_and(|e| exprs_are_equivalent(e, unsafe { &**expr })),
+                    // Normal column target on rowid index, check if column is rowid
+                    (ColumnTarget::Column(col_no), None) => {
+                        rowid_column_idx.is_some_and(|idx| idx == *col_no)
+                    }
+                    _ => false,
                 };
                 if !correct_table || !correct_column {
                     all_same_direction = false;
@@ -153,8 +165,8 @@ fn find_best_access_method_for_btree(
                 }
                 let correct_order = {
                     match &candidate.index {
-                        Some(index) => order_target.0[i].order == index.columns[i].order,
-                        None => order_target.0[i].order == SortOrder::Asc,
+                        Some(index) => target.order == index.columns[i].order,
+                        None => target.order == SortOrder::Asc,
                     }
                 };
                 if correct_order {

@@ -8,7 +8,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
-use crate::schema::{self, BTreeTable, ColDef, Index, ResolvedFkRef, Table};
+use crate::schema::{self, BTreeTable, ColDef, Index, IndexColumn, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
     OperationMode,
@@ -40,6 +40,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
     },
+    LimboError,
 };
 use crate::{Connection, Result, VirtualTable};
 
@@ -97,7 +98,6 @@ pub struct TempTableCtx {
 pub struct InsertEmitCtx<'a> {
     /// Parent table being inserted into
     pub table: &'a Arc<BTreeTable>,
-    pub table_references: &'a mut TableReferences,
 
     /// Index cursors we need to populate for this table
     /// (idx name, root_page, idx cursor id)
@@ -138,7 +138,6 @@ pub struct InsertEmitCtx<'a> {
 }
 
 impl<'a> InsertEmitCtx<'a> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         program: &mut ProgramBuilder,
         resolver: &Resolver,
@@ -147,7 +146,6 @@ impl<'a> InsertEmitCtx<'a> {
         cdc_table: Option<(usize, Arc<BTreeTable>)>,
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
-        table_references: &'a mut TableReferences,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices = resolver.schema.get_indices(table.name.as_str());
@@ -167,7 +165,6 @@ impl<'a> InsertEmitCtx<'a> {
         let key_generation_label = program.allocate_label();
         Ok(Self {
             table,
-            table_references,
             idx_cursors,
             temp_table_ctx,
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
@@ -261,6 +258,8 @@ pub fn translate_insert(
             op: Operation::default_scan_for(&table),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }],
         vec![],
@@ -283,7 +282,6 @@ pub fn translate_insert(
         cdc_table,
         values.len(),
         None,
-        &mut table_references,
     )?;
 
     program = init_source_emission(
@@ -295,6 +293,7 @@ pub fn translate_insert(
         &mut values,
         body,
         &columns,
+        &table_references,
     )?;
     let has_upsert = !upsert_actions.is_empty();
 
@@ -411,6 +410,7 @@ pub fn translate_insert(
         &upsert_actions,
         &constraints,
         connection,
+        &mut table_references,
     )?;
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
@@ -575,7 +575,7 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         emit_returning_results(
             &mut program,
-            ctx.table_references,
+            &table_references,
             &result_columns,
             insertion.first_col_register(),
             insertion.key_register(),
@@ -595,6 +595,7 @@ pub fn translate_insert(
             &table,
             &mut result_columns,
             connection,
+            &mut table_references,
         )?;
     }
 
@@ -694,16 +695,13 @@ fn emit_commit_phase(
 
         // Build [key cols..., rowid] from insertion registers
         for (i, idx_col) in index.columns.iter().enumerate() {
-            let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
-                return Err(crate::LimboError::PlanningError(
-                    "Column not found in INSERT (commit phase)".to_string(),
-                ));
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg: cm.register,
-                dst_reg: idx_start_reg + i,
-                extra_amount: 0,
-            });
+            emit_index_column_value_for_insert(
+                program,
+                resolver,
+                insertion,
+                idx_col,
+                idx_start_reg + i,
+            )?;
         }
         program.emit_insn(Insn::Copy {
             src_reg: insertion.key_register(),
@@ -863,6 +861,7 @@ fn resolve_upserts(
     table: &Table,
     result_columns: &mut [ResultSetColumn],
     connection: &Arc<crate::Connection>,
+    table_references: &mut TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
         program.preassign_label_to_next_insn(*label);
@@ -885,6 +884,7 @@ fn resolve_upserts(
                 resolver,
                 result_columns,
                 connection,
+                table_references,
             )?;
         } else {
             // UpsertDo::Nothing case
@@ -1222,6 +1222,7 @@ fn init_source_emission<'a>(
     values: &mut Vec<Box<Expr>>,
     body: InsertBody,
     columns: &'a [ast::Name],
+    table_references: &TableReferences,
 ) -> Result<ProgramBuilder> {
     let required_column_count = if columns.is_empty() {
         table.columns().len()
@@ -1254,7 +1255,7 @@ fn init_source_emission<'a>(
                 (
                     values.len(),
                     program.alloc_cursor_id_keyed(
-                        CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                        CursorKey::table(table_references.joined_tables()[0].internal_id),
                         CursorType::BTreeTable(ctx.table.clone()),
                     ),
                 )
@@ -1289,7 +1290,7 @@ fn init_source_emission<'a>(
                 program.emit_insn(Insn::EndCoroutine { yield_reg });
                 program.preassign_label_to_next_insn(jump_on_definition_label);
                 let cursor_id = program.alloc_cursor_id_keyed(
-                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorKey::table(table_references.joined_tables()[0].internal_id),
                     CursorType::BTreeTable(ctx.table.clone()),
                 );
 
@@ -1419,7 +1420,7 @@ fn init_source_emission<'a>(
             (
                 num_values,
                 program.alloc_cursor_id_keyed(
-                    CursorKey::table(ctx.table_references.joined_tables()[0].internal_id),
+                    CursorKey::table(table_references.joined_tables()[0].internal_id),
                     CursorType::BTreeTable(ctx.table.clone()),
                 ),
             )
@@ -1705,7 +1706,6 @@ fn translate_rows_multiple<'short, 'long: 'short>(
     translate_rows_base(program, insertion, translate_value_fn, resolver)
 }
 /// Populates the column registers with values for a single row
-#[allow(clippy::too_many_arguments)]
 fn translate_rows_single(
     program: &mut ProgramBuilder,
     value: &[Box<Expr>],
@@ -1837,6 +1837,7 @@ fn translate_column(
 // DO UPDATE (matching target) -> fetch conflicting rowid and jump to `upsert_entry`.
 //
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
+#[allow(clippy::too_many_arguments)]
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
@@ -1845,6 +1846,7 @@ fn emit_preflight_constraint_checks(
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     constraints: &ConstraintsToCheck,
     connection: &Arc<Connection>,
+    table_references: &mut TableReferences,
 ) -> Result<()> {
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
     for (constraint, position) in &constraints.constraints_to_check {
@@ -1868,7 +1870,13 @@ fn emit_preflight_constraint_checks(
                             dst_reg: ctx.conflict_rowid_reg,
                             extra_amount: 0,
                         });
-                        emit_replace_delete_conflicting_row(program, resolver, connection, ctx)?;
+                        emit_replace_delete_conflicting_row(
+                            program,
+                            resolver,
+                            connection,
+                            ctx,
+                            table_references,
+                        )?;
                         program.emit_insn(Insn::Goto {
                             target_pc: make_record_label,
                         });
@@ -1899,10 +1907,6 @@ fn emit_preflight_constraint_checks(
                 program.preassign_label_to_next_insn(make_record_label);
             }
             ResolvedUpsertTarget::Index(index) => {
-                let column_mappings = index
-                    .columns
-                    .iter()
-                    .map(|idx_col| insertion.get_col_mapping_by_name(&idx_col.name));
                 // find which cursor we opened earlier for this index
                 let idx_cursor_id = ctx
                     .idx_cursors
@@ -1940,18 +1944,14 @@ fn emit_preflight_constraint_checks(
 
                 // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
                 // copy each index column from the table's column registers into these scratch regs
-                for (i, column_mapping) in column_mappings.clone().enumerate() {
-                    // copy from the table's column register over to the index's scratch register
-                    let Some(col_mapping) = column_mapping else {
-                        return Err(crate::LimboError::PlanningError(
-                            "Column not found in INSERT".to_string(),
-                        ));
-                    };
-                    program.emit_insn(Insn::Copy {
-                        src_reg: col_mapping.register,
-                        dst_reg: idx_start_reg + i,
-                        extra_amount: 0,
-                    });
+                for (i, idx_col) in index.columns.iter().enumerate() {
+                    emit_index_column_value_for_insert(
+                        program,
+                        resolver,
+                        insertion,
+                        idx_col,
+                        idx_start_reg + i,
+                    )?;
                 }
                 // last register is the rowid
                 program.emit_insn(Insn::Copy {
@@ -1964,7 +1964,13 @@ fn emit_preflight_constraint_checks(
                     let aff = index
                         .columns
                         .iter()
-                        .map(|ic| ctx.table.columns[ic.pos_in_table].affinity().aff_mask())
+                        .map(|ic| {
+                            if ic.expr.is_some() {
+                                Affinity::Blob.aff_mask()
+                            } else {
+                                ctx.table.columns[ic.pos_in_table].affinity().aff_mask()
+                            }
+                        })
                         .collect::<String>();
                     program.emit_insn(Insn::Affinity {
                         start_reg: idx_start_reg,
@@ -2028,7 +2034,11 @@ fn emit_preflight_constraint_checks(
                                 dest: ctx.conflict_rowid_reg,
                             });
                             emit_replace_delete_conflicting_row(
-                                program, resolver, connection, ctx,
+                                program,
+                                resolver,
+                                connection,
+                                ctx,
+                                table_references,
                             )?;
                             program.emit_insn(Insn::Goto { target_pc: ok });
                         } else {
@@ -2326,6 +2336,93 @@ pub fn rewrite_partial_index_where(
     )
 }
 
+/// For an index expression, rewrite column references to use the insertion registers.
+fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
+    let mut missing_column = None;
+    let col_reg = |name: &str| -> Option<usize> {
+        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            Some(insertion.key_register())
+        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
+            if c.column.is_rowid_alias() {
+                Some(insertion.key_register())
+            } else {
+                Some(c.register)
+            }
+        } else {
+            None
+        }
+    };
+    walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                Expr::Id(name) | Expr::Name(name) => {
+                    let normalized = normalize_ident(name.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    } else {
+                        missing_column = Some(normalized);
+                    }
+                }
+                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
+                    let normalized = normalize_ident(col.as_str());
+                    if let Some(reg) = col_reg(&normalized) {
+                        *e = Expr::Register(reg);
+                    } else {
+                        missing_column = Some(normalized);
+                    }
+                }
+                _ => {}
+            }
+            Ok(if missing_column.is_some() {
+                WalkControl::SkipChildren
+            } else {
+                WalkControl::Continue
+            })
+        },
+    )?;
+
+    if let Some(col) = missing_column {
+        return Err(LimboError::PlanningError(format!(
+            "Column not found in INSERT: {col}"
+        )));
+    }
+    Ok(())
+}
+
+fn emit_index_column_value_for_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    idx_col: &IndexColumn,
+    dest_reg: usize,
+) -> Result<()> {
+    if let Some(expr) = &idx_col.expr {
+        let mut expr = expr.as_ref().clone();
+        rewrite_index_expr_for_insertion(&mut expr, insertion)?;
+        translate_expr_no_constant_opt(
+            program,
+            Some(&TableReferences::new_empty()),
+            &expr,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    } else {
+        let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
+            return Err(LimboError::PlanningError(
+                "Column not found in INSERT".to_string(),
+            ));
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg: cm.register,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
+}
+
 struct ConstraintsToCheck {
     constraints_to_check: Vec<(ResolvedUpsertTarget, Option<usize>)>,
     upsert_catch_all_position: Option<usize>,
@@ -2449,6 +2546,7 @@ fn emit_replace_delete_conflicting_row(
     resolver: &Resolver,
     connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx,
+    table_references: &mut TableReferences,
 ) -> Result<()> {
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
@@ -2480,13 +2578,13 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(ctx.table_references), connection)
+                .bind_where_expr(Some(table_references), connection)
                 .expect("where clause to exist");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
-                Some(ctx.table_references),
+                Some(table_references),
                 &where_copy,
                 reg,
                 resolver,
@@ -2506,11 +2604,30 @@ fn emit_replace_delete_conflicting_row(
         let start_reg = program.alloc_registers(num_regs);
 
         for (reg_offset, column_index) in index.columns.iter().enumerate() {
-            program.emit_column_or_rowid(
-                main_cursor_id,
-                column_index.pos_in_table,
-                start_reg + reg_offset,
-            );
+            if let Some(expr) = &column_index.expr {
+                let mut expr = expr.as_ref().clone();
+                bind_and_rewrite_expr(
+                    &mut expr,
+                    Some(table_references),
+                    None,
+                    connection,
+                    BindingBehavior::ResultColumnsNotAllowed,
+                )?;
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &expr,
+                    start_reg + reg_offset,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            } else {
+                program.emit_column_or_rowid(
+                    main_cursor_id,
+                    column_index.pos_in_table,
+                    start_reg + reg_offset,
+                );
+            }
         }
         program.emit_insn(Insn::Copy {
             src_reg: ctx.conflict_rowid_reg,

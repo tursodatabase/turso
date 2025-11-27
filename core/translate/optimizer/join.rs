@@ -682,6 +682,7 @@ mod tests {
                 pos_in_table: 0,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             unique: true,
             ephemeral: false,
@@ -756,6 +757,7 @@ mod tests {
                 pos_in_table: 0,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             unique: true,
             ephemeral: false,
@@ -878,6 +880,7 @@ mod tests {
                         pos_in_table: 0,
                         collation: None,
                         default: None,
+                        expr: None,
                     }],
                     unique: true,
                     ephemeral: false,
@@ -897,6 +900,7 @@ mod tests {
                 pos_in_table: 1,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             unique: false,
             ephemeral: false,
@@ -914,6 +918,7 @@ mod tests {
                 pos_in_table: 1,
                 collation: None,
                 default: None,
+                expr: None,
             }],
             unique: false,
             ephemeral: false,
@@ -1346,6 +1351,7 @@ mod tests {
                     pos_in_table: 0,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
                 IndexColumn {
                     name: "y".to_string(),
@@ -1353,6 +1359,7 @@ mod tests {
                     pos_in_table: 1,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
             ],
             unique: false,
@@ -1373,6 +1380,8 @@ mod tests {
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         });
 
@@ -1438,6 +1447,7 @@ mod tests {
                     pos_in_table: 0,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
                 IndexColumn {
                     name: "c2".to_string(),
@@ -1445,6 +1455,7 @@ mod tests {
                     pos_in_table: 1,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
                 IndexColumn {
                     name: "c3".to_string(),
@@ -1452,6 +1463,7 @@ mod tests {
                     pos_in_table: 2,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
             ],
             unique: false,
@@ -1470,6 +1482,8 @@ mod tests {
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         });
 
@@ -1531,7 +1545,7 @@ mod tests {
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
-        assert!(constraint.table_col_pos == 0); // c1
+        assert!(constraint.table_col_pos == Some(0)); // c1
     }
 
     #[test]
@@ -1555,6 +1569,7 @@ mod tests {
                     pos_in_table: 0,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
                 IndexColumn {
                     name: "c2".to_string(),
@@ -1562,6 +1577,7 @@ mod tests {
                     pos_in_table: 1,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
                 IndexColumn {
                     name: "c3".to_string(),
@@ -1569,6 +1585,7 @@ mod tests {
                     pos_in_table: 2,
                     collation: None,
                     default: None,
+                    expr: None,
                 },
             ],
             root_page: 2,
@@ -1587,6 +1604,8 @@ mod tests {
             identifier: "t1".to_string(),
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         });
 
@@ -1663,10 +1682,10 @@ mod tests {
         assert!(constraint_refs.len() == 2);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.operator == ast::Operator::Equals);
-        assert!(constraint.table_col_pos == 0); // c1
+        assert!(constraint.table_col_pos == Some(0)); // c1
         let constraint = &table_constraints[0].constraints[constraint_refs[1].lower_bound.unwrap()];
         assert!(constraint.operator == ast::Operator::Greater);
-        assert!(constraint.table_col_pos == 1); // c2
+        assert!(constraint.table_col_pos == Some(1)); // c2
     }
 
     fn _create_column(c: &TestColumn) -> Column {
@@ -1736,6 +1755,8 @@ mod tests {
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
             database_id: 0,
         }
     }

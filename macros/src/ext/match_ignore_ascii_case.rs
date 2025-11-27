@@ -86,19 +86,12 @@ pub fn match_ignore_ascci_case(input: TokenStream) -> TokenStream {
         let mut current = &mut paths;
 
         for b in keyword_b {
-            match current.sub_entries.get(&b) {
-                Some(_) => {
-                    current = current.sub_entries.get_mut(&b).unwrap();
-                }
-                None => {
-                    let new_entry = Box::new(PathEntry {
-                        result: None,
-                        sub_entries: HashMap::new(),
-                    });
-                    current.sub_entries.insert(b, new_entry);
-                    current = current.sub_entries.get_mut(&b).unwrap();
-                }
-            }
+            current = current.sub_entries.entry(b).or_insert_with(|| {
+                Box::new(PathEntry {
+                    result: None,
+                    sub_entries: HashMap::new(),
+                })
+            });
         }
 
         assert!(current.result.is_none());
