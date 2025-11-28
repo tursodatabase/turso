@@ -170,7 +170,6 @@ mod tests {
         let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
         let d_rust = vector_f32_distance_dot_rust(v1.as_f32_slice(), v2.as_f32_slice());
         let d_simd = vector_f32_distance_dot_simsimd(v1.as_f32_slice(), v2.as_f32_slice());
-        println!("testing dot product should be 0 {}, {}", d_rust, d_rust);
         (d_rust.is_nan() && d_simd.is_nan()) || (d_rust - d_simd).abs() < 1e-4
     }
 
