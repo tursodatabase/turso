@@ -308,10 +308,20 @@ impl Value {
     }
 
     pub fn exec_quote(&self) -> Self {
+        use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Integer(_) | Value::Float(_) => self.to_owned(),
-            Value::Blob(_) => todo!(),
+            Value::Blob(b) => {
+                // SQLite returns X'hexdigits' for blobs
+                let mut quoted = String::with_capacity(3 + b.len() * 2);
+                quoted.push_str("X'");
+                for byte in b.iter() {
+                    write!(&mut quoted, "{byte:02X}").expect("unable to write hex bytes");
+                }
+                quoted.push('\'');
+                Value::build_text(quoted)
+            }
             Value::Text(s) => {
                 let mut quoted = String::with_capacity(s.as_str().len() + 2);
                 quoted.push('\'');
