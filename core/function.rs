@@ -181,7 +181,7 @@ impl Display for VectorFunc {
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
             Self::VectorDistanceL2 => "vector_distance_l2".to_string(),
             Self::VectorDistanceJaccard => "vector_distance_jaccard".to_string(),
-            Self::VectorDistanceDot=> "vector_distance_dot".to_string(),
+            Self::VectorDistanceDot => "vector_distance_dot".to_string(),
             Self::VectorConcat => "vector_concat".to_string(),
             Self::VectorSlice => "vector_slice".to_string(),
         };

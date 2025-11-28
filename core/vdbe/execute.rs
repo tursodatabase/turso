@@ -26,7 +26,8 @@ use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
 use crate::vector::{
-    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice
+    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
+    vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
 use crate::{
     error::{
@@ -5558,7 +5559,7 @@ pub fn op_function(
                     let result = vector_distance_cos(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
-                VectorFunc::VectorDistanceDot=> {
+                VectorFunc::VectorDistanceDot => {
                     let result = vector_distance_dot(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
