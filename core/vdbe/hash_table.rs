@@ -40,6 +40,14 @@ const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
 
+#[inline(always)]
+fn canonicalize_f64(f: f64) -> f64 {
+    if f == 0.0 {
+        0.0 // collapse -0.0 to +0.0
+    } else {
+        f
+    }
+}
 /// Hash function for join keys using xxHash
 /// Takes collation into account when hashing text values
 fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
@@ -366,6 +374,7 @@ pub enum SpillIOState {
     WriteComplete,
     WaitingForRead,
     ReadComplete,
+    Error,
 }
 
 /// State of a partition in a spilled hash table
@@ -789,14 +798,17 @@ impl HashTable {
         let buffer = Buffer::new_temporary(data_size);
         buffer.as_mut_slice().copy_from_slice(&serialized_data);
         let buffer_ref = Arc::new(buffer);
-
+        let _buffer_ref_clone = buffer_ref.clone();
         let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
             Ok(_) => {
+                // keep buffer alive for async IO
+                let _buf = _buffer_ref_clone.clone();
                 tracing::trace!("Successfully wrote spilled partition to disk");
                 io_state.set(SpillIOState::WriteComplete);
             }
             Err(e) => {
                 tracing::error!("Error writing spilled partition to disk: {e:?}");
+                io_state.set(SpillIOState::Error);
             }
         });
 
@@ -879,14 +891,17 @@ impl HashTable {
                 let buffer = Buffer::new_temporary(data_size);
                 buffer.as_mut_slice().copy_from_slice(&serialized_data);
                 let buffer_ref = Arc::new(buffer);
+                let _cbuffer_ref_clone = buffer_ref.clone();
 
                 let write_complete =
                     Box::new(move |res: Result<i32, crate::CompletionError>| match res {
                         Ok(_) => {
+                            let _buf = _cbuffer_ref_clone.clone();
                             io_state.set(SpillIOState::WriteComplete);
                         }
                         Err(e) => {
                             tracing::error!("Error writing spilled partition to disk: {e:?}");
+                            io_state.set(SpillIOState::Error);
                         }
                     });
                 let completion = Completion::new_write(write_complete);
@@ -1045,14 +1060,20 @@ impl HashTable {
                     Some(p) => p,
                     None => return Ok(IOResult::Done(())),
                 };
+                let io_state = spilled.io_state.get();
 
+                if matches!(io_state, SpillIOState::Error) {
+                    return Err(LimboError::InternalError(
+                        "hash join spill I/O failure".into(),
+                    ));
+                }
                 // Already fully loaded
                 if spilled.is_loaded() {
                     SpillAction::AlreadyLoaded
-                } else if matches!(spilled.io_state.get(), SpillIOState::WaitingForRead) {
+                } else if matches!(io_state, SpillIOState::WaitingForRead) {
                     // We've scheduled a read, caller must wait for completion.
                     SpillAction::WaitingForIO
-                } else if matches!(spilled.io_state.get(), SpillIOState::ReadComplete) {
+                } else if matches!(io_state, SpillIOState::ReadComplete) {
                     // A chunk finished reading: advance to next chunk.
                     spilled.current_chunk_idx += 1;
                     spilled.io_state.set(SpillIOState::None);
@@ -1082,17 +1103,16 @@ impl HashTable {
                                 }
                             } else {
                                 // Non-empty chunk, schedule a read for it.
-                                let io_state = spilled.io_state.clone();
                                 let buffer_len = spilled.buffer_len.clone();
                                 let read_buffer_ref = spilled.read_buffer.clone();
 
-                                io_state.set(SpillIOState::WaitingForRead);
+                                spilled.io_state.set(SpillIOState::WaitingForRead);
                                 spilled.state = PartitionState::Loading;
 
                                 SpillAction::LoadChunk {
                                     read_size,
                                     file_offset,
-                                    io_state,
+                                    io_state: spilled.io_state.clone(),
                                     buffer_len,
                                     read_buffer_ref,
                                 }
