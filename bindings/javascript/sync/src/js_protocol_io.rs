@@ -8,7 +8,7 @@ use std::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use turso_sync_engine::{
-    protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
+    database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     types::{DatabaseRowTransformResult, DatabaseStatementReplay},
 };
 
@@ -183,7 +183,7 @@ impl JsProtocolRequestBytes {
     }
 }
 
-impl ProtocolIO for JsProtocolIo {
+impl SyncEngineIo for JsProtocolIo {
     type DataCompletionBytes = JsDataCompletion;
     type DataCompletionTransform = JsDataCompletion;
 

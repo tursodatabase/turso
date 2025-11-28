@@ -5,24 +5,26 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use turso_sync_engine::types::{DbChangesStatus, ProtocolCommand};
+use turso_sync_engine::types::{DbChangesStatus, SyncEngineIoResult};
 
 pub trait Generator {
     fn resume(&mut self, result: Option<String>) -> napi::Result<GeneratorResponse>;
 }
 
 impl<F: Future<Output = turso_sync_engine::Result<()>>> Generator
-    for genawaiter::sync::Gen<ProtocolCommand, turso_sync_engine::Result<()>, F>
+    for genawaiter::sync::Gen<SyncEngineIoResult, turso_sync_engine::Result<()>, F>
 {
     fn resume(&mut self, error: Option<String>) -> napi::Result<GeneratorResponse> {
         let result = match error {
             Some(err) => Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                format!("JsProtocolIo error: {err}"),
+                format!("JsSyncEngineIo error: {err}"),
             )),
             None => Ok(()),
         };
         match self.resume_with(result) {
-            genawaiter::GeneratorState::Yielded(ProtocolCommand::IO) => Ok(GeneratorResponse::IO),
+            genawaiter::GeneratorState::Yielded(SyncEngineIoResult::IO) => {
+                Ok(GeneratorResponse::IO)
+            }
             genawaiter::GeneratorState::Complete(Ok(())) => Ok(GeneratorResponse::Done),
             genawaiter::GeneratorState::Complete(Err(err)) => Err(napi::Error::new(
                 napi::Status::GenericFailure,

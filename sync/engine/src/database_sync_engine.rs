@@ -10,12 +10,13 @@ use turso_core::{DatabaseStorage, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
+    database_sync_engine_io::SyncEngineIo,
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
         reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
-        wal_pull_to_file, ProtocolIoStats, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        wal_pull_to_file, SyncEngineIoStats, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -24,7 +25,6 @@ use crate::{
     },
     errors::Error,
     io_operations::IoOperations,
-    protocol_io::ProtocolIO,
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus, SyncEngineStats,
@@ -79,9 +79,9 @@ impl DataStats {
     }
 }
 
-pub struct DatabaseSyncEngine<P: ProtocolIO> {
+pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     io: Arc<dyn turso_core::IO>,
-    protocol: ProtocolIoStats<P>,
+    sync_engine_io: SyncEngineIoStats<IO>,
     db_file: Arc<dyn turso_core::storage::database::DatabaseStorage>,
     main_tape: DatabaseTape,
     main_db_wal_path: String,
@@ -98,12 +98,12 @@ fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
 
-impl<P: ProtocolIO> DatabaseSyncEngine<P> {
+impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
     pub async fn new<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        protocol: Arc<P>,
+        sync_engine_io: Arc<IO>,
         main_db_path: &str,
         mut opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
@@ -114,14 +114,14 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
         tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
 
-        let completion = protocol.full_read(&meta_path)?;
+        let completion = sync_engine_io.full_read(&meta_path)?;
         let data = wait_all_results(coro, &completion, None).await?;
         let meta = if data.is_empty() {
             None
         } else {
             Some(DatabaseMetadata::load(&data)?)
         };
-        let protocol = ProtocolIoStats::new(protocol);
+        let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
         let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.take();
         let partial = partial_bootstrap_strategy.is_some();
 
@@ -131,7 +131,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
                 let revision = bootstrap_db_file(
                     coro,
-                    &protocol,
+                    &sync_engine_io,
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -155,7 +155,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                     },
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                let completion = protocol.full_write(&meta_path, meta.dump()?)?;
+                let completion = sync_engine_io.full_write(&meta_path, meta.dump()?)?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
                 wait_all_results(coro, &completion, None).await?;
                 meta
@@ -185,7 +185,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
                     partial_bootstrap_server_revision: None,
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                let completion = protocol.full_write(&meta_path, meta.dump()?)?;
+                let completion = sync_engine_io.full_write(&meta_path, meta.dump()?)?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
                 wait_all_results(coro, &completion, None).await?;
                 meta
@@ -223,7 +223,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
-                protocol.clone(),
+                sync_engine_io.clone(),
                 revision.to_string(),
             ))
         } else {
@@ -258,7 +258,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let changes_file = io.open_file(&changes_path, OpenFlags::Create, false)?;
         let db = Self {
             io,
-            protocol,
+            sync_engine_io,
             db_file,
             main_db_wal_path,
             main_tape,
@@ -377,12 +377,12 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
             last_push_unix_time,
             revision,
             network_sent_bytes: self
-                .protocol
+                .sync_engine_io
                 .network_stats
                 .written_bytes
                 .load(Ordering::SeqCst),
             network_received_bytes: self
-                .protocol
+                .sync_engine_io
                 .network_stats
                 .read_bytes
                 .load(Ordering::SeqCst),
@@ -502,7 +502,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let revision = self.meta().synced_revision.clone();
         let next_revision = wal_pull_to_file(
             coro,
-            &self.protocol,
+            &self.sync_engine_io,
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
@@ -751,8 +751,13 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
             let mut transformed = if self.opts.use_transform {
                 Some(
-                    apply_transformation(coro, &self.protocol, &local_changes, &replay.generator)
-                        .await?,
+                    apply_transformation(
+                        coro,
+                        &self.sync_engine_io,
+                        &local_changes,
+                        &replay.generator,
+                    )
+                    .await?,
                 )
             } else {
                 None
@@ -794,7 +799,7 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
 
         let (_, change_id) = push_logical_changes(
             coro,
-            &self.protocol,
+            &self.sync_engine_io,
             &self.main_tape,
             &self.client_unique_id,
             &self.opts,
@@ -845,7 +850,9 @@ impl<P: ProtocolIO> DatabaseSyncEngine<P> {
         let mut meta = self.meta().clone();
         update(&mut meta);
         tracing::info!("update_meta: {meta:?}");
-        let completion = self.protocol.full_write(&self.meta_path, meta.dump()?)?;
+        let completion = self
+            .sync_engine_io
+            .full_write(&self.meta_path, meta.dump()?)?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
         wait_all_results(coro, &completion, None).await?;
         *self.meta.lock().unwrap() = meta;

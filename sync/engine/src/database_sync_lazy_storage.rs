@@ -3,36 +3,36 @@ use std::sync::Arc;
 use turso_core::{Buffer, Completion, CompletionError, DatabaseStorage, File, LimboError};
 
 use crate::{
-    database_sync_operations::{pull_pages_v1, ProtocolIoStats, PAGE_SIZE},
+    database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::{pull_pages_v1, SyncEngineIoStats, PAGE_SIZE},
     errors,
-    protocol_io::ProtocolIO,
     types::Coro,
 };
 
-pub struct LazyDatabaseStorage<P: ProtocolIO> {
+pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     clean_file: Arc<dyn File>,
     dirty_file: Option<Arc<dyn File>>,
-    protocol: ProtocolIoStats<P>,
+    sync_engine_io: SyncEngineIoStats<IO>,
     server_revision: String,
 }
 
-impl<P: ProtocolIO> LazyDatabaseStorage<P> {
+impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
     pub fn new(
         clean_file: Arc<dyn File>,
         dirty_file: Option<Arc<dyn File>>,
-        protocol: ProtocolIoStats<P>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         server_revision: String,
     ) -> Self {
         Self {
             clean_file,
             dirty_file,
-            protocol,
+            sync_engine_io,
             server_revision,
         }
     }
 }
 
-impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
+impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
     fn read_header(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
         assert!(
             !self.clean_file.has_hole(0, PAGE_SIZE)?,
@@ -98,7 +98,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
             page_idx
         );
         let mut generator = genawaiter::sync::Gen::new({
-            let protocol = self.protocol.clone();
+            let sync_engine_io = self.sync_engine_io.clone();
             let server_revision = self.server_revision.clone();
             let clean_file = self.clean_file.clone();
             let dirty_file = self.dirty_file.clone();
@@ -106,7 +106,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
             |coro| async move {
                 let coro = Coro::new((), coro);
                 let pages = [(page_idx - 1) as u32];
-                let result = pull_pages_v1(&coro, &protocol, &server_revision, &pages).await;
+                let result = pull_pages_v1(&coro, &sync_engine_io, &server_revision, &pages).await;
                 match result {
                     Ok(page) => {
                         let read = c.as_read();
@@ -147,7 +147,7 @@ impl<P: ProtocolIO> DatabaseStorage for LazyDatabaseStorage<P> {
                 }
             }
         });
-        self.protocol
+        self.sync_engine_io
             .add_work(Box::new(move || match generator.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(_) => false,
                 genawaiter::GeneratorState::Complete(_) => true,

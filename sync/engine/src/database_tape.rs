@@ -11,7 +11,7 @@ use crate::{
     errors::Error,
     types::{
         Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChange,
-        DatabaseTapeRowChangeType, ProtocolCommand,
+        DatabaseTapeRowChangeType, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -43,7 +43,7 @@ pub(crate) async fn run_stmt_once<'a, Ctx>(
     loop {
         match stmt.step()? {
             StepResult::IO => {
-                coro.yield_(ProtocolCommand::IO).await?;
+                coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
                 return Ok(None);
@@ -90,7 +90,7 @@ pub(crate) async fn exec_stmt<Ctx>(
     loop {
         match stmt.step()? {
             StepResult::IO => {
-                coro.yield_(ProtocolCommand::IO).await?;
+                coro.yield_(SyncEngineIoResult::IO).await?;
             }
             StepResult::Done => {
                 return Ok(());

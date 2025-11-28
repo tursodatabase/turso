@@ -14,7 +14,7 @@ pub trait DataCompletion<T>: Send + Sync + 'static {
     fn is_done(&self) -> Result<bool>;
 }
 
-pub trait ProtocolIO: Send + Sync + 'static {
+pub trait SyncEngineIo: Send + Sync + 'static {
     type DataCompletionBytes: DataCompletion<u8>;
     type DataCompletionTransform: DataCompletion<DatabaseRowTransformResult>;
     fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes>;

@@ -9,25 +9,25 @@ use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
-    gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>,
+    gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>,
 }
 
 impl<Ctx> Coro<Ctx> {
-    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<ProtocolCommand, Result<Ctx>>) -> Self {
+    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>) -> Self {
         Self {
             ctx: Mutex::new(ctx),
             gen,
         }
     }
-    pub async fn yield_(&self, value: ProtocolCommand) -> Result<()> {
+    pub async fn yield_(&self, value: SyncEngineIoResult) -> Result<()> {
         let ctx = self.gen.yield_(value).await?;
         *self.ctx.lock().unwrap() = ctx;
         Ok(())
     }
 }
 
-impl From<genawaiter::sync::Co<ProtocolCommand, Result<()>>> for Coro<()> {
-    fn from(value: genawaiter::sync::Co<ProtocolCommand, Result<()>>) -> Self {
+impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
+    fn from(value: genawaiter::sync::Co<SyncEngineIoResult, Result<()>>) -> Self {
         Self {
             gen: value,
             ctx: Mutex::new(()),
@@ -405,7 +405,7 @@ fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Op
     }
 }
 
-pub enum ProtocolCommand {
+pub enum SyncEngineIoResult {
     // Protocol waits for some IO - caller must spin turso-db IO event loop and also drive ProtocolIO
     IO,
 }

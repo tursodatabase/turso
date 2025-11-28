@@ -5,7 +5,7 @@ pub mod database_sync_operations;
 pub mod database_tape;
 pub mod errors;
 pub mod io_operations;
-pub mod protocol_io;
+pub mod database_sync_engine_io;
 pub mod server_proto;
 pub mod types;
 pub mod wal_session;

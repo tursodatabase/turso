@@ -14,7 +14,7 @@ use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
     database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
-    protocol_io::ProtocolIO,
+    database_sync_engine_io::SyncEngineIo,
     types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
 };
 
