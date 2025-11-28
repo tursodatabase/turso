@@ -65,7 +65,11 @@ impl Parameters {
             .copied()
     }
 
-    pub fn next_index(&mut self) -> NonZero<usize> {
+    pub fn next_index(&self) -> NonZero<usize> {
+        self.next_index
+    }
+
+    fn allocate_new_index(&mut self) -> NonZero<usize> {
         let index = self.next_index;
         self.next_index = self.next_index.checked_add(1).unwrap();
         index
@@ -86,7 +90,7 @@ impl Parameters {
                         index
                     }
                     None => {
-                        let index = self.next_index();
+                        let index = self.allocate_new_index();
                         self.list.push(Parameter::Named(name.to_owned(), index));
                         tracing::trace!("named parameter at {index} as {name}");
                         index

@@ -1555,15 +1555,18 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn consume_stmt(self: &Arc<Connection>, sql: &str) -> Result<Option<(Statement, usize)>> {
-        let mut parser = Parser::new(sql.as_bytes());
+    pub fn consume_stmt(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Option<(Statement, usize)>> {
+        let mut parser = Parser::new(sql.as_ref().as_bytes());
         let Some(cmd) = parser.next_cmd()? else {
             return Ok(None);
         };
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
         let byte_offset_end = parser.offset();
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+        let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
         let mode = QueryMode::new(&cmd);

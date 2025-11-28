@@ -1,0 +1,59 @@
+---
+name: 2025-11-26-py-bindings-tests
+---
+
+<Output path="./tests/test_database.py">
+
+<Code model="openai/gpt-5" language="python">
+
+Turso - is the **SQLite compatible** database written in Rust.
+Your task is to generate tests for Python driver with the API similar to the SQLite DB-api2
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- Inspect tests in the test_database.py file and ALWAYS append new tests in the end
+- DO NOT change current content of the test_database.py file - ONLY APPEND new tests
+- DO NOT duplicate already existing tests
+- DO NOT test not implemented features
+- DO COVER all essential methods currently implemented in the driver
+- FOLLOW programming style of the test_database.py file
+<File path="./tests/test_database.py" />
+
+# Test case category 1: DB API2
+
+Generate tests which will cover API of the driver surface
+
+Inspect implementaton of the driver here:
+<File path="./turso/lib.py" />
+
+# Test case category 2: SQL
+
+Generate tests which will cover generic use of SQL. 
+**Non exhaustive** list of things to check:
+- Subqueries
+- INSERT ... RETURNING ...
+    * Make additional test case for scenario, where multiple values were inserted, but only one row were fetch
+    * Make sure that in this case transaction will be properly commited even when not all rows were consumed
+- CONFLICT clauses (and how driver inform caller about conflict)
+- Basic DDL statements (CREATE/DELETE)
+- More complex DDL statements (ALTER TABLE)
+- Builtin virtual tables (generate_series)
+- JOIN
+- JSON functions
+
+# Supported functions
+
+- DRIVER: .rowcount works correctly only for DML statements
+    * DO NOT test it with DQL/DDL statements
+- DRIVER: .lastrowid is not implemented right now
+    * DO NOT test it at all
+- SQLITE: generate_series is not enabled by default in the sqlite3 module
+- TURSO: ORDER BY is not supported for compound SELECTs yet
+- TURSO: Recursive CTEs are not yet supported
+- TURSO: Inspect compatibility file in order to understand what subset of SQLite query language is supported by the turso at the moment
+<File path="../../COMPAT.md" />
+
+</Code>
+
+</Output>
