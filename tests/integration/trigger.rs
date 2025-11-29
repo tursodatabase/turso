@@ -1832,8 +1832,8 @@ fn test_alter_table_drop_column_allows_when_update_targets_other_table(db: TempD
     )
     .unwrap();
 
-    // Dropping column x from table t should succeed (UPDATE u SET x refers to u.x, not t.x)
-    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
+    // Dropping column x from table t should throw an error (https://github.com/tursodatabase/turso/issues/4029)
+    assert!(conn.execute("ALTER TABLE t DROP COLUMN x").is_err());
 }
 
 #[turso_macros::test(mvcc)]
@@ -1881,15 +1881,8 @@ fn test_alter_table_drop_column_allows_when_update_set_targets_owning_table(db: 
     )
     .unwrap();
 
-    // Dropping column x from table t should succeed (SQLite allows this)
-    conn.execute("ALTER TABLE t DROP COLUMN x").unwrap();
-
-    // Verify that executing the trigger now causes an error
-    let result = conn.execute("INSERT INTO t VALUES (5)");
-    assert!(
-        result.is_err(),
-        "INSERT should fail because trigger references dropped column"
-    );
+    // Dropping column x from table t should throw an error (https://github.com/tursodatabase/turso/issues/4029)
+    assert!(conn.execute("ALTER TABLE t DROP COLUMN x").is_err());
 }
 
 #[turso_macros::test(mvcc)]
