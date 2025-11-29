@@ -780,3 +780,24 @@ do_execsql_test_in_memory_any_error trigger-cannot-create-on-system-table {
     select 1;
   end;
 }
+
+do_execsql_test_in_memory_any_error trigger-cannot-create-on-system-table {
+  create trigger t after insert on sqlite_master begin
+    select 1;
+  end;
+}
+
+do_execsql_test_on_specific_db {:memory:} trigger-col-name-trigger-subquery {
+    CREATE TABLE t ( a INTEGER, b TEXT);
+    CREATE TABLE t1 ( x INTEGER, y TEXT);
+    
+    CREATE TRIGGER trg AFTER UPDATE ON t1 BEGIN
+        INSERT INTO t SELECT * FROM t WHERE t.a = 42;
+    END;
+    insert into t VALUES (42, 'abc');
+    INSERT INTO t1 VALUES (0, '');
+    UPDATE t1 SET y = 'z' WHERE TRUE; 
+    select * from t union all select * from t1;
+} {2|abc
+42|abc
+0|z}
