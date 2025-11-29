@@ -1286,7 +1286,6 @@ fn trigger_references_column(
             ast::TriggerCmd::Update {
                 sets, where_clause, ..
             } => {
-                dbg!(&sets);
                 // Check SET expressions (not column names in SET clause)
                 let trigger_table_name = normalize_ident(&trigger.table_name);
                 for set in sets {

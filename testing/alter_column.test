@@ -333,3 +333,13 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-composite-
 } {
     "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))"
 }
+
+
+do_execsql_test_in_memory_error_content alter-column-referencing-trigger-cannot-be-dropped {
+    CREATE TABLE t (n integer);
+    CREATE TABLE t1 (m text, d integer);
+    CREATE TRIGGER trg BEFORE DELETE ON t BEGIN UPDATE t1 SET m = 'x' WHERE m = 'y'; END;
+    ALTER TABLE t1 DROP COLUMN m;
+} {
+    "Runtime error: error in trigger trg after drop column: no such column: m"
+}
