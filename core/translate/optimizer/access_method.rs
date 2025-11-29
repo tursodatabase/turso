@@ -344,8 +344,7 @@ pub fn find_equijoin_conditions(
 }
 
 /// Estimate the cost of a hash join between two tables.
-/// TODO(preston): improve cost model when we have more metadata/factors to consider, like table
-/// size and spilling implemented for hash tables.
+/// TODO(preston): improve cost model when we have more metadata/factors to consider like table size.
 pub fn estimate_hash_join_cost(
     build_cardinality: f64,
     probe_cardinality: f64,
@@ -418,9 +417,7 @@ pub fn try_hash_join_access_method(
         return None;
     }
 
-    // USING/NATURAL joins carry implicit equality constraints that aren't represented
-    // the same way as WHERE-derived predicates; skip hash join for now to avoid
-    // hashing on the wrong keys.
+    //skip hash join for now on USING/NATURAL joins
     if build_table
         .join_info
         .as_ref()

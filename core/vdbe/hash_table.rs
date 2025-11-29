@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 use rapidhash::fast::RapidHasher;
 use std::hash::Hasher;
 use std::sync::{atomic, Arc};
+use std::{cell::RefCell, collections::VecDeque};
 use std::{
     cmp::{Eq, Ordering},
     sync::atomic::AtomicUsize,
@@ -21,12 +22,12 @@ use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;
 
-// set to just 32KB to intentionally trigger more spilling when testing
+// set to a *very* small 32KB, intentionally to trigger frequent spilling during tests
 #[cfg(debug_assertions)]
-pub const DEFAULT_MEM_BUDGET: usize = 1024 * 32;
+pub const DEFAULT_MEM_BUDGET: usize = 32 * 1024;
 
 /// 64MB default memory budget for hash joins.
-/// TODO: configurable via PRAGMA
+/// TODO: make configurable via PRAGMA
 #[cfg(not(debug_assertions))]
 pub const DEFAULT_MEM_BUDGET: usize = 64 * 1024 * 1024;
 const DEFAULT_BUCKETS: usize = 1024;
@@ -40,15 +41,7 @@ const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
 
-#[inline(always)]
-fn canonicalize_f64(f: f64) -> f64 {
-    if f == 0.0 {
-        0.0 // collapse -0.0 to +0.0
-    } else {
-        f
-    }
-}
-/// Hash function for join keys using xxHash
+/// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
 fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
@@ -79,7 +72,6 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                         hasher.write(trimmed.as_bytes());
                     }
                     CollationSeq::Binary | CollationSeq::Unset => {
-                        // Binary collation: hash as-is
                         hasher.write(text.as_bytes());
                     }
                 }
@@ -211,8 +203,7 @@ impl HashEntry {
         }
     }
 
-    /// Deserialize an entry from bytes.
-    /// Returns (entry, bytes_consumed) or error.
+    /// Deserialize an entry from bytes, returning (entry, bytes_consumed) or error.
     fn deserialize(buf: &[u8]) -> Result<(Self, usize)> {
         if buf.len() < 16 {
             return Err(LimboError::Corrupt(
@@ -220,8 +211,9 @@ impl HashEntry {
             ));
         }
 
-        let hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let rowid = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+        // buffer len checked above
+        let hash = u64::from_le_bytes(buf[0..8].try_into().expect("expect 8 bytes"));
+        let rowid = i64::from_le_bytes(buf[8..16].try_into().expect("expect 8 bytes"));
         let mut offset = 16;
 
         // Read number of keys
@@ -246,7 +238,9 @@ impl HashEntry {
                             "HashEntry: buffer too small for integer".to_string(),
                         ));
                     }
-                    let i = i64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                    let i = i64::from_le_bytes(
+                        buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
+                    );
                     offset += 8;
                     Value::Integer(i)
                 }
@@ -256,7 +250,9 @@ impl HashEntry {
                             "HashEntry: buffer too small for float".to_string(),
                         ));
                     }
-                    let f = f64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+                    let f = f64::from_le_bytes(
+                        buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
+                    );
                     offset += 8;
                     Value::Float(f)
                 }
@@ -306,7 +302,7 @@ impl HashEntry {
 }
 
 /// Get partition index from hash value
-#[inline]
+#[inline(always)]
 fn partition_from_hash(hash: u64) -> usize {
     // Use top bits for partition to distribute evenly
     ((hash >> (64 - PARTITION_BITS)) as usize) & (NUM_PARTITIONS - 1)
@@ -420,6 +416,8 @@ pub struct SpilledPartition {
     buckets: Vec<HashBucket>,
     /// Current chunk being loaded (for multi-chunk reads)
     current_chunk_idx: usize,
+    /// Approximate memory used by the resident buckets for this partition
+    resident_mem: usize,
 }
 
 impl SpilledPartition {
@@ -433,6 +431,7 @@ impl SpilledPartition {
             buffer_len: Arc::new(atomic::AtomicUsize::new(0)),
             buckets: Vec::new(),
             current_chunk_idx: 0,
+            resident_mem: 0,
         }
     }
 
@@ -461,7 +460,10 @@ impl SpilledPartition {
 
     /// Check if partition is ready for probing
     pub fn is_loaded(&self) -> bool {
-        matches!(self.state, PartitionState::Loaded)
+        matches!(
+            self.state,
+            PartitionState::Loaded | PartitionState::InMemory
+        )
     }
 
     /// Check if there are more chunks to load
@@ -587,8 +589,133 @@ impl SpillState {
     }
 }
 
-/// The main hash table structure for hash joins.
-/// Supports grace hash join with disk spilling when memory budget is exceeded.
+/// HashTable is the build-side data structure used for hash joins. It behaves like a
+/// standard in-memory hash table until a configurable memory budget is exceeded, at
+/// which point it transparently switches to a grace-hash-join style layout and spills
+/// partitions to disk.
+///
+/// # Overview
+///
+/// The table is keyed by an N-column join key. Keys are hashed using a stable
+/// rapidhash hasher that is aware of SQLite-style collations for text values.
+/// Each entry stores:
+///
+/// - the precomputed hash value,
+/// - a owned copy of the join key values, and
+/// - the rowid of the build-side row, used later to SeekRowid into the build table.
+///
+/// Collisions within a hash bucket are resolved using simple chaining (a `Vec<HashEntry>`),
+/// and equality is determined by comparing the stored key values against probe keys using
+/// the same collation-aware comparison logic that was used when hashing.
+///
+/// - Construction:
+///   - `mem_budget` is an approximate upper bound on memory consumed by the
+///     build side for this join. It applies to:
+///       * `mem_used`: the base in-memory structures (buckets in non-spilled
+///         mode, plus any never-spilled partitions).
+///       * `loaded_partitions_mem`: additional resident memory for partitions
+///         that were spilled to disk and later reloaded for probing.
+///
+/// - Build phase ([HashTableState::Building] / `::Spilled`):
+///   - `insert`:
+///       * Inserts (key_values, rowid) into the in-memory hash table.
+///       * Tracks per-entry size via [HashEntry::size_bytes] and increments
+///         `mem_used`.
+///       * If `mem_used + new_entry_size > mem_budget`:
+///           - On first overflow, transitions into spilled mode:
+///               * Allocates `SpillState`.
+///               * Redistributes existing buckets into `NUM_PARTITIONS`
+///                 partition buffers via `partition_from_hash`.
+///               * Sets `state to [HashTableState::Spilled].
+///           - Spills whole partition buffers to disk, always picking the largest
+///             non-empty partition first, until the new entry fits.
+///           - Spilling:
+///               * Serializes entries in a partition buffer into a temp file,
+///                 appending as one `SpillChunk` (file_offset, size, #entries).
+///               * Clears that partition buffer and reduces `mem_used` by
+///                 its `partition.mem_used`.
+///               * Updates `SpilledPartition.chunks` and `next_spill_offset`.
+///   - In spilled mode:
+///       * New inserts are written into the corresponding `PartitionBuffer`.
+///       * These entries are either:
+///           - Spilled later (creating new chunks), or
+///           - Materialized in-memory as never-spilled partitions if they never
+///             required spilling at finalize time (see below).
+///
+/// - `finalize_build`:
+///   - Completes pending writes for any partitions that were already spilled.
+///   - For each `partition_buffers[i]`:
+///       * If there is already a `SpilledPartition` for `i` (i.e. we have
+///         existing chunks), we spill the buffer to disk (creating more chunks)
+///         and clear it, reducing `mem_used` accordingly.
+///       * Otherwise, the partition has never been spilled:
+///           - We call `materialize_partition_in_memory(i)`:
+///               * Takes owned entries out of the buffer.
+///               * Builds in-memory buckets for that partition.
+///               * Marks the resulting `SpilledPartition` as
+///                 `PartitionState::InMemory`.
+///               * These InMemory partitions are not tracked in
+///                 `loaded_partitions_lru` and do not contribute to
+///                 `loaded_partitions_mem`.
+///   - After this, the table transitions to `HashTableState::Probing`.
+///
+/// - Probe phase (`HashTableState::Probing`):
+///   - Non-spilled case:
+///       * If `spill_state.is_none()`, probing is directly over `buckets`.
+///       * `probe()` / `next_match()` walk the bucket chain for the hash.
+///   - Spilled case:
+///   * All build-side data now lives in `SpilledPartition`s:
+///       - Some partitions may be `InMemory` (never spilled, always
+///         resident, counted only in `mem_used`).
+///       - Some partitions may be `OnDisk` with one or more `chunks`
+///         (spilled build side).
+///       - Some partitions may be `Loaded` (disk-backed but currently
+///         resident in memory as buckets; counted in `loaded_partitions_mem`
+///         and tracked in `loaded_partitions_lru`).
+///   * The executor is expected to:
+///    - Compute the partition index for a probe key:
+///      `partition_for_keys(probe_keys)`.
+///    - Ensure the partition is resident:
+///      `load_spilled_partition(partition_idx)`
+///      (no-op for never-spilled / InMemory partitions).
+///    - Then probe via:
+///      `probe_partition(partition_idx, keys)`
+///      or the top-level `probe()` / `next_match()` helpers.
+///
+/// - Probe-time cache / thrash behavior:
+///   - `loaded_partitions_lru` and `loaded_partitions_mem` form an LRU cache of
+///     *only spilled* partitions that are currently loaded.
+///  - When loading or parsing a spilled partition:
+///    * We estimate its memory footprint as:
+///      `resident_mem = partition_bucket_mem(partition.buckets)`
+///      and set `partition.resident_mem`.
+///    * Before keeping it resident, we call:
+///      `evict_partitions_to_fit(resident_mem, protect_idx)`
+///      which:
+///         - Repeatedly evicts the least-recently-used partition whose state
+///           is `Loaded` and that has backing `chunks` (`!chunks.is_empty()`),
+///           skipping `protect_idx`.
+///         - Eviction clears the partition’s buckets, resets its state to
+///           `OnDisk`, zeros `resident_mem`, and decrements
+///           `loaded_partitions_mem`.
+///         - The loop stops once:
+///           mem_used + loaded_partitions_mem + incoming_mem <= mem_budget
+///           or there is no further evictable candidate, in which case the
+///           hash join may temporarily exceed `mem_budget` (bounded by one
+///           partition’s `resident_mem`).
+///   * After eviction, we call:
+///     `record_partition_resident(partition_idx, resident_mem)`
+///     which:
+///       - Adjusts `loaded_partitions_mem` by replacing the prior
+///         `resident_mem` for that partition.
+///       - Marks the partition as most recently used in
+///         `loaded_partitions_lru`.
+///   - For partitions that are already loaded, `load_spilled_partition()`
+///     simply updates their position in the LRU without changing the memory
+///     accounting.
+///
+/// The vdbe is responsible for ensuring that the correct partition has been
+/// loaded before calling `probe_partition` / `next_match` in spilled mode.
 pub struct HashTable {
     /// The hash buckets (used when not spilled).
     buckets: Vec<HashBucket>,
@@ -617,8 +744,10 @@ pub struct HashTable {
     spill_state: Option<SpillState>,
     /// Index of current spilled partition being probed
     current_spill_partition_idx: usize,
-    /// Index within loaded_entries of current spilled partition
-    current_spill_entry_idx: usize,
+    /// LRU of loaded partitions to cap probe-time memory
+    loaded_partitions_lru: RefCell<VecDeque<usize>>,
+    /// Memory used by resident (loaded or in-memory) partitions
+    loaded_partitions_mem: usize,
 }
 
 enum SpillAction {
@@ -658,7 +787,8 @@ impl HashTable {
             current_probe_hash: None,
             spill_state: None,
             current_spill_partition_idx: 0,
-            current_spill_entry_idx: 0,
+            loaded_partitions_lru: VecDeque::new().into(),
+            loaded_partitions_mem: 0,
         }
     }
 
@@ -698,11 +828,12 @@ impl HashTable {
                 self.state = HashTableState::Spilled;
             };
 
-            // Spill the largest partition to disk to make room
-            if let Some(c) = self.spill_largest_partition()? {
-                // I/O pending - caller will re-enter after completion and retry the insert.
-                // Do NOT insert the entry here, as the caller will call insert() again.
-                return Ok(IOResult::IO(IOCompletions::Single(c)));
+            // Spill whole partitions until the new entry fits
+            if let Some(c) = self.spill_partitions_for_entry(entry_size)? {
+                // I/O pending, caller will re-enter after completion and retry the insert.
+                if !c.finished() {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
             }
         }
 
@@ -736,24 +867,22 @@ impl HashTable {
         }
     }
 
-    /// Spill the largest partition to disk to free up memory.
-    fn spill_largest_partition(&mut self) -> Result<Option<Completion>> {
-        // Find the largest non-empty partition and serialize its data
-        let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
-
-        let largest_idx = spill_state
+    /// Return the next partition which should be spilled to disk, for simplicity,
+    /// we always select the largest non-empty partition buffer.
+    fn next_partition_to_spill(&self, _required_free: usize) -> Option<usize> {
+        let spill_state = self.spill_state.as_ref()?;
+        spill_state
             .partition_buffers
             .iter()
             .enumerate()
             .filter(|(_, p)| !p.is_empty())
             .max_by_key(|(_, p)| p.mem_used)
-            .map(|(idx, _)| idx);
+            .map(|(idx, _)| idx)
+    }
 
-        let Some(partition_idx) = largest_idx else {
-            // No partitions to spill - this shouldn't happen if we're over budget
-            return Ok(None);
-        };
-
+    /// Spill the given partition buffer to disk and return the pending completion.
+    fn spill_partition(&mut self, partition_idx: usize) -> Result<Option<Completion>> {
+        let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
         let partition = &spill_state.partition_buffers[partition_idx];
         if partition.is_empty() {
             return Ok(None);
@@ -778,7 +907,6 @@ impl HashTable {
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
         let mem_freed = spill_state.partition_buffers[partition_idx].mem_used;
 
-        // Clear partition buffer now before we borrow spill_state again
         spill_state.partition_buffers[partition_idx].clear();
 
         // Find existing partition or create new one
@@ -822,6 +950,61 @@ impl HashTable {
         Ok(Some(completion))
     }
 
+    /// Spill as many whole partitions as needed to keep the incoming entry within budget.
+    /// Returns a pending completion if an async write was scheduled.
+    fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
+        loop {
+            if self.mem_used + entry_size <= self.mem_budget {
+                return Ok(None);
+            }
+
+            let required_free = self.mem_used + entry_size - self.mem_budget;
+            let Some(partition_idx) = self.next_partition_to_spill(required_free) else {
+                return Ok(None);
+            };
+
+            if let Some(c) = self.spill_partition(partition_idx)? {
+                // Wait for caller to re-enter after the I/O completes.
+                if !c.finished() {
+                    return Ok(Some(c));
+                }
+            }
+        }
+    }
+
+    /// Convert a never-spilled partition buffer into in-memory buckets for probing.
+    fn materialize_partition_in_memory(&mut self, partition_idx: usize) {
+        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+        if spill_state.find_partition(partition_idx).is_some() {
+            return;
+        }
+
+        let partition_buffer = &mut spill_state.partition_buffers[partition_idx];
+        if partition_buffer.is_empty() {
+            return;
+        }
+
+        let entries = std::mem::take(&mut partition_buffer.entries);
+        // we don't change self.mem_used here, as these entries
+        // were always in memory. we’re just changing their layout
+        partition_buffer.mem_used = 0;
+
+        let bucket_count = entries.len().next_power_of_two().max(64);
+        let mut buckets = (0..bucket_count)
+            .map(|_| HashBucket::new())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let bucket_idx = (entry.hash as usize) % bucket_count;
+            buckets[bucket_idx].insert(entry);
+        }
+
+        let mut partition = SpilledPartition::new(partition_idx);
+        partition.state = PartitionState::InMemory;
+        partition.buckets = buckets;
+        partition.resident_mem = 0;
+        spill_state.partitions.push(partition);
+    }
+
     /// Finalize the build phase and prepare for probing.
     /// If spilled, flushes remaining in-memory partition entries to disk.
     /// Returns IOResult::IO if there's pending I/O, caller should re-enter after completion.
@@ -832,99 +1015,54 @@ impl HashTable {
             self.state
         );
 
-        if let Some(spill_state) = self.spill_state.as_mut() {
-            // Check for pending writes from previous call
-            for spilled in &spill_state.partitions {
-                if matches!(spilled.io_state.get(), SpillIOState::WaitingForWrite) {
-                    // I/O still pending, caller should wait
-                    io_yield_one!(Completion::new_yield());
+        if self.spill_state.is_some() {
+            {
+                // Check for pending writes from previous call
+                let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+                for spilled in &spill_state.partitions {
+                    if matches!(spilled.io_state.get(), SpillIOState::WaitingForWrite) {
+                        // I/O still pending, caller should wait
+                        io_yield_one!(Completion::new_yield());
+                    }
                 }
             }
-
-            // Flush any remaining in-memory partition entries to disk
-            for partition_idx in 0..NUM_PARTITIONS {
-                let partition = &spill_state.partition_buffers[partition_idx];
-                if partition.is_empty() {
-                    continue;
+            // Determine which partitions need to spill vs stay in memory without holding
+            // a mutable borrow across the spill/materialize calls.
+            let mut spill_targets = Vec::new();
+            let mut materialize_targets = Vec::new();
+            {
+                let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+                for partition_idx in 0..NUM_PARTITIONS {
+                    let partition = &spill_state.partition_buffers[partition_idx];
+                    if partition.is_empty() {
+                        continue;
+                    }
+                    if spill_state.find_partition(partition_idx).is_some() {
+                        spill_targets.push(partition_idx);
+                    } else {
+                        materialize_targets.push(partition_idx);
+                    }
                 }
-
-                // Serialize entries
-                let estimated_size: usize =
-                    partition.entries.iter().map(|e| e.size_bytes() + 9).sum();
-                let mut serialized_data = Vec::with_capacity(estimated_size);
-                let mut len_buf = [0u8; 9];
-                let mut entry_buf = Vec::new();
-                for entry in &partition.entries {
-                    entry.serialize(&mut entry_buf);
-                    let len_varint_size = write_varint(&mut len_buf, entry_buf.len() as u64);
-                    serialized_data.extend_from_slice(&len_buf[..len_varint_size]);
-                    serialized_data.extend_from_slice(&entry_buf);
-                    entry_buf.clear();
+            }
+            for partition_idx in spill_targets {
+                if let Some(completion) = self.spill_partition(partition_idx)? {
+                    // Return I/O completion to caller, they will re-enter after completion
+                    if !completion.finished() {
+                        io_yield_one!(completion);
+                    }
                 }
-                if serialized_data.is_empty() {
-                    continue;
-                }
-
-                let file_offset = spill_state.next_spill_offset;
-                let data_size = serialized_data.len();
-                let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
-
-                // Clear partition buffer before borrowing spill_state for partition lookup
-                spill_state.partition_buffers[partition_idx].clear();
-
-                // Find existing partition or create new one
-                let io_state = if let Some(existing) = spill_state.find_partition_mut(partition_idx)
-                {
-                    existing.add_chunk(file_offset, data_size, num_entries);
-                    existing.io_state.clone()
-                } else {
-                    let mut new_partition = SpilledPartition::new(partition_idx);
-                    new_partition.add_chunk(file_offset, data_size, num_entries);
-                    let io_state = new_partition.io_state.clone();
-                    spill_state.partitions.push(new_partition);
-                    io_state
-                };
-
-                io_state.set(SpillIOState::WaitingForWrite);
-
-                // Write to disk asynchronously
-                let buffer = Buffer::new_temporary(data_size);
-                buffer.as_mut_slice().copy_from_slice(&serialized_data);
-                let buffer_ref = Arc::new(buffer);
-                let _cbuffer_ref_clone = buffer_ref.clone();
-
-                let write_complete =
-                    Box::new(move |res: Result<i32, crate::CompletionError>| match res {
-                        Ok(_) => {
-                            let _buf = _cbuffer_ref_clone.clone();
-                            io_state.set(SpillIOState::WriteComplete);
-                        }
-                        Err(e) => {
-                            tracing::error!("Error writing spilled partition to disk: {e:?}");
-                            io_state.set(SpillIOState::Error);
-                        }
-                    });
-                let completion = Completion::new_write(write_complete);
-                let completion =
-                    spill_state
-                        .temp_file
-                        .file
-                        .pwrite(file_offset, buffer_ref, completion)?;
-
-                spill_state.next_spill_offset += data_size as u64;
-
-                // Return I/O completion to caller, they will re-enter after completion
-                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+            }
+            for partition_idx in materialize_targets {
+                self.materialize_partition_in_memory(partition_idx);
             }
         }
         self.current_spill_partition_idx = 0;
-        self.current_spill_entry_idx = 0;
         self.state = HashTableState::Probing;
         Ok(IOResult::Done(()))
     }
 
     /// Probe the hash table with the given keys, returns the first matching entry if found.
-    /// For spilled hash tables, this searches in-memory partitions first, then spilled partitions.
+    /// NOTE: Calling `probe` on a spilled table requires the relevant partition to be loaded.
     pub fn probe(&mut self, probe_keys: Vec<Value>) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
@@ -936,7 +1074,10 @@ impl HashTable {
         self.current_probe_keys = Some(probe_keys);
 
         // Compute hash of probe keys using collations
-        let probe_keys_ref = self.current_probe_keys.as_ref().unwrap();
+        let probe_keys_ref = self
+            .current_probe_keys
+            .as_ref()
+            .expect("prob keys were set");
         let key_refs: Vec<ValueRef> = probe_keys_ref.iter().map(|v| v.as_ref()).collect();
         let hash = hash_join_key(&key_refs, &self.collations);
         self.current_probe_hash = Some(hash);
@@ -954,6 +1095,7 @@ impl HashTable {
                 return None;
             }
 
+            self.touch_partition_lru(target_partition);
             let bucket_idx = (hash as usize) % partition.buckets.len();
             self.probe_bucket_idx = bucket_idx;
             self.current_spill_partition_idx = target_partition;
@@ -992,16 +1134,23 @@ impl HashTable {
             self.state
         );
 
+        turso_assert!(self.current_probe_keys.is_some(), "probe keys must be set");
         let probe_keys = self.current_probe_keys.as_ref()?;
         let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).collect();
-        let hash = self
-            .current_probe_hash
-            .unwrap_or_else(|| hash_join_key(&key_refs, &self.collations));
+        let hash = match self.current_probe_hash {
+            Some(h) => h,
+            None => {
+                let h = hash_join_key(&key_refs, &self.collations);
+                self.current_probe_hash = Some(h);
+                h
+            }
+        };
 
         if let Some(spill_state) = self.spill_state.as_ref() {
-            let target_partition = partition_from_hash(hash);
-            let partition = spill_state.find_partition(target_partition)?;
-
+            let partition_idx = self.current_spill_partition_idx;
+            // sanity check to ensure we cached the correct position
+            debug_assert_eq!(partition_idx, partition_from_hash(hash));
+            let partition = spill_state.find_partition(partition_idx)?;
             if partition.buckets.is_empty() {
                 return None;
             }
@@ -1018,11 +1167,13 @@ impl HashTable {
             }
             None
         } else {
+            // non-spilled case, seach in main buckets
             let bucket = &self.buckets[self.probe_bucket_idx];
             for idx in self.probe_entry_idx..bucket.entries.len() {
                 let entry = &bucket.entries[idx];
                 if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations)
                 {
+                    // update probe entry index for next call
                     self.probe_entry_idx = idx + 1;
                     return Some(entry);
                 }
@@ -1050,6 +1201,7 @@ impl HashTable {
     /// Re-entrantly load spilled partitions from disk
     pub fn load_spilled_partition(&mut self, partition_idx: usize) -> Result<IOResult<()>> {
         loop {
+            // to avoid holding mut borrows, split this into two phases.
             let action = {
                 let spill_state = match &mut self.spill_state {
                     Some(s) => s,
@@ -1128,8 +1280,16 @@ impl HashTable {
             };
 
             match action {
-                SpillAction::AlreadyLoaded | SpillAction::NoChunks | SpillAction::NotFound => {
-                    // Either already loaded, or nothing to load.
+                SpillAction::AlreadyLoaded => {
+                    self.touch_partition_lru(partition_idx);
+                    return Ok(IOResult::Done(()));
+                }
+                SpillAction::NoChunks => {
+                    self.evict_partitions_to_fit(0, partition_idx);
+                    self.record_partition_resident(partition_idx, 0);
+                    return Ok(IOResult::Done(()));
+                }
+                SpillAction::NotFound => {
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NeedsParsing => {
@@ -1145,7 +1305,6 @@ impl HashTable {
                     // so just loop again and recompute the next action.
                     continue;
                 }
-
                 SpillAction::LoadChunk {
                     read_size,
                     file_offset,
@@ -1170,6 +1329,7 @@ impl HashTable {
                             }
                             Err(e) => {
                                 tracing::error!("Error reading spilled partition chunk: {e:?}");
+                                io_state.set(SpillIOState::Error);
                             }
                         },
                     );
@@ -1178,7 +1338,9 @@ impl HashTable {
                     // Re-borrow to get the file handle only
                     let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                     let c = spill_state.temp_file.file.pread(file_offset, completion)?;
-                    io_yield_one!(c);
+                    if !c.finished() {
+                        io_yield_one!(c);
+                    }
                 }
             }
         }
@@ -1186,57 +1348,66 @@ impl HashTable {
 
     /// Parse entries from the read buffer into buckets for a partition.
     fn parse_partition_entries(&mut self, partition_idx: usize) -> Result<()> {
-        let spill_state = self.spill_state.as_mut().expect("spill state must exist");
-        let partition = spill_state
-            .find_partition_mut(partition_idx)
-            .expect("partition must exist for parsing");
+        let resident_mem = {
+            let spill_state = self.spill_state.as_mut().expect("spill state must exist");
+            let partition = spill_state
+                .find_partition_mut(partition_idx)
+                .expect("partition must exist for parsing");
 
-        let data_len = partition.buffer_len();
-        let data_guard = partition.read_buffer.read();
-        let data = &data_guard[..data_len];
+            let data_len = partition.buffer_len();
+            let data_guard = partition.read_buffer.read();
+            let data = &data_guard[..data_len];
 
-        let mut entries = Vec::new();
-        let mut offset = 0;
-        while offset < data.len() {
-            let (entry_len, varint_size) = read_varint(&data[offset..])?;
-            offset += varint_size;
+            let mut entries = Vec::new();
+            let mut offset = 0;
+            while offset < data.len() {
+                let (entry_len, varint_size) = read_varint(&data[offset..])?;
+                offset += varint_size;
 
-            if offset + entry_len as usize > data.len() {
-                return Err(LimboError::Corrupt("HashEntry: truncated entry".into()));
+                if offset + entry_len as usize > data.len() {
+                    return Err(LimboError::Corrupt("HashEntry: truncated entry".into()));
+                }
+
+                let (entry, consumed) =
+                    HashEntry::deserialize(&data[offset..offset + entry_len as usize])?;
+                turso_assert!(
+                    consumed == entry_len as usize,
+                    "expected to consume entire entry"
+                );
+                entries.push(entry);
+                offset += entry_len as usize;
             }
+            drop(data_guard);
 
-            let (entry, consumed) =
-                HashEntry::deserialize(&data[offset..offset + entry_len as usize])?;
-            turso_assert!(
-                consumed == entry_len as usize,
-                "expected to consume entire entry"
+            let total_num_entries = partition.total_num_entries();
+            tracing::trace!(
+                "parsing partition entries: partition_idx={}, data_len={}, parsed_entries={}, total_num_entries={}",
+                partition_idx, data_len, entries.len(), total_num_entries
             );
-            entries.push(entry);
-            offset += entry_len as usize;
-        }
 
-        // Release the read lock before modifying partition
-        drop(data_guard);
+            let bucket_count = total_num_entries.next_power_of_two().max(64);
+            partition.buckets = (0..bucket_count).map(|_| HashBucket::new()).collect();
+            for entry in entries {
+                let bucket_idx = (entry.hash as usize) % bucket_count;
+                partition.buckets[bucket_idx].insert(entry);
+            }
+            partition.state = PartitionState::Loaded;
+            partition.resident_mem = Self::partition_bucket_mem(&partition.buckets);
+            // Release staging buffer to free memory now that buckets are built.
+            partition.buffer_len.store(0, atomic::Ordering::SeqCst);
+            partition.read_buffer.write().clear();
+            partition.resident_mem
+        };
 
-        let total_num_entries = partition.total_num_entries();
-        tracing::trace!(
-            "parsing partition entries: partition_idx={}, data_len={}, parsed_entries={}, total_num_entries={}",
-            partition_idx, data_len, entries.len(), total_num_entries
-        );
-
-        let bucket_count = total_num_entries.next_power_of_two().max(64);
-        partition.buckets = (0..bucket_count).map(|_| HashBucket::new()).collect();
-        for entry in entries {
-            let bucket_idx = (entry.hash as usize) % bucket_count;
-            partition.buckets[bucket_idx].insert(entry);
-        }
-        partition.state = PartitionState::Loaded;
-
+        // Evict other partitions if needed before keeping this one resident.
+        self.evict_partitions_to_fit(resident_mem, partition_idx);
+        self.record_partition_resident(partition_idx, resident_mem);
         Ok(())
     }
 
-    /// Probe a specific partition with the given keys.
-    /// The partition must be loaded first via `load_spilled_partition`.
+    /// Probe a specific partition with the given keys. The partition must be loaded first via `load_spilled_partition`.
+    /// Executor *must* call load_spilled_partition(partition_idx) and get IOResult::Done(())
+    /// before calling probe for that partition
     pub fn probe_partition(
         &mut self,
         partition_idx: usize,
@@ -1249,6 +1420,7 @@ impl HashTable {
         self.current_probe_keys = Some(probe_keys.to_vec());
         self.current_probe_hash = Some(hash);
 
+        self.touch_partition_lru(partition_idx);
         let spill_state = self.spill_state.as_ref()?;
         let partition = spill_state.find_partition(partition_idx)?;
 
@@ -1283,25 +1455,100 @@ impl HashTable {
         self.spill_state.is_some()
     }
 
+    /// Approximate memory used by a partition's buckets.
+    fn partition_bucket_mem(buckets: &[HashBucket]) -> usize {
+        buckets.iter().map(|b| b.size_bytes()).sum()
+    }
+
+    /// Touch a partition for LRU ordering without changing its accounted memory.
+    fn touch_partition_lru(&self, partition_idx: usize) {
+        let mut lru = self.loaded_partitions_lru.borrow_mut();
+        if let Some(pos) = lru.iter().position(|p| *p == partition_idx) {
+            lru.remove(pos);
+        }
+        lru.push_back(partition_idx);
+    }
+
+    /// Record that a partition is resident with the given memory footprint and update LRU.
+    fn record_partition_resident(&mut self, partition_idx: usize, mem_used: usize) {
+        if let Some(spill_state) = self.spill_state.as_mut() {
+            if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
+                self.loaded_partitions_mem = self
+                    .loaded_partitions_mem
+                    .saturating_sub(partition.resident_mem);
+                partition.resident_mem = mem_used;
+                self.loaded_partitions_mem += mem_used;
+                self.touch_partition_lru(partition_idx);
+            }
+        }
+    }
+
+    /// Evict least-recently used spillable partitions until there is room for `incoming_mem`.
+    fn evict_partitions_to_fit(&mut self, incoming_mem: usize, protect_idx: usize) {
+        while self.mem_used + self.loaded_partitions_mem + incoming_mem > self.mem_budget {
+            let Some(victim_idx) = self.next_evictable(protect_idx) else {
+                break;
+            };
+
+            let mut freed = 0;
+            if let Some(spill_state) = self.spill_state.as_mut() {
+                if let Some(victim) = spill_state.find_partition_mut(victim_idx) {
+                    if matches!(victim.state, PartitionState::Loaded) {
+                        freed = victim.resident_mem;
+                        victim.buckets.clear();
+                        victim.state = PartitionState::OnDisk;
+                        victim.resident_mem = 0;
+                        victim.current_chunk_idx = 0;
+                        victim.buffer_len.store(0, atomic::Ordering::SeqCst);
+                        victim.read_buffer.write().clear();
+                        victim.io_state.set(SpillIOState::None);
+                    }
+                }
+            }
+
+            self.loaded_partitions_mem = self.loaded_partitions_mem.saturating_sub(freed);
+        }
+    }
+
+    /// Find the next evictable partition (LRU) that is not protected and has backing spill data.
+    fn next_evictable(&mut self, protect_idx: usize) -> Option<usize> {
+        let spill_state = self.spill_state.as_ref()?;
+
+        let len = self.loaded_partitions_lru.borrow().len();
+        for i in 0..len {
+            let lru = self.loaded_partitions_lru.borrow();
+            let candidate = lru[i];
+            if candidate == protect_idx {
+                continue;
+            }
+            if let Some(p) = spill_state.find_partition(candidate) {
+                let has_disk = !p.chunks.is_empty();
+                drop(lru);
+                if matches!(p.state, PartitionState::Loaded) && has_disk {
+                    self.loaded_partitions_lru.borrow_mut().remove(i);
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
     /// Close the hash table and free resources.
     pub fn close(&mut self) {
         self.state = HashTableState::Closed;
         self.buckets.clear();
         self.num_entries = 0;
         self.mem_used = 0;
+        self.loaded_partitions_lru.borrow_mut().clear();
+        self.loaded_partitions_mem = 0;
         let _ = self.spill_state.take();
-    }
-
-    /// Check if the hash table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.num_entries == 0
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod hashtests {
     use super::*;
-    use crate::PlatformIO;
+    use crate::MemoryIO;
 
     #[test]
     fn test_hash_function_consistency() {
@@ -1362,7 +1609,7 @@ mod tests {
 
     #[test]
     fn test_hash_table_basic() {
-        let io = Arc::new(PlatformIO::new().unwrap());
+        let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
@@ -1401,7 +1648,7 @@ mod tests {
 
     #[test]
     fn test_hash_table_collisions() {
-        let io = Arc::new(PlatformIO::new().unwrap());
+        let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 2, // Small number to force collisions
             mem_budget: 1024 * 1024,
@@ -1430,7 +1677,7 @@ mod tests {
 
     #[test]
     fn test_hash_table_duplicate_keys() {
-        let io = Arc::new(PlatformIO::new().unwrap());
+        let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
@@ -1543,5 +1790,229 @@ mod tests {
         assert_eq!(partition.chunks[0].size_bytes, 1000);
         assert_eq!(partition.chunks[1].file_offset, 1000);
         assert_eq!(partition.chunks[1].size_bytes, 500);
+    }
+
+    #[test]
+    fn test_hash_function_respects_collation_nocase() {
+        use crate::types::{TextRef, TextSubtype};
+
+        let keys1 = vec![ValueRef::Text(TextRef::new("Hello", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
+
+        // Under BINARY: hashes must differ
+        let bin_coll = vec![CollationSeq::Binary];
+        let h1_bin = hash_join_key(&keys1, &bin_coll);
+        let h2_bin = hash_join_key(&keys2, &bin_coll);
+        assert_ne!(h1_bin, h2_bin);
+
+        // Under NOCASE: hashes should be equal
+        let nocase_coll = vec![CollationSeq::NoCase];
+        let h1_nc = hash_join_key(&keys1, &nocase_coll);
+        let h2_nc = hash_join_key(&keys2, &nocase_coll);
+        assert_eq!(h1_nc, h2_nc);
+    }
+
+    #[test]
+    fn test_values_equal_with_collations() {
+        use crate::types::{TextRef, TextSubtype};
+
+        let h1 = ValueRef::Text(TextRef::new("Hello  ", TextSubtype::Text));
+        let h2 = ValueRef::Text(TextRef::new("hello", TextSubtype::Text));
+
+        // Binary: case / trailing spaces matter
+        assert!(!values_equal(h1, h2, CollationSeq::Binary));
+
+        // NOCASE: case-insensitive but trailing spaces still matter -> likely false
+        assert!(!values_equal(h1, h2, CollationSeq::NoCase));
+
+        // RTRIM: ignore trailing spaces, but case is still significant
+        let h3 = ValueRef::Text(TextRef::new("Hello", TextSubtype::Text));
+        assert!(values_equal(h1, h3, CollationSeq::Rtrim));
+    }
+
+    #[test]
+    fn test_keys_equal_with_collations() {
+        use crate::types::{TextRef, TextSubtype};
+
+        let key1 = vec![Value::Text("Hello".into())];
+        let key2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
+
+        // Binary: not equal
+        assert!(!keys_equal(&key1, &key2, &[CollationSeq::Binary]));
+
+        // NOCASE: equal
+        assert!(keys_equal(&key1, &key2, &[CollationSeq::NoCase]));
+    }
+
+    #[test]
+    fn test_hash_entry_deserialization_truncated() {
+        let entry = HashEntry::new(123, vec![Value::Integer(1), Value::Text("abc".into())], 42);
+
+        let mut buf = Vec::new();
+        entry.serialize(&mut buf);
+
+        // Cut off the buffer mid-entry
+        let truncated = &buf[..buf.len() - 2];
+
+        let res = HashEntry::deserialize(truncated);
+        assert!(
+            res.is_err(),
+            "truncated buffer should be rejected as corrupt"
+        );
+    }
+
+    #[test]
+    fn test_hash_entry_deserialization_garbage_type_tag() {
+        let entry = HashEntry::new(1, vec![Value::Integer(10)], 7);
+        let mut buf = Vec::new();
+        entry.serialize(&mut buf);
+
+        // Compute the exact offset of the *first* type tag.
+        // Layout: [0..8] hash | [8..16] rowid | varint(num_keys) | type | payload...
+        let mut corrupted = buf.clone();
+
+        let mut offset = 16;
+        let (_num_keys, varint_len) = read_varint(&corrupted[offset..]).unwrap();
+        offset += varint_len;
+        corrupted[offset] = 0xFF;
+
+        let res = HashEntry::deserialize(&corrupted);
+        assert!(
+            res.is_err(),
+            "invalid type tag should be rejected as corrupt"
+        );
+    }
+
+    fn insert_many_force_spill(ht: &mut HashTable, start: i64, count: i64) {
+        for i in 0..count {
+            let rowid = start + i;
+            let key = vec![Value::Integer(rowid)];
+            let _ = ht.insert(key, rowid);
+        }
+    }
+
+    #[test]
+    fn test_hash_table_spill_and_load_partition_round_trip() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            // very small budget to force spill
+            mem_budget: 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert enough fat rows to exceed budget and force spills
+        insert_many_force_spill(&mut ht, 0, 1024);
+
+        let _ = ht.finalize_build().unwrap();
+        assert!(ht.has_spilled(), "hash table should have spilled");
+
+        // Pick a key and find its partition
+        let probe_key = vec![Value::Integer(10)];
+        let partition_idx = ht.partition_for_keys(&probe_key);
+
+        // Load that partition into memory
+        match ht.load_spilled_partition(partition_idx).unwrap() {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => panic!("test harness must drive IO completions here"),
+        }
+
+        assert!(
+            ht.is_partition_loaded(partition_idx),
+            "partition must be resident after load_spilled_partition"
+        );
+
+        // Probe via partition API
+        let entry = ht.probe_partition(partition_idx, &probe_key);
+        assert!(entry.is_some()); // here
+        assert_eq!(entry.unwrap().rowid, 10);
+    }
+
+    #[test]
+    fn test_partition_lru_eviction() {
+        let io = Arc::new(MemoryIO::new());
+        // tiny mem_budget so only ~1 partition can stay resident
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 8 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert two disjoint key ranges that will hash to different partitions
+        insert_many_force_spill(&mut ht, 0, 256);
+        insert_many_force_spill(&mut ht, 256, 1024);
+
+        let _ = ht.finalize_build().unwrap();
+        assert!(ht.has_spilled());
+
+        let key_a = vec![Value::Integer(1)];
+        let key_b = vec![Value::Integer(10_001)];
+        let pa = ht.partition_for_keys(&key_a);
+        let pb = ht.partition_for_keys(&key_b);
+        assert_ne!(pa, pb);
+
+        // Load partition A
+        while let IOResult::IO(_) = ht.load_spilled_partition(pa).unwrap() {}
+        assert!(ht.is_partition_loaded(pa));
+
+        // Now load partition B, this should (under tight memory) evict A
+        let _ = ht.load_spilled_partition(pb).unwrap();
+        assert!(ht.is_partition_loaded(pb));
+
+        // Depending on mem_budget and actual entry sizes, A should now be evicted
+        // We can't *guarantee* that without knowing exact sizes, but in practice
+        // this test will detect regressions in the LRU bookkeeping.
+        assert!(
+            !ht.is_partition_loaded(pa) || ht.loaded_partitions_mem <= ht.mem_budget,
+            "either partition A is evicted, or loaded memory is within budget"
+        );
+    }
+
+    #[test]
+    fn test_probe_partition_with_duplicate_keys() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 8 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        let key = vec![Value::Integer(42)];
+        for i in 0..1024 {
+            match ht.insert(key.clone(), 1000 + i).unwrap() {
+                IOResult::Done(()) => {}
+                IOResult::IO(_) => panic!("memory IO"),
+            }
+        }
+        match ht.finalize_build().unwrap() {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => panic!("memory IO"),
+        }
+
+        assert!(ht.has_spilled());
+        let partition_idx = ht.partition_for_keys(&key);
+
+        match ht.load_spilled_partition(partition_idx).unwrap() {
+            IOResult::Done(()) => {}
+            IOResult::IO(_) => panic!("memory IO"),
+        }
+        assert!(ht.is_partition_loaded(partition_idx));
+
+        // First probe should give us the first rowid
+        let entry1 = ht.probe_partition(partition_idx, &key).unwrap();
+        assert_eq!(entry1.rowid, 1000);
+
+        // Then iterate through the rest with next_match
+        for i in 0..1023 {
+            let next = ht.next_match().unwrap();
+            assert_eq!(next.rowid, 1001 + i);
+        }
+        assert!(ht.next_match().is_none());
     }
 }

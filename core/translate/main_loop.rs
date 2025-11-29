@@ -796,7 +796,6 @@ pub fn open_loop(
                             db: build_table.database_id,
                         });
                     }
-
                     cursor_id
                 };
 
