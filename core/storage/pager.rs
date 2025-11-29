@@ -1,3 +1,5 @@
+use crate::storage::btree::PinGuard;
+use crate::storage::sqlite3_ondisk::begin_write_btree_page_with_snapshot;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
@@ -14,7 +16,7 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
@@ -61,11 +63,14 @@ impl HeaderRef {
                     if !pager.db_state.get().is_initialized() {
                         return Err(LimboError::Page1NotAlloc);
                     }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    match pager.read_page(DatabaseHeader::PAGE_ID as i64)? {
+                        IOResult::Done((page, c)) => {
+                            *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(c) => return Ok(IOResult::IO(c)),
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -102,10 +107,14 @@ impl HeaderRefMut {
                         return Err(LimboError::Page1NotAlloc);
                     }
 
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
+                    match pager.read_page(DatabaseHeader::PAGE_ID as i64)? {
+                        IOResult::Done((page, c)) => {
+                            *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                            if let Some(c) = c {
+                                io_yield_one!(c);
+                            }
+                        }
+                        IOResult::IO(c) => return Ok(IOResult::IO(c)),
                     }
                 }
                 HeaderRefState::CreateHeader { page } => {
@@ -143,7 +152,11 @@ pub struct PageInner {
     ///
     /// Note that [PageCache::clear] evicts the pages even if pinned, so as long as
     /// we clear the page cache on errors, pins will not 'leak'.
-    pub pin_count: AtomicUsize,
+    ///
+    /// Packed { dirty_gen (upper bits) | pin_count (lower PIN_BITS) }
+    /// dirty_gen is used to track 'generations' of dirty pages, when we spill to disk we can
+    /// have TOCTOU issues if a page is dirtied again after being spilled but before being evicted.
+    pub pin_flags: AtomicUsize,
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
@@ -171,6 +184,23 @@ pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
     let epoch = ((tag >> EPOCH_SHIFT) & (EPOCH_MAX as u64)) as u32;
     let frame = tag & FRAME_MAX;
     (frame, epoch)
+}
+
+const PIN_BITS: usize = 16; // up to 65535 nested pins
+const PIN_MASK: usize = (1usize << PIN_BITS) - 1;
+const GEN_SHIFT: usize = PIN_BITS;
+const GEN_MAX: usize = usize::MAX >> GEN_SHIFT;
+
+#[inline]
+fn pack_pin_flags(pin: usize, gen: usize) -> usize {
+    debug_assert!(pin <= PIN_MASK);
+    debug_assert!(gen <= GEN_MAX);
+    (gen << GEN_SHIFT) | pin
+}
+
+#[inline]
+fn unpack_pin_flags(val: usize) -> (usize /*pin*/, usize /*gen*/) {
+    (val & PIN_MASK, val >> GEN_SHIFT)
 }
 
 #[derive(Debug)]
@@ -202,7 +232,7 @@ impl Page {
                 flags: AtomicUsize::new(0),
                 contents: None,
                 id: id as usize,
-                pin_count: AtomicUsize::new(0),
+                pin_flags: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
             }),
         }
@@ -222,11 +252,11 @@ impl Page {
     }
 
     pub fn set_locked(&self) {
-        self.get().flags.fetch_or(PAGE_LOCKED, Ordering::Acquire);
+        self.get().flags.fetch_or(PAGE_LOCKED, Ordering::AcqRel);
     }
 
     pub fn clear_locked(&self) {
-        self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
+        self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::AcqRel);
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -236,13 +266,26 @@ impl Page {
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
-        self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
+        self.get().flags.fetch_or(PAGE_DIRTY, Ordering::AcqRel);
+        self.bump_gen();
+    }
+
+    #[inline]
+    fn set_dirty_gen(&self, new_gen: usize) {
+        self.get()
+            .pin_flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let (pin, _gen) = unpack_pin_flags(old);
+                Some(pack_pin_flags(pin, new_gen))
+            })
+            .ok();
     }
 
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
-        self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
+        self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::AcqRel);
         self.clear_wal_tag();
+        self.set_dirty_gen(0);
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -250,12 +293,12 @@ impl Page {
     }
 
     pub fn set_loaded(&self) {
-        self.get().flags.fetch_or(PAGE_LOADED, Ordering::Release);
+        self.get().flags.fetch_or(PAGE_LOADED, Ordering::AcqRel);
     }
 
     pub fn clear_loaded(&self) {
         tracing::debug!("clear loaded {}", self.get().id);
-        self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
+        self.get().flags.fetch_and(!PAGE_LOADED, Ordering::AcqRel);
     }
 
     pub fn is_index(&self) -> bool {
@@ -265,41 +308,66 @@ impl Page {
         }
     }
 
+    #[inline]
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
     pub fn pin(&self) {
-        self.get().pin_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
-    /// pinned and is eligible for eviction from the page cache.
-    pub fn unpin(&self) {
-        let was_pinned = self.try_unpin();
-
-        turso_assert!(
-            was_pinned,
-            "Attempted to unpin page {} that was not pinned",
-            self.get().id
-        );
-    }
-
-    /// Try to decrement the pin count by 1, but do nothing if it was already 0.
-    /// Returns true if the pin count was decremented.
-    pub fn try_unpin(&self) -> bool {
         self.get()
-            .pin_count
-            .fetch_update(Ordering::Release, Ordering::SeqCst, |current| {
-                if current == 0 {
+            .pin_flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let (pin, gen) = unpack_pin_flags(old);
+                if pin == PIN_MASK {
                     None
                 } else {
-                    Some(current - 1)
+                    Some(pack_pin_flags(pin + 1, gen))
+                }
+            })
+            .expect("pin overflow");
+    }
+
+    #[inline]
+    pub fn try_unpin(&self) -> bool {
+        self.get()
+            .pin_flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let (pin, gen) = unpack_pin_flags(old);
+                if pin == 0 {
+                    None
+                } else {
+                    Some(pack_pin_flags(pin - 1, gen))
                 }
             })
             .is_ok()
     }
 
-    /// Returns true if the page is pinned and thus not eligible for eviction from the page cache.
+    #[inline]
+    pub fn unpin(&self) {
+        let ok = self.try_unpin();
+        turso_assert!(
+            ok,
+            "Attempted to unpin page {} that was not pinned",
+            self.get().id
+        );
+    }
+
+    #[inline]
     pub fn is_pinned(&self) -> bool {
-        self.get().pin_count.load(Ordering::Acquire) > 0
+        (self.get().pin_flags.load(Ordering::Acquire) & PIN_MASK) != 0
+    }
+
+    #[inline]
+    pub fn dirty_gen(&self) -> u64 {
+        (self.get().pin_flags.load(Ordering::Acquire) >> GEN_SHIFT) as u64
+    }
+
+    #[inline]
+    fn bump_gen(&self) {
+        let _ = self
+            .get()
+            .pin_flags
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let (pin, gen) = unpack_pin_flags(old);
+                Some(pack_pin_flags(pin, gen.wrapping_add(1)))
+            });
     }
 
     #[inline]
@@ -551,6 +619,8 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
+    spill_info: RwLock<SpillInfo>,
+    spill_state: AtomicSpillState,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -578,6 +648,40 @@ pub enum PagerCommitResult {
     Rollback,
 }
 
+#[derive(Debug)]
+struct SpillItem {
+    page: PinGuard,
+    id: usize,
+    // None for WAL path; Some for ephemeral. Set to true by IO completion if we actually cleared dirty.
+    cleared: Option<Arc<AtomicBool>>,
+}
+#[derive(Default, Debug)]
+struct SpillInfo {
+    idx: usize,
+    just_submitted: usize,
+    items: Vec<SpillItem>,
+    completion: Option<Completion>,
+}
+impl SpillInfo {
+    fn clear(&mut self) {
+        self.idx = 0;
+        self.just_submitted = 0;
+        self.items.clear();
+        self.completion = None;
+    }
+}
+
+#[derive(Debug, AtomicEnum, Default, Clone, Copy)]
+enum SpillState {
+    #[default]
+    Idle,
+    PrepareWal,
+    PrepareWalSync,
+    SubmitBatch,
+    WaitBatch,
+    DrainDirtySet,
+}
+
 #[derive(Debug, Clone)]
 enum AllocatePageState {
     Start,
@@ -587,18 +691,22 @@ enum AllocatePageState {
     /// - If there are more trunk pages, use the current first trunk page as the new allocation,
     ///   and set the next trunk page as the database's "first freelist trunk page".
     SearchAvailableFreeListLeaf {
-        trunk_page: PageRef,
+        trunk_page: PinGuard,
         current_db_size: u32,
     },
     /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
     ReuseFreelistLeaf {
-        trunk_page: PageRef,
-        leaf_page: PageRef,
+        trunk_page: PinGuard,
+        leaf_page: PinGuard,
         number_of_freelist_leaves: u32,
     },
     /// If a suitable freelist leaf is not found, allocate an entirely new page.
     AllocateNewPage {
         current_db_size: u32,
+    },
+    FinishAllocPage {
+        page: PinGuard,
+        new_db_size: u32,
     },
 }
 
@@ -668,6 +776,8 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
+            spill_info: RwLock::new(SpillInfo::default()),
+            spill_state: AtomicSpillState::new(SpillState::default()),
         })
     }
 
@@ -995,7 +1105,7 @@ impl Pager {
                         ptrmap_pg_no
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -1102,7 +1212,7 @@ impl Pager {
                         offset_in_ptrmap_page
                     );
 
-                    let (ptrmap_page, c) = self.read_page(ptrmap_pg_no as i64)?;
+                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
                         ptrmap_page,
                         offset_in_ptrmap_page,
@@ -1268,7 +1378,6 @@ impl Pager {
 
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
-    // FIXME: handle no room in page cache
     pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
@@ -1283,7 +1392,6 @@ impl Pager {
 
     /// Allocate a new page to the btree via the pager.
     /// This marks the page as dirty and writes the page header.
-    // FIXME: handle no room in page cache
     pub fn do_allocate_page(
         &self,
         page_type: PageType,
@@ -1562,7 +1670,7 @@ impl Pager {
 
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
+    pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page(page_idx = {})", page_idx);
         let mut page_cache = self.page_cache.write();
@@ -1574,7 +1682,7 @@ impl Pager {
                 "attempted to read page {page_idx} but got page {}",
                 page.get().id
             );
-            return Ok((page.clone(), None));
+            return Ok(IOResult::Done((page.clone(), None)));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         turso_assert!(
@@ -1582,8 +1690,12 @@ impl Pager {
             "attempted to read page {page_idx} but got page {}",
             page.get().id
         );
-        self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)?;
-        Ok((page, Some(c)))
+        match self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)? {
+            IOResult::Done(page) => Ok(IOResult::Done((page, Some(c)))),
+            IOResult::IO(IOCompletions::Single(c)) => {
+                io_yield_one!(c);
+            }
+        }
     }
 
     fn begin_read_disk_page(
@@ -1608,16 +1720,215 @@ impl Pager {
         page_idx: usize,
         page: PageRef,
         page_cache: &mut PageCache,
-    ) -> Result<()> {
-        let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page.clone()) {
-            Ok(_) => {}
+    ) -> Result<IOResult<PageRef>> {
+        let key = PageCacheKey::new(page_idx);
+        // If a spill is already in flight, advance it first and propagate IO.
+        while !matches!(self.spill_state.get(), SpillState::Idle) {
+            return_if_io!(self.spill_step());
+        }
+        // Try to insert now that we’re either idle or a previous step completed
+        match page_cache.insert(key, page.clone()) {
+            Ok(existing) => Ok(IOResult::Done(existing)),
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
             }
-            Err(e) => return Err(e.into()),
+            // The page cache will only return FullCanSpill if PageCache::has_spillable(),
+            Err(CacheError::FullCanSpill) => {
+                // if we are unable to aggressively evict a clean page, than we initialize spilling
+                if page_cache.evict_clean_aggressive(1).is_err() {
+                    let candidates = page_cache.compute_spill_candidates();
+                    if matches!(self.spill_state.get(), SpillState::Idle) {
+                        self.spill_start(candidates)?;
+                    }
+                    match self.spill_step()? {
+                        IOResult::IO(c) => Ok(IOResult::IO(c)),
+                        IOResult::Done(_) => {
+                            // single retry; if still FullCanSpill, fall back to branch
+                            match page_cache.insert(key, page.clone()) {
+                                Ok(p) => Ok(IOResult::Done(p)),
+                                Err(CacheError::FullCanSpill) => Err(LimboError::Busy),
+                                Err(e) => Err(e.into()),
+                            }
+                        }
+                    }
+                } else {
+                    page_cache
+                        .insert(key, page.clone())
+                        .map(IOResult::Done)
+                        .map_err(Into::into)
+                }
+            }
+            Err(e) => Err(e.into()),
         }
+    }
+
+    fn spill_start(&self, candidates: Vec<PinGuard>) -> Result<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut si = self.spill_info.write();
+
+        if !matches!(self.spill_state.get(), SpillState::Idle) && !si.items.is_empty() {
+            si.items.extend(candidates.into_iter().map(|pg| SpillItem {
+                id: pg.get().id,
+                page: pg,
+                cleared: None,
+            }));
+            return Ok(());
+        }
+        *si = SpillInfo {
+            items: candidates
+                .into_iter()
+                .map(|pg| SpillItem {
+                    id: pg.get().id,
+                    page: pg,
+                    cleared: None,
+                })
+                .collect(),
+            idx: 0,
+            just_submitted: 0,
+            completion: None,
+        };
+        if self.wal.is_some() {
+            self.spill_state.set(SpillState::PrepareWal);
+        } else {
+            self.spill_state.set(SpillState::SubmitBatch);
+        }
+        tracing::debug!("spilling started with {} pages", si.items.len());
         Ok(())
+    }
+
+    // Cache spill state machine step, returns the number of pages successfully spilled.
+    fn spill_step(&self) -> Result<IOResult<usize>> {
+        loop {
+            let state = self.spill_state.get();
+            tracing::debug!("spill_step(state={:?})", state);
+            match state {
+                SpillState::Idle => return Ok(IOResult::Done(0)),
+                SpillState::PrepareWal => {
+                    // Only reachable if wal.is_some()
+                    let wal = self.wal.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("PrepareWal without WAL".into())
+                    })?;
+                    let copt = wal
+                        .borrow_mut()
+                        .prepare_wal_start(self.get_page_size_unchecked())?;
+                    if let Some(c) = copt {
+                        self.spill_state.set(SpillState::PrepareWalSync);
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
+                    } else {
+                        self.spill_state.set(SpillState::SubmitBatch);
+                    }
+                }
+                SpillState::PrepareWalSync => {
+                    let wal = self.wal.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("PrepareWalSync without WAL".into())
+                    })?;
+                    let c = wal.borrow_mut().prepare_wal_finish()?;
+                    self.spill_state.set(SpillState::SubmitBatch);
+                    if !c.succeeded() {
+                        io_yield_one!(c);
+                    }
+                }
+                SpillState::SubmitBatch => {
+                    let wal_opt = self.wal.as_ref();
+                    let (start, pages_chunk): (usize, Vec<PageRef>) = {
+                        let mut si = self.spill_info.write();
+                        if si.idx >= si.items.len() {
+                            self.spill_state.set(SpillState::DrainDirtySet);
+                            continue;
+                        }
+                        let remaining = si.items.len() - si.idx;
+                        let chunk = si.items[si.idx..si.idx + remaining]
+                            .iter()
+                            .map(|it| it.page.to_page())
+                            .collect();
+                        si.just_submitted = remaining;
+                        (si.idx, chunk)
+                    };
+                    if let Some(wal) = wal_opt {
+                        tracing::debug!("spilling {} pages to WAL", pages_chunk.len());
+                        let c = wal.borrow_mut().append_frames_vectored(
+                            pages_chunk,
+                            self.get_page_size_unchecked(),
+                            None,
+                        )?;
+                        self.spill_state.set(SpillState::WaitBatch);
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
+                    } else {
+                        let mut group = CompletionGroup::new(|_| {});
+                        tracing::debug!("spilling {} pages to ephemeral DB", pages_chunk.len());
+                        for (i, p) in pages_chunk.iter().enumerate() {
+                            let gen = p.dirty_gen();
+                            let snap = {
+                                let contents = p.get_contents();
+                                Arc::new(Buffer::new(contents.buffer.as_slice().to_vec()))
+                            };
+                            let can_clear = Arc::new(AtomicBool::new(false));
+                            self.spill_info.write().items[start + i].cleared =
+                                Some(can_clear.clone());
+                            let c = begin_write_btree_page_with_snapshot(
+                                self, p, snap, can_clear, gen,
+                            )?;
+                            group.add(&c);
+                        }
+                        self.spill_info.write().completion = Some(group.build());
+                        self.spill_state.set(SpillState::WaitBatch);
+                    }
+                }
+                SpillState::WaitBatch => {
+                    if self.wal.is_none() {
+                        if let Some(c) = self.spill_info.read().completion.clone() {
+                            if !c.succeeded() {
+                                io_yield_one!(c);
+                            }
+                        }
+                    }
+                    let done_all = {
+                        let mut si = self.spill_info.write();
+                        let end = si.idx + si.just_submitted;
+                        si.idx = end;
+                        if self.wal.is_none() {
+                            si.completion = None;
+                        }
+                        si.idx >= si.items.len()
+                    };
+                    self.spill_state.set(if done_all {
+                        SpillState::DrainDirtySet
+                    } else {
+                        SpillState::SubmitBatch
+                    });
+                }
+                SpillState::DrainDirtySet => {
+                    // Remove IDs from global dirty set and reset
+                    let cleaned = {
+                        let mut si = self.spill_info.write();
+                        let mut dirty = self.dirty_pages.write();
+                        if self.wal.is_some() {
+                            for it in &si.items {
+                                dirty.remove(&it.id);
+                            }
+                        } else {
+                            for it in &si.items {
+                                if it.cleared.as_ref().unwrap().load(Ordering::Acquire) {
+                                    dirty.remove(&it.id);
+                                    it.page.clear_dirty();
+                                }
+                            }
+                        }
+                        let cleaned = si.idx;
+                        si.clear();
+                        cleaned
+                    };
+                    self.spill_state.set(SpillState::Idle);
+                    return Ok(IOResult::Done(cleaned));
+                }
+            }
+        }
     }
 
     // Get a page from the cache, if it exists.
@@ -2279,7 +2590,7 @@ impl Pager {
                         )));
                     }
 
-                    let (page, _c) = match page.take() {
+                    let page = match page.take() {
                         Some(page) => {
                             assert_eq!(
                                 page.get().id,
@@ -2292,12 +2603,19 @@ impl Pager {
                                 let page_contents = page.get_contents();
                                 page_contents.overflow_cells.clear();
                             }
-                            (page, None)
+                            page
                         }
-                        None => {
-                            let (page, c) = self.read_page(page_id as i64)?;
-                            (page, Some(c))
-                        }
+                        None => match self.read_page(page_id as i64)? {
+                            IOResult::Done((page, c)) => {
+                                if let Some(c) = c {
+                                    if !c.succeeded() {
+                                        io_yield_one!(c);
+                                    }
+                                }
+                                page
+                            }
+                            IOResult::IO(c) => return Ok(IOResult::IO(c)),
+                        },
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
@@ -2311,12 +2629,17 @@ impl Pager {
                 }
                 FreePageState::AddToTrunk { page } => {
                     let trunk_page_id = header.freelist_trunk_page.get();
-                    let (trunk_page, c) = self.read_page(trunk_page_id as i64)?;
-                    if let Some(c) = c {
-                        if !c.succeeded() {
-                            io_yield_one!(c);
+                    let trunk_page = match self.read_page(trunk_page_id as i64)? {
+                        IOResult::Done((page, c)) => {
+                            if let Some(c) = c {
+                                if !c.succeeded() {
+                                    io_yield_one!(c);
+                                }
+                            }
+                            page
                         }
-                    }
+                        IOResult::IO(c) => return Ok(IOResult::IO(c)),
+                    };
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
                     let trunk_page_contents = trunk_page.get_contents();
@@ -2493,9 +2816,12 @@ impl Pager {
                             new_db_size += 1;
                             let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
                             self.add_dirty(&page)?;
-                            let page_key = PageCacheKey::new(page.get().id as usize);
+                            let page_key = page.get().id as usize;
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            match self.cache_insert(page_key, page.clone(), &mut cache)? {
+                                IOResult::IO(c) => return Ok(IOResult::IO(c)),
+                                IOResult::Done(_) => { /* inserted successfully */ }
+                            }
                         }
                     }
 
@@ -2506,13 +2832,16 @@ impl Pager {
                         };
                         continue;
                     }
-                    let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
+                    let (trunk_page, c) =
+                        return_if_io!(self.read_page(first_freelist_trunk_page_id as i64));
                     *state = AllocatePageState::SearchAvailableFreeListLeaf {
-                        trunk_page,
+                        trunk_page: PinGuard::new(trunk_page),
                         current_db_size: new_db_size,
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
                     }
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
@@ -2536,17 +2865,16 @@ impl Pager {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
                             page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
-                        let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
-
+                        let (leaf_page, c) =
+                            return_if_io!(self.read_page(next_leaf_page_id as i64));
                         turso_assert!(
                             number_of_freelist_leaves > 0,
                             "Freelist trunk page {} has no leaves",
                             trunk_page.get().id
                         );
-
                         *state = AllocatePageState::ReuseFreelistLeaf {
                             trunk_page: trunk_page.clone(),
-                            leaf_page,
+                            leaf_page: PinGuard::new(leaf_page),
                             number_of_freelist_leaves,
                         };
                         if let Some(c) = c {
@@ -2585,9 +2913,9 @@ impl Pager {
                             trunk_page.get().id
                         );
                     }
-                    let trunk_page = trunk_page.clone();
+                    let page = trunk_page.to_page();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(trunk_page));
+                    return Ok(IOResult::Done(page));
                 }
                 AllocatePageState::ReuseFreelistLeaf {
                     trunk_page,
@@ -2639,9 +2967,8 @@ impl Pager {
                         remaining_leaves_count as u32,
                     );
                     self.add_dirty(trunk_page)?;
-
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    let leaf_page = leaf_page.clone();
+                    let leaf_page = leaf_page.to_page();
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(leaf_page));
                 }
@@ -2674,17 +3001,23 @@ impl Pager {
 
                     // FIXME: should reserve page cache entry before modifying the database
                     let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                    // setup page and add to cache
+                    self.add_dirty(&page)?;
+                    *state = AllocatePageState::FinishAllocPage {
+                        page: PinGuard::new(page),
+                        new_db_size,
+                    };
+                }
+                AllocatePageState::FinishAllocPage { page, new_db_size } => {
                     {
-                        // setup page and add to cache
-                        self.add_dirty(&page)?;
-
-                        let page_key = PageCacheKey::new(page.get().id as usize);
-                        {
+                        let page_key = page.get().id;
+                        let page = {
                             // Run in separate block to avoid deadlock on page cache write lock
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
-                        }
-                        header.database_size = new_db_size.into();
+                            return_if_io!(self.cache_insert(page_key, page.to_page(), &mut cache))
+                        };
+                        header.database_size = (*new_db_size).into();
+                        let page = page.clone();
                         *state = AllocatePageState::Start;
                         return Ok(IOResult::Done(page));
                     }
