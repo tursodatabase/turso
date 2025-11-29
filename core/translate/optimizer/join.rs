@@ -52,6 +52,7 @@ pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
     rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
+    all_constraints: &'a [TableConstraints],
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
@@ -171,11 +172,13 @@ pub fn join_lhs_and_rhs<'a>(
             && !nested_loop_preserves_order
             && !rhs_has_selective_seek
         {
+            let lhs_constraints = &all_constraints[lhs_table_idx];
             if let Some(hash_join_method) = try_hash_join_access_method(
                 lhs_table,
                 rhs_table_reference,
                 lhs_table_idx,
                 rhs_table_idx,
+                lhs_constraints,
                 rhs_constraints,
                 where_clause,
                 build_cardinality,
@@ -312,6 +315,7 @@ pub fn compute_best_join_order<'a>(
             None,
             table_ref,
             &constraints[i],
+            constraints,
             &join_order,
             maybe_order_target,
             access_methods_arena,
@@ -430,6 +434,7 @@ pub fn compute_best_join_order<'a>(
                     Some(lhs),
                     &joined_tables[rhs_idx],
                     &constraints[rhs_idx],
+                    constraints,
                     &join_order,
                     maybe_order_target,
                     access_methods_arena,
@@ -541,6 +546,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         None,
         &joined_tables[0],
         &constraints[0],
+        constraints,
         &join_order[..1],
         maybe_order_target,
         access_methods_arena,
@@ -559,6 +565,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             best_plan.as_ref(),
             &joined_tables[i],
             &constraints[i],
+            constraints,
             &join_order[..=i],
             maybe_order_target,
             access_methods_arena,
@@ -1946,6 +1953,131 @@ mod tests {
                 constraint_refs,
             } => (*iter_dir, index.clone(), constraint_refs),
             _ => panic!("expected BTreeTable access method"),
+        }
+    }
+
+    #[test]
+    /// Test that when an index is available on the join column, the optimizer prefers
+    /// index lookup over hash join.
+    fn test_prefer_index_lookup_over_hash_join() {
+        // CREATE TABLE t1(a,b,c);
+        // CREATE TABLE t2(a,b,c);
+        // CREATE INDEX idx_t2_a ON t2(a);
+        // SELECT * FROM t1 JOIN t2 ON t1.a = t2.a;
+        // Expected: SCAN t1, SEARCH t2 USING INDEX idx_t2_a (a=?)
+        // Not: HASH JOIN
+
+        let t1 = _create_btree_table("t1", _create_column_list(&["a", "b", "c"], Type::Integer));
+        let t2 = _create_btree_table("t2", _create_column_list(&["a", "b", "c"], Type::Integer));
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            _create_table_reference(t1.clone(), None, table_id_counter.next()),
+            _create_table_reference(
+                t2.clone(),
+                Some(JoinInfo {
+                    outer: false,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const TABLE1: usize = 0;
+        const TABLE2: usize = 1;
+
+        // Index on t2.a
+        let mut available_indexes = HashMap::new();
+        let index_t2_a = Arc::new(Index {
+            name: "idx_t2_a".to_string(),
+            table_name: "t2".to_string(),
+            where_clause: None,
+            columns: vec![IndexColumn {
+                name: "a".to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: false, // Non-unique index
+            ephemeral: false,
+            root_page: 2,
+            has_rowid: true,
+            index_method: None,
+        });
+        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+
+        // WHERE t1.a = t2.a
+        let mut where_clause = vec![_create_binary_expr(
+            _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // t1.a
+            ast::Operator::Equals,
+            _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // t2.a
+        )];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let access_methods_arena = RefCell::new(Vec::new());
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+        )
+        .unwrap();
+
+        let result = compute_best_join_order(
+            table_references.joined_tables(),
+            None,
+            &table_constraints,
+            &access_methods_arena,
+            &mut where_clause,
+            &[],
+        )
+        .unwrap();
+        assert!(result.is_some());
+        let BestJoinOrderResult { best_plan, .. } = result.unwrap();
+
+        // Expected: t1 first (scan), t2 second (index seek)
+        assert_eq!(
+            best_plan.table_numbers().collect::<Vec<_>>(),
+            vec![TABLE1, TABLE2],
+            "Expected join order [t1, t2] to use index on t2.a"
+        );
+
+        // t1 should use table scan (no constraints)
+        let access_method_t1 = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let (_, _, constraint_refs_t1) = _as_btree(access_method_t1);
+        assert!(
+            constraint_refs_t1.is_empty(),
+            "t1 should use table scan with no constraints"
+        );
+
+        // t2 should use index seek, NOT hash join
+        let access_method_t2 = &access_methods_arena.borrow()[best_plan.data[1].1];
+        match &access_method_t2.params {
+            AccessMethodParams::BTreeTable {
+                index,
+                constraint_refs,
+                ..
+            } => {
+                assert!(
+                    index.is_some(),
+                    "t2 should use index idx_t2_a, not a hash join"
+                );
+                assert_eq!(
+                    index.as_ref().unwrap().name,
+                    "idx_t2_a",
+                    "t2 should use index idx_t2_a"
+                );
+                assert!(
+                    !constraint_refs.is_empty(),
+                    "t2 should have constraints for index seek"
+                );
+            }
+            AccessMethodParams::HashJoin { .. } => {
+                panic!("Expected index lookup on t2, but got hash join instead");
+            }
+            _ => panic!("Unexpected access method for t2"),
         }
     }
 }

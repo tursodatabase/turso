@@ -379,6 +379,7 @@ pub fn try_hash_join_access_method(
     probe_table: &JoinedTable,
     build_table_idx: usize,
     probe_table_idx: usize,
+    build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
     where_clause: &mut [WhereTerm],
     build_cardinality: f64,
@@ -461,6 +462,48 @@ pub fn try_hash_join_access_method(
     if join_keys.is_empty() {
         return None;
     }
+
+    // Check if either table has an index on any of the join columns.
+    // If so, prefer nested-loop with index lookup over hash join,
+    // this avoids building a hash table when we can use an existing index.
+    // Check both tables because we could potentially use a different
+    // join order where the indexed table becomes the probe/inner table.
+    for join_key in &join_keys {
+        // Check probe table constraints for index on join column
+        if let Some(constraint) = probe_constraints
+            .constraints
+            .iter()
+            .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+        {
+            if let Some(col_pos) = constraint.table_col_pos {
+                for candidate in &probe_constraints.candidates {
+                    if let Some(index) = &candidate.index {
+                        if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check build table constraints for index on join column
+        if let Some(constraint) = build_constraints
+            .constraints
+            .iter()
+            .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+        {
+            if let Some(col_pos) = constraint.table_col_pos {
+                for candidate in &build_constraints.candidates {
+                    if let Some(index) = &candidate.index {
+                        if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
     Some(AccessMethod {
         cost,
