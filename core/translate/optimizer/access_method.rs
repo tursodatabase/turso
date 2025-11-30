@@ -375,7 +375,7 @@ pub fn estimate_hash_join_cost(
 }
 
 /// Try to create a hash join access method for joining two tables.
-/// Returns Some(AccessMethod) if hash join is viable, None otherwise.
+/// NOTE: we are intentionally strict in choosing hash joins for the MVP, can be expanded on later on.
 #[allow(clippy::too_many_arguments)]
 pub fn try_hash_join_access_method(
     build_table: &JoinedTable,
@@ -396,7 +396,6 @@ pub fn try_hash_join_access_method(
     {
         return None;
     }
-
     // Avoid hash join on self-joins over the same underlying table. The current
     // implementation assumes distinct build/probe sources; sharing storage can
     // lead to incorrect matches.
@@ -413,7 +412,6 @@ pub fn try_hash_join_access_method(
     {
         return None;
     }
-
     // Hash joins only support INNER JOIN semantics.
     // Don't use hash joins for any form of OUTER JOINs
     if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
@@ -508,7 +506,12 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, input_cardinality, DEFAULT_MEM_BUDGET);
+    let cost = estimate_hash_join_cost(
+        build_cardinality,
+        probe_cardinality,
+        input_cardinality,
+        DEFAULT_MEM_BUDGET,
+    );
     Some(AccessMethod {
         cost,
         params: AccessMethodParams::HashJoin {

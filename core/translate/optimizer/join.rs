@@ -95,8 +95,22 @@ pub fn join_lhs_and_rhs<'a>(
     // RHS table number (used for order checks below)
     let rhs_table_number = join_order.last().unwrap().original_idx;
 
-    // Allow hash joins for chain patterns: A->B->C->D where each table is either
-    // build OR probe for exactly one hash join.
+    // If we already have a non-empty LHS (at least one table has been joined),
+    // consider a hash-join alternative for the current RHS. We only allow hash
+    // joins when:
+    //
+    // - The would-be build table (immediate LHS table) is accessed via a plain
+    //   table scan (no index, no constraint_refs).
+    // - Choosing hash join does not destroy a useful ORDER BY the nested-loop
+    //   plan would satisfy.
+    // - The RHS is not using a selective index seek we’d prefer to keep.
+    // - The build table has no remaining constraints from prior tables that
+    //   are not already consumed as hash-join keys in earlier hash joins.
+    // - We do not introduce cycles in the hash-join dependency graph: no table
+    //   is used as probe in one hash join and build in another.
+    //
+    // Under those conditions we let `try_hash_join_access_method` propose a
+    // HashJoin access method and pick it if it beats the nested-loop cost.
     if lhs.is_some() {
         let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let rhs_table_idx = join_order.last().unwrap().original_idx;
@@ -212,10 +226,11 @@ pub fn join_lhs_and_rhs<'a>(
         // that aren't part of the build & probe hash join, they can't be evaluated because the
         // build cursor is no longer positioned.
         //
-        // HOWEVER: If the constraint references a table that is the BUILD table of an earlier
-        // hash join where this proposed build table was the PROBE, then that constraint IS
-        // consumed by the earlier hash join (via HashProbe + SeekRowid). In that case, the
-        // cursor WILL be positioned when we evaluate remaining conditions.
+        // HOWEVER: If the constraint references only tables that are the BUILD side
+        // of earlier hash joins where this proposed build table was the PROBE, then
+        // that equality is already used as a hash-join key. In that case, when we
+        // later SeekRowid into the build table for that earlier join, the cursor is
+        // correctly positioned and the constraint is effectively "consumed".
         //
         // Example:
         // `SELECT... items JOIN products ON items.name = products.name JOIN order_items ON products.price = order_items.price`:
@@ -275,6 +290,10 @@ pub fn join_lhs_and_rhs<'a>(
                 false // All referenced prior tables are hash-joined
             })
         };
+
+        // Only consider hash join when the build table is using a plain table scan
+        // (no index, no constraint-driven search). Otherwise we’d drop useful filters
+        // or break the access pattern the planner chose.
         let build_am_is_plain_table_scan = lhs
             .and_then(|join| {
                 join.data
