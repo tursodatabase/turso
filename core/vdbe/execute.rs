@@ -39,6 +39,7 @@ use crate::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
+        format::exec_format,
         printf::exec_printf,
     },
     translate::emitter::TransactionMode,
@@ -5360,6 +5361,10 @@ pub fn op_function(
             }
             ScalarFunc::Printf => {
                 let result = exec_printf(&state.registers[*start_reg..*start_reg + arg_count])?;
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::Format => {
+                let result = exec_format(&state.registers[*start_reg..*start_reg + arg_count])?;
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
