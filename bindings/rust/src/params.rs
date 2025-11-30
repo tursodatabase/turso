@@ -1,5 +1,7 @@
 //! This module contains all `Param` related utilities and traits.
 
+use std::borrow::Cow;
+
 use crate::{Error, Result, Value};
 
 mod sealed {
@@ -98,7 +100,7 @@ pub trait IntoParams: Sealed {
 pub enum Params {
     None,
     Positional(Vec<Value>),
-    Named(Vec<(String, Value)>),
+    Named(Vec<(Cow<'static, str>, Value)>),
 }
 
 /// Convert an owned iterator into Params.
@@ -153,8 +155,8 @@ impl<T: IntoValue> IntoParams for Vec<T> {
     }
 }
 
-impl<T: IntoValue> Sealed for Vec<(String, T)> {}
-impl<T: IntoValue> IntoParams for Vec<(String, T)> {
+impl<T: IntoValue> Sealed for Vec<(Cow<'static, str>, T)> {}
+impl<T: IntoValue> IntoParams for Vec<(Cow<'static, str>, T)> {
     fn into_params(self) -> Result<Params> {
         let values = self
             .into_iter()
@@ -172,14 +174,11 @@ impl<T: IntoValue, const N: usize> IntoParams for [T; N] {
     }
 }
 
-impl<T: IntoValue, const N: usize> Sealed for [(&str, T); N] {}
-impl<T: IntoValue, const N: usize> IntoParams for [(&str, T); N] {
+impl<T: IntoValue, const N: usize> Sealed for [(Cow<'static, str>, T); N] {}
+impl<T: IntoValue, const N: usize> IntoParams for [(Cow<'static, str>, T); N] {
     fn into_params(self) -> Result<Params> {
         self.into_iter()
-            // TODO: Pretty unfortunate that we need to allocate here when we know
-            // the str is likely 'static. Maybe we should convert our param names
-            // to be `Cow<'static, str>`?
-            .map(|(k, v)| Ok((k.to_string(), v.into_value()?)))
+            .map(|(k, v)| Ok((k, v.into_value()?)))
             .collect::<Result<Vec<_>>>()?
             .into_params()
     }
@@ -207,10 +206,10 @@ macro_rules! tuple_into_params {
 
 macro_rules! named_tuple_into_params {
     ($count:literal : $(($field:tt $ftype:ident)),* $(,)?) => {
-        impl<$($ftype,)*> Sealed for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {}
-        impl<$($ftype,)*> IntoParams for ($((&str, $ftype),)*) where $($ftype: IntoValue,)* {
+        impl<$($ftype,)*> Sealed for ($((Cow<'static, str>, $ftype),)*) where $($ftype: IntoValue,)* {}
+        impl<$($ftype,)*> IntoParams for ($((Cow<'static, str>, $ftype),)*) where $($ftype: IntoValue,)* {
             fn into_params(self) -> Result<Params> {
-                let params = Params::Named(vec![$((self.$field.0.to_string(), self.$field.1.into_value()?)),*]);
+                let params = Params::Named(vec![$((self.$field.0, self.$field.1.into_value()?)),*]);
                 Ok(params)
             }
         }
