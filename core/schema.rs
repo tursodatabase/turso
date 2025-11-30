@@ -890,7 +890,28 @@ impl Schema {
                         }
                     }
 
+                    let has_rowid = table.has_rowid;
+                    let table_name_for_index = table.name.clone();
+                    let root_page_for_index = table.root_page;
+
                     self.add_btree_table(Arc::new(table))?;
+
+                    if !has_rowid {
+                        tracing::debug!(
+                            "WITHOUT ROWID table '{}' found. Synthesizing primary key index.",
+                            &table_name_for_index
+                        );
+                        let table_ref = self.get_btree_table(&table_name_for_index).unwrap();
+                        let pk_index = Index::automatic_from_primary_key(
+                            &table_ref,
+                            (
+                                format!("sqlite_autoindex_{}_1", &table_name_for_index),
+                                root_page_for_index,
+                            ),
+                            table_ref.primary_key_columns.len(),
+                        )?;
+                        self.add_index(Arc::new(pk_index))?;
+                    }
                 }
             }
             "index" => {
@@ -2571,6 +2592,8 @@ pub struct Index {
     pub has_rowid: bool,
     pub where_clause: Option<Box<Expr>>,
     pub index_method: Option<Arc<dyn IndexMethodAttachment>>,
+    pub is_primary_key: bool,
+    pub n_key_col: usize,
 }
 
 #[allow(dead_code)]
@@ -2611,7 +2634,33 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let mut index_columns = resolve_sorted_columns(table, &columns)?;
+
+                if !table.has_rowid {
+                    let existing_index_cols: HashSet<String> =
+                        index_columns.iter().map(|c| c.name.clone()).collect();
+
+                    for (pk_col_name, _order) in &table.primary_key_columns {
+                        if !existing_index_cols.contains(pk_col_name.as_str()) {
+                            let (pos_in_table, column) =
+                                table.get_column(pk_col_name).ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "Could not find PK column '{}' in table '{}'",
+                                        pk_col_name, table.name
+                                    ))
+                                })?;
+
+                            index_columns.push(IndexColumn {
+                                name: pk_col_name.clone(),
+                                order: SortOrder::Asc,
+                                pos_in_table,
+                                collation: column.collation_opt(),
+                                default: column.default.clone(),
+                            });
+                        }
+                    }
+                }
+
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -2639,7 +2688,9 @@ impl Index {
                         ephemeral: false,
                         has_rowid: table.has_rowid,
                         where_clause: None,
+                        is_primary_key: false,
                         index_method: Some(descriptor),
+                        n_key_col: columns.len(),
                     })
                 } else {
                     Ok(Index {
@@ -2652,6 +2703,8 @@ impl Index {
                         has_rowid: table.has_rowid,
                         where_clause,
                         index_method: None,
+                        is_primary_key: false,
+                        n_key_col: columns.len(),
                     })
                 }
             }
@@ -2676,16 +2729,17 @@ impl Index {
         assert!(has_primary_key_index);
         let (index_name, root_page) = auto_index;
 
-        let mut primary_keys = Vec::with_capacity(column_count);
+        let mut index_columns = Vec::new();
+        let mut key_column_positions = std::collections::HashSet::new();
+
         for (col_name, order) in table.primary_key_columns.iter() {
-            let Some((pos_in_table, _)) = table.get_column(col_name) else {
+            let Some((pos_in_table, column)) = table.get_column(col_name) else {
                 return Err(crate::LimboError::ParseError(format!(
                     "Column {} not found in table {}",
                     col_name, table.name
                 )));
             };
-            let (_, column) = table.get_column(col_name).unwrap();
-            primary_keys.push(IndexColumn {
+            index_columns.push(IndexColumn {
                 name: normalize_ident(col_name),
                 order: *order,
                 pos_in_table,
@@ -2693,20 +2747,42 @@ impl Index {
                 default: column.default.clone(),
                 expr: None,
             });
+            key_column_positions.insert(pos_in_table);
         }
 
-        assert!(primary_keys.len() == column_count);
+        assert!(
+            index_columns.len() == column_count,
+            "Mismatch in primary key column count"
+        );
+
+        if !table.has_rowid {
+            for (pos_in_table, column) in table.columns.iter().enumerate() {
+                // TODO: when we support generated cols look at this
+
+                if !key_column_positions.contains(&pos_in_table) {
+                    index_columns.push(IndexColumn {
+                        name: normalize_ident(column.name.as_ref().unwrap()),
+                        order: SortOrder::Asc,
+                        pos_in_table,
+                        collation: None,
+                        default: column.default.clone(),
+                    });
+                }
+            }
+        }
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
             root_page,
-            columns: primary_keys,
+            columns: index_columns,
             unique: true,
             ephemeral: false,
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            is_primary_key: true,
+            n_key_col: column_count,
         })
     }
 
@@ -2736,6 +2812,7 @@ impl Index {
             })
             .collect::<Vec<_>>();
 
+        let n_key_col = unique_cols.len();
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
             table_name: table.name.clone(),
@@ -2746,6 +2823,8 @@ impl Index {
             has_rowid: table.has_rowid,
             where_clause: None,
             index_method: None,
+            is_primary_key: false,
+            n_key_col,
         })
     }
 

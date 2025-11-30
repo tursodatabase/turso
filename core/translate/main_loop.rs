@@ -109,6 +109,8 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
         has_rowid: false,
         where_clause: None,
         index_method: None,
+        is_primary_key: false,
+        n_key_col: plan.result_columns.len(),
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     let ctx = DistinctCtx {
@@ -188,6 +190,12 @@ pub fn init_loop(
             unique: false,
             where_clause: None,
             index_method: None,
+            is_primary_key: false,
+            n_key_col: if let Some(gb) = group_by.as_ref() {
+                gb.exprs.len()
+            } else {
+                0
+            },
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         if group_by.is_none() {
