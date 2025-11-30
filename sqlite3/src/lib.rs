@@ -325,12 +325,31 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     SQLITE_OK
 }
 
+unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    let stmt_ref = &mut *stmt;
+    while stmt_ref.stmt.execution_state().is_running() {
+        let result = sqlite3_step(stmt);
+        if result != SQLITE_DONE && result != SQLITE_ROW {
+            return result;
+        }
+    }
+    SQLITE_OK
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     if stmt.is_null() {
         return SQLITE_MISUSE;
     }
     let stmt_ref = &mut *stmt;
+
+    // first, finalize any execution if it was unfinished
+    // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
+    // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
+    let result = stmt_run_to_completion(stmt);
+    if result != SQLITE_OK {
+        return result;
+    }
 
     if !stmt_ref.db.is_null() {
         let db = &mut *stmt_ref.db;
@@ -669,6 +688,13 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
+    // first, finalize any execution if it was unfinished
+    // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
+    // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
+    let result = stmt_run_to_completion(stmt);
+    if result != SQLITE_OK {
+        return result;
+    }
     stmt.stmt.reset();
     stmt.clear_text_cache();
     SQLITE_OK
@@ -1420,10 +1446,10 @@ unsafe extern "C" fn sqlite_get_table_cb(
     for i in 0..n_column {
         let value = *argv.add(i as usize);
         let value_cstring = if !value.is_null() {
-            let len = libc::strlen(value);
-            let mut buf = Vec::with_capacity(len + 1);
-            libc::strncpy(buf.as_mut_ptr() as *mut ffi::c_char, value, len);
-            buf.set_len(len + 1);
+            let value_cstr = CStr::from_ptr(value).to_bytes();
+            let len = value_cstr.len();
+            let mut buf = vec![0u8; len + 1];
+            buf[0..len].copy_from_slice(value_cstr);
             CString::from_vec_with_nul(buf).unwrap()
         } else {
             CString::new("NULL").unwrap()

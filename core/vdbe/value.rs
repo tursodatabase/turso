@@ -308,10 +308,20 @@ impl Value {
     }
 
     pub fn exec_quote(&self) -> Self {
+        use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
             Value::Integer(_) | Value::Float(_) => self.to_owned(),
-            Value::Blob(_) => todo!(),
+            Value::Blob(b) => {
+                // SQLite returns X'hexdigits' for blobs
+                let mut quoted = String::with_capacity(3 + b.len() * 2);
+                quoted.push_str("X'");
+                for byte in b.iter() {
+                    write!(&mut quoted, "{byte:02X}").expect("unable to write hex bytes");
+                }
+                quoted.push('\'');
+                Value::build_text(quoted)
+            }
             Value::Text(s) => {
                 let mut quoted = String::with_capacity(s.as_str().len() + 2);
                 quoted.push('\'');
@@ -1032,10 +1042,17 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
             '%' => regex_pattern.push_str(".*"),
             '_' => regex_pattern.push('.'),
             ch => {
-                if regex_syntax::is_meta_character(c) {
-                    regex_pattern.push('\\');
+                if ch.is_ascii_alphabetic() {
+                    regex_pattern.push('[');
+                    regex_pattern.push(ch.to_ascii_lowercase());
+                    regex_pattern.push(ch.to_ascii_uppercase());
+                    regex_pattern.push(']');
+                } else {
+                    if regex_syntax::is_meta_character(c) {
+                        regex_pattern.push('\\');
+                    }
+                    regex_pattern.push(ch);
                 }
-                regex_pattern.push(ch);
             }
         }
     }
@@ -1043,7 +1060,6 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
     regex_pattern.push('$');
 
     RegexBuilder::new(&regex_pattern)
-        .case_insensitive(true)
         .dot_matches_new_line(true)
         .build()
         .expect("constructed LIKE regex pattern should be valid")

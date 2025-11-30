@@ -35,10 +35,10 @@ fn sparse_vector(v: &str) -> Value {
     vector::operations::serialize::vector_serialize(vector)
 }
 
-#[test]
-fn test_vector_sparse_ivf_create_destroy() {
+// TODO: cannot use MVCC as we use indexes here
+#[turso_macros::test(init_sql = "CREATE TABLE t(name, embedding)")]
+fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(name, embedding)");
     let conn = tmp_db.connect_limbo();
 
     let schema_rows = || {
@@ -90,10 +90,10 @@ fn test_vector_sparse_ivf_create_destroy() {
     assert_eq!(schema_rows(), vec!["t"]);
 }
 
-#[test]
-fn test_vector_sparse_ivf_insert_query() {
+// TODO: cannot use MVCC as we use indexes here
+#[turso_macros::test(init_sql = "CREATE TABLE t(name, embedding)")]
+fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(name, embedding)");
     let conn = tmp_db.connect_limbo();
 
     let index = VectorSparseInvertedIndexMethod;
@@ -181,10 +181,10 @@ fn test_vector_sparse_ivf_insert_query() {
     }
 }
 
-#[test]
-fn test_vector_sparse_ivf_update() {
+// TODO: cannot use MVCC as we use indexes here
+#[turso_macros::test(init_sql = "CREATE TABLE t(name, embedding)")]
+fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
-    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(name, embedding)");
     let conn = tmp_db.connect_limbo();
 
     let index = VectorSparseInvertedIndexMethod;
@@ -262,9 +262,13 @@ fn test_vector_sparse_ivf_update() {
     assert!(!run(&tmp_db, || reader.query_next()).unwrap());
 }
 
-#[test]
-fn test_vector_sparse_ivf_fuzz() {
+// TODO: cannot use MVCC as we use indexes here
+#[turso_macros::test]
+fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
+
+    let opts = tmp_db.db_opts;
+    let flags = tmp_db.db_flags;
 
     const DIMS: usize = 40;
     const MOD: u32 = 5;
@@ -276,10 +280,12 @@ fn test_vector_sparse_ivf_fuzz() {
         tracing::info!("======== seed: {} ========", seed);
 
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let simple_db =
-            TempDatabase::new_with_rusqlite("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
-        let index_db =
-            TempDatabase::new_with_rusqlite("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
+        let builder = TempDatabase::builder()
+            .with_opts(opts)
+            .with_flags(flags)
+            .with_init_sql("CREATE TABLE t(key TEXT PRIMARY KEY, embedding)");
+        let simple_db = builder.clone().build();
+        let index_db = builder.build();
         tracing::info!(
             "simple_db: {:?}, index_db: {:?}",
             simple_db.path,

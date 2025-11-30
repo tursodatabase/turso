@@ -397,6 +397,10 @@ impl Schema {
         }
         Ok(())
     }
+    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.triggers.remove(&table_name);
+    }
 
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = normalize_ident(table_name);
@@ -606,7 +610,12 @@ impl Schema {
 
         pager.end_read_tx();
 
-        self.populate_indices(syms, from_sql_indexes, automatic_indices)?;
+        self.populate_indices(
+            syms,
+            from_sql_indexes,
+            automatic_indices,
+            mv_cursor.is_some(),
+        )?;
 
         self.populate_materialized_views(
             materialized_view_info,
@@ -625,6 +634,7 @@ impl Schema {
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
             if !self.indexes_enabled() {
@@ -639,6 +649,19 @@ impl Schema {
                     unparsed_sql_from_index.root_page,
                     table.as_ref(),
                 )?;
+                if mvcc_enabled {
+                    if index.columns.iter().any(|c| c.expr.is_some()) {
+                        crate::bail_parse_error!("Expression indexes are not supported with MVCC");
+                    }
+                    if index.where_clause.is_some() {
+                        crate::bail_parse_error!("Partial indexes are not supported with MVCC");
+                    }
+                    if index.index_method.is_some() {
+                        crate::bail_parse_error!(
+                            "Custom index modules are not supported with MVCC"
+                        );
+                    }
+                }
                 self.add_index(Arc::new(index))?;
             }
         }
@@ -871,7 +894,6 @@ impl Schema {
                 }
             }
             "index" => {
-                assert!(mv_store.is_none(), "indexes not yet supported for mvcc");
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {

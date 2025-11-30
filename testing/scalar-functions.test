@@ -1072,6 +1072,13 @@ do_execsql_test if-alias-multi-args-no-else-is-null {
   select if(0, 'a', 0, 'b');
 } {}
 
+do_execsql_test replace-test-zeroblob-quote {
+	select replace(substr(quote(zeroblob((6 + 1) / 2)), 3, 6), '0', 'a');
+} {aaaaaa}
+
+do_execsql_test replace-test-zeroblob-quote {
+	select quote(0xf7b);
+} {3963}
 
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {

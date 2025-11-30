@@ -31,6 +31,7 @@ mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 mod vdbe;
+pub type ProgramExecutionState = vdbe::ProgramExecutionState;
 pub mod vector;
 mod vtab;
 
@@ -537,13 +538,6 @@ impl Database {
                     }
                     Err(e) => return Err(e),
                     _ => {}
-                }
-
-                if db.mvcc_enabled() && !schema.indexes.is_empty() {
-                    return Err(LimboError::ParseError(
-                        "Database contains indexes which are not supported when MVCC is enabled."
-                            .to_string(),
-                    ));
                 }
 
                 Ok(())
@@ -2648,6 +2642,10 @@ impl Statement {
 
     pub fn interrupt(&mut self) {
         self.state.interrupt();
+    }
+
+    pub fn execution_state(&self) -> ProgramExecutionState {
+        self.state.execution_state
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {

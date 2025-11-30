@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
+use crate::mvcc::cursor::MvccCursorType;
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::schema::Table;
 use crate::state_machine::StateMachine;
@@ -14,7 +15,7 @@ use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize}
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
-    ImmutableRecord, SeekResult, Text,
+    ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
@@ -24,7 +25,10 @@ use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, Par
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
-use crate::vector::{vector32_sparse, vector_concat, vector_distance_jaccard, vector_slice};
+use crate::vector::{
+    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos,
+    vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
+};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -66,7 +70,6 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn},
     },
-    vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
 use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
@@ -945,22 +948,24 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor =
-        |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                let mv_store = mv_store
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
-                Ok(Box::new(MvCursor::new(
-                    mv_store,
-                    tx_id,
-                    *root_page,
-                    btree_cursor,
-                )?))
-            } else {
-                Ok(btree_cursor)
-            }
-        };
+    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+                                        mv_cursor_type: MvccCursorType|
+     -> Result<Box<dyn CursorTrait>> {
+        if let Some(tx_id) = program.connection.get_mv_tx_id() {
+            let mv_store = mv_store
+                .expect("mv_store should be Some when MVCC transaction is active")
+                .clone();
+            Ok(Box::new(MvCursor::new(
+                mv_store,
+                tx_id,
+                *root_page,
+                mv_cursor_type,
+                btree_cursor,
+            )?))
+        } else {
+            Ok(btree_cursor)
+        }
+    };
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
@@ -972,7 +977,7 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().name().to_string();
@@ -1001,7 +1006,7 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store, *root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -1014,7 +1019,9 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            let cursor =
+                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -5526,47 +5533,46 @@ pub fn op_function(
             }
         },
         crate::function::Func::Vector(vector_func) => {
-            let values =
-                registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+            let args = &state.registers[*start_reg..*start_reg + arg_count];
             match vector_func {
                 VectorFunc::Vector => {
-                    let result = vector32(values)?;
+                    let result = vector32(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector32 => {
-                    let result = vector32(values)?;
+                    let result = vector32(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector32Sparse => {
-                    let result = vector32_sparse(values)?;
+                    let result = vector32_sparse(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::Vector64 => {
-                    let result = vector64(values)?;
+                    let result = vector64(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorExtract => {
-                    let result = vector_extract(values)?;
+                    let result = vector_extract(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceCos => {
-                    let result = vector_distance_cos(values)?;
+                    let result = vector_distance_cos(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceL2 => {
-                    let result = vector_distance_l2(values)?;
+                    let result = vector_distance_l2(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceJaccard => {
-                    let result = vector_distance_jaccard(values)?;
+                    let result = vector_distance_jaccard(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorConcat => {
-                    let result = vector_concat(values)?;
+                    let result = vector_concat(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorSlice => {
-                    let result = vector_slice(values)?;
+                    let result = vector_slice(args)?;
                     state.registers[*dest] = Register::Value(result)
                 }
             }
@@ -7434,22 +7440,24 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor =
-            |btree_cursor: Box<dyn CursorTrait>| -> Result<Box<dyn CursorTrait>> {
-                if let Some(tx_id) = program.connection.get_mv_tx_id() {
-                    let mv_store = mv_store
-                        .expect("mv_store should be Some when MVCC transaction is active")
-                        .clone();
-                    Ok(Box::new(MvCursor::new(
-                        mv_store,
-                        tx_id,
-                        root_page,
-                        btree_cursor,
-                    )?))
-                } else {
-                    Ok(btree_cursor)
-                }
-            };
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+                                            mv_cursor_type: MvccCursorType|
+         -> Result<Box<dyn CursorTrait>> {
+            if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                let mv_store = mv_store
+                    .expect("mv_store should be Some when MVCC transaction is active")
+                    .clone();
+                Ok(Box::new(MvCursor::new(
+                    mv_store,
+                    tx_id,
+                    root_page,
+                    mv_cursor_type,
+                    btree_cursor,
+                )?))
+            } else {
+                Ok(btree_cursor)
+            }
+        };
         if let Some(index) = maybe_index {
             let conn = program.connection.clone();
             let schema = conn.schema.read();
@@ -7464,7 +7472,9 @@ pub fn op_open_write(
                 index.as_ref(),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let index_info = Arc::new(IndexInfo::new_from_index(index));
+            let cursor =
+                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -7483,7 +7493,7 @@ pub fn op_open_write(
                 maybe_transform_root_page_to_positive(mv_store, root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor)?;
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
@@ -7745,6 +7755,7 @@ pub fn op_drop_table(
     {
         conn.with_schema_mut(|schema| {
             schema.remove_indices_for_table(table_name);
+            schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
         });
     }
@@ -8482,7 +8493,13 @@ pub fn op_open_dup(
                     let mv_store = mv_store
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    Box::new(MvCursor::new(mv_store, tx_id, root_page, cursor)?)
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        MvccCursorType::Table,
+                        cursor,
+                    )?)
                 } else {
                     cursor
                 };

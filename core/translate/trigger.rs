@@ -95,6 +95,10 @@ pub fn translate_create_trigger(
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
 
+    if crate::schema::is_system_table(&normalized_table_name) {
+        bail_parse_error!("cannot create trigger on system table");
+    }
+
     // Check if trigger already exists
     if resolver
         .schema

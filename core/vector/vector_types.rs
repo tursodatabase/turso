@@ -128,7 +128,9 @@ impl<'a> Vector<'a> {
     ) -> Result<Self> {
         let owned_slice = owned.as_deref();
         let refer_slice = refer.as_ref().map(|&x| x);
-        let data = owned_slice.unwrap_or_else(|| refer_slice.unwrap());
+        let data = owned_slice.or(refer_slice).ok_or_else(|| {
+            LimboError::InternalError("Vector must have either owned or refer data".to_string())
+        })?;
         match vector_type {
             VectorType::Float32Dense => {
                 if data.len() % 4 != 0 {
@@ -167,7 +169,12 @@ impl<'a> Vector<'a> {
                 }
                 let original_len = data.len();
                 let dims_bytes = &data[original_len - 4..];
-                let dims = u32::from_le_bytes(dims_bytes.try_into().unwrap()) as usize;
+                let dims = u32::from_le_bytes([
+                    dims_bytes[0],
+                    dims_bytes[1],
+                    dims_bytes[2],
+                    dims_bytes[3],
+                ]) as usize;
                 let owned = owned.map(|mut x| {
                     x.truncate(original_len - 4);
                     x
@@ -187,17 +194,25 @@ impl<'a> Vector<'a> {
     pub fn bin_len(&self) -> usize {
         let owned = self.owned.as_ref().map(|x| x.len());
         let refer = self.refer.as_ref().map(|x| x.len());
-        owned.unwrap_or_else(|| refer.unwrap())
+        owned
+            .or(refer)
+            .expect("Vector invariant: exactly one of owned or refer must be Some")
     }
 
     pub fn bin_data(&'a self) -> &'a [u8] {
         let owned = self.owned.as_deref();
         let refer = self.refer.as_ref().map(|&x| x);
-        owned.unwrap_or_else(|| refer.unwrap())
+        owned
+            .or(refer)
+            .expect("Vector invariant: exactly one of owned or refer must be Some")
     }
 
     pub fn bin_eject(self) -> Vec<u8> {
-        self.owned.unwrap_or_else(|| self.refer.unwrap().to_vec())
+        self.owned.unwrap_or_else(|| {
+            self.refer
+                .expect("Vector invariant: exactly one of owned or refer must be Some")
+                .to_vec()
+        })
     }
 
     /// # Safety
