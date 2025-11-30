@@ -799,8 +799,8 @@ pub fn open_loop(
                     cursor_id
                 };
 
-                // Allocate registers for hash table and join keys
-                let hash_table_reg = program.alloc_register();
+                // use the build table's InternalTableID for the hash table reference
+                let hash_table_reg: usize = build_table.internal_id.into();
                 let num_keys = hash_join_op.join_keys.len();
                 let build_key_start_reg = program.alloc_registers(num_keys);
 
@@ -937,11 +937,6 @@ pub fn open_loop(
                     src_reg: match_reg,
                     target_pc: next, // Should not happen, rowid must exist
                 });
-
-                // Store hash join context for:
-                // - SeekRowid instruction to position build cursor
-                // - Emitting HashNext/HashClose in close_loop
-                // - Jumping to match_found_label when HashNext finds additional matches
                 t_ctx.hash_table_ctx = Some(HashCtx {
                     hash_table_reg,
                     match_reg,
@@ -1352,9 +1347,6 @@ pub fn close_loop(
             .position(|j| j.original_idx == table_index)
             .is_some_and(|pos| is_hash_join_build_table(pos, join_order, tables))
         {
-            // Resolve labels so any references don't panic.
-            program.resolve_label(loop_labels.next, program.offset());
-            program.resolve_label(loop_labels.loop_end, program.offset());
             continue;
         }
         match &table.op {

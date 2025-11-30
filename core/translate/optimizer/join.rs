@@ -102,7 +102,7 @@ pub fn join_lhs_and_rhs<'a>(
         let lhs_table = &joined_tables[lhs_table_idx];
 
         // If the chosen access method for the build table already uses constraints
-        // (e.g. seeks on an index or rowid), skip hash join to avoid dropping those filters.
+        // skip hash join to avoid dropping those filters.
         let build_access_method_uses_constraints = lhs
             .and_then(|join| {
                 join.data
@@ -151,10 +151,6 @@ pub fn join_lhs_and_rhs<'a>(
             preserves
         });
 
-        // Cardinality estimates for hash join cost.
-        // - build_cardinality: number of rows in the build table
-        // - probe_cardinality: number of rows in the probe table
-        // The join will scan all probe rows and look them up in the hash table.
         let build_cardinality = lhs
             .map(|l| l.output_cardinality as f64)
             .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);

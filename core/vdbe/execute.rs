@@ -9495,8 +9495,6 @@ pub fn op_hash_probe(
         },
         insn
     );
-
-    // Check if we're re-entering after I/O - use cached state if available
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
         if op_state.hash_table_reg == *hash_table_reg {
             (op_state.probe_keys, Some(op_state.partition_idx))
@@ -9589,24 +9587,16 @@ pub fn op_hash_next(
         insn
     );
 
-    // Get the hash table
     let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
     })?;
-
-    // Try to get next match
     match hash_table.next_match() {
         Some(entry) => {
-            // Another match found, store the rowid in dest_reg
-            // The code generator will emit a SeekRowid instruction after this
-            // to position the build table cursor at this rowid
             state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
-            // Continue to next instruction to process the match
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         None => {
-            // No more matches, jump to target_pc to advance to next probe row
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
@@ -9621,12 +9611,9 @@ pub fn op_hash_close(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashClose { hash_table_reg }, insn);
-
-    // Remove and drop the hash table to free memory
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_reg) {
         hash_table.close();
     }
-
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
