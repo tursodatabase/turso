@@ -95,8 +95,9 @@ pub fn join_lhs_and_rhs<'a>(
     // RHS table number (used for order checks below)
     let rhs_table_number = join_order.last().unwrap().original_idx;
 
-    // Allow a hash join between the immediately preceding table and the current RHS.
-    if lhs.is_some() && join_order.len() >= 2 {
+    // Allow hash joins for chain patterns: A->B->C->D where each table is either
+    // build OR probe for exactly one hash join.
+    if lhs.is_some() {
         let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let lhs_table = &joined_tables[lhs_table_idx];
@@ -164,9 +165,144 @@ pub fn join_lhs_and_rhs<'a>(
             } if !constraint_refs.is_empty()
         );
 
+        // The build table (lhs_table_idx) must NOT be the probe table of any
+        // earlier hash join. If it is, seeking the build table cursor would corrupt the probe
+        // iteration of that earlier hash join.
+        let build_table_is_prior_probe = lhs
+            .map(|join| {
+                let arena = access_methods_arena.borrow();
+                join.data.iter().any(|(_, am_idx)| {
+                    arena.get(*am_idx).is_some_and(|am| {
+                        if let AccessMethodParams::HashJoin {
+                            probe_table_idx, ..
+                        } = &am.params
+                        {
+                            *probe_table_idx == lhs_table_idx
+                        } else {
+                            false
+                        }
+                    })
+                })
+            })
+            .unwrap_or(false);
+
+        // The probe table (rhs_table_idx) must NOT be the build table of any
+        // earlier hash join. This prevents reverse dependencies in the join chain.
+        let probe_table_is_prior_build = lhs
+            .map(|join| {
+                let arena = access_methods_arena.borrow();
+                join.data.iter().any(|(_, am_idx)| {
+                    arena.get(*am_idx).is_some_and(|am| {
+                        if let AccessMethodParams::HashJoin {
+                            build_table_idx, ..
+                        } = &am.params
+                        {
+                            *build_table_idx == rhs_table_idx
+                        } else {
+                            false
+                        }
+                    })
+                })
+            })
+            .unwrap_or(false);
+
+        // The build table must NOT have any constraints from prior tables
+        // that won't be consumed as hash join keys. When a table becomes a hash build table,
+        // its cursor is exhausted after building. If there are constraints like `prior.x = build.x`
+        // that aren't part of the build & probe hash join, they can't be evaluated because the
+        // build cursor is no longer positioned.
+        //
+        // HOWEVER: If the constraint references a table that is the BUILD table of an earlier
+        // hash join where this proposed build table was the PROBE, then that constraint IS
+        // consumed by the earlier hash join (via HashProbe + SeekRowid). In that case, the
+        // cursor WILL be positioned when we evaluate remaining conditions.
+        //
+        // Example:
+        // `SELECT... items JOIN products ON items.name = products.name JOIN order_items ON products.price = order_items.price`:
+        // - First hash join: items(build) - products(probe)
+        // - When considering: products(build) - order_items(probe)
+        // - products has constraint from items, BUT users is build of an earlier hash join where products was probe
+        // - So the constraint IS consumed, and products cursor IS positioned via SeekRowid
+        let build_has_prior_constraints = {
+            let build_constraints = &all_constraints[lhs_table_idx];
+
+            // Get the set of tables that are build tables for hash joins where lhs_table_idx was probe
+            let tables_already_hash_joined_as_build: Vec<usize> = lhs
+                .map(|join| {
+                    let arena = access_methods_arena.borrow();
+                    join.data
+                        .iter()
+                        .filter_map(|(_, am_idx)| {
+                            arena.get(*am_idx).and_then(|am| {
+                                if let AccessMethodParams::HashJoin {
+                                    build_table_idx,
+                                    probe_table_idx,
+                                    ..
+                                } = &am.params
+                                {
+                                    if *probe_table_idx == lhs_table_idx {
+                                        Some(*build_table_idx)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            build_constraints.constraints.iter().any(|c| {
+                // Check if this constraint references prior tables that are NOT already
+                // handled by a hash join where we were the probe table
+                let prior_mask = lhs_mask;
+                if !c.lhs_mask.intersects(&prior_mask) {
+                    return false; // Constraint doesn't reference prior tables
+                }
+                // Check if ALL referenced prior tables are already hash-joined with us as probe
+                // If so, the constraint is consumed and we're OK
+                for table_idx in 0..64 {
+                    if c.lhs_mask.contains_table(table_idx)
+                        && prior_mask.contains_table(table_idx)
+                        && !tables_already_hash_joined_as_build.contains(&table_idx)
+                    {
+                        // This prior table is NOT handled by a hash join, constraint not consumed
+                        return true;
+                    }
+                }
+                false // All referenced prior tables are hash-joined
+            })
+        };
+        let build_am_is_plain_table_scan = lhs
+            .and_then(|join| {
+                join.data
+                    .iter()
+                    .find(|(table_no, _)| *table_no == lhs_table_idx)
+                    .map(|(_, am_idx)| *am_idx)
+            })
+            .map(|am_idx| {
+                let arena = access_methods_arena.borrow();
+                arena.get(am_idx).is_some_and(|am| {
+                    matches!(
+                        &am.params,
+                        AccessMethodParams::BTreeTable {
+                            index: None,
+                            constraint_refs,
+                            ..
+                        } if constraint_refs.is_empty()
+                    )
+                })
+            })
+            .unwrap_or(false);
         if !build_access_method_uses_constraints
             && !nested_loop_preserves_order
             && !rhs_has_selective_seek
+            && !build_table_is_prior_probe
+            && !probe_table_is_prior_build
+            && !build_has_prior_constraints
+            && build_am_is_plain_table_scan
         {
             let lhs_constraints = &all_constraints[lhs_table_idx];
             if let Some(hash_join_method) = try_hash_join_access_method(
@@ -179,6 +315,7 @@ pub fn join_lhs_and_rhs<'a>(
                 where_clause,
                 build_cardinality,
                 probe_cardinality,
+                input_cardinality as f64,
                 subqueries,
             ) {
                 if hash_join_method.cost < best_access_method.cost {

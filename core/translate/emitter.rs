@@ -1,6 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -129,6 +130,10 @@ pub struct HashCtx {
     /// Label for hash join match processing (points to just after HashProbe instruction)
     /// Used by HashNext to jump back to process additional matches without re-probing
     pub match_found_label: BranchOffset,
+    /// Label for advancing to the next hash match (points to HashNext instruction).
+    /// When conditions fail within a hash join, they should jump here to try the next
+    /// hash match, rather than jumping to the outer loop's next label.
+    pub hash_next_label: BranchOffset,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -161,8 +166,9 @@ pub struct TranslateCtx<'a> {
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
-    /// Hash table register and metadata for hash joins
-    pub hash_table_ctx: Option<HashCtx>,
+    /// Hash table contexts for hash joins, keyed by build table index.
+    /// Supports multiple hash joins in chain patterns.
+    pub hash_table_contexts: HashMap<usize, HashCtx>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -198,7 +204,7 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
-            hash_table_ctx: None,
+            hash_table_contexts: HashMap::new(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,

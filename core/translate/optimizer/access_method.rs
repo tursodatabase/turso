@@ -348,6 +348,7 @@ pub fn find_equijoin_conditions(
 pub fn estimate_hash_join_cost(
     build_cardinality: f64,
     probe_cardinality: f64,
+    input_cardinality: f64,
     mem_budget: usize,
 ) -> Cost {
     const CPU_HASH_COST: f64 = 0.001;
@@ -360,9 +361,11 @@ pub fn estimate_hash_join_cost(
     let estimated_hash_table_size = (build_cardinality as usize) * BYTES_PER_ROW_ESTIMATE;
     let will_spill = estimated_hash_table_size > mem_budget;
 
-    // hash and insert all rows from build table
+    // Build phase: hash and insert all rows from build table (one-time cost)
     let build_cost = build_cardinality * (CPU_HASH_COST + CPU_INSERT_COST);
-    let probe_cost = probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
+    // Probe phase: for each row from prior tables, probe the hash table for each probe table row
+    // This accounts for the nested loop multiplier when there are tables before the hash join
+    let probe_cost = input_cardinality * probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
     let spill_cost = if will_spill {
         (build_cardinality + probe_cardinality) * IO_COST * 2.0
     } else {
@@ -384,6 +387,7 @@ pub fn try_hash_join_access_method(
     where_clause: &mut [WhereTerm],
     build_cardinality: f64,
     probe_cardinality: f64,
+    input_cardinality: f64,
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<AccessMethod> {
     // Only works for B-tree tables
@@ -504,7 +508,7 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
+    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, input_cardinality, DEFAULT_MEM_BUDGET);
     Some(AccessMethod {
         cost,
         params: AccessMethodParams::HashJoin {

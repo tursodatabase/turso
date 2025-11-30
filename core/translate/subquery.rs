@@ -610,7 +610,7 @@ pub fn emit_from_clause_subquery(
         non_aggregate_expressions: Vec::new(),
         cdc_cursor_id: None,
         meta_window: None,
-        hash_table_ctx: None,
+        hash_table_contexts: std::collections::HashMap::new(),
     };
     let subquery_body_end_label = program.allocate_label();
     program.emit_insn(Insn::InitCoroutine {

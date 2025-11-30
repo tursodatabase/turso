@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     display::PlanContext,
-    emitter::{OperationMode, TranslateCtx},
+    emitter::{OperationMode, TranslateCtx, UpdateRowSource},
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
@@ -14,37 +14,29 @@ use super::{
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
-        Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
+        Aggregate, DistinctCtx, Distinctness, EvalAt, GroupBy, HashJoinOp, IterationDirection,
+        JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef,
+        SeekKeyComponent, SelectPlan, TableReferences, WhereTerm,
     },
 };
 use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::CollationSeq,
+        collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
-        plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
         result_row::emit_select_result,
+        subquery::emit_non_from_clause_subquery,
+        window::emit_window_loop_source,
     },
     turso_assert,
     types::SeekOp,
     vdbe::{
-        affinity,
+        affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
         insn::{CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
-};
-use crate::{
-    translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
-        emitter::UpdateRowSource,
-        plan::{EvalAt, NonFromClauseSubquery},
-        subquery::emit_non_from_clause_subquery,
-        window::emit_window_loop_source,
-    },
-    vdbe::affinity::Affinity,
 };
 
 // Metadata for handling LEFT JOIN operations
@@ -481,6 +473,131 @@ pub fn init_loop(
     Ok(())
 }
 
+/// Emit the hash table build phase for a hash join operation.
+/// This scans the build table and populates the hash table with matching rows.
+fn emit_hash_build_phase(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table_references: &TableReferences,
+    predicates: &[WhereTerm],
+    hash_join_op: &HashJoinOp,
+    mode: OperationMode,
+) -> Result<()> {
+    // Resolve cursors for the build table
+    let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
+    let (table_cursor_id, _index_cursor_id) = build_table.resolve_cursors(program, mode)?;
+
+    // If the build table doesn't currently have a table cursor (e.g., plan chose a
+    // covering index and only opened the index cursor), allocate and open a table
+    // cursor so the hash join can later SeekRowid into the base table if needed.
+    let table_cursor_id = if let Some(cursor_id) = table_cursor_id {
+        cursor_id
+    } else {
+        // Allocate a cursor for the build table
+        let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+            CursorKey::table(build_table.internal_id),
+            match &build_table.table {
+                Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
+                _ => panic!("Hash join build table must be a BTree table"),
+            },
+        );
+        if let Table::BTree(btree) = &build_table.table {
+            program.emit_insn(Insn::OpenRead {
+                cursor_id,
+                root_page: btree.root_page,
+                db: build_table.database_id,
+            });
+        }
+        cursor_id
+    };
+    let iteration_cursor_id = table_cursor_id;
+
+    // use the build table's InternalTableID for the hash table reference
+    let hash_table_reg: usize = build_table.internal_id.into();
+    let num_keys = hash_join_op.join_keys.len();
+    let build_key_start_reg = program.alloc_registers(num_keys);
+
+    // Create new loop for hash table build phase
+    let build_loop_start = program.allocate_label();
+    let build_loop_end = program.allocate_label();
+    let skip_to_next = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: iteration_cursor_id,
+        pc_if_empty: build_loop_end,
+    });
+
+    program.preassign_label_to_next_insn(build_loop_start);
+
+    // Planner invariants for the hash-build side:
+    // - join_lhs_and_rhs only chooses a HashJoin access method when the
+    //   left-hand (build) table's access method is a plain table scan:
+    //   That means the build table is scanned via its base B-tree and is
+    //   not driven by any index or search constraints.
+    // - Because the build side is a full table scan, all build-side join
+    //   key expressions can safely read their columns directly from the
+    //   table cursor. We never need DeferredSeek in the build phase.
+    //
+    // We intentionally do NOT apply WHERE clause filters during hash build.
+    // The hash build phase runs independently of the main join loop, so conditions
+    // that reference other tables (which aren't open yet) would fail.
+    // Filter conditions that reference only the build table will be applied during
+    // the probe phase when we seek to the matching row.
+    // Translate build key expressions into registers
+    for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+        let build_expr = join_key.get_build_expr(predicates);
+        translate_expr(
+            program,
+            Some(table_references),
+            build_expr,
+            build_key_start_reg + idx,
+            &t_ctx.resolver,
+        )?;
+    }
+
+    // Extract collations for each join key expression
+    let collations: Vec<CollationSeq> = hash_join_op
+        .join_keys
+        .iter()
+        .map(|join_key| {
+            let build_expr = join_key.get_build_expr(predicates);
+            get_collseq_from_expr(build_expr, table_references)
+                .ok()
+                .flatten()
+                .unwrap_or(CollationSeq::Binary)
+        })
+        .collect();
+
+    // Insert current row into hash table, passing in the relevant collation.
+    // HashBuild needs the rowid for later SeekRowid.
+    let hash_build_cursor_id = table_cursor_id;
+    program.emit_insn(Insn::HashBuild {
+        cursor_id: hash_build_cursor_id,
+        key_start_reg: build_key_start_reg,
+        num_keys,
+        hash_table_reg,
+        mem_budget: hash_join_op.mem_budget,
+        collations,
+    });
+
+    program.preassign_label_to_next_insn(skip_to_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: iteration_cursor_id,
+        pc_if_next: build_loop_start,
+    });
+
+    program.preassign_label_to_next_insn(build_loop_end);
+    program.emit_insn(Insn::HashBuildFinalize { hash_table_reg });
+
+    // Avoid unresolved labels for the build table's normal loop labels since
+    // we bypass the regular open/close loop plumbing for hash build.
+    let build_loop_labels = t_ctx.labels_main_loop[hash_join_op.build_table_idx];
+    program.preassign_label_to_next_insn(build_loop_labels.next);
+    program.preassign_label_to_next_insn(build_loop_labels.loop_end);
+
+    Ok(())
+}
+
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
@@ -495,6 +612,26 @@ pub fn open_loop(
     mode: OperationMode,
     subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
+    // First pass: emit ALL hash join build phases BEFORE any probe phases.
+    // This is critical for multi-table hash joins where a table can be both
+    // a probe table for one hash join and a build table for another.
+    // Building all hash tables first ensures they are populated before probing.
+    for join in join_order.iter() {
+        let joined_table_index = join.original_idx;
+        let table = &table_references.joined_tables()[joined_table_index];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            emit_hash_build_phase(
+                program,
+                t_ctx,
+                table_references,
+                predicates,
+                hash_join_op,
+                mode.clone(),
+            )?;
+        }
+    }
+
+    // Second pass: emit probe phases and all other operations
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
         let table = &table_references.joined_tables()[joined_table_index];
@@ -632,12 +769,17 @@ pub fn open_loop(
                     ),
                 }
 
-                if let Some(table_cursor_id) = table_cursor_id {
-                    if let Some(index_cursor_id) = index_cursor_id {
-                        program.emit_insn(Insn::DeferredSeek {
-                            index_cursor_id,
-                            table_cursor_id,
-                        });
+                // Don't emit DeferredSeek for hash join build tables - the build phase
+                // iterates over the index, and SeekRowid in the probe phase handles
+                // seeking to the table row.
+                if !is_build_table_for_hash_join {
+                    if let Some(table_cursor_id) = table_cursor_id {
+                        if let Some(index_cursor_id) = index_cursor_id {
+                            program.emit_insn(Insn::DeferredSeek {
+                                index_cursor_id,
+                                table_cursor_id,
+                            });
+                        }
                     }
                 }
             }
@@ -771,128 +913,16 @@ pub fn open_loop(
                 }
             }
             Operation::HashJoin(hash_join_op) => {
-                // Hash Table Build Phase
-                // Resolve cursors for the build table
+                // Build phase was already emitted in the first pass by emit_hash_build_phase.
+                // Here we only emit the probe phase.
+
+                // Get build table info for cursor resolution and hash table reference
                 let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
                 let (build_cursor_id, _) = build_table.resolve_cursors(program, mode.clone())?;
+                let build_cursor_id = build_cursor_id.expect("Build table must have a cursor");
 
-                // If build table doesn't have a cursor (e.g., using covering index),
-                // we need to allocate and open one for the hash join build phase
-                let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
-                    cursor_id
-                } else {
-                    // Allocate a cursor for the build table
-                    let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
-                        CursorKey::table(build_table.internal_id),
-                        match &build_table.table {
-                            Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
-                            _ => panic!("Hash join build table must be a BTree table"),
-                        },
-                    );
-                    if let Table::BTree(btree) = &build_table.table {
-                        program.emit_insn(Insn::OpenRead {
-                            cursor_id,
-                            root_page: btree.root_page,
-                            db: build_table.database_id,
-                        });
-                    }
-                    cursor_id
-                };
-
-                // use the build table's InternalTableID for the hash table reference
                 let hash_table_reg: usize = build_table.internal_id.into();
                 let num_keys = hash_join_op.join_keys.len();
-                let build_key_start_reg = program.alloc_registers(num_keys);
-
-                // Create new loop for hash table build phase
-                let build_loop_start = program.allocate_label();
-                let build_loop_end = program.allocate_label();
-                let skip_to_next = program.allocate_label();
-
-                program.emit_insn(Insn::Rewind {
-                    cursor_id: build_cursor_id,
-                    pc_if_empty: build_loop_end,
-                });
-
-                program.preassign_label_to_next_insn(build_loop_start);
-
-                // Apply WHERE clause filters that reference only the build table
-                // Rows that don't match are skipped and not added to hash table
-                let build_table_join_index = join_order
-                    .iter()
-                    .position(|j| j.original_idx == hash_join_op.build_table_idx);
-                if let Some(build_join_idx) = build_table_join_index {
-                    for cond in predicates
-                        .iter()
-                        .filter(|c| c.from_outer_join.is_none())
-                        .filter(|c| c.should_eval_at_loop(build_join_idx, join_order, subqueries))
-                    {
-                        let jump_target_when_true = program.allocate_label();
-                        let condition_metadata = ConditionMetadata {
-                            jump_if_condition_is_true: false,
-                            jump_target_when_true,
-                            jump_target_when_false: skip_to_next,
-                            jump_target_when_null: skip_to_next,
-                        };
-                        translate_condition_expr(
-                            program,
-                            table_references,
-                            &cond.expr,
-                            condition_metadata,
-                            &t_ctx.resolver,
-                        )?;
-                        program.preassign_label_to_next_insn(jump_target_when_true);
-                    }
-                }
-                // Translate build key expressions into registers
-                for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
-                    let build_expr = join_key.get_build_expr(predicates);
-                    translate_expr(
-                        program,
-                        Some(table_references),
-                        build_expr,
-                        build_key_start_reg + idx,
-                        &t_ctx.resolver,
-                    )?;
-                }
-
-                // Extract collations for each join key expression
-                let collations: Vec<CollationSeq> = hash_join_op
-                    .join_keys
-                    .iter()
-                    .map(|join_key| {
-                        let build_expr = join_key.get_build_expr(predicates);
-                        get_collseq_from_expr(build_expr, table_references)
-                            .ok()
-                            .flatten()
-                            .unwrap_or(CollationSeq::Binary)
-                    })
-                    .collect();
-
-                // Insert current row into hash table, passing in the relevant collation.
-                program.emit_insn(Insn::HashBuild {
-                    cursor_id: build_cursor_id,
-                    key_start_reg: build_key_start_reg,
-                    num_keys,
-                    hash_table_reg,
-                    mem_budget: hash_join_op.mem_budget,
-                    collations,
-                });
-
-                program.preassign_label_to_next_insn(skip_to_next);
-                program.emit_insn(Insn::Next {
-                    cursor_id: build_cursor_id,
-                    pc_if_next: build_loop_start,
-                });
-
-                program.preassign_label_to_next_insn(build_loop_end);
-                program.emit_insn(Insn::HashBuildFinalize { hash_table_reg });
-
-                // Avoid unresolved labels for the build table's normal loop labels since
-                // we bypass the regular open/close loop plumbing for hash build.
-                let build_loop_labels = t_ctx.labels_main_loop[hash_join_op.build_table_idx];
-                program.preassign_label_to_next_insn(build_loop_labels.next);
-                program.preassign_label_to_next_insn(build_loop_labels.loop_end);
 
                 // Hash Table Probe Phase
                 // Iterate through probe table and look up matches in hash table
@@ -923,42 +953,65 @@ pub fn open_loop(
                     key_start_reg: probe_key_start_reg,
                     num_keys,
                     dest_reg: match_reg,
-                    target_pc: next, // Jump if no match
+                    target_pc: next, // Jump if no match - advance to next probe row
                 });
 
                 // Label for match processing, HashNext jumps here to avoid re-probing
                 let match_found_label = program.allocate_label();
                 program.preassign_label_to_next_insn(match_found_label);
 
+                // Allocate hash_next_label upfront - this is where conditions should jump
+                // when they fail (to try the next hash match), NOT to `next` (which advances
+                // the probe cursor). The label will be resolved in close_loop at HashNext.
+                let hash_next_label = program.allocate_label();
+
                 // Seek build table cursor to the matched rowid
                 // The match_reg contains the rowid from the hash table
+                // On failure (should not happen), jump to hash_next to try next match
                 program.emit_insn(Insn::SeekRowid {
                     cursor_id: build_cursor_id,
                     src_reg: match_reg,
-                    target_pc: next, // Should not happen, rowid must exist
+                    target_pc: hash_next_label,
                 });
-                t_ctx.hash_table_ctx = Some(HashCtx {
-                    hash_table_reg,
-                    match_reg,
-                    match_found_label,
-                });
+                t_ctx.hash_table_contexts.insert(
+                    hash_join_op.build_table_idx,
+                    HashCtx {
+                        hash_table_reg,
+                        match_reg,
+                        match_found_label,
+                        hash_next_label,
+                    },
+                );
             }
         }
 
+        // For hash joins, when conditions fail, we should try the next hash match (hash_next_label),
+        // not advance to the next probe row (next). For other operations, use the regular next label.
+        let condition_fail_target = if let Operation::HashJoin(ref hj) = table.op {
+            t_ctx
+                .hash_table_contexts
+                .get(&hj.build_table_idx)
+                .map(|ctx| ctx.hash_next_label)
+                .unwrap_or(next)
+        } else {
+            next
+        };
+
         // First emit outer join conditions, if any.
-        if !is_build_table_for_hash_join {
-            emit_conditions(
-                program,
-                &t_ctx,
-                table_references,
-                join_order,
-                predicates,
-                join_index,
-                next,
-                true,
-                subqueries,
-            )?;
-        }
+        // Note: We emit conditions even for hash join build tables because they may have
+        // non-hash-join conditions that need to be evaluated. Hash join conditions are
+        // already marked as consumed and will be filtered out.
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            condition_fail_target,
+            true,
+            subqueries,
+        )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
         // At this point of execution we are going to emit columns for the left table,
@@ -998,19 +1051,17 @@ pub fn open_loop(
         // If the right table produces a NULL row, control jumps to the point where the match flag is set.
         // The WHERE clause conditions may reference columns from that row, so they cannot be emitted
         // before the flag is set — the row may be filtered out by the WHERE clause.
-        if !is_build_table_for_hash_join {
-            emit_conditions(
-                program,
-                &t_ctx,
-                table_references,
-                join_order,
-                predicates,
-                join_index,
-                next,
-                false,
-                subqueries,
-            )?;
-        }
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            condition_fail_target,
+            false,
+            subqueries,
+        )?;
     }
 
     if subqueries.iter().any(|s| !s.has_been_evaluated()) {
@@ -1447,17 +1498,22 @@ pub fn close_loop(
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
-            Operation::HashJoin(_) => {
+            Operation::HashJoin(ref hash_join_op) => {
                 // Probe table: emit logic for iterating through hash matches
                 if let Some(HashCtx {
                     hash_table_reg,
                     match_reg,
                     match_found_label,
-                }) = &t_ctx.hash_table_ctx
+                    hash_next_label,
+                }) = t_ctx.hash_table_contexts.get(&hash_join_op.build_table_idx)
                 {
                     let hash_table_reg = *hash_table_reg;
                     let match_reg = *match_reg;
                     let label_next_probe_row = program.allocate_label();
+
+                    // Resolve hash_next_label here, this is where conditions jump when they fail
+                    // to try the next hash match before moving to the next probe row.
+                    program.resolve_label(*hash_next_label, program.offset());
 
                     // Check for additional matches with same probe keys
                     // If found: store in match_reg and continue
@@ -1484,14 +1540,6 @@ pub fn close_loop(
                     pc_if_next: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
-
-                // Clean up hash table
-                if let Some(HashCtx { hash_table_reg, .. }) = &t_ctx.hash_table_ctx {
-                    program.emit_insn(Insn::HashClose {
-                        hash_table_reg: *hash_table_reg,
-                    });
-                    t_ctx.hash_table_ctx = None;
-                }
             }
         }
 
@@ -1552,6 +1600,20 @@ pub fn close_loop(
             }
         }
     }
+
+    // After ALL loops are closed, emit HashClose for any hash tables that were built.
+    // This must happen at the very end because hash join probe loops may be nested
+    // inside outer loops that re-enter them.
+    for join in join_order.iter() {
+        let table_index = join.original_idx;
+        let table = &tables.joined_tables()[table_index];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
+            let hash_table_reg: usize = build_table.internal_id.into();
+            program.emit_insn(Insn::HashClose { hash_table_reg });
+        }
+    }
+
     Ok(())
 }
 
