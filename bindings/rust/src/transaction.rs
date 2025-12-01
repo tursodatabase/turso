@@ -1,6 +1,6 @@
 use std::{ops::Deref, sync::atomic::Ordering};
 
-use crate::{Connection, Result};
+use crate::{Connection, Result, Statement};
 
 /// Options for transaction behavior. See [BEGIN
 /// TRANSACTION](http://www.sqlite.org/lang_transaction.html) for details.
@@ -90,6 +90,14 @@ pub struct Transaction<'conn> {
 }
 
 impl Transaction<'_> {
+    // Prepare a statement by passing it onto the connection.
+    // This allows a database update function to be passed a transaction,
+    // prepare a statement, and use it without needing direct access to the
+    // Connection
+    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.conn.prepare(sql).await
+    }
+
     /// Begin a new transaction. Cannot be nested;
     ///
     /// Even though we don't mutate the connection, we take a `&mut Connection`

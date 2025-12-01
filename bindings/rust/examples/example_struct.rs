@@ -1,4 +1,4 @@
-use turso::{Builder, Connection, Error};
+use turso::{transaction::Transaction, Builder, Connection, Error};
 
 #[derive(Debug)]
 struct User {
@@ -15,15 +15,10 @@ async fn create_tables(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-// If I want to be able to flexibly combine this in the future then
-// I should pass in a Transaction not a Connection so that it can
-// be part of a bigger Transaction
-// But if I pass in a transaction I can't prepare the statement here.
-async fn insert_users(conn: &mut Connection) -> Result<(), Error> {
-    let mut stmt = conn
+async fn insert_users(tx: Transaction<'_>) -> Result<(), Error> {
+    let mut stmt = tx
         .prepare("INSERT INTO users (email, age) VALUES (?1, ?2)")
         .await?;
-    let tx = conn.transaction().await?;
     stmt.execute(["foo@example.com", &21.to_string()]).await?;
     stmt.execute(["bar@example.com", &22.to_string()]).await?;
     tx.commit().await?;
@@ -57,7 +52,8 @@ async fn main() -> Result<(), Error> {
     let mut conn = db.connect()?;
 
     create_tables(&conn).await?;
-    insert_users(&mut conn).await?;
+    let tx = conn.transaction().await?;
+    insert_users(tx).await?;
     list_users(&conn).await?;
 
     Ok(())
