@@ -242,12 +242,12 @@ impl SyncEngineIo for JsProtocolIo {
         }))
     }
 
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>) {
+    fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>) {
         let mut work = self.work.lock().unwrap();
         work.push_back(callback);
     }
 
-    fn step_work(&self) {
+    fn step_io_callbacks(&self) {
         let mut items = {
             let mut work = self.work.lock().unwrap();
             work.drain(..).collect::<VecDeque<_>>()

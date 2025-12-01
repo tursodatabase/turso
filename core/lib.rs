@@ -233,8 +233,8 @@ static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
 pub struct Database {
     mv_store: Option<Arc<MvStore>>,
     schema: Mutex<Arc<Schema>>,
-    db_file: Arc<dyn DatabaseStorage>,
-    path: String,
+    pub db_file: Arc<dyn DatabaseStorage>,
+    pub path: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,

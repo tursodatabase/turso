@@ -300,7 +300,7 @@ impl SyncEngine {
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
             let initialized =
-                DatabaseSyncEngine::new(&coro, io.clone(), protocol, &path, opts).await?;
+                DatabaseSyncEngine::create_db(&coro, io.clone(), protocol, &path, opts).await?;
             let connection = initialized.connect_rw(&coro).await?;
 
             db.lock().unwrap().set_connected(connection).map_err(|e| {
@@ -341,7 +341,7 @@ impl SyncEngine {
 
     #[napi]
     pub fn protocol_io_step(&self) -> napi::Result<()> {
-        self.protocol()?.step_work();
+        self.protocol()?.step_io_callbacks();
         Ok(())
     }
 
