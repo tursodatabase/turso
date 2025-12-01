@@ -15,13 +15,12 @@ async fn create_tables(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-async fn insert_users(tx: Transaction<'_>) -> Result<(), Error> {
+async fn insert_users(tx: &Transaction<'_>) -> Result<(), Error> {
     let mut stmt = tx
         .prepare("INSERT INTO users (email, age) VALUES (?1, ?2)")
         .await?;
     stmt.execute(["foo@example.com", &21.to_string()]).await?;
     stmt.execute(["bar@example.com", &22.to_string()]).await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -53,7 +52,8 @@ async fn main() -> Result<(), Error> {
 
     create_tables(&conn).await?;
     let tx = conn.transaction().await?;
-    insert_users(tx).await?;
+    insert_users(&tx).await?;
+    tx.commit().await?;
     list_users(&conn).await?;
 
     Ok(())
