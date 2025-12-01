@@ -146,7 +146,7 @@ typedef struct
 } turso_database_create_result_t;
 
 /** Create database holder but do not open it */
-turso_database_create_result_t turso_database_create(turso_database_config_t config);
+turso_database_create_result_t turso_database_new(turso_database_config_t config);
 
 /** Open database */
 turso_status_t turso_database_open(turso_database_t database);

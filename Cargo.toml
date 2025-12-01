@@ -28,6 +28,7 @@ members = [
     "tests",
     "parser",
     "sync/engine",
+    "sync/sdk-kit",
     "sql_generation",
     "whopper",
     "perf/throughput/turso",
@@ -50,6 +51,7 @@ turso = { path = "bindings/rust", version = "0.4.0-pre.3" }
 turso_node = { path = "bindings/javascript", version = "0.4.0-pre.3" }
 turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.3" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.3" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.3" }
 limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.3" }
 turso_core = { path = "core", version = "0.4.0-pre.3" }
 turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.3" }

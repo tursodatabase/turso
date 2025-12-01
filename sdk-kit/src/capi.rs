@@ -16,7 +16,7 @@ pub mod c {
     include!("bindings.rs");
 }
 
-fn turso_status_ok() -> turso_status_t {
+pub fn turso_status_ok() -> turso_status_t {
     c::turso_status_t {
         error: std::ptr::null(),
         code: c::turso_status_code_t::TURSO_OK,
@@ -38,7 +38,7 @@ pub extern "C" fn turso_setup(config: c::turso_config_t) -> c::turso_status_t {
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_database_create(
+pub extern "C" fn turso_database_new(
     config: c::turso_database_config_t,
 ) -> c::turso_database_create_result_t {
     let config = match rsapi::TursoDatabaseConfig::from_capi(config) {
@@ -52,7 +52,7 @@ pub extern "C" fn turso_database_create(
     };
     c::turso_database_create_result_t {
         status: turso_status_ok(),
-        database: rsapi::TursoDatabase::create(config).to_capi(),
+        database: rsapi::TursoDatabase::new(config).to_capi(),
     }
 }
 
@@ -553,8 +553,8 @@ mod tests {
             c::{
                 turso_config_t, turso_connection_deinit, turso_connection_prepare_first,
                 turso_connection_prepare_first_result_empty, turso_connection_prepare_single,
-                turso_database_config_t, turso_database_connect, turso_database_create,
-                turso_database_deinit, turso_database_open, turso_log_t, turso_setup,
+                turso_database_config_t, turso_database_connect, turso_database_deinit,
+                turso_database_new, turso_database_open, turso_log_t, turso_setup,
                 turso_slice_ref_t, turso_statement_bind_named, turso_statement_bind_positional,
                 turso_statement_column_count, turso_statement_deinit, turso_statement_execute,
                 turso_statement_finalize, turso_statement_row_value, turso_statement_run_io,
@@ -589,7 +589,7 @@ mod tests {
     pub fn test_db_init() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -606,7 +606,7 @@ mod tests {
     pub fn test_db_error() {
         unsafe {
             let path = CString::new("not/existing/path").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -626,7 +626,7 @@ mod tests {
     pub fn test_db_conn_init() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -646,7 +646,7 @@ mod tests {
     pub fn test_db_stmt_prepare() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -677,7 +677,7 @@ mod tests {
     pub fn test_db_stmt_prepare_parse_error() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -711,7 +711,7 @@ mod tests {
     pub fn test_db_stmt_execute() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -762,7 +762,7 @@ mod tests {
     pub fn test_db_stmt_query() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -831,7 +831,7 @@ mod tests {
     pub fn test_db_stmt_bind_positional() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -966,7 +966,7 @@ mod tests {
     pub fn test_db_stmt_bind_named() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -1101,7 +1101,7 @@ mod tests {
     pub fn test_db_stmt_insert_returning() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });
@@ -1218,7 +1218,7 @@ mod tests {
     pub fn test_db_multi_stmt_exec() {
         unsafe {
             let path = CString::new(":memory:").unwrap();
-            let db = turso_database_create(turso_database_config_t {
+            let db = turso_database_new(turso_database_config_t {
                 path: path.as_ptr(),
                 ..Default::default()
             });

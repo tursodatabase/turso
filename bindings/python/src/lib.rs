@@ -154,11 +154,12 @@ pub fn py_turso_setup(py: Python, config: &PyTursoSetupConfig) -> PyResult<()> {
 /// Open the database
 #[pyfunction]
 pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTursoDatabase> {
-    let database = rsapi::TursoDatabase::create(rsapi::TursoDatabaseConfig {
+    let database = rsapi::TursoDatabase::new(rsapi::TursoDatabaseConfig {
         path: config.path.clone(),
         experimental_features: config.experimental_features.clone(),
         async_io: config.async_io,
         io: None,
+        db_file: None,
     });
     database.open().map_err(turso_error_to_py_err)?;
     Ok(PyTursoDatabase { database })

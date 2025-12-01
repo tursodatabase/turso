@@ -5215,6 +5215,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_sync_sdk_kit"
+version = "0.4.0-pre.3"
+dependencies = [
+ "bindgen",
+ "env_logger 0.11.7",
+ "genawaiter",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "turso_core",
+ "turso_sdk_kit",
+ "turso_sdk_kit_macros",
+ "turso_sync_engine",
+]
+
+[[package]]
 name = "turso_whopper"
 version = "0.4.0-pre.3"
 dependencies = [

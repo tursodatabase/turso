@@ -349,8 +349,7 @@ impl Default for turso_database_create_result_t {
 }
 unsafe extern "C" {
     #[doc = " Create database holder but do not open it"]
-    pub fn turso_database_create(config: turso_database_config_t)
-        -> turso_database_create_result_t;
+    pub fn turso_database_new(config: turso_database_config_t) -> turso_database_create_result_t;
 }
 unsafe extern "C" {
     #[doc = " Open database"]
