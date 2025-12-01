@@ -1287,12 +1287,11 @@ pub enum Insn {
     /// Build a hash table from a cursor for hash join.
     /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
     /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
-    /// The hash table is stored in hash_table_reg and created on first call.
     HashBuild {
         cursor_id: CursorID,
         key_start_reg: usize,
         num_keys: usize,
-        hash_table_reg: usize,
+        hash_table_id: usize,
         mem_budget: usize,
         collations: Vec<CollationSeq>,
     },
@@ -1300,7 +1299,7 @@ pub enum Insn {
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
     HashBuildFinalize {
-        hash_table_reg: usize,
+        hash_table_id: usize,
     },
 
     /// Probe a hash table for matches.
@@ -1309,7 +1308,7 @@ pub enum Insn {
     /// For each match, load the build-side row into dest_reg and continue.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_reg: usize,
+        hash_table_id: usize,
         key_start_reg: usize,
         num_keys: usize,
         dest_reg: usize,
@@ -1321,7 +1320,7 @@ pub enum Insn {
     /// If another match is found, store it in dest_reg and continue to next instruction.
     /// If no more matches, jump to target_pc.
     HashNext {
-        hash_table_reg: usize,
+        hash_table_id: usize,
         dest_reg: usize,
         target_pc: BranchOffset,
     },
@@ -1329,7 +1328,7 @@ pub enum Insn {
     /// Free hash table resources.
     /// Closes the hash table stored in hash_table_reg and releases memory.
     HashClose {
-        hash_table_reg: usize,
+        hash_table_id: usize,
     },
 }
 

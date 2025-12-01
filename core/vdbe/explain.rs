@@ -1952,7 +1952,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_reg, mem_budget, collations: _} => (
+        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _} => (
             "HashBuild",
             *cursor_id as i64,
             *key_start_reg as i64,
@@ -1961,7 +1961,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuildFinalize{hash_table_reg} => (
+        Insn::HashBuildFinalize{hash_table_id: hash_table_reg} => (
             "HashBuildFinalize",
             *hash_table_reg as i64,
             0,
@@ -1970,7 +1970,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc} => (
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc} => (
             "HashProbe",
             *hash_table_reg as i64,
             *key_start_reg as i64,
@@ -1979,7 +1979,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashNext{hash_table_reg, dest_reg, target_pc} => (
+        Insn::HashNext{hash_table_id: hash_table_reg, dest_reg, target_pc} => (
             "HashNext",
             *hash_table_reg as i64,
             *dest_reg as i64,
@@ -1988,7 +1988,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashClose{hash_table_reg} => (
+        Insn::HashClose{hash_table_id: hash_table_reg} => (
             "HashClose",
             *hash_table_reg as i64,
             0,

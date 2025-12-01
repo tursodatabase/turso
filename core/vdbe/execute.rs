@@ -9353,7 +9353,7 @@ pub fn op_hash_build(
             cursor_id,
             key_start_reg,
             num_keys,
-            hash_table_reg,
+            hash_table_id,
             mem_budget,
             collations,
         },
@@ -9364,7 +9364,7 @@ pub fn op_hash_build(
         .op_hash_build_state
         .take()
         .filter(|s| {
-            s.hash_table_reg == *hash_table_reg
+            s.hash_table_id == *hash_table_id
                 && s.cursor_id == *cursor_id
                 && s.key_start_reg == *key_start_reg
                 && s.num_keys == *num_keys
@@ -9374,13 +9374,13 @@ pub fn op_hash_build(
             key_idx: 0,
             rowid: None,
             cursor_id: *cursor_id,
-            hash_table_reg: *hash_table_reg,
+            hash_table_id: *hash_table_id,
             key_start_reg: *key_start_reg,
             num_keys: *num_keys,
         });
 
     // Create hash table if it doesn't exist yet
-    if !state.hash_tables.contains_key(hash_table_reg) {
+    if !state.hash_tables.contains_key(hash_table_id) {
         let config = HashTableConfig {
             initial_buckets: 1024,
             mem_budget: *mem_budget,
@@ -9388,7 +9388,7 @@ pub fn op_hash_build(
             collations: collations.clone(),
         };
         let hash_table = HashTable::new(config, pager.io.clone());
-        state.hash_tables.insert(*hash_table_reg, hash_table);
+        state.hash_tables.insert(*hash_table_id, hash_table);
     }
 
     // Read pre-computed key values directly from registers
@@ -9430,7 +9430,7 @@ pub fn op_hash_build(
     }
 
     // Insert the rowid into the hash table
-    if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
         match ht.insert(key_values.clone(), rowid) {
@@ -9461,8 +9461,8 @@ pub fn op_hash_build_finalize(
     _pager: &Arc<Pager>,
     _mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(HashBuildFinalize { hash_table_reg }, insn);
-    if let Some(ht) = state.hash_tables.get_mut(hash_table_reg) {
+    load_insn!(HashBuildFinalize { hash_table_id }, insn);
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
         match ht.finalize_build()? {
             crate::types::IOResult::Done(()) => {
@@ -9487,7 +9487,7 @@ pub fn op_hash_probe(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         HashProbe {
-            hash_table_reg,
+            hash_table_id,
             key_start_reg,
             num_keys,
             dest_reg,
@@ -9496,7 +9496,7 @@ pub fn op_hash_probe(
         insn
     );
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_reg == *hash_table_reg {
+        if op_state.hash_table_id == *hash_table_id {
             (op_state.probe_keys, Some(op_state.partition_idx))
         } else {
             // Different hash table, read fresh keys
@@ -9517,8 +9517,8 @@ pub fn op_hash_probe(
         (keys, None)
     };
 
-    let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
-        LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
     })?;
 
     // For spilled hash tables, load the appropriate partition on demand
@@ -9535,7 +9535,7 @@ pub fn op_hash_probe(
                 IOResult::IO(io) => {
                     state.op_hash_probe_state = Some(OpHashProbeState {
                         probe_keys,
-                        hash_table_reg: *hash_table_reg,
+                        hash_table_id: *hash_table_id,
                         partition_idx,
                     });
                     return Ok(InsnFunctionStepResult::IO(io));
@@ -9580,15 +9580,15 @@ pub fn op_hash_next(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         HashNext {
-            hash_table_reg,
+            hash_table_id,
             dest_reg,
             target_pc,
         },
         insn
     );
 
-    let hash_table = state.hash_tables.get_mut(hash_table_reg).ok_or_else(|| {
-        LimboError::InternalError(format!("Hash table not found in register {hash_table_reg}"))
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
     match hash_table.next_match() {
         Some(entry) => {
@@ -9610,8 +9610,8 @@ pub fn op_hash_close(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(HashClose { hash_table_reg }, insn);
-    if let Some(mut hash_table) = state.hash_tables.remove(hash_table_reg) {
+    load_insn!(HashClose { hash_table_id }, insn);
+    if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
         hash_table.close();
     }
     state.pc += 1;

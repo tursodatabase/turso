@@ -486,34 +486,10 @@ fn emit_hash_build_phase(
     // Resolve cursors for the build table
     let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
     let (table_cursor_id, _index_cursor_id) = build_table.resolve_cursors(program, mode)?;
-
-    // If the build table doesn't currently have a table cursor (e.g., plan chose a
-    // covering index and only opened the index cursor), allocate and open a table
-    // cursor so the hash join can later SeekRowid into the base table if needed.
-    let table_cursor_id = if let Some(cursor_id) = table_cursor_id {
-        cursor_id
-    } else {
-        // Allocate a cursor for the build table
-        let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
-            CursorKey::table(build_table.internal_id),
-            match &build_table.table {
-                Table::BTree(btree) => CursorType::BTreeTable(btree.clone()),
-                _ => panic!("Hash join build table must be a BTree table"),
-            },
-        );
-        if let Table::BTree(btree) = &build_table.table {
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: btree.root_page,
-                db: build_table.database_id,
-            });
-        }
-        cursor_id
-    };
-    let iteration_cursor_id = table_cursor_id;
+    let iteration_cursor_id = table_cursor_id.expect("Build table must have a cursor");
 
     // use the build table's InternalTableID for the hash table reference
-    let hash_table_reg: usize = build_table.internal_id.into();
+    let hash_table_id: usize = build_table.internal_id.into();
     let num_keys = hash_join_op.join_keys.len();
     let build_key_start_reg = program.alloc_registers(num_keys);
 
@@ -570,12 +546,11 @@ fn emit_hash_build_phase(
 
     // Insert current row into hash table, passing in the relevant collation.
     // HashBuild needs the rowid for later SeekRowid.
-    let hash_build_cursor_id = table_cursor_id;
     program.emit_insn(Insn::HashBuild {
-        cursor_id: hash_build_cursor_id,
+        cursor_id: iteration_cursor_id,
         key_start_reg: build_key_start_reg,
         num_keys,
-        hash_table_reg,
+        hash_table_id,
         mem_budget: hash_join_op.mem_budget,
         collations,
     });
@@ -587,7 +562,7 @@ fn emit_hash_build_phase(
     });
 
     program.preassign_label_to_next_insn(build_loop_end);
-    program.emit_insn(Insn::HashBuildFinalize { hash_table_reg });
+    program.emit_insn(Insn::HashBuildFinalize { hash_table_id });
 
     // Avoid unresolved labels for the build table's normal loop labels since
     // we bypass the regular open/close loop plumbing for hash build.
@@ -949,7 +924,7 @@ pub fn open_loop(
                 // Probe hash table with keys, store matched rowid in register
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
-                    hash_table_reg,
+                    hash_table_id: hash_table_reg,
                     key_start_reg: probe_key_start_reg,
                     num_keys,
                     dest_reg: match_reg,
@@ -1519,7 +1494,7 @@ pub fn close_loop(
                     // If found: store in match_reg and continue
                     // If not found: jump to next probe row
                     program.emit_insn(Insn::HashNext {
-                        hash_table_reg,
+                        hash_table_id: hash_table_reg,
                         dest_reg: match_reg,
                         target_pc: label_next_probe_row,
                     });
@@ -1610,7 +1585,9 @@ pub fn close_loop(
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
             let hash_table_reg: usize = build_table.internal_id.into();
-            program.emit_insn(Insn::HashClose { hash_table_reg });
+            program.emit_insn(Insn::HashClose {
+                hash_table_id: hash_table_reg,
+            });
         }
     }
 

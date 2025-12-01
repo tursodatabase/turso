@@ -319,7 +319,7 @@ pub struct OpHashBuildState {
     pub key_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
-    pub hash_table_reg: usize,
+    pub hash_table_id: usize,
     pub key_start_reg: usize,
     pub num_keys: usize,
 }
@@ -331,7 +331,7 @@ pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
     pub probe_keys: Vec<Value>,
     /// Hash table register being probed
-    pub hash_table_reg: usize,
+    pub hash_table_id: usize,
     /// Partition index being loaded (if any)
     pub partition_idx: usize,
 }
