@@ -9,7 +9,7 @@ This document is a quick helper to get you going.
 Turso is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
 
 * [Architecture of SQLite](https://www.sqlite.org/arch.html)
-* Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.fi/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
+* Sibsankar Haldar. [SQLite Database System Design and Implementation (2nd Edition)](https://books.google.com/books/?id=yWzwCwAAQBAJ&redir_esc=y). 2016
 * Jay Kreibich. [Using SQLite: Small. Fast. Reliable. Choose Any Three. 1st Edition](https://www.oreilly.com/library/view/using-sqlite/9781449394592/). 2010
 
 If you are new to Rust, the following books are recommended reading:
