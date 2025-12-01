@@ -18,6 +18,7 @@
 //! https://www.sqlite.org/opcode.html
 
 pub mod affinity;
+pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
 pub mod explain;
@@ -67,6 +68,7 @@ use execute::{
 use parking_lot::RwLock;
 use turso_parser::ast::ResolveType;
 
+use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
@@ -359,6 +361,9 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
 }
 
 impl std::fmt::Debug for Program {
@@ -422,6 +427,7 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::new(),
+            bloom_filters: HashMap::new(),
         }
     }
 
@@ -511,6 +517,7 @@ impl ProgramState {
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
         self.rowsets.clear();
+        self.bloom_filters.clear();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -571,6 +578,56 @@ impl ProgramState {
                 Ok(())
             }
         }
+    }
+
+    /// Gets or creates a bloom filter for the given cursor ID.
+    ///
+    /// This is used when building ephemeral indexes or hash tables to
+    /// populate the bloom filter with inserted keys.
+    pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(BloomFilter::new)
+    }
+
+    /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
+    ///
+    /// Use this when you have an estimate of how many items will be inserted.
+    pub fn get_or_create_bloom_filter_with_capacity(
+        &mut self,
+        cursor_id: usize,
+        expected_items: u32,
+        false_positive_rate: f32,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| BloomFilter::with_capacity(expected_items, false_positive_rate))
+    }
+
+    /// Gets an existing bloom filter for the given cursor ID.
+    ///
+    /// Returns None if no bloom filter exists for this cursor.
+    pub fn get_bloom_filter(&self, cursor_id: usize) -> Option<&BloomFilter> {
+        self.bloom_filters.get(&cursor_id)
+    }
+
+    /// Gets a mutable reference to an existing bloom filter for the given cursor ID.
+    ///
+    /// Returns None if no bloom filter exists for this cursor.
+    pub fn get_bloom_filter_mut(&mut self, cursor_id: usize) -> Option<&mut BloomFilter> {
+        self.bloom_filters.get_mut(&cursor_id)
+    }
+
+    /// Removes and drops the bloom filter for the given cursor ID.
+    ///
+    /// This should be called when closing an ephemeral cursor or resetting a sorter.
+    pub fn remove_bloom_filter(&mut self, cursor_id: usize) {
+        self.bloom_filters.remove(&cursor_id);
+    }
+
+    /// Checks if a bloom filter exists for the given cursor ID.
+    pub fn has_bloom_filter(&self, cursor_id: usize) -> bool {
+        self.bloom_filters.contains_key(&cursor_id)
     }
 }
 
