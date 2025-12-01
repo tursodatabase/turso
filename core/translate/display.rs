@@ -152,7 +152,7 @@ impl Display for SelectPlan {
                     )?;
                 }
                 Operation::HashJoin(_) => {
-                    writeln!(f, "{}HASH JOIN", indent)?;
+                    writeln!(f, "{indent}HASH JOIN")?;
                 }
             }
         }

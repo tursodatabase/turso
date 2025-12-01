@@ -538,9 +538,7 @@ pub fn emit_from_clause_subqueries(
                         index_method.definition().method_name
                     )
                 }
-                Operation::HashJoin(_) => {
-                    format!("HASH JOIN")
-                }
+                Operation::HashJoin(_) => "HASH JOIN".to_string(),
             }
         );
 

@@ -1957,7 +1957,7 @@ pub fn insn_to_row(
             *cursor_id as i64,
             *key_start_reg as i64,
             *num_keys as i64,
-            Value::build_text(format!("r{} budget={}", hash_table_reg, mem_budget)),
+            Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}")),
             0,
             String::new(),
         ),
