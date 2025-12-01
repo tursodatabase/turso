@@ -27,18 +27,12 @@ use crate::{
     io_operations::IoOperations,
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus, SyncEngineStats,
-        DATABASE_METADATA_VERSION,
+        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus,
+        PartialBootstrapStrategy, SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
 };
-
-#[derive(Clone, Debug)]
-pub enum PartialBootstrapStrategy {
-    Prefix { length: usize },
-    Query { query: String },
-}
 
 #[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
@@ -50,7 +44,7 @@ pub struct DatabaseSyncEngineOpts {
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
-    pub partial_bootstrap_strategy: Option<PartialBootstrapStrategy>,
+    pub partial_bootstrap_strategy: PartialBootstrapStrategy,
 }
 
 pub struct DataStats {
@@ -97,22 +91,45 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
 fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
+fn create_main_db_wal_path(main_db_path: &str) -> String {
+    format!("{main_db_path}-wal")
+}
+fn create_revert_db_wal_path(main_db_path: &str) -> String {
+    format!("{main_db_path}-wal-revert")
+}
+fn create_meta_path(main_db_path: &str) -> String {
+    format!("{main_db_path}-info")
+}
+fn create_changes_path(main_db_path: &str) -> String {
+    format!("{main_db_path}-changes")
+}
 
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
-    /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
-    pub async fn new<Ctx>(
+    pub async fn read_db_meta<Ctx>(
+        coro: &Coro<Ctx>,
+        sync_engine_io: Arc<IO>,
+        main_db_path: &str,
+    ) -> Result<Option<DatabaseMetadata>> {
+        let meta_path = create_meta_path(&main_db_path);
+        let meta_completion = sync_engine_io.full_read(&meta_path)?;
+        let meta_data = wait_all_results(coro, &meta_completion, None).await?;
+        if meta_data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(DatabaseMetadata::load(&meta_data)?))
+        }
+    }
+
+    pub async fn bootstrap_db<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
         sync_engine_io: Arc<IO>,
         main_db_path: &str,
-        mut opts: DatabaseSyncEngineOpts,
-    ) -> Result<Self> {
-        let main_db_wal_path = format!("{main_db_path}-wal");
-        let revert_db_wal_path = format!("{main_db_path}-wal-revert");
-        let meta_path = format!("{main_db_path}-info");
-        let changes_path = format!("{main_db_path}-changes");
+        opts: &DatabaseSyncEngineOpts,
+    ) -> Result<DatabaseMetadata> {
+        let meta_path = create_meta_path(main_db_path);
 
-        tracing::info!("init(path={}): opts={:?}", main_db_path, opts);
+        tracing::info!("prepare(path={}): opts={:?}", main_db_path, opts);
 
         let completion = sync_engine_io.full_read(&meta_path)?;
         let data = wait_all_results(coro, &completion, None).await?;
@@ -122,8 +139,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Some(DatabaseMetadata::load(&data)?)
         };
         let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
-        let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.take();
-        let partial = partial_bootstrap_strategy.is_some();
+        let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.clone();
+        let partial = matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
 
         let meta = match meta {
             Some(meta) => meta,
@@ -207,6 +224,19 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             return Err(Error::DatabaseSyncEngineError(error));
         }
 
+        Ok(meta)
+    }
+
+    pub fn init_db_storage(
+        io: Arc<dyn turso_core::IO>,
+        sync_engine_io: Arc<IO>,
+        meta: &DatabaseMetadata,
+        main_db_path: &str,
+        opts: &DatabaseSyncEngineOpts,
+    ) -> Result<Arc<dyn DatabaseStorage>> {
+        let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
+        let partial_bootstrap_strategy = &opts.partial_bootstrap_strategy;
+        let partial = matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if partial {
             let Some(partial_bootstrap_server_revision) = &meta.partial_bootstrap_server_revision
@@ -230,16 +260,29 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
 
-        let main_db = turso_core::Database::open_with_flags(
-            io.clone(),
-            main_db_path,
-            db_file.clone(),
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new().with_indexes(true),
-            None,
-        )?;
+        Ok(db_file)
+    }
 
-        // DB wasn't bootstrapped but remote is encrypted - so we must properly set reserved bytes field in advance
+    pub async fn open_db<Ctx>(
+        coro: &Coro<Ctx>,
+        sync_engine_io: Arc<IO>,
+        main_db: Arc<turso_core::Database>,
+        opts: DatabaseSyncEngineOpts,
+    ) -> Result<Self> {
+        let main_db_path = main_db.path.to_string();
+
+        let meta_path = create_meta_path(&main_db_path);
+        let meta_completion = sync_engine_io.full_read(&meta_path)?;
+        let meta_data = wait_all_results(coro, &meta_completion, None).await?;
+        let meta = if meta_data.is_empty() {
+            return Err(Error::DatabaseSyncEngineError(
+                "meta must be initialized before open".to_string(),
+            ));
+        } else {
+            DatabaseMetadata::load(&meta_data)?
+        };
+
+        // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
             let conn = main_db.connect()?;
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
@@ -254,17 +297,22 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             cdc_mode: Some("full".to_string()),
         };
         tracing::info!("initialize database tape connection: path={}", main_db_path);
+        let main_db_io = main_db.io.clone();
+        let main_db_file = main_db.db_file.clone();
         let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
-        let changes_file = io.open_file(&changes_path, OpenFlags::Create, false)?;
+
+        let changes_path = create_changes_path(&main_db_path);
+        let changes_file = main_db_io.open_file(&changes_path, OpenFlags::Create, false)?;
+
         let db = Self {
-            io,
-            sync_engine_io,
-            db_file,
-            main_db_wal_path,
+            io: main_db_io,
+            sync_engine_io: SyncEngineIoStats::new(sync_engine_io),
+            db_file: main_db_file,
             main_tape,
-            revert_db_wal_path,
             main_db_path: main_db_path.to_string(),
-            meta_path: format!("{main_db_path}-info"),
+            main_db_wal_path: create_main_db_wal_path(&main_db_path),
+            revert_db_wal_path: create_revert_db_wal_path(&main_db_path),
+            meta_path: create_meta_path(&main_db_path),
             changes_file: Arc::new(Mutex::new(Some(changes_file))),
             opts,
             meta: Mutex::new(meta.clone()),
@@ -283,6 +331,40 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         tracing::info!("sync engine was initialized");
         Ok(db)
+    }
+
+    /// Creates new instance of SyncEngine and initialize it immediately if no consistent local data exists
+    pub async fn create_db<Ctx>(
+        coro: &Coro<Ctx>,
+        io: Arc<dyn turso_core::IO>,
+        sync_engine_io: Arc<IO>,
+        main_db_path: &str,
+        opts: DatabaseSyncEngineOpts,
+    ) -> Result<Self> {
+        let meta = Self::bootstrap_db(
+            coro,
+            io.clone(),
+            sync_engine_io.clone(),
+            main_db_path,
+            &opts,
+        )
+        .await?;
+        let main_db_storage = Self::init_db_storage(
+            io.clone(),
+            sync_engine_io.clone(),
+            &meta,
+            main_db_path,
+            &opts,
+        )?;
+        let main_db = turso_core::Database::open_with_flags(
+            io.clone(),
+            main_db_path,
+            main_db_storage,
+            OpenFlags::Create,
+            turso_core::DatabaseOpts::new().with_indexes(true),
+            None,
+        )?;
+        Self::open_db(coro, sync_engine_io, main_db, opts).await
     }
 
     fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {

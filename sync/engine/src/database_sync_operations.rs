@@ -13,7 +13,7 @@ use turso_core::{
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
-    database_sync_engine::{DataStats, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
+    database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
         run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
@@ -29,7 +29,7 @@ use crate::{
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
         DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, SyncEngineIoResult,
+        DbSyncStatus, PartialBootstrapStrategy, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -1130,11 +1130,11 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
-    partial_bootstrap_strategy: Option<PartialBootstrapStrategy>,
+    partial_bootstrap_strategy: PartialBootstrapStrategy,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if partial_bootstrap_strategy.is_some() {
+            if matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None) {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
@@ -1152,11 +1152,9 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
-    bootstrap: Option<PartialBootstrapStrategy>,
+    bootstrap: PartialBootstrapStrategy,
 ) -> Result<DatabasePullRevision> {
-    let server_pages_selector = if let Some(PartialBootstrapStrategy::Prefix { length }) =
-        &bootstrap
-    {
+    let server_pages_selector = if let PartialBootstrapStrategy::Prefix { length } = &bootstrap {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
         let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
@@ -1167,7 +1165,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let server_query_selector = if let Some(PartialBootstrapStrategy::Query { query }) = bootstrap {
+    let server_query_selector = if let PartialBootstrapStrategy::Query { query } = bootstrap {
         query
     } else {
         String::new()

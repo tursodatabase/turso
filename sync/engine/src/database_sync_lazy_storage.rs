@@ -148,7 +148,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
         });
         self.sync_engine_io
-            .add_work(Box::new(move || match generator.resume_with(Ok(())) {
+            .add_io_callback(Box::new(move || match generator.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(_) => false,
                 genawaiter::GeneratorState::Complete(_) => true,
             }));

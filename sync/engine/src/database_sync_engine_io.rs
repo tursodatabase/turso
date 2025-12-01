@@ -30,6 +30,6 @@ pub trait SyncEngineIo: Send + Sync + 'static {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<Self::DataCompletionBytes>;
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>);
-    fn step_work(&self);
+    fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>);
+    fn step_io_callbacks(&self);
 }

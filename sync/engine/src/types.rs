@@ -35,6 +35,13 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum PartialBootstrapStrategy {
+    None,
+    Prefix { length: usize },
+    Query { query: String },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DbSyncInfo {
     pub current_generation: u64,
