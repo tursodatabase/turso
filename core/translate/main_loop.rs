@@ -994,7 +994,7 @@ pub fn open_loop(
                 .hash_table_contexts
                 .get(&hj.build_table_idx)
                 .map(|ctx| ctx.hash_next_label)
-                .unwrap_or(next)
+                .expect("should have hash context for build table")
         } else {
             next
         };

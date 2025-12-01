@@ -724,7 +724,7 @@ impl SpillState {
 ///       - Some partitions may be `Loaded` (disk-backed but currently
 ///         resident in memory as buckets; counted in `loaded_partitions_mem`
 ///         and tracked in `loaded_partitions_lru`).
-///   * The executor is expected to:
+///   * The VDBE is expected to:
 ///    - Compute the partition index for a probe key:
 ///      `partition_for_keys(probe_keys)`.
 ///    - Ensure the partition is resident:
@@ -765,9 +765,6 @@ impl SpillState {
 ///   - For partitions that are already loaded, `load_spilled_partition()`
 ///     simply updates their position in the LRU without changing the memory
 ///     accounting.
-///
-/// The vdbe is responsible for ensuring that the correct partition has been
-/// loaded before calling `probe_partition` / `next_match` in spilled mode.
 pub struct HashTable {
     /// The hash buckets (used when not spilled).
     buckets: Vec<HashBucket>,
@@ -851,12 +848,6 @@ impl HashTable {
 
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
     /// When memory budget is exceeded, triggers grace hash join by partitioning and spilling.
-    ///
-    /// # Arguments
-    /// * `key_values` - The join key values used for hashing and equality comparison
-    /// * `rowid` - The rowid of the row in the build table (for SeekRowid fallback)
-    /// * `payload_values` - Optional payload columns to store directly in the entry,
-    ///   avoiding the need for SeekRowid during probe phase when all needed columns are included
     pub fn insert(
         &mut self,
         key_values: Vec<Value>,
@@ -1018,7 +1009,6 @@ impl HashTable {
     }
 
     /// Spill as many whole partitions as needed to keep the incoming entry within budget.
-    /// Returns a pending completion if an async write was scheduled.
     fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
         loop {
             if self.mem_used + entry_size <= self.mem_budget {
@@ -1074,7 +1064,6 @@ impl HashTable {
 
     /// Finalize the build phase and prepare for probing.
     /// If spilled, flushes remaining in-memory partition entries to disk.
-    /// Returns IOResult::IO if there's pending I/O, caller should re-enter after completion.
     pub fn finalize_build(&mut self) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
@@ -1088,7 +1077,6 @@ impl HashTable {
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                 for spilled in &spill_state.partitions {
                     if matches!(spilled.io_state.get(), SpillIOState::WaitingForWrite) {
-                        // I/O still pending, caller should wait
                         io_yield_one!(Completion::new_yield());
                     }
                 }
@@ -1401,8 +1389,6 @@ impl HashTable {
                         },
                     );
                     let completion = Completion::new_read(read_buffer, read_complete);
-
-                    // Re-borrow to get the file handle only
                     let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                     let c = spill_state.temp_file.file.pread(file_offset, completion)?;
                     if !c.finished() {
@@ -1473,8 +1459,7 @@ impl HashTable {
     }
 
     /// Probe a specific partition with the given keys. The partition must be loaded first via `load_spilled_partition`.
-    /// Executor *must* call load_spilled_partition(partition_idx) and get IOResult::Done(())
-    /// before calling probe for that partition
+    /// VDBE *must* call load_spilled_partition(partition_idx) and get IOResult::Done before calling probe.
     pub fn probe_partition(
         &mut self,
         partition_idx: usize,

@@ -400,17 +400,9 @@ pub fn try_hash_join_access_method(
     // Avoid hash join on self-joins over the same underlying table. The current
     // implementation assumes distinct build/probe sources; sharing storage can
     // lead to incorrect matches.
-    if build_table
-        .table
-        .btree()
-        .and_then(|b| {
-            probe_table
-                .table
-                .btree()
-                .map(|p| b.root_page == p.root_page)
-        })
-        .unwrap_or(false)
-    {
+    let probe_root_page = probe_table.table.btree().expect("table is BTree").root_page;
+    let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
+    if build_root_page == probe_root_page {
         return None;
     }
     // Hash joins only support INNER JOIN semantics.
