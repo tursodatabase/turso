@@ -122,7 +122,6 @@ impl LimitCtx {
         }
     }
 }
-
 #[derive(Debug, Clone)]
 pub struct HashCtx {
     pub match_reg: usize,
@@ -134,6 +133,12 @@ pub struct HashCtx {
     /// When conditions fail within a hash join, they should jump here to try the next
     /// hash match, rather than jumping to the outer loop's next label.
     pub hash_next_label: BranchOffset,
+    /// Starting register where payload columns are stored after HashProbe/HashNext.
+    /// None if payload optimization is not used for this hash join.
+    pub payload_start_reg: Option<usize>,
+    /// Column indices from the build table that are stored in payload, in order.
+    /// payload_start_reg + i contains the value for column payload_columns[i].
+    pub payload_columns: Vec<usize>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.

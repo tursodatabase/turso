@@ -1287,6 +1287,8 @@ pub enum Insn {
     /// Build a hash table from a cursor for hash join.
     /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
     /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
+    /// Optionally also stores payload values (result columns from the build table) to avoid
+    /// an additional btree seek during probe phase.
     HashBuild {
         cursor_id: CursorID,
         key_start_reg: usize,
@@ -1294,6 +1296,11 @@ pub enum Insn {
         hash_table_id: usize,
         mem_budget: usize,
         collations: Vec<CollationSeq>,
+        /// Starting register for payload columns to store in the hash entry.
+        /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
+        payload_start_reg: Option<usize>,
+        /// Number of payload columns to read
+        num_payload: usize,
     },
 
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
@@ -1305,7 +1312,9 @@ pub enum Insn {
     /// Probe a hash table for matches.
     /// Extract probe keys from registers key_start_reg..key_start_reg+num_keys-1,
     /// hash them, and look up matches in the hash table stored in hash_table_reg.
-    /// For each match, load the build-side row into dest_reg and continue.
+    /// For each match, load the build-side rowid into dest_reg and continue.
+    /// If payload columns were stored during build, they are written to
+    /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
         hash_table_id: usize,
@@ -1313,20 +1322,28 @@ pub enum Insn {
         num_keys: usize,
         dest_reg: usize,
         target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
     },
 
     /// Advance to next matching row in hash table bucket.
     /// Used for handling hash collisions and duplicate keys.
-    /// If another match is found, store it in dest_reg and continue to next instruction.
+    /// If another match is found, store rowid in dest_reg (and payload in payload_dest_reg if set).
     /// If no more matches, jump to target_pc.
     HashNext {
         hash_table_id: usize,
         dest_reg: usize,
         target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry, if we are caching payload.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
     },
 
     /// Free hash table resources.
-    /// Closes the hash table stored in hash_table_reg and releases memory.
+    /// Closes the hash table referenced by hash_table_id and releases memory.
     HashClose {
         hash_table_id: usize,
     },

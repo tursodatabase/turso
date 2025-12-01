@@ -22,7 +22,7 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
-use crate::vdbe::hash_table::{HashTable, HashTableConfig};
+use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
@@ -9356,6 +9356,8 @@ pub fn op_hash_build(
             hash_table_id,
             mem_budget,
             collations,
+            payload_start_reg,
+            num_payload,
         },
         insn
     );
@@ -9372,6 +9374,8 @@ pub fn op_hash_build(
         .unwrap_or_else(|| OpHashBuildState {
             key_values: Vec::with_capacity(*num_keys),
             key_idx: 0,
+            payload_values: Vec::with_capacity(*num_payload),
+            payload_idx: 0,
             rowid: None,
             cursor_id: *cursor_id,
             hash_table_id: *hash_table_id,
@@ -9398,6 +9402,17 @@ pub fn op_hash_build(
         let value = reg.get_value().clone();
         op_state.key_values.push(value);
         op_state.key_idx += 1;
+    }
+
+    // Read payload values from registers if provided
+    if let Some(payload_reg) = payload_start_reg {
+        while op_state.payload_idx < *num_payload {
+            let i = op_state.payload_idx;
+            let reg = &state.registers[*payload_reg + i];
+            let value = reg.get_value().clone();
+            op_state.payload_values.push(value);
+            op_state.payload_idx += 1;
+        }
     }
 
     // Get the rowid from the cursor
@@ -9433,15 +9448,18 @@ pub fn op_hash_build(
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
-        match ht.insert(key_values.clone(), rowid) {
+        let payload_values = std::mem::take(&mut op_state.payload_values);
+        match ht.insert(key_values.clone(), rowid, payload_values.clone()) {
             Ok(IOResult::Done(())) => {}
             Ok(IOResult::IO(io)) => {
                 op_state.key_values = key_values;
+                op_state.payload_values = payload_values;
                 state.op_hash_build_state = Some(op_state);
                 return Ok(InsnFunctionStepResult::IO(io));
             }
             Err(e) => {
                 op_state.key_values = key_values;
+                op_state.payload_values = payload_values;
                 state.op_hash_build_state = Some(op_state);
                 return Err(e);
             }
@@ -9478,6 +9496,20 @@ pub fn op_hash_build_finalize(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Write payload values from a hash entry to registers.
+fn write_hash_payload_to_registers(
+    registers: &mut [Register],
+    entry: &HashEntry,
+    payload_dest_reg: Option<usize>,
+    num_payload: usize,
+) {
+    if let Some(dest_reg) = payload_dest_reg {
+        for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
+            registers[dest_reg + i] = Register::Value(value.clone());
+        }
+    }
+}
+
 pub fn op_hash_probe(
     program: &Program,
     state: &mut ProgramState,
@@ -9492,6 +9524,8 @@ pub fn op_hash_probe(
             num_keys,
             dest_reg,
             target_pc,
+            payload_dest_reg,
+            num_payload,
         },
         insn
     );
@@ -9547,6 +9581,12 @@ pub fn op_hash_probe(
         match hash_table.probe_partition(partition_idx, &probe_keys) {
             Some(entry) => {
                 state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                write_hash_payload_to_registers(
+                    &mut state.registers,
+                    entry,
+                    *payload_dest_reg,
+                    *num_payload,
+                );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
             }
@@ -9560,6 +9600,12 @@ pub fn op_hash_probe(
         match hash_table.probe(probe_keys) {
             Some(entry) => {
                 state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                write_hash_payload_to_registers(
+                    &mut state.registers,
+                    entry,
+                    *payload_dest_reg,
+                    *num_payload,
+                );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
             }
@@ -9583,6 +9629,8 @@ pub fn op_hash_next(
             hash_table_id,
             dest_reg,
             target_pc,
+            payload_dest_reg,
+            num_payload,
         },
         insn
     );
@@ -9593,6 +9641,12 @@ pub fn op_hash_next(
     match hash_table.next_match() {
         Some(entry) => {
             state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+            write_hash_payload_to_registers(
+                &mut state.registers,
+                entry,
+                *payload_dest_reg,
+                *num_payload,
+            );
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }

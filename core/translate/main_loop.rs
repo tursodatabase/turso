@@ -1,6 +1,6 @@
-use turso_parser::ast::{fmt::ToTokens, SortOrder};
+use turso_parser::ast::{fmt::ToTokens, Expr, SortOrder};
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -423,13 +423,14 @@ pub fn init_loop(
                     OperationMode::SELECT => {
                         // Open probe table cursor, the build table cursor should already be open from a previous iteration.
                         if let Some(table_cursor_id) = table_cursor_id {
-                            if let Table::BTree(btree) = &table.table {
-                                program.emit_insn(Insn::OpenRead {
-                                    cursor_id: table_cursor_id,
-                                    root_page: btree.root_page,
-                                    db: table.database_id,
-                                });
-                            }
+                            let Table::BTree(btree) = &table.table else {
+                                panic!("Expected hash join probe table to be a BTree table");
+                            };
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id: table_cursor_id,
+                                root_page: btree.root_page,
+                                db: table.database_id,
+                            });
                         }
                     }
                     _ => unreachable!("Hash joins should only occur in SELECT operations"),
@@ -458,6 +459,14 @@ pub fn init_loop(
 
 /// Emit the hash table build phase for a hash join operation.
 /// This scans the build table and populates the hash table with matching rows.
+/// Information about payload columns stored in the hash table during build phase.
+/// Returned by emit_hash_build_phase to be used during probe phase emission.
+#[derive(Debug, Clone)]
+pub struct HashBuildPayloadInfo {
+    /// Column indices from the build table stored as payload, in order.
+    pub payload_columns: Vec<usize>,
+}
+
 /// Uses a separate hash build cursor to allow chained hash joins where a table
 /// can be both a probe table for one join and a build table for another.
 fn emit_hash_build_phase(
@@ -468,7 +477,7 @@ fn emit_hash_build_phase(
     hash_join_op: &HashJoinOp,
     hash_build_cursor_id: CursorID,
     hash_table_id: usize,
-) -> Result<()> {
+) -> Result<HashBuildPayloadInfo> {
     let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
     let btree = build_table
         .btree()
@@ -486,7 +495,6 @@ fn emit_hash_build_phase(
         target_pc_when_reentered: label_hash_build_end,
     });
 
-    // Open the hash build cursor inside the Once block so it only opens once.
     // This is a separate cursor from the regular table cursor, allowing
     // the table to be iterated here even if it's the probe table for another hash join.
     program.emit_insn(Insn::OpenRead {
@@ -515,6 +523,32 @@ fn emit_hash_build_phase(
             &t_ctx.resolver,
         )?;
     }
+
+    // Collect payload columns, all columns referenced from the build table.
+    // These will be stored in the hash entry to avoid SeekRowid during probe.
+    let payload_columns: Vec<usize> = build_table.col_used_mask.iter().collect();
+    let num_payload = payload_columns.len();
+
+    let (payload_start_reg, payload_info) = if num_payload > 0 {
+        let payload_reg = program.alloc_registers(num_payload);
+        for (i, &col_idx) in payload_columns.iter().enumerate() {
+            program.emit_column_or_rowid(hash_build_cursor_id, col_idx, payload_reg + i);
+        }
+        (
+            Some(payload_reg),
+            HashBuildPayloadInfo {
+                payload_columns: payload_columns.clone(),
+            },
+        )
+    } else {
+        (
+            None,
+            HashBuildPayloadInfo {
+                payload_columns: vec![],
+            },
+        )
+    };
+
     program.clear_cursor_override(build_table.internal_id);
 
     // Extract collations for each join key expression
@@ -530,8 +564,7 @@ fn emit_hash_build_phase(
         })
         .collect();
 
-    // Insert current row into hash table, passing in the relevant collation.
-    // HashBuild needs the rowid for later SeekRowid.
+    // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
         cursor_id: hash_build_cursor_id,
         key_start_reg: build_key_start_reg,
@@ -539,6 +572,8 @@ fn emit_hash_build_phase(
         hash_table_id,
         mem_budget: hash_join_op.mem_budget,
         collations,
+        payload_start_reg,
+        num_payload,
     });
 
     program.preassign_label_to_next_insn(skip_to_next);
@@ -551,7 +586,7 @@ fn emit_hash_build_phase(
     program.emit_insn(Insn::HashBuildFinalize { hash_table_id });
 
     program.preassign_label_to_next_insn(label_hash_build_end);
-    Ok(())
+    Ok(payload_info)
 }
 
 /// Set up the main query execution loop
@@ -861,8 +896,7 @@ pub fn open_loop(
                     cursor_id: probe_cursor_id,
                     pc_if_empty: loop_end,
                 });
-
-                emit_hash_build_phase(
+                let payload_info = emit_hash_build_phase(
                     program,
                     t_ctx,
                     table_references,
@@ -887,7 +921,15 @@ pub fn open_loop(
                     )?;
                 }
 
-                // Probe hash table with keys, store matched rowid in register
+                // Allocate payload destination registers if we have payload columns
+                let num_payload = payload_info.payload_columns.len();
+                let payload_dest_reg = if num_payload > 0 {
+                    Some(program.alloc_registers(num_payload))
+                } else {
+                    None
+                };
+
+                // Probe hash table with keys, store matched rowid and payload in registers
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
                     hash_table_id,
@@ -895,6 +937,8 @@ pub fn open_loop(
                     num_keys,
                     dest_reg: match_reg,
                     target_pc: next,
+                    payload_dest_reg,
+                    num_payload,
                 });
 
                 // Label for match processing, HashNext jumps here to avoid re-probing
@@ -902,12 +946,8 @@ pub fn open_loop(
                 program.preassign_label_to_next_insn(match_found_label);
                 let hash_next_label = program.allocate_label();
 
-                // Seek build table cursor to the matched rowid.
-                program.emit_insn(Insn::SeekRowid {
-                    cursor_id: build_cursor_id,
-                    src_reg: match_reg,
-                    target_pc: hash_next_label,
-                });
+                // Store hash context for later use
+                let payload_columns = payload_info.payload_columns.clone();
                 t_ctx.hash_table_contexts.insert(
                     hash_join_op.build_table_idx,
                     HashCtx {
@@ -915,8 +955,37 @@ pub fn open_loop(
                         match_reg,
                         match_found_label,
                         hash_next_label,
+                        payload_start_reg: payload_dest_reg,
+                        payload_columns: payload_info.payload_columns,
                     },
                 );
+
+                // Add payload columns to resolver's cache so translate_expr will
+                // use Copy from payload registers instead of reading from cursor.
+                if let Some(payload_reg) = payload_dest_reg {
+                    t_ctx.resolver.enable_expr_to_reg_cache();
+                    for (i, &col_idx) in payload_columns.iter().enumerate() {
+                        let column = build_table.columns().get(col_idx);
+                        let is_rowid_alias = column.is_some_and(|c| c.is_rowid_alias());
+                        let expr = Expr::Column {
+                            database: None,
+                            table: build_table.internal_id,
+                            column: col_idx,
+                            is_rowid_alias,
+                        };
+                        t_ctx
+                            .resolver
+                            .expr_to_reg_cache
+                            .push((Cow::Owned(expr), payload_reg + i));
+                    }
+                } else {
+                    // When payload doesnt contain all needed columns, we still need to SeekRowid
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: build_cursor_id,
+                        src_reg: match_reg,
+                        target_pc: hash_next_label,
+                    });
+                }
             }
         }
 
@@ -1421,33 +1490,35 @@ pub fn close_loop(
             }
             Operation::HashJoin(ref hash_join_op) => {
                 // Probe table: emit logic for iterating through hash matches
-                if let Some(HashCtx {
-                    hash_table_reg,
-                    match_reg,
-                    match_found_label,
-                    hash_next_label,
-                }) = t_ctx.hash_table_contexts.get(&hash_join_op.build_table_idx)
+                if let Some(hash_ctx) = t_ctx.hash_table_contexts.get(&hash_join_op.build_table_idx)
                 {
-                    let hash_table_reg = *hash_table_reg;
-                    let match_reg = *match_reg;
+                    let hash_table_reg = hash_ctx.hash_table_reg;
+                    let match_reg = hash_ctx.match_reg;
+                    let match_found_label = hash_ctx.match_found_label;
+                    let hash_next_label = hash_ctx.hash_next_label;
+                    let payload_dest_reg = hash_ctx.payload_start_reg;
+                    let num_payload = hash_ctx.payload_columns.len();
+
                     let label_next_probe_row = program.allocate_label();
 
                     // Resolve hash_next_label here, this is where conditions jump when they fail
                     // to try the next hash match before moving to the next probe row.
-                    program.resolve_label(*hash_next_label, program.offset());
+                    program.resolve_label(hash_next_label, program.offset());
 
                     // Check for additional matches with same probe keys
-                    // If found: store in match_reg and continue
+                    // If found: store in match_reg (and payload if available) and continue
                     // If not found: jump to next probe row
                     program.emit_insn(Insn::HashNext {
                         hash_table_id: hash_table_reg,
                         dest_reg: match_reg,
                         target_pc: label_next_probe_row,
+                        payload_dest_reg,
+                        num_payload,
                     });
 
                     // Jump to match processing, skips HashProbe to preserve iteration state.
                     program.emit_insn(Insn::Goto {
-                        target_pc: *match_found_label,
+                        target_pc: match_found_label,
                     });
 
                     program.preassign_label_to_next_insn(label_next_probe_row);

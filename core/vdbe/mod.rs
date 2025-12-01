@@ -317,6 +317,8 @@ impl ProgramExecutionState {
 pub struct OpHashBuildState {
     pub key_values: Vec<Value>,
     pub key_idx: usize,
+    pub payload_values: Vec<Value>,
+    pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
     pub hash_table_id: usize,

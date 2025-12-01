@@ -1952,15 +1952,22 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _} => (
-            "HashBuild",
-            *cursor_id as i64,
-            *key_start_reg as i64,
-            *num_keys as i64,
-            Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}")),
-            0,
-            String::new(),
-        ),
+        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _, payload_start_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_start_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashBuild",
+                *cursor_id as i64,
+                *key_start_reg as i64,
+                *num_keys as i64,
+                Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}{payload_info}")),
+                0,
+                String::new(),
+            )
+        }
         Insn::HashBuildFinalize{hash_table_id: hash_table_reg} => (
             "HashBuildFinalize",
             *hash_table_reg as i64,
@@ -1970,24 +1977,38 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc} => (
-            "HashProbe",
-            *hash_table_reg as i64,
-            *key_start_reg as i64,
-            *num_keys as i64,
-            Value::build_text(format!("r[{}]={}", dest_reg, target_pc.as_debug_int())),
-            0,
-            String::new(),
-        ),
-        Insn::HashNext{hash_table_id: hash_table_reg, dest_reg, target_pc} => (
-            "HashNext",
-            *hash_table_reg as i64,
-            *dest_reg as i64,
-            target_pc.as_debug_int() as i64,
-            Value::build_text(""),
-            0,
-            String::new(),
-        ),
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashProbe",
+                *hash_table_reg as i64,
+                *key_start_reg as i64,
+                *num_keys as i64,
+                Value::build_text(format!("r[{}]={}{}", dest_reg, target_pc.as_debug_int(), payload_info)),
+                0,
+                String::new(),
+            )
+        }
+        Insn::HashNext{hash_table_id: hash_table_reg, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashNext",
+                *hash_table_reg as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(payload_info),
+                0,
+                String::new(),
+            )
+        }
         Insn::HashClose{hash_table_id: hash_table_reg} => (
             "HashClose",
             *hash_table_reg as i64,

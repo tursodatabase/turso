@@ -131,8 +131,14 @@ pub struct HashEntry {
     /// The join key values.
     pub key_values: Vec<Value>,
     /// The rowid of the row in the build table.
-    /// During probe phase, we'll use SeekRowid to fetch the full row.
+    /// During probe phase, we'll use SeekRowid to fetch the full row
+    /// (unless payload_values contains all needed columns).
     pub rowid: i64,
+    /// Optional payload values - columns from the build table that are stored
+    /// directly in the hash entry to avoid SeekRowid during probe phase.
+    /// When populated, these are the result columns needed from the build table,
+    /// stored in column index order as specified during hash table construction.
+    pub payload_values: Vec<Value>,
 }
 
 impl HashEntry {
@@ -141,64 +147,92 @@ impl HashEntry {
             hash,
             key_values,
             rowid,
+            payload_values: Vec::new(),
         }
+    }
+
+    fn new_with_payload(
+        hash: u64,
+        key_values: Vec<Value>,
+        rowid: i64,
+        payload_values: Vec<Value>,
+    ) -> Self {
+        Self {
+            hash,
+            key_values,
+            rowid,
+            payload_values,
+        }
+    }
+
+    /// Returns true if this entry has payload values stored.
+    pub fn has_payload(&self) -> bool {
+        !self.payload_values.is_empty()
     }
 
     /// Get the size of this entry in bytes (approximate).
     fn size_bytes(&self) -> usize {
-        let key_size: usize = self
-            .key_values
-            .iter()
-            .map(|v| match v {
-                Value::Null => 1,
-                Value::Integer(_) => 8,
-                Value::Float(_) => 8,
-                Value::Text(t) => t.as_str().len(),
-                Value::Blob(b) => b.len(),
-            })
-            .sum();
-        key_size + 8 + 8 // +8 for hash, +8 for rowid
+        let value_size = |v: &Value| match v {
+            Value::Null => 1,
+            Value::Integer(_) => 8,
+            Value::Float(_) => 8,
+            Value::Text(t) => t.as_str().len(),
+            Value::Blob(b) => b.len(),
+        };
+        let key_size: usize = self.key_values.iter().map(value_size).sum();
+        let payload_size: usize = self.payload_values.iter().map(value_size).sum();
+        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
     }
 
     /// Serialize this entry to bytes for disk storage.
-    /// Format: [hash:8][rowid:8][num_keys:varint][key1_type:1][key1_len:varint][key1_data]...
+    /// Format: [hash:8][rowid:8][num_keys:varint][keys...][num_payload:varint][payload...]
+    /// Each value is: [type:1][len:varint (for text/blob)][data]
     fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.hash.to_le_bytes());
         buf.extend_from_slice(&self.rowid.to_le_bytes());
 
-        // Write number of keys
-        let num_keys = self.key_values.len() as u64;
+        // Write number of keys and key values
         let varint_buf = &mut [0u8; 9];
-        let len = write_varint(varint_buf, num_keys);
+        let len = write_varint(varint_buf, self.key_values.len() as u64);
         buf.extend_from_slice(&varint_buf[..len]);
-
-        // Write each key value
         for value in &self.key_values {
-            match value {
-                Value::Null => {
-                    buf.push(NULL_HASH);
-                }
-                Value::Integer(i) => {
-                    buf.push(INT_HASH);
-                    buf.extend_from_slice(&i.to_le_bytes());
-                }
-                Value::Float(f) => {
-                    buf.push(FLOAT_HASH);
-                    buf.extend_from_slice(&f.to_le_bytes());
-                }
-                Value::Text(t) => {
-                    buf.push(TEXT_HASH);
-                    let bytes = t.as_str().as_bytes();
-                    let len = write_varint(varint_buf, bytes.len() as u64);
-                    buf.extend_from_slice(&varint_buf[..len]);
-                    buf.extend_from_slice(bytes);
-                }
-                Value::Blob(b) => {
-                    buf.push(BLOB_HASH);
-                    let len = write_varint(varint_buf, b.len() as u64);
-                    buf.extend_from_slice(&varint_buf[..len]);
-                    buf.extend_from_slice(b);
-                }
+            Self::serialize_value(value, buf, varint_buf);
+        }
+
+        // Write number of payload values and payload values
+        let len = write_varint(varint_buf, self.payload_values.len() as u64);
+        buf.extend_from_slice(&varint_buf[..len]);
+        for value in &self.payload_values {
+            Self::serialize_value(value, buf, varint_buf);
+        }
+    }
+
+    /// Helper to serialize a single Value to bytes.
+    fn serialize_value(value: &Value, buf: &mut Vec<u8>, varint_buf: &mut [u8; 9]) {
+        match value {
+            Value::Null => {
+                buf.push(NULL_HASH);
+            }
+            Value::Integer(i) => {
+                buf.push(INT_HASH);
+                buf.extend_from_slice(&i.to_le_bytes());
+            }
+            Value::Float(f) => {
+                buf.push(FLOAT_HASH);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            Value::Text(t) => {
+                buf.push(TEXT_HASH);
+                let bytes = t.as_str().as_bytes();
+                let len = write_varint(varint_buf, bytes.len() as u64);
+                buf.extend_from_slice(&varint_buf[..len]);
+                buf.extend_from_slice(bytes);
+            }
+            Value::Blob(b) => {
+                buf.push(BLOB_HASH);
+                let len = write_varint(varint_buf, b.len() as u64);
+                buf.extend_from_slice(&varint_buf[..len]);
+                buf.extend_from_slice(b);
             }
         }
     }
@@ -216,78 +250,26 @@ impl HashEntry {
         let rowid = i64::from_le_bytes(buf[8..16].try_into().expect("expect 8 bytes"));
         let mut offset = 16;
 
-        // Read number of keys
+        // Read number of keys and key values
         let (num_keys, varint_len) = read_varint(&buf[offset..])?;
         offset += varint_len;
 
         let mut key_values = Vec::with_capacity(num_keys as usize);
         for _ in 0..num_keys {
-            if offset >= buf.len() {
-                return Err(LimboError::Corrupt(
-                    "HashEntry: unexpected end of buffer".to_string(),
-                ));
-            }
-            let value_type = buf[offset];
-            offset += 1;
-
-            let value = match value_type {
-                NULL_HASH => Value::Null,
-                INT_HASH => {
-                    if offset + 8 > buf.len() {
-                        return Err(LimboError::Corrupt(
-                            "HashEntry: buffer too small for integer".to_string(),
-                        ));
-                    }
-                    let i = i64::from_le_bytes(
-                        buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
-                    );
-                    offset += 8;
-                    Value::Integer(i)
-                }
-                FLOAT_HASH => {
-                    if offset + 8 > buf.len() {
-                        return Err(LimboError::Corrupt(
-                            "HashEntry: buffer too small for float".to_string(),
-                        ));
-                    }
-                    let f = f64::from_le_bytes(
-                        buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
-                    );
-                    offset += 8;
-                    Value::Float(f)
-                }
-                TEXT_HASH => {
-                    let (str_len, varint_len) = read_varint(&buf[offset..])?;
-                    offset += varint_len;
-                    if offset + str_len as usize > buf.len() {
-                        return Err(LimboError::Corrupt(
-                            "HashEntry: buffer too small for text".to_string(),
-                        ));
-                    }
-                    let s = String::from_utf8(buf[offset..offset + str_len as usize].to_vec())
-                        .map_err(|_| LimboError::Corrupt("Invalid UTF-8 in text".to_string()))?;
-                    offset += str_len as usize;
-                    Value::Text(s.into())
-                }
-                BLOB_HASH => {
-                    let (blob_len, varint_len) = read_varint(&buf[offset..])?;
-                    offset += varint_len;
-                    if offset + blob_len as usize > buf.len() {
-                        return Err(LimboError::Corrupt(
-                            "HashEntry: buffer too small for blob".to_string(),
-                        ));
-                    }
-                    let b = buf[offset..offset + blob_len as usize].to_vec();
-                    offset += blob_len as usize;
-                    Value::Blob(b)
-                }
-                _ => {
-                    return Err(LimboError::Corrupt(format!(
-                        "HashEntry: unknown value type {value_type}",
-                    )));
-                }
-            };
+            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
             key_values.push(value);
+            offset += consumed;
+        }
+
+        // Read number of payload values and payload values
+        let (num_payload, varint_len) = read_varint(&buf[offset..])?;
+        offset += varint_len;
+
+        let mut payload_values = Vec::with_capacity(num_payload as usize);
+        for _ in 0..num_payload {
+            let (value, consumed) = Self::deserialize_value(&buf[offset..])?;
+            payload_values.push(value);
+            offset += consumed;
         }
 
         Ok((
@@ -295,9 +277,81 @@ impl HashEntry {
                 hash,
                 key_values,
                 rowid,
+                payload_values,
             },
             offset,
         ))
+    }
+
+    /// Helper to deserialize a single Value from bytes.
+    /// Returns (Value, bytes_consumed).
+    fn deserialize_value(buf: &[u8]) -> Result<(Value, usize)> {
+        if buf.is_empty() {
+            return Err(LimboError::Corrupt(
+                "HashEntry: unexpected end of buffer".to_string(),
+            ));
+        }
+        let value_type = buf[0];
+        let mut offset = 1;
+
+        let value = match value_type {
+            NULL_HASH => Value::Null,
+            INT_HASH => {
+                if offset + 8 > buf.len() {
+                    return Err(LimboError::Corrupt(
+                        "HashEntry: buffer too small for integer".to_string(),
+                    ));
+                }
+                let i = i64::from_le_bytes(
+                    buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
+                );
+                offset += 8;
+                Value::Integer(i)
+            }
+            FLOAT_HASH => {
+                if offset + 8 > buf.len() {
+                    return Err(LimboError::Corrupt(
+                        "HashEntry: buffer too small for float".to_string(),
+                    ));
+                }
+                let f = f64::from_le_bytes(
+                    buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
+                );
+                offset += 8;
+                Value::Float(f)
+            }
+            TEXT_HASH => {
+                let (str_len, varint_len) = read_varint(&buf[offset..])?;
+                offset += varint_len;
+                if offset + str_len as usize > buf.len() {
+                    return Err(LimboError::Corrupt(
+                        "HashEntry: buffer too small for text".to_string(),
+                    ));
+                }
+                let s = String::from_utf8(buf[offset..offset + str_len as usize].to_vec())
+                    .map_err(|_| LimboError::Corrupt("Invalid UTF-8 in text".to_string()))?;
+                offset += str_len as usize;
+                Value::Text(s.into())
+            }
+            BLOB_HASH => {
+                let (blob_len, varint_len) = read_varint(&buf[offset..])?;
+                offset += varint_len;
+                if offset + blob_len as usize > buf.len() {
+                    return Err(LimboError::Corrupt(
+                        "HashEntry: buffer too small for blob".to_string(),
+                    ));
+                }
+                let b = buf[offset..offset + blob_len as usize].to_vec();
+                offset += blob_len as usize;
+                Value::Blob(b)
+            }
+            _ => {
+                return Err(LimboError::Corrupt(format!(
+                    "HashEntry: unknown value type {value_type}",
+                )));
+            }
+        };
+        Ok((value, offset))
     }
 }
 
@@ -799,7 +853,18 @@ impl HashTable {
 
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
     /// When memory budget is exceeded, triggers grace hash join by partitioning and spilling.
-    pub fn insert(&mut self, key_values: Vec<Value>, rowid: i64) -> Result<IOResult<()>> {
+    ///
+    /// # Arguments
+    /// * `key_values` - The join key values used for hashing and equality comparison
+    /// * `rowid` - The rowid of the row in the build table (for SeekRowid fallback)
+    /// * `payload_values` - Optional payload columns to store directly in the entry,
+    ///   avoiding the need for SeekRowid during probe phase when all needed columns are included
+    pub fn insert(
+        &mut self,
+        key_values: Vec<Value>,
+        rowid: i64,
+        payload_values: Vec<Value>,
+    ) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "Cannot insert into hash table in state {:?}",
@@ -810,7 +875,11 @@ impl HashTable {
         let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
         let hash = hash_join_key(&key_refs, &self.collations);
 
-        let entry = HashEntry::new(hash, key_values, rowid);
+        let entry = if payload_values.is_empty() {
+            HashEntry::new(hash, key_values, rowid)
+        } else {
+            HashEntry::new_with_payload(hash, key_values, rowid, payload_values)
+        };
         let entry_size = entry.size_bytes();
 
         // Check if we would exceed memory budget
@@ -1620,10 +1689,10 @@ mod hashtests {
 
         // Insert some entries (late materialization - only store rowids)
         let key1 = vec![Value::Integer(1)];
-        let _ = ht.insert(key1.clone(), 100).unwrap();
+        let _ = ht.insert(key1.clone(), 100, vec![]).unwrap();
 
         let key2 = vec![Value::Integer(2)];
-        let _ = ht.insert(key2.clone(), 200).unwrap();
+        let _ = ht.insert(key2.clone(), 200, vec![]).unwrap();
 
         let _ = ht.finalize_build();
 
@@ -1660,7 +1729,7 @@ mod hashtests {
         // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
             let key = vec![Value::Integer(i)];
-            let _ = ht.insert(key, i * 100).unwrap();
+            let _ = ht.insert(key, i * 100, vec![]).unwrap();
         }
 
         let _ = ht.finalize_build();
@@ -1689,7 +1758,7 @@ mod hashtests {
         // Insert multiple entries with the same key
         let key = vec![Value::Integer(42)];
         for i in 0..3 {
-            let _ = ht.insert(key.clone(), 1000 + i).unwrap();
+            let _ = ht.insert(key.clone(), 1000 + i, vec![]).unwrap();
         }
 
         let _ = ht.finalize_build();
@@ -1887,7 +1956,7 @@ mod hashtests {
         for i in 0..count {
             let rowid = start + i;
             let key = vec![Value::Integer(rowid)];
-            let _ = ht.insert(key, rowid);
+            let _ = ht.insert(key, rowid, vec![]);
         }
     }
 
@@ -1985,7 +2054,7 @@ mod hashtests {
 
         let key = vec![Value::Integer(42)];
         for i in 0..1024 {
-            match ht.insert(key.clone(), 1000 + i).unwrap() {
+            match ht.insert(key.clone(), 1000 + i, vec![]).unwrap() {
                 IOResult::Done(()) => {}
                 IOResult::IO(_) => panic!("memory IO"),
             }
@@ -2014,5 +2083,244 @@ mod hashtests {
             assert_eq!(next.rowid, 1001 + i);
         }
         assert!(ht.next_match().is_none());
+    }
+
+    #[test]
+    fn test_hash_table_with_payload() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert entries with payload values (simulating cached result columns)
+        let key1 = vec![Value::Integer(1)];
+        let payload1 = vec![
+            Value::Text("Alice".into()),
+            Value::Integer(30),
+            Value::Float(1000.50),
+        ];
+        let _ = ht.insert(key1.clone(), 100, payload1.clone()).unwrap();
+
+        let key2 = vec![Value::Integer(2)];
+        let payload2 = vec![
+            Value::Text("Bob".into()),
+            Value::Integer(25),
+            Value::Float(2000.75),
+        ];
+        let _ = ht.insert(key2.clone(), 200, payload2.clone()).unwrap();
+
+        let _ = ht.finalize_build();
+
+        // Probe and verify payload is returned correctly
+        let result = ht.probe(key1);
+        assert!(result.is_some());
+        let entry1 = result.unwrap();
+        assert_eq!(entry1.rowid, 100);
+        assert!(entry1.has_payload());
+        assert_eq!(entry1.payload_values.len(), 3);
+        assert_eq!(entry1.payload_values[0], Value::Text("Alice".into()));
+        assert_eq!(entry1.payload_values[1], Value::Integer(30));
+        assert_eq!(entry1.payload_values[2], Value::Float(1000.50));
+
+        let result = ht.probe(key2);
+        assert!(result.is_some());
+        let entry2 = result.unwrap();
+        assert_eq!(entry2.rowid, 200);
+        assert!(entry2.has_payload());
+        assert_eq!(entry2.payload_values[0], Value::Text("Bob".into()));
+        assert_eq!(entry2.payload_values[1], Value::Integer(25));
+        assert_eq!(entry2.payload_values[2], Value::Float(2000.75));
+    }
+
+    #[test]
+    fn test_hash_table_payload_with_nulls() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert entry with NULL values in payload
+        let key = vec![Value::Integer(1)];
+        let payload = vec![Value::Null, Value::Text("test".into()), Value::Null];
+        let _ = ht.insert(key.clone(), 100, payload).unwrap();
+
+        let _ = ht.finalize_build();
+
+        let result = ht.probe(key);
+        assert!(result.is_some());
+        let entry = result.unwrap();
+        assert_eq!(entry.payload_values.len(), 3);
+        assert_eq!(entry.payload_values[0], Value::Null);
+        assert_eq!(entry.payload_values[1], Value::Text("test".into()));
+        assert_eq!(entry.payload_values[2], Value::Null);
+    }
+
+    #[test]
+    fn test_hash_table_payload_with_blobs() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert entry with blob payload
+        let key = vec![Value::Integer(1)];
+        let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let payload = vec![Value::Blob(blob_data.clone()), Value::Integer(42)];
+        let _ = ht.insert(key.clone(), 100, payload).unwrap();
+
+        let _ = ht.finalize_build();
+
+        let result = ht.probe(key);
+        assert!(result.is_some());
+        let entry = result.unwrap();
+        assert_eq!(entry.payload_values.len(), 2);
+        assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
+        assert_eq!(entry.payload_values[1], Value::Integer(42));
+    }
+
+    #[test]
+    fn test_hash_table_payload_duplicate_keys() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert multiple entries with the same key but different payloads
+        let key = vec![Value::Integer(42)];
+        let _ = ht
+            .insert(
+                key.clone(),
+                100,
+                vec![Value::Text("first".into()), Value::Integer(1)],
+            )
+            .unwrap();
+        let _ = ht
+            .insert(
+                key.clone(),
+                200,
+                vec![Value::Text("second".into()), Value::Integer(2)],
+            )
+            .unwrap();
+        let _ = ht
+            .insert(
+                key.clone(),
+                300,
+                vec![Value::Text("third".into()), Value::Integer(3)],
+            )
+            .unwrap();
+
+        let _ = ht.finalize_build();
+
+        // First probe should return first match
+        let result = ht.probe(key);
+        assert!(result.is_some());
+        let entry1 = result.unwrap();
+        assert_eq!(entry1.rowid, 100);
+        assert_eq!(entry1.payload_values[0], Value::Text("first".into()));
+        assert_eq!(entry1.payload_values[1], Value::Integer(1));
+
+        // next_match should return subsequent matches with their payloads
+        let entry2 = ht.next_match().unwrap();
+        assert_eq!(entry2.rowid, 200);
+        assert_eq!(entry2.payload_values[0], Value::Text("second".into()));
+        assert_eq!(entry2.payload_values[1], Value::Integer(2));
+
+        let entry3 = ht.next_match().unwrap();
+        assert_eq!(entry3.rowid, 300);
+        assert_eq!(entry3.payload_values[0], Value::Text("third".into()));
+        assert_eq!(entry3.payload_values[1], Value::Integer(3));
+
+        // No more matches
+        assert!(ht.next_match().is_none());
+    }
+
+    #[test]
+    fn test_hash_entry_payload_serialization() {
+        // Test that payload values survive serialization/deserialization
+        let entry = HashEntry::new_with_payload(
+            12345,
+            vec![Value::Integer(1), Value::Text("key".into())],
+            100,
+            vec![
+                Value::Text("payload_text".into()),
+                Value::Integer(999),
+                Value::Float(3.14),
+                Value::Null,
+                Value::Blob(vec![1, 2, 3, 4]),
+            ],
+        );
+
+        let mut buf = Vec::new();
+        entry.serialize(&mut buf);
+
+        let (deserialized, bytes_consumed) = HashEntry::deserialize(&buf).unwrap();
+        assert_eq!(bytes_consumed, buf.len());
+
+        // Verify key values
+        assert_eq!(deserialized.hash, entry.hash);
+        assert_eq!(deserialized.rowid, entry.rowid);
+        assert_eq!(deserialized.key_values.len(), 2);
+        assert_eq!(deserialized.key_values[0], Value::Integer(1));
+        assert_eq!(deserialized.key_values[1], Value::Text("key".into()));
+
+        // Verify payload values
+        assert_eq!(deserialized.payload_values.len(), 5);
+        assert_eq!(
+            deserialized.payload_values[0],
+            Value::Text("payload_text".into())
+        );
+        assert_eq!(deserialized.payload_values[1], Value::Integer(999));
+        assert_eq!(deserialized.payload_values[2], Value::Float(3.14));
+        assert_eq!(deserialized.payload_values[3], Value::Null);
+        assert_eq!(deserialized.payload_values[4], Value::Blob(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn test_hash_entry_empty_payload() {
+        // Test that entries without payload work correctly
+        let entry = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+
+        assert!(!entry.has_payload());
+        assert!(entry.payload_values.is_empty());
+
+        // Serialization should still work
+        let mut buf = Vec::new();
+        entry.serialize(&mut buf);
+
+        let (deserialized, _) = HashEntry::deserialize(&buf).unwrap();
+        assert!(!deserialized.has_payload());
+        assert!(deserialized.payload_values.is_empty());
+        assert_eq!(deserialized.rowid, 100);
+    }
+
+    #[test]
+    fn test_hash_entry_size_includes_payload() {
+        let entry_no_payload = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+
+        let entry_with_payload = HashEntry::new_with_payload(
+            12345,
+            vec![Value::Integer(1)],
+            100,
+            vec![Value::Text("a]long payload string".into()), Value::Integer(42)],
+        );
+
+        // Entry with payload should have larger size
+        assert!(entry_with_payload.size_bytes() > entry_no_payload.size_bytes());
     }
 }
