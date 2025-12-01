@@ -1,350 +1,326 @@
-use anyhow::Result;
-use errors::*;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::rc::Rc;
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyTuple},
+};
 use std::sync::Arc;
-use turso_core::{DatabaseOpts, Value};
+use turso_sdk_kit::rsapi::{self, TursoError, TursoStatusCode, Value, ValueRef};
 
-mod errors;
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+
+// support equality for status codes
+#[pyclass(eq, eq_int)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Add necessary traits for your use case
+pub enum PyTursoStatusCode {
+    Ok = 0,
+    Done = 1,
+    Row = 2,
+    Io = 3,
+}
+create_exception!(turso, Busy, PyException, "database is busy");
+create_exception!(turso, Interrupt, PyException, "interrupted");
+create_exception!(turso, Error, PyException, "generic error");
+create_exception!(turso, Misuse, PyException, "API misuse");
+create_exception!(turso, Constraint, PyException, "constraint error");
+create_exception!(turso, Readonly, PyException, "database is readonly");
+create_exception!(turso, DatabaseFull, PyException, "database is full");
+create_exception!(turso, NotAdb, PyException, "not a database`");
+create_exception!(turso, Corrupt, PyException, "database corrupted");
+
+fn turso_error_to_py_err(err: TursoError) -> PyErr {
+    match err.code {
+        rsapi::TursoStatusCode::Busy => Busy::new_err(err.message),
+        rsapi::TursoStatusCode::Interrupt => Interrupt::new_err(err.message),
+        rsapi::TursoStatusCode::Error => Error::new_err(err.message),
+        rsapi::TursoStatusCode::Misuse => Misuse::new_err(err.message),
+        rsapi::TursoStatusCode::Constraint => Constraint::new_err(err.message),
+        rsapi::TursoStatusCode::Readonly => Readonly::new_err(err.message),
+        rsapi::TursoStatusCode::DatabaseFull => DatabaseFull::new_err(err.message),
+        rsapi::TursoStatusCode::NotAdb => NotAdb::new_err(err.message),
+        rsapi::TursoStatusCode::Corrupt => Corrupt::new_err(err.message),
+        _ => Error::new_err("unexpected status from the sdk-kit".to_string()),
+    }
+}
+
+fn turso_status_to_py(status: TursoStatusCode) -> PyTursoStatusCode {
+    match status {
+        TursoStatusCode::Ok => PyTursoStatusCode::Ok,
+        TursoStatusCode::Done => PyTursoStatusCode::Done,
+        TursoStatusCode::Row => PyTursoStatusCode::Row,
+        TursoStatusCode::Io => PyTursoStatusCode::Io,
+        _ => panic!("unexpected status code: {status:?}"),
+    }
+}
 
 #[pyclass]
-#[derive(Clone, Debug)]
-struct Description {
+pub struct PyTursoExecutionResult {
     #[pyo3(get)]
-    name: String,
+    pub status: PyTursoStatusCode,
     #[pyo3(get)]
-    type_code: String,
-    #[pyo3(get)]
-    display_size: Option<String>,
-    #[pyo3(get)]
-    internal_size: Option<String>,
-    #[pyo3(get)]
-    precision: Option<String>,
-    #[pyo3(get)]
-    scale: Option<String>,
-    #[pyo3(get)]
-    null_ok: Option<String>,
+    pub rows_changed: u64,
 }
 
-#[pyclass(unsendable)]
-pub struct Cursor {
-    /// This read/write attribute specifies the number of rows to fetch at a time with `.fetchmany()`.
-    /// It defaults to `1`, meaning it fetches a single row at a time.
+#[pyclass]
+pub struct PyTursoLog {
     #[pyo3(get)]
-    arraysize: i64,
-
-    conn: Connection,
-
-    /// The `.description` attribute is a read-only sequence of 7-item, each describing a column in the result set:
-    ///
-    /// - `name`: The column's name (always present).
-    /// - `type_code`: The data type code (always present).
-    /// - `display_size`: Column's display size (optional).
-    /// - `internal_size`: Column's internal size (optional).
-    /// - `precision`: Numeric precision (optional).
-    /// - `scale`: Numeric scale (optional).
-    /// - `null_ok`: Indicates if null values are allowed (optional).
-    ///
-    /// The `name` and `type_code` fields are mandatory; others default to `None` if not applicable.
-    ///
-    /// This attribute is `None` for operations that do not return rows or if no `.execute*()` method has been invoked.
+    pub message: String,
     #[pyo3(get)]
-    description: Option<Description>,
-
-    /// Read-only attribute that provides the number of modified rows for `INSERT`, `UPDATE`, `DELETE`,
-    /// and `REPLACE` statements; it is `-1` for other statements, including CTE queries.
-    /// It is only updated by the `execute()` and `executemany()` methods after the statement has run to completion.
-    /// This means any resulting rows must be fetched for `rowcount` to be updated.
+    pub target: String,
     #[pyo3(get)]
-    rowcount: i64,
-
-    smt: Option<Rc<RefCell<turso_core::Statement>>>,
+    pub file: String,
+    #[pyo3(get)]
+    pub timestamp: u64,
+    #[pyo3(get)]
+    pub line: usize,
+    #[pyo3(get)]
+    pub level: String,
 }
 
-#[allow(unused_variables, clippy::arc_with_non_send_sync)]
-#[pymethods]
-impl Cursor {
-    #[pyo3(signature = (sql, parameters=None))]
-    pub fn execute(&mut self, sql: &str, parameters: Option<Py<PyTuple>>) -> Result<Self> {
-        let stmt_is_dml = stmt_is_dml(sql);
-        let stmt_is_ddl = stmt_is_ddl(sql);
-        let stmt_is_tx = stmt_is_tx(sql);
-
-        let statement = self.conn.conn.prepare(sql).map_err(|e| {
-            PyErr::new::<ProgrammingError, _>(format!("Failed to prepare statement: {e:?}"))
-        })?;
-
-        let stmt = Rc::new(RefCell::new(statement));
-
-        Python::with_gil(|py| {
-            if let Some(params) = parameters {
-                let obj = params.into_bound(py);
-
-                for (i, elem) in obj.iter().enumerate() {
-                    let value = py_to_db_value(&elem)?;
-                    stmt.borrow_mut()
-                        .bind_at(NonZeroUsize::new(i + 1).unwrap(), value);
-                }
-            }
-
-            Ok::<(), anyhow::Error>(())
-        })?;
-
-        if stmt_is_dml && self.conn.conn.get_auto_commit() {
-            self.conn.conn.execute("BEGIN").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!(
-                    "Failed to start transaction after DDL: {e:?}"
-                ))
-            })?;
-        }
-
-        // For DDL and DML statements,
-        // we need to execute the statement immediately
-        if stmt_is_ddl || stmt_is_dml || stmt_is_tx {
-            let mut stmt = stmt.borrow_mut();
-            while let turso_core::StepResult::IO = stmt
-                .step()
-                .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
-            {
-                stmt.run_once()
-                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("IO error: {e:?}")))?;
-            }
-        }
-
-        self.smt = Some(stmt);
-
-        Ok(Cursor {
-            smt: self.smt.clone(),
-            conn: self.conn.clone(),
-            description: self.description.clone(),
-            rowcount: self.rowcount,
-            arraysize: self.arraysize,
-        })
-    }
-
-    pub fn fetchone(&mut self, py: Python) -> Result<Option<PyObject>> {
-        if let Some(smt) = &self.smt {
-            loop {
-                let mut stmt = smt.borrow_mut();
-                match stmt
-                    .step()
-                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
-                {
-                    turso_core::StepResult::Row => {
-                        let row = stmt.row().unwrap();
-                        let py_row = row_to_py(py, row)?;
-                        return Ok(Some(py_row));
-                    }
-                    turso_core::StepResult::IO => {
-                        stmt.run_once().map_err(|e| {
-                            PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
-                        })?;
-                    }
-                    turso_core::StepResult::Interrupt => {
-                        return Ok(None);
-                    }
-                    turso_core::StepResult::Done => {
-                        return Ok(None);
-                    }
-                    turso_core::StepResult::Busy => {
-                        return Err(
-                            PyErr::new::<OperationalError, _>("Busy error".to_string()).into()
-                        );
-                    }
-                }
-            }
-        } else {
-            Err(PyErr::new::<ProgrammingError, _>("No statement prepared for execution").into())
-        }
-    }
-
-    pub fn fetchall(&mut self, py: Python) -> Result<Vec<PyObject>> {
-        let mut results = Vec::new();
-        if let Some(smt) = &self.smt {
-            loop {
-                let mut stmt = smt.borrow_mut();
-                match stmt
-                    .step()
-                    .map_err(|e| PyErr::new::<OperationalError, _>(format!("Step error: {e:?}")))?
-                {
-                    turso_core::StepResult::Row => {
-                        let row = stmt.row().unwrap();
-                        let py_row = row_to_py(py, row)?;
-                        results.push(py_row);
-                    }
-                    turso_core::StepResult::IO => {
-                        stmt.run_once().map_err(|e| {
-                            PyErr::new::<OperationalError, _>(format!("IO error: {e:?}"))
-                        })?;
-                    }
-                    turso_core::StepResult::Interrupt => {
-                        return Ok(results);
-                    }
-                    turso_core::StepResult::Done => {
-                        return Ok(results);
-                    }
-                    turso_core::StepResult::Busy => {
-                        return Err(
-                            PyErr::new::<OperationalError, _>("Busy error".to_string()).into()
-                        );
-                    }
-                }
-            }
-        } else {
-            Err(PyErr::new::<ProgrammingError, _>("No statement prepared for execution").into())
-        }
-    }
-
-    pub fn close(&self) -> PyResult<()> {
-        self.conn.close()?;
-
-        Ok(())
-    }
-
-    #[pyo3(signature = (sql, parameters=None))]
-    pub fn executemany(&self, sql: &str, parameters: Option<Py<PyList>>) -> PyResult<()> {
-        Err(PyErr::new::<NotSupportedError, _>(
-            "executemany() is not supported in this version",
-        ))
-    }
-
-    #[pyo3(signature = (size=None))]
-    pub fn fetchmany(&self, size: Option<i64>) -> PyResult<Option<Vec<PyObject>>> {
-        Err(PyErr::new::<NotSupportedError, _>(
-            "fetchmany() is not supported in this version",
-        ))
-    }
-}
-
-fn stmt_is_dml(sql: &str) -> bool {
-    let sql = sql.trim();
-    let sql = sql.to_uppercase();
-    sql.starts_with("INSERT") || sql.starts_with("UPDATE") || sql.starts_with("DELETE")
-}
-
-fn stmt_is_ddl(sql: &str) -> bool {
-    let sql = sql.trim();
-    let sql = sql.to_uppercase();
-    sql.starts_with("CREATE") || sql.starts_with("ALTER") || sql.starts_with("DROP")
-}
-
-fn stmt_is_tx(sql: &str) -> bool {
-    let sql = sql.trim();
-    let sql = sql.to_uppercase();
-    sql.starts_with("BEGIN") || sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK")
-}
-
-#[pyclass(unsendable)]
-#[derive(Clone)]
-pub struct Connection {
-    conn: Arc<turso_core::Connection>,
-    _io: Arc<dyn turso_core::IO>,
+#[pyclass]
+pub struct PyTursoSetupConfig {
+    pub logger: Option<Py<PyAny>>,
+    pub log_level: Option<String>,
 }
 
 #[pymethods]
-impl Connection {
-    pub fn cursor(&self) -> Result<Cursor> {
-        Ok(Cursor {
-            arraysize: 1,
-            conn: self.clone(),
-            description: None,
-            rowcount: -1,
-            smt: None,
+impl PyTursoSetupConfig {
+    #[new]
+    #[pyo3(signature = (logger, log_level))]
+    fn new(logger: Option<Py<PyAny>>, log_level: Option<String>) -> Self {
+        Self { logger, log_level }
+    }
+}
+
+#[pyclass]
+pub struct PyTursoDatabaseConfig {
+    pub path: String,
+
+    /// comma-separated list of experimental features to enable
+    /// this field is intentionally just a string in order to make enablement of experimental features as flexible as possible
+    pub experimental_features: Option<String>,
+
+    /// if true, library methods will return Io status code and delegate Io loop to the caller
+    /// if false, library will spin IO itself in case of Io status code and never return it to the caller
+    pub async_io: bool,
+}
+
+#[pymethods]
+impl PyTursoDatabaseConfig {
+    #[new]
+    #[pyo3(signature = (path, experimental_features=None, async_io=false))]
+    fn new(path: String, experimental_features: Option<String>, async_io: bool) -> Self {
+        Self {
+            path,
+            experimental_features,
+            async_io,
+        }
+    }
+}
+
+#[pyclass]
+pub struct PyTursoDatabase {
+    database: Arc<rsapi::TursoDatabase>,
+}
+
+/// Setup logging for the turso globally
+/// Only first invocation has effect - all subsequent updates will be ignored
+#[pyfunction]
+pub fn py_turso_setup(py: Python, config: &PyTursoSetupConfig) -> PyResult<()> {
+    rsapi::turso_setup(rsapi::TursoSetupConfig {
+        logger: if let Some(logger) = &config.logger {
+            let logger = logger.clone_ref(py);
+            Some(Box::new(move |log| {
+                Python::attach(|py| {
+                    let py_log = PyTursoLog {
+                        message: log.message.to_string(),
+                        target: log.target.to_string(),
+                        file: log.file.to_string(),
+                        timestamp: log.timestamp,
+                        line: log.line,
+                        level: log.level.to_string(),
+                    };
+                    logger.call1(py, (py_log,)).unwrap();
+                })
+            }))
+        } else {
+            None
+        },
+        log_level: config.log_level.clone(),
+    })
+    .map_err(turso_error_to_py_err)?;
+    Ok(())
+}
+
+/// Open the database
+#[pyfunction]
+pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTursoDatabase> {
+    let database = rsapi::TursoDatabase::create(rsapi::TursoDatabaseConfig {
+        path: config.path.clone(),
+        experimental_features: config.experimental_features.clone(),
+        async_io: config.async_io,
+        io: None,
+    });
+    database.open().map_err(turso_error_to_py_err)?;
+    Ok(PyTursoDatabase { database })
+}
+
+#[pymethods]
+impl PyTursoDatabase {
+    pub fn connect(&self) -> PyResult<PyTursoConnection> {
+        Ok(PyTursoConnection {
+            connection: self.database.connect().map_err(turso_error_to_py_err)?,
         })
     }
+}
 
+#[pyclass]
+pub struct PyTursoConnection {
+    connection: Arc<rsapi::TursoConnection>,
+}
+
+#[pymethods]
+impl PyTursoConnection {
+    /// prepare single statement from the string
+    pub fn prepare_single(&self, sql: &str) -> PyResult<PyTursoStatement> {
+        Ok(PyTursoStatement {
+            statement: self
+                .connection
+                .prepare_single(sql)
+                .map_err(turso_error_to_py_err)?,
+        })
+    }
+    /// prepare first statement from the string which can have multiple statements separated by semicolon
+    /// returns None if string has no statements
+    /// returns Some with prepared statement and position in the string right after the prepared statement end
+    pub fn prepare_first(&self, sql: &str) -> PyResult<Option<(PyTursoStatement, usize)>> {
+        match self
+            .connection
+            .prepare_first(sql)
+            .map_err(turso_error_to_py_err)?
+        {
+            Some((statement, tail_idx)) => Ok(Some((PyTursoStatement { statement }, tail_idx))),
+            None => Ok(None),
+        }
+    }
+    /// Get the auto_commmit mode for the connection
+    pub fn get_auto_commit(&self) -> PyResult<bool> {
+        Ok(self.connection.get_auto_commit())
+    }
+    /// Close the connection
+    /// (caller must ensure that no operations over connection or derived statements will happen after the call)
     pub fn close(&self) -> PyResult<()> {
-        self.conn.close().map_err(|e| {
-            PyErr::new::<OperationalError, _>(format!("Failed to close connection: {e:?}"))
-        })?;
-
-        Ok(())
-    }
-
-    pub fn commit(&self) -> PyResult<()> {
-        if !self.conn.get_auto_commit() {
-            self.conn.execute("COMMIT").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
-            })?;
-
-            self.conn.execute("BEGIN").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn rollback(&self) -> PyResult<()> {
-        if !self.conn.get_auto_commit() {
-            self.conn.execute("ROLLBACK").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
-            })?;
-
-            self.conn.execute("BEGIN").map_err(|e| {
-                PyErr::new::<OperationalError, _>(format!("Failed to commit: {e:?}"))
-            })?;
-        }
-        Ok(())
-    }
-
-    fn __enter__(&self) -> PyResult<Self> {
-        Ok(self.clone())
-    }
-
-    fn __exit__(
-        &self,
-        _exc_type: Option<&Bound<'_, PyAny>>,
-        _exc_val: Option<&Bound<'_, PyAny>>,
-        _exc_tb: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
-        self.close()
+        self.connection.close().map_err(turso_error_to_py_err)
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.conn) == 1 {
-            self.conn
-                .close()
-                .expect("Failed to drop (close) connection");
-        }
-    }
+#[pyclass]
+pub struct PyTursoStatement {
+    statement: Box<rsapi::TursoStatement>,
 }
 
-#[allow(clippy::arc_with_non_send_sync)]
-#[pyfunction(signature = (path))]
-pub fn connect(path: &str) -> Result<Connection> {
-    match turso_core::Connection::from_uri(path, DatabaseOpts::default()) {
-        Ok((io, conn)) => Ok(Connection { conn, _io: io }),
-        Err(e) => Err(PyErr::new::<ProgrammingError, _>(format!(
-            "Failed to create connection: {e:?}"
+#[pymethods]
+impl PyTursoStatement {
+    /// binds positional parameters to the statement
+    pub fn bind(&mut self, parameters: Bound<PyTuple>) -> PyResult<()> {
+        let len = parameters.len();
+        for i in 0..len {
+            let parameter = parameters.get_item(i)?;
+            self.statement
+                .bind_positional(i + 1, py_to_db_value(parameter)?)
+                .map_err(turso_error_to_py_err)?;
+        }
+        Ok(())
+    }
+
+    /// step one iteration of the statement execution
+    /// Returns [PyTursoStatusCode::Done] when execution is finished
+    /// Returns [PyTursoStatusCode::Row] when execution generated a row which can be consumed with [Self::row] method
+    /// Returns [PyTursoStatusCode::Io] when async_io is set and execution needs IO in order to make progress
+    ///
+    /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
+    pub fn step(&mut self) -> PyResult<PyTursoStatusCode> {
+        Ok(turso_status_to_py(
+            self.statement.step().map_err(turso_error_to_py_err)?,
         ))
-        .into()),
+    }
+
+    /// execute statement and ignore all rows generated by it
+    /// Returns [PyTursoStatusCode::Done] when execution is finished
+    /// Returns [PyTursoStatusCode::Io] when async_io is set and execution needs IO in order to make progress
+    ///
+    /// Note, that execute never returns Row status code
+    ///
+    /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
+    pub fn execute(&mut self) -> PyResult<PyTursoExecutionResult> {
+        let result = self.statement.execute().map_err(turso_error_to_py_err)?;
+        Ok(PyTursoExecutionResult {
+            status: turso_status_to_py(result.status),
+            rows_changed: result.rows_changed,
+        })
+    }
+    /// Run one iteration of IO backend
+    pub fn run_io(&self) -> PyResult<()> {
+        self.statement.run_io().map_err(turso_error_to_py_err)?;
+        Ok(())
+    }
+    /// Get column names of the statement
+    pub fn columns(&self, py: Python) -> PyResult<Py<PyTuple>> {
+        let columns_count = self.statement.column_count();
+        let mut columns = Vec::with_capacity(columns_count);
+        for i in 0..columns_count {
+            columns.push(
+                self.statement
+                    .column_name(i)
+                    .map_err(turso_error_to_py_err)?
+                    .to_string(),
+            );
+        }
+        Ok(PyTuple::new(py, columns.into_iter())?.unbind())
+    }
+    /// Get tuple with current row values
+    /// This method is only valid to call after [Self::step] returned [PyTursoStatusCode::Row] status code
+    pub fn row(&self, py: Python) -> PyResult<Py<PyTuple>> {
+        let columns_count = self.statement.column_count();
+        let mut py_values = Vec::with_capacity(columns_count);
+        for i in 0..columns_count {
+            py_values.push(db_value_to_py(
+                py,
+                self.statement.row_value(i).map_err(turso_error_to_py_err)?,
+            )?);
+        }
+        Ok(PyTuple::new(py, &py_values)?.into_pyobject(py)?.into())
+    }
+    /// Finalize statement execution
+    /// This method must be called when statement is no longer need
+    /// It will perform necessary cleanup and run any unfinished statement operations to completion
+    /// (for example, in `INSERT INTO ... RETURNING ...` query, finalize is essential as it will make sure that all inserts will be completed, even if only few first rows were consumed by the caller)
+    ///
+    /// Note, that if statement wasn't started (no step / execute methods was called) - finalize will not execute the statement
+    pub fn finalize(&mut self) -> PyResult<PyTursoStatusCode> {
+        Ok(turso_status_to_py(
+            self.statement.finalize().map_err(turso_error_to_py_err)?,
+        ))
+    }
+    /// Reset the statement by clearing bindings and reclaiming memory of the program from previous run
+    /// This will also abort last operation if any was unfinished (but if transaction was opened before this statement - its state will be untouched, reset will only affect operation within current statement)
+    pub fn reset(&mut self) -> PyResult<()> {
+        self.statement.reset().map_err(turso_error_to_py_err)?;
+        Ok(())
     }
 }
 
-fn row_to_py(py: Python, row: &turso_core::Row) -> Result<PyObject> {
-    let mut py_values = Vec::new();
-    for value in row.get_values() {
-        match value {
-            turso_core::Value::Null => py_values.push(py.None()),
-            turso_core::Value::Integer(i) => py_values.push(i.into_pyobject(py)?.into()),
-            turso_core::Value::Float(f) => py_values.push(f.into_pyobject(py)?.into()),
-            turso_core::Value::Text(s) => py_values.push(s.as_str().into_pyobject(py)?.into()),
-            turso_core::Value::Blob(b) => py_values.push(PyBytes::new(py, b.as_slice()).into()),
-        }
+fn db_value_to_py(py: Python, value: rsapi::ValueRef) -> PyResult<Py<PyAny>> {
+    match value {
+        ValueRef::Null => Ok(py.None()),
+        ValueRef::Integer(i) => Ok(i.into_pyobject(py)?.into()),
+        ValueRef::Float(f) => Ok(f.into_pyobject(py)?.into()),
+        ValueRef::Text(s) => Ok(s.as_str().into_pyobject(py)?.into()),
+        ValueRef::Blob(b) => Ok(PyBytes::new(py, b).into()),
     }
-    Ok(PyTuple::new(py, &py_values)
-        .unwrap()
-        .into_pyobject(py)?
-        .into())
 }
 
 /// Converts a Python object to a Turso Value
-fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
+fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
@@ -353,32 +329,38 @@ fn py_to_db_value(obj: &Bound<PyAny>) -> Result<turso_core::Value> {
         Ok(Value::Float(float))
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
-    } else if let Ok(bytes) = obj.downcast::<PyBytes>() {
+    } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else {
-        return Err(PyErr::new::<ProgrammingError, _>(format!(
-            "Unsupported Python type: {}",
-            obj.get_type().name()?
+        Err(Error::new_err(
+            "unexpected parameter value, only None, numbers, strings and bytes are supported"
+                .to_string(),
         ))
-        .into());
     }
 }
 
 #[pymodule]
 fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add_class::<Connection>()?;
-    m.add_class::<Cursor>()?;
-    m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add("Warning", m.py().get_type::<Warning>())?;
+    m.add_function(wrap_pyfunction!(py_turso_setup, m)?)?;
+    m.add_function(wrap_pyfunction!(py_turso_database_open, m)?)?;
+    m.add_class::<PyTursoStatusCode>()?;
+    m.add_class::<PyTursoExecutionResult>()?;
+    m.add_class::<PyTursoLog>()?;
+    m.add_class::<PyTursoSetupConfig>()?;
+    m.add_class::<PyTursoDatabaseConfig>()?;
+    m.add_class::<PyTursoDatabase>()?;
+    m.add_class::<PyTursoConnection>()?;
+    m.add_class::<PyTursoStatement>()?;
+
+    m.add("Busy", m.py().get_type::<Busy>())?;
+    m.add("Interrupt", m.py().get_type::<Interrupt>())?;
     m.add("Error", m.py().get_type::<Error>())?;
-    m.add("InterfaceError", m.py().get_type::<InterfaceError>())?;
-    m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
-    m.add("DataError", m.py().get_type::<DataError>())?;
-    m.add("OperationalError", m.py().get_type::<OperationalError>())?;
-    m.add("IntegrityError", m.py().get_type::<IntegrityError>())?;
-    m.add("InternalError", m.py().get_type::<InternalError>())?;
-    m.add("ProgrammingError", m.py().get_type::<ProgrammingError>())?;
-    m.add("NotSupportedError", m.py().get_type::<NotSupportedError>())?;
+    m.add("Misuse", m.py().get_type::<Misuse>())?;
+    m.add("Constraint", m.py().get_type::<Constraint>())?;
+    m.add("Readonly", m.py().get_type::<Readonly>())?;
+    m.add("DatabaseFull", m.py().get_type::<DatabaseFull>())?;
+    m.add("NotAdb", m.py().get_type::<NotAdb>())?;
+    m.add("Corrupt", m.py().get_type::<Corrupt>())?;
     Ok(())
 }
