@@ -1482,3 +1482,7 @@ do_execsql_test_regex sqlite-version-should-return-valid-output {
 do_execsql_test_regex explain-64-bit-integer-no-overflow {
   EXPLAIN SELECT 123123123123;
 } {\s123123123123\s}
+
+do_execsql_test_on_specific_db {:memory:} large-values-comparison {
+  SELECT 8211127122155032455 = 8211127122155033000;
+} {0}

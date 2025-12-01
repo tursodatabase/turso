@@ -14,6 +14,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use either::Either;
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicU8;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
@@ -198,8 +199,18 @@ pub fn parse_schema_rows(
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
-    match (num_str.parse::<f64>(), other.parse::<f64>()) {
-        (Ok(num), Ok(other)) => num == other,
+    fn parse(s: &str) -> Option<Either<i64, f64>> {
+        if let Ok(i) = s.parse::<i64>() {
+            Some(Either::Left(i))
+        } else if let Ok(f) = s.parse::<f64>() {
+            Some(Either::Right(f))
+        } else {
+            None
+        }
+    }
+
+    match (parse(num_str), parse(other)) {
+        (Some(left), Some(right)) => left == right,
         _ => num_str == other,
     }
 }
