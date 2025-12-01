@@ -441,7 +441,7 @@ pub fn init_loop(
 
     for cond in where_clause
         .iter()
-        .filter(|c| c.should_eval_before_loop(join_order, subqueries))
+        .filter(|c| c.should_eval_before_loop(join_order, subqueries, Some(tables)))
     {
         let jump_target = program.allocate_label();
         let meta = ConditionMetadata {
@@ -1091,7 +1091,9 @@ fn emit_conditions(
     for cond in predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
-        .filter(|cond| cond.should_eval_at_loop(join_index, join_order, subqueries))
+        .filter(|cond| {
+            cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+        })
     {
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {

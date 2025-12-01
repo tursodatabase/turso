@@ -302,9 +302,8 @@ impl HashEntry {
                         "HashEntry: buffer too small for integer".to_string(),
                     ));
                 }
-                let i = i64::from_le_bytes(
-                    buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
-                );
+                let i =
+                    i64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
                 Value::Integer(i)
             }
@@ -314,9 +313,8 @@ impl HashEntry {
                         "HashEntry: buffer too small for float".to_string(),
                     ));
                 }
-                let f = f64::from_le_bytes(
-                    buf[offset..offset + 8].try_into().expect("expect 8 bytes"),
-                );
+                let f =
+                    f64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
                 Value::Float(f)
             }
@@ -2260,7 +2258,7 @@ mod hashtests {
             vec![
                 Value::Text("payload_text".into()),
                 Value::Integer(999),
-                Value::Float(3.14),
+                Value::Float(std::f64::consts::PI),
                 Value::Null,
                 Value::Blob(vec![1, 2, 3, 4]),
             ],
@@ -2286,9 +2284,15 @@ mod hashtests {
             Value::Text("payload_text".into())
         );
         assert_eq!(deserialized.payload_values[1], Value::Integer(999));
-        assert_eq!(deserialized.payload_values[2], Value::Float(3.14));
+        assert_eq!(
+            deserialized.payload_values[2],
+            Value::Float(std::f64::consts::PI)
+        );
         assert_eq!(deserialized.payload_values[3], Value::Null);
-        assert_eq!(deserialized.payload_values[4], Value::Blob(vec![1, 2, 3, 4]));
+        assert_eq!(
+            deserialized.payload_values[4],
+            Value::Blob(vec![1, 2, 3, 4])
+        );
     }
 
     #[test]
@@ -2317,7 +2321,10 @@ mod hashtests {
             12345,
             vec![Value::Integer(1)],
             100,
-            vec![Value::Text("a]long payload string".into()), Value::Integer(42)],
+            vec![
+                Value::Text("a]long payload string".into()),
+                Value::Integer(42),
+            ],
         );
 
         // Entry with payload should have larger size

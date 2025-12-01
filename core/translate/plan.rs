@@ -12,6 +12,7 @@ use crate::{
         expr::as_binary_components,
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
+        planner::determine_where_to_eval_term,
     },
     vdbe::{
         affinity::Affinity,
@@ -25,7 +26,7 @@ use crate::{schema::Type, types::SeekOp};
 
 use turso_parser::ast::TableInternalId;
 
-use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
+use super::emitter::OperationMode;
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -122,11 +123,12 @@ impl WhereTerm {
         &self,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
@@ -137,11 +139,12 @@ impl WhereTerm {
         loop_idx: usize,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
@@ -151,8 +154,9 @@ impl WhereTerm {
         &self,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries)
+        determine_where_to_eval_term(self, join_order, subqueries, table_references)
     }
 }
 
