@@ -1,6 +1,7 @@
 use parking_lot::RwLock;
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     sync::{atomic::AtomicI64, Arc},
 };
 
@@ -55,6 +56,8 @@ pub struct CursorKey {
     /// The index, in case of an index cursor.
     /// The combination of table internal id and index is enough to disambiguate.
     pub index: Option<Arc<Index>>,
+    /// Whether this cursor is an special case build cursor.
+    pub is_build: bool,
 }
 
 impl CursorKey {
@@ -62,6 +65,7 @@ impl CursorKey {
         Self {
             table_reference_id,
             index: None,
+            is_build: false,
         }
     }
 
@@ -69,11 +73,25 @@ impl CursorKey {
         Self {
             table_reference_id,
             index: Some(index),
+            is_build: false,
+        }
+    }
+
+    /// Create a cursor key for hash join build operations.
+    /// This creates a separate cursor from the regular table cursor.
+    pub fn hash_build(table_reference_id: TableInternalId) -> Self {
+        Self {
+            table_reference_id,
+            index: None,
+            is_build: true,
         }
     }
 
     pub fn equals(&self, other: &CursorKey) -> bool {
         if self.table_reference_id != other.table_reference_id {
+            return false;
+        }
+        if self.is_build != other.is_build {
             return false;
         }
         match (self.index.as_ref(), other.index.as_ref()) {
@@ -131,6 +149,9 @@ pub struct ProgramBuilder {
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub resolve_type: ResolveType,
+    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
+    /// This allows for things like hash build to use a separate cursor for iterating the same table.
+    cursor_overrides: HashMap<usize, CursorID>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +258,7 @@ impl ProgramBuilder {
             needs_stmt_subtransactions: false,
             trigger,
             resolve_type: ResolveType::Abort,
+            cursor_overrides: HashMap::new(),
         }
     }
 
@@ -848,8 +870,31 @@ impl ProgramBuilder {
         self.label_to_resolved_offset.clear();
     }
 
+    /// Set a cursor override for a table. When resolving a table cursor for this table,
+    /// the override cursor will be used instead of the normal resolution.
+    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
+        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    }
+
+    /// Clear the cursor override for a table.
+    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
+        self.cursor_overrides.remove(&table_ref_id.into());
+    }
+
+    /// Clear all cursor overrides.
+    pub fn clear_all_cursor_overrides(&mut self) {
+        self.cursor_overrides.clear();
+    }
+
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
+        // Check cursor overrides first, only apply override for table cursors
+        if key.index.is_none() && !key.is_build {
+            let table_id: usize = key.table_reference_id.into();
+            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
+                return Some(cursor_id);
+            }
+        }
         self.cursor_ref
             .iter()
             .position(|(k, _)| k.as_ref().is_some_and(|k| k.equals(key)))

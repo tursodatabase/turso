@@ -358,7 +358,8 @@ pub fn estimate_hash_join_cost(
     const BYTES_PER_ROW_ESTIMATE: usize = 100;
 
     // Estimate if the hash table will fit in memory
-    let estimated_hash_table_size = (build_cardinality as usize) * BYTES_PER_ROW_ESTIMATE;
+    let estimated_hash_table_size =
+        (build_cardinality as usize).saturating_mul(BYTES_PER_ROW_ESTIMATE);
     let will_spill = estimated_hash_table_size > mem_budget;
 
     // Build phase: hash and insert all rows from build table (one-time cost)

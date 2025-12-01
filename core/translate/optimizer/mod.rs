@@ -727,9 +727,31 @@ fn optimize_table_access(
         best_plan.table_numbers().collect::<Vec<_>>(),
     );
 
+    // Collect hash join build table indices. These tables should NOT be in the join_order
+    // because they are fully consumed during hash table building (similar to how ephemeral
+    // index source tables work). The build table's cursor is still opened and used, but
+    // it doesn't participate in the main loop iteration structure.
+    let hash_join_build_tables: Vec<usize> = best_access_methods
+        .iter()
+        .filter_map(|&am_idx| {
+            let arena = access_methods_arena.borrow();
+            arena.get(am_idx).and_then(|am| {
+                if let AccessMethodParams::HashJoin {
+                    build_table_idx, ..
+                } = &am.params
+                {
+                    Some(*build_table_idx)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
-        .into_iter()
-        .map(|table_number| JoinOrderMember {
+        .iter()
+        .filter(|table_number| !hash_join_build_tables.contains(table_number))
+        .map(|&table_number| JoinOrderMember {
             table_id: table_references.joined_tables_mut()[table_number].internal_id,
             original_idx: table_number,
             is_outer: table_references.joined_tables_mut()[table_number]
@@ -740,8 +762,9 @@ fn optimize_table_access(
         .collect();
 
     // Mutate the Operations in `joined_tables` to use the selected access methods.
-    for (i, join_order_member) in best_join_order.iter().enumerate() {
-        let table_idx = join_order_member.original_idx;
+    // We iterate over ALL tables (including hash join build tables) to set their operations,
+    // even though build tables are not in best_join_order.
+    for (i, &table_idx) in best_table_numbers.iter().enumerate() {
         let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
         match &access_method.params {
             AccessMethodParams::BTreeTable {
@@ -768,9 +791,10 @@ fn optimize_table_access(
                     }
                     // This branch means we have a full table scan for a non-outermost table.
                     // Try to construct an ephemeral index since it's going to be better than a scan.
+                    let table_id = table_references.joined_tables()[table_idx].internal_id;
                     let table_constraints = constraints_per_table
                         .iter()
-                        .find(|c| c.table_id == join_order_member.table_id);
+                        .find(|c| c.table_id == table_id);
                     let Some(table_constraints) = table_constraints else {
                         table_references.joined_tables_mut()[table_idx].op =
                             Operation::Scan(Scan::BTreeTable {
