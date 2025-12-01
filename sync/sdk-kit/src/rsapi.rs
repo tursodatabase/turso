@@ -14,13 +14,10 @@ use crate::{
     turso_async_operation::{TursoAsyncOperationResult, TursoDatabaseAsyncOperation},
 };
 
-const DEFAULT_WAL_PULL_BATCH_SIZE: u32 = 100;
-
 #[derive(Clone)]
 pub struct TursoDatabaseSyncConfig {
     pub path: String,
     pub client_name: String,
-    pub wal_pull_batch_size: Option<u32>,
     pub long_poll_timeout_ms: Option<u32>,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
@@ -35,11 +32,6 @@ impl TursoDatabaseSyncConfig {
         Ok(Self {
             path: str_from_c_str(value.path)?.to_string(),
             client_name: str_from_c_str(value.client_name)?.to_string(),
-            wal_pull_batch_size: if value.wal_pull_batch_size == 0 {
-                None
-            } else {
-                Some(value.wal_pull_batch_size as u32)
-            },
             long_poll_timeout_ms: if value.long_poll_timeout_ms == 0 {
                 None
             } else {
@@ -95,6 +87,8 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
 }
 
 impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
+    /// create database sync holder struct but do not initialize it yet
+    /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
     pub fn new(
         db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
         sync_config: TursoDatabaseSyncConfig,
@@ -103,9 +97,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],
             use_transform: false,
-            wal_pull_batch_size: sync_config
-                .wal_pull_batch_size
-                .unwrap_or(DEFAULT_WAL_PULL_BATCH_SIZE) as u64,
+            wal_pull_batch_size: 0,
             long_poll_timeout: sync_config
                 .long_poll_timeout_ms
                 .map(|t| std::time::Duration::from_millis(t as u64)),
@@ -159,6 +151,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             sync_engine: Arc::new(Mutex::new(None)),
         }))
     }
+    /// initialize database on disk and bootstrap if necessary (bootstrap requires network availability)
     pub fn init(&self) -> Box<TursoDatabaseAsyncOperation> {
         let io = self.db_io.clone();
         let sync_engine_io = self.sync_engine_io_queue.clone();
@@ -176,6 +169,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Ok(None)
         }))
     }
+    /// open the database which must be created earlier (e.g. through [Self::init])
     pub fn open(&self) -> Box<TursoDatabaseAsyncOperation> {
         let io = self.db_io.clone();
         let sync_engine_io = self.sync_engine_io_queue.clone();
@@ -230,6 +224,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Ok(None)
         }))
     }
+    /// initialize and open the database
     pub fn create(&self) -> Box<TursoDatabaseAsyncOperation> {
         let io = self.db_io.clone();
         let sync_engine_io = self.sync_engine_io_queue.clone();
@@ -282,6 +277,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         }))
     }
 
+    /// create tursodb connection for already opened database (with [Self::open] or [Self::create] methods)
     pub fn connect(&self) -> Box<TursoDatabaseAsyncOperation> {
         let db_config = self.db_config.clone();
         let sync_engine = self.sync_engine.clone();
@@ -299,6 +295,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         }))
     }
 
+    /// get stats of synced database
     pub fn stats(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
@@ -312,6 +309,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Ok(Some(TursoAsyncOperationResult::Stats { stats: stats }))
         }))
     }
+    /// checkpoint WAL of synced database
     pub fn checkpoint(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
@@ -325,6 +323,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Ok(None)
         }))
     }
+    /// push local changes to remote for synced database
     pub fn push_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
@@ -338,6 +337,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             Ok(None)
         }))
     }
+    /// wait changes from remote to apply them later with [Self::apply_changes] methods
     pub fn wait_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
@@ -353,6 +353,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             }))
         }))
     }
+    /// apply changes from remote locally fetched with [Self::wait_changes] method
     pub fn apply_changes(
         &self,
         changes: Box<TursoDatabaseSyncChanges>,
@@ -373,10 +374,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         }))
     }
 
+    /// take sync engine IO item to process
+    /// note, that sync engine extends IO operation from tursodatabase with atomic file operations and HTTP
+    /// that's why there is another flow to process sync-engine specific IO operations
     pub fn take_io_item(&self) -> Option<Box<sync_engine_io::SyncEngineIoQueueItem<TBytes>>> {
         self.sync_engine_io_queue.pop_front()
     }
 
+    /// run synced database extra callbacks after execution of IO operation on the caller side
     pub fn step_io_callbacks(&self) {
         self.sync_engine_io_queue.step_io_callbacks();
     }
@@ -389,7 +394,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         }
     }
 
-    /// TODO
+    /// helper method to restore [TursoDatabaseSync] ref from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: capi::c::turso_sync_database_t,
     ) -> Result<&'a Self, TursoError> {
@@ -403,7 +412,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         }
     }
 
-    /// TODO
+    /// helper method to restore [TursoDatabaseSync] instance from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn arc_from_capi(value: capi::c::turso_sync_database_t) -> Arc<Self> {
         Arc::from_raw(value.inner as *const Self)
     }

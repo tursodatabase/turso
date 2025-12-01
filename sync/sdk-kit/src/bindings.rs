@@ -175,7 +175,7 @@ pub enum turso_sync_operation_result_type_t {
     TURSO_ASYNC_RESULT_CHANGES = 2,
     TURSO_ASYNC_RESULT_STATS = 3,
 }
-#[doc = " structure holding opaque pointer to the TursoDatabaseSyncChanges instance\n SAFETY: todo"]
+#[doc = " structure holding opaque pointer to the TursoDatabaseSyncChanges instance\n SAFETY: turso_sync_changes_t have independent lifetime and must be explicitly deallocated with turso_sync_changes_deinit method OR passed to the turso_sync_database_apply_changes method which gather ownership to this object"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_changes_t {
@@ -197,7 +197,7 @@ impl Default for turso_sync_changes_t {
         }
     }
 }
-#[doc = " structure holding opaque pointer to the TursoDatabaseSyncChanges instance\n SAFETY: todo"]
+#[doc = " structure holding opaque pointer to the SyncEngineStats instance\n SAFETY: revision string will be valid only during async operation lifetime (until turso_sync_operation_deinit)\n Most likely, caller will need to copy revision slice to its internal buffer for longer lifetime"]
 #[repr(C)]
 pub struct turso_sync_stats_t {
     pub cdc_operations: i64,
@@ -292,13 +292,12 @@ impl Default for turso_sync_operation_result_t {
         }
     }
 }
-#[doc = " Database description."]
+#[doc = " Database sync description."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_database_config_t {
     pub path: *const ::std::os::raw::c_char,
     pub client_name: *const ::std::os::raw::c_char,
-    pub wal_pull_batch_size: i32,
     pub long_poll_timeout_ms: i32,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: i32,
@@ -308,31 +307,29 @@ pub struct turso_sync_database_config_t {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of turso_sync_database_config_t"]
-        [::std::mem::size_of::<turso_sync_database_config_t>() - 48usize];
+        [::std::mem::size_of::<turso_sync_database_config_t>() - 40usize];
     ["Alignment of turso_sync_database_config_t"]
         [::std::mem::align_of::<turso_sync_database_config_t>() - 8usize];
     ["Offset of field: turso_sync_database_config_t::path"]
         [::std::mem::offset_of!(turso_sync_database_config_t, path) - 0usize];
     ["Offset of field: turso_sync_database_config_t::client_name"]
         [::std::mem::offset_of!(turso_sync_database_config_t, client_name) - 8usize];
-    ["Offset of field: turso_sync_database_config_t::wal_pull_batch_size"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, wal_pull_batch_size) - 16usize];
     ["Offset of field: turso_sync_database_config_t::long_poll_timeout_ms"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, long_poll_timeout_ms) - 20usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, long_poll_timeout_ms) - 16usize];
     ["Offset of field: turso_sync_database_config_t::bootstrap_if_empty"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, bootstrap_if_empty) - 24usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, bootstrap_if_empty) - 20usize];
     ["Offset of field: turso_sync_database_config_t::reserved_bytes"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, reserved_bytes) - 28usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, reserved_bytes) - 24usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_prefix"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_strategy_prefix
     )
-        - 32usize];
+        - 28usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_query"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_strategy_query
     )
-        - 40usize];
+        - 32usize];
 };
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {
@@ -343,7 +340,7 @@ impl Default for turso_sync_database_config_t {
         }
     }
 }
-#[doc = " structure holding opaque pointer to the TursoDatabaseSync instance\n SAFETY: todo"]
+#[doc = " structure holding opaque pointer to the TursoDatabaseSync instance"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_database_t {
@@ -366,7 +363,7 @@ impl Default for turso_sync_database_t {
         }
     }
 }
-#[doc = " structure holding opaque pointer to the TursoAsyncOperation instance\n SAFETY: todo"]
+#[doc = " structure holding opaque pointer to the TursoAsyncOperation instance\n SAFETY: methods for the turso_sync_operation_t can't be called concurrently"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_operation_t {
@@ -389,6 +386,7 @@ impl Default for turso_sync_operation_t {
         }
     }
 }
+#[doc = " structure holding opaque pointer to the SyncEngineIoQueueItem instance"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_io_item_t {
@@ -512,7 +510,7 @@ unsafe extern "C" {
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Apply remote changes locally"]
+    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error"]
     pub fn turso_sync_database_apply_changes(
         self_: turso_sync_database_t,
         changes: turso_sync_changes_t,
@@ -544,7 +542,7 @@ impl Default for turso_sync_operation_resume_result_t {
     }
 }
 unsafe extern "C" {
-    #[doc = " Resume async operation"]
+    #[doc = " Resume async operation\n If return error status - turso_status_t must be properly cleaned up\n If return TURSO_IO - caller must drive IO\n If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly"]
     pub fn turso_sync_operation_resume(
         self_: turso_sync_operation_t,
     ) -> turso_sync_operation_resume_result_t;
@@ -581,7 +579,7 @@ unsafe extern "C" {
     ) -> turso_sync_database_io_take_item_t;
 }
 unsafe extern "C" {
-    #[doc = " Try to take IO request from the sync engine IO queue"]
+    #[doc = " Run extra database callbacks after IO execution"]
     pub fn turso_sync_database_io_step_callbacks(self_: turso_sync_database_t) -> turso_status_t;
 }
 #[repr(C)]
@@ -641,7 +639,7 @@ impl Default for turso_sync_database_io_request_header_t {
     }
 }
 unsafe extern "C" {
-    #[doc = " Get request reference from the IO request"]
+    #[doc = " Get HTTP request header reference from the IO request"]
     pub fn turso_sync_database_io_request_header(
         self_: turso_sync_io_item_t,
         header_idx: i32,
@@ -681,10 +679,10 @@ unsafe extern "C" {
     pub fn turso_sync_operation_deinit(self_: turso_sync_operation_t);
 }
 unsafe extern "C" {
-    #[doc = " TODO"]
+    #[doc = " Deallocate a SyncEngineIoQueueItem"]
     pub fn turso_sync_database_io_item_deinit(self_: turso_sync_io_item_t);
 }
 unsafe extern "C" {
-    #[doc = " Deallocate a turso async opeartion result"]
-    pub fn turso_sync_operation_result_deinit(self_: turso_sync_operation_result_t);
+    #[doc = " Deallocate a TursoDatabaseSyncChanges"]
+    pub fn turso_sync_changes_deinit(self_: turso_sync_changes_t);
 }

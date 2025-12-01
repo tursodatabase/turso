@@ -1,7 +1,7 @@
 use turso_sdk_kit::{
     capi::{
         self,
-        c::{turso_connection_deinit, turso_slice_ref_t, turso_status_t},
+        c::{turso_slice_ref_t, turso_status_t},
         turso_status_ok,
     },
     rsapi::{bytes_from_turso_slice, str_from_turso_slice},
@@ -24,7 +24,6 @@ pub mod c {
 }
 
 type TursoDatabaseSync = rsapi::TursoDatabaseSync<Vec<u8>>;
-// type SyncEngineIoQueueItem = crate::sync_engine_io::SyncEngineIoQueueItem<Vec<u8>>;
 
 #[no_mangle]
 #[signature(c)]
@@ -451,17 +450,9 @@ pub extern "C" fn turso_sync_database_io_item_deinit(item: c::turso_sync_io_item
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_sync_operation_result_deinit(item: c::turso_sync_operation_result_t) {
-    match item.type_ {
-        c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CONNECTION => {
-            unsafe { turso_connection_deinit(*item.result.connection) };
-        }
-        c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CHANGES => {
-            if !unsafe { item.result.changes }.inner.is_null() {
-                let _ = unsafe { TursoDatabaseSyncChanges::box_from_capi(*item.result.changes) };
-            }
-        }
-        _ => {}
+pub extern "C" fn turso_sync_changes_deinit(item: c::turso_sync_changes_t) {
+    if !item.inner.is_null() {
+        let _ = unsafe { TursoDatabaseSyncChanges::box_from_capi(item) };
     }
 }
 

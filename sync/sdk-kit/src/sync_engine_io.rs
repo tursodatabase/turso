@@ -10,6 +10,7 @@ use turso_sdk_kit::rsapi::{turso_slice_from_bytes, TursoError, TursoStatusCode};
 
 use crate::capi::c::{self};
 
+/// sync engine extended IO request
 pub enum SyncEngineIoRequest {
     Http {
         method: String,
@@ -17,16 +18,14 @@ pub enum SyncEngineIoRequest {
         body: Option<Vec<u8>>,
         headers: Vec<(String, String)>,
     },
-    FullRead {
-        path: String,
-    },
-    FullWrite {
-        path: String,
-        content: Vec<u8>,
-    },
+    /// atomic full read of the file content
+    FullRead { path: String },
+    /// atomic write of the file content (on most FS, this will be temp file write followed by rename and fsync)
+    FullWrite { path: String, content: Vec<u8> },
 }
 
 impl SyncEngineIoRequest {
+    /// extract header key-value pair from the HTTP IO request
     pub fn header_to_capi(
         &self,
         index: usize,
@@ -167,6 +166,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static>
     }
 }
 
+/// IO completion which is manipulated by the caller
 pub struct SyncEngineIoCompletion<TBytes: AsRef<[u8]>> {
     inner: Arc<Mutex<SyncEngineIoCompletionInner<TBytes>>>,
 }
@@ -180,21 +180,22 @@ impl<TBytes: AsRef<[u8]>> Clone for SyncEngineIoCompletion<TBytes> {
 }
 
 impl<TBytes: AsRef<[u8]>> SyncEngineIoCompletion<TBytes> {
+    /// set error to the IO completion which will trigger appropriate error path on the sync-engine side
     pub fn poison(&self, err: String) {
         let mut completion = self.inner.lock().unwrap();
         completion.err = Some(err);
     }
-
+    /// set HTTP status code for HTTP IO request
     pub fn status(&self, value: u32) {
         let mut completion = self.inner.lock().unwrap();
         completion.status = Some(value as u16);
     }
-
+    /// push raw data to the IO request (FullRead or HTTP)
     pub fn push_buffer(&self, value: TBytes) {
         let mut completion = self.inner.lock().unwrap();
         completion.chunks.push_back(value);
     }
-
+    /// mark completion as done (sync-engine will stop waiting for more data to arrive)
     pub fn done(&self) {
         let mut completion = self.inner.lock().unwrap();
         completion.finished = true;
@@ -211,6 +212,7 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoCompletion<TBytes> {
     }
 }
 
+/// sync engine queued IO request with its completion
 pub struct SyncEngineIoQueueItem<TBytes: AsRef<[u8]>> {
     request: SyncEngineIoRequest,
     completion: SyncEngineIoCompletion<TBytes>,
@@ -228,7 +230,6 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
-    /// TODO
     pub unsafe fn ref_from_capi<'a>(
         value: c::turso_sync_io_item_t,
     ) -> Result<&'a Self, TursoError> {
@@ -242,7 +243,6 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
         }
     }
 
-    /// TODO
     pub unsafe fn box_from_capi(value: c::turso_sync_io_item_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }

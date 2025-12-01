@@ -123,14 +123,11 @@ impl TursoDatabaseAsyncOperation {
             Ok(result)
         }
     }
-    /// todo
     pub fn to_capi(self: Box<Self>) -> c::turso_sync_operation_t {
         c::turso_sync_operation_t {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
-
-    /// TODO
     pub unsafe fn ref_from_capi<'a>(
         value: c::turso_sync_operation_t,
     ) -> Result<&'a Self, TursoError> {
@@ -143,8 +140,6 @@ impl TursoDatabaseAsyncOperation {
             Ok(&*(value.inner as *const Self))
         }
     }
-
-    /// TODO
     pub unsafe fn box_from_capi(value: c::turso_sync_operation_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }
