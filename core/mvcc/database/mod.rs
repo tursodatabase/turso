@@ -1193,7 +1193,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             table_id.into()
         };
-        if minimum < self.next_table_id.load(Ordering::SeqCst) {
+        if minimum <= self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
         }
     }
