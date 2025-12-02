@@ -70,7 +70,12 @@ fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_lo
 }
 
 impl TursoSetupConfig {
-    pub fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
+    /// helper method to restore [TursoSetupConfig] instance from C representation
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// [capi::c::turso_config_t::log_level] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
         Ok(Self {
             log_level: if !value.log_level.is_null() {
                 Some(str_from_c_str(value.log_level)?.to_string())
@@ -177,14 +182,16 @@ pub fn bytes_from_turso_slice<'a>(
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
 
-pub fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
+/// # Safety
+/// ptr must be valid C-string pointer or null
+pub unsafe fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
     if ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
             message: Some("expected zero terminated c string, got null pointer".to_string()),
         });
     }
-    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    let c_str = std::ffi::CStr::from_ptr(ptr);
     match c_str.to_str() {
         Ok(s) => Ok(s),
         Err(err) => Err(TursoError {
@@ -197,7 +204,13 @@ pub fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, Turso
 }
 
 impl TursoDatabaseConfig {
-    pub fn from_capi(value: capi::c::turso_database_config_t) -> Result<Self, TursoError> {
+    /// helper method to restore [TursoSetupConfig] instance from C representation
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// [capi::c::turso_database_config_t::path] field must be valid C-string pointer
+    /// [capi::c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(value: capi::c::turso_database_config_t) -> Result<Self, TursoError> {
         Ok(Self {
             path: str_from_c_str(value.path)?.to_string(),
             experimental_features: if !value.experimental_features.is_null() {

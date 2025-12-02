@@ -31,8 +31,8 @@ impl TursoAsyncOperationStatus {
                                 cdc_operations: stats.cdc_operations,
                                 main_wal_size: stats.main_wal_size as i64,
                                 revert_wal_size: stats.revert_wal_size as i64,
-                                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0) as i64,
-                                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0) as i64,
+                                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0),
+                                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0),
                                 network_sent_bytes: stats.network_sent_bytes as i64,
                                 network_received_bytes: stats.network_received_bytes as i64,
                                 revision: if let Some(revision) = stats.revision {
@@ -138,6 +138,11 @@ impl TursoDatabaseAsyncOperation {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
+    /// helper method to restore [TursoDatabaseAsyncOperation] ref from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: c::turso_sync_operation_t,
     ) -> Result<&'a Self, TursoError> {
@@ -150,6 +155,11 @@ impl TursoDatabaseAsyncOperation {
             Ok(&*(value.inner as *const Self))
         }
     }
+    /// helper method to restore [TursoDatabaseAsyncOperation] instance from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn box_from_capi(value: c::turso_sync_operation_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }

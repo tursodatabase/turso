@@ -31,7 +31,8 @@ pub extern "C" fn turso_sync_database_new(
     db_config: capi::c::turso_database_config_t,
     sync_config: c::turso_sync_database_config_t,
 ) -> c::turso_sync_database_new_result_t {
-    let db_config = match turso_sdk_kit::rsapi::TursoDatabaseConfig::from_capi(db_config) {
+    let db_config = match unsafe { turso_sdk_kit::rsapi::TursoDatabaseConfig::from_capi(db_config) }
+    {
         Ok(sync_config) => sync_config,
         Err(err) => {
             return c::turso_sync_database_new_result_t {
@@ -40,7 +41,7 @@ pub extern "C" fn turso_sync_database_new(
             }
         }
     };
-    let sync_config = match rsapi::TursoDatabaseSyncConfig::from_capi(sync_config) {
+    let sync_config = match unsafe { rsapi::TursoDatabaseSyncConfig::from_capi(sync_config) } {
         Ok(sync_config) => sync_config,
         Err(err) => {
             return c::turso_sync_database_new_result_t {
@@ -484,7 +485,7 @@ mod tests {
         capi::c::{
             turso_connection_deinit, turso_connection_prepare_single, turso_database_config_t,
             turso_statement_deinit, turso_statement_row_value, turso_statement_step,
-            turso_status_code_t, turso_status_t, turso_type_t,
+            turso_status_code_t, turso_type_t,
         },
         rsapi::{str_from_turso_slice, turso_slice_from_bytes},
     };
@@ -498,10 +499,6 @@ mod tests {
         turso_sync_io_request_type_t, turso_sync_operation_deinit,
         turso_sync_operation_result_type_t, turso_sync_operation_resume,
     };
-
-    unsafe fn error(status: &turso_status_t) -> &str {
-        std::ffi::CStr::from_ptr(status.error).to_str().unwrap()
-    }
 
     #[test]
     pub fn database_sync_create() {

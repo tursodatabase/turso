@@ -1,5 +1,3 @@
-#![deny(clippy::all)]
-
 use std::{
     collections::VecDeque,
     mem::ManuallyDrop,
@@ -230,6 +228,11 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
+    /// helper method to restore [SyncEngineIoQueueItem] ref from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: c::turso_sync_io_item_t,
     ) -> Result<&'a Self, TursoError> {
@@ -242,7 +245,11 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
             Ok(&*(value.inner as *const Self))
         }
     }
-
+    /// helper method to restore [SyncEngineIoQueueItem] instance from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn box_from_capi(value: c::turso_sync_io_item_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }

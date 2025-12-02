@@ -29,7 +29,14 @@ pub struct TursoDatabaseSyncConfig {
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
 
 impl TursoDatabaseSyncConfig {
-    pub fn from_capi(
+    /// helper method to restore [TursoDatabaseSyncConfig] instance from C representation
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// [capi::c::turso_sync_database_config_t::path] field must be valid C-string pointer
+    /// [capi::c::turso_sync_database_config_t::client_name] field must be valid C-string pointer
+    /// [capi::c::turso_sync_database_config_t::partial_bootstrap_strategy_query] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(
         value: capi::c::turso_sync_database_config_t,
     ) -> Result<Self, turso_sdk_kit::rsapi::TursoError> {
         Ok(Self {
@@ -76,6 +83,11 @@ impl TursoDatabaseSyncChanges {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
+    /// helper method to restore [TursoDatabaseSyncChanges] ref from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
         value: capi::c::turso_sync_changes_t,
     ) -> Result<&'a Self, TursoError> {
@@ -88,6 +100,11 @@ impl TursoDatabaseSyncChanges {
             Ok(&*(value.inner as *const Self))
         }
     }
+    /// helper method to restore [TursoDatabaseSyncChanges] instance from C raw container
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn box_from_capi(value: capi::c::turso_sync_changes_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }
@@ -125,36 +142,34 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let is_memory = db_config.path == ":memory:";
         let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
             io.clone()
+        } else if is_memory {
+            Arc::new(MemoryIO::new())
         } else {
-            if is_memory {
-                Arc::new(MemoryIO::new())
-            } else {
-                #[cfg(target_os = "linux")]
-                {
-                    if matches!(
-                        sync_engine_opts.partial_bootstrap_strategy,
-                        PartialBootstrapStrategy::None
-                    ) {
-                        Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                            code: TursoStatusCode::Error,
-                            message: Some(format!("Failed to create platform IO: {e}")),
-                        })?)
-                    } else {
-                        use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-                        Arc::new(SparseLinuxIo::new().map_err(|e| TursoError {
-                            code: TursoStatusCode::Error,
-                            message: Some(format!("Failed to create sparse IO: {e}")),
-                        })?)
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
+            #[cfg(target_os = "linux")]
+            {
+                if matches!(
+                    sync_engine_opts.partial_bootstrap_strategy,
+                    PartialBootstrapStrategy::None
+                ) {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
                         code: TursoStatusCode::Error,
                         message: Some(format!("Failed to create platform IO: {e}")),
                     })?)
+                } else {
+                    use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+                    Arc::new(SparseLinuxIo::new().map_err(|e| TursoError {
+                        code: TursoStatusCode::Error,
+                        message: Some(format!("Failed to create sparse IO: {e}")),
+                    })?)
                 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
+                    code: TursoStatusCode::Error,
+                    message: Some(format!("Failed to create platform IO: {e}")),
+                })?)
             }
         };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
@@ -334,7 +349,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     ));
                 };
                 let stats = sync_engine.stats(&coro).await?;
-                Ok(Some(TursoAsyncOperationResult::Stats { stats: stats }))
+                Ok(Some(TursoAsyncOperationResult::Stats { stats }))
             })
         })))
     }

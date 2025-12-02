@@ -118,7 +118,7 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
     is_memory: bool,
 ) -> Result<Option<Vec<u8>>> {
     if !is_memory {
-        let completion = sync_engine_io.full_read(&path)?;
+        let completion = sync_engine_io.full_read(path)?;
         let data = wait_all_results(coro, &completion, None).await?;
         if data.is_empty() {
             return Ok(None);
@@ -162,7 +162,7 @@ async fn full_write<Ctx, IO: SyncEngineIo>(
     content: Vec<u8>,
 ) -> Result<()> {
     if !is_memory {
-        let completion = sync_engine_io.full_write(&path, content)?;
+        let completion = sync_engine_io.full_write(path, content)?;
         wait_all_results(coro, &completion, None).await?;
         return Ok(());
     }
@@ -189,7 +189,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
-        let path = create_meta_path(&main_db_path);
+        let path = create_meta_path(main_db_path);
         let meta = full_read(
             coro,
             io,
@@ -266,7 +266,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     io.clone(),
                     sync_engine_io.io.clone(),
                     &meta_path,
-                    is_memory(&main_db_path),
+                    is_memory(main_db_path),
                     meta.dump()?,
                 )
                 .await?;
@@ -303,7 +303,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     io.clone(),
                     sync_engine_io.io.clone(),
                     &meta_path,
-                    is_memory(&main_db_path),
+                    is_memory(main_db_path),
                     meta.dump()?,
                 )
                 .await?;

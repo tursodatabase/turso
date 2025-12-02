@@ -26,7 +26,7 @@ pub fn turso_status_ok() -> turso_status_t {
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_setup(config: c::turso_config_t) -> c::turso_status_t {
-    let config = match rsapi::TursoSetupConfig::from_capi(config) {
+    let config = match unsafe { rsapi::TursoSetupConfig::from_capi(config) } {
         Ok(config) => config,
         Err(err) => return err.to_capi(),
     };
@@ -41,7 +41,7 @@ pub extern "C" fn turso_setup(config: c::turso_config_t) -> c::turso_status_t {
 pub extern "C" fn turso_database_new(
     config: c::turso_database_config_t,
 ) -> c::turso_database_create_result_t {
-    let config = match rsapi::TursoDatabaseConfig::from_capi(config) {
+    let config = match unsafe { rsapi::TursoDatabaseConfig::from_capi(config) } {
         Ok(config) => config,
         Err(err) => {
             return c::turso_database_create_result_t {

@@ -196,7 +196,7 @@ impl PyTursoSyncDatabaseChanges {
     /// check if some changes were fetched from remote
     pub fn empty(&self) -> PyResult<bool> {
         let Some(changes) = &self.changes else {
-            return Err(Misuse::new_err(format!("changes were already applied")));
+            return Err(Misuse::new_err("changes were already applied".to_string()));
         };
         Ok(changes.empty())
     }
@@ -275,7 +275,7 @@ impl PyTursoAsyncOperation {
                 })),
             }
         } else {
-            Err(Error::new_err(format!("unexpected resume status")))
+            Err(Error::new_err("unexpected resume status".to_string()))
         }
     }
 }
@@ -360,10 +360,7 @@ impl PyTursoSyncIoItem {
                     PyTursoSyncIoItemHttpRequest {
                         method: method.clone(),
                         path: path.clone(),
-                        body: match body {
-                            Some(body) => Some(PyBytes::new(py, body.as_ref()).unbind()),
-                            None => None,
-                        },
+                        body: body.as_ref().map(|body| PyBytes::new(py, body.as_ref()).unbind()),
                         headers: {
                             let mut tuples = Vec::new();
                             for (key, value) in headers {
@@ -487,9 +484,7 @@ impl PyTursoSyncDatabase {
         changes: &mut PyTursoSyncDatabaseChanges,
     ) -> PyResult<PyTursoAsyncOperation> {
         let Some(changes) = changes.changes.take() else {
-            return Err(Misuse::new_err(format!(
-                "changes were already applied before"
-            )));
+            return Err(Misuse::new_err("changes were already applied before".to_string()));
         };
         Ok(PyTursoAsyncOperation {
             operation: self.database.apply_changes(changes),
