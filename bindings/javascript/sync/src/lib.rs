@@ -13,9 +13,11 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
+    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
-    types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
+    types::{
+        Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
+    },
 };
 
 use crate::{
@@ -140,7 +142,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
-    pub partial_boostrap_strategy: Option<PartialBootstrapStrategy>,
+    pub partial_boostrap_strategy: PartialBootstrapStrategy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,14 +256,17 @@ impl SyncEngine {
                     ))
                 }
             },
-            partial_boostrap_strategy: opts.partial_boostrap_strategy.map(|s| match s {
-                JsPartialBootstrapStrategy::Prefix { length } => PartialBootstrapStrategy::Prefix {
-                    length: length as usize,
-                },
-                JsPartialBootstrapStrategy::Query { query } => {
+            partial_boostrap_strategy: match opts.partial_boostrap_strategy {
+                Some(JsPartialBootstrapStrategy::Prefix { length }) => {
+                    PartialBootstrapStrategy::Prefix {
+                        length: length as usize,
+                    }
+                }
+                Some(JsPartialBootstrapStrategy::Query { query }) => {
                     PartialBootstrapStrategy::Query { query }
                 }
-            }),
+                None => PartialBootstrapStrategy::None,
+            },
         };
         Ok(SyncEngine {
             opts: opts_filled,

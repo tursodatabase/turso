@@ -3560,6 +3560,7 @@ dependencies = [
  "pyo3",
  "pyo3-build-config",
  "turso_sdk_kit",
+ "turso_sync_sdk_kit",
  "version_check",
 ]
 
@@ -5221,6 +5222,7 @@ dependencies = [
  "bindgen",
  "env_logger 0.11.7",
  "genawaiter",
+ "parking_lot",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

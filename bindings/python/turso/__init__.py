@@ -19,6 +19,12 @@ from .lib import (
     threadsafety,
 )
 
+from .lib_sync import (
+    connect_sync,
+    PartialSyncPrefixBootstrap,
+    PartialSyncQueryBootstrap,
+)
+
 __all__ = [
     "Connection",
     "Cursor",
@@ -38,4 +44,8 @@ __all__ = [
     "apilevel",
     "paramstyle",
     "threadsafety",
+    
+    "connect_sync",
+    "PartialSyncPrefixBootstrap",
+    "PartialSyncQueryBootstrap",
 ]
