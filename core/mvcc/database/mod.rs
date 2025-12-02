@@ -1207,7 +1207,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
         // Get all rows from the SQLite schema table
         let mut get_all_sqlite_schema_rows =
-            bootstrap_conn.prepare("SELECT rootpage FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'")?;
+            bootstrap_conn.prepare("SELECT rootpage FROM sqlite_schema WHERE type in ('table', 'index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'")?;
         let sqlite_schema_root_pages = stmt_get_all_rows(&mut get_all_sqlite_schema_rows)?
             .into_iter()
             .map(|row| {
