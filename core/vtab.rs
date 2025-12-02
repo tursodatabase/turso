@@ -504,7 +504,10 @@ impl ExtVirtualTableCursor {
             })?),
             None => None,
         };
-        let c_idx_str_ptr = idx_str.map(|s| s.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let c_idx_str_ptr = idx_str
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let rc = unsafe {
             (self.implementation.filter)(
                 self.cursor.as_ptr(),
