@@ -1418,8 +1418,14 @@ impl Connection {
 
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
+        // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
+        let mv_tx = if self.is_mvcc_bootstrap_connection() {
+            None
+        } else {
+            self.get_mv_tx()
+        };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), None, existing_views)?;
+        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -2477,6 +2483,10 @@ impl Connection {
 
     pub(crate) fn get_mv_tx(&self) -> Option<(u64, TransactionMode)> {
         *self.mv_tx.read()
+    }
+
+    pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
+        *self.mv_tx.write() = tx_id_and_mode;
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
