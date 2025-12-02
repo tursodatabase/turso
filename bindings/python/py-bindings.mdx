@@ -52,7 +52,8 @@ def connect(
 ): ...
 
 # Make it easy to enable logging with native `logging` Python module
-def setup_logging(level: int = logging.INFO) -> None: ...
+# (import logging only inside this function - make an exception here)
+def setup_logging(level: Optional[int] = None) -> None: ...
 ```
 - AVOID unnecessary FFI calls as their cost is non zero
 - AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible

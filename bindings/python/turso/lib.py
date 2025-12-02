@@ -888,7 +888,6 @@ def setup_logging(level: Optional[int] = None) -> None:
     level = level or logging.INFO
     logger = logging.getLogger("turso")
     logger.setLevel(level)
-    logger.propagate = True
 
     def _py_logger(log: PyTursoLog) -> None:
         # Map Rust/Turso log level strings to Python logging levels (best-effort)
