@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -876,7 +875,7 @@ def connect(
 
 
 # Make it easy to enable logging with native `logging` Python module
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(level: Optional[int] = None) -> None:
     """
     Setup Turso logging to integrate with Python's logging module.
 
@@ -884,15 +883,18 @@ def setup_logging(level: int = logging.INFO) -> None:
         import turso
         turso.setup_logging(logging.DEBUG)
     """
+    import logging
+
+    level = level or logging.INFO
     logger = logging.getLogger("turso")
     logger.setLevel(level)
+    logger.propagate = True
 
     def _py_logger(log: PyTursoLog) -> None:
         # Map Rust/Turso log level strings to Python logging levels (best-effort)
         lvl_map = {
             "ERROR": logging.ERROR,
             "WARN": logging.WARNING,
-            "WARNING": logging.WARNING,
             "INFO": logging.INFO,
             "DEBUG": logging.DEBUG,
             "TRACE": logging.DEBUG,
@@ -908,6 +910,11 @@ def setup_logging(level: int = logging.INFO) -> None:
         )
 
     try:
-        py_turso_setup(PyTursoSetupConfig(logger=_py_logger, log_level=None))
+        py_turso_setup(PyTursoSetupConfig(logger=_py_logger, log_level={
+            logging.ERROR: 'error',
+            logging.WARN: 'warn',
+            logging.INFO: 'info',
+            logging.DEBUG: 'debug',
+        }[level]))
     except Exception as exc:  # noqa: BLE001
         raise _map_turso_exception(exc)

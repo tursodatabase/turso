@@ -15,6 +15,7 @@ use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
     database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::SyncEngineIoStats,
     types::{
         Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
     },
@@ -304,8 +305,14 @@ impl SyncEngine {
         let path = self.opts.path.clone();
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
-            let initialized =
-                DatabaseSyncEngine::create_db(&coro, io.clone(), protocol, &path, opts).await?;
+            let initialized = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                SyncEngineIoStats::new(protocol),
+                &path,
+                opts,
+            )
+            .await?;
             let connection = initialized.connect_rw(&coro).await?;
 
             db.lock().unwrap().set_connected(connection).map_err(|e| {
