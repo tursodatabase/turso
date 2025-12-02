@@ -581,18 +581,11 @@ impl ProgramState {
     }
 
     /// Gets or creates a bloom filter for the given cursor ID.
-    ///
-    /// This is used when building ephemeral indexes or hash tables to
-    /// populate the bloom filter with inserted keys.
     pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
-        self.bloom_filters
-            .entry(cursor_id)
-            .or_insert_with(BloomFilter::new)
+        self.bloom_filters.entry(cursor_id).or_default()
     }
 
     /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
-    ///
-    /// Use this when you have an estimate of how many items will be inserted.
     pub fn get_or_create_bloom_filter_with_capacity(
         &mut self,
         cursor_id: usize,
@@ -605,22 +598,16 @@ impl ProgramState {
     }
 
     /// Gets an existing bloom filter for the given cursor ID.
-    ///
-    /// Returns None if no bloom filter exists for this cursor.
     pub fn get_bloom_filter(&self, cursor_id: usize) -> Option<&BloomFilter> {
         self.bloom_filters.get(&cursor_id)
     }
 
     /// Gets a mutable reference to an existing bloom filter for the given cursor ID.
-    ///
-    /// Returns None if no bloom filter exists for this cursor.
     pub fn get_bloom_filter_mut(&mut self, cursor_id: usize) -> Option<&mut BloomFilter> {
         self.bloom_filters.get_mut(&cursor_id)
     }
 
     /// Removes and drops the bloom filter for the given cursor ID.
-    ///
-    /// This should be called when closing an ephemeral cursor or resetting a sorter.
     pub fn remove_bloom_filter(&mut self, cursor_id: usize) {
         self.bloom_filters.remove(&cursor_id);
     }
