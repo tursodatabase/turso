@@ -1613,14 +1613,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Filter{cursor_id, not_target_pc, value_reg} => (
+            Insn::Filter{cursor_id, target_pc, value_reg} => (
                 "Filter",
                 *cursor_id as i64,
-                not_target_pc.as_debug_int() as i64,
+                target_pc.as_debug_int() as i64,
                 *value_reg as i64,
                 Value::build_text(""),
                 0,
-                format!("if !bloom_filter({}) goto {}", value_reg, not_target_pc.as_debug_int()),
+                format!("if !contains({value_reg}) goto {}", target_pc.as_debug_int()),
             ),
             Insn::FilterAdd{cursor_id, value_reg} => (
                 "FilterAdd",
@@ -1629,7 +1629,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("bloom_filter_add({})", value_reg),
+                format!("bloom_filter_add({value_reg})"),
             ),
             Insn::SetCookie {
                 db,

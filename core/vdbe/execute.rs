@@ -9562,7 +9562,7 @@ pub fn op_filter(
     load_insn!(
         Filter {
             cursor_id,
-            not_target_pc,
+            target_pc,
             value_reg
         },
         insn
@@ -9572,7 +9572,7 @@ pub fn op_filter(
         .get_bloom_filter(*cursor_id)
         .expect("FilterAdd must have created a bloom filter for this cursor_id");
     if !filter.contains_value(value) {
-        state.pc = not_target_pc.as_offset_int();
+        state.pc = target_pc.as_offset_int();
     } else {
         state.pc += 1;
     }
@@ -9595,6 +9595,7 @@ pub fn op_filter_add(
     );
     let reg = &state.registers[*value_reg] as *const Register;
     let filter = state.get_or_create_bloom_filter(*cursor_id);
+    // safety: we only need to read from reg, it's not mutated during this call
     match unsafe { &*reg } {
         Register::Record(ref rec) => filter.insert_record_key(&rec.get_values()),
         Register::Value(ref value) => filter.insert_value(value),

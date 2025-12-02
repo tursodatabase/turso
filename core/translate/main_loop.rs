@@ -1410,7 +1410,7 @@ fn emit_seek(
                 program.emit_insn(Insn::Filter {
                     cursor_id: seek_cursor_id,
                     value_reg: start_reg,
-                    not_target_pc: loop_end,
+                    target_pc: loop_end,
                 });
             }
         }

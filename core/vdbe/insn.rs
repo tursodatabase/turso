@@ -299,9 +299,10 @@ pub enum Insn {
     // False negatives are harmless. It is always safe to fall through, even if the value is in the bloom filter. A false negative causes more CPU cycles to be used, but it should still yield the correct answer. However, an incorrect answer may well arise from a false positive - if the jump is taken when it should fall through.
     Filter {
         cursor_id: CursorID,
-        not_target_pc: BranchOffset,
+        target_pc: BranchOffset,
         value_reg: usize,
     },
+    /// Compute a hash on the P4 registers starting with r[P3] and add that hash to the bloom filter contained in r[P1].
     FilterAdd {
         cursor_id: CursorID,
         value_reg: usize,
