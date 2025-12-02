@@ -84,7 +84,7 @@ intrusive-collections = "0.9.7"
 roaring = "0.11.2"
 simsimd = "6.5.3"
 arc-swap = "1.7"
-bloom = "0.3"
+bloom = "0.3.2"
 rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
