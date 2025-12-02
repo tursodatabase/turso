@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
 use turso_sdk_kit::rsapi::{str_from_c_str, TursoError, TursoStatusCode};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
-    types::PartialBootstrapStrategy,
 };
 
 use crate::{
@@ -24,6 +24,8 @@ pub struct TursoDatabaseSyncConfig {
     pub partial_bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy,
     pub db_io: Option<Arc<dyn IO>>,
 }
+
+pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
 
 impl TursoDatabaseSyncConfig {
     pub fn from_capi(
@@ -65,13 +67,26 @@ pub struct TursoDatabaseSyncChanges {
 }
 
 impl TursoDatabaseSyncChanges {
-    /// TODO
+    pub fn empty(&self) -> bool {
+        self.changes.file_slot.is_none()
+    }
     pub fn to_capi(self: Box<Self>) -> capi::c::turso_sync_changes_t {
         capi::c::turso_sync_changes_t {
             inner: Box::into_raw(self) as *mut std::ffi::c_void,
         }
     }
-    /// TODO
+    pub unsafe fn ref_from_capi<'a>(
+        value: capi::c::turso_sync_changes_t,
+    ) -> Result<&'a Self, TursoError> {
+        if value.inner.is_null() {
+            Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("got null pointer".to_string()),
+            })
+        } else {
+            Ok(&*(value.inner as *const Self))
+        }
+    }
     pub unsafe fn box_from_capi(value: capi::c::turso_sync_changes_t) -> Box<Self> {
         Box::from_raw(value.inner as *mut Self)
     }
@@ -106,11 +121,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_bootstrap_strategy: sync_config.partial_bootstrap_strategy.clone(),
         };
-        let sync_engine_io_queue = SyncEngineIoQueue::new();
+        let is_memory = db_config.path == ":memory:";
         let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
             io.clone()
         } else {
-            let is_memory = db_config.path == ":memory:";
             if is_memory {
                 Arc::new(MemoryIO::new())
             } else {
@@ -142,6 +156,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 }
             }
         };
+        let sync_engine_io_queue = SyncEngineIoQueue::new();
         Ok(Arc::new(Self {
             db_config,
             sync_config,
@@ -157,17 +172,19 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine_io = self.sync_engine_io_queue.clone();
         let main_db_path = self.sync_config.path.clone();
         let sync_engine_opts = self.sync_engine_opts.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let _ = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
-                &coro,
-                io,
-                sync_engine_io,
-                &main_db_path,
-                &sync_engine_opts,
-            )
-            .await?;
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let _ = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
+                    &coro,
+                    io,
+                    sync_engine_io,
+                    &main_db_path,
+                    &sync_engine_opts,
+                )
+                .await?;
+                Ok(None)
+            })
+        })))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
     pub fn open(&self) -> Box<TursoDatabaseAsyncOperation> {
@@ -177,52 +194,56 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let db_config = self.db_config.clone();
         let sync_engine_opts = self.sync_engine_opts.clone();
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
-                &coro,
-                sync_engine_io.clone(),
-                &main_db_path,
-            )
-            .await?;
-            let Some(metadata) = metadata else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "metadata not found".to_string(),
-                ));
-            };
-            let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                io.clone(),
-                sync_engine_io.clone(),
-                &metadata,
-                &main_db_path,
-                &sync_engine_opts,
-            )?;
-            let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
-                turso_sdk_kit::rsapi::TursoDatabaseConfig {
-                    db_file: Some(db_file),
-                    io: Some(io),
-                    ..db_config
-                },
-            );
-            main_db.open().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "unable to open database file: {e}"
-                ))
-            })?;
-            let main_db_core = main_db.db_core().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "unable to get core database instance: {e}",
-                ))
-            })?;
-            let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
-                &coro,
-                sync_engine_io,
-                main_db_core,
-                sync_engine_opts,
-            )
-            .await?;
-            *sync_engine.lock().unwrap() = Some(sync_engine_opened);
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_db_path,
+                )
+                .await?;
+                let Some(metadata) = metadata else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "metadata not found".to_string(),
+                    ));
+                };
+                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &metadata,
+                    &main_db_path,
+                    &sync_engine_opts,
+                )?;
+                let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
+                    turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                        db_file: Some(db_file),
+                        io: Some(io.clone()),
+                        ..db_config
+                    },
+                );
+                main_db.open().map_err(|e| {
+                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                        "unable to open database file: {e}"
+                    ))
+                })?;
+                let main_db_core = main_db.db_core().map_err(|e| {
+                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                        "unable to get core database instance: {e}",
+                    ))
+                })?;
+                let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
+                    &coro,
+                    io,
+                    sync_engine_io,
+                    main_db_core,
+                    sync_engine_opts,
+                )
+                .await?;
+                *sync_engine.lock() = Some(sync_engine_opened);
+                Ok(None)
+            })
+        })))
     }
     /// initialize and open the database
     pub fn create(&self) -> Box<TursoDatabaseAsyncOperation> {
@@ -232,126 +253,139 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let db_config = self.db_config.clone();
         let sync_engine_opts = self.sync_engine_opts.clone();
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
-                &coro,
-                io.clone(),
-                sync_engine_io.clone(),
-                &main_db_path,
-                &sync_engine_opts,
-            )
-            .await?;
-            let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
-                io.clone(),
-                sync_engine_io.clone(),
-                &metadata,
-                &main_db_path,
-                &sync_engine_opts,
-            )?;
-            let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
-                turso_sdk_kit::rsapi::TursoDatabaseConfig {
-                    db_file: Some(db_file),
-                    io: Some(io),
-                    ..db_config
-                },
-            );
-            main_db.open().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "unable to open database file: {e}"
-                ))
-            })?;
-            let main_db_core = main_db.db_core().map_err(|e| {
-                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                    "unable to get core database instance: {e}",
-                ))
-            })?;
-            let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
-                &coro,
-                sync_engine_io,
-                main_db_core,
-                sync_engine_opts,
-            )
-            .await?;
-            *sync_engine.lock().unwrap() = Some(sync_engine_opened);
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_db_path,
+                    &sync_engine_opts,
+                )
+                .await?;
+                let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &metadata,
+                    &main_db_path,
+                    &sync_engine_opts,
+                )?;
+                let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
+                    turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                        db_file: Some(db_file),
+                        io: Some(io.clone()),
+                        ..db_config
+                    },
+                );
+                main_db.open().map_err(|e| {
+                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                        "unable to open database file: {e}"
+                    ))
+                })?;
+                let main_db_core = main_db.db_core().map_err(|e| {
+                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                        "unable to get core database instance: {e}",
+                    ))
+                })?;
+                let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
+                    &coro,
+                    io,
+                    sync_engine_io,
+                    main_db_core,
+                    sync_engine_opts,
+                )
+                .await?;
+                *sync_engine.lock() = Some(sync_engine_opened);
+                Ok(None)
+            })
+        })))
     }
 
     /// create tursodb connection for already opened database (with [Self::open] or [Self::create] methods)
     pub fn connect(&self) -> Box<TursoDatabaseAsyncOperation> {
         let db_config = self.db_config.clone();
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            let connection = sync_engine.connect_rw(&coro).await?;
-            Ok(Some(TursoAsyncOperationResult::Connection {
-                connection: turso_sdk_kit::rsapi::TursoConnection::new(&db_config, connection),
-            }))
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                let connection = sync_engine.connect_rw(&coro).await?;
+                Ok(Some(TursoAsyncOperationResult::Connection {
+                    connection: turso_sdk_kit::rsapi::TursoConnection::new(&db_config, connection),
+                }))
+            })
+        })))
     }
 
     /// get stats of synced database
     pub fn stats(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            let stats = sync_engine.stats(&coro).await?;
-            Ok(Some(TursoAsyncOperationResult::Stats { stats: stats }))
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                let stats = sync_engine.stats(&coro).await?;
+                Ok(Some(TursoAsyncOperationResult::Stats { stats: stats }))
+            })
+        })))
     }
     /// checkpoint WAL of synced database
     pub fn checkpoint(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            sync_engine.checkpoint(&coro).await?;
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                sync_engine.checkpoint(&coro).await?;
+                Ok(None)
+            })
+        })))
     }
     /// push local changes to remote for synced database
     pub fn push_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            sync_engine.push_changes_to_remote(&coro).await?;
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                sync_engine.push_changes_to_remote(&coro).await?;
+                Ok(None)
+            })
+        })))
     }
     /// wait changes from remote to apply them later with [Self::apply_changes] methods
     pub fn wait_changes(&self) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            let changes = sync_engine.wait_changes_from_remote(&coro).await?;
-            Ok(Some(TursoAsyncOperationResult::Changes {
-                changes: Box::new(TursoDatabaseSyncChanges { changes }),
-            }))
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                let changes = sync_engine.wait_changes_from_remote(&coro).await?;
+                Ok(Some(TursoAsyncOperationResult::Changes {
+                    changes: Box::new(TursoDatabaseSyncChanges { changes }),
+                }))
+            })
+        })))
     }
     /// apply changes from remote locally fetched with [Self::wait_changes] method
     pub fn apply_changes(
@@ -359,19 +393,21 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         changes: Box<TursoDatabaseSyncChanges>,
     ) -> Box<TursoDatabaseAsyncOperation> {
         let sync_engine = self.sync_engine.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(async move |coro| {
-            let sync_engine = sync_engine.lock().unwrap();
-            let Some(sync_engine) = &*sync_engine else {
-                return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
-                    "sync engine must be initialized".to_string(),
-                ));
-            };
-            let changes = changes.changes;
-            sync_engine
-                .apply_changes_from_remote(&coro, changes)
-                .await?;
-            Ok(None)
-        }))
+        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
+            Box::pin(async move {
+                let sync_engine = sync_engine.lock_arc();
+                let Some(sync_engine) = &*sync_engine else {
+                    return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                        "sync engine must be initialized".to_string(),
+                    ));
+                };
+                let changes = changes.changes;
+                sync_engine
+                    .apply_changes_from_remote(&coro, changes)
+                    .await?;
+                Ok(None)
+            })
+        })))
     }
 
     /// take sync engine IO item to process

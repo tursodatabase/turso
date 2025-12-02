@@ -86,23 +86,33 @@ pub trait TursoAsyncOperation {
 }
 
 pub struct TursoDatabaseAsyncOperation {
-    pub generator: Arc<Mutex<dyn TursoAsyncOperation>>,
+    pub generator: Arc<Mutex<dyn TursoAsyncOperation + Send + 'static>>,
     pub response: Arc<Mutex<Option<TursoAsyncOperationResult>>>,
 }
 
+// todo(sivukhin): unsafe - get rid of this
+unsafe impl Send for TursoDatabaseAsyncOperation {}
+
+type Generator = Box<
+    dyn FnOnce(
+            turso_sync_engine::types::Coro<()>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = turso_sync_engine::Result<Option<TursoAsyncOperationResult>>,
+                    > + Send,
+            >,
+        > + Send,
+>;
+
 impl TursoDatabaseAsyncOperation {
-    pub fn new(
-        f: impl AsyncFnOnce(
-                &turso_sync_engine::types::Coro<()>,
-            ) -> turso_sync_engine::Result<Option<TursoAsyncOperationResult>>
-            + 'static,
-    ) -> Self {
+    pub fn new(f: Generator) -> Self {
         let response = Arc::new(Mutex::new(None));
         let generator = genawaiter::sync::Gen::new({
             let response = response.clone();
             |coro| async move {
                 let coro = turso_sync_engine::types::Coro::new((), coro);
-                *response.lock().unwrap() = f(&coro).await?;
+                *response.lock().unwrap() = f(coro).await?;
                 Ok(())
             }
         });

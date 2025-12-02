@@ -467,54 +467,85 @@ impl Default for turso_sync_operation_return_t {
     }
 }
 unsafe extern "C" {
-    #[doc = " Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)"]
+    #[doc = " Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)\n AsyncOperation returns None"]
     pub fn turso_sync_database_init(self_: turso_sync_database_t) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Open prepared synced database, fail if no properly setup database exists"]
+    #[doc = " Open prepared synced database, fail if no properly setup database exists\n AsyncOperation returns None"]
     pub fn turso_sync_database_open(self_: turso_sync_database_t) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Open or prepared synced database or create it if no properly setup database exists"]
+    #[doc = " Open or prepared synced database or create it if no properly setup database exists\n AsyncOperation returns None"]
     pub fn turso_sync_database_create(
         self_: turso_sync_database_t,
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Create turso database connection\n SAFETY: synced database must be opened before that operation (with either turso_database_sync_create or turso_database_sync_open)"]
+    #[doc = " Create turso database connection\n SAFETY: synced database must be opened before that operation (with either turso_database_sync_create or turso_database_sync_open)\n AsyncOperation returns Connection"]
     pub fn turso_sync_database_connect(
         self_: turso_sync_database_t,
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Collect stats about synced database"]
+    #[doc = " Collect stats about synced database\n AsyncOperation returns Stats"]
     pub fn turso_sync_database_stats(self_: turso_sync_database_t)
         -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Checkpoint WAL of the synced database"]
+    #[doc = " Checkpoint WAL of the synced database\n AsyncOperation returns None"]
     pub fn turso_sync_database_checkpoint(
         self_: turso_sync_database_t,
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Push local changes to remote"]
+    #[doc = " Push local changes to remote\n AsyncOperation returns None"]
     pub fn turso_sync_database_push_changes(
         self_: turso_sync_database_t,
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Wait for remote changes"]
+    #[doc = " Wait for remote changes\n AsyncOperation returns Changes (which must be properly deinited or used in the [turso_sync_database_apply_changes] method)"]
     pub fn turso_sync_database_wait_changes(
         self_: turso_sync_database_t,
     ) -> turso_sync_operation_return_t;
 }
 unsafe extern "C" {
-    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error"]
+    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error\n\n AsyncOperation returns None"]
     pub fn turso_sync_database_apply_changes(
         self_: turso_sync_database_t,
         changes: turso_sync_changes_t,
     ) -> turso_sync_operation_return_t;
+}
+#[repr(C)]
+pub struct turso_sync_changes_empty_result_t {
+    pub status: turso_status_t,
+    pub empty: bool,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of turso_sync_changes_empty_result_t"]
+        [::std::mem::size_of::<turso_sync_changes_empty_result_t>() - 24usize];
+    ["Alignment of turso_sync_changes_empty_result_t"]
+        [::std::mem::align_of::<turso_sync_changes_empty_result_t>() - 8usize];
+    ["Offset of field: turso_sync_changes_empty_result_t::status"]
+        [::std::mem::offset_of!(turso_sync_changes_empty_result_t, status) - 0usize];
+    ["Offset of field: turso_sync_changes_empty_result_t::empty"]
+        [::std::mem::offset_of!(turso_sync_changes_empty_result_t, empty) - 16usize];
+};
+impl Default for turso_sync_changes_empty_result_t {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+unsafe extern "C" {
+    #[doc = " Return if no changes were fetched from remote"]
+    pub fn turso_sync_changes_empty(
+        changes: turso_sync_changes_t,
+    ) -> turso_sync_changes_empty_result_t;
 }
 #[repr(C)]
 pub struct turso_sync_operation_resume_result_t {

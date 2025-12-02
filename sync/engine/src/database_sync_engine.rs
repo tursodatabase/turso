@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use turso_core::{DatabaseStorage, OpenFlags};
+use turso_core::{Buffer, Completion, DatabaseStorage, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -91,6 +91,9 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
 fn db_size_from_page(page: &[u8]) -> u32 {
     u32::from_be_bytes(page[28..28 + 4].try_into().unwrap())
 }
+fn is_memory(main_db_path: &str) -> bool {
+    main_db_path == ":memory:"
+}
 fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
 }
@@ -104,19 +107,93 @@ fn create_changes_path(main_db_path: &str) -> String {
     format!("{main_db_path}-changes")
 }
 
+/// caller has no access to the memory io - so we handle it here implicitly
+/// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
+/// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
+async fn full_read<Ctx, IO: SyncEngineIo>(
+    coro: &Coro<Ctx>,
+    io: Arc<dyn turso_core::IO>,
+    sync_engine_io: Arc<IO>,
+    path: &str,
+    is_memory: bool,
+) -> Result<Option<Vec<u8>>> {
+    if !is_memory {
+        let completion = sync_engine_io.full_read(&path)?;
+        let data = wait_all_results(coro, &completion, None).await?;
+        if data.is_empty() {
+            return Ok(None);
+        } else {
+            return Ok(Some(data));
+        }
+    }
+    let Ok(file) = io.open_file(path, OpenFlags::None, false) else {
+        return Ok(None);
+    };
+    let mut content = Vec::new();
+    let mut offset = 0;
+    let buffer = Arc::new(Buffer::new_temporary(4096));
+    let read_len = Arc::new(Mutex::new(0));
+    loop {
+        let c = Completion::new_read(buffer.clone(), {
+            let read_len = read_len.clone();
+            move |r| *read_len.lock().unwrap() = r.expect("memory io must not fail").1
+        });
+        let read = file.pread(offset, c).expect("memory io must not fail");
+        assert!(read.finished(), "memory io must complete immediately");
+        let read_len = *read_len.lock().unwrap();
+        if read_len == 0 {
+            break;
+        }
+        content.extend_from_slice(&buffer.as_slice()[0..read_len as usize]);
+        offset += read_len as u64;
+    }
+    Ok(Some(content))
+}
+
+/// caller has no access to the memory io - so we handle it here implicitly
+/// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
+/// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
+async fn full_write<Ctx, IO: SyncEngineIo>(
+    coro: &Coro<Ctx>,
+    io: Arc<dyn turso_core::IO>,
+    sync_engine_io: Arc<IO>,
+    path: &str,
+    is_memory: bool,
+    content: Vec<u8>,
+) -> Result<()> {
+    if !is_memory {
+        let completion = sync_engine_io.full_write(&path, content)?;
+        wait_all_results(coro, &completion, None).await?;
+        return Ok(());
+    }
+    let file = io.open_file(path, OpenFlags::Create, false)?;
+    let trunc = file
+        .truncate(0, Completion::new_trunc(|_| {}))
+        .expect("memory io must not fail");
+    assert!(trunc.finished(), "memory io must complete immediately");
+    let write = file
+        .pwrite(
+            0,
+            Arc::new(Buffer::new(content)),
+            Completion::new_write(|_| {}),
+        )
+        .expect("memory io must nof fail");
+    assert!(write.finished(), "memory io must complete immediately");
+    Ok(())
+}
+
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
+        io: Arc<dyn turso_core::IO>,
         sync_engine_io: Arc<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
-        let meta_path = create_meta_path(&main_db_path);
-        let meta_completion = sync_engine_io.full_read(&meta_path)?;
-        let meta_data = wait_all_results(coro, &meta_completion, None).await?;
-        if meta_data.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(DatabaseMetadata::load(&meta_data)?))
+        let path = create_meta_path(&main_db_path);
+        let meta = full_read(coro, io, sync_engine_io, &path, is_memory(main_db_path)).await?;
+        match meta {
+            Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
+            None => Ok(None),
         }
     }
 
@@ -131,12 +208,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         tracing::info!("prepare(path={}): opts={:?}", main_db_path, opts);
 
-        let completion = sync_engine_io.full_read(&meta_path)?;
-        let data = wait_all_results(coro, &completion, None).await?;
-        let meta = if data.is_empty() {
-            None
-        } else {
-            Some(DatabaseMetadata::load(&data)?)
+        let meta = full_read(
+            coro,
+            io.clone(),
+            sync_engine_io.clone(),
+            &meta_path,
+            is_memory(main_db_path),
+        )
+        .await?;
+        let meta = match meta {
+            Some(meta) => Some(DatabaseMetadata::load(&meta)?),
+            None => None,
         };
         let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
         let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.clone();
@@ -172,9 +254,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     },
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                let completion = sync_engine_io.full_write(&meta_path, meta.dump()?)?;
+
+                full_write(
+                    coro,
+                    io.clone(),
+                    sync_engine_io.sync_engine_io.clone(),
+                    &meta_path,
+                    is_memory(&main_db_path),
+                    meta.dump()?,
+                )
+                .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-                wait_all_results(coro, &completion, None).await?;
                 meta
             }
             None => {
@@ -202,9 +292,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     partial_bootstrap_server_revision: None,
                 };
                 tracing::info!("write meta after successful bootstrap: meta={meta:?}");
-                let completion = sync_engine_io.full_write(&meta_path, meta.dump()?)?;
+                full_write(
+                    coro,
+                    io.clone(),
+                    sync_engine_io.sync_engine_io.clone(),
+                    &meta_path,
+                    is_memory(&main_db_path),
+                    meta.dump()?,
+                )
+                .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-                wait_all_results(coro, &completion, None).await?;
                 meta
             }
         };
@@ -265,6 +362,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
     pub async fn open_db<Ctx>(
         coro: &Coro<Ctx>,
+        io: Arc<dyn turso_core::IO>,
         sync_engine_io: Arc<IO>,
         main_db: Arc<turso_core::Database>,
         opts: DatabaseSyncEngineOpts,
@@ -272,15 +370,21 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let main_db_path = main_db.path.to_string();
 
         let meta_path = create_meta_path(&main_db_path);
-        let meta_completion = sync_engine_io.full_read(&meta_path)?;
-        let meta_data = wait_all_results(coro, &meta_completion, None).await?;
-        let meta = if meta_data.is_empty() {
+
+        let meta = full_read(
+            coro,
+            io.clone(),
+            sync_engine_io.clone(),
+            &meta_path,
+            is_memory(&main_db_path),
+        )
+        .await?;
+        let Some(meta) = meta else {
             return Err(Error::DatabaseSyncEngineError(
                 "meta must be initialized before open".to_string(),
             ));
-        } else {
-            DatabaseMetadata::load(&meta_data)?
         };
+        let meta = DatabaseMetadata::load(&meta)?;
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
@@ -364,7 +468,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             turso_core::DatabaseOpts::new().with_indexes(true),
             None,
         )?;
-        Self::open_db(coro, sync_engine_io, main_db, opts).await
+        Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 
     fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {
@@ -932,11 +1036,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let mut meta = self.meta().clone();
         update(&mut meta);
         tracing::info!("update_meta: {meta:?}");
-        let completion = self
-            .sync_engine_io
-            .full_write(&self.meta_path, meta.dump()?)?;
+        full_write(
+            coro,
+            self.io.clone(),
+            self.sync_engine_io.sync_engine_io.clone(),
+            &self.meta_path,
+            is_memory(&self.main_db_path),
+            meta.dump()?,
+        )
+        .await?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
-        wait_all_results(coro, &completion, None).await?;
         *self.meta.lock().unwrap() = meta;
         Ok(())
     }

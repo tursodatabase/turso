@@ -16,7 +16,7 @@ typedef enum
     TURSO_SYNC_IO_NONE = 0,
     // HTTP request (secure layer can be added by the caller which actually execute the IO)
     TURSO_SYNC_IO_HTTP = 1,
-    // atomic read of the file
+    // atomic read of the file (not found file must be treated as empty file)
     TURSO_SYNC_IO_FULL_READ = 2,
     // atomic write of the file (operation either succeed or no, on most FS this will be write to temp file followed by rename)
     TURSO_SYNC_IO_FULL_WRITE = 3,
@@ -185,37 +185,64 @@ typedef struct
     turso_sync_operation_t operation;
 } turso_sync_operation_return_t;
 
-/** Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access) */
+/** Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
+ * AsyncOperation returns None
+ */
 turso_sync_operation_return_t turso_sync_database_init(turso_sync_database_t self);
 
-/** Open prepared synced database, fail if no properly setup database exists */
+/** Open prepared synced database, fail if no properly setup database exists
+ * AsyncOperation returns None
+ */
 turso_sync_operation_return_t turso_sync_database_open(turso_sync_database_t self);
 
-/** Open or prepared synced database or create it if no properly setup database exists */
+/** Open or prepared synced database or create it if no properly setup database exists
+ * AsyncOperation returns None
+ */
 turso_sync_operation_return_t turso_sync_database_create(turso_sync_database_t self);
 
 /** Create turso database connection
  * SAFETY: synced database must be opened before that operation (with either turso_database_sync_create or turso_database_sync_open)
+ * AsyncOperation returns Connection
  */
 turso_sync_operation_return_t turso_sync_database_connect(turso_sync_database_t self);
 
-/** Collect stats about synced database */
+/** Collect stats about synced database
+ * AsyncOperation returns Stats
+ */
 turso_sync_operation_return_t turso_sync_database_stats(turso_sync_database_t self);
 
-/** Checkpoint WAL of the synced database */
+/** Checkpoint WAL of the synced database
+ * AsyncOperation returns None
+ */
 turso_sync_operation_return_t turso_sync_database_checkpoint(turso_sync_database_t self);
 
-/** Push local changes to remote */
+/** Push local changes to remote
+ * AsyncOperation returns None
+ */
 turso_sync_operation_return_t turso_sync_database_push_changes(turso_sync_database_t self);
 
-/** Wait for remote changes */
+/** Wait for remote changes
+ * AsyncOperation returns Changes (which must be properly deinited or used in the [turso_sync_database_apply_changes] method)
+ */
 turso_sync_operation_return_t turso_sync_database_wait_changes(turso_sync_database_t self);
 
 /** Apply remote changes locally
  * SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)
  * otherwise, operation will return MISUSE error
+ *
+ * AsyncOperation returns None
  */
 turso_sync_operation_return_t turso_sync_database_apply_changes(turso_sync_database_t self, turso_sync_changes_t changes);
+
+typedef struct
+{
+    turso_status_t status;
+    bool empty;
+} turso_sync_changes_empty_result_t;
+
+/** Return if no changes were fetched from remote */
+turso_sync_changes_empty_result_t
+turso_sync_changes_empty(turso_sync_changes_t changes);
 
 typedef struct
 {
