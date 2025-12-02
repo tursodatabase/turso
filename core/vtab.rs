@@ -500,7 +500,7 @@ impl ExtVirtualTableCursor {
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
         let idx_str = match idx_str {
             Some(idx_str) => Some(std::ffi::CString::new(idx_str).map_err(|e| {
-                crate::LimboError::InternalError("failed to convert idx_str string".to_string())
+                crate::LimboError::InternalError(format!("failed to convert idx_str string: {e}"))
             })?),
             None => None,
         };
