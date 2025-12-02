@@ -1636,29 +1636,46 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row_id: &RowKey,
         tx_id: TxID,
     ) -> RowVersionState {
-        tracing::trace!(
-            "find_row_last_version_state(table_id={}, row_id={})",
-            table_id,
-            row_id,
-        );
-
         let tx = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
-        let Some(versions) = self.rows.get(&RowID {
-            table_id,
-            row_id: row_id.clone(),
-        }) else {
-            return RowVersionState::NotFound;
-        };
-        let versions = versions.value().read();
-        let last_version = versions.last().expect("versions should not be empty");
-        if last_version.is_visible_to(tx, &self.txs) {
-            RowVersionState::LiveVersion
-        } else {
-            RowVersionState::Deleted
+        match row_id {
+            RowKey::Int(_) => {
+                let Some(versions) = self.rows.get(&RowID {
+                    table_id,
+                    row_id: row_id.clone(),
+                }) else {
+                    return RowVersionState::NotFound;
+                };
+                let versions = versions.value().read();
+                let Some(last_version) = versions.last() else {
+                    return RowVersionState::NotFound;
+                };
+                if last_version.is_visible_to(tx, &self.txs) {
+                    RowVersionState::LiveVersion
+                } else {
+                    RowVersionState::Deleted
+                }
+            }
+            RowKey::Record(record) => {
+                let index_rows = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
+                let index_rows = index_rows.value();
+                let Some(versions) = index_rows.get(record) else {
+                    return RowVersionState::NotFound;
+                };
+                let versions = versions.value().read();
+                if let Some(last_version) = versions.last() {
+                    if last_version.is_visible_to(tx, &self.txs) {
+                        RowVersionState::LiveVersion
+                    } else {
+                        RowVersionState::Deleted
+                    }
+                } else {
+                    RowVersionState::NotFound
+                }
+            }
         }
     }
 
