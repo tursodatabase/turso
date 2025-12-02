@@ -6,6 +6,7 @@ use turso_sdk_kit::rsapi::{str_from_c_str, TursoError, TursoStatusCode};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::SyncEngineIoStats,
 };
 
 use crate::{
@@ -97,7 +98,7 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     sync_config: TursoDatabaseSyncConfig,
     sync_engine_opts: turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts,
     db_io: Arc<dyn IO>,
-    sync_engine_io_queue: Arc<SyncEngineIoQueue<TBytes>>,
+    sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
     sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
 }
 
@@ -156,7 +157,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                 }
             }
         };
-        let sync_engine_io_queue = SyncEngineIoQueue::new();
+        let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
         Ok(Arc::new(Self {
             db_config,
             sync_config,

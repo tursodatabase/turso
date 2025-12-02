@@ -64,14 +64,14 @@ pub(crate) fn acquire_slot<T: Clone>(slot: &Arc<Mutex<Option<T>>>) -> Result<Mut
 }
 
 pub struct SyncEngineIoStats<IO: SyncEngineIo> {
-    pub sync_engine_io: Arc<IO>,
+    pub io: Arc<IO>,
     pub network_stats: Arc<DataStats>,
 }
 
 impl<IO: SyncEngineIo> SyncEngineIoStats<IO> {
-    pub fn new(sync_engine_io: Arc<IO>) -> Self {
+    pub fn new(io: Arc<IO>) -> Self {
         Self {
-            sync_engine_io,
+            io,
             network_stats: Arc::new(DataStats::new()),
         }
     }
@@ -80,7 +80,7 @@ impl<IO: SyncEngineIo> SyncEngineIoStats<IO> {
 impl<IO: SyncEngineIo> Clone for SyncEngineIoStats<IO> {
     fn clone(&self) -> Self {
         Self {
-            sync_engine_io: self.sync_engine_io.clone(),
+            io: self.io.clone(),
             network_stats: self.network_stats.clone(),
         }
     }
@@ -90,7 +90,7 @@ impl<IO: SyncEngineIo> Deref for SyncEngineIoStats<IO> {
     type Target = IO;
 
     fn deref(&self) -> &Self::Target {
-        &self.sync_engine_io
+        &self.io
     }
 }
 

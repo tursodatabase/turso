@@ -12,8 +12,8 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    types::AsValueRef, Connection, Database, DatabaseOpts, DatabaseStorage, LimboError, OpenFlags,
-    Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
+    DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
 };
 
 use crate::{assert_send, assert_sync, capi, ConcurrentGuard};
@@ -436,6 +436,15 @@ impl TursoDatabase {
                 },
             }
         };
+        let open_flags = OpenFlags::default();
+        let db_file = if let Some(db_file) = &self.config.db_file {
+            db_file.clone()
+        } else {
+            let file = io
+                .open_file(&self.config.path, open_flags, true)
+                .map_err(turso_error_from_limbo_error)?;
+            Arc::new(DatabaseFile::new(file))
+        };
         let mut opts = DatabaseOpts::new();
         if let Some(experimental_features) = &self.config.experimental_features {
             for features in experimental_features.split(",").map(|s| s.trim()) {
@@ -449,10 +458,11 @@ impl TursoDatabase {
                 };
             }
         }
-        match turso_core::Database::open_file_with_flags(
+        match turso_core::Database::open_with_flags(
             io.clone(),
             &self.config.path,
-            OpenFlags::default(),
+            db_file,
+            open_flags,
             opts,
             None,
         ) {

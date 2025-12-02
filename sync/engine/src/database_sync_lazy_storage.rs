@@ -62,7 +62,13 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             return Err(LimboError::IntegerOverflow);
         };
 
-        if !self.clean_file.has_hole(pos as usize, size)? {
+        let is_hole = self.clean_file.has_hole(pos as usize, size)?;
+        tracing::info!(
+            "LazyDatabaseStorage::read_page(page_idx={}): is_hole={}",
+            page_idx,
+            is_hole
+        );
+        if !is_hole {
             let Some(dirty_file) = &self.dirty_file else {
                 // no dirty file was set - this means that FS is atomic (e.g. MemoryIO)
                 return self.clean_file.pread(pos, c);
@@ -147,11 +153,12 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                 }
             }
         });
-        self.sync_engine_io
-            .add_io_callback(Box::new(move || match generator.resume_with(Ok(())) {
+        self.sync_engine_io.add_io_callback(Box::new(move || {
+            match generator.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(_) => false,
                 genawaiter::GeneratorState::Complete(_) => true,
-            }));
+            }
+        }));
         Ok(c)
     }
 

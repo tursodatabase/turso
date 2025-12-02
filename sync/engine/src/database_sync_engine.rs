@@ -186,11 +186,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        sync_engine_io: Arc<IO>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
         let path = create_meta_path(&main_db_path);
-        let meta = full_read(coro, io, sync_engine_io, &path, is_memory(main_db_path)).await?;
+        let meta = full_read(
+            coro,
+            io,
+            sync_engine_io.io.clone(),
+            &path,
+            is_memory(main_db_path),
+        )
+        .await?;
         match meta {
             Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
             None => Ok(None),
@@ -200,7 +207,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn bootstrap_db<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        sync_engine_io: Arc<IO>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
     ) -> Result<DatabaseMetadata> {
@@ -211,7 +218,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta = full_read(
             coro,
             io.clone(),
-            sync_engine_io.clone(),
+            sync_engine_io.io.clone(),
             &meta_path,
             is_memory(main_db_path),
         )
@@ -220,9 +227,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Some(meta) => Some(DatabaseMetadata::load(&meta)?),
             None => None,
         };
-        let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
         let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.clone();
-        let partial = matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
+        let partial = !matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
 
         let meta = match meta {
             Some(meta) => meta,
@@ -258,7 +264,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 full_write(
                     coro,
                     io.clone(),
-                    sync_engine_io.sync_engine_io.clone(),
+                    sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(&main_db_path),
                     meta.dump()?,
@@ -295,7 +301,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 full_write(
                     coro,
                     io.clone(),
-                    sync_engine_io.sync_engine_io.clone(),
+                    sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(&main_db_path),
                     meta.dump()?,
@@ -326,14 +332,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
     pub fn init_db_storage(
         io: Arc<dyn turso_core::IO>,
-        sync_engine_io: Arc<IO>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
     ) -> Result<Arc<dyn DatabaseStorage>> {
-        let sync_engine_io = SyncEngineIoStats::new(sync_engine_io);
         let partial_bootstrap_strategy = &opts.partial_bootstrap_strategy;
-        let partial = matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
+        let partial = !matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if partial {
             let Some(partial_bootstrap_server_revision) = &meta.partial_bootstrap_server_revision
@@ -347,6 +352,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "partial sync is supported only for V1 protocol".to_string(),
                 ));
             };
+            tracing::info!("create LazyDatabaseStorage database storage");
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
@@ -363,7 +369,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn open_db<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        sync_engine_io: Arc<IO>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         main_db: Arc<turso_core::Database>,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
@@ -374,7 +380,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta = full_read(
             coro,
             io.clone(),
-            sync_engine_io.clone(),
+            sync_engine_io.io.clone(),
             &meta_path,
             is_memory(&main_db_path),
         )
@@ -410,7 +416,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let db = Self {
             io: main_db_io,
-            sync_engine_io: SyncEngineIoStats::new(sync_engine_io),
+            sync_engine_io,
             db_file: main_db_file,
             main_tape,
             main_db_path: main_db_path.to_string(),
@@ -441,7 +447,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn create_db<Ctx>(
         coro: &Coro<Ctx>,
         io: Arc<dyn turso_core::IO>,
-        sync_engine_io: Arc<IO>,
+        sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
@@ -1039,7 +1045,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         full_write(
             coro,
             self.io.clone(),
-            self.sync_engine_io.sync_engine_io.clone(),
+            self.sync_engine_io.io.clone(),
             &self.meta_path,
             is_memory(&self.main_db_path),
             meta.dump()?,
