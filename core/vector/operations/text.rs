@@ -41,7 +41,7 @@ fn format_text<T: std::string::ToString>(values: impl Iterator<Item = T>) -> Str
 /// ```console
 /// [1.0, 2.0, 3.0]
 /// ```
-pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector> {
+pub fn vector_from_text(vector_type: VectorType, text: &str) -> Result<Vector<'_>> {
     let text = text.trim();
     let mut chars = text.chars();
     if chars.next() != Some('[') || chars.last() != Some(']') {

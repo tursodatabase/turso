@@ -674,7 +674,7 @@ where
     I: IntoIterator<IntoIter = E, Item = V>,
 {
     let mut values = values.into_iter();
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);
@@ -714,7 +714,7 @@ where
     I: IntoIterator<IntoIter = E, Item = V>,
 {
     let mut values = values.into_iter();
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         bail_constraint_error!("json_object() requires an even number of arguments")
     }
     let mut json = Jsonb::make_empty_obj(values.len() * 50);

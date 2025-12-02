@@ -254,7 +254,7 @@ impl File for MemoryFile {
 
     fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
         turso_assert!(
-            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            pos.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE),
             "hole must be page aligned"
         );
         let start_page = pos / PAGE_SIZE;

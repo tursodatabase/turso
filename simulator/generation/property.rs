@@ -44,7 +44,7 @@ type PropertyQueryGenFunc<'a, R, G> =
     fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
 
 impl Property {
-    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
+    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<'_, R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,

@@ -20,7 +20,7 @@ impl Default for PseudoCursor {
 }
 
 impl PseudoCursor {
-    pub fn record(&self) -> Ref<Option<ImmutableRecord>> {
+    pub fn record(&self) -> Ref<'_, Option<ImmutableRecord>> {
         self.current.borrow()
     }
 

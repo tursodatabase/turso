@@ -143,7 +143,7 @@ pub fn display_manual(page: Option<&str>, writer: &mut dyn Write) -> anyhow::Res
         Ok(())
     } else if page.is_none() {
         // If no page specified, list available pages
-        return list_available_manuals(writer);
+        list_available_manuals(writer)
     } else {
         let available_pages = MANUAL_DIR
             .files()

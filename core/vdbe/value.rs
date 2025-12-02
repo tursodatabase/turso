@@ -1353,7 +1353,7 @@ mod tests {
 
     #[test]
     fn test_exec_and() {
-        let inputs = vec![
+        let inputs = [
             (Value::Integer(0), Value::Null),
             (Value::Null, Value::Integer(1)),
             (Value::Null, Value::Null),

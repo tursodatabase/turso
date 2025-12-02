@@ -722,7 +722,7 @@ impl TursoStatement {
     }
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
-    pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
+    pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef<'_>, TursoError> {
         let Some(row) = self.statement.row() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,

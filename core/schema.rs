@@ -3297,7 +3297,7 @@ mod tests {
             ("sqlite_autoindex_t1_2".to_string(), 3),
             ("sqlite_autoindex_t1_3".to_string(), 4),
         ];
-        let indices = vec![
+        let indices = [
             Index::automatic_from_primary_key(&table, ("sqlite_autoindex_t1_1".to_string(), 2), 1)?,
             Index::automatic_from_unique(
                 &table,

@@ -302,7 +302,7 @@ fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
         let vector = |rng: &mut ChaCha8Rng| {
             let mut values = Vec::with_capacity(DIMS);
             for _ in 0..DIMS {
-                if rng.next_u32() % MOD == 0 {
+                if rng.next_u32().is_multiple_of(MOD) {
                     values.push((rng.next_u32() as f32 / (u32::MAX as f32)).to_string());
                 } else {
                     values.push("0".to_string())

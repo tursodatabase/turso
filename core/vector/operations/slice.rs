@@ -57,7 +57,7 @@ mod tests {
         vector_types::{Vector, VectorType},
     };
 
-    fn float32_vec_from(slice: &[f32]) -> Vector {
+    fn float32_vec_from(slice: &[f32]) -> Vector<'_> {
         let mut data = Vec::new();
         for &v in slice {
             data.extend_from_slice(&v.to_le_bytes());

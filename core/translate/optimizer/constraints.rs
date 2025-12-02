@@ -289,6 +289,7 @@ pub fn constraints_from_where_clause(
                     // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
                     // we check it here.
                     if *table == table_reference.internal_id && rowid_alias_column.is_some() {
+                        #[expect(clippy::unnecessary_unwrap)]
                         let table_column =
                             &table_reference.table.columns()[rowid_alias_column.unwrap()];
                         cs.constraints.push(Constraint {
@@ -338,6 +339,7 @@ pub fn constraints_from_where_clause(
                 }
                 ast::Expr::RowId { table, .. } => {
                     if *table == table_reference.internal_id && rowid_alias_column.is_some() {
+                        #[expect(clippy::unnecessary_unwrap)]
                         let table_column =
                             &table_reference.table.columns()[rowid_alias_column.unwrap()];
                         cs.constraints.push(Constraint {

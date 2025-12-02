@@ -447,12 +447,19 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ExternalAggState {
     pub state: *mut AggCtx,
     pub argc: usize,
     pub step_fn: StepFunction,
     pub finalize_fn: FinalizeFunction,
+}
+
+impl PartialEq for ExternalAggState {
+    fn eq(&self, other: &Self) -> bool {
+        // Cannot compare functions pointers as they are not predicatble, per rustc lint: `unpredictable_function_pointer_comparisons`
+        self.state == other.state && self.argc == other.argc
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth

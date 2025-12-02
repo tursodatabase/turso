@@ -1572,7 +1572,6 @@ fn emit_update_column_values<'a>(
 /// `target_table_cursor_id` is the cursor id of the table that is being updated.
 ///
 /// `target_table` is the table that is being updated.
-#[allow(clippy::too_many_arguments)]
 fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
