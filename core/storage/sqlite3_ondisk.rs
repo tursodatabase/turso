@@ -188,8 +188,9 @@ pub struct Version(u8);
 
 impl Version {
     #![allow(non_upper_case_globals)]
-    const Legacy: Self = Self(1);
-    const Wal: Self = Self(2);
+    pub const Legacy: Self = Self(1);
+    pub const Wal: Self = Self(2);
+    pub const Mvcc: Self = Self(255);
 }
 
 impl std::fmt::Debug for Version {
@@ -197,6 +198,7 @@ impl std::fmt::Debug for Version {
         match *self {
             Self::Legacy => f.write_str("Version::Legacy"),
             Self::Wal => f.write_str("Version::Wal"),
+            Self::Mvcc => f.write_str("Version::Mvcc"),
             Self(v) => write!(f, "Version::Invalid({v})"),
         }
     }
