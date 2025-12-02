@@ -1107,7 +1107,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
-        todo!()
+        if self.is_btree_allocated() {
+            // Defer to btree cursor's seek_end implementation
+            self.btree_cursor.seek_end()
+        } else {
+            // SkipMap inserts don't require cursor positioning because
+            // SeekEnd instruction is only used for insertions.
+            Ok(IOResult::Done(()))
+        }
     }
 
     fn seek_to_last(&mut self) -> Result<IOResult<()>> {
