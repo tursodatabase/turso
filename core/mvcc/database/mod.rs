@@ -1310,6 +1310,40 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         Ok(())
     }
 
+    /// Inserts a deletion record for a row that does not currently have any versions in the MV store.
+    /// This is used in cases where the BTree contains that record, but it is logically deleted.
+    pub fn insert_tombstone_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        id: RowID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        let row_version = RowVersion {
+            begin: Some(TxTimestampOrID::Timestamp(0)),
+            end: Some(TxTimestampOrID::TxID(tx_id)),
+            row: row.clone(),
+        };
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        tx.insert_to_write_set(id.clone());
+        match maybe_index_id {
+            Some(index_id) => {
+                let RowKey::Record(sortable_key) = row.id.row_id else {
+                    panic!("Index writes must be to a record");
+                };
+                self.insert_index_version(index_id, sortable_key, row_version);
+            }
+            None => {
+                self.insert_version(id, row_version);
+            }
+        }
+        Ok(())
+    }
+
     /// Updates a row in a table in the database with new values.
     ///
     /// This function updates an existing row in the database within the
@@ -1469,6 +1503,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 Ok(false)
             }
         }
+    }
+
+    /// Same as insert_tombstone_to_table_or_index() but specialcased for tables only.
+    /// This is invoked during logical log recovery process to make sure transactions do not see
+    /// records that exist in btree but have been deleted according to the logical log.
+    fn insert_tombstone_to_table(&self, tx_id: TxID, rowid: RowID, row: Row) -> Result<()> {
+        self.insert_tombstone_to_table_or_index(tx_id, rowid, row, None)
     }
 
     /// Retrieves a row from the table with the given `id`.
