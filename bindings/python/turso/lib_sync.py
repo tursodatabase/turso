@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Union, Iterable, Tuple
-from dataclasses import dataclass
+import os
+import urllib.error
 
 # for HTTP IO
 import urllib.request
-import urllib.error
-import io
-import os
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
-from .lib import Connection as _Connection
 from ._turso import (
     Misuse,
+    PyTursoAsyncOperation,
+    PyTursoAsyncOperationResultKind,
     PyTursoConnection,
     PyTursoDatabaseConfig,
     PyTursoSyncDatabase,
@@ -19,10 +19,9 @@ from ._turso import (
     PyTursoSyncDatabaseStats,
     PyTursoSyncIoItem,
     PyTursoSyncIoItemRequestKind,
-    PyTursoAsyncOperation,
-    PyTursoAsyncOperationResultKind,
     py_turso_sync_new,
 )
+from .lib import Connection as _Connection
 
 # Constants
 _HTTP_CHUNK_SIZE = 64 * 1024  # 64 KiB
@@ -95,6 +94,7 @@ def _headers_iter_to_pairs(headers: Iterable[Tuple[str, str]]) -> list[tuple[str
     return pairs
 
 
+# ruff: noqa: C901
 def _process_http_item(
     sync: PyTursoSyncDatabase,
     io_item: PyTursoSyncIoItem,

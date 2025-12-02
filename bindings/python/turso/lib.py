@@ -163,7 +163,8 @@ def _run_execute_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[],
         status = result.status
         if status == Status.Io:
             stmt.run_io()
-            if extra_io: extra_io()
+            if extra_io:
+                extra_io()
             continue
         return result
 
@@ -176,7 +177,8 @@ def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], N
         status = stmt.step()
         if status == Status.Io:
             stmt.run_io()
-            if extra_io: extra_io()
+            if extra_io:
+                extra_io()
             continue
         return status
 
@@ -909,11 +911,16 @@ def setup_logging(level: Optional[int] = None) -> None:
         )
 
     try:
-        py_turso_setup(PyTursoSetupConfig(logger=_py_logger, log_level={
-            logging.ERROR: 'error',
-            logging.WARN: 'warn',
-            logging.INFO: 'info',
-            logging.DEBUG: 'debug',
-        }[level]))
+        py_turso_setup(
+            PyTursoSetupConfig(
+                logger=_py_logger,
+                log_level={
+                    logging.ERROR: "error",
+                    logging.WARN: "warn",
+                    logging.INFO: "info",
+                    logging.DEBUG: "debug",
+                }[level],
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         raise _map_turso_exception(exc)
