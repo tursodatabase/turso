@@ -1,7 +1,6 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
-use crate::schema::Schema;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -11,6 +10,7 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
 use crate::types::compare_immutable;
@@ -34,6 +34,7 @@ use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::RwLock;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -1224,20 +1225,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.insert_table_id_to_rootpage(root_page_as_table_id, Some(*root_page));
         }
 
-        if !self.maybe_recover_logical_log(bootstrap_conn.pager.load().clone())? {
+        // Promote the connection to a regular one, meaning it will start reading data from the MV store.
+        // This is done because as we deserialize schema entries from the logical log, we will want those to
+        // end up in the in-memory schema object as well.
+        bootstrap_conn.promote_to_regular_connection();
+
+        if !self.maybe_recover_logical_log(bootstrap_conn.clone())? {
             // There was no logical log to recover, so we're done.
             return Ok(());
         }
-
-        // Make sure we capture all the schema changes that were deserialized from the logical log.
-        bootstrap_conn.promote_to_regular_connection();
-        bootstrap_conn.reparse_schema()?;
-        *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
-
-        // Populate index rows from recovered table rows.
-        // Index entries are not persisted to the logical log, so we reconstruct them here.
-        let schema = bootstrap_conn.schema.read();
-        self.populate_index_rows_from_tables(&schema)?;
 
         Ok(())
     }
@@ -1962,10 +1958,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Begins a loading transaction
     ///
     /// A loading transaction is one that happens while trying recover from a logical log file.
-    /// This transaction will be stored on tx_id = 0.
-    pub fn begin_load_tx(&self, pager: Arc<Pager>) -> Result<()> {
-        let tx_id = 0;
-        let begin_ts = self.get_timestamp();
+    pub fn begin_load_tx(&self, connection: Arc<Connection>) -> Result<()> {
+        let pager = connection.pager.load().clone();
+        let tx_id = LOGICAL_LOG_RECOVERY_TRANSACTION_ID;
+        let begin_ts = LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP;
 
         let header = self.get_new_transaction_database_header(&pager);
         let tx = Transaction::new(tx_id, begin_ts, header);
@@ -1975,6 +1971,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             "somehow we tried to call begin_load_tx twice"
         );
         self.txs.insert(tx_id, tx);
+
+        // disable trying to commit pager transaction automatically; during the "load tx" (bootstrap of MVCC) we
+        // only care about reading sqlite_schema and the logical log and we don't want our normal "end transaction"
+        // logic to run.
+        connection.auto_commit.store(false, Ordering::SeqCst);
+        connection.set_mv_tx(Some((tx_id, TransactionMode::Read)));
 
         Ok(())
     }
@@ -2090,8 +2092,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Commits a load transaction that is running while recovering from a logical log file.
     /// This will simply mark timestamps of row version correctly so they are now visible to new
     /// transactions.
-    pub fn commit_load_tx(&self, tx_id: TxID) {
-        let end_ts = self.get_timestamp();
+    pub fn commit_load_tx(&self, tx_id: TxID, connection: &Arc<Connection>) {
+        let end_ts = LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP;
         let tx = self
             .txs
             .get(&tx_id)
@@ -2125,123 +2127,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                 }
             }
-        }
-    }
-
-    /// Populates index rows from table rows after logical log recovery.
-    ///
-    /// Only table rows are persisted to the logical log (not index rows).
-    /// This method reconstructs index entries by iterating over all recovered table rows
-    /// and inserting corresponding index entries for each index defined in the schema.
-    pub fn populate_index_rows_from_tables(&self, schema: &Schema) -> Result<()> {
-        // Iterate over all indexes in the schema
-        for (table_name, indexes) in &schema.indexes {
-            for index in indexes {
-                // Skip ephemeral indexes
-                if index.ephemeral {
-                    crate::bail_corrupt_error!(
-                        "Somehow we deserialized an ephemeral index from the logical log"
-                    );
-                }
-
-                if !index.has_rowid {
-                    crate::bail_parse_error!("Without rowid indexes are not supported with MVCC");
-                }
-
-                // Expression indexes are unsupported - we would have to evaluate the expression here
-                // and we don't have the machinery
-                if index.columns.iter().any(|c| c.expr.is_some()) {
-                    crate::bail_parse_error!("Expression indexes are not supported with MVCC");
-                }
-
-                // Partial indexes are unsupported - we would have to evaluate the where clause here
-                // and we don't have the machinery
-                if index.where_clause.is_some() {
-                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                }
-
-                let table = schema.get_table(table_name).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "Table {} not found for index {}",
-                        index.table_name, index.name
-                    ))
-                })?;
-
-                let Some(btree_table) = table.btree() else {
-                    crate::bail_corrupt_error!("Table {} is not a btree table", table_name);
-                };
-
-                if !btree_table.has_rowid {
-                    crate::bail_parse_error!("Without rowid tables are not supported with MVCC");
-                }
-
-                let table_id = self.get_table_id_from_root_page(btree_table.root_page);
-                let index_id = self.get_table_id_from_root_page(index.root_page);
-
-                // Create IndexInfo for proper key ordering
-                let index_info = Arc::new(IndexInfo::new_from_index(index));
-
-                // Iterate all rows for this table
-                for entry in self.rows.iter() {
-                    let rowid = entry.key();
-                    // Yeah this is inefficient to loop over all rows for each index lol
-                    if rowid.table_id != table_id {
-                        continue;
+            let Some(index_rows) = self.index_rows.get(&rowid.table_id) else {
+                continue;
+            };
+            let index_rows = index_rows.value();
+            let RowKey::Record(sortable_key) = &rowid.row_id else {
+                panic!("index row id is not a record");
+            };
+            let index_row_versions = index_rows.get(sortable_key);
+            if let Some(index_row_versions) = index_row_versions {
+                let mut index_row_versions = index_row_versions.value().write();
+                for index_row_version in index_row_versions.iter_mut() {
+                    if let Some(TxTimestampOrID::TxID(id)) = index_row_version.begin {
+                        assert_eq!(id, tx_id);
+                        index_row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
                     }
-
-                    let row_versions = entry.value().read();
-                    for row_version in row_versions.iter() {
-                        // Only process committed versions (both live and deleted)
-                        // Deleted versions need index entries too so readers can see the deletion
-                        assert!(
-                            matches!(row_version.begin, Some(TxTimestampOrID::Timestamp(1))),
-                            "all table rows should be committed by the bootstrap transaction, but got {:?}", row_version.begin
-                        );
-                        if let Some(ref end) = row_version.end {
-                            assert!(
-                                matches!(end, TxTimestampOrID::Timestamp(1)),
-                                "all table rows should be committed by the bootstrap transaction, but got {end:?}",
-                            );
-                        }
-
-                        // Deserialize row data to extract index columns
-                        let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
-                        let mut record_cursor = RecordCursor::new();
-
-                        // Build index key: extract columns at pos_in_table positions, then append rowid
-                        let mut key_values: Vec<ValueRef> =
-                            Vec::with_capacity(index.columns.len() + 1);
-                        for idx_col in &index.columns {
-                            let val = record_cursor.get_value(&record, idx_col.pos_in_table)?;
-                            key_values.push(val);
-                        }
-
-                        let RowKey::Int(row_id) = &rowid.row_id else {
-                            crate::bail_parse_error!("Rowid of table row is not an integer");
-                        };
-                        key_values.push(ValueRef::Integer(*row_id));
-
-                        let index_key =
-                            SortableIndexKey::new_from_values(key_values, index_info.clone());
-
-                        // Create a committed row version for the index entry, preserving begin/end timestamps
-                        let index_row = Row::new(
-                            RowID::new(index_id, RowKey::Record(index_key.clone())),
-                            row_version.row.data.clone(),
-                            row_version.row.column_count,
-                        );
-                        let index_row_version = RowVersion {
-                            begin: row_version.begin.clone(),
-                            end: row_version.end.clone(),
-                            row: index_row,
-                        };
-
-                        self.insert_index_version(index_id, index_key, index_row_version);
+                    if let Some(TxTimestampOrID::TxID(id)) = index_row_version.end {
+                        assert_eq!(id, tx_id);
+                        index_row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
                     }
                 }
             }
         }
-        Ok(())
+        connection.auto_commit.store(true, Ordering::SeqCst);
+        connection.set_mv_tx(None);
     }
 
     /// Rolls back a transaction with the specified ID.
@@ -2578,7 +2487,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     // Recovers the logical log if there is any content.
     // Returns true if the logical log was recovered, false otherwise.
-    pub fn maybe_recover_logical_log(&self, pager: Arc<Pager>) -> Result<bool> {
+    pub fn maybe_recover_logical_log(&self, connection: Arc<Connection>) -> Result<bool> {
+        let pager = connection.pager.load().clone();
         let file = self.get_logical_log_file();
         let mut reader = StreamingLogicalLogReader::new(file.clone());
 
@@ -2588,12 +2498,45 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let c = reader.read_header()?;
         pager.io.wait_for_completion(c)?;
-        let tx_id = 0;
-        self.begin_load_tx(pager.clone())?;
+        let tx_id = LOGICAL_LOG_RECOVERY_TRANSACTION_ID;
+        self.begin_load_tx(connection.clone())?;
+
+        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::new();
+
+        // Helper to get an Arc<IndexInfo> to construct a SortableIndexKey
+        let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {
+            if let Some(index_info) = index_infos.get(&index_id) {
+                Ok(index_info.clone())
+            } else {
+                let schema = connection.schema.read();
+                let root_page = self
+                    .table_id_to_rootpage
+                    .get(&index_id)
+                    .and_then(|entry| *entry.value())
+                    .map(|value| value as i64)
+                    .unwrap_or(i64::from(index_id)); // this can be negative for non-checkpointed indexes
+
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.root_page == root_page)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "Index with root page {root_page} not found in schema",
+                        ))
+                    })?;
+                let index_info = Arc::new(IndexInfo::new_from_index(index));
+                index_infos.insert(index_id, index_info.clone());
+                Ok(index_info)
+            }
+        };
         loop {
-            match reader.next_record(&pager.io)? {
-                StreamingResult::InsertRow { row, rowid } => {
-                    if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+            let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
+            match next_rec {
+                StreamingResult::InsertTableRow { row, rowid } => {
+                    let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
+                    if is_schema_row {
                         // Sqlite schema row version inserts
                         let row_data = row.data.clone();
                         let record = ImmutableRecord::from_bin_record(row_data);
@@ -2629,11 +2572,25 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // Other table row version inserts; table id must exist in mapping (otherwise there's a row version insert to an unknown table)
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
-                    self.insert(tx_id, row)?; // TODO: reconstruct index rows from table row on recovery
+                    self.insert(tx_id, row)?;
+                    if is_schema_row {
+                        // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
+                        // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
+                        // changes in the logical log are special cases that don't happen that often.
+                        connection.reparse_schema()?;
+                        *connection.db.schema.lock() = connection.schema.read().clone();
+                    }
                 }
-                StreamingResult::DeleteRow { rowid } => {
+                StreamingResult::DeleteTableRow { row, rowid } => {
                     assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
-                    self.delete(tx_id, rowid)?; // TODO: reconstruct index rows from table row on recovery
+                    self.insert_tombstone_to_table(tx_id, rowid, row)?;
+                }
+                StreamingResult::InsertIndexRow { row, rowid } => {
+                    self.insert_to_table_or_index(tx_id, row, Some(rowid.table_id))?;
+                }
+                StreamingResult::DeleteIndexRow { row, rowid } => {
+                    let index_id = rowid.table_id;
+                    self.insert_tombstone_to_table_or_index(tx_id, rowid, row, Some(index_id))?;
                 }
                 StreamingResult::Eof => {
                     // Set offset to the end so that next writes go to the end of the file
@@ -2642,7 +2599,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
-        self.commit_load_tx(tx_id);
+        self.commit_load_tx(tx_id, &connection);
         Ok(true)
     }
 
