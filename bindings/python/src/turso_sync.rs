@@ -360,7 +360,9 @@ impl PyTursoSyncIoItem {
                     PyTursoSyncIoItemHttpRequest {
                         method: method.clone(),
                         path: path.clone(),
-                        body: body.as_ref().map(|body| PyBytes::new(py, body.as_ref()).unbind()),
+                        body: body
+                            .as_ref()
+                            .map(|body| PyBytes::new(py, body.as_ref()).unbind()),
                         headers: {
                             let mut tuples = Vec::new();
                             for (key, value) in headers {
@@ -484,7 +486,9 @@ impl PyTursoSyncDatabase {
         changes: &mut PyTursoSyncDatabaseChanges,
     ) -> PyResult<PyTursoAsyncOperation> {
         let Some(changes) = changes.changes.take() else {
-            return Err(Misuse::new_err("changes were already applied before".to_string()));
+            return Err(Misuse::new_err(
+                "changes were already applied before".to_string(),
+            ));
         };
         Ok(PyTursoAsyncOperation {
             operation: self.database.apply_changes(changes),
