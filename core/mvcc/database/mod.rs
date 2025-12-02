@@ -1078,6 +1078,8 @@ impl DeleteRowStateMachine {
 }
 
 pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
+pub const LOGICAL_LOG_RECOVERY_TRANSACTION_ID: u64 = 0;
+pub const LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP: u64 = 0;
 
 /// A multi-version concurrency control database.
 #[derive(Debug)]
@@ -2442,16 +2444,22 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
-            if self.get_begin_timestamp(&v.begin) <= self.get_begin_timestamp(&row_version.begin) {
-                position = i + 1;
+            let existing_begin = self.get_begin_timestamp(&v.begin);
+            let new_begin = self.get_begin_timestamp(&row_version.begin);
+            if existing_begin <= new_begin {
+                if existing_begin == new_begin
+                    && existing_begin == LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP
+                {
+                    // During recovery we may have both an insert for row R and a deletion for row R.
+                    // In these cases just replace the version so that "find_last_visible_version()" doesn't return
+                    // the non-deleted version since both of the versions have the same begin timestamp during recovery.
+                    versions[position] = row_version;
+                    return;
+                } else {
+                    position = i + 1;
+                }
                 break;
             }
-        }
-        if versions.len() - position > 3 {
-            tracing::debug!(
-                "Inserting a row version {} positions from the end",
-                versions.len() - position
-            );
         }
         versions.insert(position, row_version);
     }
