@@ -4,6 +4,28 @@ We'd love to have you contribute to Turso!
 
 This document is a quick helper to get you going.
 
+<!--toc:start-->
+- [Contributing to Turso](#contributing-to-turso)
+  - [Getting Started](#getting-started)
+    - [Configuring `mold` Linker](#configuring-mold-linker)
+    - [Running Tests On Linux](#running-tests-on-linux)
+  - [Debugging bugs](#debugging-bugs)
+    - [Query execution debugging](#query-execution-debugging)
+    - [Stress testing with sanitizers](#stress-testing-with-sanitizers)
+  - [Finding things to work on](#finding-things-to-work-on)
+  - [Submitting your work](#submitting-your-work)
+  - [Compatibility tests](#compatibility-tests)
+    - [Prerequisites](#prerequisites)
+    - [Running the tests](#running-the-tests)
+  - [TPC-H](#tpc-h)
+  - [Deterministic simulation tests](#deterministic-simulation-tests)
+    - [Whopper](#whopper)
+  - [Python Bindings](#python-bindings)
+  - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
+  - [Antithesis](#antithesis)
+  - [Adding Third Party Dependencies](#adding-third-party-dependencies)
+<!--toc:end-->
+
 ## Getting Started
 
 Turso is a rewrite of SQLite in Rust. If you are new to SQLite, the following articles and books are a good starting point:
