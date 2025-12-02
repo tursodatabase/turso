@@ -176,9 +176,11 @@ pub fn parse_schema_rows(
                 // read the schema is actually complete?
                 rows.run_once()?;
             }
-            StepResult::Interrupt => break,
+            StepResult::Interrupt => {
+                return Err(LimboError::InternalError("interrupted".to_string()))
+            }
             StepResult::Done => break,
-            StepResult::Busy => break,
+            StepResult::Busy => return Err(LimboError::Busy),
         }
     }
 
