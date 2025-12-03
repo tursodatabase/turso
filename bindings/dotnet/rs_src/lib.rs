@@ -75,10 +75,10 @@ pub fn to_value(value: TursoValue) -> Value {
         ValueType::Text => {
             let slice =
                 unsafe { slice::from_raw_parts(value.value.text.ptr, value.value.text.len) };
-            return match str::from_utf8(slice) {
+            match str::from_utf8(slice) {
                 Ok(value) => Value::Text(Text::new(value)),
                 Err(_) => Value::Null,
-            };
+            }
         }
     }
 }
