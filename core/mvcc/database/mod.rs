@@ -1879,27 +1879,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, SortableIndexKey>>,
     ) -> Option<RowID> {
-        if index_iterator.is_none() {
-            let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
-            let index_rows = index_rows.value();
-            let start = if inclusive {
-                Bound::Included(start)
-            } else {
-                Bound::Excluded(start)
-            };
-            let range = create_seek_range(start, direction);
-            let iter_box = match direction {
-                IterationDirection::Forwards => Box::new(index_rows.range(range))
-                    as Box<
-                        dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
-                    >,
-                IterationDirection::Backwards => Box::new(index_rows.range(range).rev())
-                    as Box<
-                        dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
-                    >,
-            };
-            *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
-        }
+        let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index_rows = index_rows.value();
+        let start = if inclusive {
+            Bound::Included(start)
+        } else {
+            Bound::Excluded(start)
+        };
+        let range = create_seek_range(start, direction);
+        let iter_box = match direction {
+            IterationDirection::Forwards => Box::new(index_rows.range(range))
+                as Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
+            IterationDirection::Backwards => Box::new(index_rows.range(range).rev())
+                as Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
+        };
+        *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
