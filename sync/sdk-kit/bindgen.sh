@@ -8,6 +8,11 @@ bindgen turso_sync.h -o src/bindings.rs \
     --allowlist-function "turso_sync_.*" \
     --blocklist-type "turso_status_code_t" \
     --blocklist-type "turso_database_config_t" \
+    --blocklist-type "turso_database" \
+    --blocklist-type "turso_database_t" \
+    --blocklist-type "turso_database" \
+    --blocklist-type "turso_database_t" \
+    --blocklist-type "turso_connection" \
     --blocklist-type "turso_connection_t" \
     --blocklist-type "turso_status_t" \
     --blocklist-type "turso_slice_ref_t" \
