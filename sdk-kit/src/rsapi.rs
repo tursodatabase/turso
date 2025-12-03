@@ -761,7 +761,7 @@ impl TursoStatement {
         }
     }
     /// execute statement to completion
-    /// method returns [TursoStatusCode::Ok] if execution completed
+    /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self) -> Result<TursoExecutionResult, TursoError> {
         let guard = self.concurrent_guard.clone();
@@ -778,7 +778,7 @@ impl TursoStatement {
                 });
             } else if status == TursoStatusCode::Done {
                 return Ok(TursoExecutionResult {
-                    status: TursoStatusCode::Ok,
+                    status: TursoStatusCode::Done,
                     rows_changed: self.statement.n_change() as u64,
                 });
             }

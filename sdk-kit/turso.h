@@ -175,7 +175,10 @@ turso_status_code_t turso_connection_close(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Execute single statement */
+/** Execute single statement
+ * execute returns TURSO_DONE if execution completed
+ * execute returns TURSO_IO if async_io was set and execution needs IO in order to make progress
+ */
 turso_status_code_t turso_statement_execute(
     const turso_statement_t *self,
     uint64_t *rows_changes,
@@ -189,10 +192,15 @@ turso_status_code_t turso_statement_execute(
  */
 turso_status_code_t turso_statement_step(const turso_statement_t *self, const char **error_opt_out);
 
-/** Execute one iteration of underlying IO backend */
+/** Execute one iteration of underlying IO backend after TURSO_IO status code
+ * This function either return some ERROR status or TURSO_OK
+ */
 turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const char **error_opt_out);
 
-/** Reset a statement */
+/** Reset a statement
+ * This method must be called in order to cleanup statement resources and prepare it for re-execution
+ * Any pending execution will be aborted - be careful and in certain cases ensure that turso_statement_finalize called before turso_statement_reset
+ */
 turso_status_code_t turso_statement_reset(const turso_statement_t *self, const char **error_opt_out);
 
 /** Finalize a statement
