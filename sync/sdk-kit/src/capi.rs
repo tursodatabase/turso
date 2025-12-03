@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use turso_sdk_kit::{
     capi::{
         self,
@@ -35,15 +37,15 @@ pub extern "C" fn turso_sync_database_new(
     let db_config = match unsafe { turso_sdk_kit::rsapi::TursoDatabaseConfig::from_capi(db_config) }
     {
         Ok(sync_config) => sync_config,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     let sync_config = match unsafe { rsapi::TursoDatabaseSyncConfig::from_capi(sync_config) } {
         Ok(sync_config) => sync_config,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     let db = match TursoDatabaseSync::new(db_config, sync_config) {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *db_ref = db.to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -58,7 +60,7 @@ pub extern "C" fn turso_sync_database_init(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.init().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -73,7 +75,7 @@ pub extern "C" fn turso_sync_database_open(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.open().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -88,7 +90,7 @@ pub extern "C" fn turso_sync_database_create(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.create().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -103,7 +105,7 @@ pub extern "C" fn turso_sync_database_connect(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.connect().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -118,7 +120,7 @@ pub extern "C" fn turso_sync_database_stats(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.stats().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -133,7 +135,7 @@ pub extern "C" fn turso_sync_database_checkpoint(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.checkpoint().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -148,7 +150,7 @@ pub extern "C" fn turso_sync_database_push_changes(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.push_changes().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -163,7 +165,7 @@ pub extern "C" fn turso_sync_database_wait_changes(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *operation = db.wait_changes().to_capi() };
     capi::c::turso_status_code_t::TURSO_OK
@@ -179,7 +181,7 @@ pub extern "C" fn turso_sync_database_apply_changes(
 ) -> turso_sdk_kit::capi::c::turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe {
         *operation = db
@@ -197,11 +199,11 @@ pub extern "C" fn turso_sync_operation_resume(
 ) -> turso_status_code_t {
     let operation = match unsafe { TursoDatabaseAsyncOperation::ref_from_capi(operation) } {
         Ok(operation) => operation,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     let result = match operation.resume() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     result.to_capi()
 }
@@ -226,11 +228,11 @@ pub extern "C" fn turso_sync_operation_result_extract_connection(
 ) -> turso_status_code_t {
     let operation = match unsafe { TursoDatabaseAsyncOperation::ref_from_capi(operation) } {
         Ok(operation) => operation,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let connection = match operation.take_connection_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *connection_ref = connection };
     turso_status_code_t::TURSO_OK
@@ -244,11 +246,11 @@ pub extern "C" fn turso_sync_operation_result_extract_changes(
 ) -> turso_status_code_t {
     let operation = match unsafe { TursoDatabaseAsyncOperation::ref_from_capi(operation) } {
         Ok(operation) => operation,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let changes = match operation.take_changes_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *changes_ref = changes };
     turso_status_code_t::TURSO_OK
@@ -262,11 +264,11 @@ pub extern "C" fn turso_sync_operation_result_extract_stats(
 ) -> turso_status_code_t {
     let operation = match unsafe { TursoDatabaseAsyncOperation::ref_from_capi(operation) } {
         Ok(operation) => operation,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let stats = match operation.get_stats_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *stats_ref = stats };
     turso_status_code_t::TURSO_OK
@@ -281,7 +283,7 @@ pub extern "C" fn turso_sync_database_io_take_item(
 ) -> turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match db.take_io_item() {
         Some(item) => {
@@ -303,7 +305,7 @@ pub extern "C" fn turso_sync_database_io_step_callbacks(
 ) -> turso_status_code_t {
     let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
         Ok(db) => db,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     db.step_io_callbacks();
     turso_status_code_t::TURSO_OK
@@ -329,11 +331,11 @@ pub extern "C" fn turso_sync_database_io_request_http(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let http = match request.get_request().http_to_capi() {
         Ok(http) => http,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *http_ref = http };
     turso_status_code_t::TURSO_OK
@@ -348,11 +350,11 @@ pub extern "C" fn turso_sync_database_io_request_http_header(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let header = match request.get_request().header_to_capi(index) {
         Ok(heaeder) => heaeder,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *header_ref = header };
     turso_status_code_t::TURSO_OK
@@ -366,11 +368,11 @@ pub extern "C" fn turso_sync_database_io_request_full_read(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let full_read = match request.get_request().full_read_to_capi() {
         Ok(full_read) => full_read,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *full_read_ref = full_read };
     turso_status_code_t::TURSO_OK
@@ -384,11 +386,11 @@ pub extern "C" fn turso_sync_database_io_request_full_write(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let full_write = match request.get_request().full_write_to_capi() {
         Ok(full_write) => full_write,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     unsafe { *full_write_ref = full_write };
     turso_status_code_t::TURSO_OK
@@ -402,11 +404,11 @@ pub extern "C" fn turso_sync_database_io_poison(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let error = match str_from_turso_slice(unsafe { *error }) {
         Ok(error) => error.to_string(),
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     request.get_completion().poison(error);
     turso_status_code_t::TURSO_OK
@@ -420,7 +422,7 @@ pub extern "C" fn turso_sync_database_io_status(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     request.get_completion().status(status as u32);
     turso_status_code_t::TURSO_OK
@@ -434,11 +436,11 @@ pub extern "C" fn turso_sync_database_io_push_buffer(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let buffer = match bytes_from_turso_slice(unsafe { *buffer }) {
         Ok(buffer) => buffer,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     request.get_completion().push_buffer(buffer.to_vec());
     turso_status_code_t::TURSO_OK
@@ -451,7 +453,7 @@ pub extern "C" fn turso_sync_database_io_done(
 ) -> turso_status_code_t {
     let request = match unsafe { SyncEngineIoQueueItem::<Vec<u8>>::ref_from_capi(request) } {
         Ok(request) => request,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     request.get_completion().done();
     turso_status_code_t::TURSO_OK

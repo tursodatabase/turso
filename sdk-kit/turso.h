@@ -262,7 +262,7 @@ turso_statement_bind_positional_blob(
     const turso_statement_t *self,
     size_t position,
     /* pointer to the start of BLOB slice */
-    const uint8_t *ptr,
+    const char *ptr,
     /* length of BLOB slice */
     size_t len);
 turso_status_code_t

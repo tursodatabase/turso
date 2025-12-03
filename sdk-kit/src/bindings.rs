@@ -239,7 +239,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Execute single statement"]
+    #[doc = " Execute single statement\n execute returns TURSO_DONE if execution completed\n execute returns TURSO_IO if async_io was set and execution needs IO in order to make progress"]
     pub fn turso_statement_execute(
         self_: *const turso_statement_t,
         rows_changes: *mut u64,
@@ -254,14 +254,14 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Execute one iteration of underlying IO backend"]
+    #[doc = " Execute one iteration of underlying IO backend after TURSO_IO status code\n This function either return some ERROR status or TURSO_OK"]
     pub fn turso_statement_run_io(
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Reset a statement"]
+    #[doc = " Reset a statement\n This method must be called in order to cleanup statement resources and prepare it for re-execution\n Any pending execution will be aborted - be careful and in certain cases ensure that turso_statement_finalize called before turso_statement_reset"]
     pub fn turso_statement_reset(
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
@@ -346,7 +346,7 @@ unsafe extern "C" {
     pub fn turso_statement_bind_positional_blob(
         self_: *const turso_statement_t,
         position: usize,
-        ptr: *const u8,
+        ptr: *const ::std::os::raw::c_char,
         len: usize,
     ) -> turso_status_code_t;
 }
