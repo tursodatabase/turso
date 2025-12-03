@@ -26,7 +26,7 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
         let conn = db.connect().unwrap();
-        let mvcc_store = db.mv_store.as_ref().unwrap().clone();
+        let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
             db,
@@ -90,7 +90,7 @@ impl MvccTestDbNoConn {
     }
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<LocalClock>> {
-        self.get_db().mv_store.as_ref().unwrap().clone()
+        self.get_db().get_mv_store().clone().unwrap()
     }
 }
 
