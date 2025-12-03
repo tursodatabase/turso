@@ -39,13 +39,6 @@ impl Arbitrary for FromClause {
 
         tables.retain(|t| t.name != table.name);
 
-        let name = table.name.clone();
-
-        let mut table_context = JoinTable {
-            tables: Vec::new(),
-            rows: Vec::new(),
-        };
-
         let joins: Vec<_> = (0..num_joins)
             .filter_map(|_| {
                 if tables.is_empty() {
@@ -55,18 +48,6 @@ impl Arbitrary for FromClause {
                 let joined_table_name = join_table.name.clone();
 
                 tables.retain(|t| t.name != join_table.name);
-                table_context.rows = table_context
-                    .rows
-                    .iter()
-                    .cartesian_product(join_table.rows.iter())
-                    .map(|(t_row, j_row)| {
-                        let mut row = t_row.clone();
-                        row.extend(j_row.clone());
-                        row
-                    })
-                    .collect();
-                // TODO: inneficient. use a Deque to push_front?
-                table_context.tables.insert(0, join_table);
                 for row in &mut table.rows {
                     assert_eq!(
                         row.len(),
@@ -84,7 +65,7 @@ impl Arbitrary for FromClause {
             })
             .collect();
         FromClause {
-            table: SelectTable::Table(name),
+            table: SelectTable::Table(table.name.clone()),
             joins,
         }
     }
