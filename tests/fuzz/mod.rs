@@ -1975,7 +1975,6 @@ mod fuzz_tests {
             }
         }
     }
-    // TODO: mvcc indexes
     #[turso_macros::test(mvcc)]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
