@@ -300,7 +300,8 @@ impl Interactions {
     pub fn check_tables(&self) -> bool {
         match &self.interactions {
             InteractionsType::Property(property) => property.check_tables(),
-            InteractionsType::Query(..) | InteractionsType::Fault(..) => false,
+            InteractionsType::Query(query) => query.is_dml(),
+            InteractionsType::Fault(..) => false,
         }
     }
 
@@ -312,6 +313,7 @@ impl Interactions {
             || matches!(
                 self.interactions,
                 InteractionsType::Property(Property::AllTableHaveExpectedContent { .. })
+                    | InteractionsType::Property(Property::TableHasExpectedContent { .. })
             )
     }
 }
